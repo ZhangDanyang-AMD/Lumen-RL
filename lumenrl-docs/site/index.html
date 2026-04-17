@@ -34,16 +34,24 @@ body{font-family:var(--sans);background:var(--bg);color:var(--text);line-height:
 a{color:var(--cyan);text-decoration:none}
 a:hover{text-decoration:underline}
 code,pre{font-family:var(--mono)}
+code{background:var(--surface);padding:2px 6px;border-radius:4px;font-size:0.88em;color:var(--lime)}
 .wrap{max-width:1120px;margin:0 auto;padding:0 28px}
 
 /* ── NAV ── */
-nav{position:sticky;top:0;z-index:100;background:rgba(10,10,15,0.85);backdrop-filter:blur(16px) saturate(1.4);border-bottom:1px solid var(--border);padding:16px 0}
+nav{position:sticky;top:0;z-index:200;background:rgba(10,10,15,0.88);backdrop-filter:blur(16px) saturate(1.4);border-bottom:1px solid var(--border);padding:14px 0}
 nav .wrap{display:flex;align-items:center;justify-content:space-between}
 .logo{font-family:var(--mono);font-size:20px;font-weight:700;letter-spacing:2px;color:var(--text)}
 .logo b{color:var(--amd-red)}
-.nav-links{display:flex;gap:24px}
-.nav-links a{color:var(--text-dim);font-size:13px;font-weight:600;letter-spacing:0.5px;text-transform:uppercase;transition:color .2s}
+.nav-links{display:flex;gap:20px;align-items:center}
+.nav-links a{color:var(--text-dim);font-size:12px;font-weight:600;letter-spacing:0.5px;text-transform:uppercase;transition:color .2s}
 .nav-links a:hover{color:var(--text);text-decoration:none}
+.nav-links a.active{color:var(--amd-red)}
+.nav-divider{width:1px;height:16px;background:var(--border)}
+.hamburger{display:none;background:none;border:none;color:var(--text);font-size:24px;cursor:pointer}
+
+/* ── PAGE MODES ── */
+.page-home,.page-docs{display:none}
+.page-home.active,.page-docs.active{display:block}
 
 /* ── HERO ── */
 .hero{padding:100px 0 80px;text-align:center;position:relative;overflow:hidden}
@@ -94,8 +102,8 @@ nav .wrap{display:flex;align-items:center;justify-content:space-between}
 
 /* ── TABLES ── */
 .tbl-section{padding:80px 0}
-.tbl-section:nth-child(odd){background:var(--bg-raised)}
-.tbl-section:nth-child(even){background:var(--bg)}
+.tbl-section.bg-raised{background:var(--bg-raised)}
+.tbl-section.bg-base{background:var(--bg)}
 .tbl{width:100%;border-collapse:collapse;background:var(--bg-card);border:1px solid var(--border);border-radius:10px;overflow:hidden}
 .tbl thead{background:var(--surface)}
 .tbl th{text-align:left;padding:14px 20px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--text-dim);border-bottom:1px solid var(--border)}
@@ -110,7 +118,7 @@ nav .wrap{display:flex;align-items:center;justify-content:space-between}
 .tag-a{background:rgba(251,191,36,0.1);color:var(--amber)}
 .tag-r{background:rgba(237,28,36,0.1);color:var(--amd-red)}
 
-/* ── RL EXPERIMENTS ── */
+/* ── EXPERIMENTS ── */
 .exp{padding:80px 0;background:var(--bg)}
 .exp-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 .ecard{background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:28px 24px}
@@ -119,6 +127,41 @@ nav .wrap{display:flex;align-items:center;justify-content:space-between}
 .ecard p{font-size:13px;color:var(--text-dim);margin-bottom:16px}
 .ecard pre{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px 16px;font-size:12px;line-height:1.6;overflow-x:auto;color:var(--text-dim)}
 
+/* ── DOCS LAYOUT ── */
+.docs-layout{display:grid;grid-template-columns:260px 1fr;gap:0;min-height:calc(100vh - 58px)}
+.docs-sidebar{background:var(--bg-raised);border-right:1px solid var(--border);padding:28px 0;position:sticky;top:58px;height:calc(100vh - 58px);overflow-y:auto}
+.docs-sidebar::-webkit-scrollbar{width:4px}
+.docs-sidebar::-webkit-scrollbar-track{background:transparent}
+.docs-sidebar::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
+.docs-main{padding:48px 48px 80px;max-width:860px;overflow-x:auto}
+.sidebar-group{margin-bottom:24px}
+.sidebar-group-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:2px;color:var(--amd-red);padding:0 24px;margin-bottom:8px;font-family:var(--mono)}
+.sidebar-link{display:block;padding:6px 24px;font-size:13px;color:var(--text-dim);transition:all .15s;cursor:pointer;border-left:2px solid transparent}
+.sidebar-link:hover{color:var(--text);background:rgba(255,255,255,0.03);text-decoration:none}
+.sidebar-link.active{color:var(--cyan);border-left-color:var(--cyan);background:rgba(0,229,255,0.04)}
+
+/* ── DOCS CONTENT ── */
+.doc-section{display:none}
+.doc-section.active{display:block}
+.doc-section h1{font-size:32px;font-weight:800;letter-spacing:-1px;margin-bottom:12px}
+.doc-section h2{font-size:22px;font-weight:700;letter-spacing:-0.3px;margin:40px 0 12px;padding-top:20px;border-top:1px solid var(--border)}
+.doc-section h2:first-of-type{border-top:none;margin-top:24px}
+.doc-section h3{font-size:17px;font-weight:700;margin:28px 0 8px;color:var(--text)}
+.doc-section h4{font-size:15px;font-weight:600;margin:20px 0 6px;color:var(--text)}
+.doc-section p{font-size:14px;color:var(--text-dim);margin-bottom:14px;line-height:1.7}
+.doc-section ul,.doc-section ol{padding-left:20px;margin-bottom:14px}
+.doc-section li{font-size:14px;color:var(--text-dim);margin-bottom:6px;line-height:1.65}
+.doc-section li strong{color:var(--text)}
+.doc-section pre{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px 20px;font-size:12.5px;line-height:1.6;overflow-x:auto;color:var(--text-dim);margin:12px 0 20px}
+.doc-section .dtbl{width:100%;border-collapse:collapse;margin:12px 0 20px;font-size:13px}
+.doc-section .dtbl th{text-align:left;padding:10px 14px;background:var(--surface);border:1px solid var(--border);font-weight:700;color:var(--text-dim);font-size:11px;text-transform:uppercase;letter-spacing:0.5px}
+.doc-section .dtbl td{padding:10px 14px;border:1px solid var(--border);color:var(--text-dim)}
+.doc-section .dtbl td:first-child{color:var(--text);font-weight:500}
+.doc-section .callout{background:var(--bg-card);border:1px solid var(--border);border-left:3px solid var(--amber);border-radius:6px;padding:14px 18px;margin:16px 0;font-size:13px;color:var(--text-dim)}
+.doc-section .callout strong{color:var(--amber)}
+.doc-section .callout.info{border-left-color:var(--cyan)}
+.doc-section .callout.info strong{color:var(--cyan)}
+
 /* ── FOOTER ── */
 footer{border-top:1px solid var(--border);padding:40px 0;text-align:center;background:var(--bg-raised)}
 footer p{font-size:13px;color:var(--text-muted)}
@@ -126,10 +169,19 @@ footer a{color:var(--text-dim)}
 footer a:hover{color:var(--text)}
 footer .links{margin-top:12px;display:flex;gap:24px;justify-content:center;flex-wrap:wrap}
 
-@media(max-width:768px){
+/* ── MOBILE ── */
+@media(max-width:900px){
   .fgrid,.qs-grid,.exp-grid{grid-template-columns:1fr}
-  .nav-links{display:none}
-  .hero h1{font-size:32px}
+  .nav-links .desktop-only{display:none}
+  .hamburger{display:block}
+  .docs-layout{grid-template-columns:1fr}
+  .docs-sidebar{position:fixed;left:-280px;top:58px;width:280px;height:calc(100vh - 58px);z-index:150;transition:left .3s}
+  .docs-sidebar.open{left:0;box-shadow:4px 0 24px rgba(0,0,0,0.5)}
+  .docs-main{padding:28px 20px 60px}
+}
+@media(max-width:600px){
+  .hero h1{font-size:28px}
+  .nav-links a{font-size:11px}
 }
 </style>
 </head>
@@ -137,18 +189,24 @@ footer .links{margin-top:12px;display:flex;gap:24px;justify-content:center;flex-
 
 <nav>
   <div class="wrap">
-    <div class="logo"><b>LUMEN</b>RL</div>
+    <div class="logo"><a href="#" onclick="showHome();return false" style="color:inherit;text-decoration:none"><b>LUMEN</b>RL</a></div>
     <div class="nav-links">
-      <a href="#features">Features</a>
-      <a href="#arch">Architecture</a>
-      <a href="#quickstart">Quick Start</a>
-      <a href="#algorithms">Algorithms</a>
-      <a href="#models">Models</a>
-      <a href="#experiments">Experiments</a>
+      <a href="#" onclick="showHome();return false" class="nav-home active">Home</a>
+      <a href="#" onclick="showDocs();return false" class="nav-docs">Docs</a>
+      <span class="nav-divider desktop-only"></span>
+      <a href="#features" class="desktop-only" onclick="showHome()">Features</a>
+      <a href="#arch" class="desktop-only" onclick="showHome()">Architecture</a>
+      <a href="#quickstart" class="desktop-only" onclick="showHome()">Quick Start</a>
+      <a href="#algorithms" class="desktop-only" onclick="showHome()">Algorithms</a>
       <a href="https://github.com/ZhangDanyang-AMD/Lumen-RL">GitHub</a>
     </div>
   </div>
 </nav>
+
+<!-- ============================================ -->
+<!--                HOME PAGE                     -->
+<!-- ============================================ -->
+<div class="page-home active" id="page-home">
 
 <section class="hero">
   <div class="wrap">
@@ -161,8 +219,9 @@ footer .links{margin-top:12px;display:flex;gap:24px;justify-content:center;flex-
       <span class="pill"><i style="background:var(--amber)"></i>MI300X &bull; MI355X</span>
     </div>
     <div class="btns">
-      <a class="btn btn-red" href="#quickstart">Get Started</a>
-      <a class="btn btn-outline" href="https://github.com/ZhangDanyang-AMD/Lumen-RL">&#9733; GitHub</a>
+      <a class="btn btn-red" href="#" onclick="showDocs();navigateDoc('install');return false">Get Started</a>
+      <a class="btn btn-outline" href="#" onclick="showDocs();return false">Read Docs</a>
+      <a class="btn btn-outline" href="https://github.com/ZhangDanyang-AMD/Lumen-RL">GitHub</a>
     </div>
   </div>
 </section>
@@ -216,18 +275,12 @@ footer .links{margin-top:12px;display:flex;gap:24px;justify-content:center;flex-
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 680">
         <rect width="960" height="680" rx="12" fill="#0a0a0f"/>
         <text x="480" y="28" text-anchor="middle" fill="#8b8ba0" font-size="10" font-weight="700" font-family="monospace" letter-spacing="3">LUMENRL ARCHITECTURE</text>
-
-        <!-- Layer 0: Algorithms -->
         <rect x="30" y="44" width="900" height="48" rx="8" fill="none" stroke="#a78bfa" stroke-width="1.2" stroke-dasharray="4,3"/>
         <text x="480" y="62" text-anchor="middle" fill="#a78bfa" font-size="9" font-weight="700" font-family="monospace" letter-spacing="2">RL ALGORITHMS</text>
         <text x="240" y="80" text-anchor="middle" fill="#e8e8ef" font-size="13" font-weight="700" font-family="system-ui">GRPO</text>
         <text x="480" y="80" text-anchor="middle" fill="#e8e8ef" font-size="13" font-weight="700" font-family="system-ui">DAPO</text>
         <text x="720" y="80" text-anchor="middle" fill="#e8e8ef" font-size="13" font-weight="700" font-family="system-ui">PPO</text>
-
-        <line x1="480" y1="92" x2="480" y2="108" stroke="#5e5e74" stroke-width="1.2"/>
-        <polygon points="480,112 476,106 484,106" fill="#5e5e74"/>
-
-        <!-- Layer 1: Ray Controller -->
+        <line x1="480" y1="92" x2="480" y2="108" stroke="#5e5e74" stroke-width="1.2"/><polygon points="480,112 476,106 484,106" fill="#5e5e74"/>
         <rect x="30" y="112" width="900" height="68" rx="8" fill="#12121a" stroke="#1976d2" stroke-width="1.2"/>
         <text x="480" y="130" text-anchor="middle" fill="#42a5f5" font-size="9" font-weight="700" font-family="monospace" letter-spacing="2">RAY CONTROLLER</text>
         <rect x="50" y="138" width="130" height="30" rx="5" fill="#1a237e" stroke="#42a5f5" stroke-width="1"/><text x="115" y="158" text-anchor="middle" fill="#90caf9" font-size="10" font-weight="600" font-family="system-ui">RLTrainer</text>
@@ -235,13 +288,10 @@ footer .links{margin-top:12px;display:flex;gap:24px;justify-content:center;flex-
         <rect x="340" y="138" width="130" height="30" rx="5" fill="#1a237e" stroke="#42a5f5" stroke-width="1"/><text x="405" y="158" text-anchor="middle" fill="#90caf9" font-size="10" font-weight="600" font-family="system-ui">WorkerGroups</text>
         <rect x="485" y="138" width="130" height="30" rx="5" fill="#1a237e" stroke="#42a5f5" stroke-width="1"/><text x="550" y="158" text-anchor="middle" fill="#90caf9" font-size="10" font-weight="600" font-family="system-ui">Callbacks</text>
         <rect x="630" y="138" width="280" height="30" rx="5" fill="#1a237e" stroke="#42a5f5" stroke-width="1"/><text x="770" y="158" text-anchor="middle" fill="#90caf9" font-size="10" font-weight="600" font-family="system-ui">Checkpoint &bull; Logging &bull; Metrics</text>
-
         <text x="240" y="196" text-anchor="middle" fill="#5e5e74" font-size="8" font-weight="600" font-family="monospace">dispatch DataProto</text>
         <line x1="240" y1="200" x2="240" y2="218" stroke="#5e5e74" stroke-width="1.2"/><polygon points="240,222 236,216 244,216" fill="#5e5e74"/>
         <text x="720" y="196" text-anchor="middle" fill="#5e5e74" font-size="8" font-weight="600" font-family="monospace">collect DataProto</text>
         <line x1="720" y1="200" x2="720" y2="218" stroke="#5e5e74" stroke-width="1.2"/><polygon points="720,222 716,216 724,216" fill="#5e5e74"/>
-
-        <!-- Layer 2 Left: ATOM -->
         <rect x="30" y="222" width="440" height="160" rx="8" fill="#0d1a0d" stroke="#388e3c" stroke-width="1.2"/>
         <text x="250" y="242" text-anchor="middle" fill="#66bb6a" font-size="9" font-weight="700" font-family="monospace" letter-spacing="2">ATOM &middot; INFERENCE</text>
         <rect x="46" y="252" width="120" height="44" rx="5" fill="#1b2e1b" stroke="#388e3c" stroke-width="1"/><text x="106" y="270" text-anchor="middle" fill="#a5d6a7" font-size="9.5" font-weight="600" font-family="system-ui">FP8 W8A8</text><text x="106" y="284" text-anchor="middle" fill="#5e5e74" font-size="8" font-family="system-ui">Blockwise Quant</text>
@@ -249,8 +299,6 @@ footer .links{margin-top:12px;display:flex;gap:24px;justify-content:center;flex-
         <rect x="306" y="252" width="148" height="44" rx="5" fill="#1b2e1b" stroke="#388e3c" stroke-width="1"/><text x="380" y="270" text-anchor="middle" fill="#a5d6a7" font-size="9.5" font-weight="600" font-family="system-ui">MoE Expert Par.</text><text x="380" y="284" text-anchor="middle" fill="#5e5e74" font-size="8" font-family="system-ui">MORI Dispatch</text>
         <rect x="46" y="306" width="195" height="36" rx="5" fill="#2a1800" stroke="#e65100" stroke-width="1"/><text x="144" y="322" text-anchor="middle" fill="#ffab40" font-size="9" font-weight="600" font-family="system-ui">Router Recorder (R3)</text><text x="144" y="335" text-anchor="middle" fill="#5e5e74" font-size="7.5" font-family="system-ui">Capture MoE routing logits</text>
         <rect x="251" y="306" width="205" height="36" rx="5" fill="#0d0d2a" stroke="#3f51b5" stroke-width="1"/><text x="354" y="322" text-anchor="middle" fill="#9fa8da" font-size="9" font-weight="600" font-family="system-ui">Generation Interface</text><text x="354" y="335" text-anchor="middle" fill="#5e5e74" font-size="7.5" font-family="system-ui">Batch rollout + sampling</text>
-
-        <!-- Layer 2 Right: Lumen -->
         <rect x="490" y="222" width="440" height="160" rx="8" fill="#1a0d0d" stroke="#d32f2f" stroke-width="1.2"/>
         <text x="710" y="242" text-anchor="middle" fill="#ef5350" font-size="9" font-weight="700" font-family="monospace" letter-spacing="2">LUMEN &middot; TRAINING</text>
         <rect x="506" y="252" width="120" height="44" rx="5" fill="#2e1b1b" stroke="#d32f2f" stroke-width="1"/><text x="566" y="270" text-anchor="middle" fill="#ef9a9a" font-size="9.5" font-weight="600" font-family="system-ui">FSDP2</text><text x="566" y="284" text-anchor="middle" fill="#5e5e74" font-size="8" font-family="system-ui">Full Shard + FP8</text>
@@ -258,43 +306,27 @@ footer .links{margin-top:12px;display:flex;gap:24px;justify-content:center;flex-
         <rect x="776" y="252" width="140" height="44" rx="5" fill="#2e1b1b" stroke="#d32f2f" stroke-width="1"/><text x="846" y="270" text-anchor="middle" fill="#ef9a9a" font-size="9.5" font-weight="600" font-family="system-ui">FP8 Training</text><text x="846" y="284" text-anchor="middle" fill="#5e5e74" font-size="8" font-family="system-ui">Hybrid E4M3 / E5M2</text>
         <rect x="506" y="306" width="195" height="36" rx="5" fill="#2a1800" stroke="#e65100" stroke-width="1"/><text x="604" y="322" text-anchor="middle" fill="#ffab40" font-size="9" font-weight="600" font-family="system-ui">Router Replayer (R3)</text><text x="604" y="335" text-anchor="middle" fill="#5e5e74" font-size="7.5" font-family="system-ui">Inject routing distributions</text>
         <rect x="711" y="306" width="205" height="36" rx="5" fill="#0d0d2a" stroke="#3f51b5" stroke-width="1"/><text x="814" y="322" text-anchor="middle" fill="#9fa8da" font-size="9" font-weight="600" font-family="system-ui">MoE Grouped GEMM</text><text x="814" y="335" text-anchor="middle" fill="#5e5e74" font-size="7.5" font-family="system-ui">AITER Fused Experts</text>
-
-        <!-- R3 Arrow -->
-        <line x1="144" y1="342" x2="144" y2="375" stroke="#e65100" stroke-width="1.5" stroke-dasharray="5,3"/>
-        <line x1="144" y1="375" x2="604" y2="375" stroke="#e65100" stroke-width="1.5" stroke-dasharray="5,3"/>
-        <line x1="604" y1="375" x2="604" y2="348" stroke="#e65100" stroke-width="1.5" stroke-dasharray="5,3"/>
-        <polygon points="604,342 600,350 608,350" fill="#e65100"/>
-
+        <line x1="144" y1="342" x2="144" y2="375" stroke="#e65100" stroke-width="1.5" stroke-dasharray="5,3"/><line x1="144" y1="375" x2="604" y2="375" stroke="#e65100" stroke-width="1.5" stroke-dasharray="5,3"/><line x1="604" y1="375" x2="604" y2="348" stroke="#e65100" stroke-width="1.5" stroke-dasharray="5,3"/><polygon points="604,342 600,350 608,350" fill="#e65100"/>
         <line x1="480" y1="384" x2="480" y2="400" stroke="#5e5e74" stroke-width="1.2"/><polygon points="480,404 476,398 484,398" fill="#5e5e74"/>
-
-        <!-- Layer 3: Quantization -->
         <rect x="30" y="404" width="900" height="56" rx="8" fill="#1a1400" stroke="#e65100" stroke-width="1.2"/>
         <text x="480" y="422" text-anchor="middle" fill="#ffab40" font-size="9" font-weight="700" font-family="monospace" letter-spacing="2">FP8-RL QUANTIZATION STACK</text>
         <rect x="46" y="432" width="185" height="22" rx="4" fill="#2a1800" stroke="#e65100" stroke-width="0.8"/><text x="139" y="447" text-anchor="middle" fill="#ffcc80" font-size="9" font-weight="600" font-family="system-ui">FP8 Rollout (W8A8)</text>
         <rect x="241" y="432" width="185" height="22" rx="4" fill="#2a1800" stroke="#e65100" stroke-width="0.8"/><text x="334" y="447" text-anchor="middle" fill="#ffcc80" font-size="9" font-weight="600" font-family="system-ui">FP8 Weight Quantizer</text>
         <rect x="436" y="432" width="185" height="22" rx="4" fill="#2a1800" stroke="#e65100" stroke-width="0.8"/><text x="529" y="447" text-anchor="middle" fill="#ffcc80" font-size="9" font-weight="600" font-family="system-ui">FP8 KV-Cache Quant</text>
         <rect x="631" y="432" width="285" height="22" rx="4" fill="#2a1800" stroke="#e65100" stroke-width="0.8"/><text x="774" y="447" text-anchor="middle" fill="#ffcc80" font-size="9" font-weight="600" font-family="system-ui">Rollout Correction (TIS / MIS)</text>
-
         <line x1="480" y1="460" x2="480" y2="478" stroke="#5e5e74" stroke-width="1.2"/><polygon points="480,482 476,476 484,476" fill="#5e5e74"/>
-
-        <!-- Layer 4: AITER + MORI -->
         <rect x="30" y="482" width="440" height="62" rx="8" fill="#0d1a0d" stroke="#388e3c" stroke-width="1.2"/>
         <text x="250" y="502" text-anchor="middle" fill="#66bb6a" font-size="9" font-weight="700" font-family="monospace" letter-spacing="1">AITER &middot; KERNEL PROVIDER</text>
         <text x="250" y="518" text-anchor="middle" fill="#5e5e74" font-size="10" font-family="system-ui">ASM &gt; CK &gt; Triton &bull; Attention / GEMM / MoE / Norm</text>
         <text x="250" y="534" text-anchor="middle" fill="#5e5e74" font-size="10" font-family="system-ui">FP8 blockwise &bull; MXFP8 &bull; per-tensor</text>
-
         <rect x="490" y="482" width="440" height="62" rx="8" fill="#0d1a1a" stroke="#00796b" stroke-width="1.2"/>
         <text x="710" y="502" text-anchor="middle" fill="#4db6ac" font-size="9" font-weight="700" font-family="monospace" letter-spacing="1">MORI &middot; COMMUNICATION</text>
         <text x="710" y="518" text-anchor="middle" fill="#5e5e74" font-size="10" font-family="system-ui">MORI-CCL (AG, RS, AR) + MORI-EP (MoE)</text>
         <text x="710" y="534" text-anchor="middle" fill="#5e5e74" font-size="10" font-family="system-ui">Device-side RDMA &bull; FP8 &bull; AINIC &bull; CX-7</text>
-
         <line x1="480" y1="544" x2="480" y2="562" stroke="#5e5e74" stroke-width="1.2"/><polygon points="480,566 476,560 484,560" fill="#5e5e74"/>
-
-        <!-- Layer 5: Hardware -->
         <rect x="30" y="566" width="900" height="48" rx="8" fill="none" stroke="#d32f2f" stroke-width="1.2"/>
         <text x="480" y="584" text-anchor="middle" fill="#ef5350" font-size="9" font-weight="700" font-family="monospace" letter-spacing="2">HARDWARE</text>
         <text x="480" y="602" text-anchor="middle" fill="#e8e8ef" font-size="14" font-weight="700" font-family="system-ui">AMD Instinct MI300X / MI355X &mdash; ROCm</text>
-
         <text x="480" y="644" text-anchor="middle" fill="#5e5e74" font-size="9" font-style="italic" font-family="system-ui">All cross-worker communication via DataProto &bull; Ray-orchestrated &bull; AMD-native</text>
       </svg>
     </div>
@@ -367,7 +399,7 @@ bash examples/DAPO/run_1d_fp8_e2e_blockwise.sh</pre>
   </div>
 </section>
 
-<section class="tbl-section" id="algorithms">
+<section class="tbl-section bg-raised" id="algorithms">
   <div class="wrap">
     <p class="stitle">// algorithms</p>
     <h2 class="htitle">RL Algorithms</h2>
@@ -383,7 +415,7 @@ bash examples/DAPO/run_1d_fp8_e2e_blockwise.sh</pre>
   </div>
 </section>
 
-<section class="tbl-section" id="models">
+<section class="tbl-section bg-base" id="models">
   <div class="wrap">
     <p class="stitle">// models</p>
     <h2 class="htitle">Supported Models</h2>
@@ -408,32 +440,970 @@ bash examples/DAPO/run_1d_fp8_e2e_blockwise.sh</pre>
     <p class="hsub">DAPO on Qwen3-8B-Base, 8&times; MI350X &mdash; reproducing VERL FP8 benchmarks</p>
     <div class="exp-grid">
       <div class="ecard">
-        <h3>Experiment 1A &mdash; BF16 Baseline</h3>
+        <h3>1A &mdash; BF16 Baseline</h3>
         <p>Pure BF16 training + BF16 rollout. Reference curve for all FP8 comparisons.</p>
         <pre>bash examples/DAPO/run_1a_bf16_baseline.sh</pre>
       </div>
       <div class="ecard">
-        <h3>Experiment 1B &mdash; FP8 Rollout + TIS</h3>
-        <p>BF16 training + FP8 rollout with token-level importance sampling. Expected: 1B &asymp; 1A.</p>
+        <h3>1B &mdash; FP8 Rollout + TIS</h3>
+        <p>BF16 training + FP8 rollout with token-level importance sampling.</p>
         <pre>bash examples/DAPO/run_1b_fp8_rollout_tis.sh</pre>
       </div>
       <div class="ecard">
-        <h3>Experiment 1D &mdash; FP8 E2E Blockwise</h3>
-        <p>Full Lumen FP8 training (blockwise 128) + FP8 rollout + TIS. Priority 1 &mdash; closest to TE reference.</p>
+        <h3>1D &mdash; FP8 E2E Blockwise</h3>
+        <p>Full Lumen FP8 training (blockwise 128) + FP8 rollout + TIS.</p>
         <pre>bash examples/DAPO/run_1d_fp8_e2e_blockwise.sh</pre>
       </div>
       <div class="ecard">
-        <h3>Experiment 1F &mdash; FP8 E2E Per-Tensor</h3>
-        <p>Lumen FP8 per-tensor delayed scaling. Coarsest granularity &mdash; validates lower bound.</p>
+        <h3>1F &mdash; FP8 E2E Per-Tensor</h3>
+        <p>Lumen FP8 per-tensor delayed scaling. Coarsest granularity.</p>
         <pre>bash examples/DAPO/run_1f_fp8_e2e_per_tensor.sh</pre>
       </div>
       <div class="ecard full">
-        <h3>Experiment Matrix</h3>
-        <p>Complete matrix includes MXFP8 sweep (block=32/64/128), attention FP8 sweep, and optimizer sweep. See the <a href="https://github.com/ZhangDanyang-AMD/Lumen-RL/blob/main/examples/DAPO/README.md">DAPO README</a> and the <a href="https://github.com/ZhangDanyang-AMD/Lumen/blob/dev/RL/outputs/fp8_training_alignment/FP8_TRAINING_ALIGNMENT_PLAN.md">FP8 Training Alignment Plan</a> for the full 30+ run matrix across Qwen3-8B, Qwen3-30B-A3B-Base, and Qwen3-30B-A3B.</p>
+        <h3>Full Experiment Matrix</h3>
+        <p>Includes MXFP8 sweep (block=32/64/128), attention FP8, and optimizer sweep across Qwen3-8B, Qwen3-30B-A3B-Base, and Qwen3-30B-A3B. See the <a href="https://github.com/ZhangDanyang-AMD/Lumen-RL/blob/main/examples/DAPO/README.md">DAPO README</a> and the <a href="https://github.com/ZhangDanyang-AMD/Lumen/blob/dev/RL/outputs/fp8_training_alignment/FP8_TRAINING_ALIGNMENT_PLAN.md">FP8 Training Alignment Plan</a>.</p>
       </div>
     </div>
   </div>
 </section>
+
+</div><!-- /page-home -->
+
+<!-- ============================================ -->
+<!--                DOCS PAGE                     -->
+<!-- ============================================ -->
+<div class="page-docs" id="page-docs">
+<div class="docs-layout">
+
+<aside class="docs-sidebar" id="docs-sidebar">
+  <div class="sidebar-group">
+    <div class="sidebar-group-title">Getting Started</div>
+    <a class="sidebar-link active" data-doc="install" onclick="navigateDoc('install')">Installation</a>
+    <a class="sidebar-link" data-doc="quick_start" onclick="navigateDoc('quick_start')">Quick Start</a>
+  </div>
+  <div class="sidebar-group">
+    <div class="sidebar-group-title">Architecture</div>
+    <a class="sidebar-link" data-doc="architecture" onclick="navigateDoc('architecture')">System Overview</a>
+  </div>
+  <div class="sidebar-group">
+    <div class="sidebar-group-title">Examples</div>
+    <a class="sidebar-link" data-doc="ex_grpo" onclick="navigateDoc('ex_grpo')">GRPO Training</a>
+    <a class="sidebar-link" data-doc="ex_dapo" onclick="navigateDoc('ex_dapo')">DAPO Training</a>
+    <a class="sidebar-link" data-doc="ex_ppo" onclick="navigateDoc('ex_ppo')">PPO Training</a>
+    <a class="sidebar-link" data-doc="ex_fp8" onclick="navigateDoc('ex_fp8')">FP8 Training</a>
+    <a class="sidebar-link" data-doc="ex_moe" onclick="navigateDoc('ex_moe')">MoE R3 Training</a>
+  </div>
+  <div class="sidebar-group">
+    <div class="sidebar-group-title">Advanced</div>
+    <a class="sidebar-link" data-doc="adv_fp8" onclick="navigateDoc('adv_fp8')">FP8 Quantization</a>
+    <a class="sidebar-link" data-doc="adv_moe" onclick="navigateDoc('adv_moe')">MoE R3</a>
+    <a class="sidebar-link" data-doc="adv_dist" onclick="navigateDoc('adv_dist')">Distributed Training</a>
+    <a class="sidebar-link" data-doc="adv_algo" onclick="navigateDoc('adv_algo')">Algorithms</a>
+  </div>
+  <div class="sidebar-group">
+    <div class="sidebar-group-title">API Reference</div>
+    <a class="sidebar-link" data-doc="api_config" onclick="navigateDoc('api_config')">Config</a>
+    <a class="sidebar-link" data-doc="api_protocol" onclick="navigateDoc('api_protocol')">DataProto</a>
+    <a class="sidebar-link" data-doc="api_algo" onclick="navigateDoc('api_algo')">Algorithms</a>
+    <a class="sidebar-link" data-doc="api_quant" onclick="navigateDoc('api_quant')">Quantization</a>
+    <a class="sidebar-link" data-doc="api_moe" onclick="navigateDoc('api_moe')">MoE</a>
+  </div>
+</aside>
+
+<main class="docs-main">
+
+<!-- ─── INSTALL ─── -->
+<div class="doc-section active" id="doc-install">
+<h1>Installation</h1>
+<p>Hardware and software requirements, container-based setup, editable installs, and verification.</p>
+
+<h2>Requirements</h2>
+<table class="dtbl"><thead><tr><th>Component</th><th>Version / Hardware</th></tr></thead><tbody>
+<tr><td>Python</td><td>&gt;= 3.10</td></tr>
+<tr><td>PyTorch</td><td>&gt;= 2.4 (ROCm build recommended)</td></tr>
+<tr><td>ROCm</td><td>&gt;= 6.2</td></tr>
+<tr><td>GPU</td><td>AMD Instinct MI250 or MI300 series</td></tr>
+</tbody></table>
+<div class="callout info"><strong>Note:</strong> Match your PyTorch wheel to the ROCm version on the host or inside the container. Mismatched userspace stacks are the most common source of runtime failures on AMD clusters.</div>
+
+<h2>Docker Install (recommended)</h2>
+<pre>docker pull rocm/atom-dev:latest
+
+docker run -it --network=host \
+  --device=/dev/kfd --device=/dev/dri \
+  --group-add video --cap-add=SYS_PTRACE \
+  --security-opt seccomp=unconfined \
+  --shm-size=16G \
+  -v $HOME:/home/$USER \
+  rocm/atom-dev:latest</pre>
+<p>Inside the container, clone LumenRL and install:</p>
+<pre>git clone https://github.com/ZhangDanyang-AMD/Lumen-RL.git && cd Lumen-RL
+pip install -e ".[all]"</pre>
+
+<h2>Developer Install</h2>
+<pre>git clone https://github.com/ZhangDanyang-AMD/Lumen-RL.git && cd Lumen-RL
+
+# Full install (recommended)
+pip install -e ".[all]"
+
+# Minimal package only
+pip install -e "."</pre>
+
+<h2>Third-Party Libraries</h2>
+<table class="dtbl"><thead><tr><th>Library</th><th>Import</th><th>Role</th></tr></thead><tbody>
+<tr><td><a href="https://github.com/ZhangDanyang-AMD/Lumen">Lumen</a></td><td><code>lumen</code></td><td>Quantized training: hybrid FP8/MXFP8, AITER kernels, MORI hooks</td></tr>
+<tr><td><a href="https://github.com/ROCm/ATOM">ATOM</a></td><td><code>atom</code></td><td>High-throughput inference: FP8 rollout, MoE expert parallel</td></tr>
+<tr><td><a href="https://github.com/ROCm/aiter">AITER</a></td><td><code>amd-aiter</code></td><td>Low-level GPU kernels (attention, GEMM, MoE, norm)</td></tr>
+<tr><td><a href="https://github.com/ROCm/mori">MORI</a></td><td><code>mori</code></td><td>RDMA-aware GPU collectives and MoE expert dispatch</td></tr>
+<tr><td><a href="https://github.com/ray-project/ray">Ray</a></td><td><code>ray</code></td><td>Controller/worker orchestration and resource placement</td></tr>
+</tbody></table>
+
+<h2>Verify Installation</h2>
+<pre>python - &lt;&lt;'PY'
+import sys, torch
+print("python", sys.version.split()[0])
+print("torch", torch.__version__)
+print("cuda/hip available:", torch.cuda.is_available())
+
+import lumenrl
+from lumenrl.core.config import LumenRLConfig
+cfg = LumenRLConfig()
+print("LumenRLConfig OK:", type(cfg).__name__)
+PY</pre>
+</div>
+
+<!-- ─── QUICK START ─── -->
+<div class="doc-section" id="doc-quick_start">
+<h1>Quick Start</h1>
+<p>Run GRPO in three regimes&mdash;BF16 baseline, FP8 end-to-end, and MoE with R3&mdash;then scale with SLURM.</p>
+
+<h2>Run GRPO (BF16 Baseline)</h2>
+<pre>cd Lumen-RL
+python examples/run_grpo.py --config configs/grpo_dense_bf16.yaml</pre>
+<p>Trains <code>Qwen/Qwen3-0.6B</code> with GRPO, ATOM rollouts, and FSDP2 policy updates. Checkpoints write under <code>checkpointing.checkpoint_dir</code>.</p>
+
+<h2>Run GRPO (FP8 End-to-End)</h2>
+<pre>python examples/run_grpo.py --config configs/grpo_dense_fp8.yaml</pre>
+
+<h2>Run GRPO (MoE with R3)</h2>
+<pre>python examples/run_grpo.py --config configs/grpo_moe_fp8_r3.yaml</pre>
+
+<h2>YAML Configuration Sketch</h2>
+<pre>cluster:
+  num_nodes: 1
+  gpus_per_node: 8
+
+policy:
+  model_name: Qwen/Qwen3-0.6B
+  training_backend: fsdp2
+  generation_backend: atom
+  max_total_sequence_length: 2048
+  train_global_batch_size: 32
+  train_micro_batch_size: 8
+
+algorithm:
+  name: grpo
+  grpo:
+    num_generations: 8
+    clip_ratio: 0.2
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+  rollout_correction:
+    enabled: false
+
+moe:
+  r3:
+    enabled: false
+
+num_training_steps: 200
+seed: 42</pre>
+
+<h2>Multi-Node SLURM Launch</h2>
+<pre>NUM_NODES=2
+
+COMMAND="python examples/run_grpo_moe.py \
+    --config configs/grpo_moe_fp8_r3_multinode.yaml \
+    cluster.num_nodes=$NUM_NODES \
+    cluster.gpus_per_node=8 \
+    policy.model_name=Qwen/Qwen3-30B-A3B \
+    quantization.rollout.precision=fp8 \
+    moe.r3.enabled=true"
+
+sbatch --nodes=$NUM_NODES --gres=gpu:8 scripts/ray.sub</pre>
+</div>
+
+<!-- ─── ARCHITECTURE ─── -->
+<div class="doc-section" id="doc-architecture">
+<h1>Architecture</h1>
+<p>LumenRL follows a controller/worker split: a Ray driver owns scheduling and batching, while specialized workers host ATOM inference, policy training, reference models, rewards, and critics. All cross-worker payloads are <code>DataProto</code> batches.</p>
+
+<h2>Ray Controller</h2>
+<p>The controller (<code>lumenrl/controller/</code>) connects Ray clusters, builds worker groups, and dispatches <code>DataProto</code> batches. It handles: bootstrapping Ray, grouping GPUs into actor/rollout/ref/reward/critic pools, and sequencing the RL outer loop: generate &rarr; score &rarr; ref/KL &rarr; train.</p>
+
+<h2>Workers</h2>
+<table class="dtbl"><thead><tr><th>Worker</th><th>Responsibility</th></tr></thead><tbody>
+<tr><td>Rollout</td><td>ATOM-backed generation, logits/log-prob capture, FP8 rollout quant hooks</td></tr>
+<tr><td>Actor</td><td>Policy forward/backward under FSDP2 or Megatron</td></tr>
+<tr><td>Reference</td><td>Frozen reference policy for KL-regularized algorithms</td></tr>
+<tr><td>Reward</td><td>Rule or model-based scoring surfaced as <code>rewards</code> tensors</td></tr>
+<tr><td>Critic</td><td>Value heads for PPO-style advantage estimation</td></tr>
+<tr><td>Hybrid</td><td>Colocated paths when memory or placement favors fused processes</td></tr>
+</tbody></table>
+
+<h2>DataProto Protocol</h2>
+<p><code>DataProto</code> is the universal batch container: a <code>dict[str, torch.Tensor]</code> plus <code>meta</code> for non-tensor fields. The controller merges partial batches from DP workers and splits for micro-batching inside actor steps.</p>
+
+<h2>Engine Layer</h2>
+<ul>
+<li><strong>ATOM inference</strong> &mdash; wraps generation, KV-cache extensions, and weight loaders so rollout matches training naming and sharding.</li>
+<li><strong>Lumen training</strong> &mdash; selects FSDP2 or Megatron, applies Lumen quantization hooks, and applies MoE R3 replay during forward passes.</li>
+</ul>
+
+<h2>Quantization Stack</h2>
+<p>Rollout quantization uses <code>FP8RolloutQuantizer</code> and <code>FP8KVCacheQuantizer</code>; training uses <code>FP8TrainingManager</code>. When FP8 rollouts diverge from BF16, <code>apply_rollout_correction</code> adjusts advantages using TIS or MIS.</p>
+
+<h2>MoE R3</h2>
+<p><code>R3Manager</code> coordinates <code>RouterRecorder</code> (inference) and <code>RouterReplayer</code> (training), with tensors carried via <code>DataProto.add_router_distributions</code>. This closes the router mismatch that otherwise spikes policy&ndash;inference KL.</p>
+
+<h2>Repository Layout</h2>
+<pre>Lumen-RL/
+├── lumenrl/                     # Main Python package
+│   ├── core/                    #   Config, DataProto, registry, types
+│   ├── controller/              #   Ray cluster, worker groups, dispatch
+│   ├── workers/                 #   Actor, critic, ref, reward, rollout, hybrid
+│   ├── engine/
+│   │   ├── inference/           #   ATOM engine wrapper, generation
+│   │   └── training/            #   FSDP2/Megatron backends, weight sync
+│   ├── algorithms/              #   GRPO, DAPO, PPO, loss functions
+│   ├── quantization/            #   FP8 rollout, KV-cache, training, correction
+│   ├── moe/                     #   R3 recorder/replayer/manager
+│   ├── trainer/                 #   RLTrainer main loop, callbacks
+│   └── utils/                   #   Logging, checkpoint, metrics
+├── configs/                     # Reference YAML configs
+├── examples/                    # Launch scripts + DAPO experiments
+├── scripts/                     # SLURM launchers
+├── tests/                       # Unit / integration / e2e tests
+└── docker/                      # Dockerfile, Dockerfile.dev</pre>
+</div>
+
+<!-- ─── EXAMPLE: GRPO ─── -->
+<div class="doc-section" id="doc-ex_grpo">
+<h1>GRPO Training Example</h1>
+<p>Group Relative Policy Optimization normalizes rewards within each prompt's sample group and applies a clipped surrogate policy loss&mdash;no critic required.</p>
+
+<h2>BF16 Baseline Configuration</h2>
+<pre>policy:
+  model_name: Qwen/Qwen3-0.6B
+  training_backend: fsdp2
+  generation_backend: atom
+
+algorithm:
+  name: grpo
+  grpo:
+    num_generations: 8
+    kl_coeff: 0.0
+    clip_ratio: 0.2
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null</pre>
+
+<h2>Running With Different Configs</h2>
+<pre># Baseline dense BF16
+python examples/run_grpo.py --config configs/grpo_dense_bf16.yaml
+
+# FP8 stack
+python examples/run_grpo.py --config configs/grpo_dense_fp8.yaml
+
+# Multi-GPU sweep
+python examples/run_grpo.py --config configs/grpo_dense_fp8_8gpu.yaml</pre>
+
+<h3>CLI Overrides</h3>
+<pre>python examples/run_grpo.py --config configs/grpo_dense_bf16.yaml \
+  policy.train_global_batch_size=16 \
+  algorithm.grpo.num_generations=4 \
+  num_training_steps=50</pre>
+
+<h2>Expected Output</h2>
+<ul>
+<li><strong>Scheduler logs</strong> &mdash; Ray workers placed on visible GPUs without repeated restart loops</li>
+<li><strong>Rollout logs</strong> &mdash; generation throughput and sequence lengths within <code>max_total_sequence_length</code></li>
+<li><strong>Training logs</strong> &mdash; monotonically increasing step indices and finite <code>loss_pg</code></li>
+<li><strong>Checkpoints</strong> &mdash; appear under <code>checkpoint_dir</code> every <code>save_steps</code> updates</li>
+</ul>
+</div>
+
+<!-- ─── EXAMPLE: DAPO ─── -->
+<div class="doc-section" id="doc-ex_dapo">
+<h1>DAPO Training Example</h1>
+<p>Decoupled Advantage Policy Optimization with asymmetric clipping and dynamic sampling.</p>
+
+<h2>When to Use DAPO</h2>
+<ul>
+<li><strong>Asymmetric clipping</strong> &mdash; different bounds for ratio increase vs decrease</li>
+<li><strong>High-variance rewards</strong> &mdash; dynamic sampling auto-filters degenerate groups</li>
+<li><strong>Overlong responses</strong> &mdash; overlong reward shaping penalizes excess length</li>
+</ul>
+
+<h2>BF16 Baseline</h2>
+<pre>python examples/run_dapo.py --config configs/dapo_dense_bf16.yaml</pre>
+<pre>algorithm:
+  name: dapo
+  dapo:
+    num_generations: 4
+    clip_ratio_low: 0.8
+    clip_ratio_high: 1.28
+    kl_coeff: 0.02
+    dynamic_sampling: true
+    overlong_reward_shaping: true
+    token_level_pg: true</pre>
+
+<h2>FP8 DAPO</h2>
+<pre>python examples/run_dapo.py --config configs/dapo_dense_fp8.yaml</pre>
+<pre>quantization:
+  rollout:
+    precision: fp8
+  training:
+    fp8: hybrid
+  rollout_correction:
+    enabled: true
+    method: tis
+    clip: 1.5</pre>
+
+<h2>GRPO vs DAPO</h2>
+<table class="dtbl"><thead><tr><th>Feature</th><th>GRPO</th><th>DAPO</th></tr></thead><tbody>
+<tr><td>Clip bounds</td><td>Symmetric [1-&epsilon;, 1+&epsilon;]</td><td>Asymmetric [low, high]</td></tr>
+<tr><td>Sampling</td><td>All groups</td><td>Dynamic (filter zero-variance)</td></tr>
+<tr><td>Length penalty</td><td>None</td><td>Overlong reward shaping</td></tr>
+<tr><td>PG level</td><td>Token or sequence</td><td>Token-level by default</td></tr>
+</tbody></table>
+
+<h2>Monitoring</h2>
+<ul>
+<li><code>loss_pg</code> &mdash; Policy gradient loss; should decrease</li>
+<li><code>active_frac</code> &mdash; Fraction of groups kept after dynamic sampling (healthy: 0.7&ndash;1.0)</li>
+<li><code>kl</code> &mdash; KL divergence from reference policy; should stay bounded</li>
+</ul>
+</div>
+
+<!-- ─── EXAMPLE: PPO ─── -->
+<div class="doc-section" id="doc-ex_ppo">
+<h1>PPO Training Example</h1>
+<p>Proximal Policy Optimization with GAE-Lambda advantages and a value function.</p>
+
+<h2>When to Use PPO</h2>
+<ul>
+<li>You have a <strong>trained critic</strong> (value function) and want GAE advantages</li>
+<li>You need <strong>value loss clipping</strong> for stable value estimation</li>
+<li>The task benefits from <strong>multi-epoch</strong> updates on each rollout batch</li>
+</ul>
+
+<h2>Configuration</h2>
+<pre>algorithm:
+  name: ppo
+  ppo:
+    clip_ratio: 0.2
+    num_ppo_epochs: 4
+    num_mini_batches: 4
+    discount: 0.99
+    gae_lambda: 0.95
+    kl_coeff: 0.01</pre>
+
+<h2>Running PPO</h2>
+<pre>python examples/run_grpo.py \
+    --config configs/grpo_dense_bf16.yaml \
+    algorithm.name=ppo \
+    algorithm.ppo.num_ppo_epochs=4 \
+    algorithm.ppo.num_mini_batches=4</pre>
+
+<h2>PPO with FP8</h2>
+<pre>python examples/run_grpo.py \
+    --config configs/grpo_dense_fp8.yaml \
+    algorithm.name=ppo \
+    algorithm.ppo.num_ppo_epochs=4</pre>
+
+<h2>Key Metrics</h2>
+<table class="dtbl"><thead><tr><th>Metric</th><th>Healthy Range</th><th>Indicates</th></tr></thead><tbody>
+<tr><td><code>loss_pg</code></td><td>Decreasing</td><td>Policy improving</td></tr>
+<tr><td><code>loss_vf</code></td><td>Decreasing</td><td>Value function fitting returns</td></tr>
+<tr><td><code>explained_variance</code></td><td>&gt; 0.5, trending toward 1.0</td><td>Critic predicting returns well</td></tr>
+<tr><td><code>kl</code></td><td>&lt; 0.1</td><td>Policy not drifting far from reference</td></tr>
+</tbody></table>
+
+<h2>PPO vs GRPO vs DAPO</h2>
+<table class="dtbl"><thead><tr><th>Feature</th><th>PPO</th><th>GRPO</th><th>DAPO</th></tr></thead><tbody>
+<tr><td>Advantages</td><td>GAE-Lambda (critic)</td><td>Group-relative (no critic)</td><td>Group-relative + dynamic</td></tr>
+<tr><td>Epochs per batch</td><td>Multiple (4 typical)</td><td>Single</td><td>Single</td></tr>
+<tr><td>Value loss</td><td>Yes (clipped MSE)</td><td>No</td><td>No</td></tr>
+<tr><td>Critic required</td><td>Yes</td><td>No</td><td>No</td></tr>
+</tbody></table>
+</div>
+
+<!-- ─── EXAMPLE: FP8 ─── -->
+<div class="doc-section" id="doc-ex_fp8">
+<h1>FP8 Training Example</h1>
+<p>FP8 W8A8 rollout in ATOM, hybrid FP8 training in Lumen, and token-level TIS correction.</p>
+
+<h2>FP8 Rollout Configuration</h2>
+<pre>quantization:
+  rollout:
+    precision: fp8
+    use_deep_gemm: true
+    num_first_layers_in_bf16: 0
+    num_last_layers_in_bf16: 0</pre>
+<p>Keeping the first/last layers in BF16 is useful when numerics at the embedding or LM head are fragile.</p>
+
+<h2>FP8 Training Configuration</h2>
+<pre>quantization:
+  training:
+    fp8: hybrid
+    fp8_recipe: blockwise
+    fp8_weight_cache: true</pre>
+
+<h2>Rollout Correction</h2>
+<pre>quantization:
+  rollout_correction:
+    enabled: true
+    method: tis
+    clip: 1.5</pre>
+
+<h2>Comparing FP8 Against BF16</h2>
+<pre># BF16 baseline
+python examples/run_grpo.py --config configs/grpo_dense_bf16.yaml \
+  num_training_steps=100 logger.log_interval=1
+
+# FP8 stack
+python examples/run_grpo.py --config configs/grpo_dense_fp8.yaml \
+  num_training_steps=100 logger.log_interval=1</pre>
+
+<table class="dtbl"><thead><tr><th>Signal</th><th>BF16</th><th>FP8</th></tr></thead><tbody>
+<tr><td>Tokens / second</td><td>Lower bandwidth use</td><td>Often higher via DeepGEMM/ATOM</td></tr>
+<tr><td><code>loss_pg</code> noise</td><td>Lower</td><td>Slightly higher; watch correction meta</td></tr>
+<tr><td>GPU memory</td><td>Baseline</td><td>Larger savings from KV + activations</td></tr>
+</tbody></table>
+
+<div class="callout"><strong>Warning:</strong> If you disable <code>rollout_correction</code> while keeping FP8 rollouts, monitor KL and off-policy metrics&mdash;uncorrected FP8 behavior policies can bias advantages.</div>
+</div>
+
+<!-- ─── EXAMPLE: MoE R3 ─── -->
+<div class="doc-section" id="doc-ex_moe">
+<h1>MoE R3 Training Example</h1>
+<p>MoE models amplify throughput but introduce train/inference router mismatch. R3 records router logits during rollout and replays them during training.</p>
+
+<h2>Qwen3-MoE Reference Config</h2>
+<pre>policy:
+  model_name: Qwen/Qwen3-30B-A3B
+  training_backend: megatron
+  generation_backend: atom
+  training:
+    megatron_cfg:
+      tensor_parallel_size: 4
+      expert_parallel_size: 2
+      num_experts: 128
+      moe_grouped_gemm: true
+  generation:
+    atom_cfg:
+      tensor_parallel_size: 4
+      kv_cache_dtype: fp8
+
+moe:
+  r3:
+    enabled: true
+    record_router_logits: true
+    replay_mode: distribution</pre>
+
+<h2>R3 Enabled vs Disabled</h2>
+<pre># R3 on (recommended)
+python examples/run_grpo.py --config configs/grpo_moe_fp8_r3.yaml
+
+# R3 off (diagnostic only)
+python examples/run_grpo.py --config configs/grpo_moe_fp8_r3.yaml moe.r3.enabled=false</pre>
+<p>When R3 is off, watch for sudden spikes in policy&ndash;reference KL and erratic reward variance.</p>
+
+<h2>Monitoring Router Stability</h2>
+<pre>from lumenrl.moe.moe_utils import compute_router_entropy, check_expert_utilization
+
+summary = check_expert_utilization(router_logits, num_experts=128)
+entropy = compute_router_entropy(router_logits)
+print(summary["argmax_expert_mass_mean"], float(entropy))</pre>
+<div class="callout info"><strong>Note:</strong> R3 tensors travel inside <code>DataProto</code> under keys <code>router_dist_layer_{idx}</code>. Preserve them across merge/split boundaries when scaling DP workers.</div>
+</div>
+
+<!-- ─── ADV: FP8 ─── -->
+<div class="doc-section" id="doc-adv_fp8">
+<h1>FP8 Quantization</h1>
+<p>LumenRL implements an FP8-RL style stack: low-precision rollouts for throughput, hybrid FP8 training in Lumen, and importance-sampling correction.</p>
+
+<h2>FP8 Rollout (ATOM Path)</h2>
+<h3>W8A8 Linear Layers</h3>
+<p><code>FP8RolloutQuantizer</code> replaces eligible <code>nn.Linear</code> modules with blockwise W8A8. Weights are quantized once per replacement; activations use dynamic scales from 128-wide blocks.</p>
+<table class="dtbl"><thead><tr><th>Field</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>precision</code></td><td><code>"fp8"</code> enables rollout quantizers; <code>"bf16"</code> disables</td></tr>
+<tr><td><code>use_deep_gemm</code></td><td>Prefer fused GEMM when <code>deep_gemm</code> is installed</td></tr>
+<tr><td><code>num_first/last_layers_in_bf16</code></td><td>Keep boundary layers in BF16 for stability</td></tr>
+</tbody></table>
+
+<h3>KV-Cache Quantization</h3>
+<p><code>FP8KVCacheQuantizer</code> maintains per-projection FP8 scales on <code>q_proj</code>, <code>k_proj</code>, <code>v_proj</code>. <code>recalibrate_scales</code> should run whenever policy weights change.</p>
+
+<h3>Weight Quantizer</h3>
+<p><code>WeightQuantizer</code> provides standalone blockwise FP8 packing for <code>state_dict</code> tensors.</p>
+
+<h2>FP8 Training (Lumen Path)</h2>
+<p><code>FP8TrainingManager</code> reads config and calls <code>lumen.quantize.enable</code>:</p>
+<table class="dtbl"><thead><tr><th>YAML Field</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>quantization.training.fp8</code></td><td>When set (e.g. <code>"hybrid"</code>), overrides rollout precision</td></tr>
+<tr><td><code>quantization.training.fp8_recipe</code></td><td><code>"blockwise"</code> (default) or <code>"tensorwise"</code></td></tr>
+<tr><td><code>quantization.training.fp8_weight_cache</code></td><td>Registers optimizer post-step hooks to avoid re-quantization</td></tr>
+</tbody></table>
+
+<h2>Rollout Correction (TIS and MIS)</h2>
+<h3>TIS (Truncated Importance Sampling)</h3>
+<p>Let &rho;<sub>t</sub> = exp(log &pi;<sub>bf16</sub> - log &pi;<sub>fp8</sub>). TIS clamps &rho;<sub>t</sub> to [1/c, c] where c is <code>clip</code> (default 1.5), then multiplies advantages:</p>
+<pre>from lumenrl.quantization.rollout_correction import token_level_tis
+adv_corrected = token_level_tis(bf16_logprobs, fp8_logprobs, advantages, clip=1.5)</pre>
+
+<h3>MIS (Mean Importance Sampling)</h3>
+<p>MIS keeps raw ratios but normalizes to mean 1 across tokens:</p>
+<pre>from lumenrl.quantization.rollout_correction import token_level_mis
+adv_corrected = token_level_mis(bf16_logprobs, fp8_logprobs, advantages)</pre>
+
+<h2>Memory and Throughput Trade-offs</h2>
+<table class="dtbl"><thead><tr><th>Mode</th><th>Activations / KV</th><th>Policy Memory</th><th>Notes</th></tr></thead><tbody>
+<tr><td>BF16 baseline</td><td>BF16</td><td>Highest</td><td>Simplest numerics</td></tr>
+<tr><td>FP8 rollout only</td><td>FP8</td><td>Moderate reduction</td><td>Still trains BF16</td></tr>
+<tr><td>FP8 rollout + training</td><td>FP8</td><td>Largest reduction</td><td>Requires Lumen FP8</td></tr>
+<tr><td>+ fp8_weight_cache</td><td>n/a</td><td>Fewer re-quant spikes</td><td>Helps large MoE</td></tr>
+</tbody></table>
+<div class="callout"><strong>Warning:</strong> Always validate FP8 recipes against a short BF16 reference run (50&ndash;100 steps) before scaling out.</div>
+</div>
+
+<!-- ─── ADV: MoE R3 ─── -->
+<div class="doc-section" id="doc-adv_moe">
+<h1>MoE Rollout Routing Replay (R3)</h1>
+<p>MoE RL couples two different code paths: high-throughput inference routers (ATOM) and training routers (Megatron/Lumen). Small differences yield different expert assignments, which shows up as unstable KL and collapsed expert usage.</p>
+
+<h2>Problem Statement</h2>
+<ul>
+<li>Inference stacks may fuse softmax, top-k, and dispatch differently than training</li>
+<li>FP8 rollouts change logits slightly, altering argmax routes even when BF16 is "close"</li>
+<li>Expert parallel sharding reorders reductions, amplifying bitwise drift</li>
+</ul>
+<p>The result is <strong>router inconsistency</strong>: the policy gradient is computed against a different routing process than what produced the data.</p>
+
+<h2>R3 Solution (Record / Transfer / Replay)</h2>
+<ol>
+<li><strong>Record</strong> &mdash; During ATOM rollout, <code>RouterRecorder</code> installs hooks and stores CPU float copies of router logits keyed by layer index</li>
+<li><strong>Transfer</strong> &mdash; <code>R3Manager.transfer_distributions</code> copies recorded tensors into <code>DataProto</code></li>
+<li><strong>Replay</strong> &mdash; <code>RouterReplayer</code> installs hooks during training to overwrite router outputs with recorded logits</li>
+</ol>
+
+<h2>Configuration</h2>
+<pre>moe:
+  r3:
+    enabled: true
+    record_router_logits: true
+    replay_mode: distribution   # or hard_assignment</pre>
+<table class="dtbl"><thead><tr><th>Field</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>enabled</code></td><td>Master switch for recorder/replayer</td></tr>
+<tr><td><code>record_router_logits</code></td><td>When false, record phase becomes a no-op</td></tr>
+<tr><td><code>replay_mode</code></td><td><code>distribution</code> feeds soft logits; <code>hard_assignment</code> locks discrete decisions</td></tr>
+</tbody></table>
+
+<h2>Monitoring</h2>
+<ul>
+<li><strong>Policy&ndash;reference KL</strong> &mdash; spikes often precede MoE collapse</li>
+<li><strong>Expert utilization</strong> &mdash; compute from <code>router_logits</code> with <code>check_expert_utilization</code></li>
+<li><strong>Router entropy</strong> &mdash; <code>compute_router_entropy</code> tracks routing decisiveness over time</li>
+</ul>
+
+<h2>Best Practices</h2>
+<ul>
+<li>Enable R3 for <strong>all MoE RL runs</strong> unless explicitly isolating a baseline</li>
+<li>Keep <code>record_router_logits=true</code> until you verify hooks are lightweight</li>
+<li>When debugging, log histograms of <code>router_dist_layer_*</code> norms per layer</li>
+<li>Pair R3 with FP8 correction when rollouts are quantized</li>
+</ul>
+</div>
+
+<!-- ─── ADV: DISTRIBUTED ─── -->
+<div class="doc-section" id="doc-adv_dist">
+<h1>Distributed Training</h1>
+<p>LumenRL scales along two axes: training backend parallelism (FSDP2 vs Megatron-Core) and cluster orchestration (Ray, multi-node SLURM).</p>
+
+<h2>FSDP2 Backend</h2>
+<p><code>policy.training_backend: fsdp2</code> selects PyTorch FSDP2. Default for dense models and smaller MoE runs. Native integration with HF module trees, compatible with Lumen FP8 hooks.</p>
+
+<h2>Megatron-Core Backend</h2>
+<p><code>policy.training_backend: megatron</code> enables Megatron for large sharded models. MoE RL recipes typically need Megatron for MORI-backed expert parallel and grouped GEMM.</p>
+
+<h2>Backend Support Matrix</h2>
+<table class="dtbl"><thead><tr><th>Capability</th><th>FSDP2</th><th>Megatron-Core</th></tr></thead><tbody>
+<tr><td>Dense FP8 training</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>MoE training</td><td>Limited</td><td>Yes (EP via MORI)</td></tr>
+<tr><td>FP8 rollout (ATOM)</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>R3 router replay</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>Expert parallel</td><td>No</td><td>Yes</td></tr>
+<tr><td>Sequence parallelism</td><td>Yes</td><td>Yes</td></tr>
+</tbody></table>
+
+<h2>Multi-Node Launch</h2>
+<pre>cluster:
+  num_nodes: 2
+  gpus_per_node: 8
+  ray_address: null    # or "auto"</pre>
+
+<h2>SLURM Integration</h2>
+<pre>NUM_NODES=4
+COMMAND="python examples/run_grpo_moe.py \
+  --config configs/grpo_moe_fp8_r3_multinode.yaml \
+  cluster.num_nodes=$NUM_NODES"
+
+sbatch --nodes=$NUM_NODES --gres=gpu:8 scripts/ray.sub</pre>
+<p>Validate networking (<code>NCCL_SOCKET_IFNAME</code>, RoCE GIDs) independently of LumenRL&mdash;distributed hangs manifest as "stuck rollout" rather than Python tracebacks.</p>
+
+<h2>Ray Cluster Setup</h2>
+<ul>
+<li><strong>Single-node local</strong> &mdash; default <code>ray.init()</code> when <code>cluster.ray_address</code> is unset</li>
+<li><strong>Head + workers</strong> &mdash; set <code>cluster.ray_address</code> to <code>ray://&lt;head-ip&gt;:10001</code></li>
+</ul>
+<p>Ensure object store memory and <code>/dev/shm</code> are adequate for <code>DataProto</code> payloads containing long responses and MoE router tensors.</p>
+</div>
+
+<!-- ─── ADV: ALGORITHMS ─── -->
+<div class="doc-section" id="doc-adv_algo">
+<h1>Algorithms</h1>
+<p>Three policy-gradient trainers&mdash;GRPO, DAPO, and PPO&mdash;sharing the same <code>DataProto</code> batching and loss helpers.</p>
+
+<h2>GRPO</h2>
+<p>Group Relative Policy Optimization: normalizes scalar rewards within each prompt's <code>num_generations</code> group. Uses <code>policy_gradient_loss</code> with symmetric clip.</p>
+<ul>
+<li><strong>Group-relative advantages</strong> &mdash; reshape to [B//G, G], subtract group means, divide by group std</li>
+<li><strong>Clipped surrogate</strong> &mdash; uses <code>clip_ratio</code></li>
+</ul>
+
+<h2>DAPO</h2>
+<p>Decoupled Advantage Policy Optimization adds stabilizers on top of GRPO-style advantages:</p>
+<ul>
+<li><strong>Asymmetric clip</strong> &mdash; ratios clamp to [clip_ratio_low, clip_ratio_high]</li>
+<li><strong>Dynamic sampling</strong> &mdash; groups with near-zero reward variance are masked out</li>
+<li><strong>Overlong shaping</strong> &mdash; optional linear penalty for responses exceeding max length</li>
+</ul>
+
+<h2>PPO</h2>
+<p>Classic Proximal Policy Optimization with critic network and GAE-Lambda:</p>
+<ul>
+<li><strong>GAE-Lambda</strong> &mdash; constructs token-level advantages and returns</li>
+<li><strong>Value loss</strong> &mdash; clips value deltas similar to policy ratio clip</li>
+<li><strong>Entropy bonus</strong> &mdash; optional exploration encouragement</li>
+</ul>
+
+<h2>Loss Functions Reference</h2>
+<table class="dtbl"><thead><tr><th>Function</th><th>Role</th></tr></thead><tbody>
+<tr><td><code>policy_gradient_loss</code></td><td>Symmetric clipped policy surrogate</td></tr>
+<tr><td><code>asymmetric_clip_loss</code></td><td>DAPO-style asymmetric clipping</td></tr>
+<tr><td><code>value_loss</code></td><td>Clipped critic regression</td></tr>
+<tr><td><code>kl_penalty</code></td><td>Reference KL penalty</td></tr>
+<tr><td><code>entropy_bonus</code></td><td>Sampling entropy surrogate</td></tr>
+</tbody></table>
+
+<h2>Choosing an Algorithm</h2>
+<table class="dtbl"><thead><tr><th>Scenario</th><th>Suggested</th></tr></thead><tbody>
+<tr><td>Preference-style scalar rewards, no critic</td><td>GRPO</td></tr>
+<tr><td>Long responses, asymmetric off-policy noise</td><td>DAPO</td></tr>
+<tr><td>Classic actor&ndash;critic with value bootstrapping</td><td>PPO</td></tr>
+</tbody></table>
+<div class="callout"><strong>Warning:</strong> GRPO and DAPO assume contiguous blocks of size <code>num_generations</code>. If your sampler interleaves prompts, normalize ordering before calling <code>compute_advantages</code>.</div>
+</div>
+
+<!-- ─── API: CONFIG ─── -->
+<div class="doc-section" id="doc-api_config">
+<h1>Configuration API</h1>
+<p><code>lumenrl.core.config</code> defines structured dataclasses for YAML-driven training. Top-level object is <code>LumenRLConfig</code>, loaded through OmegaConf.</p>
+
+<h2>LumenRLConfig</h2>
+<table class="dtbl"><thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>cluster</code></td><td><code>ClusterConfig</code></td><td>Node / GPU layout and optional Ray address</td></tr>
+<tr><td><code>policy</code></td><td><code>PolicyConfig</code></td><td>Model id, backends, batching, sequence cap</td></tr>
+<tr><td><code>algorithm</code></td><td><code>AlgorithmConfig</code></td><td>Algorithm name and nested hyperparameters</td></tr>
+<tr><td><code>reward</code></td><td><code>RewardConfig</code></td><td>Reward channel selection</td></tr>
+<tr><td><code>quantization</code></td><td><code>QuantizationConfig</code></td><td>Rollout, training, and correction numerics</td></tr>
+<tr><td><code>moe</code></td><td><code>MoEConfig</code></td><td>MoE R3 knobs</td></tr>
+<tr><td><code>checkpointing</code></td><td><code>CheckpointConfig</code></td><td>Output directory, cadence, rotation</td></tr>
+<tr><td><code>logger</code></td><td><code>LoggerConfig</code></td><td>W&amp;B toggles and log density</td></tr>
+<tr><td><code>num_training_steps</code></td><td><code>int</code></td><td>Total optimizer-bearing steps</td></tr>
+<tr><td><code>seed</code></td><td><code>int</code></td><td>RNG seed surfaced to workers</td></tr>
+</tbody></table>
+
+<h3>Loading Helpers</h3>
+<pre>from lumenrl.core.config import LumenRLConfig, load_config
+
+cfg = LumenRLConfig.from_yaml("configs/grpo_dense_bf16.yaml")
+cfg_over = LumenRLConfig.from_yaml(
+    "configs/grpo_dense_fp8.yaml",
+    overrides=["policy.train_global_batch_size=16"],
+)
+same = load_config("configs/grpo_dense_bf16.yaml", overrides=["seed=123"])</pre>
+
+<h2>ClusterConfig</h2>
+<table class="dtbl"><thead><tr><th>Field</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>num_nodes</code></td><td>1</td><td>Logical node count</td></tr>
+<tr><td><code>gpus_per_node</code></td><td>1</td><td>GPUs per node</td></tr>
+<tr><td><code>ray_address</code></td><td>None</td><td>Optional Ray head address</td></tr>
+</tbody></table>
+
+<h2>AlgorithmConfig</h2>
+<table class="dtbl"><thead><tr><th>Field</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>name</code></td><td><code>"grpo"</code></td><td>Algorithm name (grpo, dapo, ppo)</td></tr>
+<tr><td><code>grpo</code></td><td><code>GRPOConfig</code></td><td>num_generations, kl_coeff, clip_ratio</td></tr>
+<tr><td><code>dapo</code></td><td><code>DAPOConfig</code></td><td>Asymmetric clip + DAPO toggles</td></tr>
+<tr><td><code>ppo</code></td><td><code>PPOConfig</code></td><td>GAE, discount, PPO epoch settings</td></tr>
+</tbody></table>
+
+<h2>QuantizationConfig</h2>
+<table class="dtbl"><thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>rollout</code></td><td><code>RolloutQuantConfig</code></td><td>ATOM rollout dtype + layer boundaries</td></tr>
+<tr><td><code>training</code></td><td><code>TrainingQuantConfig</code></td><td>Lumen FP8 training recipe</td></tr>
+<tr><td><code>rollout_correction</code></td><td><code>RolloutCorrectionConfig</code></td><td>TIS/MIS advantage correction</td></tr>
+</tbody></table>
+
+<h2>MoEConfig / R3Config</h2>
+<table class="dtbl"><thead><tr><th>Field</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>enabled</code></td><td>False</td><td>Master R3 toggle</td></tr>
+<tr><td><code>record_router_logits</code></td><td>True</td><td>Capture logits during rollout</td></tr>
+<tr><td><code>replay_mode</code></td><td><code>"distribution"</code></td><td>distribution or hard_assignment</td></tr>
+</tbody></table>
+
+<h2>CLI Overrides</h2>
+<pre>python examples/run_grpo.py --config configs/grpo_dense_bf16.yaml \
+  cluster.gpus_per_node=8 \
+  algorithm.name=dapo</pre>
+<div class="callout info"><strong>Note:</strong> Dataclasses are the source of truth; misspelled YAML keys raise during merge rather than silently falling back.</div>
+</div>
+
+<!-- ─── API: PROTOCOL ─── -->
+<div class="doc-section" id="doc-api_protocol">
+<h1>DataProto API</h1>
+<p><code>lumenrl.core.protocol.DataProto</code> is the tensor batch exchanged between Ray workers. Tensors live on CPU for serialization; each worker calls <code>.cuda()</code> before math.</p>
+
+<h2>Constructor</h2>
+<pre>from lumenrl.core.protocol import DataProto
+import torch
+
+batch = DataProto(
+    tensors={
+        "input_ids": torch.ones(4, 32, dtype=torch.long),
+        "attention_mask": torch.ones(4, 32, dtype=torch.bool),
+    },
+    meta={"response_lengths": [12, 10, 15, 9]},
+)</pre>
+
+<h2>Item Access</h2>
+<pre>batch["input_ids"] = batch["input_ids"].clamp(min=0)
+assert "attention_mask" in batch
+print(len(batch))  # batch size (dim 0 of first tensor)</pre>
+
+<h2>Split and Merge</h2>
+<pre>chunks = batch.split(2)          # two near-equal parts along dim 0
+merged = DataProto.merge(chunks)</pre>
+
+<h2>Mini-Batches</h2>
+<pre>for mini in batch.mini_batches(batch_size=2):
+    train_on_gpu(mini.cuda())</pre>
+
+<h2>Device Movement</h2>
+<pre>on_gpu = batch.to("cuda:0")
+also_gpu = batch.cuda(device=0)
+back = on_gpu.cpu()</pre>
+
+<h2>Router Distribution Helpers (R3)</h2>
+<pre>batch.add_router_distributions(layer_idx=3, logits=router_logits_cpu)
+all_dists = batch.get_router_distributions()
+assert batch.has_router_distributions()</pre>
+
+<h2>Common Tensor Keys</h2>
+<table class="dtbl"><thead><tr><th>Category</th><th>Keys</th><th>Required By</th></tr></thead><tbody>
+<tr><td>Prompting</td><td><code>input_ids</code>, <code>attention_mask</code></td><td>generation</td></tr>
+<tr><td>Policy</td><td><code>log_probs</code>, <code>old_log_probs</code></td><td>GRPO/DAPO/PPO</td></tr>
+<tr><td>Rewards</td><td><code>rewards</code></td><td>GRPO/DAPO advantage</td></tr>
+<tr><td>Critic</td><td><code>values</code>, <code>returns</code>, <code>old_values</code></td><td>PPO</td></tr>
+<tr><td>Reference</td><td><code>ref_log_probs</code></td><td>KL penalties</td></tr>
+<tr><td>FP8</td><td><code>fp8_logprobs</code>, <code>bf16_logprobs</code></td><td>rollout correction</td></tr>
+<tr><td>MoE R3</td><td><code>router_dist_layer_*</code></td><td>R3 replay</td></tr>
+</tbody></table>
+</div>
+
+<!-- ─── API: ALGORITHMS ─── -->
+<div class="doc-section" id="doc-api_algo">
+<h1>Algorithms API</h1>
+<p><code>lumenrl.algorithms</code> implements policy-gradient algorithms on <code>DataProto</code> batches. All concrete classes inherit from <code>BaseAlgorithm</code>.</p>
+
+<h2>BaseAlgorithm</h2>
+<pre>class BaseAlgorithm:
+    def __init__(self, config: LumenRLConfig) -> None: ...
+    def compute_advantages(self, batch: DataProto) -> DataProto: ...
+    def compute_loss(self, batch: DataProto) -> tuple[Tensor, dict[str, Any]]: ...
+    def get_config(self) -> dict[str, Any]: ...</pre>
+
+<h2>GRPOAlgorithm</h2>
+<p>Requires <code>rewards</code> shaped [B]. Builds advantages by normalizing within groups of <code>num_generations</code>.</p>
+<pre>from lumenrl.algorithms import GRPOAlgorithm
+from lumenrl.core.config import LumenRLConfig
+
+algo = GRPOAlgorithm(LumenRLConfig())
+batch = algo.compute_advantages(batch)
+loss, metrics = algo.compute_loss(batch)</pre>
+
+<h2>DAPOAlgorithm</h2>
+<p>Extends GRPO with optional <code>dapo_sample_mask</code>, overlong reward shaping, and asymmetric objectives.</p>
+
+<h2>PPOAlgorithm</h2>
+<p>Requires <code>values</code> [B, T], writes <code>advantages</code> and <code>returns</code>. Adds 0.5 * value_loss to policy loss.</p>
+
+<h2>ALGORITHM_REGISTRY</h2>
+<pre>from lumenrl.core.registry import ALGORITHM_REGISTRY
+cls = ALGORITHM_REGISTRY.get("grpo")
+algo = cls(config)</pre>
+
+<h2>Loss Functions</h2>
+<h3>policy_gradient_loss</h3>
+<pre>from lumenrl.algorithms.loss_functions import policy_gradient_loss
+loss_pg = policy_gradient_loss(log_probs, old_log_probs, adv, clip_ratio=0.2, mask=mask)</pre>
+
+<h3>asymmetric_clip_loss</h3>
+<p>Same as above but clamps ratios to [clip_low, clip_high] (DAPO).</p>
+
+<h3>value_loss</h3>
+<p>Clipped value regression combining clipped/unclipped MSE terms.</p>
+
+<h3>kl_penalty</h3>
+<p>Token-average <code>ref_logprobs - logprobs</code>, used as approximate KL penalty.</p>
+
+<h3>entropy_bonus</h3>
+<p>Surrogate entropy from sampled log-probs; subtract <code>coeff * entropy_bonus</code> from loss.</p>
+</div>
+
+<!-- ─── API: QUANTIZATION ─── -->
+<div class="doc-section" id="doc-api_quant">
+<h1>Quantization API</h1>
+<p><code>lumenrl.quantization</code> groups FP8 rollout modules, KV-cache helpers, training bridges, and rollout correction.</p>
+
+<h2>FP8Config</h2>
+<pre>from lumenrl.core.config import LumenRLConfig
+from lumenrl.quantization import FP8Config
+
+cfg = LumenRLConfig()
+fp8 = FP8Config.from_config(cfg.quantization)</pre>
+<table class="dtbl"><thead><tr><th>Field</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>precision</code></td><td><code>"bf16"</code></td><td>Active precision string</td></tr>
+<tr><td><code>recipe</code></td><td><code>"blockwise"</code></td><td>Scaling recipe</td></tr>
+<tr><td><code>use_deep_gemm</code></td><td>True</td><td>Prefer DeepGEMM where installed</td></tr>
+</tbody></table>
+
+<h2>WeightQuantizer</h2>
+<pre>from lumenrl.quantization import FP8Config, WeightQuantizer
+wq = WeightQuantizer(FP8Config(precision="fp8"))
+q_w, scales = wq.quantize_tensor(weight.float(), block_size=128)
+restored = wq.dequantize_tensor(q_w, scales, block_size=128)</pre>
+
+<h2>FP8RolloutQuantizer</h2>
+<pre>from lumenrl.quantization import FP8Config, FP8RolloutQuantizer
+quant = FP8RolloutQuantizer(FP8Config.from_config(config.quantization))
+quant.quantize_model(actor_model)
+# ... rollout ...
+quant.restore_model(actor_model)</pre>
+
+<h2>FP8KVCacheQuantizer</h2>
+<pre>from lumenrl.quantization import FP8Config, FP8KVCacheQuantizer
+kvq = FP8KVCacheQuantizer(FP8Config(precision="fp8"))
+kvq.enable(model)
+kvq.recalibrate_scales(model)  # call after each weight swap</pre>
+
+<h2>FP8TrainingManager</h2>
+<pre>from lumenrl.quantization import FP8TrainingManager
+mgr = FP8TrainingManager(config)
+mgr.enable(model)
+mgr.register_optimizer_hooks(optimizer)
+mgr.reset_fp8_state(model)  # after resharding / weight reload</pre>
+
+<h2>Rollout Correction</h2>
+<h3>token_level_tis</h3>
+<p>Truncated importance sampling: build exp(log_bf16 - log_fp8), clamp to [1/clip, clip], multiply advantages.</p>
+
+<h3>token_level_mis</h3>
+<p>Mean-normalized ratios so average weight is 1.</p>
+
+<h3>apply_rollout_correction</h3>
+<pre>from lumenrl.quantization import apply_rollout_correction
+batch = apply_rollout_correction(batch, config)</pre>
+<div class="callout"><strong>Warning:</strong> Correction functions assume token-aligned log-probability tensors. Sequence-level averages must be broadcast before calling.</div>
+</div>
+
+<!-- ─── API: MoE ─── -->
+<div class="doc-section" id="doc-api_moe">
+<h1>MoE API</h1>
+<p><code>lumenrl.moe</code> contains Rollout Routing Replay utilities, expert-parallel helpers, and router diagnostics.</p>
+
+<h2>RouterRecorder</h2>
+<table class="dtbl"><thead><tr><th>Method</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>install_hooks(model)</code></td><td>Registers hooks on MoE modules</td></tr>
+<tr><td><code>remove_hooks()</code></td><td>Detaches all recorder hooks</td></tr>
+<tr><td><code>get_distributions()</code></td><td>Returns dict[int, Tensor] of CPU logits</td></tr>
+<tr><td><code>clear()</code></td><td>Drops recorded tensors without removing hooks</td></tr>
+<tr><td><code>recording(model)</code></td><td>Context manager for install/remove</td></tr>
+</tbody></table>
+<pre>from lumenrl.moe.router_recorder import RouterRecorder
+rec = RouterRecorder()
+with rec.recording(model):
+    _ = model(tokens)
+router_tensors = rec.get_distributions()</pre>
+
+<h2>RouterReplayer</h2>
+<pre>from lumenrl.moe.router_replayer import RouterReplayer
+rep = RouterReplayer()
+rep.install_hooks(train_model, router_tensors)
+try:
+    loss = train_model(batch)
+finally:
+    rep.remove_hooks()</pre>
+
+<h2>R3Manager</h2>
+<pre>from lumenrl.core.config import R3Config
+from lumenrl.moe.r3_manager import R3Manager
+
+mgr = R3Manager(R3Config(enabled=True))
+with mgr.record_phase(atom_model):
+    sequences = atom_model.generate(...)
+recorded = mgr.recorder.get_distributions()
+batch = R3Manager.transfer_distributions(batch, recorded)
+with mgr.replay_phase(lumen_model, batch.get_router_distributions()):
+    loss, metrics = algo.compute_loss(batch)</pre>
+
+<h2>ExpertParallelManager</h2>
+<pre>from lumenrl.moe.expert_parallel import ExpertParallelManager
+epm = ExpertParallelManager(config.policy.training.megatron_cfg)
+epm.setup_ep(model, ep_size=2)
+new_sd = epm.reshard_for_inference(state_dict, train_ep_size=4, infer_ep_size=2)</pre>
+
+<h2>moe_utils</h2>
+<table class="dtbl"><thead><tr><th>Symbol</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>iter_moe_modules(model)</code></td><td>Yields (layer_index, name, module) candidates</td></tr>
+<tr><td><code>compute_load_balance_loss</code></td><td>Switch-style auxiliary loss for balanced experts</td></tr>
+<tr><td><code>compute_router_entropy</code></td><td>Mean Shannon entropy of router distributions</td></tr>
+<tr><td><code>check_expert_utilization</code></td><td>Per-expert mean/std softmax mass summary</td></tr>
+</tbody></table>
+<div class="callout info"><strong>Note:</strong> <code>RouterRecorder</code> / <code>RouterReplayer</code> rely on heuristics in <code>iter_moe_modules</code>; exotic MoE block names may need additional patterns.</div>
+</div>
+
+</main>
+</div><!-- /docs-layout -->
+</div><!-- /page-docs -->
 
 <footer>
   <div class="wrap">
@@ -448,6 +1418,32 @@ bash examples/DAPO/run_1d_fp8_e2e_blockwise.sh</pre>
     </div>
   </div>
 </footer>
+
+<script>
+function showHome() {
+  document.getElementById('page-home').classList.add('active');
+  document.getElementById('page-docs').classList.remove('active');
+  document.querySelector('.nav-home').classList.add('active');
+  document.querySelector('.nav-docs').classList.remove('active');
+}
+function showDocs() {
+  document.getElementById('page-home').classList.remove('active');
+  document.getElementById('page-docs').classList.add('active');
+  document.querySelector('.nav-home').classList.remove('active');
+  document.querySelector('.nav-docs').classList.add('active');
+}
+function navigateDoc(id) {
+  document.querySelectorAll('.doc-section').forEach(function(s) { s.classList.remove('active'); });
+  document.querySelectorAll('.sidebar-link').forEach(function(l) { l.classList.remove('active'); });
+  var section = document.getElementById('doc-' + id);
+  if (section) section.classList.add('active');
+  var link = document.querySelector('.sidebar-link[data-doc="' + id + '"]');
+  if (link) link.classList.add('active');
+  var main = document.querySelector('.docs-main');
+  if (main) main.scrollTop = 0;
+  showDocs();
+}
+</script>
 
 </body>
 </html>
