@@ -1,0 +1,22 @@
+FROM rocm/pytorch:latest
+
+WORKDIR /workspace
+
+RUN pip install --no-cache-dir \
+    ray[default]>=2.9 \
+    omegaconf>=2.3 \
+    transformers>=4.40 \
+    datasets>=2.18 \
+    accelerate>=0.28 \
+    pytest>=8.0 \
+    pytest-xdist>=3.5 \
+    ruff>=0.3 \
+    mypy>=1.8
+
+COPY . /workspace/Lumen-RL/
+
+RUN cd /workspace/Lumen-RL && pip install -e ".[dev]"
+
+WORKDIR /workspace/Lumen-RL
+
+ENTRYPOINT ["/bin/bash"]

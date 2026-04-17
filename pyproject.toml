@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68.0", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lumenrl"
+dynamic = ["version"]
+description = "High-performance RL post-training framework for LLMs on AMD GPUs"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+dependencies = [
+    "ray[default]>=2.9",
+    "omegaconf>=2.3",
+    "torch>=2.4",
+    "transformers>=4.40",
+    "datasets>=2.18",
+    "accelerate>=0.28",
+]
+
+[project.optional-dependencies]
+all = [
+    "lumenrl[train,infer,test]",
+]
+train = [
+    "lumen",
+]
+infer = [
+    "atom",
+]
+test = [
+    "pytest>=8.0",
+    "pytest-xdist>=3.5",
+]
+dev = [
+    "lumenrl[all]",
+    "ruff>=0.3",
+    "mypy>=1.8",
+]
+
+[tool.setuptools_scm]
+write_to = "lumenrl/_version.py"
+fallback_version = "0.1.0"
+
+[tool.setuptools.packages.find]
+include = ["lumenrl*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: requires 1 GPU",
+    "multigpu: requires 2+ GPUs",
+    "moe: requires MoE model",
+    "fp8: requires FP8-capable GPU",
+    "slow: takes > 60 seconds",
+]

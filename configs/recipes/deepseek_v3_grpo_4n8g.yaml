@@ -1,0 +1,71 @@
+# Production recipe: DeepSeek V3 GRPO on 4 nodes x 8 GPUs
+# FP8 E2E + R3 router alignment + MORI-EP
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 4
+
+policy:
+  model_name: deepseek-ai/DeepSeek-V3
+  training_backend: megatron
+  generation_backend: atom
+  max_total_sequence_length: 16384
+  train_global_batch_size: 256
+  train_micro_batch_size: 1
+
+  training:
+    megatron_cfg:
+      tensor_parallel_size: 8
+      expert_parallel_size: 4
+      pipeline_parallel_size: 1
+      num_experts: 256
+      moe_grouped_gemm: true
+
+  generation:
+    atom_cfg:
+      tensor_parallel_size: 8
+      kv_cache_dtype: fp8
+
+algorithm:
+  name: grpo
+  grpo:
+    num_generations: 8
+    kl_coeff: 0.0
+    clip_ratio: 0.2
+
+quantization:
+  rollout:
+    precision: fp8
+    use_deep_gemm: true
+  training:
+    fp8: hybrid
+    fp8_recipe: blockwise
+    fp8_weight_cache: true
+  rollout_correction:
+    enabled: true
+    method: tis
+    clip: 1.5
+
+moe:
+  r3:
+    enabled: true
+    record_router_logits: true
+    replay_mode: distribution
+
+reward:
+  type: function
+  function: math_reward
+  dataset: nvidia/OpenMathInstruct-2
+
+checkpointing:
+  checkpoint_dir: results/deepseek_v3_grpo
+  save_steps: 50
+
+logger:
+  wandb_enabled: true
+  wandb:
+    project: lumenrl
+    name: deepseek-v3-grpo-fp8-r3
+
+num_training_steps: 1000
+seed: 42

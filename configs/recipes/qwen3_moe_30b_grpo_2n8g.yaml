@@ -1,0 +1,70 @@
+# Production recipe: Qwen3-MoE 30B-A3B GRPO on 2 nodes x 8 GPUs
+# FP8 E2E + R3 router alignment
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2
+
+policy:
+  model_name: Qwen/Qwen3-30B-A3B
+  training_backend: megatron
+  generation_backend: atom
+  max_total_sequence_length: 8192
+  train_global_batch_size: 128
+  train_micro_batch_size: 2
+
+  training:
+    megatron_cfg:
+      tensor_parallel_size: 8
+      expert_parallel_size: 2
+      num_experts: 128
+      moe_grouped_gemm: true
+
+  generation:
+    atom_cfg:
+      tensor_parallel_size: 8
+      kv_cache_dtype: fp8
+
+algorithm:
+  name: grpo
+  grpo:
+    num_generations: 16
+    kl_coeff: 0.0
+    clip_ratio: 0.2
+
+quantization:
+  rollout:
+    precision: fp8
+    use_deep_gemm: true
+  training:
+    fp8: hybrid
+    fp8_recipe: blockwise
+    fp8_weight_cache: true
+  rollout_correction:
+    enabled: true
+    method: tis
+    clip: 1.5
+
+moe:
+  r3:
+    enabled: true
+    record_router_logits: true
+    replay_mode: distribution
+
+reward:
+  type: function
+  function: math_reward
+  dataset: nvidia/OpenMathInstruct-2
+
+checkpointing:
+  checkpoint_dir: results/qwen3_moe_30b_grpo
+  save_steps: 100
+
+logger:
+  wandb_enabled: true
+  wandb:
+    project: lumenrl
+    name: qwen3-moe-30b-grpo-fp8-r3
+
+num_training_steps: 2000
+seed: 42

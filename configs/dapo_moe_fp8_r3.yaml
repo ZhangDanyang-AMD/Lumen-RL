@@ -1,0 +1,71 @@
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
+
+policy:
+  model_name: Qwen/Qwen3-30B-A3B
+  training_backend: megatron
+  generation_backend: atom
+  max_total_sequence_length: 4096
+  train_global_batch_size: 64
+  train_micro_batch_size: 4
+
+  training:
+    megatron_cfg:
+      tensor_parallel_size: 4
+      expert_parallel_size: 2
+      num_experts: 128
+      moe_grouped_gemm: true
+
+  generation:
+    atom_cfg:
+      tensor_parallel_size: 4
+      kv_cache_dtype: fp8
+
+algorithm:
+  name: dapo
+  dapo:
+    num_generations: 8
+    kl_coeff: 0.0
+    clip_ratio_low: 0.8
+    clip_ratio_high: 1.2
+    dynamic_sampling: true
+    token_level_pg: true
+    overlong_reward_shaping: true
+
+quantization:
+  rollout:
+    precision: fp8
+    use_deep_gemm: true
+  training:
+    fp8: hybrid
+    fp8_recipe: blockwise
+    fp8_weight_cache: true
+  rollout_correction:
+    enabled: true
+    method: tis
+    clip: 1.5
+
+moe:
+  r3:
+    enabled: true
+    record_router_logits: true
+    replay_mode: distribution
+
+reward:
+  type: function
+  function: math_reward
+  dataset: nvidia/OpenMathInstruct-2
+
+checkpointing:
+  checkpoint_dir: results/dapo_moe_fp8_r3
+  save_steps: 50
+
+logger:
+  wandb_enabled: true
+  wandb:
+    project: lumenrl
+    name: dapo-moe-fp8-r3
+
+num_training_steps: 500
+seed: 42
