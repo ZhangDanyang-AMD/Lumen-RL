@@ -9,8 +9,13 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from lumenrl.algorithms.loss_functions import (
+    asymmetric_clip_loss,
+    kl_penalty,
+    policy_gradient_loss,
+)
 from lumenrl.core.protocol import DataProto
-from lumenrl.core.types import TrainingBackend
+from lumenrl.core.types import AlgorithmName, TrainingBackend
 from lumenrl.engine.training.fsdp_backend import FSDP2Backend
 from lumenrl.engine.training.megatron_backend import MegatronBackend
 from lumenrl.workers.base_worker import BaseWorker, get_nested_config
@@ -80,7 +85,12 @@ class LumenActorWorker(BaseWorker):
         return out
 
     def train_step(self, batch: DataProto) -> dict[str, float]:
-        """Single PPO / GRPO style gradient step; returns scalar diagnostics."""
+        """Compute the RL surrogate loss, backward, and step the optimizer.
+
+        The worker recomputes the forward pass locally so gradients flow
+        through the model parameters.  The algorithm name and hyperparameters
+        are passed via ``batch.meta``.
+        """
         if self._model is None or self._optimizer is None:
             raise RuntimeError("init_model() must be called before train_step().")
         if "input_ids" not in batch.tensors:
@@ -91,21 +101,58 @@ class LumenActorWorker(BaseWorker):
         logits = self._model(input_ids)
         shift_logits = logits[:, :-1].contiguous()
         shift_labels = input_ids[:, 1:].contiguous()
-        loss = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
-        )
 
+        log_probs = torch.log_softmax(shift_logits, dim=-1)
+        token_log_probs = log_probs.gather(
+            -1, shift_labels.unsqueeze(-1)
+        ).squeeze(-1)
+
+        old_logp = batch.tensors.get("old_log_probs")
         adv = batch.tensors.get("advantages")
-        if adv is not None:
+        algo_name = str(batch.meta.get("algorithm", "grpo")).lower()
+
+        if old_logp is not None and adv is not None:
+            old_logp = old_logp.to(self._device)
             adv = adv.to(self._device)
-            if adv.shape == shift_labels.shape:
-                per_token = F.cross_entropy(
-                    shift_logits.view(-1, shift_logits.size(-1)),
-                    shift_labels.view(-1),
-                    reduction="none",
-                ).view_as(shift_labels)
-                loss = (per_token * adv[:, 1:]).mean()
+
+            if adv.dim() == 1:
+                adv = adv.unsqueeze(-1).expand_as(token_log_probs)
+            elif adv.shape[-1] != token_log_probs.shape[-1]:
+                adv = adv[..., : token_log_probs.shape[-1]]
+
+            if old_logp.shape[-1] != token_log_probs.shape[-1]:
+                old_logp = old_logp[..., : token_log_probs.shape[-1]]
+
+            mask = batch.tensors.get("attention_mask")
+            if mask is not None:
+                mask = mask.to(self._device)[..., : token_log_probs.shape[-1]].float()
+
+            algo_cfg = batch.meta.get("algo_config", {})
+            if algo_name == AlgorithmName.DAPO.value:
+                clip_low = float(algo_cfg.get("clip_ratio_low", 0.8))
+                clip_high = float(algo_cfg.get("clip_ratio_high", 1.28))
+                loss = asymmetric_clip_loss(
+                    token_log_probs, old_logp, adv, clip_low, clip_high, mask=mask,
+                )
+            else:
+                clip = float(algo_cfg.get("clip_ratio", 0.2))
+                loss = policy_gradient_loss(
+                    token_log_probs, old_logp, adv, clip, mask=mask,
+                )
+
+            kl_c = float(algo_cfg.get("kl_coeff", 0.0))
+            ref_logp = batch.tensors.get("ref_log_probs")
+            if kl_c > 0.0 and ref_logp is not None:
+                ref_logp = ref_logp.to(self._device)
+                if ref_logp.shape[-1] != token_log_probs.shape[-1]:
+                    ref_logp = ref_logp[..., : token_log_probs.shape[-1]]
+                kl = kl_penalty(token_log_probs, ref_logp, mask=mask)
+                loss = loss + kl_c * kl
+        else:
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+            )
 
         self._optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -113,7 +160,7 @@ class LumenActorWorker(BaseWorker):
         self._optimizer.step()
 
         metrics: dict[str, float] = {"loss": float(loss.detach().cpu())}
-        self._log.debug("train_step loss=%f", metrics["loss"])
+        self._log.debug("train_step loss=%f (algo=%s)", metrics["loss"], algo_name)
         return metrics
 
     def get_state_dict(self) -> dict[str, torch.Tensor]:

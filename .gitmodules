@@ -1,0 +1,8 @@
+[submodule "third_party/Lumen"]
+	path = third_party/Lumen
+	url = https://github.com/ZhangDanyang-AMD/Lumen.git
+	branch = dev/RL
+[submodule "third_party/verl"]
+	path = third_party/verl
+	url = https://github.com/verl-project/verl.git
+	branch = main

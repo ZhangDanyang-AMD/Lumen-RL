@@ -34,6 +34,19 @@ def test_mis_normalization() -> None:
     assert out.sum().item() == pytest.approx(float(bsz * tok))
 
 
+def test_mis_self_normalizing() -> None:
+    """MIS ratio weights should average to ~1 after mean normalization."""
+    bsz, tok = 4, 10
+    bf16 = torch.randn(bsz, tok)
+    fp8 = bf16 + 0.5 * torch.randn(bsz, tok)
+    adv = torch.ones(bsz, tok)
+    out = token_level_mis(bf16, fp8, adv)
+    ratio = torch.exp(torch.clamp(bf16 - fp8, min=-20.0, max=20.0))
+    normalized = ratio / ratio.mean().clamp(min=1e-8)
+    assert torch.allclose(out, normalized * adv)
+    assert normalized.mean().item() == pytest.approx(1.0, abs=1e-5)
+
+
 def test_tis_with_known_values() -> None:
     bf16 = torch.tensor([[math.log(10.0)]])
     fp8 = torch.zeros(1, 1)
@@ -54,9 +67,11 @@ def test_mis_with_known_values() -> None:
     adv = torch.tensor([[3.0, 5.0]])
     out = token_level_mis(bf16, fp8, adv)
     r = torch.exp(torch.clamp(bf16 - fp8, min=-20.0, max=20.0))
-    assert torch.allclose(out, r * adv)
-    assert float(out[0, 0].item()) == pytest.approx(3.0)
-    assert float(out[0, 1].item()) == pytest.approx(10.0)
+    normalized = r / r.mean().clamp(min=1e-8)
+    assert torch.allclose(out, normalized * adv)
+    mean_ratio = (1.0 + 2.0) / 2.0  # raw ratios: 1.0, 2.0
+    assert float(out[0, 0].item()) == pytest.approx(3.0 * (1.0 / mean_ratio))
+    assert float(out[0, 1].item()) == pytest.approx(5.0 * (2.0 / mean_ratio))
 
 
 def test_apply_rollout_correction_on_dataproto() -> None:

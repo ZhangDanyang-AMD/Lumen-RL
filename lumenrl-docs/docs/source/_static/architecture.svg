@@ -1,0 +1,148 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 700" width="960" height="700">
+
+  <rect width="960" height="700" rx="16" fill="#fafbfc" stroke="#e1e4e8" stroke-width="1"/>
+
+  <text x="480" y="30" text-anchor="middle" fill="#333" font-size="18" font-weight="700" font-family="sans-serif" letter-spacing="0.5">LumenRL Architecture</text>
+
+  <!-- Layer 0: RL Algorithms -->
+  <rect x="30" y="48" width="900" height="52" rx="10" fill="#f3e8f5" stroke="#9c27b0" stroke-width="1.5"/>
+  <text x="480" y="68" text-anchor="middle" fill="#7b1fa2" font-size="10" font-weight="600" font-family="sans-serif" letter-spacing="1">RL ALGORITHMS</text>
+  <text x="240" y="87" text-anchor="middle" fill="#333" font-size="14" font-weight="600" font-family="sans-serif">GRPO</text>
+  <text x="480" y="87" text-anchor="middle" fill="#333" font-size="14" font-weight="600" font-family="sans-serif">DAPO</text>
+  <text x="720" y="87" text-anchor="middle" fill="#333" font-size="14" font-weight="600" font-family="sans-serif">PPO</text>
+
+  <line x1="480" y1="100" x2="480" y2="118" stroke="#999" stroke-width="1.5"/>
+  <polygon points="480,122 475,114 485,114" fill="#999"/>
+
+  <!-- Layer 1: Ray Controller -->
+  <rect x="30" y="122" width="900" height="72" rx="10" fill="#e3f2fd" stroke="#1976d2" stroke-width="1.5"/>
+  <text x="480" y="142" text-anchor="middle" fill="#1565c0" font-size="10" font-weight="600" font-family="sans-serif" letter-spacing="1">RAY CONTROLLER</text>
+
+  <rect x="55"  y="150" width="148" height="34" rx="6" fill="#bbdefb" stroke="#1976d2" stroke-width="1"/>
+  <text x="129" y="172" text-anchor="middle" fill="#1565c0" font-size="11" font-weight="600" font-family="sans-serif">RLTrainer</text>
+
+  <rect x="218" y="150" width="148" height="34" rx="6" fill="#bbdefb" stroke="#1976d2" stroke-width="1"/>
+  <text x="292" y="172" text-anchor="middle" fill="#1565c0" font-size="11" font-weight="600" font-family="sans-serif">DataManager</text>
+
+  <rect x="381" y="150" width="148" height="34" rx="6" fill="#bbdefb" stroke="#1976d2" stroke-width="1"/>
+  <text x="455" y="172" text-anchor="middle" fill="#1565c0" font-size="11" font-weight="600" font-family="sans-serif">WorkerGroups</text>
+
+  <rect x="544" y="150" width="148" height="34" rx="6" fill="#bbdefb" stroke="#1976d2" stroke-width="1"/>
+  <text x="618" y="172" text-anchor="middle" fill="#1565c0" font-size="11" font-weight="600" font-family="sans-serif">Callbacks</text>
+
+  <rect x="707" y="150" width="198" height="34" rx="6" fill="#bbdefb" stroke="#1976d2" stroke-width="1"/>
+  <text x="806" y="172" text-anchor="middle" fill="#1565c0" font-size="11" font-weight="600" font-family="sans-serif">Checkpoint / Logging</text>
+
+  <!-- Dispatch / Collect -->
+  <text x="240" y="208" text-anchor="middle" fill="#999" font-size="9" font-weight="600" font-family="sans-serif">dispatch DataProto</text>
+  <line x1="240" y1="212" x2="240" y2="230" stroke="#999" stroke-width="1.5"/>
+  <polygon points="240,234 235,226 245,226" fill="#999"/>
+
+  <text x="720" y="208" text-anchor="middle" fill="#999" font-size="9" font-weight="600" font-family="sans-serif">collect DataProto</text>
+  <line x1="720" y1="212" x2="720" y2="230" stroke="#999" stroke-width="1.5"/>
+  <polygon points="720,234 715,226 725,226" fill="#999"/>
+
+  <!-- Layer 2 Left: ATOM Inference -->
+  <rect x="30" y="234" width="440" height="168" rx="10" fill="#e8f5e9" stroke="#388e3c" stroke-width="1.5"/>
+  <text x="250" y="256" text-anchor="middle" fill="#2e7d32" font-size="10" font-weight="700" font-family="sans-serif" letter-spacing="1">ATOM  |  INFERENCE ENGINE</text>
+
+  <rect x="48" y="266" width="125" height="48" rx="6" fill="#c8e6c9" stroke="#388e3c" stroke-width="1"/>
+  <text x="111" y="286" text-anchor="middle" fill="#2e7d32" font-size="10" font-weight="600" font-family="sans-serif">FP8 W8A8</text>
+  <text x="111" y="300" text-anchor="middle" fill="#555" font-size="8.5" font-family="sans-serif">Blockwise Quant</text>
+
+  <rect x="183" y="266" width="125" height="48" rx="6" fill="#c8e6c9" stroke="#388e3c" stroke-width="1"/>
+  <text x="246" y="286" text-anchor="middle" fill="#2e7d32" font-size="10" font-weight="600" font-family="sans-serif">FP8 KV-Cache</text>
+  <text x="246" y="300" text-anchor="middle" fill="#555" font-size="8.5" font-family="sans-serif">QKV Recalibration</text>
+
+  <rect x="318" y="266" width="135" height="48" rx="6" fill="#c8e6c9" stroke="#388e3c" stroke-width="1"/>
+  <text x="386" y="286" text-anchor="middle" fill="#2e7d32" font-size="10" font-weight="600" font-family="sans-serif">MoE EP</text>
+  <text x="386" y="300" text-anchor="middle" fill="#555" font-size="8.5" font-family="sans-serif">MORI Dispatch</text>
+
+  <rect x="48" y="324" width="200" height="40" rx="6" fill="#fff8e1" stroke="#f9a825" stroke-width="1"/>
+  <text x="148" y="342" text-anchor="middle" fill="#e65100" font-size="9.5" font-weight="600" font-family="sans-serif">Router Recorder (R3)</text>
+  <text x="148" y="356" text-anchor="middle" fill="#777" font-size="8" font-family="sans-serif">Capture MoE routing logits</text>
+
+  <rect x="258" y="324" width="200" height="40" rx="6" fill="#e8eaf6" stroke="#3f51b5" stroke-width="1"/>
+  <text x="358" y="342" text-anchor="middle" fill="#283593" font-size="9.5" font-weight="600" font-family="sans-serif">Generation Interface</text>
+  <text x="358" y="356" text-anchor="middle" fill="#777" font-size="8" font-family="sans-serif">Batch rollout + sampling</text>
+
+  <!-- Layer 2 Right: Lumen Training -->
+  <rect x="490" y="234" width="440" height="168" rx="10" fill="#fde8e8" stroke="#d32f2f" stroke-width="1.5"/>
+  <text x="710" y="256" text-anchor="middle" fill="#c62828" font-size="10" font-weight="700" font-family="sans-serif" letter-spacing="1">LUMEN  |  TRAINING ENGINE</text>
+
+  <rect x="508" y="266" width="125" height="48" rx="6" fill="#ffcdd2" stroke="#d32f2f" stroke-width="1"/>
+  <text x="571" y="286" text-anchor="middle" fill="#c62828" font-size="10" font-weight="600" font-family="sans-serif">FSDP2</text>
+  <text x="571" y="300" text-anchor="middle" fill="#555" font-size="8.5" font-family="sans-serif">Full Shard + FP8</text>
+
+  <rect x="643" y="266" width="135" height="48" rx="6" fill="#ffcdd2" stroke="#d32f2f" stroke-width="1"/>
+  <text x="711" y="286" text-anchor="middle" fill="#c62828" font-size="10" font-weight="600" font-family="sans-serif">Megatron-Core</text>
+  <text x="711" y="300" text-anchor="middle" fill="#555" font-size="8.5" font-family="sans-serif">TP / PP / EP / DP</text>
+
+  <rect x="788" y="266" width="125" height="48" rx="6" fill="#ffcdd2" stroke="#d32f2f" stroke-width="1"/>
+  <text x="851" y="286" text-anchor="middle" fill="#c62828" font-size="10" font-weight="600" font-family="sans-serif">FP8 Training</text>
+  <text x="851" y="300" text-anchor="middle" fill="#555" font-size="8.5" font-family="sans-serif">Hybrid E4M3 / E5M2</text>
+
+  <rect x="508" y="324" width="200" height="40" rx="6" fill="#fff8e1" stroke="#f9a825" stroke-width="1"/>
+  <text x="608" y="342" text-anchor="middle" fill="#e65100" font-size="9.5" font-weight="600" font-family="sans-serif">Router Replayer (R3)</text>
+  <text x="608" y="356" text-anchor="middle" fill="#777" font-size="8" font-family="sans-serif">Inject routing distributions</text>
+
+  <rect x="718" y="324" width="200" height="40" rx="6" fill="#e8eaf6" stroke="#3f51b5" stroke-width="1"/>
+  <text x="818" y="342" text-anchor="middle" fill="#283593" font-size="9.5" font-weight="600" font-family="sans-serif">MoE Grouped GEMM</text>
+  <text x="818" y="356" text-anchor="middle" fill="#777" font-size="8" font-family="sans-serif">AITER Fused Experts</text>
+
+  <!-- R3 arrow: Recorder -> down -> across -> up -> Replayer -->
+  <line x1="148" y1="364" x2="148" y2="394" stroke="#e65100" stroke-width="2" stroke-dasharray="6,3"/>
+  <line x1="148" y1="394" x2="608" y2="394" stroke="#e65100" stroke-width="2" stroke-dasharray="6,3"/>
+  <line x1="608" y1="394" x2="608" y2="370" stroke="#e65100" stroke-width="2" stroke-dasharray="6,3"/>
+  <polygon points="608,364 603,372 613,372" fill="#e65100"/>
+
+
+
+  <!-- Arrow down -->
+  <line x1="480" y1="402" x2="480" y2="418" stroke="#999" stroke-width="1.5"/>
+  <polygon points="480,422 475,414 485,414" fill="#999"/>
+
+  <!-- Layer 3: FP8-RL Quantization -->
+  <rect x="30" y="422" width="900" height="64" rx="10" fill="#fff3e0" stroke="#e65100" stroke-width="1.5"/>
+  <text x="480" y="442" text-anchor="middle" fill="#e65100" font-size="10" font-weight="700" font-family="sans-serif" letter-spacing="1">FP8-RL QUANTIZATION STACK</text>
+
+  <rect x="48" y="451" width="192" height="26" rx="6" fill="#ffe0b2" stroke="#e65100" stroke-width="1"/>
+  <text x="144" y="469" text-anchor="middle" fill="#bf360c" font-size="9.5" font-weight="600" font-family="sans-serif">FP8 Rollout (W8A8)</text>
+
+  <rect x="252" y="451" width="192" height="26" rx="6" fill="#ffe0b2" stroke="#e65100" stroke-width="1"/>
+  <text x="348" y="469" text-anchor="middle" fill="#bf360c" font-size="9.5" font-weight="600" font-family="sans-serif">FP8 Weight Quantizer</text>
+
+  <rect x="456" y="451" width="192" height="26" rx="6" fill="#ffe0b2" stroke="#e65100" stroke-width="1"/>
+  <text x="552" y="469" text-anchor="middle" fill="#bf360c" font-size="9.5" font-weight="600" font-family="sans-serif">FP8 KV-Cache Quant</text>
+
+  <rect x="660" y="451" width="252" height="26" rx="6" fill="#ffe0b2" stroke="#e65100" stroke-width="1"/>
+  <text x="786" y="469" text-anchor="middle" fill="#bf360c" font-size="9.5" font-weight="600" font-family="sans-serif">Rollout Correction (TIS / MIS)</text>
+
+  <!-- Arrow down -->
+  <line x1="480" y1="486" x2="480" y2="504" stroke="#999" stroke-width="1.5"/>
+  <polygon points="480,508 475,500 485,500" fill="#999"/>
+
+  <!-- Layer 4: AITER + MORI -->
+  <rect x="30" y="508" width="440" height="68" rx="10" fill="#e8f5e9" stroke="#388e3c" stroke-width="1.5"/>
+  <text x="250" y="530" text-anchor="middle" fill="#2e7d32" font-size="10" font-weight="700" font-family="sans-serif" letter-spacing="0.5">AITER  |  KERNEL PROVIDER</text>
+  <text x="250" y="548" text-anchor="middle" fill="#555" font-size="11" font-family="sans-serif">ASM &gt; CK &gt; Triton fallback chain</text>
+  <text x="250" y="564" text-anchor="middle" fill="#555" font-size="11" font-family="sans-serif">Attention / GEMM / MoE / Norm / RoPE</text>
+
+  <rect x="490" y="508" width="440" height="68" rx="10" fill="#e0f2f1" stroke="#00796b" stroke-width="1.5"/>
+  <text x="710" y="530" text-anchor="middle" fill="#00695c" font-size="10" font-weight="700" font-family="sans-serif" letter-spacing="0.5">MORI  |  COMMUNICATION PROVIDER</text>
+  <text x="710" y="548" text-anchor="middle" fill="#555" font-size="11" font-family="sans-serif">MORI-CCL (AG, RS, AR) + MORI-EP (MoE)</text>
+  <text x="710" y="564" text-anchor="middle" fill="#555" font-size="11" font-family="sans-serif">Device-side RDMA / FP8 / AINIC / CX-7</text>
+
+  <!-- Arrow down -->
+  <line x1="480" y1="576" x2="480" y2="596" stroke="#999" stroke-width="1.5"/>
+  <polygon points="480,600 475,592 485,592" fill="#999"/>
+
+  <!-- Layer 5: Hardware -->
+  <rect x="30" y="600" width="900" height="52" rx="10" fill="#fde8e8" stroke="#d32f2f" stroke-width="1.5"/>
+  <text x="480" y="620" text-anchor="middle" fill="#c62828" font-size="10" font-weight="600" font-family="sans-serif" letter-spacing="1">HARDWARE</text>
+  <text x="480" y="640" text-anchor="middle" fill="#333" font-size="15" font-weight="700" font-family="sans-serif">AMD Instinct MI300X / MI355X  --  ROCm</text>
+
+  <!-- Footer -->
+  <text x="480" y="674" text-anchor="middle" fill="#999" font-size="9.5" font-style="italic" font-family="sans-serif">All cross-worker communication via DataProto  |  Ray-orchestrated  |  AMD-native</text>
+
+</svg>

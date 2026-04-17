@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import math
 from typing import Any, Type
 
 import torch
@@ -14,6 +13,7 @@ from lumenrl.controller.ray_worker_group import RayWorkerGroup
 from lumenrl.core.config import LumenRLConfig
 from lumenrl.core.protocol import DataProto
 from lumenrl.core.registry import ALGORITHM_REGISTRY
+from lumenrl.quantization.rollout_correction import apply_rollout_correction
 from lumenrl.trainer.callbacks import Callback, LoggingCallback
 from lumenrl.utils.metrics import MetricsTracker, compute_kl_divergence
 
@@ -113,7 +113,14 @@ class StubRewardWorker:
 
 
 class StubActorWorker:
-    """Training-side worker: policy forward (stub), R3 replay hooks, weight sync."""
+    """Training-side worker: policy forward (stub), R3 replay hooks, weight sync.
+
+    The ``train_step`` accepts a pre-computed scalar loss tensor stored in
+    ``batch.meta["loss"]`` and simulates the backward/update cycle. In a real
+    deployment, the worker recomputes the RL loss inside its own process using
+    the algorithm's ``compute_loss`` and calls ``.backward()`` on the
+    resulting graph.
+    """
 
     def __init__(self, rank: int, world_size: int, **_: Any) -> None:
         self.rank = rank
@@ -142,7 +149,23 @@ class StubActorWorker:
         return batch
 
     def train_step(self, batch: DataProto) -> DataProto:
-        """Apply a backward/update pass on the worker (stub; real runs use engine optimizers)."""
+        """Simulate backward/update using algorithm-computed loss from controller.
+
+        In real runs, each actor worker recomputes forward + loss + backward
+        using the local model and optimizer.  The stub records the loss value
+        so the trainer can verify the pipeline is end-to-end connected.
+        """
+        loss_val = batch.meta.get("loss")
+        if loss_val is not None:
+            logger.debug(
+                "StubActorWorker.train_step rank=%d loss=%.6f (simulated backward)",
+                self.rank, float(loss_val),
+            )
+        else:
+            logger.debug(
+                "StubActorWorker.train_step rank=%d (no loss in meta; skipping backward)",
+                self.rank,
+            )
         return batch
 
     def sync_weights_to_rollout(self) -> None:
@@ -245,29 +268,9 @@ class RLTrainer:
                 batch.tensors["old_log_probs"]
             )
 
-    def _apply_rollout_correction(self, batch: DataProto) -> None:
-        """Importance-style reweighting of advantages (TIS/MIS compatible stub)."""
-        rc = self.config.quantization.rollout_correction
-        if not rc.enabled:
-            return
-        if "advantages" not in batch.tensors:
-            return
-        if "fp8_log_probs" not in batch.tensors or "old_log_probs" not in batch.tensors:
-            logger.debug("rollout_correction skipped: missing fp8 or old log-probs")
-            return
-
-        log_ratio = batch.tensors["old_log_probs"] - batch.tensors["fp8_log_probs"]
-        clip = float(rc.clip)
-        if rc.method.lower() == "mis":
-            log_ratio = torch.where(log_ratio > math.log(clip), torch.full_like(log_ratio, math.log(clip)), log_ratio)
-        else:
-            log_ratio = torch.clamp(log_ratio, max=math.log(clip))
-        weights = torch.exp(log_ratio)
-        adv = batch.tensors["advantages"]
-        if adv.dim() == 1:
-            adv = adv.unsqueeze(-1).expand_as(weights)
-        batch.tensors["advantages"] = adv * weights
-        logger.debug("Applied rollout correction method=%s clip=%.4f", rc.method, clip)
+    def _apply_rollout_correction(self, batch: DataProto) -> DataProto:
+        """Delegate to the canonical ``apply_rollout_correction`` implementation."""
+        return apply_rollout_correction(batch, self.config)
 
     def train(self) -> None:
         """Main training loop: rollout → ref → reward → advantages → correction → train → sync."""
@@ -294,7 +297,7 @@ class RLTrainer:
             batch = self.reward_wg.dispatch_and_call("compute_rewards", batch)  # type: ignore[union-attr]
 
             batch = self._algorithm.compute_advantages(batch)
-            self._apply_rollout_correction(batch)
+            batch = self._apply_rollout_correction(batch)
 
             if self.config.moe.r3.enabled:
                 self.actor_wg.call_all("prepare_r3_replay", self.config.moe.r3.replay_mode)
@@ -314,11 +317,14 @@ class RLTrainer:
                 for mini in batch.mini_batches(mini_bs):
                     updated = self.actor_wg.dispatch_and_call("forward_log_probs", mini)
                     loss, m = self._algorithm.compute_loss(updated)
+                    loss_val = float(loss.detach().cpu())
                     metrics_accum.setdefault("loss", 0.0)
-                    metrics_accum["loss"] += float(loss.detach().cpu())
+                    metrics_accum["loss"] += loss_val
                     for k, v in m.items():
                         metrics_accum[k] = metrics_accum.get(k, 0.0) + float(v)
 
+                    updated.meta["loss"] = loss_val
+                    updated.meta["algorithm"] = self.config.algorithm.name
                     self.actor_wg.dispatch_and_call("train_step", updated)
                     step_count += 1
 

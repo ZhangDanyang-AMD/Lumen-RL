@@ -7,10 +7,11 @@ from typing import Any
 
 import torch
 
-from lumenrl.core.config import AtomConfig
+from lumenrl.core.config import AtomConfig, R3Config
 from lumenrl.core.protocol import DataProto
 from lumenrl.engine.inference.atom_engine import AtomEngine
 from lumenrl.engine.inference.kv_cache import FP8KVCacheManager
+from lumenrl.moe.r3_manager import R3Manager
 from lumenrl.workers.base_worker import BaseWorker, get_nested_config
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,8 @@ class AtomRolloutWorker(BaseWorker):
         super().__init__(rank, world_size, config)
         self._engine: AtomEngine | None = None
         self._kv_manager: FP8KVCacheManager | None = None
+        self._r3: R3Manager | None = None
+        self._record_r3: bool = False
 
     def init_model(self) -> None:
         """Construct :class:`~lumenrl.engine.inference.atom_engine.AtomEngine`."""
@@ -40,7 +43,22 @@ class AtomRolloutWorker(BaseWorker):
         quant = get_nested_config(self.config, "quantization", "rollout", default={}) or {}
         fp8_kv = str(quant.get("precision", "")).lower() in ("fp8", "float8")
         self._kv_manager = FP8KVCacheManager(enabled=fp8_kv)
+
+        moe = get_nested_config(self.config, "moe", "r3", default={}) or {}
+        r3_cfg = R3Config(
+            enabled=bool(moe.get("enabled", False)),
+            record_router_logits=bool(moe.get("record_router_logits", True)),
+            replay_mode=str(moe.get("replay_mode", "soft")),
+        )
+        self._r3 = R3Manager(r3_cfg)
         self._log.info("AtomRolloutWorker: engine ready for %s", model_name)
+
+    def prepare_r3_recording(self) -> None:
+        """Enable MoE R3 router capture for the next rollout."""
+        self._record_r3 = True
+
+    def clear_r3_recording(self) -> None:
+        self._record_r3 = False
 
     def prepare_for_generation(self) -> None:
         """Recalibrate caches / set sampling defaults before a rollout burst."""
@@ -49,7 +67,13 @@ class AtomRolloutWorker(BaseWorker):
         self._log.info("AtomRolloutWorker.prepare_for_generation")
 
     def generate(self, batch: DataProto) -> DataProto:
-        """Batch decode prompts into ``sequences`` (and optional router tensors)."""
+        """Batch decode prompts into ``sequences`` (and optional router tensors).
+
+        When R3 recording is active, router logits are captured via
+        :class:`~lumenrl.moe.r3_manager.R3Manager.record_phase` hooks on
+        the ATOM engine's model. If the engine does not expose MoE layers
+        (e.g. dense model), no distributions are recorded.
+        """
         if self._engine is None:
             raise RuntimeError("init_model() must be called before generate().")
         if "input_ids" not in batch.tensors:
@@ -59,7 +83,17 @@ class AtomRolloutWorker(BaseWorker):
         sampling = dict(batch.meta.get("sampling_params", {}))
         sampling.setdefault("max_new_tokens", 32)
         sampling.setdefault("temperature", 1.0)
-        token_lists = self._engine.generate(prompts, sampling_params=sampling)
+
+        model = getattr(self._engine, "_model", None)
+        use_r3 = self._record_r3 and self._r3 is not None and model is not None
+
+        if use_r3:
+            with self._r3.record_phase(model) as recorder:
+                token_lists = self._engine.generate(prompts, sampling_params=sampling)
+                recorded = recorder.get_distributions()
+        else:
+            token_lists = self._engine.generate(prompts, sampling_params=sampling)
+            recorded = {}
 
         max_len = max(len(seq) for seq in token_lists)
         pad_id = int(batch.meta.get("pad_token_id", 0))
@@ -70,12 +104,11 @@ class AtomRolloutWorker(BaseWorker):
         meta_out = {**batch.meta, "sampling_params": sampling}
         out_proto = DataProto(tensors={"sequences": out}, meta=meta_out)
 
-        if batch.meta.get("return_router_dists", False):
-            layers = int(batch.meta.get("num_router_layers", 1))
-            bsz = out.shape[0]
-            for layer_idx in range(layers):
-                logits = torch.randn(bsz, 8)
-                out_proto.add_router_distributions(layer_idx, logits)
+        if recorded:
+            out_proto = R3Manager.transfer_distributions(out_proto, recorded)
+            self._log.info("R3: captured %d layer distributions", len(recorded))
+
+        self._record_r3 = False
         return out_proto
 
     def update_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
@@ -90,8 +123,11 @@ class AtomRolloutWorker(BaseWorker):
         self._log.info("AtomRolloutWorker.finish_generation")
 
     def cleanup(self) -> None:
+        if self._r3 is not None:
+            self._r3.clear()
         if self._engine is not None:
             self._engine.shutdown()
         self._engine = None
         self._kv_manager = None
+        self._r3 = None
         super().cleanup()

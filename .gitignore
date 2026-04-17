@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.log
+.env
+wandb/
+outputs/
+checkpoints/
+docs/build/
+_site/
+
+# Keep output/ directory structure but ignore run artifacts
+output/DAPO/*.log
+output/DAPO/metrics/*.json
+output/DAPO/metrics/*.csv
+output/DAPO/dashboard.html

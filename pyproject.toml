@@ -19,21 +19,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-all = [
-    "lumenrl[train,infer,test]",
-]
-train = [
-    "lumen",
-]
-infer = [
-    "atom",
-]
+# NOTE: lumen and atom are installed from source (submodules), not from PyPI.
+# See docker/Dockerfile or README.md for full install instructions.
 test = [
     "pytest>=8.0",
     "pytest-xdist>=3.5",
 ]
 dev = [
-    "lumenrl[all]",
+    "lumenrl[test]",
     "ruff>=0.3",
     "mypy>=1.8",
 ]

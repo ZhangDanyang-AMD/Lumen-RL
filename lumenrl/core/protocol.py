@@ -73,7 +73,11 @@ class DataProto:
 
     @staticmethod
     def merge(protos: list["DataProto"]) -> "DataProto":
-        """Merge a list of DataProtos by concatenating tensors along dim 0."""
+        """Merge a list of DataProtos by concatenating tensors along dim 0.
+
+        All non-empty chunks must share the same set of tensor keys. A
+        ``ValueError`` is raised if keys are inconsistent across chunks.
+        """
         if not protos:
             return DataProto()
 
@@ -81,9 +85,19 @@ class DataProto:
         if not non_empty:
             return DataProto(meta=protos[0].meta.copy())
 
-        all_keys = non_empty[0].keys()
+        ref_keys = set(non_empty[0].keys())
+        for idx, p in enumerate(non_empty[1:], start=1):
+            chunk_keys = set(p.keys())
+            if chunk_keys != ref_keys:
+                missing = ref_keys - chunk_keys
+                extra = chunk_keys - ref_keys
+                raise ValueError(
+                    f"DataProto.merge: chunk {idx} keys mismatch. "
+                    f"missing={missing or '{}'}, extra={extra or '{}'}"
+                )
+
         merged_tensors = {}
-        for key in all_keys:
+        for key in ref_keys:
             merged_tensors[key] = torch.cat([p[key] for p in non_empty], dim=0)
 
         return DataProto(tensors=merged_tensors, meta=non_empty[0].meta.copy())

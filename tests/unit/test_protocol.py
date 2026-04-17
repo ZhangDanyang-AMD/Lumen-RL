@@ -88,3 +88,11 @@ def test_merge_preserves_data() -> None:
     m = DataProto.merge([a, b])
     assert torch.allclose(m["x"], torch.tensor([[1.0], [2.0], [3.0]]))
     assert m.meta["tag"] == "a"
+
+
+def test_merge_key_mismatch_raises() -> None:
+    a = DataProto(tensors={"x": torch.tensor([[1.0]]), "y": torch.tensor([[2.0]])})
+    b = DataProto(tensors={"x": torch.tensor([[3.0]])})
+    import pytest
+    with pytest.raises(ValueError, match="keys mismatch"):
+        DataProto.merge([a, b])

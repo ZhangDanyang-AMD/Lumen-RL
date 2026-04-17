@@ -45,11 +45,24 @@ def token_level_mis(
     fp8_logprobs: Tensor,
     advantages: Tensor,
 ) -> Tensor:
-    """Multiplicative importance sampling correction without truncation."""
+    """Self-normalizing multiplicative importance sampling correction.
+
+    Unlike TIS, MIS avoids hard clipping and instead normalizes the raw
+    density ratio so that the per-token mean weight equals 1.  This
+    preserves the expected gradient direction while absorbing FP8/BF16
+    distributional shift:
+
+    .. math::
+
+        \\rho_t = \\exp(\\log \\pi_\\text{bf16} - \\log \\pi_\\text{fp8}),\\quad
+        \\bar{\\rho}_t = \\rho_t / \\mathrm{mean}(\\rho),\\quad
+        \\tilde{A}_t = \\bar{\\rho}_t A_t
+    """
     log_ratio = bf16_logprobs - fp8_logprobs
     log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)
     ratio = torch.exp(log_ratio)
-    return ratio * advantages
+    normalized = ratio / ratio.mean().clamp(min=1e-8)
+    return normalized * advantages
 
 
 def _resolve_rollout_correction_config(config: Any) -> RolloutCorrectionConfig:
