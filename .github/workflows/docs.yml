@@ -30,24 +30,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install dependencies
-        run: pip install -r lumenrl-docs/docs/requirements.txt
-
-      - name: Build Sphinx documentation
-        run: |
-          cd lumenrl-docs/docs
-          sphinx-build -b html source build/html -W --keep-going
-
       - name: Assemble site
         run: |
           mkdir -p _site
           cp lumenrl-docs/site/index.html _site/index.html
-          cp -r lumenrl-docs/docs/build/html _site/docs
 
       - name: Setup Pages
         if: github.ref == 'refs/heads/main'

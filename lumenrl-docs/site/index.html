@@ -3,638 +3,449 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>LumenRL — High-Performance RL Post-Training for LLMs on AMD GPUs</title>
+<title>LumenRL — RL Post-Training for LLMs on AMD GPUs</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700;9..40,800&display=swap" rel="stylesheet">
 <style>
 :root {
+  --bg: #0a0a0f;
+  --bg-raised: #12121a;
+  --bg-card: #16161f;
+  --bg-card-hover: #1c1c28;
+  --surface: #1e1e2a;
   --amd-red: #ed1c24;
-  --amd-red-dark: #c41922;
-  --bg-primary: #ffffff;
-  --bg-secondary: #f8f9fb;
-  --bg-card: #ffffff;
-  --bg-card-hover: #f5f6f8;
-  --text-primary: #1a1a2e;
-  --text-secondary: #5c6370;
-  --text-muted: #8b95a5;
-  --accent: #ed1c24;
-  --accent-soft: rgba(237, 28, 36, 0.08);
-  --green: #2da44e;
-  --blue: #0969da;
-  --yellow: #bf8700;
-  --purple: #8250df;
-  --border: #d0d7de;
-  --border-light: #e8ecf0;
-  --radius: 12px;
-  --shadow-sm: 0 1px 3px rgba(0,0,0,0.06);
-  --shadow-md: 0 4px 12px rgba(0,0,0,0.08);
+  --amd-glow: #ff2d36;
+  --cyan: #00e5ff;
+  --lime: #b8ff57;
+  --violet: #a78bfa;
+  --amber: #fbbf24;
+  --text: #e8e8ef;
+  --text-dim: #8b8ba0;
+  --text-muted: #5e5e74;
+  --border: #2a2a3a;
+  --border-glow: rgba(237, 28, 36, 0.3);
+  --mono: 'Space Mono', monospace;
+  --sans: 'DM Sans', system-ui, sans-serif;
 }
-* { margin:0; padding:0; box-sizing:border-box; }
-body {
-  font-family: 'Inter', -apple-system, sans-serif;
-  background: var(--bg-primary);
-  color: var(--text-primary);
-  line-height: 1.6;
-  -webkit-font-smoothing: antialiased;
-}
-a { color: var(--blue); text-decoration: none; }
-a:hover { text-decoration: underline; }
-code, pre { font-family: 'JetBrains Mono', monospace; }
-.container { max-width: 1100px; margin: 0 auto; padding: 0 24px; }
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{font-family:var(--sans);background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased}
+a{color:var(--cyan);text-decoration:none}
+a:hover{text-decoration:underline}
+code,pre{font-family:var(--mono)}
+.wrap{max-width:1120px;margin:0 auto;padding:0 28px}
 
-/* NAV */
-nav {
-  position: sticky; top: 0; z-index: 100;
-  background: rgba(255,255,255,0.92);
-  backdrop-filter: blur(12px);
-  border-bottom: 1px solid var(--border-light);
-  padding: 14px 0;
-}
-nav .container {
-  display: flex; align-items: center; justify-content: space-between;
-}
-nav .logo {
-  font-size: 22px; font-weight: 800; color: var(--text-primary);
-  letter-spacing: -0.5px;
-}
-nav .logo span { color: var(--accent); }
-nav .links { display: flex; gap: 28px; }
-nav .links a {
-  color: var(--text-secondary); font-size: 14px; font-weight: 500;
-  transition: color 0.2s;
-}
-nav .links a:hover { color: var(--text-primary); text-decoration: none; }
+/* ── NAV ── */
+nav{position:sticky;top:0;z-index:100;background:rgba(10,10,15,0.85);backdrop-filter:blur(16px) saturate(1.4);border-bottom:1px solid var(--border);padding:16px 0}
+nav .wrap{display:flex;align-items:center;justify-content:space-between}
+.logo{font-family:var(--mono);font-size:20px;font-weight:700;letter-spacing:2px;color:var(--text)}
+.logo b{color:var(--amd-red)}
+.nav-links{display:flex;gap:24px}
+.nav-links a{color:var(--text-dim);font-size:13px;font-weight:600;letter-spacing:0.5px;text-transform:uppercase;transition:color .2s}
+.nav-links a:hover{color:var(--text);text-decoration:none}
 
-/* HERO */
-.hero {
-  padding: 80px 0 64px;
-  text-align: center;
-  background: linear-gradient(180deg, #fff 0%, var(--bg-secondary) 100%);
-}
-.hero h1 {
-  font-size: 48px; font-weight: 800; letter-spacing: -1.5px;
-  line-height: 1.15; margin-bottom: 20px; color: var(--text-primary);
-}
-.hero h1 .highlight { color: var(--accent); }
-.hero .subtitle {
-  font-size: 18px; color: var(--text-secondary);
-  max-width: 680px; margin: 0 auto 32px;
-}
-.hero .badges { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; margin-bottom: 36px; }
-.badge {
-  display: inline-flex; align-items: center; gap: 6px;
-  background: var(--bg-primary); border: 1px solid var(--border);
-  border-radius: 20px; padding: 6px 14px;
-  font-size: 13px; font-weight: 500; color: var(--text-secondary);
-  box-shadow: var(--shadow-sm);
-}
-.badge .dot { width: 8px; height: 8px; border-radius: 50%; }
-.badge .dot.red { background: var(--accent); }
-.badge .dot.green { background: var(--green); }
-.badge .dot.blue { background: var(--blue); }
-.badge .dot.yellow { background: var(--yellow); }
-.btn-group { display: flex; gap: 12px; justify-content: center; }
-.btn {
-  display: inline-flex; align-items: center; gap: 8px;
-  padding: 11px 22px; border-radius: 8px;
-  font-size: 14px; font-weight: 600;
-  transition: all 0.2s; cursor: pointer; border: none;
-}
-.btn-primary { background: var(--accent); color: #fff; }
-.btn-primary:hover { background: var(--amd-red-dark); text-decoration: none; color: #fff; }
-.btn-secondary {
-  background: var(--bg-primary); color: var(--text-primary);
-  border: 1px solid var(--border);
-}
-.btn-secondary:hover { background: var(--bg-secondary); text-decoration: none; }
+/* ── HERO ── */
+.hero{padding:100px 0 80px;text-align:center;position:relative;overflow:hidden}
+.hero::before{content:'';position:absolute;inset:0;background:radial-gradient(ellipse 60% 50% at 50% 0%,rgba(237,28,36,0.08),transparent);pointer-events:none}
+.hero h1{font-size:clamp(36px,6vw,64px);font-weight:800;letter-spacing:-2px;line-height:1.05;margin-bottom:24px}
+.hero h1 em{font-style:normal;background:linear-gradient(135deg,var(--amd-red),var(--amd-glow));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.hero .sub{font-size:18px;color:var(--text-dim);max-width:640px;margin:0 auto 36px;line-height:1.65}
+.pill-row{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-bottom:40px}
+.pill{display:inline-flex;align-items:center;gap:7px;padding:6px 14px;border-radius:999px;font-size:12px;font-weight:600;font-family:var(--mono);letter-spacing:0.4px;border:1px solid var(--border);background:var(--bg-raised);color:var(--text-dim);transition:border-color .3s}
+.pill:hover{border-color:var(--border-glow)}
+.pill i{width:7px;height:7px;border-radius:50%;display:inline-block}
+.btns{display:flex;gap:14px;justify-content:center}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:12px 28px;border-radius:6px;font-size:14px;font-weight:700;letter-spacing:0.3px;transition:all .2s;cursor:pointer;border:none}
+.btn-red{background:var(--amd-red);color:#fff}
+.btn-red:hover{background:var(--amd-glow);text-decoration:none;color:#fff;box-shadow:0 0 24px rgba(237,28,36,0.35)}
+.btn-outline{background:transparent;color:var(--text);border:1.5px solid var(--border)}
+.btn-outline:hover{border-color:var(--text-dim);text-decoration:none;background:var(--bg-raised)}
 
-/* FEATURES */
-.features { padding: 72px 0; background: var(--bg-primary); }
-.section-title {
-  font-size: 32px; font-weight: 700; text-align: center;
-  margin-bottom: 10px; letter-spacing: -0.5px; color: var(--text-primary);
-}
-.section-sub {
-  font-size: 15px; color: var(--text-secondary); text-align: center;
-  margin-bottom: 40px; max-width: 560px; margin-left: auto; margin-right: auto;
-}
-.feature-grid {
-  display: grid; grid-template-columns: repeat(3, 1fr);
-  gap: 16px;
-}
-.feature-card {
-  background: var(--bg-card);
-  border: 1px solid var(--border-light);
-  border-radius: var(--radius);
-  padding: 24px;
-  transition: all 0.2s;
-  box-shadow: var(--shadow-sm);
-}
-.feature-card:hover {
-  box-shadow: var(--shadow-md);
-  border-color: var(--border);
-  transform: translateY(-2px);
-}
-.feature-card .icon {
-  width: 36px; height: 36px; border-radius: 8px;
-  display: flex; align-items: center; justify-content: center;
-  font-size: 18px; margin-bottom: 14px;
-}
-.feature-card h3 { font-size: 16px; font-weight: 600; margin-bottom: 6px; }
-.feature-card p { font-size: 13px; color: var(--text-secondary); line-height: 1.55; }
+/* ── FEATURES ── */
+.features{padding:80px 0;background:var(--bg)}
+.stitle{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:3px;color:var(--amd-red);text-align:center;margin-bottom:10px;font-family:var(--mono)}
+.htitle{font-size:36px;font-weight:800;text-align:center;letter-spacing:-1px;margin-bottom:12px}
+.hsub{font-size:15px;color:var(--text-dim);text-align:center;max-width:540px;margin:0 auto 48px}
+.fgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+.fcard{background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:28px 24px;transition:all .25s}
+.fcard:hover{border-color:var(--border-glow);transform:translateY(-3px);box-shadow:0 8px 32px rgba(0,0,0,0.3)}
+.fcard .ic{width:40px;height:40px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:18px;margin-bottom:16px}
+.fcard h3{font-size:16px;font-weight:700;margin-bottom:6px;letter-spacing:-0.2px}
+.fcard p{font-size:13px;color:var(--text-dim);line-height:1.6}
 
-/* ARCH DIAGRAM */
-.arch-section { padding: 72px 0; background: var(--bg-secondary); }
-.arch-wrapper {
-  background: var(--bg-primary);
-  border: 1px solid var(--border-light);
-  border-radius: 16px;
-  padding: 40px 28px;
-  overflow-x: auto;
-  box-shadow: var(--shadow-sm);
-}
-.arch-svg { width: 100%; max-width: 960px; margin: 0 auto; display: block; }
+/* ── ARCHITECTURE ── */
+.arch{padding:80px 0;background:var(--bg-raised)}
+.arch-box{background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:40px 24px;overflow-x:auto}
+.arch-box svg{display:block;margin:0 auto;width:100%;max-width:960px}
 
-/* CODE EXAMPLE */
-.code-section { padding: 72px 0; background: var(--bg-primary); }
-.code-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-.code-block {
-  background: #f6f8fa;
-  border: 1px solid var(--border-light);
-  border-radius: var(--radius);
-  overflow: hidden;
-}
-.code-header {
-  padding: 10px 16px;
-  border-bottom: 1px solid var(--border-light);
-  font-size: 13px; font-weight: 600; color: var(--text-secondary);
-  display: flex; align-items: center; gap: 8px;
-  background: #fff;
-}
-.code-header .lang-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--blue); }
-.code-block pre {
-  padding: 16px 18px;
-  font-size: 13px; line-height: 1.6;
-  overflow-x: auto; color: #24292f;
-}
-.kw { color: #cf222e; }
-.str { color: #0a3069; }
-.fn { color: #8250df; }
-.cm { color: #6e7781; }
-.num { color: #0550ae; }
+/* ── QUICK START ── */
+.qs{padding:80px 0;background:var(--bg)}
+.qs-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.cblock{background:var(--bg-card);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+.cblock .ch{padding:10px 18px;border-bottom:1px solid var(--border);font-size:12px;font-weight:700;color:var(--text-dim);display:flex;align-items:center;gap:8px;font-family:var(--mono);letter-spacing:0.5px;text-transform:uppercase;background:var(--bg-raised)}
+.cblock .ch i{width:9px;height:9px;border-radius:50%;display:inline-block}
+.cblock pre{padding:18px 20px;font-size:12.5px;line-height:1.65;overflow-x:auto;color:var(--text-dim)}
+.cblock pre .c{color:var(--text-muted)}
+.cblock pre .s{color:var(--lime)}
+.cblock pre .k{color:var(--amd-red)}
+.cblock pre .n{color:var(--cyan)}
+.cblock pre .v{color:var(--violet)}
 
-/* OP TABLE */
-.ops-section { padding: 72px 0; background: var(--bg-secondary); }
-.ops-table {
-  width: 100%; border-collapse: collapse;
-  background: var(--bg-primary);
-  border: 1px solid var(--border-light);
-  border-radius: var(--radius);
-  overflow: hidden;
-  box-shadow: var(--shadow-sm);
-}
-.ops-table thead { background: #f6f8fa; }
-.ops-table th {
-  text-align: left; padding: 12px 20px;
-  font-size: 12px; font-weight: 600;
-  text-transform: uppercase; letter-spacing: 0.5px;
-  color: var(--text-secondary);
-  border-bottom: 1px solid var(--border-light);
-}
-.ops-table td {
-  padding: 10px 20px; font-size: 14px;
-  border-bottom: 1px solid var(--border-light);
-  color: var(--text-secondary);
-}
-.ops-table td:first-child { color: var(--text-primary); font-weight: 500; }
-.ops-table tr:last-child td { border-bottom: none; }
-.ops-table tr:hover td { background: #f6f8fa; }
-.tag {
-  display: inline-block; padding: 2px 8px; border-radius: 4px;
-  font-size: 11px; font-weight: 600;
-}
-.tag-green { background: rgba(45,164,78,0.1); color: var(--green); }
-.tag-blue { background: rgba(9,105,218,0.1); color: var(--blue); }
-.tag-purple { background: rgba(130,80,223,0.1); color: var(--purple); }
+/* ── TABLES ── */
+.tbl-section{padding:80px 0}
+.tbl-section:nth-child(odd){background:var(--bg-raised)}
+.tbl-section:nth-child(even){background:var(--bg)}
+.tbl{width:100%;border-collapse:collapse;background:var(--bg-card);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+.tbl thead{background:var(--surface)}
+.tbl th{text-align:left;padding:14px 20px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--text-dim);border-bottom:1px solid var(--border)}
+.tbl td{padding:12px 20px;font-size:14px;border-bottom:1px solid var(--border);color:var(--text-dim)}
+.tbl td:first-child{color:var(--text);font-weight:600}
+.tbl tr:last-child td{border-bottom:none}
+.tbl tr:hover td{background:var(--bg-card-hover)}
+.tag{display:inline-block;padding:3px 10px;border-radius:4px;font-size:11px;font-weight:700;font-family:var(--mono)}
+.tag-g{background:rgba(0,229,255,0.1);color:var(--cyan)}
+.tag-v{background:rgba(167,139,250,0.1);color:var(--violet)}
+.tag-l{background:rgba(184,255,87,0.1);color:var(--lime)}
+.tag-a{background:rgba(251,191,36,0.1);color:var(--amber)}
+.tag-r{background:rgba(237,28,36,0.1);color:var(--amd-red)}
 
-/* RL SECTION */
-.rl-section { padding: 72px 0; background: var(--bg-primary); }
-.rl-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-.rl-card {
-  background: var(--bg-card); border: 1px solid var(--border-light);
-  border-radius: var(--radius); padding: 24px;
-  box-shadow: var(--shadow-sm);
-}
-.rl-card.full-width { grid-column: 1 / -1; }
-.rl-card h3 { font-size: 17px; font-weight: 600; margin-bottom: 10px; }
-.rl-card h4 { font-size: 15px; font-weight: 600; margin: 18px 0 8px; color: var(--text-primary); }
-.rl-card p { font-size: 13px; color: var(--text-secondary); margin-bottom: 14px; }
-.rl-card table { width: 100%; border-collapse: collapse; font-size: 13px; }
-.rl-card th, .rl-card td { text-align: left; padding: 7px 0; border-bottom: 1px solid var(--border-light); }
-.rl-card th { color: var(--text-secondary); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; }
-.rl-card td { color: var(--text-primary); }
-.rl-card ul { padding-left: 18px; margin: 0 0 14px; }
-.rl-card li { font-size: 13px; color: var(--text-secondary); line-height: 1.7; margin-bottom: 4px; }
-.rl-card li strong { color: var(--text-primary); }
-.rl-card .rl-env { font-size: 12px; color: var(--text-muted); margin-bottom: 16px; }
-.rl-card pre {
-  background: #f6f8fa; border: 1px solid var(--border-light); border-radius: 8px;
-  padding: 12px 14px; font-size: 12px; line-height: 1.5; overflow-x: auto;
-  color: #24292f; margin: 8px 0 14px;
-}
-.rl-tables-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-@media (max-width: 768px) { .rl-tables-row { grid-template-columns: 1fr; } }
+/* ── RL EXPERIMENTS ── */
+.exp{padding:80px 0;background:var(--bg)}
+.exp-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.ecard{background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:28px 24px}
+.ecard.full{grid-column:1/-1}
+.ecard h3{font-size:17px;font-weight:700;margin-bottom:8px}
+.ecard p{font-size:13px;color:var(--text-dim);margin-bottom:16px}
+.ecard pre{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px 16px;font-size:12px;line-height:1.6;overflow-x:auto;color:var(--text-dim)}
 
-/* FOOTER */
-footer {
-  border-top: 1px solid var(--border-light);
-  padding: 36px 0;
-  text-align: center;
-  font-size: 14px; color: var(--text-secondary);
-  background: var(--bg-secondary);
-}
-footer a { color: var(--text-secondary); }
-footer a:hover { color: var(--text-primary); }
+/* ── FOOTER ── */
+footer{border-top:1px solid var(--border);padding:40px 0;text-align:center;background:var(--bg-raised)}
+footer p{font-size:13px;color:var(--text-muted)}
+footer a{color:var(--text-dim)}
+footer a:hover{color:var(--text)}
+footer .links{margin-top:12px;display:flex;gap:24px;justify-content:center;flex-wrap:wrap}
 
-@media (max-width: 768px) {
-  .hero h1 { font-size: 32px; }
-  .feature-grid { grid-template-columns: 1fr; }
-  .code-grid { grid-template-columns: 1fr; }
-  .rl-grid { grid-template-columns: 1fr; }
-  nav .links { display: none; }
+@media(max-width:768px){
+  .fgrid,.qs-grid,.exp-grid{grid-template-columns:1fr}
+  .nav-links{display:none}
+  .hero h1{font-size:32px}
 }
 </style>
 </head>
 <body>
 
 <nav>
-  <div class="container">
-    <div class="logo"><span>LumenRL</span></div>
-    <div class="links">
+  <div class="wrap">
+    <div class="logo"><b>LUMEN</b>RL</div>
+    <div class="nav-links">
       <a href="#features">Features</a>
-      <a href="#architecture">Architecture</a>
+      <a href="#arch">Architecture</a>
       <a href="#quickstart">Quick Start</a>
       <a href="#algorithms">Algorithms</a>
       <a href="#models">Models</a>
-      <a href="docs/index.html">Docs</a>
+      <a href="#experiments">Experiments</a>
       <a href="https://github.com/ZhangDanyang-AMD/Lumen-RL">GitHub</a>
     </div>
   </div>
 </nav>
 
 <section class="hero">
-  <div class="container">
-    <h1>
-      <span class="highlight">LumenRL</span>: High-Performance<br>
-      RL Post-Training for LLMs
-    </h1>
-    <p class="subtitle">
-      A framework for reinforcement learning post-training on AMD Instinct GPUs — FP8 quantized rollout and training, MoE R3 router alignment, powered by Lumen + ATOM.
-    </p>
-    <div class="badges">
-      <span class="badge"><span class="dot red"></span>FP8 E4M3 / E5M2 / MXFP8</span>
-      <span class="badge"><span class="dot green"></span>AITER Kernels</span>
-      <span class="badge"><span class="dot blue"></span>R3 MoE Routing</span>
-      <span class="badge"><span class="dot yellow"></span>MI300X / MI355X</span>
+  <div class="wrap">
+    <h1><em>LumenRL</em><br>RL Post-Training<br>for LLMs</h1>
+    <p class="sub">FP8 quantized rollout &amp; training, MoE R3 router alignment, GRPO / DAPO / PPO &mdash; built for AMD Instinct GPUs with Lumen + ATOM.</p>
+    <div class="pill-row">
+      <span class="pill"><i style="background:var(--amd-red)"></i>FP8 E4M3 / MXFP8</span>
+      <span class="pill"><i style="background:var(--lime)"></i>AITER Kernels</span>
+      <span class="pill"><i style="background:var(--cyan)"></i>R3 MoE Routing</span>
+      <span class="pill"><i style="background:var(--amber)"></i>MI300X &bull; MI355X</span>
     </div>
-    <div class="btn-group">
-      <a class="btn btn-primary" href="#quickstart">Get Started</a>
-      <a class="btn btn-secondary" href="https://github.com/ZhangDanyang-AMD/Lumen-RL">GitHub</a>
+    <div class="btns">
+      <a class="btn btn-red" href="#quickstart">Get Started</a>
+      <a class="btn btn-outline" href="https://github.com/ZhangDanyang-AMD/Lumen-RL">&#9733; GitHub</a>
     </div>
   </div>
 </section>
 
 <section class="features" id="features">
-  <div class="container">
-    <h2 class="section-title">Key Features</h2>
-    <p class="section-sub">High-performance RL post-training for LLMs on AMD GPUs — Lumen quantized training and ATOM optimized inference</p>
-    <div class="feature-grid">
-      <div class="feature-card">
-        <div class="icon" style="background:var(--accent-soft); color:var(--accent);">&#9889;</div>
+  <div class="wrap">
+    <p class="stitle">// capabilities</p>
+    <h2 class="htitle">Key Features</h2>
+    <p class="hsub">Everything you need for high-performance RL post-training on AMD GPUs</p>
+    <div class="fgrid">
+      <div class="fcard">
+        <div class="ic" style="background:rgba(237,28,36,0.12);color:var(--amd-red)">&#9889;</div>
         <h3>AMD-Native</h3>
-        <p>AITER kernels, MORI communication, and a ROCm-first stack tuned for AMD Instinct — from fused ops to device-side collectives and MoE expert dispatch.</p>
+        <p>AITER kernels (ASM &gt; CK &gt; Triton), MORI device-side RDMA collectives, and a ROCm-first stack from fused ops to MoE expert dispatch.</p>
       </div>
-      <div class="feature-card">
-        <div class="icon" style="background:rgba(9,105,218,0.08); color:var(--blue);">&#9881;</div>
+      <div class="fcard">
+        <div class="ic" style="background:rgba(0,229,255,0.1);color:var(--cyan)">&#9881;</div>
         <h3>FP8 End-to-End</h3>
-        <p>FP8 rollout (W8A8 + KV-cache) plus FP8 training with hybrid formats — up to 44% throughput gain over BF16 on representative workloads.</p>
+        <p>FP8 W8A8 rollout plus FP8 training with blockwise, MXFP8, or per-tensor scaling. Rollout correction via TIS/MIS for train-inference alignment.</p>
       </div>
-      <div class="feature-card">
-        <div class="icon" style="background:rgba(45,164,78,0.08); color:var(--green);">&#9650;</div>
+      <div class="fcard">
+        <div class="ic" style="background:rgba(184,255,87,0.1);color:var(--lime)">&#9650;</div>
         <h3>MoE-Stable RL</h3>
-        <p>R3 (Rollout Routing Replay) records inference routing and replays it in training so train and inference routers stay aligned.</p>
+        <p>R3 (Rollout Routing Replay) captures inference routing distributions and replays them during training to keep MoE routers aligned.</p>
       </div>
-      <div class="feature-card">
-        <div class="icon" style="background:rgba(130,80,223,0.08); color:var(--purple);">&#9850;</div>
+      <div class="fcard">
+        <div class="ic" style="background:rgba(167,139,250,0.1);color:var(--violet)">&#9850;</div>
         <h3>Flexible Backends</h3>
-        <p>FSDP2 or Megatron-Core for policy training with Lumen FP8, plus ATOM for rollout with TP, EP, and DP parallelism.</p>
+        <p>FSDP2 or Megatron-Core for training with Lumen FP8. ATOM for rollout with tensor, expert, and data parallelism.</p>
       </div>
-      <div class="feature-card">
-        <div class="icon" style="background:rgba(191,135,0,0.08); color:var(--yellow);">&#9783;</div>
-        <h3>Multiple Algorithms</h3>
-        <p>GRPO, DAPO, and PPO with clipped surrogate objectives, advantage normalization, and group-relative baselines where applicable.</p>
+      <div class="fcard">
+        <div class="ic" style="background:rgba(251,191,36,0.1);color:var(--amber)">&#9783;</div>
+        <h3>GRPO &bull; DAPO &bull; PPO</h3>
+        <p>Clipped surrogate, asymmetric clip, and value-based objectives with group-relative baselines and GAE-Lambda.</p>
       </div>
-      <div class="feature-card">
-        <div class="icon" style="background:rgba(0,0,0,0.04); color:var(--text-secondary);">&#9879;</div>
-        <h3>Production-Ready</h3>
-        <p>Ray orchestration, YAML-driven configs, multi-node SLURM launch scripts, and Docker images for reproducible clusters.</p>
-      </div>
-    </div>
-  </div>
-</section>
-
-<section class="arch-section" id="architecture">
-  <div class="container">
-    <h2 class="section-title">Architecture</h2>
-    <p class="section-sub">Ray controller, ATOM inference with FP8 rollout and R3 recording, Lumen training with FP8 and R3 replay — AITER kernels and MORI comms end to end</p>
-    <div class="arch-wrapper">
-      <svg class="arch-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 700">
-
-  <rect width="960" height="700" rx="16" fill="#fafbfc" stroke="#e1e4e8" stroke-width="1"/>
-
-  <text x="480" y="30" text-anchor="middle" fill="#333" font-size="18" font-weight="700" font-family="sans-serif" letter-spacing="0.5">LumenRL Architecture</text>
-
-  <!-- Layer 0: RL Algorithms -->
-  <rect x="30" y="48" width="900" height="52" rx="10" fill="#f3e8f5" stroke="#9c27b0" stroke-width="1.5"/>
-  <text x="480" y="68" text-anchor="middle" fill="#7b1fa2" font-size="10" font-weight="600" font-family="sans-serif" letter-spacing="1">RL ALGORITHMS</text>
-  <text x="240" y="87" text-anchor="middle" fill="#333" font-size="14" font-weight="600" font-family="sans-serif">GRPO</text>
-  <text x="480" y="87" text-anchor="middle" fill="#333" font-size="14" font-weight="600" font-family="sans-serif">DAPO</text>
-  <text x="720" y="87" text-anchor="middle" fill="#333" font-size="14" font-weight="600" font-family="sans-serif">PPO</text>
-
-  <line x1="480" y1="100" x2="480" y2="118" stroke="#999" stroke-width="1.5"/>
-  <polygon points="480,122 475,114 485,114" fill="#999"/>
-
-  <!-- Layer 1: Ray Controller -->
-  <rect x="30" y="122" width="900" height="72" rx="10" fill="#e3f2fd" stroke="#1976d2" stroke-width="1.5"/>
-  <text x="480" y="142" text-anchor="middle" fill="#1565c0" font-size="10" font-weight="600" font-family="sans-serif" letter-spacing="1">RAY CONTROLLER</text>
-
-  <rect x="55"  y="150" width="148" height="34" rx="6" fill="#bbdefb" stroke="#1976d2" stroke-width="1"/>
-  <text x="129" y="172" text-anchor="middle" fill="#1565c0" font-size="11" font-weight="600" font-family="sans-serif">RLTrainer</text>
-
-  <rect x="218" y="150" width="148" height="34" rx="6" fill="#bbdefb" stroke="#1976d2" stroke-width="1"/>
-  <text x="292" y="172" text-anchor="middle" fill="#1565c0" font-size="11" font-weight="600" font-family="sans-serif">DataManager</text>
-
-  <rect x="381" y="150" width="148" height="34" rx="6" fill="#bbdefb" stroke="#1976d2" stroke-width="1"/>
-  <text x="455" y="172" text-anchor="middle" fill="#1565c0" font-size="11" font-weight="600" font-family="sans-serif">WorkerGroups</text>
-
-  <rect x="544" y="150" width="148" height="34" rx="6" fill="#bbdefb" stroke="#1976d2" stroke-width="1"/>
-  <text x="618" y="172" text-anchor="middle" fill="#1565c0" font-size="11" font-weight="600" font-family="sans-serif">Callbacks</text>
-
-  <rect x="707" y="150" width="198" height="34" rx="6" fill="#bbdefb" stroke="#1976d2" stroke-width="1"/>
-  <text x="806" y="172" text-anchor="middle" fill="#1565c0" font-size="11" font-weight="600" font-family="sans-serif">Checkpoint / Logging</text>
-
-  <!-- Dispatch / Collect -->
-  <text x="240" y="208" text-anchor="middle" fill="#999" font-size="9" font-weight="600" font-family="sans-serif">dispatch DataProto</text>
-  <line x1="240" y1="212" x2="240" y2="230" stroke="#999" stroke-width="1.5"/>
-  <polygon points="240,234 235,226 245,226" fill="#999"/>
-
-  <text x="720" y="208" text-anchor="middle" fill="#999" font-size="9" font-weight="600" font-family="sans-serif">collect DataProto</text>
-  <line x1="720" y1="212" x2="720" y2="230" stroke="#999" stroke-width="1.5"/>
-  <polygon points="720,234 715,226 725,226" fill="#999"/>
-
-  <!-- Layer 2 Left: ATOM Inference -->
-  <rect x="30" y="234" width="440" height="168" rx="10" fill="#e8f5e9" stroke="#388e3c" stroke-width="1.5"/>
-  <text x="250" y="256" text-anchor="middle" fill="#2e7d32" font-size="10" font-weight="700" font-family="sans-serif" letter-spacing="1">ATOM  |  INFERENCE ENGINE</text>
-
-  <rect x="48" y="266" width="125" height="48" rx="6" fill="#c8e6c9" stroke="#388e3c" stroke-width="1"/>
-  <text x="111" y="286" text-anchor="middle" fill="#2e7d32" font-size="10" font-weight="600" font-family="sans-serif">FP8 W8A8</text>
-  <text x="111" y="300" text-anchor="middle" fill="#555" font-size="8.5" font-family="sans-serif">Blockwise Quant</text>
-
-  <rect x="183" y="266" width="125" height="48" rx="6" fill="#c8e6c9" stroke="#388e3c" stroke-width="1"/>
-  <text x="246" y="286" text-anchor="middle" fill="#2e7d32" font-size="10" font-weight="600" font-family="sans-serif">FP8 KV-Cache</text>
-  <text x="246" y="300" text-anchor="middle" fill="#555" font-size="8.5" font-family="sans-serif">QKV Recalibration</text>
-
-  <rect x="318" y="266" width="135" height="48" rx="6" fill="#c8e6c9" stroke="#388e3c" stroke-width="1"/>
-  <text x="386" y="286" text-anchor="middle" fill="#2e7d32" font-size="10" font-weight="600" font-family="sans-serif">MoE EP</text>
-  <text x="386" y="300" text-anchor="middle" fill="#555" font-size="8.5" font-family="sans-serif">MORI Dispatch</text>
-
-  <rect x="48" y="324" width="200" height="40" rx="6" fill="#fff8e1" stroke="#f9a825" stroke-width="1"/>
-  <text x="148" y="342" text-anchor="middle" fill="#e65100" font-size="9.5" font-weight="600" font-family="sans-serif">Router Recorder (R3)</text>
-  <text x="148" y="356" text-anchor="middle" fill="#777" font-size="8" font-family="sans-serif">Capture MoE routing logits</text>
-
-  <rect x="258" y="324" width="200" height="40" rx="6" fill="#e8eaf6" stroke="#3f51b5" stroke-width="1"/>
-  <text x="358" y="342" text-anchor="middle" fill="#283593" font-size="9.5" font-weight="600" font-family="sans-serif">Generation Interface</text>
-  <text x="358" y="356" text-anchor="middle" fill="#777" font-size="8" font-family="sans-serif">Batch rollout + sampling</text>
-
-  <!-- Layer 2 Right: Lumen Training -->
-  <rect x="490" y="234" width="440" height="168" rx="10" fill="#fde8e8" stroke="#d32f2f" stroke-width="1.5"/>
-  <text x="710" y="256" text-anchor="middle" fill="#c62828" font-size="10" font-weight="700" font-family="sans-serif" letter-spacing="1">LUMEN  |  TRAINING ENGINE</text>
-
-  <rect x="508" y="266" width="125" height="48" rx="6" fill="#ffcdd2" stroke="#d32f2f" stroke-width="1"/>
-  <text x="571" y="286" text-anchor="middle" fill="#c62828" font-size="10" font-weight="600" font-family="sans-serif">FSDP2</text>
-  <text x="571" y="300" text-anchor="middle" fill="#555" font-size="8.5" font-family="sans-serif">Full Shard + FP8</text>
-
-  <rect x="643" y="266" width="135" height="48" rx="6" fill="#ffcdd2" stroke="#d32f2f" stroke-width="1"/>
-  <text x="711" y="286" text-anchor="middle" fill="#c62828" font-size="10" font-weight="600" font-family="sans-serif">Megatron-Core</text>
-  <text x="711" y="300" text-anchor="middle" fill="#555" font-size="8.5" font-family="sans-serif">TP / PP / EP / DP</text>
-
-  <rect x="788" y="266" width="125" height="48" rx="6" fill="#ffcdd2" stroke="#d32f2f" stroke-width="1"/>
-  <text x="851" y="286" text-anchor="middle" fill="#c62828" font-size="10" font-weight="600" font-family="sans-serif">FP8 Training</text>
-  <text x="851" y="300" text-anchor="middle" fill="#555" font-size="8.5" font-family="sans-serif">Hybrid E4M3 / E5M2</text>
-
-  <rect x="508" y="324" width="200" height="40" rx="6" fill="#fff8e1" stroke="#f9a825" stroke-width="1"/>
-  <text x="608" y="342" text-anchor="middle" fill="#e65100" font-size="9.5" font-weight="600" font-family="sans-serif">Router Replayer (R3)</text>
-  <text x="608" y="356" text-anchor="middle" fill="#777" font-size="8" font-family="sans-serif">Inject routing distributions</text>
-
-  <rect x="718" y="324" width="200" height="40" rx="6" fill="#e8eaf6" stroke="#3f51b5" stroke-width="1"/>
-  <text x="818" y="342" text-anchor="middle" fill="#283593" font-size="9.5" font-weight="600" font-family="sans-serif">MoE Grouped GEMM</text>
-  <text x="818" y="356" text-anchor="middle" fill="#777" font-size="8" font-family="sans-serif">AITER Fused Experts</text>
-
-  <!-- R3 arrow: Recorder -> down -> across -> up -> Replayer -->
-  <line x1="148" y1="364" x2="148" y2="394" stroke="#e65100" stroke-width="2" stroke-dasharray="6,3"/>
-  <line x1="148" y1="394" x2="608" y2="394" stroke="#e65100" stroke-width="2" stroke-dasharray="6,3"/>
-  <line x1="608" y1="394" x2="608" y2="370" stroke="#e65100" stroke-width="2" stroke-dasharray="6,3"/>
-  <polygon points="608,364 603,372 613,372" fill="#e65100"/>
-
-
-
-  <!-- Arrow down -->
-  <line x1="480" y1="402" x2="480" y2="418" stroke="#999" stroke-width="1.5"/>
-  <polygon points="480,422 475,414 485,414" fill="#999"/>
-
-  <!-- Layer 3: FP8-RL Quantization -->
-  <rect x="30" y="422" width="900" height="64" rx="10" fill="#fff3e0" stroke="#e65100" stroke-width="1.5"/>
-  <text x="480" y="442" text-anchor="middle" fill="#e65100" font-size="10" font-weight="700" font-family="sans-serif" letter-spacing="1">FP8-RL QUANTIZATION STACK</text>
-
-  <rect x="48" y="451" width="192" height="26" rx="6" fill="#ffe0b2" stroke="#e65100" stroke-width="1"/>
-  <text x="144" y="469" text-anchor="middle" fill="#bf360c" font-size="9.5" font-weight="600" font-family="sans-serif">FP8 Rollout (W8A8)</text>
-
-  <rect x="252" y="451" width="192" height="26" rx="6" fill="#ffe0b2" stroke="#e65100" stroke-width="1"/>
-  <text x="348" y="469" text-anchor="middle" fill="#bf360c" font-size="9.5" font-weight="600" font-family="sans-serif">FP8 Weight Quantizer</text>
-
-  <rect x="456" y="451" width="192" height="26" rx="6" fill="#ffe0b2" stroke="#e65100" stroke-width="1"/>
-  <text x="552" y="469" text-anchor="middle" fill="#bf360c" font-size="9.5" font-weight="600" font-family="sans-serif">FP8 KV-Cache Quant</text>
-
-  <rect x="660" y="451" width="252" height="26" rx="6" fill="#ffe0b2" stroke="#e65100" stroke-width="1"/>
-  <text x="786" y="469" text-anchor="middle" fill="#bf360c" font-size="9.5" font-weight="600" font-family="sans-serif">Rollout Correction (TIS / MIS)</text>
-
-  <!-- Arrow down -->
-  <line x1="480" y1="486" x2="480" y2="504" stroke="#999" stroke-width="1.5"/>
-  <polygon points="480,508 475,500 485,500" fill="#999"/>
-
-  <!-- Layer 4: AITER + MORI -->
-  <rect x="30" y="508" width="440" height="68" rx="10" fill="#e8f5e9" stroke="#388e3c" stroke-width="1.5"/>
-  <text x="250" y="530" text-anchor="middle" fill="#2e7d32" font-size="10" font-weight="700" font-family="sans-serif" letter-spacing="0.5">AITER  |  KERNEL PROVIDER</text>
-  <text x="250" y="548" text-anchor="middle" fill="#555" font-size="11" font-family="sans-serif">ASM &gt; CK &gt; Triton fallback chain</text>
-  <text x="250" y="564" text-anchor="middle" fill="#555" font-size="11" font-family="sans-serif">Attention / GEMM / MoE / Norm / RoPE</text>
-
-  <rect x="490" y="508" width="440" height="68" rx="10" fill="#e0f2f1" stroke="#00796b" stroke-width="1.5"/>
-  <text x="710" y="530" text-anchor="middle" fill="#00695c" font-size="10" font-weight="700" font-family="sans-serif" letter-spacing="0.5">MORI  |  COMMUNICATION PROVIDER</text>
-  <text x="710" y="548" text-anchor="middle" fill="#555" font-size="11" font-family="sans-serif">MORI-CCL (AG, RS, AR) + MORI-EP (MoE)</text>
-  <text x="710" y="564" text-anchor="middle" fill="#555" font-size="11" font-family="sans-serif">Device-side RDMA / FP8 / AINIC / CX-7</text>
-
-  <!-- Arrow down -->
-  <line x1="480" y1="576" x2="480" y2="596" stroke="#999" stroke-width="1.5"/>
-  <polygon points="480,600 475,592 485,592" fill="#999"/>
-
-  <!-- Layer 5: Hardware -->
-  <rect x="30" y="600" width="900" height="52" rx="10" fill="#fde8e8" stroke="#d32f2f" stroke-width="1.5"/>
-  <text x="480" y="620" text-anchor="middle" fill="#c62828" font-size="10" font-weight="600" font-family="sans-serif" letter-spacing="1">HARDWARE</text>
-  <text x="480" y="640" text-anchor="middle" fill="#333" font-size="15" font-weight="700" font-family="sans-serif">AMD Instinct MI300X / MI355X  --  ROCm</text>
-
-  <!-- Footer -->
-  <text x="480" y="674" text-anchor="middle" fill="#999" font-size="9.5" font-style="italic" font-family="sans-serif">All cross-worker communication via DataProto  |  Ray-orchestrated  |  AMD-native</text>
-
-</svg>
-    </div>
-  </div>
-</section>
-
-<section class="code-section" id="quickstart">
-  <div class="container">
-    <h2 class="section-title">Quick Start</h2>
-    <p class="section-sub">Docker or editable install, then launch GRPO with BF16, FP8, or MoE R3 configs</p>
-    <div class="code-grid">
-      <div class="code-block">
-        <div class="code-header"><span class="lang-dot"></span> Install</div>
-<pre><span class="cm"># Docker (recommended)</span>
-docker pull rocm/atom-dev:latest
-docker run -it --network=host \
-  --device=/dev/kfd --device=/dev/dri \
-  --group-add video --cap-add=SYS_PTRACE \
-  --security-opt seccomp=unconfined \
-  --shm-size=16G -v $HOME:/home/$USER \
-  rocm/atom-dev:latest
-
-<span class="cm"># Inside container — developer install</span>
-git clone https://github.com/ZhangDanyang-AMD/Lumen-RL.git &amp;&amp; cd Lumen-RL
-pip install -e <span class="str">".[all]"</span></pre>
-      </div>
-      <div class="code-block">
-        <div class="code-header"><span class="lang-dot" style="background:var(--yellow)"></span> Run GRPO</div>
-<pre><span class="cm"># BF16 baseline (single GPU)</span>
-python examples/run_grpo.py --config configs/grpo_dense_bf16.yaml
-
-<span class="cm"># FP8 end-to-end</span>
-python examples/run_grpo.py --config configs/grpo_dense_fp8.yaml
-
-<span class="cm"># 8 GPUs</span>
-python examples/run_grpo.py --config configs/grpo_dense_fp8_8gpu.yaml
-
-<span class="cm"># MoE + R3 + FP8</span>
-python examples/run_grpo.py --config configs/grpo_moe_fp8_r3.yaml</pre>
-      </div>
-      <div class="code-block">
-        <div class="code-header"><span class="lang-dot" style="background:var(--green)"></span> FP8 Config</div>
-<pre>quantization:
-  rollout:
-    precision: fp8
-    use_deep_gemm: true
-    num_first_layers_in_bf16: <span class="num">0</span>
-    num_last_layers_in_bf16: <span class="num">0</span>
-  training:
-    fp8: hybrid
-    fp8_recipe: blockwise
-    fp8_weight_cache: true
-  rollout_correction:
-    enabled: true
-    method: tis
-    clip: <span class="num">1.5</span></pre>
-      </div>
-      <div class="code-block">
-        <div class="code-header"><span class="lang-dot" style="background:var(--purple)"></span> MoE R3 Config</div>
-<pre>moe:
-  r3:
-    enabled: true
-    record_router_logits: true
-    replay_mode: distribution</pre>
+      <div class="fcard">
+        <div class="ic" style="background:rgba(255,255,255,0.05);color:var(--text-dim)">&#9879;</div>
+        <h3>Production Ready</h3>
+        <p>Ray orchestration, YAML configs, multi-node SLURM launch, Docker images, and checkpoint/resume for long training runs.</p>
       </div>
     </div>
   </div>
 </section>
 
-<section class="ops-section" id="algorithms">
-  <div class="container">
-    <h2 class="section-title">Algorithms</h2>
-    <p class="section-sub">Policy optimization objectives implemented under <code>algorithms/</code></p>
-    <table class="ops-table">
-      <thead>
-        <tr><th>Algorithm</th><th>Source</th><th>Loss Type</th><th>Advantages</th></tr>
-      </thead>
+<section class="arch" id="arch">
+  <div class="wrap">
+    <p class="stitle">// system design</p>
+    <h2 class="htitle">Architecture</h2>
+    <p class="hsub">Ray controller orchestrates ATOM inference and Lumen training, connected by DataProto</p>
+    <div class="arch-box">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 680">
+        <rect width="960" height="680" rx="12" fill="#0a0a0f"/>
+        <text x="480" y="28" text-anchor="middle" fill="#8b8ba0" font-size="10" font-weight="700" font-family="monospace" letter-spacing="3">LUMENRL ARCHITECTURE</text>
+
+        <!-- Layer 0: Algorithms -->
+        <rect x="30" y="44" width="900" height="48" rx="8" fill="none" stroke="#a78bfa" stroke-width="1.2" stroke-dasharray="4,3"/>
+        <text x="480" y="62" text-anchor="middle" fill="#a78bfa" font-size="9" font-weight="700" font-family="monospace" letter-spacing="2">RL ALGORITHMS</text>
+        <text x="240" y="80" text-anchor="middle" fill="#e8e8ef" font-size="13" font-weight="700" font-family="system-ui">GRPO</text>
+        <text x="480" y="80" text-anchor="middle" fill="#e8e8ef" font-size="13" font-weight="700" font-family="system-ui">DAPO</text>
+        <text x="720" y="80" text-anchor="middle" fill="#e8e8ef" font-size="13" font-weight="700" font-family="system-ui">PPO</text>
+
+        <line x1="480" y1="92" x2="480" y2="108" stroke="#5e5e74" stroke-width="1.2"/>
+        <polygon points="480,112 476,106 484,106" fill="#5e5e74"/>
+
+        <!-- Layer 1: Ray Controller -->
+        <rect x="30" y="112" width="900" height="68" rx="8" fill="#12121a" stroke="#1976d2" stroke-width="1.2"/>
+        <text x="480" y="130" text-anchor="middle" fill="#42a5f5" font-size="9" font-weight="700" font-family="monospace" letter-spacing="2">RAY CONTROLLER</text>
+        <rect x="50" y="138" width="130" height="30" rx="5" fill="#1a237e" stroke="#42a5f5" stroke-width="1"/><text x="115" y="158" text-anchor="middle" fill="#90caf9" font-size="10" font-weight="600" font-family="system-ui">RLTrainer</text>
+        <rect x="195" y="138" width="130" height="30" rx="5" fill="#1a237e" stroke="#42a5f5" stroke-width="1"/><text x="260" y="158" text-anchor="middle" fill="#90caf9" font-size="10" font-weight="600" font-family="system-ui">DataManager</text>
+        <rect x="340" y="138" width="130" height="30" rx="5" fill="#1a237e" stroke="#42a5f5" stroke-width="1"/><text x="405" y="158" text-anchor="middle" fill="#90caf9" font-size="10" font-weight="600" font-family="system-ui">WorkerGroups</text>
+        <rect x="485" y="138" width="130" height="30" rx="5" fill="#1a237e" stroke="#42a5f5" stroke-width="1"/><text x="550" y="158" text-anchor="middle" fill="#90caf9" font-size="10" font-weight="600" font-family="system-ui">Callbacks</text>
+        <rect x="630" y="138" width="280" height="30" rx="5" fill="#1a237e" stroke="#42a5f5" stroke-width="1"/><text x="770" y="158" text-anchor="middle" fill="#90caf9" font-size="10" font-weight="600" font-family="system-ui">Checkpoint &bull; Logging &bull; Metrics</text>
+
+        <text x="240" y="196" text-anchor="middle" fill="#5e5e74" font-size="8" font-weight="600" font-family="monospace">dispatch DataProto</text>
+        <line x1="240" y1="200" x2="240" y2="218" stroke="#5e5e74" stroke-width="1.2"/><polygon points="240,222 236,216 244,216" fill="#5e5e74"/>
+        <text x="720" y="196" text-anchor="middle" fill="#5e5e74" font-size="8" font-weight="600" font-family="monospace">collect DataProto</text>
+        <line x1="720" y1="200" x2="720" y2="218" stroke="#5e5e74" stroke-width="1.2"/><polygon points="720,222 716,216 724,216" fill="#5e5e74"/>
+
+        <!-- Layer 2 Left: ATOM -->
+        <rect x="30" y="222" width="440" height="160" rx="8" fill="#0d1a0d" stroke="#388e3c" stroke-width="1.2"/>
+        <text x="250" y="242" text-anchor="middle" fill="#66bb6a" font-size="9" font-weight="700" font-family="monospace" letter-spacing="2">ATOM &middot; INFERENCE</text>
+        <rect x="46" y="252" width="120" height="44" rx="5" fill="#1b2e1b" stroke="#388e3c" stroke-width="1"/><text x="106" y="270" text-anchor="middle" fill="#a5d6a7" font-size="9.5" font-weight="600" font-family="system-ui">FP8 W8A8</text><text x="106" y="284" text-anchor="middle" fill="#5e5e74" font-size="8" font-family="system-ui">Blockwise Quant</text>
+        <rect x="176" y="252" width="120" height="44" rx="5" fill="#1b2e1b" stroke="#388e3c" stroke-width="1"/><text x="236" y="270" text-anchor="middle" fill="#a5d6a7" font-size="9.5" font-weight="600" font-family="system-ui">FP8 KV-Cache</text><text x="236" y="284" text-anchor="middle" fill="#5e5e74" font-size="8" font-family="system-ui">QKV Recalib</text>
+        <rect x="306" y="252" width="148" height="44" rx="5" fill="#1b2e1b" stroke="#388e3c" stroke-width="1"/><text x="380" y="270" text-anchor="middle" fill="#a5d6a7" font-size="9.5" font-weight="600" font-family="system-ui">MoE Expert Par.</text><text x="380" y="284" text-anchor="middle" fill="#5e5e74" font-size="8" font-family="system-ui">MORI Dispatch</text>
+        <rect x="46" y="306" width="195" height="36" rx="5" fill="#2a1800" stroke="#e65100" stroke-width="1"/><text x="144" y="322" text-anchor="middle" fill="#ffab40" font-size="9" font-weight="600" font-family="system-ui">Router Recorder (R3)</text><text x="144" y="335" text-anchor="middle" fill="#5e5e74" font-size="7.5" font-family="system-ui">Capture MoE routing logits</text>
+        <rect x="251" y="306" width="205" height="36" rx="5" fill="#0d0d2a" stroke="#3f51b5" stroke-width="1"/><text x="354" y="322" text-anchor="middle" fill="#9fa8da" font-size="9" font-weight="600" font-family="system-ui">Generation Interface</text><text x="354" y="335" text-anchor="middle" fill="#5e5e74" font-size="7.5" font-family="system-ui">Batch rollout + sampling</text>
+
+        <!-- Layer 2 Right: Lumen -->
+        <rect x="490" y="222" width="440" height="160" rx="8" fill="#1a0d0d" stroke="#d32f2f" stroke-width="1.2"/>
+        <text x="710" y="242" text-anchor="middle" fill="#ef5350" font-size="9" font-weight="700" font-family="monospace" letter-spacing="2">LUMEN &middot; TRAINING</text>
+        <rect x="506" y="252" width="120" height="44" rx="5" fill="#2e1b1b" stroke="#d32f2f" stroke-width="1"/><text x="566" y="270" text-anchor="middle" fill="#ef9a9a" font-size="9.5" font-weight="600" font-family="system-ui">FSDP2</text><text x="566" y="284" text-anchor="middle" fill="#5e5e74" font-size="8" font-family="system-ui">Full Shard + FP8</text>
+        <rect x="636" y="252" width="130" height="44" rx="5" fill="#2e1b1b" stroke="#d32f2f" stroke-width="1"/><text x="701" y="270" text-anchor="middle" fill="#ef9a9a" font-size="9.5" font-weight="600" font-family="system-ui">Megatron-Core</text><text x="701" y="284" text-anchor="middle" fill="#5e5e74" font-size="8" font-family="system-ui">TP / PP / EP / DP</text>
+        <rect x="776" y="252" width="140" height="44" rx="5" fill="#2e1b1b" stroke="#d32f2f" stroke-width="1"/><text x="846" y="270" text-anchor="middle" fill="#ef9a9a" font-size="9.5" font-weight="600" font-family="system-ui">FP8 Training</text><text x="846" y="284" text-anchor="middle" fill="#5e5e74" font-size="8" font-family="system-ui">Hybrid E4M3 / E5M2</text>
+        <rect x="506" y="306" width="195" height="36" rx="5" fill="#2a1800" stroke="#e65100" stroke-width="1"/><text x="604" y="322" text-anchor="middle" fill="#ffab40" font-size="9" font-weight="600" font-family="system-ui">Router Replayer (R3)</text><text x="604" y="335" text-anchor="middle" fill="#5e5e74" font-size="7.5" font-family="system-ui">Inject routing distributions</text>
+        <rect x="711" y="306" width="205" height="36" rx="5" fill="#0d0d2a" stroke="#3f51b5" stroke-width="1"/><text x="814" y="322" text-anchor="middle" fill="#9fa8da" font-size="9" font-weight="600" font-family="system-ui">MoE Grouped GEMM</text><text x="814" y="335" text-anchor="middle" fill="#5e5e74" font-size="7.5" font-family="system-ui">AITER Fused Experts</text>
+
+        <!-- R3 Arrow -->
+        <line x1="144" y1="342" x2="144" y2="375" stroke="#e65100" stroke-width="1.5" stroke-dasharray="5,3"/>
+        <line x1="144" y1="375" x2="604" y2="375" stroke="#e65100" stroke-width="1.5" stroke-dasharray="5,3"/>
+        <line x1="604" y1="375" x2="604" y2="348" stroke="#e65100" stroke-width="1.5" stroke-dasharray="5,3"/>
+        <polygon points="604,342 600,350 608,350" fill="#e65100"/>
+
+        <line x1="480" y1="384" x2="480" y2="400" stroke="#5e5e74" stroke-width="1.2"/><polygon points="480,404 476,398 484,398" fill="#5e5e74"/>
+
+        <!-- Layer 3: Quantization -->
+        <rect x="30" y="404" width="900" height="56" rx="8" fill="#1a1400" stroke="#e65100" stroke-width="1.2"/>
+        <text x="480" y="422" text-anchor="middle" fill="#ffab40" font-size="9" font-weight="700" font-family="monospace" letter-spacing="2">FP8-RL QUANTIZATION STACK</text>
+        <rect x="46" y="432" width="185" height="22" rx="4" fill="#2a1800" stroke="#e65100" stroke-width="0.8"/><text x="139" y="447" text-anchor="middle" fill="#ffcc80" font-size="9" font-weight="600" font-family="system-ui">FP8 Rollout (W8A8)</text>
+        <rect x="241" y="432" width="185" height="22" rx="4" fill="#2a1800" stroke="#e65100" stroke-width="0.8"/><text x="334" y="447" text-anchor="middle" fill="#ffcc80" font-size="9" font-weight="600" font-family="system-ui">FP8 Weight Quantizer</text>
+        <rect x="436" y="432" width="185" height="22" rx="4" fill="#2a1800" stroke="#e65100" stroke-width="0.8"/><text x="529" y="447" text-anchor="middle" fill="#ffcc80" font-size="9" font-weight="600" font-family="system-ui">FP8 KV-Cache Quant</text>
+        <rect x="631" y="432" width="285" height="22" rx="4" fill="#2a1800" stroke="#e65100" stroke-width="0.8"/><text x="774" y="447" text-anchor="middle" fill="#ffcc80" font-size="9" font-weight="600" font-family="system-ui">Rollout Correction (TIS / MIS)</text>
+
+        <line x1="480" y1="460" x2="480" y2="478" stroke="#5e5e74" stroke-width="1.2"/><polygon points="480,482 476,476 484,476" fill="#5e5e74"/>
+
+        <!-- Layer 4: AITER + MORI -->
+        <rect x="30" y="482" width="440" height="62" rx="8" fill="#0d1a0d" stroke="#388e3c" stroke-width="1.2"/>
+        <text x="250" y="502" text-anchor="middle" fill="#66bb6a" font-size="9" font-weight="700" font-family="monospace" letter-spacing="1">AITER &middot; KERNEL PROVIDER</text>
+        <text x="250" y="518" text-anchor="middle" fill="#5e5e74" font-size="10" font-family="system-ui">ASM &gt; CK &gt; Triton &bull; Attention / GEMM / MoE / Norm</text>
+        <text x="250" y="534" text-anchor="middle" fill="#5e5e74" font-size="10" font-family="system-ui">FP8 blockwise &bull; MXFP8 &bull; per-tensor</text>
+
+        <rect x="490" y="482" width="440" height="62" rx="8" fill="#0d1a1a" stroke="#00796b" stroke-width="1.2"/>
+        <text x="710" y="502" text-anchor="middle" fill="#4db6ac" font-size="9" font-weight="700" font-family="monospace" letter-spacing="1">MORI &middot; COMMUNICATION</text>
+        <text x="710" y="518" text-anchor="middle" fill="#5e5e74" font-size="10" font-family="system-ui">MORI-CCL (AG, RS, AR) + MORI-EP (MoE)</text>
+        <text x="710" y="534" text-anchor="middle" fill="#5e5e74" font-size="10" font-family="system-ui">Device-side RDMA &bull; FP8 &bull; AINIC &bull; CX-7</text>
+
+        <line x1="480" y1="544" x2="480" y2="562" stroke="#5e5e74" stroke-width="1.2"/><polygon points="480,566 476,560 484,560" fill="#5e5e74"/>
+
+        <!-- Layer 5: Hardware -->
+        <rect x="30" y="566" width="900" height="48" rx="8" fill="none" stroke="#d32f2f" stroke-width="1.2"/>
+        <text x="480" y="584" text-anchor="middle" fill="#ef5350" font-size="9" font-weight="700" font-family="monospace" letter-spacing="2">HARDWARE</text>
+        <text x="480" y="602" text-anchor="middle" fill="#e8e8ef" font-size="14" font-weight="700" font-family="system-ui">AMD Instinct MI300X / MI355X &mdash; ROCm</text>
+
+        <text x="480" y="644" text-anchor="middle" fill="#5e5e74" font-size="9" font-style="italic" font-family="system-ui">All cross-worker communication via DataProto &bull; Ray-orchestrated &bull; AMD-native</text>
+      </svg>
+    </div>
+  </div>
+</section>
+
+<section class="qs" id="quickstart">
+  <div class="wrap">
+    <p class="stitle">// get started</p>
+    <h2 class="htitle">Quick Start</h2>
+    <p class="hsub">Docker or editable install, then launch with BF16, FP8, or MoE R3 configs</p>
+    <div class="qs-grid">
+      <div class="cblock">
+        <div class="ch"><i style="background:var(--amd-red)"></i> install</div>
+<pre><span class="c"># Clone with submodules</span>
+git clone --recursive \
+  https://github.com/ZhangDanyang-AMD/Lumen-RL.git
+cd Lumen-RL
+
+<span class="c"># Docker build</span>
+bash docker/build.sh
+
+<span class="c"># Or editable install</span>
+pip install -e <span class="s">".[dev]"</span>
+pip install -e <span class="s">third_party/Lumen</span>
+pip install -e <span class="s">third_party/verl</span></pre>
+      </div>
+      <div class="cblock">
+        <div class="ch"><i style="background:var(--lime)"></i> run</div>
+<pre><span class="c"># BF16 baseline (single node, 8 GPU)</span>
+python examples/run_grpo.py \
+  --config configs/grpo_dense_bf16.yaml
+
+<span class="c"># FP8 end-to-end</span>
+python examples/run_grpo.py \
+  --config configs/grpo_dense_fp8.yaml
+
+<span class="c"># MoE + R3 + FP8</span>
+python examples/run_grpo.py \
+  --config configs/grpo_moe_fp8_r3.yaml</pre>
+      </div>
+      <div class="cblock">
+        <div class="ch"><i style="background:var(--cyan)"></i> fp8 config</div>
+<pre><span class="k">quantization</span>:
+  <span class="v">rollout</span>:
+    precision: <span class="s">fp8</span>
+    use_deep_gemm: <span class="n">true</span>
+  <span class="v">training</span>:
+    fp8: <span class="s">hybrid</span>
+    fp8_recipe: <span class="s">blockwise</span>
+    fp8_weight_cache: <span class="n">true</span>
+  <span class="v">rollout_correction</span>:
+    enabled: <span class="n">true</span>
+    method: <span class="s">tis</span>
+    clip: <span class="n">1.5</span></pre>
+      </div>
+      <div class="cblock">
+        <div class="ch"><i style="background:var(--violet)"></i> moe r3 config</div>
+<pre><span class="k">moe</span>:
+  <span class="v">r3</span>:
+    enabled: <span class="n">true</span>
+    record_router_logits: <span class="n">true</span>
+    replay_mode: <span class="s">distribution</span>
+
+<span class="c"># DAPO example</span>
+bash examples/DAPO/run_1a_bf16_baseline.sh
+bash examples/DAPO/run_1d_fp8_e2e_blockwise.sh</pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="tbl-section" id="algorithms">
+  <div class="wrap">
+    <p class="stitle">// algorithms</p>
+    <h2 class="htitle">RL Algorithms</h2>
+    <p class="hsub">Policy optimization objectives under <code>lumenrl/algorithms/</code></p>
+    <table class="tbl">
+      <thead><tr><th>Algorithm</th><th>Source</th><th>Loss</th><th>Advantages</th></tr></thead>
       <tbody>
-        <tr>
-          <td>GRPO</td><td><code>algorithms/grpo.py</code></td><td>Clipped Surrogate</td>
-          <td><span class="tag tag-green">Group-relative normalized</span></td>
-        </tr>
-        <tr>
-          <td>DAPO</td><td><code>algorithms/dapo.py</code></td><td>Asymmetric Clip</td>
-          <td><span class="tag tag-blue">Group-relative + dynamic sampling</span></td>
-        </tr>
-        <tr>
-          <td>PPO</td><td><code>algorithms/ppo.py</code></td><td>Clipped Surrogate + Value</td>
-          <td><span class="tag tag-purple">GAE-Lambda</span></td>
-        </tr>
+        <tr><td>GRPO</td><td><code>grpo.py</code></td><td>Clipped Surrogate</td><td><span class="tag tag-l">Group-relative</span></td></tr>
+        <tr><td>DAPO</td><td><code>dapo.py</code></td><td>Asymmetric Clip</td><td><span class="tag tag-g">Group-relative + Dynamic Sampling</span></td></tr>
+        <tr><td>PPO</td><td><code>ppo.py</code></td><td>Clipped Surrogate + Value</td><td><span class="tag tag-v">GAE-Lambda</span></td></tr>
       </tbody>
     </table>
   </div>
 </section>
 
-<section class="code-section" id="models">
-  <div class="container">
-    <h2 class="section-title">Supported Models</h2>
-    <p class="section-sub">Dense and MoE architectures with FP8 rollout and training; R3 where MoE routing alignment applies</p>
-    <table class="ops-table">
-      <thead>
-        <tr><th>Model</th><th>Architecture</th><th>Dense/MoE</th><th>FP8</th><th>R3</th></tr>
-      </thead>
+<section class="tbl-section" id="models">
+  <div class="wrap">
+    <p class="stitle">// models</p>
+    <h2 class="htitle">Supported Models</h2>
+    <p class="hsub">Dense and MoE architectures with FP8 rollout, FP8 training, and R3 router alignment</p>
+    <table class="tbl">
+      <thead><tr><th>Model</th><th>Architecture</th><th>Type</th><th>FP8</th><th>R3</th></tr></thead>
       <tbody>
-        <tr>
-          <td>Llama 3.x</td><td><code>LlamaForCausalLM</code></td><td>Dense</td>
-          <td><span class="tag tag-green">Yes</span></td><td>N/A</td>
-        </tr>
-        <tr>
-          <td>Qwen3</td><td><code>Qwen3ForCausalLM</code></td><td>Dense</td>
-          <td><span class="tag tag-green">Yes</span></td><td>N/A</td>
-        </tr>
-        <tr>
-          <td>Qwen3-MoE</td><td><code>Qwen3MoeForCausalLM</code></td><td>MoE</td>
-          <td><span class="tag tag-green">Yes</span></td><td><span class="tag tag-blue">Yes</span></td>
-        </tr>
-        <tr>
-          <td>DeepSeek V2/V3</td><td><code>DeepseekV3ForCausalLM</code></td><td>MoE</td>
-          <td><span class="tag tag-green">Yes</span></td><td><span class="tag tag-blue">Yes</span></td>
-        </tr>
-        <tr>
-          <td>Mixtral</td><td><code>MixtralForCausalLM</code></td><td>MoE</td>
-          <td><span class="tag tag-green">Yes</span></td><td><span class="tag tag-blue">Yes</span></td>
-        </tr>
+        <tr><td>Llama 3.x</td><td><code>LlamaForCausalLM</code></td><td>Dense</td><td><span class="tag tag-g">Yes</span></td><td>&mdash;</td></tr>
+        <tr><td>Qwen3</td><td><code>Qwen3ForCausalLM</code></td><td>Dense</td><td><span class="tag tag-g">Yes</span></td><td>&mdash;</td></tr>
+        <tr><td>Qwen3-MoE</td><td><code>Qwen3MoeForCausalLM</code></td><td>MoE</td><td><span class="tag tag-g">Yes</span></td><td><span class="tag tag-v">Yes</span></td></tr>
+        <tr><td>DeepSeek V2/V3</td><td><code>DeepseekV3ForCausalLM</code></td><td>MoE</td><td><span class="tag tag-g">Yes</span></td><td><span class="tag tag-v">Yes</span></td></tr>
+        <tr><td>Mixtral</td><td><code>MixtralForCausalLM</code></td><td>MoE</td><td><span class="tag tag-g">Yes</span></td><td><span class="tag tag-v">Yes</span></td></tr>
       </tbody>
     </table>
+  </div>
+</section>
+
+<section class="exp" id="experiments">
+  <div class="wrap">
+    <p class="stitle">// experiments</p>
+    <h2 class="htitle">FP8 Alignment Experiments</h2>
+    <p class="hsub">DAPO on Qwen3-8B-Base, 8&times; MI350X &mdash; reproducing VERL FP8 benchmarks</p>
+    <div class="exp-grid">
+      <div class="ecard">
+        <h3>Experiment 1A &mdash; BF16 Baseline</h3>
+        <p>Pure BF16 training + BF16 rollout. Reference curve for all FP8 comparisons.</p>
+        <pre>bash examples/DAPO/run_1a_bf16_baseline.sh</pre>
+      </div>
+      <div class="ecard">
+        <h3>Experiment 1B &mdash; FP8 Rollout + TIS</h3>
+        <p>BF16 training + FP8 rollout with token-level importance sampling. Expected: 1B &asymp; 1A.</p>
+        <pre>bash examples/DAPO/run_1b_fp8_rollout_tis.sh</pre>
+      </div>
+      <div class="ecard">
+        <h3>Experiment 1D &mdash; FP8 E2E Blockwise</h3>
+        <p>Full Lumen FP8 training (blockwise 128) + FP8 rollout + TIS. Priority 1 &mdash; closest to TE reference.</p>
+        <pre>bash examples/DAPO/run_1d_fp8_e2e_blockwise.sh</pre>
+      </div>
+      <div class="ecard">
+        <h3>Experiment 1F &mdash; FP8 E2E Per-Tensor</h3>
+        <p>Lumen FP8 per-tensor delayed scaling. Coarsest granularity &mdash; validates lower bound.</p>
+        <pre>bash examples/DAPO/run_1f_fp8_e2e_per_tensor.sh</pre>
+      </div>
+      <div class="ecard full">
+        <h3>Experiment Matrix</h3>
+        <p>Complete matrix includes MXFP8 sweep (block=32/64/128), attention FP8 sweep, and optimizer sweep. See the <a href="https://github.com/ZhangDanyang-AMD/Lumen-RL/blob/main/examples/DAPO/README.md">DAPO README</a> and the <a href="https://github.com/ZhangDanyang-AMD/Lumen/blob/dev/RL/outputs/fp8_training_alignment/FP8_TRAINING_ALIGNMENT_PLAN.md">FP8 Training Alignment Plan</a> for the full 30+ run matrix across Qwen3-8B, Qwen3-30B-A3B-Base, and Qwen3-30B-A3B.</p>
+      </div>
+    </div>
   </div>
 </section>
 
 <footer>
-  <div class="container">
-    <p><strong>LumenRL</strong> — Apache License 2.0 — &copy; 2026 AMD</p>
-    <p style="margin-top:8px">
-      <a href="https://github.com/ZhangDanyang-AMD/Lumen-RL">GitHub</a> &middot;
-      <a href="https://github.com/ZhangDanyang-AMD/Lumen">Lumen</a> &middot;
-      <a href="https://github.com/ROCm/ATOM">ATOM</a> &middot;
-      <a href="https://github.com/ROCm/aiter">AITER</a> &middot;
-      <a href="https://github.com/ROCm/mori">MORI</a> &middot;
+  <div class="wrap">
+    <p><strong>LumenRL</strong> &mdash; Apache License 2.0 &mdash; &copy; 2026 AMD</p>
+    <div class="links">
+      <a href="https://github.com/ZhangDanyang-AMD/Lumen-RL">GitHub</a>
+      <a href="https://github.com/ZhangDanyang-AMD/Lumen">Lumen</a>
+      <a href="https://github.com/ROCm/ATOM">ATOM</a>
+      <a href="https://github.com/ROCm/aiter">AITER</a>
+      <a href="https://github.com/ROCm/mori">MORI</a>
       <a href="https://rocm.docs.amd.com/">ROCm Docs</a>
-    </p>
+    </div>
   </div>
 </footer>
 
