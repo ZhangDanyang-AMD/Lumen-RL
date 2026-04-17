@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Common DAPO configuration for LumenRL FP8 training alignment experiments.
-# Adapted from Lumen/examples/rl/verl/dapo/common.sh for the LumenRL framework.
+# Legacy experiment runner (uses VERL entry point during transition to LumenRL native trainer).
 #
 # Source this file from individual run scripts.
 
@@ -119,8 +119,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export VLLM_USE_V1=1
 
 # ─── Entry point selection ────────────────────────────────────────────────────
-# Uses Lumen's VERL entry point when any Lumen feature is enabled,
-# otherwise falls back to stock VERL.
+# LEGACY: Uses VERL entry point during transition to LumenRL native trainer.
 VERL_ENTRY="verl.trainer.main_ppo"
 if [ "${FP8_PARAM_MANAGER}" = "1" ] || [ "${LUMEN_FP8}" = "1" ] \
    || [ "${LUMEN_NORM}" = "1" ] || [ "${LUMEN_FP8_ACTIVATION_STORE}" = "1" ] \
@@ -129,7 +128,7 @@ if [ "${FP8_PARAM_MANAGER}" = "1" ] || [ "${LUMEN_FP8}" = "1" ] \
 fi
 
 # ─── Patches ─────────────────────────────────────────────────────────────────
-# Apply LumenRL/Lumen-specific patches to VERL and vLLM if present.
+# LEGACY: Apply patches to VERL and vLLM (will be removed when LumenRL native trainer is ready).
 PATCHES_DIR="${SCRIPT_DIR}/patches"
 if [ -d "${PATCHES_DIR}" ] && [ "$(ls -A "${PATCHES_DIR}" 2>/dev/null)" ]; then
     echo ">>> Applying LumenRL patches from ${PATCHES_DIR}"

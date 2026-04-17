@@ -6,7 +6,7 @@
 # Full Lumen FP8 E2E training with blockwise scaling (128-element blocks),
 # matching the FP8-RL paper's TE blockwise approach.
 #
-# This is the PRIORITY 1 FP8 E2E run — closest match to VERL reference.
+# This is the PRIORITY 1 FP8 E2E run — closest match to the FP8 reference.
 # Expected: 1D ≈ 1A (FP8 training aligns with BF16).
 # ═══════════════════════════════════════════════════════════════════════════════
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

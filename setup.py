@@ -22,11 +22,11 @@ setup(
         "accelerate>=0.28",
     ],
     extras_require={
-        # NOTE: lumen and atom are installed from source (submodules or editable).
+        # NOTE: lumen, aiter, and mori are installed from source (submodules).
         # They are NOT on PyPI. Install them separately:
         #   pip install -e third_party/Lumen       (training engine)
-        #   pip install -e third_party/verl         (RL orchestrator)
-        # AITER/mori are built from Lumen's third_party/.
+        #   pip install -e third_party/aiter        (GPU kernels)
+        #   pip install -e third_party/mori         (communication)
         "test": [
             "pytest>=8.0",
             "pytest-xdist>=3.5",

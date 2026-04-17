@@ -32,8 +32,13 @@ if [ ! -d "third_party/Lumen/lumen" ]; then
     echo "  git submodule update --init --recursive"
     exit 1
 fi
-if [ ! -d "third_party/verl/verl" ]; then
-    echo "ERROR: VERL submodule not initialized. Run:"
+if [ ! -d "third_party/aiter/aiter" ]; then
+    echo "ERROR: AITER submodule not initialized. Run:"
+    echo "  git submodule update --init --recursive"
+    exit 1
+fi
+if [ ! -d "third_party/mori" ]; then
+    echo "ERROR: MORI submodule not initialized. Run:"
     echo "  git submodule update --init --recursive"
     exit 1
 fi

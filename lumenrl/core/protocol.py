@@ -13,9 +13,8 @@ logger = logging.getLogger(__name__)
 class DataProto:
     """A tensor-dict batch that flows between controller and workers.
 
-    Inspired by VeRL's DataProto. All cross-worker data exchange uses this
-    format. Tensors are stored on CPU for serialization; workers move them
-    to GPU as needed.
+    All cross-worker data exchange uses this format. Tensors are stored on
+    CPU for serialization; workers move them to GPU as needed.
     """
 
     def __init__(self, tensors: dict[str, torch.Tensor] | None = None,

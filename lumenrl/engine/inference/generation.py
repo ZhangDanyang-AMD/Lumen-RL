@@ -1,4 +1,4 @@
-"""NeMo RL-style generation facade over :class:`~lumenrl.engine.inference.atom_engine.AtomEngine`."""
+"""Generation facade over :class:`~lumenrl.engine.inference.atom_engine.AtomEngine`."""
 
 from __future__ import annotations
 
@@ -17,9 +17,8 @@ logger = logging.getLogger(__name__)
 class GenerationInterface:
     """Prepare / generate / finish lifecycle for rollout DataProto batches.
 
-    Mirrors the coarse structure used in NeMo RL: amortize setup costs in
-    ``prepare_for_generation``, stream ``generate`` calls, then tear down in
-    ``finish_generation``.
+    Amortizes setup costs in ``prepare_for_generation``, streams ``generate``
+    calls, then tears down in ``finish_generation``.
     """
 
     def __init__(self) -> None:

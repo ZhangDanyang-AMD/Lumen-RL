@@ -115,3 +115,4 @@ Escalation order for R3:
 ## Pairing
 
 Pair with `lumenrl-coding` when code changes are needed.
+Pair with `lumenrl-debug` when the bug originates in Lumen, ATOM, or AITER rather than LumenRL itself.

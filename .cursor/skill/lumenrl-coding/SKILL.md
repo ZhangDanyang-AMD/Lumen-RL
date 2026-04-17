@@ -9,6 +9,20 @@ description: >-
 
 # LumenRL Coding Guide
 
+## Core Principle
+
+LumenRL is a standalone RL framework. It does NOT use VERL, NeMo-RL, or any
+other third-party RL framework. All controller, worker, algorithm, and trainer
+code is written from scratch in `lumenrl/`. The only external dependencies are:
+
+- **Lumen** (`third_party/Lumen`) — FP8 quantized training kernels and ops
+- **ATOM** (`third_party/ATOM`) — optimized inference engine
+- **AITER** (submodule) — low-level GPU kernels (ASM/CK/Triton)
+- **MORI** (submodule) — RDMA + GPU communication
+- **Ray** — distributed orchestration (used as a library, not a framework)
+
+Never copy patterns, classes, or utilities from VERL or NeMo-RL into LumenRL.
+
 ## Architecture Rules
 
 - Controller is single-process; all GPU work happens in Ray workers
@@ -97,3 +111,4 @@ When modifying MoE router paths:
 ## Pairing
 
 Pair with `lumenrl-training` when debugging RL training runs, reward collapse, or FP8/R3 stability issues.
+Pair with `lumenrl-debug` when fixing bugs that originate in Lumen, ATOM, or AITER.

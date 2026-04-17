@@ -5,7 +5,7 @@
 # Reference: FP8_TRAINING_ALIGNMENT_PLAN.md §Experiment 1
 # This is the pure BF16 baseline against which all FP8 variants are compared.
 #
-# Config aligned to VERL FP8 docs (Qwen3-8B-Base, 8×MI350X):
+# Config (Qwen3-8B-Base, 8×MI350X):
 #   train_bsz=32, gen_bsz=32, mini_bsz=32, n=16, max_resp=20K
 #   rollout_tp=1, sp_size=1
 #

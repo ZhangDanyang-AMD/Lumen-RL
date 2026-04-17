@@ -14,15 +14,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ─── Copy LumenRL source (includes submodules) ──────────────────────────────
 COPY . /workspace/Lumen-RL
 
-# ─── AITER (editable from Lumen's third_party) ──────────────────────────────
+# ─── AITER (lumen/triton_kernels branch, editable) ──────────────────────────
 # PREBUILD_KERNELS=1 pre-compiles CK attention .so at install time.
 # Without it the first CK call triggers JIT compilation which can SIGSEGV
 # inside mp.spawn subprocesses (fork + HIP driver issue).
-RUN cd /workspace/Lumen-RL/third_party/Lumen/third_party/aiter && \
+RUN cd /workspace/Lumen-RL/third_party/aiter && \
     PREBUILD_KERNELS=1 pip install -e .
 
-# ─── mori — SDMA communication library (editable from Lumen's third_party) ──
-RUN cd /workspace/Lumen-RL/third_party/Lumen/third_party/mori && \
+# ─── MORI — SDMA communication library (sdma-new branch, editable) ──────────
+RUN cd /workspace/Lumen-RL/third_party/mori && \
     git submodule update --init --recursive && \
     pip install setuptools-scm && \
     pip install -e .
@@ -30,9 +30,6 @@ RUN cd /workspace/Lumen-RL/third_party/Lumen/third_party/mori && \
 # ─── Lumen (training engine, dev/RL branch, editable) ───────────────────────
 RUN cd /workspace/Lumen-RL/third_party/Lumen && pip install -e ".[dev]"
 RUN pip install -r /workspace/Lumen-RL/third_party/Lumen/requirements.txt
-
-# ─── VERL (RL orchestrator, editable) ───────────────────────────────────────
-RUN cd /workspace/Lumen-RL/third_party/verl && pip install -e .
 
 # ─── torchao (quantization reference) ───────────────────────────────────────
 RUN pip install torchao>=0.8
@@ -48,7 +45,7 @@ RUN git clone --recursive https://github.com/ROCm/Megatron-LM.git /workspace/meg
 RUN cd /workspace/Lumen-RL && pip install -e ".[test]"
 
 # ─── PYTHONPATH: submodules accessible without install ──────────────────────
-ENV PYTHONPATH="/workspace/megatron_lm:/workspace/Lumen-RL/third_party/Lumen/third_party/mori:/workspace/Lumen-RL/third_party/Lumen/third_party/aiter:/workspace/Lumen-RL/third_party/Lumen:/workspace/Lumen-RL:${PYTHONPATH:-}"
+ENV PYTHONPATH="/workspace/megatron_lm:/workspace/Lumen-RL/third_party/mori:/workspace/Lumen-RL/third_party/aiter:/workspace/Lumen-RL/third_party/Lumen:/workspace/Lumen-RL:${PYTHONPATH:-}"
 
 # ─── Runtime env (override HIP_VISIBLE_DEVICES at container launch) ─────────
 ENV MORI_ENABLE_SDMA=1

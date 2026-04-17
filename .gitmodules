@@ -2,7 +2,15 @@
 	path = third_party/Lumen
 	url = https://github.com/ZhangDanyang-AMD/Lumen.git
 	branch = dev/RL
-[submodule "third_party/verl"]
-	path = third_party/verl
-	url = https://github.com/verl-project/verl.git
-	branch = main
+[submodule "third_party/aiter"]
+	path = third_party/aiter
+	url = https://github.com/ZhangDanyang-AMD/aiter.git
+	branch = lumen/triton_kernels
+[submodule "third_party/mori"]
+	path = third_party/mori
+	url = https://github.com/ZhangDanyang-AMD/mori.git
+	branch = sdma-new
+[submodule "third_party/ATOM"]
+	path = third_party/ATOM
+	url = https://github.com/ZhangDanyang-AMD/ATOM.git
+	branch = Lumen/RL

@@ -18,7 +18,6 @@ class RayWorkerGroup:
     """A group of Ray actor workers for a single RL role.
 
     Handles creation, dispatch, collection, and lifecycle of workers.
-    Inspired by VeRL's WorkerGroup and NeMo RL's RayWorkerGroup.
     """
 
     def __init__(

@@ -236,8 +236,8 @@ pytest tests/ -v
 |---|---|---|
 | [Lumen](https://github.com/ZhangDanyang-AMD/Lumen) | `lumen` | AMD-native quantized training: FP8/MXFP8, AITER kernels, MORI comms |
 | [ATOM](https://github.com/ROCm/ATOM) | `atom` | AITER-optimized inference: FP8, MoE EP, speculative decoding |
-| [AITER](https://github.com/ROCm/aiter) | `amd-aiter` | GPU kernels: attention, GEMM, MoE, normalization (ASM/CK/Triton) |
-| [MORI](https://github.com/ROCm/mori) | `mori` | RDMA + GPU communication: collectives, MoE expert dispatch |
+| [AITER](https://github.com/ZhangDanyang-AMD/aiter) | `amd-aiter` | GPU kernels: attention, GEMM, MoE, normalization (ASM/CK/Triton) |
+| [MORI](https://github.com/ZhangDanyang-AMD/mori) | `mori` | RDMA + GPU communication: collectives, MoE expert dispatch |
 | [Ray](https://github.com/ray-project/ray) | `ray` | Distributed orchestration, resource management |
 
 ## Citation
@@ -278,10 +278,10 @@ MoE R3 router alignment:
 
 LumenRL builds on the work of many open-source projects:
 
-- [VeRL](https://github.com/verl-project/verl) — HybridFlow architecture, Ray WorkerGroup, DataProto design
-- [NeMo RL](https://github.com/NVIDIA-NeMo/RL) — Controller pattern, GenerationInterface, weight sync design
 - [Lumen](https://github.com/ZhangDanyang-AMD/Lumen) — Quantized training lifecycle, AITER/MORI integration
 - [ATOM](https://github.com/ROCm/ATOM) — Optimized inference engine, FP8/MoE support
+- [AITER](https://github.com/ZhangDanyang-AMD/aiter) — AMD GPU kernels (ASM/CK/Triton)
+- [MORI](https://github.com/ZhangDanyang-AMD/mori) — RDMA + GPU communication
 
 ## License
 
