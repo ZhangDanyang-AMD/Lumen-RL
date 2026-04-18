@@ -1,0 +1,47 @@
+# Smoke test: 2-step BF16 baseline with tiny batch size
+# Validates the full LumenRL pipeline: data → rollout → reward → train
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 1
+
+policy:
+  model_name: /dev/shm/model/qwen3-8b-base
+  training_backend: fsdp2
+  generation_backend: hf
+  max_total_sequence_length: 2048
+  train_global_batch_size: 16       # 2 prompts × 8 generations
+  train_micro_batch_size: 2
+
+algorithm:
+  name: dapo
+  dapo:
+    num_generations: 8
+    kl_coeff: 0.0
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    dynamic_sampling: false
+    token_level_pg: true
+    overlong_reward_shaping: false
+
+reward:
+  type: function
+  function: lumenrl.rewards.math_reward.dapo_math_reward
+  dataset: /dev/shm/data/dapo-math-17k.parquet
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+
+checkpointing:
+  checkpoint_dir: ""
+  save_steps: 999
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 2
+seed: 42

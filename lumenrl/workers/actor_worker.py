@@ -129,8 +129,8 @@ class LumenActorWorker(BaseWorker):
 
             algo_cfg = batch.meta.get("algo_config", {})
             if algo_name == AlgorithmName.DAPO.value:
-                clip_low = float(algo_cfg.get("clip_ratio_low", 0.8))
-                clip_high = float(algo_cfg.get("clip_ratio_high", 1.28))
+                clip_low = float(algo_cfg.get("clip_ratio_low", 0.2))
+                clip_high = float(algo_cfg.get("clip_ratio_high", 0.28))
                 loss = asymmetric_clip_loss(
                     token_log_probs, old_logp, adv, clip_low, clip_high, mask=mask,
                 )

@@ -43,6 +43,7 @@ caption: Advanced Features
 advance/fp8_quantization
 advance/moe_r3
 advance/distributed
+advance/async_training
 advance/algorithms
 ```
 

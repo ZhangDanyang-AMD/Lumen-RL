@@ -25,7 +25,7 @@ def test_asymmetric_clip_loss() -> None:
     logp = torch.tensor([[0.5, 0.5]])
     old_logp = torch.zeros(1, 2)
     adv = torch.ones(1, 2)
-    loss = asymmetric_clip_loss(logp, old_logp, adv, clip_low=0.9, clip_high=1.1)
+    loss = asymmetric_clip_loss(logp, old_logp, adv, clip_low=0.2, clip_high=0.28)
     assert loss.ndim == 0
     assert torch.isfinite(loss)
 

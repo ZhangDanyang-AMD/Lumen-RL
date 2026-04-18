@@ -22,6 +22,60 @@ Write back only meaningful tests or experiments that change confidence in a hypo
 
 ## Open
 
+### [2026-04-17 async-trainer-nan-grads]
+- Symptom: 226-232 of 399 parameters consistently have NaN gradients during backward pass.
+  Forward pass and loss are valid. Model weights remain clean. Happens on every step.
+- Origin: LumenRL (`lumenrl/trainer/async_trainer.py`) + FSDP2 backward
+- Config: AsyncRLTrainer staged pipeline, 8×MI350X, require_batches=4, BF16.
+- Observations:
+  1. Forward pass works: log-probs are valid (nan=0), ratios are reasonable (0.1-7.0).
+  2. Loss is valid: 0.025, 0.079, -0.043 etc.
+  3. After backward, ~226/399 params have NaN grads. Always the same set of params.
+  4. Zeroing NaN grads before clip_grad_norm and optimizer.step preserves model health.
+  5. grad_norm after zeroing is ~10-22 (reasonable for BF16 FSDP2).
+  6. Model weights stay clean (nan_params=0/399) across all steps.
+- Workaround: `torch.where(grad.isnan(), zeros, grad)` before optimizer step. Training proceeds.
+- Possible root cause:
+  a) FSDP2 gradient all-reduce producing NaN for specific sharded params on ROCm.
+  b) `_fused_token_log_probs` backward through `float().logsumexp()` chain.
+  c) Padding tokens in merged DataProto creating extreme logit values during backward.
+- Next check: Identify which specific params have NaN grads (embedding? attention? MLP?).
+  Compare with sync RLTrainer to see if same issue exists there.
+- Status: open (workaround applied)
+
+### [2026-04-17 atom-nan-loss]
+- Symptom: loss_pg=nan, loss_total=nan on ALL steps (0-15+). Model not learning.
+  Accuracy fluctuates 2-20% (base model stochastic) but no upward trend.
+- Origin: LumenRL (`lumenrl/trainer/rl_trainer.py` — training step)
+- Config: ATOM/vLLM gen, 8 prompts × 16 gens, seq=8K, BF16. DAPO with kl_coeff=0.
+- Observations:
+  1. `timing/ref_s=~26μs` — reference log-prob compute is effectively skipped/instant.
+     This means `old_logprobs` may be zeros or NaN → `exp(logp - old_logp)` = Inf/NaN → loss=nan.
+  2. vLLM generation works (responses are real, non-empty, ~960 tok avg).
+  3. Rewards are non-trivial (acc ~11% avg, reward ~-0.77 avg). Advantage should be non-zero.
+  4. `_sync_weights_to_atom()` is disabled (FSDP2 lazy storage workaround) — but NaN loss is
+     independent of weight sync (loss was NaN from step 0 before any weight update).
+  5. FSDP2 forward/backward completes (train_s ~56s). No OOM.
+- Possible bugs:
+  a) `_compute_ref_logprobs()` returns zeros or skips computation entirely.
+  b) `old_logprobs` from rollout are not correctly computed for the generated tokens.
+  c) Token-level log-probs from `_fused_token_log_probs()` produce NaN for padding tokens,
+     and masking doesn't exclude them before the ratio computation.
+- Next check: Add debug prints in training step to inspect old_logprobs, logprobs, advantages,
+  and ratio tensors for NaN/Inf. Check `_compute_ref_logprobs()` code path.
+- Status: open
+
+### [2026-04-17 atom-weight-sync-disabled]
+- Symptom: ATOM always generates with initial (untrained) model weights.
+- Origin: LumenRL (`lumenrl/trainer/rl_trainer.py` — `_sync_weights_to_atom()`)
+- Root cause: `safetensors.torch.save_file()` crashes with `RuntimeError: Attempted to access
+  the data pointer on an invalid python storage` when given FSDP2 state_dict with lazy storage.
+- Impact: Model doesn't use trained weights for generation. Acceptable for initial pipeline
+  validation, but must be fixed for actual training.
+- Next check: Implement FSDP2 `get_model_state_dict()` with `StateDictOptions(full_state_dict=True)`
+  to consolidate shards before serializing.
+- Status: open
+
 ### [2026-04-10 fp8-training-alignment-repro]
 - Goal: Demonstrate FP8 training aligns with BF16 using LumenRL (Lumen + ATOM) on 8× MI350X.
 - Models: Qwen3-8B-Base (dense), Qwen3-30B-A3B (MoE)
@@ -38,6 +92,28 @@ Write back only meaningful tests or experiments that change confidence in a hypo
 ## Ruled Out
 
 Move disproved suspicions here instead of deleting them.
+
+### [2026-04-17 atom-nan-loss] — RESOLVED
+- Moved from Open. Was: loss_pg=nan, loss_total=nan on ALL steps.
+- Root causes found and fixed in previous session:
+  1. `asymmetric_clip_loss` misinterpreted epsilon values as raw ratio bounds → extreme clamping.
+  2. `_optimizer.step()` called per mini-batch instead of per global step → stale old_log_probs.
+  3. `NaN * 0 = NaN` propagation through masked padding tokens.
+  4. `_fused_token_log_probs` using `F.cross_entropy` produced NaN on bf16 logits.
+- Fixes applied:
+  1. Fixed `asymmetric_clip_loss` to use `1-clip_low` and `1+clip_high`.
+  2. Implemented proper gradient accumulation (zero_grad before loop, step after loop).
+  3. Added `torch.where(mask, pg, zeros)` to prevent NaN propagation.
+  4. Reverted `_fused_token_log_probs` to row-chunked `float().logsumexp()`.
+  5. Added optimizer CPU offload between rollout and training phases for OOM fix.
+- Status: resolved
+
+### [2026-04-17 atom-colocate-oom] — RESOLVED
+- Was: vLLM OOM on startup after training (37 GiB free vs 50 GiB requested).
+- Root cause: FSDP2 optimizer states (~215 GiB across 8 GPUs) not freed before vLLM spawn.
+- Fix: Added `_offload_optimizer_to_cpu()` before ATOM rollout and `_reload_optimizer_to_gpu()`
+  after. This frees ~30+ GiB per GPU for vLLM startup.
+- Status: resolved
 
 ## Resolved — Lumen (third_party/Lumen)
 

@@ -1,0 +1,55 @@
+# Experiment 1A: BF16 Training + BF16 Rollout (Baseline)
+# Qwen3-8B on 8×MI350X, DAPO algorithm
+# Aligned to VERL reference: https://github.com/verl-project/verl/blob/main/docs/advance/fp8.md#qwen3-8b-base-dense-model
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
+
+policy:
+  model_name: /dev/shm/model/qwen3-8b-base
+  training_backend: fsdp2
+  generation_backend: atom
+  max_total_sequence_length: 8192    # 1024 prompt + 7168 response
+  max_response_length: 7168          # 7K response (practical for single-GPU gen)
+  train_global_batch_size: 128       # 8 prompts × 16 generations
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 8192        # dynamic micro-batching for variable-length seqs
+  generation:
+    atom_cfg:
+      gpu_memory_utilization: 0.13   # ROCm: ~33 GiB, fits in ~37 GiB free after FSDP2+optimizer
+      max_model_len: 8192
+
+algorithm:
+  name: dapo
+  dapo:
+    num_generations: 16              # 16 (match reference)
+    kl_coeff: 0.0
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    dynamic_sampling: true
+    token_level_pg: true
+    overlong_reward_shaping: true
+
+reward:
+  type: function
+  function: lumenrl.rewards.math_reward.dapo_math_reward
+  dataset: /dev/shm/data/dapo-math-17k.parquet
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+
+checkpointing:
+  checkpoint_dir: /root/ckpts/lumenrl-dapo/1a-bf16-baseline
+  save_steps: 25
+  save_total_limit: 3
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 275
+seed: 42

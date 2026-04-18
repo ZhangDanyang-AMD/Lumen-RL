@@ -94,9 +94,15 @@ class DAPOAlgorithm(BaseAlgorithm):
 
         batch.tensors["advantages"] = adv_flat
         batch.tensors["dapo_sample_mask"] = row_mask.to(dtype=torch.float32)
-        logger.debug(
-            "DAPO advantages: active_frac=%.4f",
+        logger.info(
+            "NaN-DEBUG DAPO advantages: active_frac=%.4f, adv nan=%d inf=%d "
+            "min=%.4f max=%.4f mean=%.4f, rewards min=%.4f max=%.4f mean=%.4f, "
+            "std min=%.6f max=%.6f",
             float(row_mask.float().mean().cpu()),
+            adv_flat.isnan().sum().item(), adv_flat.isinf().sum().item(),
+            adv_flat.min().item(), adv_flat.max().item(), adv_flat.mean().item(),
+            rewards.min().item(), rewards.max().item(), rewards.mean().item(),
+            std.min().item(), std.max().item(),
         )
         return batch
 

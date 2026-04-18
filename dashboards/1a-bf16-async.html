@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>LumenRL 1A-Async Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e1e4e8}
+.hdr{background:linear-gradient(135deg,#1a1e2e,#252a3a);padding:24px 32px;border-bottom:1px solid #30363d}
+.hdr h1{font-size:1.6rem;font-weight:600}.hdr .s{color:#8b949e;font-size:.9rem;margin-top:4px}
+.cds{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;padding:20px 32px}
+.cd{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px}
+.cd .l{font-size:.7rem;color:#8b949e;text-transform:uppercase;letter-spacing:.05em}
+.cd .v{font-size:1.4rem;font-weight:600;margin-top:4px}
+.cd .v.g{color:#3fb950}.cd .v.a{color:#d29922}.cd .v.r{color:#f85149}
+.ch{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:0 32px 32px}
+.cb{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px}
+.cb h3{font-size:.9rem;margin-bottom:12px;color:#c9d1d9}
+@media(max-width:900px){.ch{grid-template-columns:1fr}}
+</style></head><body>
+<div class="hdr"><h1>LumenRL 1A-Async &#8212; BF16 Fully Async Training</h1>
+<div class="s">Qwen3-8B-Base &#183; 8x MI350X &#183; DAPO &#183; Updated 2026-04-17 22:24:06</div></div>
+<div class="cds">
+<div class="cd"><div class="l">Steps</div><div class="v g">11 / 275</div></div>
+<div class="cd"><div class="l">Latest Loss</div><div class="v green">0.0732</div></div>
+<div class="cd"><div class="l">Avg Step</div><div class="v">188.1s</div></div>
+<div class="cd"><div class="l">ETA</div><div class="v a">13.8h</div></div>
+<div class="cd"><div class="l">Avg Gen</div><div class="v">151.2s</div></div>
+<div class="cd"><div class="l">NaN Grads</div><div class="v red">226/399</div></div>
+<div class="cd"><div class="l">Reward</div><div class="v">-0.875</div></div>
+<div class="cd"><div class="l">Active Frac</div><div class="v">75%</div></div>
+</div>
+<div class="ch">
+<div class="cb"><h3>Training Loss</h3><canvas id="c1"></canvas></div>
+<div class="cb"><h3>Step / Gen Time (s)</h3><canvas id="c2"></canvas></div>
+<div class="cb"><h3>Reward Mean</h3><canvas id="c3"></canvas></div>
+<div class="cb"><h3>Grad Norm (post NaN-zero)</h3><canvas id="c4"></canvas></div>
+</div>
+<script>
+const dg={color:'rgba(255,255,255,.06)'},dt={color:'#8b949e'};
+const co={responsive:true,plugins:{legend:{labels:{color:'#c9d1d9'}}},scales:{x:{grid:dg,ticks:dt},y:{grid:dg,ticks:dt}}};
+const co0={responsive:true,plugins:{legend:{labels:{color:'#c9d1d9'}}},scales:{x:{grid:dg,ticks:dt},y:{grid:dg,ticks:dt,beginAtZero:true}}};
+new Chart(document.getElementById('c1'),{type:'line',data:{labels:[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],datasets:[{label:'Loss',data:[0.0253602, 0.0792101, -0.0431702, -0.0406101, 0.066331, 0.0237234, 0.00726603, 0.031113, -0.00240533, 0.0, 0.0731524],borderColor:'#58a6ff',borderWidth:2,pointRadius:2,tension:.3,spanGaps:true}]},options:co});
+new Chart(document.getElementById('c2'),{type:'line',data:{labels:[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],datasets:[{label:'Step',data:[185.008, 198.445, 167.845, 193.505, 192.425, 213.389, 177.03, 174.731, 186.273, 180.764, 199.872],borderColor:'#d29922',borderWidth:2,pointRadius:1,tension:.3},{label:'Gen',data:[144.639, 157.625, 141.686, 152.091, 150.92, 168.239, 145.001, 143.511, 153.668, 149.525, 155.792],borderColor:'#3fb950',borderWidth:2,pointRadius:1,tension:.3}]},options:co});
+new Chart(document.getElementById('c3'),{type:'line',data:{labels:[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],datasets:[{label:'Reward',data:[-0.9688, -0.75, -0.9688, -0.9688, -0.9688, -0.9375, -0.9688, -0.9375, -0.9062, -1.0, -0.875],borderColor:'#f0883e',borderWidth:2,pointRadius:1,tension:.3}]},options:co});
+new Chart(document.getElementById('c4'),{type:'line',data:{labels:[0, 1, 2, 3, 4, 5, 6, 7, 8, 10],datasets:[{label:'Grad Norm',data:[6.7188, 21.375, 11.0625, 10.875, 20.375, 8.625, 5.8125, 8.6875, 8.5, 17.75],borderColor:'#bc8cff',borderWidth:2,pointRadius:2,tension:.3},{label:'NaN Params (÷10)',data:[22.6, 22.6, 22.6, 23.2, 22.6, 22.6, 22.6, 22.6, 22.6, 22.6],borderColor:'rgba(248,81,73,.6)',borderWidth:2,pointRadius:2,tension:.3}]},options:co0});
+</script></body></html>

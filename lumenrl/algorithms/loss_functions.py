@@ -58,29 +58,30 @@ def asymmetric_clip_loss(
 ) -> Tensor:
     """Policy-gradient surrogate with asymmetric ratio clipping (DAPO-style).
 
-    The importance ratio ``exp(logp - logp_old)`` is clamped to ``[clip_low, clip_high]``
-    instead of a symmetric epsilon band.
+    ``clip_low`` and ``clip_high`` are **epsilon** values: the importance ratio
+    ``exp(logp - logp_old)`` is clamped to ``[1 - clip_low, 1 + clip_high]``.
 
     Args:
         logprobs: Current log-probabilities.
         old_logprobs: Reference log-probabilities.
         advantages: Advantage tensor (broadcastable).
-        clip_low: Lower bound for the clipped ratio (e.g. ``0.8``).
-        clip_high: Upper bound for the clipped ratio (e.g. ``1.2``).
+        clip_low: Lower epsilon; ratio lower bound is ``1 - clip_low`` (e.g. 0.2 → 0.8).
+        clip_high: Upper epsilon; ratio upper bound is ``1 + clip_high`` (e.g. 0.28 → 1.28).
         mask: Optional token mask for masked mean reduction.
 
     Returns:
         Scalar loss tensor to minimize.
     """
     ratio = torch.exp(logprobs - old_logprobs)
-    clipped = torch.clamp(ratio, clip_low, clip_high)
+    clipped = torch.clamp(ratio, 1.0 - clip_low, 1.0 + clip_high)
     surr1 = ratio * advantages
     surr2 = clipped * advantages
     pg = -torch.minimum(surr1, surr2)
     if mask is not None:
         w = mask.to(dtype=pg.dtype)
+        pg = torch.where(w.bool(), pg, torch.zeros_like(pg))
         denom = torch.clamp(w.sum(), min=1.0)
-        return (pg * w).sum() / denom
+        return pg.sum() / denom
     return pg.mean()
 
 

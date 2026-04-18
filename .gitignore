@@ -23,3 +23,5 @@ output/DAPO/*.log
 output/DAPO/metrics/*.json
 output/DAPO/metrics/*.csv
 output/DAPO/dashboard.html
+output/DAPO/1a-bf16-8gpu/ckpts/
+output/DAPO/1a-bf16-8gpu-opt/ckpts/

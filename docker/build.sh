@@ -42,6 +42,11 @@ if [ ! -d "third_party/mori" ]; then
     echo "  git submodule update --init --recursive"
     exit 1
 fi
+if [ ! -d "third_party/ATOM/atom" ]; then
+    echo "ERROR: ATOM submodule not initialized. Run:"
+    echo "  git submodule update --init --recursive"
+    exit 1
+fi
 
 if [ "${DEV_MODE}" = true ]; then
     DOCKERFILE="docker/Dockerfile.dev"

@@ -31,8 +31,14 @@ RUN cd /workspace/Lumen-RL/third_party/mori && \
 RUN cd /workspace/Lumen-RL/third_party/Lumen && pip install -e ".[dev]"
 RUN pip install -r /workspace/Lumen-RL/third_party/Lumen/requirements.txt
 
+# ─── ATOM (inference engine, Lumen/RL branch, editable) ────────────────────
+RUN cd /workspace/Lumen-RL/third_party/ATOM && pip install -e .
+
 # ─── torchao (quantization reference) ───────────────────────────────────────
 RUN pip install torchao>=0.8
+
+# ─── RL training dependencies ──────────────────────────────────────────────
+RUN pip install datasets "math_verify[antlr4_13_2]"
 
 # ─── Megatron-LM-AMD (optional Megatron backend) ────────────────────────────
 ARG MEGATRON_COMMIT=8dd45f5a51378ec1ee7937dee3c20d8626df4763
@@ -45,7 +51,7 @@ RUN git clone --recursive https://github.com/ROCm/Megatron-LM.git /workspace/meg
 RUN cd /workspace/Lumen-RL && pip install -e ".[test]"
 
 # ─── PYTHONPATH: submodules accessible without install ──────────────────────
-ENV PYTHONPATH="/workspace/megatron_lm:/workspace/Lumen-RL/third_party/mori:/workspace/Lumen-RL/third_party/aiter:/workspace/Lumen-RL/third_party/Lumen:/workspace/Lumen-RL:${PYTHONPATH:-}"
+ENV PYTHONPATH="/workspace/megatron_lm:/workspace/Lumen-RL/third_party/ATOM:/workspace/Lumen-RL/third_party/mori:/workspace/Lumen-RL/third_party/aiter:/workspace/Lumen-RL/third_party/Lumen:/workspace/Lumen-RL:${PYTHONPATH:-}"
 
 # ─── Runtime env (override HIP_VISIBLE_DEVICES at container launch) ─────────
 ENV MORI_ENABLE_SDMA=1

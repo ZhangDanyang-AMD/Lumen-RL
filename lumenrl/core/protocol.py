@@ -97,7 +97,20 @@ class DataProto:
 
         merged_tensors = {}
         for key in ref_keys:
-            merged_tensors[key] = torch.cat([p[key] for p in non_empty], dim=0)
+            parts = [p[key] for p in non_empty]
+            if parts[0].ndim >= 2:
+                max_seq = max(t.shape[1] for t in parts)
+                if any(t.shape[1] != max_seq for t in parts):
+                    padded = []
+                    for t in parts:
+                        diff = max_seq - t.shape[1]
+                        if diff > 0:
+                            trailing_dims = t.ndim - 2
+                            pad_spec = [0, 0] * trailing_dims + [0, diff]
+                            t = torch.nn.functional.pad(t, pad_spec, value=0)
+                        padded.append(t)
+                    parts = padded
+            merged_tensors[key] = torch.cat(parts, dim=0)
 
         return DataProto(tensors=merged_tensors, meta=non_empty[0].meta.copy())
 

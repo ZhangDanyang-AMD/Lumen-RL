@@ -111,6 +111,41 @@ COMMAND="python examples/run_grpo_moe.py \
 sbatch --nodes=$NUM_NODES --gres=gpu:8 scripts/ray.sub
 ```
 
+## Fully Async Training
+
+LumenRL supports **fully-async training** that decouples rollout and training for up to 2.7× throughput improvement, inspired by [VERL's fully_async_policy](https://github.com/verl-project/verl/blob/main/docs/advance/fully_async.md).
+
+<div align="center">
+  <img src="figures/async_architecture.svg" alt="LumenRL Fully Async Training Architecture" width="960">
+</div>
+
+Key features:
+- **Parallel generation and training** — Rollouter generates while Trainer updates
+- **Streaming samples** — Single-sample granularity with configurable batching
+- **Staleness control** — Tunable `staleness_threshold` for freshness vs throughput tradeoff
+- **Partial rollout** — Interrupt in-progress generation on weight sync to minimize wait
+- **Filesystem weight sync** — safetensors snapshots for cross-process parameter transfer
+
+```yaml
+async_training:
+  enabled: true
+  require_batches: 4
+  trigger_parameter_sync_step: 4
+  staleness_threshold: 0.5
+  partial_rollout: true
+```
+
+Four modes supported:
+
+| Mode | Settings | Use Case |
+| --- | --- | --- |
+| On-policy | `staleness=0, sync_step=1` | Small-scale, stability-first |
+| Stream off-policy | `staleness=0, sync_step>1` | Moderate throughput gain |
+| Async + stale | `staleness>0, partial=False` | Large-scale, balanced |
+| Async + partial | `staleness>0, partial=True` | Maximum throughput |
+
+See [docs/advance/async_training.md](lumenrl-docs/docs/source/advance/async_training.md) for detailed configuration and tuning.
+
 ## FP8 Quantization
 
 LumenRL implements the [FP8-RL](https://arxiv.org/abs/2601.18150) stack for low-precision RL training:
@@ -204,7 +239,7 @@ Lumen-RL/
 │   ├── algorithms/                 #   GRPO, DAPO, PPO, loss functions
 │   ├── quantization/               #   FP8 rollout, KV-cache, training, correction
 │   ├── moe/                        #   R3 recorder/replayer/manager, expert parallel
-│   ├── trainer/                    #   RLTrainer main loop, callbacks
+│   ├── trainer/                    #   RLTrainer, AsyncRLTrainer, message queue, weight sync
 │   └── utils/                      #   Logging, checkpoint, metrics, distributed
 │
 ├── configs/                        # Reference YAML configs + production recipes

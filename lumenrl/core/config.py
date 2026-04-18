@@ -41,6 +41,7 @@ class AtomConfig:
     tensor_parallel_size: int = 1
     kv_cache_dtype: str = "auto"
     max_model_len: Optional[int] = None
+    gpu_memory_utilization: float = 0.6
 
 
 @dataclass
@@ -62,8 +63,10 @@ class PolicyConfig:
     training: TrainingConfig = field(default_factory=TrainingConfig)
     generation: GenerationConfig = field(default_factory=GenerationConfig)
     max_total_sequence_length: int = 4096
+    max_response_length: int = 20480
     train_global_batch_size: int = 64
     train_micro_batch_size: int = 8
+    max_token_len_per_gpu: int = 0
 
 
 @dataclass
@@ -79,8 +82,8 @@ class GRPOConfig:
 class DAPOConfig:
     num_generations: int = 8
     kl_coeff: float = 0.0
-    clip_ratio_low: float = 0.8
-    clip_ratio_high: float = 1.2
+    clip_ratio_low: float = 0.2
+    clip_ratio_high: float = 0.28
     dynamic_sampling: bool = True
     token_level_pg: bool = True
     overlong_reward_shaping: bool = True
@@ -178,6 +181,21 @@ class LoggerConfig:
 
 
 @dataclass
+class AsyncTrainingConfig:
+    """Configuration for fully-async separated rollout + training."""
+    enabled: bool = False
+    require_batches: int = 4
+    trigger_parameter_sync_step: int = 4
+    staleness_threshold: float = 0.0
+    partial_rollout: bool = False
+    use_rollout_log_probs: bool = True
+    rollout_n_gpus: int = 0
+    trainer_n_gpus: int = 0
+    queue_maxsize: int = 64
+    weight_sync_dir: str = "/tmp/lumenrl_weight_sync"
+
+
+@dataclass
 class LumenRLConfig:
     """Top-level configuration for LumenRL."""
 
@@ -189,6 +207,7 @@ class LumenRLConfig:
     moe: MoEConfig = field(default_factory=MoEConfig)
     checkpointing: CheckpointConfig = field(default_factory=CheckpointConfig)
     logger: LoggerConfig = field(default_factory=LoggerConfig)
+    async_training: AsyncTrainingConfig = field(default_factory=AsyncTrainingConfig)
     num_training_steps: int = 1000
     seed: int = 42
 
