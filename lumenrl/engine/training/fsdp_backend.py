@@ -33,33 +33,21 @@ class _TinyLM(nn.Module):
 def _load_hf_model(model_name: str, torch_dtype: torch.dtype = torch.bfloat16) -> nn.Module:
     """Load a HuggingFace causal LM with gradient checkpointing.
 
-    In distributed mode, only rank 0 loads from disk. Other ranks load
-    with empty weights (meta device), then rely on FSDP2's broadcast
-    to receive the actual parameters.
+    All ranks load the full model from disk to ensure identical weights
+    before FSDP2 sharding. Model files on /dev/shm make this fast.
     """
     import torch.distributed as dist
-    from transformers import AutoModelForCausalLM, AutoConfig
+    from transformers import AutoModelForCausalLM
 
-    is_distributed = dist.is_initialized()
-    rank = dist.get_rank() if is_distributed else 0
+    rank = dist.get_rank() if dist.is_initialized() else 0
 
-    if is_distributed and rank != 0:
-        logger.info("[rank %d] Loading HF model config only (rank 0 has weights): %s", rank, model_name)
-        config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-        with torch.device("meta"):
-            model = AutoModelForCausalLM.from_config(
-                config,
-                torch_dtype=torch_dtype,
-                attn_implementation="sdpa",
-            )
-    else:
-        logger.info("[rank %d] Loading HF model: %s (dtype=%s)", rank, model_name, torch_dtype)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch_dtype,
-            attn_implementation="sdpa",
-            trust_remote_code=True,
-        )
+    logger.info("[rank %d] Loading HF model: %s (dtype=%s)", rank, model_name, torch_dtype)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch_dtype,
+        attn_implementation="sdpa",
+        trust_remote_code=True,
+    )
 
     model.gradient_checkpointing_enable(
         gradient_checkpointing_kwargs={"use_reentrant": False},
@@ -116,10 +104,8 @@ def _apply_fsdp2_sharding(
 ) -> nn.Module:
     """Apply PyTorch FSDP2 ``fully_shard`` to the model.
 
-    Non-rank-0 processes may have meta-device parameters. FSDP2's
-    ``fully_shard`` will materialize them during the first all-gather.
-    We provide a ``param_init_fn`` that allocates empty tensors on the
-    local device so FSDP2 can then populate them from rank 0.
+    All ranks must have identical, fully-loaded parameters on their
+    local CUDA device before this call. FSDP2 will then shard them.
     """
     import torch.distributed as dist
 
@@ -133,34 +119,7 @@ def _apply_fsdp2_sharding(
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     local_device = torch.device(f"cuda:{local_rank}")
 
-    has_meta = any(p.device.type == "meta" for p in model.parameters())
-    if has_meta:
-        logger.info("[rank %d] Materializing meta parameters on %s", rank, local_device)
-        for name, param in model.named_parameters():
-            if param.device.type == "meta":
-                materialized = torch.empty(
-                    param.shape, dtype=param.dtype, device=local_device,
-                )
-                param_module_name = ".".join(name.split(".")[:-1])
-                param_name = name.split(".")[-1]
-                mod = model
-                for part in param_module_name.split("."):
-                    if part:
-                        mod = getattr(mod, part)
-                setattr(mod, param_name, nn.Parameter(materialized, requires_grad=param.requires_grad))
-
-        for name, buf in model.named_buffers():
-            if buf.device.type == "meta":
-                materialized = torch.empty(buf.shape, dtype=buf.dtype, device=local_device)
-                buf_module_name = ".".join(name.split(".")[:-1])
-                buf_name = name.split(".")[-1]
-                mod = model
-                for part in buf_module_name.split("."):
-                    if part:
-                        mod = getattr(mod, part)
-                mod.register_buffer(buf_name, materialized)
-    elif rank == 0:
-        model.to(local_device)
+    model.to(local_device)
 
     if fp8_linear:
         mp_policy = MixedPrecisionPolicy(

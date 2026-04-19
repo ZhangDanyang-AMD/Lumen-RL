@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import logging
+import os
+import re
 from abc import ABC
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+import torch
 
 from lumenrl.utils.checkpoint import CheckpointManager
 
@@ -39,24 +44,92 @@ class LoggingCallback(Callback):
     def on_step_end(self, trainer: "RLTrainer", step: int, metrics: dict[str, float]) -> None:
         if step % self.interval != 0:
             return
+        if trainer._rank != 0:
+            return
         parts = [f"{k}={v:.6g}" for k, v in sorted(metrics.items())]
         logger.info("step=%d %s", step, " ".join(parts))
 
 
 class CheckpointCallback(Callback):
-    """Persist checkpoints using :class:`~lumenrl.utils.checkpoint.CheckpointManager`."""
+    """Save full training state (model, optimizer, step) for crash recovery.
 
-    def __init__(self, checkpoint_dir: str, save_interval: int) -> None:
+    Uses FSDP2-aware ``get_model_state_dict`` / ``get_optimizer_state_dict``
+    when distributed, falling back to plain ``state_dict()`` otherwise.
+    Only rank 0 writes to disk.  Old checkpoints beyond ``save_total_limit``
+    are pruned automatically.
+    """
+
+    def __init__(
+        self,
+        checkpoint_dir: str,
+        save_interval: int,
+        save_total_limit: int = 3,
+    ) -> None:
         self.checkpoint_dir = checkpoint_dir
         self.save_interval = max(1, int(save_interval))
+        self.save_total_limit = max(1, int(save_total_limit))
         self._manager = CheckpointManager()
 
     def on_step_end(self, trainer: "RLTrainer", step: int, metrics: dict[str, float]) -> None:
         if step % self.save_interval != 0:
             return
-        path = f"{self.checkpoint_dir.rstrip('/')}/checkpoint_{step}.pt"
-        state = {"metrics": metrics, "step": step, "algo": trainer.config.algorithm.name}
-        self._manager.save(state, path, step)
+
+        rank = trainer._rank
+        ckpt_dir = Path(self.checkpoint_dir)
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        path = ckpt_dir / f"checkpoint_{step}.pt"
+
+        state: dict[str, Any] = {
+            "step": step,
+            "metrics": metrics,
+            "algo": trainer.config.algorithm.name,
+        }
+
+        if trainer._is_distributed:
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            try:
+                from torch.distributed.checkpoint.state_dict import (
+                    get_model_state_dict,
+                    get_optimizer_state_dict,
+                    StateDictOptions,
+                )
+                opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
+                state["model_state_dict"] = get_model_state_dict(
+                    trainer._actor_model, options=opts,
+                )
+                state["optimizer_state_dict"] = get_optimizer_state_dict(
+                    trainer._actor_model, trainer._optimizer, options=opts,
+                )
+            except Exception as exc:
+                logger.warning("FSDP2 state_dict extraction failed (%s); saving metrics only.", exc)
+        else:
+            if trainer._actor_model is not None:
+                state["model_state_dict"] = trainer._actor_model.state_dict()
+            if trainer._optimizer is not None:
+                state["optimizer_state_dict"] = trainer._optimizer.state_dict()
+
+        if rank == 0:
+            self._manager.save(state, path, step)
+            self._prune_old_checkpoints(ckpt_dir)
+
+        if trainer._is_distributed:
+            torch.distributed.barrier()
+
+    def _prune_old_checkpoints(self, ckpt_dir: Path) -> None:
+        pattern = re.compile(r"checkpoint_(\d+)\.pt$")
+        ckpts: list[tuple[int, Path]] = []
+        for p in ckpt_dir.iterdir():
+            m = pattern.match(p.name)
+            if m:
+                ckpts.append((int(m.group(1)), p))
+        ckpts.sort(key=lambda x: x[0])
+        while len(ckpts) > self.save_total_limit:
+            _, old = ckpts.pop(0)
+            try:
+                old.unlink()
+                logger.info("Pruned old checkpoint: %s", old)
+            except OSError:
+                pass
 
 
 class EvalCallback(Callback):
@@ -67,6 +140,8 @@ class EvalCallback(Callback):
 
     def on_step_end(self, trainer: "RLTrainer", step: int, metrics: dict[str, float]) -> None:
         if step % self.interval != 0:
+            return
+        if trainer._rank != 0:
             return
         val_metrics = trainer.run_validation()
         logger.info("validation step=%d %s", step, val_metrics)
@@ -102,6 +177,8 @@ class WandbCallback(Callback):
 
     def on_step_end(self, trainer: "RLTrainer", step: int, metrics: dict[str, float]) -> None:
         if not self._enabled or self._wandb is None:
+            return
+        if trainer._rank != 0:
             return
         payload = {f"train/{k}": v for k, v in metrics.items()}
         payload["train/global_step"] = step

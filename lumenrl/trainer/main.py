@@ -15,13 +15,24 @@ import sys
 import torch
 
 
+class _FlushHandler(logging.StreamHandler):
+    """StreamHandler that flushes after every emit (unbuffered logging)."""
+    def emit(self, record: logging.LogRecord) -> None:
+        super().emit(record)
+        self.flush()
+
+
 def _setup_logging() -> None:
     level = os.environ.get("LUMENRL_LOG_LEVEL", "INFO").upper()
-    logging.basicConfig(
-        level=getattr(logging, level, logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handler = _FlushHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    ))
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, level, logging.INFO))
+    root.handlers.clear()
+    root.addHandler(handler)
 
 
 def _setup_distributed() -> None:
@@ -29,9 +40,11 @@ def _setup_distributed() -> None:
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         torch.cuda.set_device(local_rank)
+        from datetime import timedelta
+        timeout = timedelta(seconds=int(os.environ.get("NCCL_TIMEOUT", 7200)))
         torch.distributed.init_process_group(
-            backend="nccl",
-            device_id=torch.device(f"cuda:{local_rank}"),
+            backend="cpu:gloo,cuda:nccl",
+            timeout=timeout,
         )
         rank = torch.distributed.get_rank()
         if rank != 0:
@@ -68,6 +81,7 @@ def main() -> None:
         cbs.append(CheckpointCallback(
             checkpoint_dir=config.checkpointing.checkpoint_dir,
             save_interval=config.checkpointing.save_steps,
+            save_total_limit=config.checkpointing.save_total_limit,
         ))
 
     if config.logger.wandb_enabled:

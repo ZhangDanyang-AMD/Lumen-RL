@@ -88,6 +88,12 @@ class RLTrainer:
         self._actor_model = FSDP2Backend.build_model(model_name)
         self._actor_model = FSDP2Backend.apply_lumen_optimizations(self._actor_model, quant)
 
+        if hasattr(self._actor_model, "gradient_checkpointing_enable"):
+            self._actor_model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False},
+            )
+            logger.info("[rank %d] Gradient checkpointing enabled.", self._rank)
+
         if self._is_distributed:
             fsdp_cfg = {"enabled": True}
             if hasattr(self.config.policy, "training") and hasattr(self.config.policy.training, "fsdp_cfg") and self.config.policy.training.fsdp_cfg:
@@ -147,11 +153,15 @@ class RLTrainer:
         if not self.callbacks:
             self.callbacks.append(LoggingCallback(interval=max(1, self.config.logger.log_interval)))
 
+        self._resume_step = 0
+        if getattr(self.config.checkpointing, "resume", True):
+            self._try_resume_checkpoint()
+
         if self._is_distributed:
             torch.distributed.barrier()
 
-        logger.info("[rank %d] RLTrainer.setup complete: algo=%s, model=%s, world_size=%d, atom=%s",
-                     self._rank, self.config.algorithm.name, model_name, self._world_size, self._use_atom)
+        logger.info("[rank %d] RLTrainer.setup complete: algo=%s, model=%s, world_size=%d, atom=%s, resume_step=%d",
+                     self._rank, self.config.algorithm.name, model_name, self._world_size, self._use_atom, self._resume_step)
 
     def _load_dataset(self) -> None:
         """Load the training dataset from config."""
@@ -174,6 +184,71 @@ class RLTrainer:
             self._dataset = load_dataset(dataset_path, split="train")
 
         logger.info("Loaded dataset: %d samples from %s", len(self._dataset), dataset_path)
+
+    def _try_resume_checkpoint(self) -> None:
+        """Load model + optimizer state from the latest checkpoint if available."""
+        from lumenrl.utils.checkpoint import CheckpointManager
+
+        ckpt_dir = self.config.checkpointing.checkpoint_dir
+        latest = CheckpointManager.get_latest(ckpt_dir)
+        if latest is None:
+            logger.info("[rank %d] No checkpoint found in %s; training from scratch.", self._rank, ckpt_dir)
+            return
+
+        logger.info("[rank %d] Resuming from checkpoint: %s", self._rank, latest)
+        payload = CheckpointManager.load(latest)
+        self._resume_step = int(payload.get("step", 0)) + 1
+
+        model_sd = payload.get("model_state_dict")
+        if model_sd and self._actor_model is not None:
+            if self._is_distributed:
+                try:
+                    from torch.distributed.checkpoint.state_dict import (
+                        set_model_state_dict,
+                        set_optimizer_state_dict,
+                        StateDictOptions,
+                    )
+                    opts = StateDictOptions(full_state_dict=True)
+                    set_model_state_dict(self._actor_model, model_sd, options=opts)
+                    logger.info("[rank %d] Restored FSDP2 model state.", self._rank)
+                except Exception as exc:
+                    logger.warning("[rank %d] FSDP2 set_model_state_dict failed (%s); "
+                                   "trying load_state_dict.", self._rank, exc)
+                    self._actor_model.load_state_dict(model_sd, strict=False)
+            else:
+                self._actor_model.load_state_dict(model_sd, strict=False)
+                logger.info("[rank %d] Restored model state.", self._rank)
+
+        opt_sd = payload.get("optimizer_state_dict")
+        if opt_sd and self._optimizer is not None:
+            if self._is_distributed:
+                try:
+                    from torch.distributed.checkpoint.state_dict import (
+                        set_optimizer_state_dict,
+                        StateDictOptions,
+                    )
+                    opts = StateDictOptions(full_state_dict=True)
+                    set_optimizer_state_dict(
+                        self._actor_model, self._optimizer, opt_sd, options=opts,
+                    )
+                    logger.info("[rank %d] Restored FSDP2 optimizer state.", self._rank)
+                except Exception as exc:
+                    logger.warning("[rank %d] FSDP2 set_optimizer_state_dict failed (%s); "
+                                   "trying load_state_dict.", self._rank, exc)
+                    try:
+                        self._optimizer.load_state_dict(opt_sd)
+                    except Exception:
+                        logger.warning("[rank %d] Optimizer state restore failed; using fresh optimizer.", self._rank)
+            else:
+                try:
+                    self._optimizer.load_state_dict(opt_sd)
+                    logger.info("[rank %d] Restored optimizer state.", self._rank)
+                except Exception:
+                    logger.warning("[rank %d] Optimizer state restore failed; using fresh optimizer.", self._rank)
+
+        del payload
+        gc.collect()
+        logger.info("[rank %d] Resume complete. Will start from step %d.", self._rank, self._resume_step)
 
     def _get_batch_prompts(self, step: int) -> tuple[list[str], list[str]]:
         """Get a batch of (prompts, ground_truths) for the current step."""
@@ -248,13 +323,14 @@ class RLTrainer:
         return encoding["input_ids"], encoding["attention_mask"]
 
     def _offload_optimizer_to_cpu(self) -> None:
-        """Move optimizer state tensors to CPU to free GPU memory for rollout."""
+        """Move optimizer state tensors to CPU (pinned in /dev/shm via tmpfs)."""
         if self._optimizer is None:
             return
         for state in self._optimizer.state.values():
             for k, v in state.items():
                 if isinstance(v, torch.Tensor) and v.device.type != "cpu":
-                    state[k] = v.cpu()
+                    state[k] = v.to("cpu", non_blocking=True)
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
     def _reload_optimizer_to_gpu(self) -> None:
@@ -267,16 +343,14 @@ class RLTrainer:
                     state[k] = v.to(self._device, non_blocking=True)
 
     def _sync_weights_to_atom(self) -> None:
-        """Extract FSDP actor weights and push to ATOM engine for next rollout.
+        """Push updated weights to ATOM engine for next rollout.
 
-        TODO: Currently skipped because safetensors has issues with FSDP2
-        lazy storage pointers.  The vLLM subprocess is always spawned fresh
-        with the original model weights.  Weight sync will be re-enabled
-        once we implement proper FSDP2 state_dict consolidation.
+        Currently a no-op: ``get_model_state_dict(full_state_dict=True)``
+        OOMs on 8B with 8×MI350X.  The sync trainer generates with the
+        original base model weights via ATOM.
         """
         if self._atom_engine is None or self._actor_model is None:
             return
-        logger.debug("Weight sync to ATOM skipped (FSDP2 lazy storage workaround).")
 
     def _rollout_with_atom(
         self,
@@ -309,9 +383,9 @@ class RLTrainer:
                 expanded_prompts.append(p)
 
         if self._rank == 0:
-            self._atom_engine.wake()
+            if not getattr(self._atom_engine, '_initialized', False):
+                self._atom_engine.wake()
             response_texts = self._atom_engine.generate(expanded_prompts, sampling_params=sp)
-            self._atom_engine.sleep()
 
             full_texts = [p + r for p, r in zip(expanded_prompts, response_texts)]
             encoding = self._tokenizer(
@@ -528,19 +602,19 @@ class RLTrainer:
 
     @staticmethod
     def _fused_token_log_probs(logits: torch.Tensor, target_ids: torch.Tensor) -> torch.Tensor:
-        """Per-token log-probs via row-chunked logsumexp to bound peak memory.
+        """Per-token log-probs via row-chunked log_softmax to bound peak memory.
 
-        Processes one sequence at a time so the float32 promotion for
-        numerical stability only needs ``[S, V]`` instead of ``[B, S, V]``.
+        Uses F.log_softmax per sequence row, which avoids promoting the full
+        [S, V] logit tensor to float32 and is numerically stable for bf16.
+        Matches VERL's ``logprobs_from_logits_v2`` bf16 path.
         """
         logits_shifted = logits[:, :-1]            # [B, S-1, V]  bf16 view
         targets = target_ids[:, 1:].unsqueeze(-1)  # [B, S-1, 1]
-        chosen = logits_shifted.gather(-1, targets).squeeze(-1).float()  # [B, S-1]
-        log_z_parts = []
+        lp_parts = []
         for i in range(logits_shifted.shape[0]):
-            log_z_parts.append(logits_shifted[i].float().logsumexp(dim=-1))
-        log_z = torch.stack(log_z_parts, dim=0)    # [B, S-1]
-        return chosen - log_z
+            row_lp = torch.nn.functional.log_softmax(logits_shifted[i], dim=-1)
+            lp_parts.append(row_lp.gather(-1, targets[i]).squeeze(-1))
+        return torch.stack(lp_parts, dim=0).float()  # [B, S-1]
 
     def _compute_log_probs_for_model(
         self,
@@ -551,8 +625,8 @@ class RLTrainer:
     ) -> torch.Tensor:
         """Compute per-token log-probs from model for given sequences.
 
-        Uses a memory-efficient fused gather+logsumexp instead of full
-        log_softmax over the vocabulary.
+        Uses row-chunked F.log_softmax for numerical stability with
+        bf16, avoiding float32 promotion of the full vocab dimension.
 
         When ``move_to_gpu`` is True, moves the model to GPU before forward
         and back to CPU afterward (for CPU-offloaded reference model).
@@ -576,6 +650,7 @@ class RLTrainer:
                 logits = outputs.logits if hasattr(outputs, "logits") else outputs
                 token_lp = self._fused_token_log_probs(logits, ids_chunk)
                 all_log_probs.append(token_lp)
+                del outputs, logits
 
         if move_to_gpu:
             model.cpu()
@@ -672,45 +747,12 @@ class RLTrainer:
         outputs = self._actor_model(input_ids=sequences, attention_mask=attention_mask)
         logits = outputs.logits if hasattr(outputs, "logits") else outputs
         token_log_probs = self._fused_token_log_probs(logits, sequences)
+        del outputs, logits
 
         batch.tensors["log_probs"] = token_log_probs
 
-        if self.global_step < 3 and self._rank == 0:
-            mb_idx = getattr(self, "_nan_debug_mb_idx", 0)
-            self._nan_debug_mb_idx = mb_idx + 1
-            olp = batch.tensors["old_log_probs"]
-            nlp = token_log_probs
-            rmask = batch.tensors.get("response_mask")
-            adv = batch.tensors.get("advantages")
-            ratio_dbg = torch.exp(nlp - olp)
-            logger.info(
-                "NaN-DEBUG mb=%d: B=%d, adv min=%.4f max=%.4f zero=%d/%d, "
-                "ratio nan=%d inf=%d min=%.4f max=%.4f, "
-                "logp nan=%d oldlogp nan=%d logits nan=%d",
-                mb_idx, sequences.shape[0],
-                adv.min().item() if adv is not None else 0,
-                adv.max().item() if adv is not None else 0,
-                (adv.abs() < 1e-8).sum().item() if adv is not None else -1,
-                adv.numel() if adv is not None else -1,
-                ratio_dbg.isnan().sum().item(), ratio_dbg.isinf().sum().item(),
-                ratio_dbg.min().item(), ratio_dbg.max().item(),
-                nlp.isnan().sum().item(), olp.isnan().sum().item(),
-                logits.isnan().sum().item(),
-            )
-
         loss, metrics = self._algorithm.compute_loss(batch)
         loss = loss.to(self._device)
-
-        if self.global_step < 3 and self._rank == 0:
-            mb_idx = getattr(self, "_nan_debug_mb_idx", 1) - 1
-            logger.info(
-                "NaN-DEBUG step=%d mb=%d loss: loss=%.6f loss_pg=%.6f loss_total=%.6f "
-                "loss_isnan=%s",
-                self.global_step, mb_idx, float(loss.detach()),
-                metrics.get("loss_pg", float("nan")),
-                metrics.get("loss_total", float("nan")),
-                loss.isnan().item(),
-            )
 
         if loss.isnan():
             metrics["loss"] = float("nan")
@@ -734,8 +776,11 @@ class RLTrainer:
 
         num_generations = _algo_num_generations(self.config)
         total_steps = int(self.config.num_training_steps)
+        start_step = self._resume_step
+        if start_step > 0:
+            logger.info("[rank %d] Skipping steps 0..%d (resuming from checkpoint).", self._rank, start_step - 1)
 
-        for step in range(total_steps):
+        for step in range(start_step, total_steps):
             step_start = time.time()
             self.global_step = step
             if self._rank == 0:
@@ -745,7 +790,7 @@ class RLTrainer:
             prompts, ground_truths = self._get_batch_prompts(step)
             input_ids, attention_mask = self._tokenize_prompts(prompts)
 
-            if self._use_atom and self._atom_engine is not None and step > 0:
+            if self._use_atom and self._atom_engine is not None:
                 self._offload_optimizer_to_cpu()
 
             t0 = time.time()
@@ -758,9 +803,6 @@ class RLTrainer:
                     input_ids, attention_mask, num_generations,
                 )
             gen_time = time.time() - t0
-
-            if self._use_atom and self._atom_engine is not None and step > 0:
-                self._reload_optimizer_to_gpu()
 
             prompt_tok = int(attention_mask.repeat_interleave(
                 num_generations, dim=0).to(seq_mask.device).sum().item()) if num_generations > 0 else 0
@@ -827,6 +869,9 @@ class RLTrainer:
             batch = self._algorithm.compute_advantages(batch)
             batch = apply_rollout_correction(batch, self.config)
 
+            if self._use_atom and self._atom_engine is not None:
+                self._reload_optimizer_to_gpu()
+
             t2 = time.time()
             micro_bs = max(1, int(self.config.policy.train_micro_batch_size))
             max_tok = int(self.config.policy.max_token_len_per_gpu)
@@ -835,18 +880,43 @@ class RLTrainer:
             self._optimizer.zero_grad(set_to_none=True)
             metrics_accum: dict[str, float] = {}
             step_count = 0
+            nan_mb_count = 0
             for mini in mini_batches:
                 m = self._train_step(mini)
+                if m.get("loss") is not None and (m["loss"] != m["loss"]):
+                    nan_mb_count += 1
+                    continue
                 for k, v in m.items():
-                    metrics_accum[k] = metrics_accum.get(k, 0.0) + v
+                    if v == v:
+                        metrics_accum[k] = metrics_accum.get(k, 0.0) + v
                 step_count += 1
-            torch.nn.utils.clip_grad_norm_(self._actor_model.parameters(), max_norm=1.0)
+            nan_param_count = 0
+            total_param_count = 0
+            for p in self._actor_model.parameters():
+                if p.grad is not None:
+                    total_param_count += 1
+                    if p.grad.isnan().any():
+                        nan_param_count += 1
+                        p.grad = torch.where(
+                            p.grad.isnan(), torch.zeros_like(p.grad), p.grad,
+                        )
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self._actor_model.parameters(), max_norm=1.0,
+            )
             self._optimizer.step()
             self._optimizer.zero_grad(set_to_none=True)
             train_time = time.time() - t2
 
+            if nan_param_count > 0 and self._rank == 0:
+                logger.warning(
+                    "[step %d] Zeroed NaN grads in %d/%d params, grad_norm=%.4f",
+                    step, nan_param_count, total_param_count, float(grad_norm),
+                )
+
             denom = max(1, step_count)
             metrics = {k: v / denom for k, v in metrics_accum.items()}
+            metrics["grad_norm"] = float(grad_norm)
+            metrics["nan_params"] = nan_param_count
 
             step_time = time.time() - step_start
             metrics["timing/step_s"] = step_time
@@ -876,12 +946,8 @@ class RLTrainer:
 
             self._sync_rollout_weights()
 
-            if self._rank == 0:
-                for cb in self.callbacks:
-                    cb.on_step_end(self, step, metrics)
-
-            if self._is_distributed:
-                torch.distributed.barrier()
+            for cb in self.callbacks:
+                cb.on_step_end(self, step, metrics)
 
             del sequences, seq_mask, old_log_probs, ref_log_probs
             del rewards, responses, response_mask, batch, mini_batches

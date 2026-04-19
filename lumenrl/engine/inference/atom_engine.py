@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -31,14 +32,16 @@ logger = logging.getLogger(__name__)
 
 _WEIGHT_SYNC_DIR = os.environ.get(
     "LUMENRL_WEIGHT_SYNC_DIR",
-    "/tmp/lumenrl_weight_sync",
+    "/dev/shm/lumenrl_weight_sync",
 )
 
 _WORKER_SCRIPT = textwrap.dedent("""\
 import gc, json, os, sys, logging
 
+os.environ["VLLM_USE_V1"] = "1"
 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 os.environ["VLLM_CONFIGURE_LOGGING"] = "0"
+os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
 for key in list(os.environ.keys()):
     if any(key.startswith(p) for p in [
         "MASTER_ADDR", "MASTER_PORT", "RANK", "LOCAL_RANK",
@@ -68,6 +71,10 @@ kwargs = {
     "dtype": "bfloat16",
     "trust_remote_code": True,
     "tensor_parallel_size": 1,
+    "enable_chunked_prefill": True,
+    "max_num_batched_tokens": 32768,
+    "max_num_seqs": 64,
+    "disable_log_stats": True,
 }
 if max_model_len is not None:
     kwargs["max_model_len"] = max_model_len
@@ -104,8 +111,12 @@ for line in cmd_f:
         resp_f.flush()
 
     elif cmd == "sleep":
-        del llm
-        llm = None
+        level = int(msg.get("level", 1))
+        if llm is not None and hasattr(llm, "sleep"):
+            llm.sleep(level=level)
+        elif llm is not None:
+            del llm
+            llm = None
         torch.cuda.empty_cache()
         gc.collect()
         torch.cuda.empty_cache()
@@ -116,11 +127,14 @@ for line in cmd_f:
         new_path = msg.get("model_path")
         if new_path:
             kwargs["model"] = new_path
-        if llm is not None:
-            del llm
-            torch.cuda.empty_cache()
-            gc.collect()
-        llm = LLM(**kwargs)
+        if llm is not None and hasattr(llm, "wake_up"):
+            llm.wake_up()
+        else:
+            if llm is not None:
+                del llm
+                torch.cuda.empty_cache()
+                gc.collect()
+            llm = LLM(**kwargs)
         resp_f.write(json.dumps({"status": "ok"}) + "\\n")
         resp_f.flush()
 
@@ -153,6 +167,7 @@ class AtomEngine:
         self._model_name = model_name
         self._proc: subprocess.Popen | None = None
         self._initialized = False
+        self._sleeping = False
         self._weight_dir: str | None = None
         self._cmd_fifo: str | None = None
         self._resp_fifo: str | None = None
@@ -178,7 +193,7 @@ class AtomEngine:
         if env_mem is not None:
             gpu_mem = float(env_mem)
 
-        gpu_id = int(os.environ.get("LOCAL_RANK", "0"))
+        gpu_id = self._config.gpu_id if self._config.gpu_id is not None else int(os.environ.get("LOCAL_RANK", "0"))
 
         fifo_dir = tempfile.mkdtemp(prefix="lumenrl_fifo_")
         self._cmd_fifo = os.path.join(fifo_dir, "cmd")
@@ -188,8 +203,10 @@ class AtomEngine:
 
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        env["VLLM_USE_V1"] = "1"
         env["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         env["VLLM_CONFIGURE_LOGGING"] = "0"
+        env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
         for key in list(env.keys()):
             if any(key.startswith(p) for p in [
                 "MASTER_ADDR", "MASTER_PORT", "RANK", "LOCAL_RANK",
@@ -287,6 +304,52 @@ class AtomEngine:
         save_file(tensors, str(save_path))
         self._weight_dir = str(sync_dir)
         logger.info("AtomEngine.update_weights: saved %d tensors to %s", len(tensors), save_path)
+
+    def sleep_inprocess(self, level: int = 1) -> None:
+        """Put vLLM to sleep without killing the subprocess.
+
+        Uses vLLM's native ``LLM.sleep(level)`` to offload model weights
+        to CPU and free KV cache memory, keeping the subprocess alive
+        for fast ``wake_inprocess()`` restoration.
+
+        Level 1: offload weights to CPU, discard KV cache (fast restore).
+        Level 2: discard weights and KV cache (lower CPU memory).
+        """
+        if self._proc is None or self._proc.poll() is not None:
+            return
+        if self._sleeping:
+            return
+        try:
+            self._send_cmd({"cmd": "sleep", "level": level})
+            self._sleeping = True
+            logger.info("AtomEngine: sleep_inprocess(level=%d) complete.", level)
+        except Exception as exc:
+            logger.warning("AtomEngine: sleep_inprocess failed (%s), falling back to kill.", exc)
+            self.sleep()
+
+    def wake_inprocess(self) -> None:
+        """Wake vLLM from in-process sleep (restore weights + KV cache).
+
+        If the subprocess died or ``wake_up()`` fails (e.g. ROCm page fault),
+        kills the subprocess, waits briefly for driver cleanup, then starts
+        a fresh subprocess.
+        """
+        if not self._sleeping:
+            if self._proc is None or self._proc.poll() is not None:
+                self.wake()
+            return
+        if self._proc is not None and self._proc.poll() is None:
+            try:
+                self._send_cmd({"cmd": "wake"})
+                self._sleeping = False
+                logger.info("AtomEngine: wake_inprocess complete.")
+                return
+            except Exception as exc:
+                logger.warning("AtomEngine: wake_inprocess failed (%s), killing subprocess and restarting.", exc)
+                self.sleep()
+                time.sleep(5)
+        self._sleeping = False
+        self.wake()
 
     def sleep(self) -> None:
         """Kill the vLLM subprocess to free all GPU memory for training.

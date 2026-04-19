@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Qwen3-8B-Base BF16 DAPO Sync Training Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Instrument+Sans:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #070a0f; --card: #101620; --border: #1a2636;
+    --text: #c8d0dc; --muted: #6b7c92; --accent: #38bdf8;
+    --green: #34d399; --orange: #fbbf24; --red: #fb7185;
+    --purple: #c084fc; --teal: #2dd4bf; --amber: #fcd34d;
+    --glow: rgba(56, 189, 248, 0.12);
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: radial-gradient(1200px 600px at 10% -10%, rgba(56, 189, 248, 0.08), transparent),
+                radial-gradient(900px 500px at 100% 0%, rgba(52, 211, 153, 0.05), transparent),
+                var(--bg);
+    color: var(--text); font-family: 'Instrument Sans', sans-serif;
+    padding: 32px 36px 48px; min-height: 100vh;
+  }
+  h1 {
+    font-size: 1.85rem; font-weight: 700; margin-bottom: 6px; letter-spacing: -0.02em;
+    background: linear-gradient(120deg, #7dd3fc, #34d399, #a5b4fc);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+  .subtitle { color: var(--muted); font-size: 0.88rem; margin-bottom: 22px; font-family: 'JetBrains Mono', monospace; line-height: 1.5; }
+  .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 18px; margin-bottom: 22px; }
+  @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
+  .card {
+    background: linear-gradient(145deg, rgba(16, 22, 32, 0.95), rgba(10, 14, 22, 0.98));
+    border: 1px solid var(--border); border-radius: 14px; padding: 20px 22px;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.03);
+  }
+  .card h2 {
+    font-size: 0.92rem; font-weight: 600; margin-bottom: 12px; color: var(--accent);
+    letter-spacing: -0.01em; display: flex; align-items: center; gap: 8px;
+  }
+  .card h2::before {
+    content: ''; width: 3px; height: 14px; border-radius: 2px;
+    background: linear-gradient(180deg, var(--accent), var(--teal));
+  }
+  .chart-wrap { height: 280px; }
+  .ref-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; font-family: 'JetBrains Mono', monospace; }
+  .ref-table th, .ref-table td { padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: top; }
+  .ref-table th {
+    color: var(--muted); font-weight: 600; font-size: 0.68rem; text-transform: uppercase;
+    letter-spacing: 0.55px; background: rgba(0,0,0,0.2);
+  }
+  .ref-table tr:hover td { background: rgba(56, 189, 248, 0.04); }
+  .ref-table td:first-child { color: var(--accent); font-weight: 600; font-family: 'Instrument Sans', sans-serif; white-space: nowrap; }
+  .status { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; vertical-align: middle; }
+  .status.running { background: var(--green); box-shadow: 0 0 10px var(--green); animation: pulse 1.8s ease-in-out infinite; }
+  .status.snapshot { background: var(--orange); }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+  .badge { display: inline-block; padding: 2px 9px; border-radius: 6px; font-size: 0.68rem; font-weight: 600; font-family: 'JetBrains Mono', monospace; }
+  .badge-sync { background: rgba(45, 212, 191, 0.14); color: var(--teal); border: 1px solid rgba(45, 212, 191, 0.25); }
+  .badge-phase { background: rgba(251, 191, 36, 0.14); color: var(--orange); border: 1px solid rgba(251, 191, 36, 0.25); }
+  .metric-row { display: flex; gap: 12px; margin-bottom: 22px; flex-wrap: wrap; }
+  .metric-box {
+    background: linear-gradient(160deg, rgba(56, 189, 248, 0.06), rgba(16, 22, 32, 0.9));
+    border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; flex: 1;
+    min-width: 118px; max-width: 200px; transition: border-color 0.2s, box-shadow 0.2s;
+  }
+  .metric-box:hover { border-color: rgba(56, 189, 248, 0.35); box-shadow: 0 0 0 1px var(--glow); }
+  .metric-box .label {
+    font-size: 0.65rem; color: var(--muted); text-transform: uppercase;
+    letter-spacing: 0.65px; font-family: 'JetBrains Mono', monospace;
+  }
+  .metric-box .value { font-size: 1.35rem; font-weight: 700; margin-top: 4px; font-family: 'JetBrains Mono', monospace; line-height: 1.15; }
+  .metric-box .hint { font-size: 0.7rem; margin-top: 4px; color: var(--muted); font-family: 'JetBrains Mono', monospace; }
+  .hint.pos { color: var(--green); } .hint.neg { color: var(--red); } .hint.neu { color: var(--muted); }
+  .full-width { grid-column: 1 / -1; }
+  .note {
+    border-radius: 10px; padding: 14px 18px; margin-bottom: 20px; font-size: 0.82rem;
+    font-family: 'JetBrains Mono', monospace; border: 1px solid var(--border);
+    background: rgba(56, 189, 248, 0.05); color: var(--text);
+  }
+  .note strong { color: var(--accent); }
+  .config-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; font-family: 'JetBrains Mono', monospace; margin-top: 12px; }
+  .config-table th, .config-table td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border); }
+  .config-table th { color: var(--muted); font-weight: 600; font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.5px; background: rgba(0,0,0,0.2); }
+  .config-table .old { color: var(--red); text-decoration: line-through; opacity: 0.6; }
+  .config-table .new { color: var(--green); font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>Qwen3-8B-Base BF16 DAPO Sync Training Dashboard</h1>
+<div class="subtitle">
+  <span class="badge badge-sync">Sync &middot; RLTrainer</span>
+  <span class="badge badge-phase">Phase 1 &middot; Optimized</span>
+  <span class="status running"></span> Training in progress &mdash; Phase 1 optimizations &middot;
+  Last update: <span id="hdr-ts">2026-04-18 14:50</span>
+</div>
+
+<div class="note">
+  <strong>Phase 1 optimizations applied:</strong>
+  <b>Opt 1</b> batch_size 64&rarr;128 |
+  <b>Opt 2</b> ATOM gpu_mem 0.13&rarr;0.20 |
+  <b>Opt 5</b> seq_len 8192&rarr;4096 |
+  <b>Opt 7</b> checkpoint resume (first save at step 25).
+  <br><br>
+  <strong>vLLM Zero-Risk Opts:</strong> V1 engine, chunked prefill, max_num_seqs=64, disable_log_stats.
+  <br>
+  <strong>Bugs fixed:</strong> Checkpoint callback deadlock (FSDP2 collective rank-0-only &rarr; all-rank).
+  <br>
+  <strong>Current status:</strong> Run 3 completed 21 steps (0&ndash;20), crashed step 21 (ROCm page fault GPU-2).
+  Run 4 resumed from ckpt_0, completed 11 steps (1&ndash;11), crashed step 12 (ROCm page fault ALL GPUs).
+  Run 5 resuming from ckpt_10. save_steps=10 for crash recovery.
+  <br>
+  Phase 1 chart uses Run 3 data (longest continuous trajectory, 21 steps).
+  Run 4 data shown as &ldquo;Resumed&rdquo; series where available.
+</div>
+
+<div class="card" style="margin-bottom: 22px;">
+  <h2>Phase 1 Config Changes</h2>
+  <table class="config-table">
+    <thead><tr><th>Parameter</th><th>Run v1 (old)</th><th>Phase 1 (new)</th><th>Rationale</th></tr></thead>
+    <tbody>
+      <tr><td>train_global_batch_size</td><td class="old">64 (4x16)</td><td class="new">128 (8x16)</td><td>Match VERL baseline; better gradient quality</td></tr>
+      <tr><td>gpu_memory_utilization</td><td class="old">0.13 (~33 GiB)</td><td class="new">0.20 (~50 GiB)</td><td>More KV cache, higher gen throughput</td></tr>
+      <tr><td>max_total_sequence_length</td><td class="old">8192</td><td class="new">4096</td><td>Math rarely needs &gt;3K; reduces peak memory</td></tr>
+      <tr><td>max_response_length</td><td class="old">7168</td><td class="new">3072</td><td>Aligned with reduced seq length</td></tr>
+      <tr><td>max_model_len (ATOM)</td><td class="old">8192</td><td class="new">4096</td><td>Match sequence length cap</td></tr>
+      <tr><td>checkpoint resume</td><td class="old">metrics only</td><td class="new">full model+optimizer state</td><td>Crash recovery (ROCm page faults)</td></tr>
+      <tr><td>init_process_group timeout</td><td class="old">1800s (default)</td><td class="new">7200s</td><td>Prevent Gloo timeout during long gen</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="metric-row" id="summary-cards"></div>
+
+<div class="grid">
+  <div class="card"><h2>Training Loss</h2><div class="chart-wrap"><canvas id="c-loss"></canvas></div></div>
+  <div class="card"><h2>Reward Mean</h2><div class="chart-wrap"><canvas id="c-rmean"></canvas></div></div>
+  <div class="card"><h2>Reward Accuracy</h2><div class="chart-wrap"><canvas id="c-racc"></canvas></div></div>
+  <div class="card"><h2>Step Time</h2><div class="chart-wrap"><canvas id="c-step"></canvas></div></div>
+  <div class="card"><h2>Gen Time &amp; Gen Throughput</h2><div class="chart-wrap"><canvas id="c-gen"></canvas></div></div>
+  <div class="card"><h2>Grad Norm</h2><div class="chart-wrap"><canvas id="c-grad"></canvas></div></div>
+  <div class="card"><h2>Time per Token (Gen) &mdash; ms</h2><div class="chart-wrap"><canvas id="c-tpt"></canvas></div></div>
+  <div class="card"><h2>Mean Response Length</h2><div class="chart-wrap"><canvas id="c-meanlen"></canvas></div></div>
+  <div class="card"><h2>Max Sequence Length</h2><div class="chart-wrap"><canvas id="c-maxlen"></canvas></div></div>
+
+  <div class="card full-width">
+    <h2>Metrics Reference</h2>
+    <table class="ref-table">
+      <thead><tr><th>Metric</th><th>Formula / Computation</th><th>Source</th><th>Granularity</th></tr></thead>
+      <tbody>
+        <tr><td>Training Loss</td><td>Clipped surrogate DAPO asymmetric clip <code>[1-e_low, 1+e_high]</code></td><td>loss_functions.py, dapo.py</td><td>Mean over mini-batches per step</td></tr>
+        <tr><td>Reward Mean</td><td><code>mean(rewards)</code> over all rollout sequences</td><td>rl_trainer.py</td><td>Per step</td></tr>
+        <tr><td>Reward Accuracy</td><td>Fraction of sequences with reward &gt; 0</td><td>rl_trainer.py</td><td>Per step</td></tr>
+        <tr><td>Step Time</td><td>Wall clock: gen + old_logp + ref + train + sync</td><td>rl_trainer.py</td><td>Per step</td></tr>
+        <tr><td>Gen Time</td><td>Wall clock for rollout phase (ATOM vLLM)</td><td>rl_trainer.py</td><td>Per step</td></tr>
+        <tr><td>Gen Throughput</td><td><code>generated_tokens / gen_time</code></td><td>rl_trainer.py</td><td>Per step</td></tr>
+        <tr><td>Time per Token (Gen)</td><td><code>1000 / gen_tok_per_s</code> &mdash; ms per generated token during rollout</td><td>Derived from rl_trainer.py</td><td>Per step</td></tr>
+        <tr><td>Grad Norm</td><td><code>clip_grad_norm_(params, 1.0)</code> global L2</td><td>rl_trainer.py</td><td>Per step</td></tr>
+        <tr><td>NaN Grads</td><td>Params with NaN <code>.grad</code>; zeroed before clip</td><td>rl_trainer.py</td><td>Per step</td></tr>
+        <tr><td>Mean Response Length</td><td>Mean token count from <code>response_mask</code></td><td>rl_trainer.py</td><td>Per step</td></tr>
+        <tr><td>Max Sequence Length</td><td>Max padded sequence length in batch</td><td>rl_trainer.py</td><td>Per step</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+var V1_STEPS=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17];
+var V1_LOSS=[-0.0914343,0.0493069,0.0950321,0.0488714,-0.0373262,-0.0514216,0.0374856,0,0.0579588,0.0130063,0.101164,0.0542512,0.0922696,-0.116074,0.062252,0.00902419,-0.0846051,0.134629];
+var V1_REWARD_MEAN=[-0.90625,-0.65625,-0.875,-0.84375,-0.875,-0.6875,-0.90625,-1,-0.90625,-0.9375,-0.8125,-0.96875,-0.78125,-0.59375,-0.71875,-0.78125,-0.71875,-0.78125];
+var V1_REWARD_ACC=[0.046875,0.171875,0.0625,0.078125,0.0625,0.15625,0.046875,0,0.046875,0.03125,0.09375,0.015625,0.109375,0.203125,0.140625,0.109375,0.140625,0.109375];
+var V1_STEP_S=[86.2233,67.5819,54.6486,85.5501,72.6152,82.657,59.5421,70.9706,60.3779,64.8084,76.8484,64.9383,64.7454,89.6192,82.9879,57.2422,82.9475,100.251];
+var V1_GEN_S=[40.3178,27.3849,22.5275,35.1995,30.2927,33.9176,24.0526,29.7012,25.1362,27.5957,32.4175,26.6691,27.0047,36.7578,33.3738,23.5548,34.0202,40.6965];
+var V1_GEN_TOK_S=[1228.56,2283.03,1986.47,1399.34,2165.51,1390.28,1867.74,1763.13,1814.8,1405.33,1511.5,1830.33,1841.24,1630.43,1378.33,1988.82,1406.58,1502.68];
+var V1_GRAD_NORM=[0.297607,0.431641,0.343018,0.294922,0.254028,0.737793,0.222534,0,0.457275,0.201172,0.370605,0.175293,0.469727,0.396484,0.378418,0.371094,0.333008,0.424072];
+var V1_MEAN_RESP_LEN=[944.062,1092.59,827.125,920.75,1143.12,897.828,853.547,973.516,831.156,729.734,888.875,907.047,917.109,1065.44,866.828,851.812,862.625,1078.05];
+var V1_MAX_SEQ_LEN=[2366,2612,2253,3562,2961,3415,2558,2932,2513,2686,3078,2699,2642,3628,3501,2332,3445,4062];
+
+var P1_STEPS=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20];
+var P1_LOSS=[0.000476,0.0304,0.3134,-0.0298,0.0238,-0.00370,-0.00164,-0.1089,0.0133,-0.0129,0.0675,0.0852,0.0376,0.0195,-0.0630,-0.00453,0.00762,0.0162,-0.0796,0.0193,-0.0437];
+var P1_REWARD_MEAN=[-0.6875,-0.84375,-0.8125,-0.796875,-0.703125,-0.703125,-0.625,-0.703125,-0.734375,-0.84375,-0.734375,-0.765625,-0.875,-0.78125,-0.75,-0.546875,-0.578125,-0.90625,-0.65625,-0.78125,-0.6875];
+var P1_REWARD_ACC=[0.15625,0.078125,0.09375,0.101562,0.148438,0.148438,0.1875,0.148438,0.132812,0.078125,0.132812,0.117188,0.0625,0.109375,0.125,0.226562,0.210938,0.046875,0.171875,0.109375,0.15625];
+var P1_STEP_S=[160.09,139.94,120.70,137.12,101.23,130.90,152.09,109.45,133.59,127.45,144.27,131.22,131.42,130.80,110.95,128.37,125.99,103.04,98.13,129.50,130.60];
+var P1_GEN_S=[51.50,38.47,31.43,37.26,26.52,37.06,43.00,30.12,34.34,37.00,41.44,35.88,33.54,32.37,29.79,36.52,32.43,30.33,34.74,35.85,36.20];
+var P1_GEN_TOK_S=[1970.16,3003.06,3321.05,2919.89,2895.02,3044.85,3160.40,3025.29,3263.30,2776.87,3112.03,2317.22,3054.46,2459.13,2949.79,2807.01,2815.87,2825.72,2106.06,2680.68,2629.74];
+var P1_GRAD_NORM=[0.2286,0.1931,183.688,0.2866,0.4944,0.3599,0.3989,0.2694,0.2499,0.2467,0.2549,0.3726,0.1952,0.6162,0.00243,0.3643,0.3025,0.2341,0.4514,0.2506,0.3911];
+var P1_MEAN_RESP_LEN=[939.73,1041.04,956.75,1004.23,721.76,1013.82,1193.26,846.70,994.09,937.48,1143.85,801.84,955.49,791.41,822.37,962.66,829.91,833.76,702.90,858.27,875.09];
+var P1_MAX_SEQ_LEN=[3177,3216,2945,3209,2550,3065,3244,2593,3208,3016,3260,3227,3242,3321,2727,2790,3133,2423,2104,3116,3168];
+var P1_NAN_PARAMS=[0,0,309,0,0,0,0,0,0,0,0,0,0,0,399,0,0,0,0,0,0];
+
+var TOTAL_TRAINING_STEPS=275;
+
+var V1_TPT=V1_GEN_TOK_S.map(function(t){return t>0?1000/t:0;});
+var P1_TPT=P1_GEN_TOK_S.map(function(t){return t>0?1000/t:0;});
+
+var avgStep=P1_STEP_S.reduce(function(a,b){return a+b;},0)/P1_STEP_S.length;
+var remaining=Math.max(0,TOTAL_TRAINING_STEPS-P1_STEPS.length);
+var etaH=(remaining*avgStep)/3600;
+var latestTput=P1_GEN_TOK_S[P1_GEN_TOK_S.length-1];
+var latestTPT=latestTput>0?(1000/latestTput).toFixed(2):'---';
+
+function fmtNum(x){
+  var ax=Math.abs(x);
+  if(ax>=1000)return x.toFixed(1);
+  if(ax>=100)return x.toFixed(2);
+  if(ax>=10)return x.toFixed(3);
+  if(ax>=1)return x.toFixed(4);
+  return x.toFixed(5);
+}
+
+var cards=[
+  {label:'Phase 1 step',value:String(P1_STEPS[P1_STEPS.length-1]),hint:P1_STEPS.length+' / '+TOTAL_TRAINING_STEPS,hClass:'neu'},
+  {label:'Run v1 steps',value:String(V1_STEPS.length),hint:'bs=64, completed',hClass:'neu'},
+  {label:'Training loss',value:fmtNum(P1_LOSS[P1_LOSS.length-1]),hint:'Phase 1 latest',hClass:'neu'},
+  {label:'Reward accuracy',value:(P1_REWARD_ACC[P1_REWARD_ACC.length-1]*100).toFixed(1)+'%',hint:'fraction r>0',hClass:'pos'},
+  {label:'Reward mean',value:fmtNum(P1_REWARD_MEAN[P1_REWARD_MEAN.length-1]),hint:'batch mean',hClass:'neu'},
+  {label:'Gen throughput',value:latestTput.toFixed(0)+' tok/s',hint:'Phase 1',hClass:'pos'},
+  {label:'ms/token (gen)',value:latestTPT,hint:'1000 / tok_per_s',hClass:'neu'},
+  {label:'Step time',value:avgStep.toFixed(0)+'s',hint:'Phase 1 avg',hClass:'neu'},
+  {label:'Grad norm',value:fmtNum(P1_GRAD_NORM[P1_GRAD_NORM.length-1]),hint:'global L2',hClass:'neu'},
+  {label:'NaN grad steps',value:P1_NAN_PARAMS.filter(function(x){return x>0;}).length+'/'+P1_STEPS.length,hint:'steps 2,14 spiked',hClass:P1_NAN_PARAMS[P1_NAN_PARAMS.length-1]>0?'neg':'pos'},
+  {label:'ETA (est.)',value:etaH<200?etaH.toFixed(1)+' h':'---',hint:remaining+' steps x '+avgStep.toFixed(0)+'s',hClass:'neu'},
+];
+document.getElementById('summary-cards').innerHTML=cards.map(function(c){
+  return '<div class="metric-box"><div class="label">'+c.label+'</div><div class="value" style="color:var(--text)">'+c.value+'</div><div class="hint '+c.hClass+'">'+c.hint+'</div></div>';
+}).join('');
+
+var cF={family:"'JetBrains Mono', monospace",size:11};
+var gridColor='#1a2434';
+var tickColor='#7a8ca3';
+var baseOpts={
+  responsive:true,maintainAspectRatio:false,
+  interaction:{mode:'index',intersect:false},
+  plugins:{
+    legend:{display:true,labels:{color:tickColor,font:cF,boxWidth:14}},
+    tooltip:{backgroundColor:'rgba(10,14,22,0.94)',titleFont:cF,bodyFont:cF,borderColor:'#2a3a50',borderWidth:1,padding:10},
+  },
+  scales:{
+    x:{type:'linear',ticks:{color:tickColor,font:cF,maxTicksLimit:12},grid:{color:gridColor},title:{display:true,text:'Training step',color:tickColor,font:cF}},
+    y:{ticks:{color:tickColor,font:cF},grid:{color:gridColor}},
+  },
+};
+
+function dualChart(canvasId,label1,steps1,data1,color1,label2,steps2,data2,color2,yTitle,opts){
+  opts=opts||{};
+  var ds1={
+    label:label1,data:steps1.map(function(s,i){return{x:s,y:data1[i]};}),
+    borderColor:color1,backgroundColor:color1+'22',borderWidth:1.5,tension:0.3,
+    pointRadius:2,pointHoverRadius:4,borderDash:[4,3],fill:false,spanGaps:true,
+  };
+  var ds2={
+    label:label2,data:steps2.map(function(s,i){return{x:s,y:data2[i]};}),
+    borderColor:color2,backgroundColor:color2+'22',borderWidth:2.5,tension:0.3,
+    pointRadius:3,pointHoverRadius:6,fill:opts.fill||false,spanGaps:true,
+  };
+  var datasets=steps2.length>0?[ds1,ds2]:[ds1];
+  var yAxis={ticks:{color:tickColor,font:cF},grid:{color:gridColor},title:{display:true,text:yTitle,color:tickColor,font:cF}};
+  if(opts.yMin!==undefined)yAxis.min=opts.yMin;
+  if(opts.yMax!==undefined)yAxis.max=opts.yMax;
+  return new Chart(document.getElementById(canvasId),{
+    type:'line',data:{datasets:datasets},
+    options:{responsive:true,maintainAspectRatio:false,interaction:baseOpts.interaction,plugins:baseOpts.plugins,scales:{x:baseOpts.scales.x,y:yAxis}},
+  });
+}
+
+dualChart('c-loss','Run v1 (bs=64)',V1_STEPS,V1_LOSS,'#6b7c92','Phase 1 (bs=128)',P1_STEPS,P1_LOSS,'#38bdf8','loss');
+dualChart('c-rmean','Run v1',V1_STEPS,V1_REWARD_MEAN,'#6b7c92','Phase 1',P1_STEPS,P1_REWARD_MEAN,'#fbbf24','reward/mean');
+dualChart('c-racc','Run v1',V1_STEPS,V1_REWARD_ACC.map(function(v){return v*100;}),'#6b7c92','Phase 1',P1_STEPS,P1_REWARD_ACC.map(function(v){return v*100;}),'#34d399','reward/accuracy (%)',{yMin:0,yMax:50});
+dualChart('c-step','Run v1',V1_STEPS,V1_STEP_S,'#6b7c92','Phase 1',P1_STEPS,P1_STEP_S,'#a78bfa','timing/step_s');
+
+(function(){
+  var ctx=document.getElementById('c-gen');
+  new Chart(ctx,{
+    type:'line',
+    data:{datasets:[
+      {label:'Gen time v1',data:V1_STEPS.map(function(s,i){return{x:s,y:V1_GEN_S[i]};}),borderColor:'#6b7c92',borderWidth:1.5,borderDash:[4,3],tension:0.3,pointRadius:2,fill:false,yAxisID:'y'},
+      {label:'Gen time P1',data:P1_STEPS.map(function(s,i){return{x:s,y:P1_GEN_S[i]};}),borderColor:'#2dd4bf',borderWidth:2.5,tension:0.3,pointRadius:3,fill:false,yAxisID:'y'},
+      {label:'Throughput v1',data:V1_STEPS.map(function(s,i){return{x:s,y:V1_GEN_TOK_S[i]};}),borderColor:'#4a5568',borderWidth:1,borderDash:[2,2],tension:0.3,pointRadius:1,fill:false,yAxisID:'y1'},
+      {label:'Throughput P1',data:P1_STEPS.map(function(s,i){return{x:s,y:P1_GEN_TOK_S[i]};}),borderColor:'#f472b6',borderWidth:2.5,tension:0.3,pointRadius:3,fill:false,yAxisID:'y1'},
+    ]},
+    options:{responsive:true,maintainAspectRatio:false,interaction:baseOpts.interaction,plugins:baseOpts.plugins,
+      scales:{x:baseOpts.scales.x,
+        y:{ticks:{color:'#2dd4bf',font:cF},grid:{color:gridColor},title:{display:true,text:'gen_time (s)',color:'#2dd4bf',font:cF},position:'left'},
+        y1:{ticks:{color:'#f472b6',font:cF},grid:{drawOnChartArea:false},title:{display:true,text:'tok/s',color:'#f472b6',font:cF},position:'right'},
+      },
+    },
+  });
+})();
+
+dualChart('c-grad','Run v1',V1_STEPS,V1_GRAD_NORM,'#6b7c92','Phase 1',P1_STEPS,P1_GRAD_NORM,'#c084fc','grad_norm');
+dualChart('c-tpt','Run v1',V1_STEPS,V1_TPT,'#6b7c92','Phase 1',P1_STEPS,P1_TPT,'#fb923c','ms/token',{yMin:0});
+dualChart('c-meanlen','Run v1',V1_STEPS,V1_MEAN_RESP_LEN,'#6b7c92','Phase 1',P1_STEPS,P1_MEAN_RESP_LEN,'#7dd3fc','seq/mean_response_len');
+dualChart('c-maxlen','Run v1',V1_STEPS,V1_MAX_SEQ_LEN,'#6b7c92','Phase 1',P1_STEPS,P1_MAX_SEQ_LEN,'#fcd34d','seq/max_len');
+</script>
+</body>
+</html>

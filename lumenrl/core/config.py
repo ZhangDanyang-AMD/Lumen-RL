@@ -42,6 +42,7 @@ class AtomConfig:
     kv_cache_dtype: str = "auto"
     max_model_len: Optional[int] = None
     gpu_memory_utilization: float = 0.6
+    gpu_id: Optional[int] = None
 
 
 @dataclass
@@ -163,6 +164,7 @@ class CheckpointConfig:
     checkpoint_dir: str = "results/default"
     save_steps: int = 50
     save_total_limit: int = 3
+    resume: bool = True
 
 
 @dataclass

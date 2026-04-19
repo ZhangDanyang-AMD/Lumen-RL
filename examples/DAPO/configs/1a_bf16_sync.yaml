@@ -1,0 +1,60 @@
+# Experiment 1A-Sync: BF16 Training + BF16 Rollout — Sync On-Policy Mode
+# Qwen3-8B on 8×MI350X, DAPO algorithm
+# Uses RLTrainer (sync) with ATOM generation + optimizer offload.
+# On-policy: generates with current weights, trains on that data.
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
+
+policy:
+  model_name: /dev/shm/model/qwen3-8b-base
+  training_backend: fsdp2
+  generation_backend: atom
+  max_total_sequence_length: 4096     # Opt 5: reduced from 8192 — math rarely needs >3K
+  max_response_length: 3072           # Opt 5: reduced from 7168
+  train_global_batch_size: 128        # Opt 1: 8 prompts × 16 gens (was 4×16=64)
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 4096
+  training:
+    fsdp_cfg:
+      param_offload: false
+  generation:
+    atom_cfg:
+      gpu_memory_utilization: 0.20    # Opt 2: more KV cache for higher gen throughput (was 0.13)
+      max_model_len: 4096             # Opt 5: match max_total_sequence_length
+
+algorithm:
+  name: dapo
+  dapo:
+    num_generations: 16
+    kl_coeff: 0.0
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    dynamic_sampling: true
+    token_level_pg: true
+    overlong_reward_shaping: true
+
+reward:
+  type: function
+  function: lumenrl.rewards.math_reward.dapo_math_reward
+  dataset: /dev/shm/data/dapo-math-17k.parquet
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+
+checkpointing:
+  checkpoint_dir: /dev/shm/ckpts/lumenrl-dapo/1a-bf16-sync
+  save_steps: 2
+  save_total_limit: 3
+  resume: true                        # Opt 7: auto-resume from latest checkpoint
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 275
+seed: 42

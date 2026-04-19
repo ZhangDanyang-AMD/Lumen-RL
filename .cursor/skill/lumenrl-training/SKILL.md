@@ -106,6 +106,57 @@ Escalation order for R3:
 - Ignoring weight sync step when debugging output quality
 - Comparing runs with different seeds, datasets, or tokenizers
 
+## Dashboard Organization
+
+After a training run, the analysis dashboard must be saved to the `dashboards/` folder under a subfolder that identifies the run.
+
+**Naming convention:** `{model}-{quantization}-{run_mode}`
+
+| Component | Examples |
+|-----------|----------|
+| `{model}` | `1a` (Qwen3-1.7B), `8b` (Qwen3-8B), `32b`, etc. |
+| `{quantization}` | `bf16`, `fp8`, `fp8-kv` |
+| `{run_mode}` | `baseline`, `async`, `sync`, `moe`, `r3` |
+
+**Examples:**
+- `dashboards/1a-bf16-baseline/` — 1A model, BF16, baseline sync training
+- `dashboards/1a-bf16-async/` — 1A model, BF16, fully async training
+- `dashboards/8b-fp8-async/` — 8B model, FP8, async training
+- `dashboards/32b-fp8-moe-r3/` — 32B MoE model, FP8, with R3
+
+A single-file dashboard (e.g. `1a-bf16-async.html`) at the `dashboards/` root is acceptable for lightweight summaries; use a subfolder when additional artifacts (images, JSON data, comparison files) accompany the dashboard.
+
+### Live Monitoring Cadence
+
+Once an RL training run is confirmed running (first few steps complete without crash), monitor and update the dashboard **every 1 hour**:
+
+1. Read the latest training logs (tail the log file or check WandB)
+2. Check for red flags: reward collapse, NaN spike, KL blowup, stuck generation
+3. Update the dashboard HTML with fresh data points (all charts and summary cards)
+4. If any red flag is detected, alert immediately — do not wait for the next hourly check
+5. Record observations in `.cursor/tmp-rl-bugs.md` if anything is anomalous
+
+The hourly cycle continues until the run finishes or is stopped. If the run is healthy and uneventful for 3+ consecutive checks, the interval can relax to every 2 hours.
+
+### Dashboard Metrics Reference
+
+Every dashboard should include a metrics reference table explaining how each displayed metric is computed. Use the table below as the canonical source.
+
+| Metric | Formula / Computation | Source | Granularity |
+|--------|----------------------|--------|-------------|
+| **Training Loss** | Clipped surrogate: `-E[min(r*A, clip(r,1-e,1+e)*A)]` + optional `kl_coeff * kl`. `r = exp(logp - logp_old)`. DAPO uses asymmetric clip `[1-e_low, 1+e_high]`. Masked mean over response tokens. | `loss_functions.py`, `grpo.py`, `dapo.py` | Mean over mini-batches per step |
+| **Reward Mean** | `mean(rewards)` over all rollout sequences in the batch | `rl_trainer.py` | Per step |
+| **Reward Accuracy** | Fraction of sequences with `reward > 0` | `rl_trainer.py` | Per step |
+| **Step Time** | Wall clock from step start to end (includes rollout + train + sync) | `rl_trainer.py` | Per step |
+| **Gen Time** | Wall clock for rollout phase only | `rl_trainer.py` | Per step |
+| **Gen Throughput** | `generated_tokens / gen_time` | `rl_trainer.py` | Per step |
+| **Grad Norm** | `torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)` — global L2 norm | `rl_trainer.py` (sync), `async_trainer.py` | Per step (logged in async only) |
+| **NaN Grads** | Count of parameters whose `.grad` contains any NaN; NaN elements zeroed before clip | `async_trainer.py` | Per step (async only, parsed from logs) |
+| **Active Fraction** | `mean(row_mask)` — fraction of rollout rows kept after filtering groups with `std <= 1e-6` (DAPO dynamic sampling) | `dapo.py` | Per step (log string only) |
+| **KL Divergence** | `masked_mean(ref_logp - logp)` — Monte Carlo estimate; only when `kl_coeff > 0` and `ref_log_probs` present | `loss_functions.py` | Mean over mini-batches per step |
+| **Mean Response Length** | Mean token count from `response_mask` | `rl_trainer.py` | Per step |
+| **Max Sequence Length** | Max padded sequence length in the batch | `rl_trainer.py` | Per step |
+
 ## References
 
 - `.cursor/tmp-rl-bugs.md` in the Lumen-RL repo root — open bug candidates and evidence

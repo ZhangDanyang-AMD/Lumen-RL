@@ -22,6 +22,63 @@ Write back only meaningful tests or experiments that change confidence in a hypo
 
 ## Open
 
+### [2026-04-18 checkpoint-callback-deadlock] — RESOLVED
+- Symptom: Training hangs immediately after step 0 completes. Rank 0 at 172-198% CPU (running),
+  ranks 1-7 sleeping on `futex_wait_queue_me`, vLLM idle on `pipe_read`. Only GPU[3] at 100%.
+  Log file has zero output after step 0 callback line. Confirmed NOT log buffering — process
+  was genuinely stuck for 1.5+ hours. Occurs on every restart.
+- Origin: LumenRL (`lumenrl/trainer/rl_trainer.py` + `lumenrl/trainer/callbacks.py`)
+- Root cause: `on_step_end` callbacks were called only from rank 0 (`if self._rank == 0`),
+  but `CheckpointCallback.on_step_end()` calls `get_model_state_dict()` and
+  `get_optimizer_state_dict()` with `full_state_dict=True` — these are FSDP2 collective
+  operations requiring ALL ranks to participate. Rank 0 entered all-gather, ranks 1-7 waited
+  at a different barrier → deadlock. Triggered at step 0 because `0 % save_interval(25) == 0`.
+- Fix: Changed `rl_trainer.py` to call `on_step_end` on ALL ranks (removed the `if self._rank == 0`
+  guard). Added `if trainer._rank != 0: return` guards to `LoggingCallback`, `WandbCallback`,
+  and `EvalCallback` to prevent duplicate logging. `CheckpointCallback` already had correct
+  structure (FSDP2 ops on all ranks, save on rank 0 only, barrier at end).
+- Status: resolved
+
+### [2026-04-18 sync-trainer-rocm-page-fault]
+- Symptom: ATOM/vLLM subprocess crashes with `Memory access fault by GPU node-2 ... Write access
+  to a read-only page`. Non-deterministic: crashes between step 3 and step 21 depending on run.
+- Origin: ROCm driver (`hipMemSetAccess` / VMM bug on MI350X)
+- Root cause: `hipMemSetAccess` is broken on ROCm 7.12 / MI350X (rocm-systems#2516). Any memory
+  management operation that touches the VMM layer can trigger "write to read-only page" faults.
+  This includes vLLM model loading, `LLM.sleep()`/`wake_up()`, subprocess creation/destruction,
+  and even normal vLLM generation after enough cumulative GPU memory churn.
+- Investigation (3 approaches tried):
+  1. **Persistent vLLM (no sleep/wake)**: Keeps vLLM alive across steps. Survived 10-21 steps
+     before page fault during normal generation. Memory pressure from colocation (vLLM + FSDP2
+     on rank 0's GPU: ~116 GiB vs ~68 GiB on other ranks) accelerates the fault.
+  2. **In-process sleep/wake** (`LLM.sleep(level=1)` / `wake_up()`): Works for ~3 cycles, then
+     `wake_up()` triggers page fault via `hipMemSetAccess` internally. Required clearing
+     `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` from the vLLM subprocess environment
+     (incompatible with `CuMemAllocator`).
+  3. **Dedicated GPU** (7 GPUs training + GPU 7 for vLLM): Page fault still occurs ON the
+     isolated vLLM GPU, proving the bug is not caused by memory pressure from colocation.
+     The bug is fundamental to `hipMemSetAccess` on this hardware/driver.
+- After any page fault, GPU state is corrupted and subsequent runs crash immediately.
+  Container restart (`docker restart`) clears the corruption.
+- Current mitigation: Auto-restart loop in `run_1a_bf16_sync.sh` with `save_steps=2` for
+  frequent checkpointing. Each crash loses at most 1 step. Training makes steady progress
+  across restarts.
+- Code kept: `sleep_inprocess()`/`wake_inprocess()` in `AtomEngine` (useful when ROCm driver
+  is fixed), `gpu_id` config (useful for dedicated-GPU setups), auto-restart in launch script.
+- Status: MITIGATED — auto-restart + frequent checkpoints. Awaiting ROCm driver fix from AMD.
+
+### [2026-04-18 async-trainer-oom-step11]
+- Symptom: OOM at step 11 during `old_log_probs` forward pass. `lm_head` linear tried to allocate
+  60.70 GiB, only 30 GiB free on all 8 GPUs. PyTorch had 136.84 GiB alloc + 79.93 GiB reserved.
+- Origin: LumenRL (`lumenrl/trainer/async_trainer.py:627`)
+- Root cause: `old_log_probs` were computed on the full merged batch (4 prompts × 16 gens = 64 seqs)
+  in a single forward pass. The `lm_head` output tensor `[64, seq_len, 151936]` × 2B ≈ 60+ GiB.
+  The training step already used mini-batches, but the old_log_probs forward did not.
+- Fix: Chunked the `old_log_probs` forward pass using `mini_bs` (=1) as chunk size, processing
+  one sequence at a time through the model, then concatenating results. Same computation, bounded memory.
+- Evidence: v1 run OOM'd at step 11 on all 8 GPUs. v2 run with fix passed step 13 (ongoing).
+- Status: CONFIRMED FIXED — v2 passed step 11 (the previous OOM point) and is now at step 13 with stable memory usage.
+
 ### [2026-04-17 async-trainer-nan-grads]
 - Symptom: 226-232 of 399 parameters consistently have NaN gradients during backward pass.
   Forward pass and loss are valid. Model weights remain clean. Happens on every step.
@@ -90,6 +147,22 @@ Write back only meaningful tests or experiments that change confidence in a hypo
   (val_acc ~28-29% at step 245, matching reference). Need to reproduce with LumenRL native trainer.
 
 ## Ruled Out
+
+### [2026-04-18 sync-trainer-nan-logprobs] — RESOLVED
+- Was: ALL `old_log_probs` NaN (151360/151360 elements) from step 0 in sync RLTrainer.
+  Caused 399/399 params NaN grads, grad_norm=0, loss=0 — model not learning.
+- Root cause: `_load_hf_model` in `fsdp_backend.py` loaded model with `from_config` on meta
+  device for non-rank-0 processes, then materialized with `torch.empty()` (uninitialized memory).
+  FSDP2's `fully_shard` does NOT broadcast weights from rank 0 — it assumes each rank already
+  has correct parameters. Result: non-rank-0 shards contained garbage → all-gathered parameters
+  mixed real weights with garbage → NaN logits everywhere.
+- Fix: All ranks now load full model via `from_pretrained` (model on `/dev/shm` is fast).
+  Eliminates meta-device materialization entirely.
+- Additional fix: Switched `_fused_token_log_probs` from `float().logsumexp()` to per-row
+  `F.log_softmax` (matching VERL's `logprobs_from_logits_v2` bf16 path). More memory efficient,
+  avoids float32 promotion of full vocab dimension.
+- Evidence: Step 0 changed from `nan=151360` to `nan=0`, grad_norm from 0 to 0.297607.
+- Status: resolved
 
 Move disproved suspicions here instead of deleting them.
 
