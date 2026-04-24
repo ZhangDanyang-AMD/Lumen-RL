@@ -56,6 +56,7 @@ def main() -> None:
     _setup_distributed()
 
     from lumenrl.core.config import LumenRLConfig
+    from lumenrl.core.types import AlgorithmName
     from lumenrl.trainer.rl_trainer import RLTrainer
     from lumenrl.trainer.async_trainer import AsyncRLTrainer
     from lumenrl.trainer.callbacks import (
@@ -70,7 +71,15 @@ def main() -> None:
                 config.algorithm.name, config.policy.model_name,
                 config.num_training_steps, config.async_training.enabled)
 
-    if config.async_training.enabled:
+    algo_name = config.algorithm.name.lower()
+
+    if algo_name == AlgorithmName.OPD.value:
+        from lumenrl.trainer.opd_trainer import OPDTrainer
+        trainer = OPDTrainer(config)
+    elif algo_name == AlgorithmName.SPEC_DISTILL.value:
+        from lumenrl.trainer.spec_distill_trainer import SpecDistillTrainer
+        trainer = SpecDistillTrainer(config)
+    elif config.async_training.enabled:
         trainer = AsyncRLTrainer(config)
     else:
         trainer = RLTrainer(config)

@@ -9,6 +9,7 @@ from lumenrl.workers.hybrid_worker import HybridWorker
 from lumenrl.workers.ref_worker import RefPolicyWorker
 from lumenrl.workers.reward_worker import RewardWorker
 from lumenrl.workers.rollout_worker import AtomRolloutWorker
+from lumenrl.workers.teacher_worker import TeacherWorker
 
 __all__ = [
     "AtomRolloutWorker",
@@ -18,5 +19,6 @@ __all__ = [
     "LumenActorWorker",
     "RefPolicyWorker",
     "RewardWorker",
+    "TeacherWorker",
     "get_nested_config",
 ]

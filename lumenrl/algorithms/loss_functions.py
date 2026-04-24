@@ -140,6 +140,101 @@ def kl_penalty(logprobs: Tensor, ref_logprobs: Tensor, *, mask: Optional[Tensor]
     return kl.mean()
 
 
+def opd_kl_divergence(
+    student_logits: Tensor,
+    teacher_logits: Tensor,
+    *,
+    mask: Optional[Tensor] = None,
+    kl_direction: str = "reverse",
+    temperature: float = 1.0,
+    position_weights: Optional[Tensor] = None,
+) -> Tensor:
+    """Full-vocabulary KL divergence for On-Policy Distillation.
+
+    Unlike :func:`kl_penalty` which operates on sampled-token log-probs, this
+    computes the exact KL over the entire vocabulary at each token position.
+
+    Args:
+        student_logits: Raw logits from the student model, ``[B, T, V]``.
+        teacher_logits: Raw logits from the teacher model, ``[B, T, V]`` (detached).
+        mask: Optional ``[B, T]`` mask (1 = include token in loss).
+        kl_direction: ``"reverse"`` for ``D_KL(student || teacher)`` (DeepSeek-V4),
+            ``"forward"`` for ``D_KL(teacher || student)`` (TorchSpec Eagle3).
+        temperature: Softmax temperature applied to both distributions.
+        position_weights: Optional ``[T]`` weights (e.g. ``0.8 ** i``) for
+            position-dependent weighting.
+
+    Returns:
+        Scalar KL divergence loss tensor.
+    """
+    if temperature != 1.0:
+        student_logits = student_logits / temperature
+        teacher_logits = teacher_logits / temperature
+
+    student_log_probs = F.log_softmax(student_logits.float(), dim=-1)
+    teacher_log_probs = F.log_softmax(teacher_logits.float(), dim=-1)
+
+    if kl_direction == "reverse":
+        # D_KL(student || teacher) = sum_v p_s(v) * [log p_s(v) - log p_t(v)]
+        student_probs = student_log_probs.exp()
+        kl_per_token = (student_probs * (student_log_probs - teacher_log_probs)).sum(dim=-1)
+    elif kl_direction == "forward":
+        # D_KL(teacher || student) = sum_v p_t(v) * [log p_t(v) - log p_s(v)]
+        teacher_probs = teacher_log_probs.exp()
+        kl_per_token = (teacher_probs * (teacher_log_probs - student_log_probs)).sum(dim=-1)
+    else:
+        raise ValueError(f"Unknown kl_direction: {kl_direction!r}. Use 'reverse' or 'forward'.")
+
+    if position_weights is not None:
+        T_len = kl_per_token.shape[1]
+        pw = position_weights[:T_len].to(dtype=kl_per_token.dtype, device=kl_per_token.device)
+        kl_per_token = kl_per_token * pw.unsqueeze(0)
+
+    if mask is not None:
+        w = mask.to(dtype=kl_per_token.dtype)
+        denom = torch.clamp(w.sum(), min=1.0)
+        return (kl_per_token * w).sum() / denom
+    return kl_per_token.mean()
+
+
+def hidden_state_loss(
+    student_hidden: Tensor,
+    teacher_hidden: Tensor,
+    *,
+    mask: Optional[Tensor] = None,
+    loss_type: str = "mse",
+    projection: Optional[torch.nn.Module] = None,
+) -> Tensor:
+    """Hidden-state matching loss for speculative decoding draft model training.
+
+    Args:
+        student_hidden: Student hidden states, ``[B, T, D_s]``.
+        teacher_hidden: Teacher hidden states, ``[B, T, D_t]``.
+        mask: Optional ``[B, T]`` mask.
+        loss_type: ``"mse"`` for mean squared error, ``"cosine"`` for cosine distance.
+        projection: Optional linear layer to project ``D_s`` to ``D_t`` if they differ.
+
+    Returns:
+        Scalar loss tensor.
+    """
+    if projection is not None:
+        student_hidden = projection(student_hidden)
+
+    if loss_type == "mse":
+        per_token = F.mse_loss(student_hidden.float(), teacher_hidden.float(), reduction="none").mean(dim=-1)
+    elif loss_type == "cosine":
+        cos_sim = F.cosine_similarity(student_hidden.float(), teacher_hidden.float(), dim=-1)
+        per_token = 1.0 - cos_sim
+    else:
+        raise ValueError(f"Unknown loss_type: {loss_type!r}. Use 'mse' or 'cosine'.")
+
+    if mask is not None:
+        w = mask.to(dtype=per_token.dtype)
+        denom = torch.clamp(w.sum(), min=1.0)
+        return (per_token * w).sum() / denom
+    return per_token.mean()
+
+
 def entropy_bonus(logprobs: Tensor, *, mask: Optional[Tensor] = None) -> Tensor:
     """Surrogate entropy term from sampled-action log-probabilities.
 

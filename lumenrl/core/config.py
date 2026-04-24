@@ -101,11 +101,58 @@ class PPOConfig:
 
 
 @dataclass
+class OPDConfig:
+    """On-Policy Distillation (DeepSeek-V4 style)."""
+    kl_direction: str = "reverse"
+    temperature: float = 1.0
+    position_weighting: bool = False
+    position_decay: float = 0.8
+    opd_coeff: float = 1.0
+    lazy_logits: bool = True
+    teacher_micro_batch_size: int = 4
+
+
+@dataclass
+class SpecDistillConfig:
+    """Speculative Decoding draft model distillation (TorchSpec style)."""
+    draft_type: str = "eagle3"
+    loss_type: str = "forward_kl"
+    position_decay: float = 0.8
+    loss_decay_gamma: float = 7.0
+    num_target_layers: int = 1
+    aux_hidden_state_layer_ids: Optional[list[int]] = None
+    anchor_num: int = 512
+
+
+@dataclass
+class TeacherConfig:
+    """Teacher / target model configuration."""
+    model_name: str = ""
+    lm_head_key: str = "lm_head.weight"
+    norm_key: str = "model.norm.weight"
+    load_norm: bool = False
+    inference_backend: str = "hf"
+
+
+@dataclass
+class DraftModelConfig:
+    """Draft model (student) configuration for speculative distillation."""
+    model_name: str = ""
+    from_scratch: bool = False
+    head_dim: Optional[int] = None
+    num_layers: Optional[int] = None
+
+
+@dataclass
 class AlgorithmConfig:
     name: str = AlgorithmName.GRPO.value
     grpo: GRPOConfig = field(default_factory=GRPOConfig)
     dapo: DAPOConfig = field(default_factory=DAPOConfig)
     ppo: PPOConfig = field(default_factory=PPOConfig)
+    opd: OPDConfig = field(default_factory=OPDConfig)
+    spec_distill: SpecDistillConfig = field(default_factory=SpecDistillConfig)
+    teacher: TeacherConfig = field(default_factory=TeacherConfig)
+    draft: DraftModelConfig = field(default_factory=DraftModelConfig)
 
 
 @dataclass
