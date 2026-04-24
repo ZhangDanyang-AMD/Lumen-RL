@@ -85,6 +85,7 @@ class DAPOConfig:
     kl_coeff: float = 0.0
     clip_ratio_low: float = 0.2
     clip_ratio_high: float = 0.28
+    clip_ratio_c: float = 3.0
     dynamic_sampling: bool = True
     token_level_pg: bool = True
     overlong_reward_shaping: bool = True

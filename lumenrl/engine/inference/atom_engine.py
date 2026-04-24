@@ -37,10 +37,18 @@ _WEIGHT_SYNC_DIR = os.environ.get(
 
 _WORKER_SCRIPT = textwrap.dedent("""\
 import gc, json, os, sys, logging
+import numpy as np
 
-os.environ["VLLM_USE_V1"] = "1"
-os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-os.environ["VLLM_CONFIGURE_LOGGING"] = "0"
+class _NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
 os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
 for key in list(os.environ.keys()):
     if any(key.startswith(p) for p in [
@@ -55,7 +63,7 @@ for key in list(os.environ.keys()):
 logging.basicConfig(stream=sys.stderr, level=logging.INFO)
 
 import torch
-from vllm import LLM, SamplingParams
+from atom import LLMEngine, SamplingParams
 
 cmd_fifo = sys.argv[1]
 resp_fifo = sys.argv[2]
@@ -68,20 +76,17 @@ kwargs = {
     "model": model_path,
     "gpu_memory_utilization": gpu_mem,
     "enforce_eager": True,
-    "dtype": "bfloat16",
     "trust_remote_code": True,
     "tensor_parallel_size": 1,
-    "enable_chunked_prefill": True,
     "max_num_batched_tokens": 32768,
     "max_num_seqs": 64,
-    "disable_log_stats": True,
 }
 if max_model_len is not None:
     kwargs["max_model_len"] = max_model_len
 if kv_cache_dtype != "auto":
     kwargs["kv_cache_dtype"] = kv_cache_dtype
 
-llm = LLM(**kwargs)
+llm = LLMEngine(**kwargs)
 
 resp_f = open(resp_fifo, "w")
 resp_f.write(json.dumps({"status": "ready"}) + "\\n")
@@ -99,22 +104,27 @@ for line in cmd_f:
     if cmd == "generate":
         prompts = msg["prompts"]
         sp_dict = msg.get("sampling_params", {})
-        vllm_sp = SamplingParams(
+        atom_sp = SamplingParams(
             max_tokens=int(sp_dict.get("max_tokens", sp_dict.get("max_new_tokens", 128))),
             temperature=float(sp_dict.get("temperature", 1.0)),
             top_p=float(sp_dict.get("top_p", 1.0)),
             top_k=int(sp_dict.get("top_k", -1)),
         )
-        outputs = llm.generate(prompts, vllm_sp, use_tqdm=False)
-        results = [o.outputs[0].text if o.outputs else "" for o in outputs]
-        resp_f.write(json.dumps({"results": results}) + "\\n")
+        results = llm.generate(prompts, atom_sp)
+        str_results = []
+        for r in results:
+            if isinstance(r, dict):
+                str_results.append(r.get("text", str(r)))
+            elif isinstance(r, str):
+                str_results.append(r)
+            else:
+                str_results.append(str(r))
+        resp_f.write(json.dumps({"results": str_results}, cls=_NumpyEncoder) + "\\n")
         resp_f.flush()
 
     elif cmd == "sleep":
-        level = int(msg.get("level", 1))
-        if llm is not None and hasattr(llm, "sleep"):
-            llm.sleep(level=level)
-        elif llm is not None:
+        if llm is not None:
+            llm.close()
             del llm
             llm = None
         torch.cuda.empty_cache()
@@ -127,19 +137,19 @@ for line in cmd_f:
         new_path = msg.get("model_path")
         if new_path:
             kwargs["model"] = new_path
-        if llm is not None and hasattr(llm, "wake_up"):
-            llm.wake_up()
-        else:
-            if llm is not None:
-                del llm
-                torch.cuda.empty_cache()
-                gc.collect()
-            llm = LLM(**kwargs)
+        if llm is not None:
+            llm.close()
+            del llm
+            torch.cuda.empty_cache()
+            gc.collect()
+        llm = LLMEngine(**kwargs)
         resp_f.write(json.dumps({"status": "ok"}) + "\\n")
         resp_f.flush()
 
     elif cmd == "shutdown":
         try:
+            if llm is not None:
+                llm.close()
             del llm
         except Exception:
             pass
@@ -216,6 +226,10 @@ class AtomEngine:
                 "OMP_NUM_THREADS",
             ]):
                 del env[key]
+
+        attn_backend = os.environ.get("VLLM_ROCM_ATTN_BACKEND")
+        if attn_backend:
+            env["VLLM_ROCM_ATTN_BACKEND"] = attn_backend
 
         max_model_len_str = str(self._config.max_model_len) if self._config.max_model_len is not None else "None"
 
@@ -387,15 +401,20 @@ class AtomEngine:
         logger.info("AtomEngine: sleep complete (subprocess terminated).")
 
     def wake(self) -> None:
-        """Start a fresh vLLM subprocess for generation."""
+        """Start a fresh vLLM subprocess for generation.
+
+        If ``_weight_dir`` is set (from a prior ``update_weights`` or
+        weight-sync call), loads from that path instead of the original
+        model. The directory is **not** cleared so that subsequent
+        wake cycles (e.g. after crash recovery) still use the latest
+        synced weights.
+        """
         if self._proc is not None and self._proc.poll() is None:
             logger.info("AtomEngine: already awake.")
             return
         model_path = self._weight_dir or self._model_name
         self._start_worker(model_path)
-        if self._weight_dir is not None:
-            self._weight_dir = None
-        logger.info("AtomEngine: wake complete (fresh subprocess).")
+        logger.info("AtomEngine: wake complete (fresh subprocess, path=%s).", model_path)
 
     def shutdown(self) -> None:
         """Release all resources permanently."""

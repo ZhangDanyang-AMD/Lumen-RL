@@ -69,4 +69,6 @@ docker build \
     .
 
 echo "Done. Run with:"
-echo "  docker run --rm -it --device /dev/kfd --device /dev/dri -v /dev/shm:/dev/shm --shm-size=256g ${TAG}"
+echo "  docker run --rm -it --device /dev/kfd --device /dev/dri \\"
+echo "    -v /home/danyzhan:/home/danyzhan -v /dev/shm:/dev/shm --shm-size=256g \\"
+echo "    --network=host ${TAG}"

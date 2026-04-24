@@ -1,28 +1,35 @@
 # Experiment 1A-Sync: BF16 Training + BF16 Rollout — Sync On-Policy Mode
-# Qwen3-8B on 8×MI350X, DAPO algorithm
-# Uses RLTrainer (sync) with ATOM generation + optimizer offload.
+# Qwen3-8B-Base on 8×MI300X/MI350X, DAPO algorithm
+# Uses RLTrainer (sync) with ATOM generation + FSDP2 param_offload.
 # On-policy: generates with current weights, trains on that data.
+#
+# Verl-aligned config: 96 prompts × 16 gens = 1536 rollout batch,
+# max_response_length=20K. Matches Verl's "32×3×16" effective batch.
+# Requires param_offload=true for 20K sequences on MI300X (192 GiB).
+#
+# Default paths use /home/danyzhan.  Override from the launch script via
+# CLI overrides (e.g. policy.model_name=..., reward.dataset=...).
 
 cluster:
   num_nodes: 1
   gpus_per_node: 8
 
 policy:
-  model_name: /dev/shm/model/qwen3-8b-base
+  model_name: /home/danyzhan/model/qwen3-8b-base
   training_backend: fsdp2
   generation_backend: atom
-  max_total_sequence_length: 4096     # Opt 5: reduced from 8192 — math rarely needs >3K
-  max_response_length: 3072           # Opt 5: reduced from 7168
-  train_global_batch_size: 128        # Opt 1: 8 prompts × 16 gens (was 4×16=64)
+  max_total_sequence_length: 20480
+  max_response_length: 20480
+  train_global_batch_size: 1536       # 96 prompts × 16 gens (matches verl 32×3×16)
   train_micro_batch_size: 1
-  max_token_len_per_gpu: 4096
+  max_token_len_per_gpu: 20480
   training:
     fsdp_cfg:
-      param_offload: false
+      param_offload: true
   generation:
     atom_cfg:
-      gpu_memory_utilization: 0.20    # Opt 2: more KV cache for higher gen throughput (was 0.13)
-      max_model_len: 4096             # Opt 5: match max_total_sequence_length
+      gpu_memory_utilization: 0.25
+      max_model_len: 20480
 
 algorithm:
   name: dapo
@@ -31,6 +38,7 @@ algorithm:
     kl_coeff: 0.0
     clip_ratio_low: 0.2
     clip_ratio_high: 0.28
+    clip_ratio_c: 10.0
     dynamic_sampling: true
     token_level_pg: true
     overlong_reward_shaping: true
@@ -38,7 +46,7 @@ algorithm:
 reward:
   type: function
   function: lumenrl.rewards.math_reward.dapo_math_reward
-  dataset: /dev/shm/data/dapo-math-17k.parquet
+  dataset: /home/danyzhan/data/dapo-math-17k.parquet
 
 quantization:
   rollout:
@@ -47,10 +55,10 @@ quantization:
     fp8: null
 
 checkpointing:
-  checkpoint_dir: /dev/shm/ckpts/lumenrl-dapo/1a-bf16-sync
-  save_steps: 2
+  checkpoint_dir: /home/danyzhan/ckpts/lumenrl-dapo/1a-bf16-sync
+  save_steps: 5
   save_total_limit: 3
-  resume: true                        # Opt 7: auto-resume from latest checkpoint
+  resume: false
 
 logger:
   wandb_enabled: false
