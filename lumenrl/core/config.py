@@ -85,6 +85,7 @@ class DAPOConfig:
     kl_coeff: float = 0.0
     clip_ratio_low: float = 0.2
     clip_ratio_high: float = 0.28
+    clip_ratio_c: float = 3.0
     dynamic_sampling: bool = True
     token_level_pg: bool = True
     overlong_reward_shaping: bool = True
@@ -131,7 +132,14 @@ class TeacherConfig:
     lm_head_key: str = "lm_head.weight"
     norm_key: str = "model.norm.weight"
     load_norm: bool = False
-    inference_backend: str = "hf"
+    inference_backend: str = "hf"           # "hf" | "atom"
+    quantization: str = ""                  # "" | "fp8" | "fp4" | "mxfp4"
+    tensor_parallel_size: int = 1           # ATOM tensor parallelism
+    gpu_ids: Optional[list[int]] = None     # GPUs for ATOM inference
+    # MORI-IO P2P RDMA for GPU-direct hidden state transfer
+    mori_io_host: str = "127.0.0.1"         # OOB communication address
+    mori_io_port: int = 0                   # 0 = auto-assign
+    mori_io_qp_per_transfer: int = 2        # RDMA queue pairs per transfer
 
 
 @dataclass

@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LumenRL 1A BF16 — Training Dashboard</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Instrument+Serif&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0a0c10;
+    --surface: #12151c;
+    --border: #1e2330;
+    --accent: #22d3ee;
+    --accent2: #f472b6;
+    --accent3: #a78bfa;
+    --accent4: #34d399;
+    --accent5: #fb923c;
+    --text: #e2e8f0;
+    --dim: #64748b;
+    --positive: #22d3ee;
+    --negative: #f472b6;
+    --warn: #fbbf24;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  .noise {
+    position: fixed; inset: 0; z-index: 0; opacity: 0.03; pointer-events: none;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    background-size: 200px;
+  }
+
+  .header {
+    position: relative; z-index: 1;
+    padding: 32px 40px 24px;
+    display: flex; align-items: baseline; gap: 20px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .header h1 {
+    font-family: 'Instrument Serif', serif;
+    font-size: 36px; font-weight: 400; letter-spacing: -0.5px;
+    background: linear-gradient(135deg, var(--accent), var(--accent3));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+
+  .header .tag {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 2px;
+    color: var(--dim); padding: 4px 10px;
+    border: 1px solid var(--border); border-radius: 4px;
+  }
+
+  .header .live-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--accent4);
+    animation: pulse 2s ease-in-out infinite;
+    margin-left: auto;
+  }
+
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+  .header .status {
+    font-size: 12px; color: var(--accent4); margin-left: 8px;
+  }
+
+  .kpi-row {
+    position: relative; z-index: 1;
+    display: grid; grid-template-columns: repeat(7, 1fr);
+    gap: 1px; background: var(--border);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .kpi {
+    background: var(--surface); padding: 20px 22px;
+    display: flex; flex-direction: column; gap: 5px;
+    animation: fadeUp 0.5s ease both;
+  }
+
+  .kpi:nth-child(2) { animation-delay: 0.04s; }
+  .kpi:nth-child(3) { animation-delay: 0.08s; }
+  .kpi:nth-child(4) { animation-delay: 0.12s; }
+  .kpi:nth-child(5) { animation-delay: 0.16s; }
+  .kpi:nth-child(6) { animation-delay: 0.20s; }
+  .kpi:nth-child(7) { animation-delay: 0.24s; }
+
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(12px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .kpi .label {
+    font-size: 9px; text-transform: uppercase; letter-spacing: 1.5px;
+    color: var(--dim);
+  }
+
+  .kpi .value {
+    font-size: 24px; font-weight: 700; letter-spacing: -1px;
+  }
+
+  .kpi .delta {
+    font-size: 11px; display: flex; align-items: center; gap: 4px;
+  }
+
+  .kpi .delta.up { color: var(--accent4); }
+  .kpi .delta.down { color: var(--negative); }
+  .kpi .delta.neutral { color: var(--dim); }
+
+  .charts {
+    position: relative; z-index: 1;
+    display: grid; grid-template-columns: 1fr 1fr 1fr;
+    gap: 1px; background: var(--border);
+  }
+
+  .chart-panel {
+    background: var(--surface); padding: 24px;
+    animation: fadeUp 0.6s ease both;
+  }
+
+  .chart-panel:nth-child(2) { animation-delay: 0.06s; }
+  .chart-panel:nth-child(3) { animation-delay: 0.12s; }
+  .chart-panel:nth-child(4) { animation-delay: 0.18s; }
+  .chart-panel:nth-child(5) { animation-delay: 0.24s; }
+  .chart-panel:nth-child(6) { animation-delay: 0.30s; }
+
+  .chart-panel h3 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 1.5px;
+    color: var(--dim); margin-bottom: 16px;
+  }
+
+  .chart-panel canvas { width: 100% !important; height: 200px !important; }
+
+  .table-section {
+    position: relative; z-index: 1;
+    padding: 24px 40px;
+    animation: fadeUp 0.7s ease both;
+    animation-delay: 0.25s;
+  }
+
+  .table-section h3 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: 1.5px;
+    color: var(--dim); margin-bottom: 14px;
+  }
+
+  table {
+    width: 100%; border-collapse: collapse;
+    font-size: 12px;
+  }
+
+  th {
+    text-align: left; padding: 8px 10px;
+    font-size: 9px; text-transform: uppercase; letter-spacing: 1px;
+    color: var(--dim); border-bottom: 1px solid var(--border);
+    font-weight: 600; white-space: nowrap;
+  }
+
+  td {
+    padding: 8px 10px; border-bottom: 1px solid #161a24;
+    font-variant-numeric: tabular-nums; white-space: nowrap;
+  }
+
+  tr:hover td { background: rgba(34, 211, 238, 0.03); }
+
+  .c-accent { color: var(--accent); }
+  .c-accent2 { color: var(--accent2); }
+  .c-accent3 { color: var(--accent3); }
+  .c-accent4 { color: var(--accent4); }
+  .c-accent5 { color: var(--accent5); }
+  .c-warn { color: var(--warn); }
+
+  .config-bar {
+    position: relative; z-index: 1;
+    padding: 14px 40px;
+    border-top: 1px solid var(--border);
+    display: flex; gap: 28px; flex-wrap: wrap;
+    font-size: 11px; color: var(--dim);
+  }
+
+  .config-bar span { display: flex; align-items: center; gap: 6px; }
+  .config-bar .val { color: var(--text); font-weight: 600; }
+
+  .update-ts {
+    position: relative; z-index: 1;
+    padding: 8px 40px;
+    font-size: 10px; color: var(--dim);
+    border-top: 1px solid var(--border);
+    text-align: right;
+  }
+</style>
+</head>
+<body>
+<div class="noise"></div>
+
+<div class="header">
+  <h1>LumenRL Training</h1>
+  <span class="tag">1A BF16 Sync</span>
+  <span class="tag">Qwen3-8B-Base</span>
+  <span class="tag">8×MI300X</span>
+  <div class="live-dot"></div>
+  <span class="status" id="statusText">Running</span>
+</div>
+
+<div class="kpi-row" id="kpiRow"></div>
+
+<div class="charts">
+  <div class="chart-panel">
+    <h3>Accuracy & Reward</h3>
+    <canvas id="chartAccuracy"></canvas>
+  </div>
+  <div class="chart-panel">
+    <h3>Loss & Gradient Norm</h3>
+    <canvas id="chartLoss"></canvas>
+  </div>
+  <div class="chart-panel">
+    <h3>Response Length (mean tokens)</h3>
+    <canvas id="chartRespLen"></canvas>
+  </div>
+  <div class="chart-panel">
+    <h3>Throughput & Timing</h3>
+    <canvas id="chartTiming"></canvas>
+  </div>
+  <div class="chart-panel">
+    <h3>Time per Token (ms) — Generation</h3>
+    <canvas id="chartTpT"></canvas>
+  </div>
+  <div class="chart-panel">
+    <h3>Reward Breakdown per Step</h3>
+    <canvas id="chartBreakdown"></canvas>
+  </div>
+</div>
+
+<div class="table-section">
+  <h3>Step History</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Step</th><th>Accuracy</th><th>Reward</th>
+        <th>Loss</th><th>Grad Norm</th>
+        <th>+1</th><th>-1</th>
+        <th>Resp Len</th><th>ms/tok</th>
+        <th>Gen tok/s</th><th>Gen (s)</th><th>Train (s)</th><th>Total (s)</th>
+      </tr>
+    </thead>
+    <tbody id="tableBody"></tbody>
+  </table>
+</div>
+
+<div class="config-bar">
+  <span>Model: <b class="val">Qwen3-8B-Base</b></span>
+  <span>Algorithm: <b class="val">DAPO</b></span>
+  <span>Batch: <b class="val">1536 (96p × 16g)</b></span>
+  <span>max_response_length: <b class="val">20480</b></span>
+  <span>dynamic_sampling: <b class="val c-accent4">ON</b></span>
+  <span>Weight Sync: <b class="val c-accent4">ENABLED</b></span>
+  <span>Precision: <b class="val">BF16</b></span>
+  <span>Attn: <b class="val">AITER FA (Lumen patch)</b></span>
+  <span>ATOM Sleep: <b class="val c-accent4">POST-GEN</b></span>
+  <span>param_offload: <b class="val c-accent4">ON</b></span>
+  <span>clip_ratio_c: <b class="val c-accent4">10.0</b></span>
+  <span>weight_decay: <b class="val">0.1</b></span>
+  <span>overlong_penalty: <b class="val">1.0</b></span>
+  <span>optimizer: <b class="val c-accent4">per-mini-batch step</b></span>
+</div>
+
+<div class="update-ts" id="updateTs"></div>
+
+<script>
+// ── RUN 2 (2026-04-23, steps 0-8): DAPO fixes only — gradient accumulation, loss≈0, accuracy flat ──
+// ── ROOT CAUSE: optimizer.step() called ONCE after all mini-batches → ratio=1 → no learning ──
+// const OLD_DATA = [
+//   { step: 0, acc: 0.107422, reward: -0.785156, loss: 1.649e-09 },
+//   { step: 1, acc: 0.125, reward: -0.75, loss: -1.921e-09 },
+//   { step: 2, acc: 0.104818, reward: -0.790365, loss: 3.900e-09 },
+//   { step: 3, acc: 0.100911, reward: -0.798177, loss: 2.134e-10 },
+//   { step: 4, acc: 0.0976562, reward: -0.804688, loss: -1.94e-10 },
+//   { step: 5, acc: 0.121745, reward: -0.75651, loss: -1.397e-09 },
+//   { step: 6, acc: 0.110026, reward: -0.779948, loss: 2.522e-09 },
+//   { step: 7, acc: 0.136068, reward: -0.727865, loss: -2.716e-10 },
+//   { step: 8, acc: 0.0859375, reward: -0.828125, loss: -5.239e-10 },
+// ];
+
+// ── RUN 3 (2026-04-24): Per-mini-batch optimizer stepping — matching verl architecture ──
+// Fix: optimizer.step() now called after EACH mini-batch (not accumulated).
+// This makes ratio ≠ 1.0 from mini-batch 2 onward → meaningful PPO clipping → actual learning.
+const DATA = [
+  { step: 0, acc: 0.10612, reward: -0.78776, loss: 0.00336109, grad: 1.48633, pos: 163, neg: 1373, genTok: 585.214, genS: 2795.88, trainS: 3989.7, stepS: 11476.1, respLen: 1214.68, maxLen: 20480, time: "05:38", syncS: 62.48 },
+  { step: 1, acc: 0.13737, reward: -0.72526, loss: -0.00159607, grad: 3.88672, pos: 211, neg: 1325, genTok: 1122.11, genS: 1363.13, trainS: 3941.6, stepS: 5958.92, respLen: 1146.62, maxLen: 20480, time: "07:19", syncS: 61.16 },
+  { step: 2, acc: 0.111979, reward: -0.776042, loss: 0.00348772, grad: 32.7656, pos: 172, neg: 1364, genTok: 1179.67, genS: 1667.99, trainS: 4293.22, stepS: 6619.26, respLen: 1427.81, maxLen: 20480, time: "09:11", syncS: 61.68 },
+  { step: 3, acc: 0.111328, reward: -0.777344, loss: -0.0016283, grad: 6.62891, pos: 171, neg: 1365, genTok: 1272.62, genS: 1362.14, trainS: 3942.26, stepS: 5964.29, respLen: 1281.79, maxLen: 20480, time: "10:51", syncS: 61.22 },
+  { step: 4, acc: 0.106771, reward: -0.786458, loss: 0.00197054, grad: 8.875, pos: 164, neg: 1372, genTok: 1159.58, genS: 1576.5, trainS: 3946.48, stepS: 6184.56, respLen: 1332.68, maxLen: 20480, time: "12:35", syncS: 62.09 },
+];
+
+DATA.forEach(d => {
+  d.msTok = d.genTok > 0 ? (1000 / d.genTok) : 0;
+});
+
+const latest = DATA[DATA.length - 1];
+const prev = DATA.length > 1 ? DATA[DATA.length - 2] : null;
+
+function fmt(v, d=4) { return v.toFixed(d); }
+function pct(v) { return (v * 100).toFixed(1) + '%'; }
+function delta(curr, prev, fmt_fn, invert=false) {
+  if (!prev && prev !== 0) return { text: '—', cls: 'neutral' };
+  const d = curr - prev;
+  const sign = d > 0 ? '+' : '';
+  const cls = d === 0 ? 'neutral' : (invert ? (d > 0 ? 'down' : 'up') : (d > 0 ? 'up' : 'down'));
+  return { text: sign + fmt_fn(d), cls };
+}
+
+const kpis = [
+  { label: 'Latest Step', value: latest.step, delta: null },
+  { label: 'Accuracy', value: pct(latest.acc), delta: delta(latest.acc, prev?.acc, v => pct(v)) },
+  { label: 'Mean Reward', value: fmt(latest.reward, 3), delta: delta(latest.reward, prev?.reward, v => fmt(v, 3)) },
+  { label: 'Grad Norm', value: fmt(latest.grad, 3), delta: delta(latest.grad, prev?.grad, v => fmt(v, 3)) },
+  { label: 'Resp Len (mean)', value: fmt(latest.respLen, 0), delta: delta(latest.respLen, prev?.respLen, v => fmt(v, 0)) },
+  { label: 'ms / token', value: fmt(latest.msTok, 2), delta: delta(latest.msTok, prev?.msTok, v => fmt(v, 2), true) },
+  { label: 'Gen Throughput', value: fmt(latest.genTok, 0) + ' t/s', delta: delta(latest.genTok, prev?.genTok, v => fmt(v, 0)) },
+];
+
+const kpiRow = document.getElementById('kpiRow');
+kpis.forEach(k => {
+  const div = document.createElement('div');
+  div.className = 'kpi';
+  let dHtml = '';
+  if (k.delta) {
+    dHtml = `<div class="delta ${k.delta.cls}">${k.delta.cls === 'up' ? '▲' : k.delta.cls === 'down' ? '▼' : '●'} ${k.delta.text}</div>`;
+  }
+  div.innerHTML = `<span class="label">${k.label}</span><span class="value">${k.value}</span>${dHtml}`;
+  kpiRow.appendChild(div);
+});
+
+const tbody = document.getElementById('tableBody');
+DATA.forEach(d => {
+  const tr = document.createElement('tr');
+  tr.innerHTML = `
+    <td class="c-accent">${d.step}</td>
+    <td class="c-accent4">${pct(d.acc)}</td>
+    <td>${fmt(d.reward, 3)}</td>
+    <td>${fmt(d.loss, 4)}</td>
+    <td>${fmt(d.grad, 3)}</td>
+    <td class="c-accent4">${d.pos}</td>
+    <td class="c-accent2">${d.neg}</td>
+    <td class="c-accent5">${fmt(d.respLen, 0)}</td>
+    <td class="c-warn">${fmt(d.msTok, 2)}</td>
+    <td>${fmt(d.genTok, 0)}</td>
+    <td>${fmt(d.genS, 1)}</td>
+    <td>${fmt(d.trainS, 1)}</td>
+    <td>${fmt(d.stepS, 1)}</td>
+  `;
+  tbody.appendChild(tr);
+});
+
+document.getElementById('updateTs').textContent = 'Last updated: ' + new Date().toLocaleString();
+
+const chartDefaults = {
+  responsive: true,
+  maintainAspectRatio: false,
+  plugins: { legend: { labels: { color: '#64748b', font: { family: 'JetBrains Mono', size: 10 } } } },
+  scales: {
+    x: { ticks: { color: '#64748b', font: { family: 'JetBrains Mono', size: 10 } }, grid: { color: '#1e2330' } },
+    y: { ticks: { color: '#64748b', font: { family: 'JetBrains Mono', size: 10 } }, grid: { color: '#1e2330' } },
+  },
+};
+
+const steps = DATA.map(d => 'Step ' + d.step);
+
+new Chart(document.getElementById('chartAccuracy'), {
+  type: 'line',
+  data: {
+    labels: steps,
+    datasets: [
+      { label: 'Accuracy %', data: DATA.map(d => d.acc * 100), borderColor: '#22d3ee', backgroundColor: 'rgba(34,211,238,0.1)', tension: 0.3, fill: true, pointRadius: 5, pointBackgroundColor: '#22d3ee' },
+      { label: 'Reward', data: DATA.map(d => d.reward * 50 + 50), borderColor: '#f472b6', tension: 0.3, fill: false, pointRadius: 5, pointBackgroundColor: '#f472b6', yAxisID: 'y1' },
+    ]
+  },
+  options: {
+    ...chartDefaults,
+    scales: {
+      ...chartDefaults.scales,
+      y: { ...chartDefaults.scales.y, title: { display: true, text: 'Accuracy %', color: '#64748b' }, min: 0, max: 80 },
+      y1: { position: 'right', ticks: { color: '#f472b6', font: { family: 'JetBrains Mono', size: 10 }, callback: v => ((v - 50) / 50).toFixed(2) }, grid: { display: false }, title: { display: true, text: 'Reward', color: '#f472b6' } },
+    }
+  }
+});
+
+new Chart(document.getElementById('chartLoss'), {
+  type: 'line',
+  data: {
+    labels: steps,
+    datasets: [
+      { label: 'Loss', data: DATA.map(d => d.loss), borderColor: '#a78bfa', tension: 0.3, pointRadius: 5, pointBackgroundColor: '#a78bfa' },
+      { label: 'Grad Norm', data: DATA.map(d => d.grad), borderColor: '#fbbf24', tension: 0.3, pointRadius: 5, pointBackgroundColor: '#fbbf24', yAxisID: 'y1' },
+    ]
+  },
+  options: {
+    ...chartDefaults,
+    scales: {
+      ...chartDefaults.scales,
+      y: { ...chartDefaults.scales.y, title: { display: true, text: 'Loss', color: '#a78bfa' } },
+      y1: { position: 'right', ticks: { color: '#fbbf24', font: { family: 'JetBrains Mono', size: 10 } }, grid: { display: false }, title: { display: true, text: 'Grad Norm', color: '#fbbf24' } },
+    }
+  }
+});
+
+new Chart(document.getElementById('chartRespLen'), {
+  type: 'line',
+  data: {
+    labels: steps,
+    datasets: [
+      { label: 'Mean Response Len', data: DATA.map(d => d.respLen), borderColor: '#fb923c', backgroundColor: 'rgba(251,146,60,0.1)', tension: 0.3, fill: true, pointRadius: 5, pointBackgroundColor: '#fb923c' },
+    ]
+  },
+  options: {
+    ...chartDefaults,
+    plugins: { ...chartDefaults.plugins, legend: { display: false } },
+    scales: {
+      ...chartDefaults.scales,
+      y: { ...chartDefaults.scales.y, title: { display: true, text: 'Tokens', color: '#fb923c' }, min: 0 },
+    }
+  }
+});
+
+new Chart(document.getElementById('chartTiming'), {
+  type: 'bar',
+  data: {
+    labels: steps,
+    datasets: [
+      { label: 'Generation (s)', data: DATA.map(d => d.genS), backgroundColor: 'rgba(34,211,238,0.6)', borderRadius: 4 },
+      { label: 'Training (s)', data: DATA.map(d => d.trainS), backgroundColor: 'rgba(167,139,250,0.6)', borderRadius: 4 },
+    ]
+  },
+  options: {
+    ...chartDefaults,
+    scales: {
+      ...chartDefaults.scales,
+      x: { ...chartDefaults.scales.x, stacked: true },
+      y: { ...chartDefaults.scales.y, stacked: true, title: { display: true, text: 'Seconds', color: '#64748b' } },
+    }
+  }
+});
+
+new Chart(document.getElementById('chartTpT'), {
+  type: 'line',
+  data: {
+    labels: steps,
+    datasets: [
+      { label: 'ms/token (gen)', data: DATA.map(d => d.msTok), borderColor: '#fbbf24', backgroundColor: 'rgba(251,191,36,0.1)', tension: 0.3, fill: true, pointRadius: 6, pointBackgroundColor: '#fbbf24', borderWidth: 2 },
+    ]
+  },
+  options: {
+    ...chartDefaults,
+    plugins: { ...chartDefaults.plugins, legend: { display: false } },
+    scales: {
+      ...chartDefaults.scales,
+      y: { ...chartDefaults.scales.y, title: { display: true, text: 'ms / token', color: '#fbbf24' }, min: 0 },
+    }
+  }
+});
+
+new Chart(document.getElementById('chartBreakdown'), {
+  type: 'bar',
+  data: {
+    labels: steps,
+    datasets: [
+      { label: 'Correct (+1)', data: DATA.map(d => d.pos), backgroundColor: 'rgba(34,211,158,0.7)', borderRadius: 4 },
+      { label: 'Wrong (-1)', data: DATA.map(d => d.neg), backgroundColor: 'rgba(244,114,182,0.4)', borderRadius: 4 },
+    ]
+  },
+  options: {
+    ...chartDefaults,
+    scales: {
+      ...chartDefaults.scales,
+      x: { ...chartDefaults.scales.x, stacked: true },
+      y: { ...chartDefaults.scales.y, stacked: true, title: { display: true, text: 'Count (of 1536)', color: '#64748b' }, max: 1536 },
+    }
+  }
+});
+</script>
+</body>
+</html>

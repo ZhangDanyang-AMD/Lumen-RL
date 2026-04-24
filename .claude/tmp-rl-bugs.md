@@ -1,6 +1,6 @@
 # Temporary Training Bug Notes
 
-This file lives at `.cursor/tmp-rl-bugs.md` relative to the `Lumen-RL` repo root. Read the whole file at the start of every new LumenRL training debug session.
+This file lives at `.claude/tmp-rl-bugs.md` relative to the `Lumen-RL` repo root. Read the whole file at the start of every new LumenRL training debug session.
 
 Use it to keep track of possible bugs found during testing. Do not treat any entry here as proof. Re-check against the current reference diff and current repro before acting.
 
@@ -54,8 +54,66 @@ Write back only meaningful tests or experiments that change confidence in a hypo
     3. **max_response_length 16384 vs Verl 20K.** Verl allows 20K tokens for chain-of-thought.
        Ours caps at 16K. For math reasoning, longer responses help.
   - Additionally, LumenRL currently lacks the 3-round rollout multiplier (only 1 round).
-- Status: running — step 16 in progress. Training is stable but accuracy won't match Verl
-  until rollout batch size and TIS are addressed.
+- **2026-04-23 loss function alignment fixes (batch 1536 run, steps 0-4, loss ~1e-10):**
+  - Dashboard shows: acc oscillates 9.5-13.3%, loss ~1e-10, grad_norm ~1.0
+  - Diffed LumenRL DAPO loss against verl reference (core_algos.py). Found 4 mismatches:
+    1. **Missing DAPO dual-clip (C-clip)**: Verl uses `clip_ratio_c=10.0` — for negative
+       advantages, caps loss at `-adv * C`. Prevents bad-action loss from dominating gradient
+       as ratio grows. LumenRL had NO C-clip. Fixed: added `clip_ratio_c` param to
+       `asymmetric_clip_loss` and `DAPOConfig`, set to 10.0 in all YAML configs.
+    2. **Missing log-prob clamping**: Verl clamps `logp - old_logp` to `[-20, 20]` before
+       exp to prevent Inf/NaN. LumenRL did raw `torch.exp(logp - old_logp)`. Fixed.
+    3. **weight_decay=0.01 vs verl 0.1**: 10× lower regularization. Fixed to 0.1 in
+       `rl_trainer.py`.
+    4. **overlong_penalty default 1e-4 vs verl 1.0**: 10000× lower penalty for overlong
+       sequences. Fixed default to 1.0 in `dapo.py`.
+  - Also fixed loss formula to use `torch.maximum(pg1, pg2)` convention (matching verl)
+    instead of `-torch.minimum(surr1, surr2)` (algebraically equivalent but clearer).
+  - Note: loss being ~0 when ratio=1 is EXPECTED for GRPO/DAPO (group advantages sum to 0
+    by construction). Both verl and LumenRL compute old_log_probs from the same actor model.
+    The gradient signal (grad_norm ~1.0) IS present despite near-zero loss scalar.
+    The C-clip becomes important as training progresses and ratio deviates from 1.
+- **2026-04-23 post-fix run results (steps 0-4, callbacks data):**
+  - Applied all 4 fixes (clip_ratio_c=10.0, weight_decay=0.1, overlong_penalty=1.0, log-prob clamp).
+  - Results (callbacks/full-batch):
+    | Step | Accuracy | Reward | Loss | Grad Norm | Resp Len |
+    |------|----------|--------|------|-----------|----------|
+    | 0 | 10.74% | -0.785 | 1.65e-9 | 1.584 | 1171 |
+    | 1 | 12.50% | -0.750 | -1.92e-9 | 1.430 | 1288 |
+    | 2 | 10.48% | -0.790 | 3.90e-9 | 1.505 | 1304 |
+    | 3 | 10.09% | -0.798 | 2.13e-10 | 1.123 | 1320 |
+    | 4 | 9.77% | -0.805 | -1.94e-10 | 1.184 | 1471 |
+  - **FINDING: Loss is still ~1e-9 to ~1e-10 after 5 steps.** The DAPO fixes (C-clip,
+    weight_decay, overlong_penalty) did NOT change the loss magnitude because the root issue
+    is NOT the loss function — it's that ratio ≈ 1 in on-policy sync mode.
+  - In sync on-policy training, old_log_probs are computed from the SAME model as new_log_probs
+    in each step. The only gradient signal comes from the within-step forward-backward log-prob
+    difference (which is tiny). Group-normalized advantages sum to ~0 by construction, so when
+    ratio=1, loss = -mean(adv * ratio) ≈ -mean(adv) ≈ 0.
+  - **Note on Reward: vs callbacks discrepancy**: `Reward:` line shows rank-0 shard (192 seqs).
+    `callbacks` shows full-batch (1536 seqs). Use callbacks as authoritative.
+  - **Key question**: Why does verl BF16 show accuracy climbing from ~15% → ~35% in 50 steps
+    with the same on-policy scheme? Verl must have a mechanism that creates non-trivial ratio
+    deviation even in on-policy mode. Investigate: does verl compute old_log_probs BEFORE the
+    training step (at rollout time) and then compare against post-training log-probs? That would
+    give ratio != 1 within a single step.
+  - **Response length slowly increasing**: 1171 → 1471 over 5 steps. This is expected as the
+    model learns to generate longer responses.
+- **2026-04-24 ROOT CAUSE FOUND: gradient accumulation kills PPO learning signal**
+  - LumenRL accumulated gradients over ALL ~192 mini-batches, then called `optimizer.step()` ONCE.
+  - With ratio=1.0 for all mini-batches (old_log_probs == new_log_probs from identical weights),
+    the PPO loss = -mean(advantage) ≈ 0 (group-normalized advantages cancel).
+  - Verl calls `optimizer.step()` after EACH mini-batch. After mini-batch 1, the weights change,
+    so mini-batch 2+ sees ratio ≠ 1.0 → meaningful clipping → actual learning.
+  - **Historical irony**: The ORIGINAL LumenRL code had per-mini-batch stepping. It was changed to
+    gradient accumulation as part of the NaN-loss fix [2026-04-17 atom-nan-loss]. The NaN was
+    caused by 3 other bugs (epsilon misinterpretation, NaN propagation, cross_entropy NaN),
+    NOT by per-mini-batch stepping. The "fix" accidentally broke the learning signal.
+  - **Fix applied**: Restored per-mini-batch `optimizer.step()` in `rl_trainer.py`. Each mini-batch
+    now does: zero_grad → forward → backward → NaN-grad cleanup → clip_grad_norm → optimizer.step().
+    Gradient accumulation division (`loss / num_accum`) also removed.
+  - Relaunched training at 02:14 UTC on 2026-04-24 with clean checkpoints.
+- Status: running — per-mini-batch stepping fix applied, monitoring for accuracy improvement.
 
 ### [2026-04-22 atom-not-sleeping-during-training] — RESOLVED
 - Symptom: `torch.OutOfMemoryError` on GPU 0 during backward pass at step 2-3 (after

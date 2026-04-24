@@ -11,7 +11,7 @@ description: >-
 
 ## Core Principle
 
-When an RL run behaves unexpectedly, compare against a known-good BF16 baseline before changing any hyperparameters. Use `.cursor/tmp-rl-bugs.md` in the Lumen-RL repo root as working memory. Do not solve stability problems by retuning parameters that already match the baseline.
+When an RL run behaves unexpectedly, compare against a known-good BF16 baseline before changing any hyperparameters. Use `.claude/tmp-rl-bugs.md` in the Lumen-RL repo root as working memory. Do not solve stability problems by retuning parameters that already match the baseline.
 
 ## Use When
 
@@ -27,19 +27,19 @@ Treat any fresh return to the same debugging problem as a new debug session.
 
 ## Default Workflow
 
-1. Read `.cursor/tmp-rl-bugs.md` at the start of every new debug session
+1. Read `.claude/tmp-rl-bugs.md` at the start of every new debug session
 2. Stop the run once behavior is clearly wrong; save logs and the last good checkpoint
 3. Compare current config against the baseline recipe (YAML diff, not memory)
 4. Check reward / KL / entropy curves for the first anomalous step
 5. For FP8 issues: compare BF16 vs FP8 rollout log-probs; check if rollout correction (TIS/MIS) is enabled
 6. For MoE issues: check if R3 is enabled; compare router distribution entropy between train and inference
 7. For weight sync issues: compare model outputs before and after weight transfer on the same input
-8. After each meaningful test, update `.cursor/tmp-rl-bugs.md` with findings
+8. After each meaningful test, update `.claude/tmp-rl-bugs.md` with findings
 
 ## Hard Rules
 
 - Stop the run when reward collapses. Debug from the last good checkpoint.
-- Start every new debug session by reading `.cursor/tmp-rl-bugs.md`
+- Start every new debug session by reading `.claude/tmp-rl-bugs.md`
 - Never disable R3 "to see if it helps" without first recording the routing distributions
 - Never change clip ratio, KL coefficient, or learning rate if they already match the baseline
 - FP8 precision issues are not hyperparameter problems; isolate the quantization path first
@@ -99,7 +99,7 @@ Escalation order for R3:
 
 ## Red Flags
 
-- Starting a debug session without reading `.cursor/tmp-rl-bugs.md`
+- Starting a debug session without reading `.claude/tmp-rl-bugs.md`
 - Changing aligned hyperparameters to chase a symptom
 - Running with R3 disabled on MoE models without documenting why
 - Claiming FP8 parity from memory instead of a written comparison
@@ -134,7 +134,7 @@ Once an RL training run is confirmed running (first few steps complete without c
 2. Check for red flags: reward collapse, NaN spike, KL blowup, stuck generation
 3. Update the dashboard HTML with fresh data points (all charts and summary cards)
 4. If any red flag is detected, alert immediately — do not wait for the next 30-minute check
-5. Record observations in `.cursor/tmp-rl-bugs.md` if anything is anomalous
+5. Record observations in `.claude/tmp-rl-bugs.md` if anything is anomalous
 
 The 30-minute cycle continues until the run finishes or is stopped. If the run is healthy and uneventful for 3+ consecutive checks, the interval can relax to every 1 hour.
 
@@ -159,7 +159,7 @@ Every dashboard should include a metrics reference table explaining how each dis
 
 ## References
 
-- `.cursor/tmp-rl-bugs.md` in the Lumen-RL repo root — open bug candidates and evidence
+- `.claude/tmp-rl-bugs.md` in the Lumen-RL repo root — open bug candidates and evidence
 - [reference.md](reference.md) — pre-training diff checklist, FP8 debug checklist, R3 debug checklist, weight sync debug checklist, reward debug checklist
 - `configs/grpo_dense_bf16.yaml` — BF16 baseline recipe (the primary reference for parity testing)
 

@@ -72,7 +72,7 @@ class DAPOAlgorithm(BaseAlgorithm):
                 rewards,
                 batch,
                 max_len=int(self._config.policy.max_total_sequence_length),
-                penalty=float(batch.meta.get("overlong_penalty", 1e-4)),
+                penalty=float(batch.meta.get("overlong_penalty", 1.0)),
             )
 
         grouped = rewards.view(-1, g)
@@ -119,13 +119,18 @@ class DAPOAlgorithm(BaseAlgorithm):
         sample_mask = batch.tensors.get("dapo_sample_mask")
 
         cfg = self._config.algorithm.dapo
+
+        # Expand sequence-level advantages [B] -> [B, T] for token-level loss.
+        # Multiply by response_mask so prompt tokens get zero advantage
+        # (matching verl: scores = scores.unsqueeze(-1) * response_mask).
         if adv.dim() == 1:
             adv = adv.unsqueeze(-1)
         if mask is not None:
-            adv = adv.expand_as(mask.to(dtype=adv.dtype)) * mask.to(dtype=adv.dtype)
+            adv = adv.expand_as(logp) * mask.to(dtype=adv.dtype)
         else:
             adv = adv.expand_as(logp)
 
+        # Build the combined mask for loss aggregation (response_mask * sample_mask).
         if sample_mask is not None:
             sm = sample_mask
             if sm.dim() == 1:
@@ -138,8 +143,11 @@ class DAPOAlgorithm(BaseAlgorithm):
 
         low = float(cfg.clip_ratio_low)
         high = float(cfg.clip_ratio_high)
+        clip_c = float(getattr(cfg, "clip_ratio_c", 0.0))
         if cfg.token_level_pg:
-            pg = asymmetric_clip_loss(logp, old_logp, adv, low, high, mask=sm)
+            pg = asymmetric_clip_loss(
+                logp, old_logp, adv, low, high, mask=sm, clip_ratio_c=clip_c,
+            )
         else:
             # Sequence-level: mean logp per row, scalar adv per row
             denom = torch.clamp(sm.sum(dim=-1, keepdim=True), min=1.0)
@@ -148,7 +156,9 @@ class DAPOAlgorithm(BaseAlgorithm):
             seq_adv = adv.sum(dim=-1, keepdim=True) / torch.clamp(
                 sm.sum(dim=-1, keepdim=True), min=1.0
             )
-            pg = asymmetric_clip_loss(seq_logp, seq_old, seq_adv, low, high, mask=None)
+            pg = asymmetric_clip_loss(
+                seq_logp, seq_old, seq_adv, low, high, mask=None, clip_ratio_c=clip_c,
+            )
 
         loss = pg
         metrics: dict[str, Any] = {"loss_pg": float(pg.detach().cpu())}

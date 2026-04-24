@@ -55,11 +55,17 @@ def asymmetric_clip_loss(
     clip_high: float,
     *,
     mask: Optional[Tensor] = None,
+    clip_ratio_c: float = 0.0,
 ) -> Tensor:
     """Policy-gradient surrogate with asymmetric ratio clipping (DAPO-style).
 
     ``clip_low`` and ``clip_high`` are **epsilon** values: the importance ratio
     ``exp(logp - logp_old)`` is clamped to ``[1 - clip_low, 1 + clip_high]``.
+
+    When ``clip_ratio_c > 0``, applies DAPO dual-clip: for negative advantages,
+    the loss is capped at ``-advantages * clip_ratio_c``, preventing domination
+    by highly negative advantages and preserving gradient signal for positive
+    advantage tokens. Matches verl's implementation.
 
     Args:
         logprobs: Current log-probabilities.
@@ -68,15 +74,24 @@ def asymmetric_clip_loss(
         clip_low: Lower epsilon; ratio lower bound is ``1 - clip_low`` (e.g. 0.2 → 0.8).
         clip_high: Upper epsilon; ratio upper bound is ``1 + clip_high`` (e.g. 0.28 → 1.28).
         mask: Optional token mask for masked mean reduction.
+        clip_ratio_c: Dual-clip bound C (DAPO). 0 disables. Typical value: 3.0.
 
     Returns:
         Scalar loss tensor to minimize.
     """
-    ratio = torch.exp(logprobs - old_logprobs)
+    neg_approx_kl = logprobs - old_logprobs
+    neg_approx_kl = torch.clamp(neg_approx_kl, min=-20.0, max=20.0)
+    ratio = torch.exp(neg_approx_kl)
     clipped = torch.clamp(ratio, 1.0 - clip_low, 1.0 + clip_high)
-    surr1 = ratio * advantages
-    surr2 = clipped * advantages
-    pg = -torch.minimum(surr1, surr2)
+    pg_losses1 = -advantages * ratio
+    pg_losses2 = -advantages * clipped
+    pg = torch.maximum(pg_losses1, pg_losses2)
+
+    if clip_ratio_c > 0.0:
+        pg_losses3 = -advantages * clip_ratio_c
+        pg_clipped = torch.minimum(pg_losses3, pg)
+        pg = torch.where(advantages < 0, pg_clipped, pg)
+
     if mask is not None:
         w = mask.to(dtype=pg.dtype)
         pg = torch.where(w.bool(), pg, torch.zeros_like(pg))

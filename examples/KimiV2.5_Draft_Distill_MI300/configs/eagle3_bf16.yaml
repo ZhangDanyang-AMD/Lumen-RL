@@ -1,0 +1,78 @@
+# KimiV2.5 Eagle3 Draft Model Distillation
+#
+# Off-policy speculative decoding draft model training.
+# Teacher (Kimi-K2.5) produces hidden states on dataset sequences; Eagle3 draft
+# model learns to predict future tokens from teacher representations.
+#
+# Teacher: moonshotai/Kimi-K2.5 — 1T MoE (32B activated), hidden_dim=7168,
+#          64 heads, 61 layers, vocab=160,256
+# Draft:   Eagle3 architecture (3B) — see lightseekorg/kimi-k2.5-eagle3
+#
+# GPU split strategy (8x MI300X):
+#   GPUs 0-3: ATOM teacher inference, TP=4, MXFP4 quantization
+#             ~500 GB / 4 GPUs = ~125 GB/GPU — fits comfortably
+#   GPUs 4-7: torchrun FSDP2, draft model training (BF16)
+#             Draft model (3B) is negligible (~1.5 GB/GPU)
+#
+# Hidden state transfer: MORI-IO P2P RDMA (GPU Direct, no CPU copy)
+#
+# Reference: TorchSpec (https://github.com/lightseekorg/TorchSpec)
+# Reference: KimiV2.5 Technical Report (https://arxiv.org/abs/2505.01759)
+#
+# Usage:
+#   bash examples/KimiV2.5_Draft_Distill_MI300/run_eagle3_bf16.sh
+
+cluster:
+  gpus_per_node: 4                      # Training GPUs (4-7 via CUDA_VISIBLE_DEVICES)
+  num_nodes: 1
+
+policy:
+  model_name: /dev/shm/model/kimi-k2.5  # Used for tokenizer + draft model hidden dim
+  training_backend: fsdp2
+  generation_backend: hf                # No rollout needed for spec distill
+  max_total_sequence_length: 4096
+  train_global_batch_size: 32
+  train_micro_batch_size: 4
+
+algorithm:
+  name: spec_distill
+  spec_distill:
+    draft_type: eagle3                  # Eagle3 iterative refinement
+    loss_type: forward_kl               # D_KL(teacher || student)
+    position_decay: 0.8                 # Weight decay per prediction step: 0.8^i
+    num_target_layers: 1                # Use last-layer teacher hidden states
+  teacher:
+    model_name: /dev/shm/model/kimi-k2.5  # moonshotai/Kimi-K2.5
+    inference_backend: atom             # ATOM engine on GPUs 0-3
+    tensor_parallel_size: 4             # TP=4 across teacher GPUs
+    gpu_ids: [0, 1, 2, 3]              # Physical GPU IDs for teacher
+    mori_io_host: "127.0.0.1"          # MORI-IO OOB address (intra-node)
+    mori_io_qp_per_transfer: 2         # RDMA queue pairs
+  draft:
+    from_scratch: true                  # Train Eagle3 from random init
+    num_layers: 1                       # 1 Transformer block in draft model
+    # Reference architecture: lightseekorg/kimi-k2.5-eagle3 (3B params)
+
+quantization:
+  training:
+    fp8: null                           # Draft model trains in BF16
+  rollout_correction:
+    enabled: false
+
+reward:
+  type: function
+  function: math_reward
+  dataset: nvidia/OpenMathInstruct-2    # Dataset for teacher forward pass
+
+checkpointing:
+  checkpoint_dir: results/kimiv2.5_eagle3_bf16
+  save_steps: 100
+  save_total_limit: 3
+  resume: true
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 2000
+seed: 42

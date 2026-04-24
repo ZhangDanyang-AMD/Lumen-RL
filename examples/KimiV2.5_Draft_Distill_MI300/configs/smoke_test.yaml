@@ -1,0 +1,58 @@
+# Smoke test: 2-step Eagle3 distillation to verify pipeline on 4x MI300X.
+#
+# Uses Qwen3-8B as a stand-in teacher with HF backend for quick verification.
+# For real training, use the full configs with moonshotai/Kimi-K2.5 + ATOM.
+#
+# Usage:
+#   CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 \
+#       -m lumenrl.trainer.main \
+#       --config examples/KimiV2.5_Draft_Distill_MI300/configs/smoke_test.yaml
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1
+
+policy:
+  model_name: Qwen/Qwen3-8B            # Stand-in for smoke test
+  training_backend: fsdp2
+  generation_backend: hf
+  max_total_sequence_length: 2048
+  train_global_batch_size: 8
+  train_micro_batch_size: 1
+
+algorithm:
+  name: spec_distill
+  spec_distill:
+    draft_type: eagle3
+    loss_type: forward_kl
+    position_decay: 0.8
+    num_target_layers: 1
+  teacher:
+    model_name: Qwen/Qwen3-8B          # Stand-in (HF backend, no ATOM needed)
+    inference_backend: hf
+  draft:
+    from_scratch: true
+    num_layers: 1
+
+quantization:
+  training:
+    fp8: null
+  rollout_correction:
+    enabled: false
+
+reward:
+  type: function
+  function: math_reward
+  dataset: nvidia/OpenMathInstruct-2
+
+checkpointing:
+  checkpoint_dir: results/smoke_spec_distill
+  save_steps: 999
+  resume: false
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 2
+seed: 42

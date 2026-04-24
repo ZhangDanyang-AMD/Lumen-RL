@@ -11,9 +11,12 @@ Supports three modes:
 from __future__ import annotations
 
 import gc
+import json
 import logging
 import os
+import shutil
 import time
+from pathlib import Path
 from typing import Any, Type
 
 import torch
@@ -102,10 +105,16 @@ class RLTrainer:
         else:
             self._actor_model.to(self._device)
         lr = 1e-6
+        self._param_offload = False
+        if hasattr(self.config.policy, "training") and hasattr(self.config.policy.training, "fsdp_cfg"):
+            _fc = self.config.policy.training.fsdp_cfg
+            if isinstance(_fc, dict):
+                self._param_offload = _fc.get("param_offload", False)
         self._optimizer = torch.optim.AdamW(
             [p for p in self._actor_model.parameters() if p.requires_grad],
             lr=lr,
-            weight_decay=0.01,
+            weight_decay=0.1,
+            foreach=not self._param_offload,
         )
 
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -322,9 +331,29 @@ class RLTrainer:
         )
         return encoding["input_ids"], encoding["attention_mask"]
 
+    def _log_gpu_mem(self, phase: str, step: int) -> None:
+        """Log GPU 0 memory at a critical point (rank 0 only)."""
+        if self._rank != 0:
+            return
+        free, total = torch.cuda.mem_get_info(0)
+        alloc = torch.cuda.memory_allocated(0) / 1e9
+        reserved = torch.cuda.memory_reserved(0) / 1e9
+        logger.info(
+            "GPU-MEM [step=%d phase=%s] alloc=%.1fGB reserved=%.1fGB free=%.1fGB/%.1fGB",
+            step, phase, alloc, reserved, free / 1e9, total / 1e9,
+        )
+
     def _offload_optimizer_to_cpu(self) -> None:
-        """Move optimizer state tensors to CPU (pinned in /dev/shm via tmpfs)."""
+        """Move optimizer state tensors to CPU to free GPU for ATOM rollout.
+
+        Skipped when FSDP2 ``param_offload`` is active because FSDP2's
+        ``CPUOffloadPolicy`` already keeps parameters and gradients on CPU
+        and manages the GPU ↔ CPU lifecycle automatically.
+        """
         if self._optimizer is None:
+            return
+        if self._param_offload:
+            torch.cuda.empty_cache()
             return
         for state in self._optimizer.state.values():
             for k, v in state.items():
@@ -334,8 +363,11 @@ class RLTrainer:
         torch.cuda.empty_cache()
 
     def _reload_optimizer_to_gpu(self) -> None:
-        """Move optimizer state tensors back to GPU for the next training step."""
-        if self._optimizer is None:
+        """Move optimizer state tensors back to GPU for the next training step.
+
+        No-op when FSDP2 ``param_offload`` is active.
+        """
+        if self._optimizer is None or self._param_offload:
             return
         for state in self._optimizer.state.values():
             for k, v in state.items():
@@ -343,14 +375,104 @@ class RLTrainer:
                     state[k] = v.to(self._device, non_blocking=True)
 
     def _sync_weights_to_atom(self) -> None:
-        """Push updated weights to ATOM engine for next rollout.
+        """Push updated FSDP2 weights to ATOM engine for next rollout.
 
-        Currently a no-op: ``get_model_state_dict(full_state_dict=True)``
-        OOMs on 8B with 8×MI350X.  The sync trainer generates with the
-        original base model weights via ATOM.
+        Follows verl's approach: extract per-tensor from FSDP2's DTensor
+        state_dict, save to /dev/shm as safetensors (HF format), then
+        tell the ATOM subprocess to reload from the new path.
+
+        Sequence (GPU 0 memory-safe):
+        1. Rank 0: ensure ATOM is already sleeping (done after generation)
+        2. All ranks: FSDP2 ``full_tensor()`` all-gather (needs GPU headroom)
+        3. Rank 0: save gathered weights, update ``_weight_dir``
         """
         if self._atom_engine is None or self._actor_model is None:
             return
+
+        from torch.distributed._tensor import DTensor
+
+        t0 = time.time()
+
+        if self._rank == 0 and not self._atom_engine._sleeping:
+            self._atom_engine.sleep_inprocess()
+            logger.info("Weight sync: ATOM engine released (in-process sleep).")
+
+        if self._is_distributed:
+            torch.distributed.barrier()
+        torch.cuda.empty_cache()
+
+        sd = self._actor_model.state_dict()
+
+        cpu_state: dict[str, torch.Tensor] = {}
+        for name, param in sd.items():
+            if isinstance(param, DTensor):
+                full = param.full_tensor()
+            else:
+                full = param
+            cpu_state[name] = full.detach().cpu().contiguous()
+
+        del sd
+        torch.cuda.empty_cache()
+
+        sync_dir = Path(os.environ.get(
+            "LUMENRL_WEIGHT_SYNC_DIR", "/dev/shm/lumenrl_weight_sync",
+        ))
+
+        total_bytes = 0
+        if self._rank == 0:
+            sync_dir.mkdir(parents=True, exist_ok=True)
+
+            from safetensors.torch import save_file
+
+            max_shard_bytes = 4 * 1024 * 1024 * 1024
+            shards: list[dict[str, torch.Tensor]] = [{}]
+            current_bytes = 0
+            for name, tensor in cpu_state.items():
+                t_bytes = tensor.numel() * tensor.element_size()
+                if current_bytes + t_bytes > max_shard_bytes and shards[-1]:
+                    shards.append({})
+                    current_bytes = 0
+                shards[-1][name] = tensor
+                current_bytes += t_bytes
+
+            weight_map: dict[str, str] = {}
+            for i, shard in enumerate(shards, 1):
+                fname = f"model-{i:05d}-of-{len(shards):05d}.safetensors"
+                save_file(shard, str(sync_dir / fname))
+                for k, v in shard.items():
+                    weight_map[k] = fname
+                    total_bytes += v.numel() * v.element_size()
+
+            index = {
+                "metadata": {"total_size": total_bytes},
+                "weight_map": weight_map,
+            }
+            (sync_dir / "model.safetensors.index.json").write_text(
+                json.dumps(index, indent=2)
+            )
+
+            orig = Path(self.config.policy.model_name)
+            for fname in ["config.json", "tokenizer_config.json", "tokenizer.json",
+                          "special_tokens_map.json", "generation_config.json",
+                          "vocab.json", "merges.txt"]:
+                src = orig / fname
+                if src.exists():
+                    shutil.copy2(str(src), str(sync_dir / fname))
+
+            save_time = time.time() - t0
+            logger.info(
+                "Weight sync: saved %d params to %s in %.1fs (%.1f GB)",
+                len(cpu_state), sync_dir, save_time, total_bytes / 1e9,
+            )
+
+            self._atom_engine._weight_dir = str(sync_dir)
+            logger.info("Weight sync: ATOM will reload from %s on next generation.", sync_dir)
+
+        del cpu_state
+        gc.collect()
+
+        if self._is_distributed:
+            torch.distributed.barrier()
 
     def _rollout_with_atom(
         self,
@@ -382,8 +504,40 @@ class RLTrainer:
             for _ in range(num_generations):
                 expanded_prompts.append(p)
 
+        if os.environ.get("LUMENRL_DRY_RUN") == "1":
+            target_len = int(os.environ.get("LUMENRL_DRY_RUN_RESP_LEN", "100"))
+            mock_resp = ("Step: think carefully about this problem. " * (target_len // 7 + 1))[:target_len * 4] + " The answer is \\boxed{42}."
+            response_texts = [mock_resp] * len(expanded_prompts)
+            full_texts = [p + mock_resp for p in expanded_prompts]
+            encoding = self._tokenizer(
+                full_texts, padding=True, truncation=True,
+                max_length=self.config.policy.max_total_sequence_length,
+                return_tensors="pt",
+            )
+            sequences = encoding["input_ids"].to(self._device)
+            seq_mask = encoding["attention_mask"].to(self._device)
+            if self._is_distributed:
+                torch.distributed.barrier()
+                shape_tensor = torch.tensor(list(sequences.shape), device=self._device, dtype=torch.long)
+                torch.distributed.broadcast(shape_tensor, src=0)
+                torch.distributed.broadcast(sequences, src=0)
+                torch.distributed.broadcast(seq_mask, src=0)
+            prompt_lengths = []
+            for p in expanded_prompts:
+                p_enc = self._tokenizer(p, return_tensors="pt")
+                prompt_lengths.append(p_enc["input_ids"].shape[1])
+            return sequences, seq_mask, prompt_lengths
+
         if self._rank == 0:
-            if not getattr(self._atom_engine, '_initialized', False):
+            if self._atom_engine._sleeping:
+                model_path = self._atom_engine._weight_dir or self._atom_engine._model_name
+                self._atom_engine._send_cmd({
+                    "cmd": "wake",
+                    "model_path": model_path,
+                })
+                self._atom_engine._sleeping = False
+                logger.info("AtomEngine: woke in-process with %s", model_path)
+            elif not getattr(self._atom_engine, '_initialized', False):
                 self._atom_engine.wake()
             response_texts = self._atom_engine.generate(expanded_prompts, sampling_params=sp)
 
@@ -688,6 +842,22 @@ class RLTrainer:
         accuracy = sum(1 for d in details if d["acc"]) / max(1, len(details))
         logger.info("Reward: accuracy=%.4f, mean=%.4f", accuracy, rewards.mean().item())
 
+        n_pos = sum(1 for r in rewards if r > 0)
+        n_neg = sum(1 for r in rewards if r < 0)
+        n_invalid = sum(1 for d in details if d.get("pred") == "[INVALID]")
+        logger.info(
+            "Reward breakdown: +1=%d, -1=%d, invalid_format=%d / %d total",
+            n_pos, n_neg, n_invalid, len(details),
+        )
+        for idx in range(min(2, len(responses), len(details))):
+            tail = responses[idx][-400:]
+            pred = details[idx].get("pred", "N/A")
+            gt = expanded_gts[idx] if idx < len(expanded_gts) else "?"
+            logger.info(
+                "Sample[%d] reward=%.1f pred=%s gt=%s tail=...%s",
+                idx, rewards[idx].item(), pred, gt, repr(tail[-200:]),
+            )
+
         return rewards.to(self._device), responses
 
     def _build_response_mask(
@@ -717,7 +887,10 @@ class RLTrainer:
         if max_token_len <= 0:
             return list(batch.mini_batches(fallback_bs))
 
-        seq_lens = batch.tensors["attention_mask"].sum(dim=1)
+        # Use padded length (not actual tokens) to bound GPU memory correctly.
+        # With padding, each row costs seq_dim tokens of compute/memory.
+        padded_len = batch.tensors["input_ids"].shape[1]
+        seq_lens = torch.full((batch.batch_size,), padded_len, dtype=torch.long)
         batches: list[DataProto] = []
         start = 0
         n = batch.batch_size
@@ -758,9 +931,7 @@ class RLTrainer:
             metrics["loss"] = float("nan")
             return metrics
 
-        num_accum = getattr(self, "_grad_accum_steps", 1)
-        scaled_loss = loss / num_accum
-        scaled_loss.backward()
+        loss.backward()
 
         metrics["loss"] = float(loss.detach())
         return metrics
@@ -793,6 +964,7 @@ class RLTrainer:
             if self._use_atom and self._atom_engine is not None:
                 self._offload_optimizer_to_cpu()
 
+            self._log_gpu_mem("pre_gen", step)
             t0 = time.time()
             if self._use_atom and self._atom_engine is not None:
                 sequences, seq_mask, prompt_lengths = self._rollout_with_atom(
@@ -803,10 +975,39 @@ class RLTrainer:
                     input_ids, attention_mask, num_generations,
                 )
             gen_time = time.time() - t0
+            self._log_gpu_mem("post_gen", step)
+
+            if self._use_atom and self._atom_engine is not None and self._rank == 0:
+                if not self._atom_engine._sleeping:
+                    self._atom_engine.sleep_inprocess()
+                    logger.info("ATOM slept after generation — freeing GPU 0 for training.")
+            if self._use_atom and self._is_distributed:
+                torch.distributed.barrier()
+            torch.cuda.empty_cache()
+            self._log_gpu_mem("post_atom_sleep", step)
 
             prompt_tok = int(attention_mask.repeat_interleave(
                 num_generations, dim=0).to(seq_mask.device).sum().item()) if num_generations > 0 else 0
             gen_tokens = int(seq_mask.sum().item()) - prompt_tok if num_generations > 0 else 0
+
+            # Shard sequences to per-rank for log-prob computation and training.
+            # FSDP2 does gradient all-reduce; each rank only needs its own shard.
+            if self._is_distributed and self._world_size > 1:
+                _total = sequences.shape[0]
+                _chunk = max(1, _total // self._world_size)
+                _s = self._rank * _chunk
+                _e = _s + _chunk if self._rank < self._world_size - 1 else _total
+                sequences = sequences[_s:_e]
+                seq_mask = seq_mask[_s:_e]
+                if isinstance(prompt_lengths, list):
+                    prompt_lengths = prompt_lengths[_s:_e]
+                # ground_truths is prompt-level (N_prompts), not sequence-level
+                _n_prompts = len(ground_truths) if isinstance(ground_truths, list) else 0
+                if _n_prompts > 0:
+                    _p_chunk = max(1, _n_prompts // self._world_size)
+                    _ps = self._rank * _p_chunk
+                    _pe = _ps + _p_chunk if self._rank < self._world_size - 1 else _n_prompts
+                    ground_truths = ground_truths[_ps:_pe]
 
             self._actor_model.eval()
             old_log_probs = self._compute_log_probs_for_model(
@@ -872,40 +1073,47 @@ class RLTrainer:
             if self._use_atom and self._atom_engine is not None:
                 self._reload_optimizer_to_gpu()
 
+            self._log_gpu_mem("pre_train", step)
             t2 = time.time()
             micro_bs = max(1, int(self.config.policy.train_micro_batch_size))
             max_tok = int(self.config.policy.max_token_len_per_gpu)
             mini_batches = self._dynamic_mini_batches(batch, max_tok, micro_bs)
-            self._grad_accum_steps = len(mini_batches)
-            self._optimizer.zero_grad(set_to_none=True)
             metrics_accum: dict[str, float] = {}
             step_count = 0
             nan_mb_count = 0
+            grad_norm = torch.tensor(0.0)
+            nan_param_count = 0
+            total_param_count = 0
             for mini in mini_batches:
+                self._optimizer.zero_grad(set_to_none=True)
                 m = self._train_step(mini)
                 if m.get("loss") is not None and (m["loss"] != m["loss"]):
                     nan_mb_count += 1
                     continue
+                # Clean NaN grads before stepping
+                _nan_cnt = 0
+                _total_cnt = 0
+                for p in self._actor_model.parameters():
+                    if p.grad is not None:
+                        _total_cnt += 1
+                        if p.grad.isnan().any():
+                            _nan_cnt += 1
+                            p.grad = torch.where(
+                                p.grad.isnan(), torch.zeros_like(p.grad), p.grad,
+                            )
+                nan_param_count = max(nan_param_count, _nan_cnt)
+                total_param_count = _total_cnt
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self._actor_model.parameters(), max_norm=1.0,
+                )
+                self._optimizer.step()
                 for k, v in m.items():
                     if v == v:
                         metrics_accum[k] = metrics_accum.get(k, 0.0) + v
                 step_count += 1
-            nan_param_count = 0
-            total_param_count = 0
-            for p in self._actor_model.parameters():
-                if p.grad is not None:
-                    total_param_count += 1
-                    if p.grad.isnan().any():
-                        nan_param_count += 1
-                        p.grad = torch.where(
-                            p.grad.isnan(), torch.zeros_like(p.grad), p.grad,
-                        )
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                self._actor_model.parameters(), max_norm=1.0,
-            )
-            self._optimizer.step()
             self._optimizer.zero_grad(set_to_none=True)
             train_time = time.time() - t2
+            self._log_gpu_mem("post_train", step)
 
             if nan_param_count > 0 and self._rank == 0:
                 logger.warning(
@@ -944,7 +1152,11 @@ class RLTrainer:
             for k, v in metrics.items():
                 self._metrics.update(k, v)
 
+            t_sync = time.time()
             self._sync_rollout_weights()
+            sync_time = time.time() - t_sync
+            if sync_time > 1.0:
+                metrics["timing/weight_sync_s"] = sync_time
 
             for cb in self.callbacks:
                 cb.on_step_end(self, step, metrics)

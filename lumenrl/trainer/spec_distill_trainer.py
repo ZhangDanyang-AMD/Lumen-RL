@@ -44,6 +44,7 @@ class SpecDistillTrainer:
         self.callbacks: list[Callback] = []
 
         self._teacher_model: torch.nn.Module | None = None
+        self._teacher_engine: Any | None = None  # AtomTeacherEngine (if backend=atom)
         self._draft_model: torch.nn.Module | None = None
         self._lm_head_weight: torch.Tensor | None = None
         self._optimizer: torch.optim.Optimizer | None = None
@@ -80,32 +81,13 @@ class SpecDistillTrainer:
             )
 
         # ---- Teacher model (frozen) ----
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
-        logger.info("[rank %d] Loading teacher model: %s", self._rank, teacher_name)
-        self._teacher_model = AutoModelForCausalLM.from_pretrained(
-            teacher_name,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="sdpa",
-            trust_remote_code=True,
-        )
-        self._teacher_model.eval()
-        for p in self._teacher_model.parameters():
-            p.requires_grad_(False)
-        self._teacher_model.to(self._device)
-
-        # Extract lm_head weight for draft model's logit projection
-        lm_head_weight = None
-        for name, param in self._teacher_model.named_parameters():
-            if "lm_head" in name and "weight" in name:
-                lm_head_weight = param.detach().clone()
-                break
-        if lm_head_weight is None:
-            raise RuntimeError("Could not find lm_head.weight in teacher model.")
-        self._lm_head_weight = lm_head_weight
+        if teacher_cfg.inference_backend == "atom":
+            self._setup_teacher_atom(teacher_cfg, teacher_name)
+        else:
+            self._setup_teacher_hf(teacher_name)
 
         # Determine hidden dim from teacher
-        teacher_hidden_dim = lm_head_weight.shape[1]
+        teacher_hidden_dim = self._lm_head_weight.shape[1]
 
         # ---- Draft model ----
         draft_type = spec_cfg.draft_type.lower()
@@ -182,6 +164,86 @@ class SpecDistillTrainer:
             teacher_name,
             draft_type,
         )
+
+    def _setup_teacher_hf(self, teacher_name: str) -> None:
+        """Load teacher model via HuggingFace (original path)."""
+        from transformers import AutoModelForCausalLM
+
+        logger.info("[rank %d] Loading teacher model (HF): %s", self._rank, teacher_name)
+        self._teacher_model = AutoModelForCausalLM.from_pretrained(
+            teacher_name,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="sdpa",
+            trust_remote_code=True,
+        )
+        self._teacher_model.eval()
+        for p in self._teacher_model.parameters():
+            p.requires_grad_(False)
+        self._teacher_model.to(self._device)
+
+        lm_head_weight = None
+        for name, param in self._teacher_model.named_parameters():
+            if "lm_head" in name and "weight" in name:
+                lm_head_weight = param.detach().clone()
+                break
+        if lm_head_weight is None:
+            raise RuntimeError("Could not find lm_head.weight in teacher model.")
+        self._lm_head_weight = lm_head_weight
+
+    def _setup_teacher_atom(self, teacher_cfg: Any, teacher_name: str) -> None:
+        """Load teacher model via ATOM engine (subprocess, TP, quantization).
+
+        Hidden states are transferred via MORI-IO P2P RDMA (GPU Direct).
+        """
+        from lumenrl.engine.inference.atom_teacher_engine import AtomTeacherEngine
+
+        gpu_ids = teacher_cfg.gpu_ids or list(range(teacher_cfg.tensor_parallel_size))
+        logger.info(
+            "[rank %d] Loading teacher model (ATOM): %s (tp=%d, gpus=%s)",
+            self._rank, teacher_name,
+            teacher_cfg.tensor_parallel_size, gpu_ids,
+        )
+        # Only rank 0 starts the ATOM subprocess
+        if self._rank == 0:
+            max_bs = max(1, int(self.config.policy.train_global_batch_size))
+            max_seq = int(self.config.policy.max_total_sequence_length)
+            self._teacher_engine = AtomTeacherEngine(
+                model_name=teacher_name,
+                tensor_parallel_size=teacher_cfg.tensor_parallel_size,
+                gpu_ids=gpu_ids,
+                mori_io_host=getattr(teacher_cfg, "mori_io_host", "127.0.0.1"),
+                mori_io_port=getattr(teacher_cfg, "mori_io_port", 0),
+                mori_io_qp_per_transfer=getattr(teacher_cfg, "mori_io_qp_per_transfer", 2),
+                max_batch_size=max_bs,
+                max_seq_len=max_seq,
+                local_device=self._device,
+            )
+            self._teacher_engine.start()
+            self._lm_head_weight = self._teacher_engine.get_lm_head_weight()
+        else:
+            self._teacher_engine = None
+            self._lm_head_weight = None
+
+        # Broadcast lm_head_weight to all ranks
+        if self._is_distributed:
+            if self._rank == 0:
+                shape = torch.tensor(
+                    list(self._lm_head_weight.shape),
+                    dtype=torch.long, device=self._device,
+                )
+            else:
+                shape = torch.zeros(2, dtype=torch.long, device=self._device)
+            torch.distributed.broadcast(shape, src=0)
+
+            if self._rank == 0:
+                weight = self._lm_head_weight.to(self._device)
+            else:
+                weight = torch.zeros(
+                    shape[0].item(), shape[1].item(),
+                    dtype=torch.bfloat16, device=self._device,
+                )
+            torch.distributed.broadcast(weight, src=0)
+            self._lm_head_weight = weight.cpu()
 
     def _load_dataset(self) -> None:
         """Load training dataset."""
@@ -287,10 +349,71 @@ class SpecDistillTrainer:
         - ``"token_embeds"``: input embeddings ``[B, T, D]`` (for Eagle3)
         - ``"input_ids"``: the original input ids
         """
+        if self._teacher_engine is not None:
+            return self._teacher_forward_atom(input_ids, attention_mask)
+        return self._teacher_forward_hf(input_ids, attention_mask)
+
+    def _teacher_forward_atom(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Teacher forward via ATOM engine (rank 0 only, then broadcast).
+
+        Hidden states arrive on the training GPU via MORI-IO RDMA
+        (GPU Direct), avoiding CPU round-trips.
+        """
+        if self._rank == 0:
+            # MORI-IO returns tensors already on the training GPU
+            result = self._teacher_engine.extract_hidden_states(
+                input_ids, attention_mask,
+            )
+            hidden_states = result["hidden_states"]  # [B, T, D] on GPU
+            token_embeds = result["token_embeds"]     # [B, T, D] on GPU
+        else:
+            hidden_states = None
+            token_embeds = None
+
+        # Broadcast from rank 0 to all training ranks
+        if self._is_distributed:
+            if self._rank == 0:
+                shape = torch.tensor(
+                    list(hidden_states.shape),
+                    dtype=torch.long, device=self._device,
+                )
+            else:
+                shape = torch.zeros(3, dtype=torch.long, device=self._device)
+            torch.distributed.broadcast(shape, src=0)
+
+            B, T, D = shape[0].item(), shape[1].item(), shape[2].item()
+            if self._rank == 0:
+                # Already on GPU from MORI-IO, clone to avoid aliasing
+                # the pre-registered buffer during broadcast
+                h = hidden_states.clone()
+                e = token_embeds.clone()
+            else:
+                h = torch.zeros(B, T, D, dtype=torch.bfloat16, device=self._device)
+                e = torch.zeros(B, T, D, dtype=torch.bfloat16, device=self._device)
+            torch.distributed.broadcast(h, src=0)
+            torch.distributed.broadcast(e, src=0)
+            hidden_states = h
+            token_embeds = e
+
+        return {
+            "hidden_states": hidden_states,
+            "token_embeds": token_embeds,
+            "input_ids": input_ids,
+        }
+
+    def _teacher_forward_hf(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Teacher forward via HuggingFace (original path)."""
         if self._teacher_model is None:
             raise RuntimeError("Teacher model not loaded.")
 
-        spec_cfg = self.config.algorithm.spec_distill
         micro_bs = max(1, self.config.algorithm.opd.teacher_micro_batch_size)
 
         all_hidden: list[torch.Tensor] = []
@@ -308,7 +431,6 @@ class SpecDistillTrainer:
                     output_hidden_states=True,
                 )
 
-                # Get embeddings (first hidden state = after embedding layer)
                 if hasattr(outputs, "hidden_states") and outputs.hidden_states:
                     all_embeds.append(outputs.hidden_states[0].cpu())
                     all_hidden.append(outputs.hidden_states[-1].cpu())
@@ -498,6 +620,9 @@ class SpecDistillTrainer:
 
     def cleanup(self) -> None:
         """Release all resources."""
+        if self._teacher_engine is not None:
+            self._teacher_engine.shutdown()
+            self._teacher_engine = None
         del self._teacher_model, self._draft_model
         self._teacher_model = None
         self._draft_model = None

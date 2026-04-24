@@ -1,0 +1,76 @@
+# KimiV2.5 DFlash Draft Model Distillation
+#
+# Off-policy DFlash draft model training with block-causal masking.
+# Teacher (Kimi-K2.5) produces hidden states; DFlash learns multi-layer fusion
+# with cross-entropy loss and exponential decay weighting.
+#
+# Teacher: moonshotai/Kimi-K2.5 — 1T MoE (32B activated), hidden_dim=7168,
+#          64 heads, 61 layers, vocab=160,256
+# Draft:   DFlash architecture — block-causal masking + multi-layer fusion
+#
+# GPU split strategy (8x MI300X):
+#   GPUs 0-3: ATOM teacher inference, TP=4, MXFP4 quantization
+#             ~500 GB / 4 GPUs = ~125 GB/GPU — fits comfortably
+#   GPUs 4-7: torchrun FSDP2, draft model training (BF16)
+#
+# Hidden state transfer: MORI-IO P2P RDMA (GPU Direct, no CPU copy)
+#
+# Reference: TorchSpec (https://github.com/lightseekorg/TorchSpec)
+# Reference: KimiV2.5 Technical Report (https://arxiv.org/abs/2505.01759)
+#
+# Usage:
+#   bash examples/KimiV2.5_Draft_Distill_MI300/run_dflash_bf16.sh
+
+cluster:
+  gpus_per_node: 4                      # Training GPUs (4-7 via CUDA_VISIBLE_DEVICES)
+  num_nodes: 1
+
+policy:
+  model_name: /dev/shm/model/kimi-k2.5  # Used for tokenizer + draft model hidden dim
+  training_backend: fsdp2
+  generation_backend: hf
+  max_total_sequence_length: 4096
+  train_global_batch_size: 32
+  train_micro_batch_size: 4
+
+algorithm:
+  name: spec_distill
+  spec_distill:
+    draft_type: dflash                  # DFlash with block-causal masking
+    loss_type: ce_decay                 # Cross-entropy + exponential decay
+    loss_decay_gamma: 7.0               # Decay factor: exp(-i/7.0)
+    num_target_layers: 1                # Teacher layers to fuse
+  teacher:
+    model_name: /dev/shm/model/kimi-k2.5  # moonshotai/Kimi-K2.5
+    inference_backend: atom             # ATOM engine on GPUs 0-3
+    tensor_parallel_size: 4
+    gpu_ids: [0, 1, 2, 3]
+    mori_io_host: "127.0.0.1"          # MORI-IO OOB address (intra-node)
+    mori_io_qp_per_transfer: 2         # RDMA queue pairs
+  draft:
+    from_scratch: true
+    num_layers: 2                       # 2 Transformer blocks in DFlash
+
+quantization:
+  training:
+    fp8: null
+  rollout_correction:
+    enabled: false
+
+reward:
+  type: function
+  function: math_reward
+  dataset: nvidia/OpenMathInstruct-2
+
+checkpointing:
+  checkpoint_dir: results/kimiv2.5_dflash_bf16
+  save_steps: 100
+  save_total_limit: 3
+  resume: true
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 2000
+seed: 42

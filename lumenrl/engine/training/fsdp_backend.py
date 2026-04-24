@@ -30,6 +30,22 @@ class _TinyLM(nn.Module):
         return self.lm_head(x)
 
 
+def _patch_hf_attention_with_lumen() -> None:
+    """Patch HF sdpa attention to use AITER CK kernels via Lumen.
+
+    Uses ``lumen.ops.attention.hf_patch`` which replaces the ``sdpa``
+    entry in HF's ``ALL_ATTENTION_FUNCTIONS`` with an AITER-backed
+    implementation that supports both forward and backward.
+    """
+    try:
+        from lumen.ops.attention.hf_patch import patch_hf_sdpa
+        patch_hf_sdpa()
+    except ImportError:
+        logger.warning("Lumen HF attention patch not available; using default SDPA/AOTriton.")
+    except Exception as exc:
+        logger.error("Lumen HF attention patch failed: %s", exc, exc_info=True)
+
+
 def _load_hf_model(model_name: str, torch_dtype: torch.dtype = torch.bfloat16) -> nn.Module:
     """Load a HuggingFace causal LM with gradient checkpointing.
 
@@ -40,6 +56,8 @@ def _load_hf_model(model_name: str, torch_dtype: torch.dtype = torch.bfloat16) -
     from transformers import AutoModelForCausalLM
 
     rank = dist.get_rank() if dist.is_initialized() else 0
+
+    _patch_hf_attention_with_lumen()
 
     logger.info("[rank %d] Loading HF model: %s (dtype=%s)", rank, model_name, torch_dtype)
     model = AutoModelForCausalLM.from_pretrained(
@@ -79,6 +97,7 @@ def _apply_lumen_fp8(model: nn.Module, quant_config: dict[str, Any]) -> nn.Modul
             linear_fp8=bool(fp8_enabled),
             fp8_param_manager=bool(fp8_pm),
             lumen_norm=bool(lumen_norm),
+            hf_attn_patch=True,
             scaling=os.environ.get("LUMEN_FP8_SCALING", "delayed"),
             format=os.environ.get("LUMEN_FP8_FORMAT", "fp8_e4m3"),
             block_size=int(os.environ.get("LUMEN_FP8_BLOCK_SIZE", "128")),
