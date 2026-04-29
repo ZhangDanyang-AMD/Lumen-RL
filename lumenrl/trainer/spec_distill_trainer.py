@@ -44,7 +44,8 @@ class SpecDistillTrainer:
         self.callbacks: list[Callback] = []
 
         self._teacher_model: torch.nn.Module | None = None
-        self._teacher_engine: Any | None = None  # AtomTeacherEngine (if backend=atom)
+        self._teacher_engine: Any | None = None  # AtomTeacherEngine or SglangTeacherEngine
+        self._mooncake_master: Any | None = None
         self._draft_model: torch.nn.Module | None = None
         self._lm_head_weight: torch.Tensor | None = None
         self._optimizer: torch.optim.Optimizer | None = None
@@ -81,7 +82,9 @@ class SpecDistillTrainer:
             )
 
         # ---- Teacher model (frozen) ----
-        if teacher_cfg.inference_backend == "atom":
+        if teacher_cfg.inference_backend == "sglang":
+            self._setup_teacher_sglang(teacher_cfg, teacher_name)
+        elif teacher_cfg.inference_backend == "atom":
             self._setup_teacher_atom(teacher_cfg, teacher_name)
         else:
             self._setup_teacher_hf(teacher_name)
@@ -102,11 +105,12 @@ class SpecDistillTrainer:
             from lumenrl.models.eagle3 import Eagle3Model
 
             num_layers = draft_cfg.num_layers or 1
+            spec_length = self.config.algorithm.spec_distill.spec_length
             self._draft_model = Eagle3Model(
                 hidden_dim=teacher_hidden_dim,
                 num_heads=max(1, teacher_hidden_dim // 128),
                 num_layers=num_layers,
-                length=5,
+                length=spec_length,
             )
         elif draft_type == "dflash":
             from lumenrl.models.dflash import DFlashModel
@@ -135,11 +139,32 @@ class SpecDistillTrainer:
 
         self._optimizer = torch.optim.AdamW(
             [p for p in self._draft_model.parameters() if p.requires_grad],
-            lr=3e-4,
-            weight_decay=0.01,
+            lr=self.config.policy.learning_rate,
+            weight_decay=self.config.policy.weight_decay,
         )
 
+        total_steps = self.config.num_training_steps
+        warmup_ratio = self.config.policy.warmup_ratio
+        warmup_steps = int(total_steps * warmup_ratio)
+        if warmup_steps > 0 or warmup_ratio > 0:
+            from torch.optim.lr_scheduler import LambdaLR
+            import math as _math
+
+            def _cosine_with_warmup(current_step: int) -> float:
+                if current_step < warmup_steps:
+                    return float(current_step) / max(1, warmup_steps)
+                progress = (current_step - warmup_steps) / max(
+                    1, total_steps - warmup_steps
+                )
+                return max(0.0, 0.5 * (1.0 + _math.cos(_math.pi * progress)))
+
+            self._scheduler = LambdaLR(self._optimizer, _cosine_with_warmup)
+        else:
+            self._scheduler = None
+
         # ---- Tokenizer ----
+        from transformers import AutoTokenizer
+
         self._tokenizer = AutoTokenizer.from_pretrained(
             teacher_name, trust_remote_code=True
         )
@@ -245,6 +270,69 @@ class SpecDistillTrainer:
             torch.distributed.broadcast(weight, src=0)
             self._lm_head_weight = weight.cpu()
 
+    def _setup_teacher_sglang(self, teacher_cfg: Any, teacher_name: str) -> None:
+        """Load teacher via SGLang Engine + ATOM plugin + Mooncake RDMA."""
+        from lumenrl.engine.inference.sglang_teacher_engine import SglangTeacherEngine
+
+        gpu_ids = teacher_cfg.gpu_ids or list(range(teacher_cfg.tensor_parallel_size))
+        atom_plugin = getattr(teacher_cfg, "atom_plugin", False)
+        logger.info(
+            "[rank %d] Loading teacher (SGLang+ATOM): %s (tp=%d, gpus=%s, atom=%s)",
+            self._rank, teacher_name,
+            teacher_cfg.tensor_parallel_size, gpu_ids, atom_plugin,
+        )
+
+        mc_config = getattr(self.config, "mooncake", None)
+
+        # Launch Mooncake master if needed (rank 0 only)
+        if self._rank == 0 and mc_config is not None:
+            if not mc_config.master_server_address:
+                from lumenrl.transfer.mooncake_master import launch_mooncake_master
+                self._mooncake_master = launch_mooncake_master(mc_config)
+                logger.info(
+                    "Mooncake master started: %s", mc_config.master_server_address
+                )
+
+        # Only rank 0 starts the subprocess
+        if self._rank == 0:
+            self._teacher_engine = SglangTeacherEngine(
+                model_name=teacher_name,
+                gpu_ids=gpu_ids,
+                mooncake_config=mc_config,
+                tensor_parallel_size=teacher_cfg.tensor_parallel_size,
+                atom_plugin=atom_plugin,
+                quantization=getattr(teacher_cfg, "quantization", ""),
+                max_batch_size=max(1, int(self.config.policy.train_global_batch_size)),
+                max_seq_len=int(self.config.policy.max_total_sequence_length),
+                local_device=self._device,
+            )
+            self._teacher_engine.start()
+            self._lm_head_weight = self._teacher_engine.get_lm_head_weight()
+        else:
+            self._teacher_engine = None
+            self._lm_head_weight = None
+
+        # Broadcast lm_head_weight to all ranks
+        if self._is_distributed:
+            if self._rank == 0:
+                shape = torch.tensor(
+                    list(self._lm_head_weight.shape),
+                    dtype=torch.long, device=self._device,
+                )
+            else:
+                shape = torch.zeros(2, dtype=torch.long, device=self._device)
+            torch.distributed.broadcast(shape, src=0)
+
+            if self._rank == 0:
+                weight = self._lm_head_weight.to(self._device)
+            else:
+                weight = torch.zeros(
+                    shape[0].item(), shape[1].item(),
+                    dtype=torch.bfloat16, device=self._device,
+                )
+            torch.distributed.broadcast(weight, src=0)
+            self._lm_head_weight = weight.cpu()
+
     def _load_dataset(self) -> None:
         """Load training dataset."""
         dataset_path = self.config.reward.dataset
@@ -269,8 +357,10 @@ class SpecDistillTrainer:
         else:
             self._dataset = load_dataset(dataset_path, split="train")
 
+        self._dataset = self._dataset.shuffle(seed=self.config.seed)
         logger.info(
-            "Loaded dataset: %d samples from %s", len(self._dataset), dataset_path
+            "Loaded dataset: %d samples (shuffled, seed=%d) from %s",
+            len(self._dataset), self.config.seed, dataset_path,
         )
 
     # ------------------------------------------------------------------
@@ -297,10 +387,26 @@ class SpecDistillTrainer:
             samples = [self._dataset[idx] for idx in indices]
             texts = []
             for s in samples:
-                raw = s.get("prompt") or s.get("question") or s.get("input") or ""
+                convs = s.get("conversations")
+                if convs and isinstance(convs, list) and isinstance(convs[0], dict):
+                    if hasattr(self._tokenizer, "apply_chat_template"):
+                        text = self._tokenizer.apply_chat_template(
+                            convs, tokenize=False, add_generation_prompt=False
+                        )
+                    else:
+                        text = "\n".join(
+                            m.get("content", "") for m in convs if isinstance(m, dict)
+                        )
+                    texts.append(text)
+                    continue
+                raw = (
+                    s.get("prompt") or s.get("question") or s.get("input")
+                    or s.get("problem") or ""
+                )
                 answer = (
                     s.get("answer")
                     or s.get("solution")
+                    or s.get("generated_solution")
                     or s.get("target")
                     or s.get("output")
                     or ""
@@ -349,7 +455,8 @@ class SpecDistillTrainer:
         - ``"token_embeds"``: input embeddings ``[B, T, D]`` (for Eagle3)
         - ``"input_ids"``: the original input ids
         """
-        if self._teacher_engine is not None:
+        backend = self.config.algorithm.teacher.inference_backend
+        if backend in ("sglang", "atom"):
             return self._teacher_forward_atom(input_ids, attention_mask)
         return self._teacher_forward_hf(input_ids, attention_mask)
 
@@ -534,7 +641,7 @@ class SpecDistillTrainer:
 
     def train(self) -> None:
         """Spec Distill loop: teacher forward on dataset -> draft model train."""
-        if self._draft_model is None or self._teacher_model is None:
+        if self._draft_model is None and self._teacher_model is None and self._teacher_engine is None:
             raise RuntimeError("Call setup() before train().")
 
         if self._rank == 0:
@@ -572,13 +679,17 @@ class SpecDistillTrainer:
                 metrics = self._train_step_dflash(teacher_data, attention_mask)
 
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                self._draft_model.parameters(), max_norm=1.0
+                self._draft_model.parameters(),
+                max_norm=self.config.policy.max_grad_norm,
             )
             self._optimizer.step()
+            if self._scheduler is not None:
+                self._scheduler.step()
             self._optimizer.zero_grad(set_to_none=True)
             train_time = time.time() - t1
 
             metrics["grad_norm"] = float(grad_norm)
+            metrics["lr"] = self._optimizer.param_groups[0]["lr"]
             metrics["timing/step_s"] = time.time() - step_start
             metrics["timing/teacher_s"] = teacher_time
             metrics["timing/train_s"] = train_time
@@ -623,6 +734,9 @@ class SpecDistillTrainer:
         if self._teacher_engine is not None:
             self._teacher_engine.shutdown()
             self._teacher_engine = None
+        if self._mooncake_master is not None:
+            self._mooncake_master.shutdown()
+            self._mooncake_master = None
         del self._teacher_model, self._draft_model
         self._teacher_model = None
         self._draft_model = None

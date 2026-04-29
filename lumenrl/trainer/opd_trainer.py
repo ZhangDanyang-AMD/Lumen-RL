@@ -109,8 +109,8 @@ class OPDTrainer:
 
         self._optimizer = torch.optim.AdamW(
             [p for p in self._student_model.parameters() if p.requires_grad],
-            lr=1e-6,
-            weight_decay=0.01,
+            lr=self.config.policy.learning_rate,
+            weight_decay=self.config.policy.weight_decay,
         )
 
         # ---- Teacher model ----
@@ -530,7 +530,8 @@ class OPDTrainer:
                 step_count += 1
 
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                self._student_model.parameters(), max_norm=1.0
+                self._student_model.parameters(),
+                max_norm=self.config.policy.max_grad_norm,
             )
             self._optimizer.step()
             self._optimizer.zero_grad(set_to_none=True)

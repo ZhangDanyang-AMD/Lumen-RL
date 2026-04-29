@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import math
+import sys
 from typing import Optional
 
 import torch
@@ -27,6 +28,23 @@ import torch.nn.functional as F
 from torch import Tensor
 
 logger = logging.getLogger(__name__)
+
+_flex_attn_module = None
+
+
+def _get_flex_attention():
+    global _flex_attn_module
+    if _flex_attn_module is not None:
+        return _flex_attn_module
+    try:
+        sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[2] / "third_party"))
+        from aiter.flex_attention import FlexMultiheadAttention, create_causal_block_mask
+        _flex_attn_module = (FlexMultiheadAttention, create_causal_block_mask)
+        logger.info("Using Triton FlexAttention for Eagle3 training")
+    except ImportError:
+        _flex_attn_module = (None, None)
+        logger.info("FlexAttention not available, using nn.MultiheadAttention")
+    return _flex_attn_module
 
 
 class Eagle3FusionLayer(nn.Module):
@@ -48,7 +66,13 @@ class Eagle3TransformerBlock(nn.Module):
         super().__init__()
         ffn_dim = ffn_dim or hidden_dim * 4
         self.attn_norm = nn.LayerNorm(hidden_dim)
-        self.attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
+        FlexMHA, _ = _get_flex_attention()
+        if FlexMHA is not None:
+            self.attn = FlexMHA(hidden_dim, num_heads)
+            self._use_flex = True
+        else:
+            self.attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
+            self._use_flex = False
         self.ffn_norm = nn.LayerNorm(hidden_dim)
         self.w1 = nn.Linear(hidden_dim, ffn_dim, bias=False)
         self.w2 = nn.Linear(ffn_dim, hidden_dim, bias=False)
@@ -58,9 +82,13 @@ class Eagle3TransformerBlock(nn.Module):
         self,
         x: Tensor,
         attn_mask: Optional[Tensor] = None,
+        block_mask=None,
     ) -> Tensor:
         h = self.attn_norm(x)
-        h, _ = self.attn(h, h, h, attn_mask=attn_mask, need_weights=False)
+        if self._use_flex:
+            h, _ = self.attn(h, h, h, block_mask=block_mask)
+        else:
+            h, _ = self.attn(h, h, h, attn_mask=attn_mask, need_weights=False)
         x = x + h
         h = self.ffn_norm(x)
         x = x + self.w2(F.silu(self.w1(h)) * self.w3(h))
@@ -98,6 +126,8 @@ class Eagle3Model(nn.Module):
             [Eagle3TransformerBlock(hidden_dim, num_heads) for _ in range(num_layers)]
         )
         self.out_norm = nn.LayerNorm(hidden_dim)
+        _, self._create_block_mask = _get_flex_attention()
+        self._use_flex = self._create_block_mask is not None
 
     def forward(
         self,
@@ -126,35 +156,50 @@ class Eagle3Model(nn.Module):
         losses: list[Tensor] = []
         accuracies: list[Tensor] = []
 
+        block_mask = None
+        if self._use_flex:
+            block_mask = self._create_block_mask(B, T, token_embeds.device)
+
         h = self.fusion(token_embeds, teacher_hidden)
 
         for step in range(self.length):
             for block in self.blocks:
-                h = block(h)
+                h = block(h, block_mask=block_mask)
 
             normed = self.out_norm(h)
             step_logits = F.linear(normed, lm_head_weight)  # [B, T, V]
             logits_list.append(step_logits)
 
-            if target_ids is not None and step + 1 < target_ids.shape[1] - T + 1:
-                # target for this step
-                tgt = target_ids[:, step + 1 : step + 1 + T]  # [B, T]
-                ce = F.cross_entropy(
-                    step_logits.reshape(-1, step_logits.size(-1)),
-                    tgt.reshape(-1),
-                    reduction="none",
-                ).reshape(B, T)
-
-                if loss_mask is not None:
-                    mask_f = loss_mask.to(dtype=ce.dtype)
-                    denom = mask_f.sum().clamp(min=1.0)
-                    losses.append((ce * mask_f).sum() / denom)
-                    preds = step_logits.argmax(dim=-1)
-                    correct = (preds == tgt).float()
-                    accuracies.append((correct * mask_f).sum() / denom)
+            if target_ids is not None:
+                shift = step + 1
+                T_ids = target_ids.shape[1]
+                if T_ids > T:
+                    tgt = target_ids[:, shift : shift + T]
                 else:
-                    losses.append(ce.mean())
-                    accuracies.append((step_logits.argmax(dim=-1) == tgt).float().mean())
+                    tgt = target_ids[:, shift:]
+                    step_logits_for_loss = step_logits[:, : tgt.shape[1]]
+                if T_ids > T:
+                    step_logits_for_loss = step_logits
+
+                if tgt.shape[1] > 0:
+                    ce = F.cross_entropy(
+                        step_logits_for_loss.reshape(-1, step_logits_for_loss.size(-1)),
+                        tgt.reshape(-1),
+                        reduction="none",
+                    ).reshape(tgt.shape[0], tgt.shape[1])
+
+                    if loss_mask is not None:
+                        mask_f = loss_mask[:, :tgt.shape[1]].to(dtype=ce.dtype)
+                        denom = mask_f.sum().clamp(min=1.0)
+                        losses.append((ce * mask_f).sum() / denom)
+                        preds = step_logits_for_loss.argmax(dim=-1)
+                        correct = (preds == tgt).float()
+                        accuracies.append((correct * mask_f).sum() / denom)
+                    else:
+                        losses.append(ce.mean())
+                        accuracies.append(
+                            (step_logits_for_loss.argmax(dim=-1) == tgt).float().mean()
+                        )
 
             # Feed back: use predicted token embedding for next step
             next_token = step_logits.argmax(dim=-1)  # [B, T]
