@@ -1,0 +1,72 @@
+# Phase 1: Foundation Training (lightseekorg/kimi-k2.5-eagle3 recipe)
+#
+# Dataset: perfectblend subset (~296K samples) from kimi-mtp-dataset
+# Steps: 20,000
+# Teacher: moonshotai/Kimi-K2.5 BF16 -> ATOM online MXFP4 (SGLang+ATOM, TP=4, GPUs 4-7)
+# Draft: Eagle3, 1-layer Transformer, from scratch (FSDP2, GPUs 0-3)
+# Transfer: Mooncake RDMA
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1
+
+policy:
+  model_name: /datasets/Kimi-K2.5-BF16
+  training_backend: fsdp2
+  generation_backend: hf
+  max_total_sequence_length: 8192
+  train_global_batch_size: 8
+  train_micro_batch_size: 2
+  learning_rate: 1e-4
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  warmup_ratio: 0.0
+
+algorithm:
+  name: spec_distill
+  spec_distill:
+    draft_type: eagle3
+    loss_type: forward_kl
+    position_decay: 0.8
+    num_target_layers: 1
+    spec_length: 5
+  teacher:
+    model_name: /datasets/Kimi-K2.5-BF16
+    inference_backend: sglang
+    tensor_parallel_size: 4
+    gpu_ids: [4, 5, 6, 7]
+    atom_plugin: true
+    quantization: mxfp4
+  draft:
+    from_scratch: true
+    num_layers: 1
+
+mooncake:
+  protocol: rdma
+  device_name: mlx5_8
+  global_segment_size: 16GB
+  local_buffer_size: 4GB
+
+quantization:
+  training:
+    fp8: null
+  rollout_correction:
+    enabled: false
+
+reward:
+  type: function
+  function: math_reward
+  dataset: /datasets/kimi-mtp-dataset-phase1/train.jsonl
+
+checkpointing:
+  checkpoint_dir: /datasets/checkpoints/kimi_k25_eagle3_phase1
+  save_steps: 500
+  save_total_limit: 3
+  resume: true
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 20000
+seed: 42

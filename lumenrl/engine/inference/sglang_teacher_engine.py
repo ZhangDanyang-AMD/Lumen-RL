@@ -120,11 +120,35 @@ engine_kwargs = dict(
     chunked_prefill_size=-1,
     disable_cuda_graph=not bool(quantization),
     disable_custom_all_reduce=True,
+    log_level="info",
+    watchdog_timeout=1200,
 )
-if quantization in ("fp4", "nvfp4", "mxfp4", "modelopt_fp4"):
-    engine_kwargs["quantization"] = "modelopt_fp4"
-    engine_kwargs["kv_cache_dtype"] = "fp8_e4m3"
-    logger.info("NVFP4 quantization enabled: modelopt_fp4 + fp8_e4m3 KV cache")
+if quantization in ("mxfp4", "fp4"):
+    # Check if model already has a quantization_config (e.g. compressed-tensors).
+    # SGLang rejects mismatched quant methods, so skip explicit quantization arg
+    # and let ATOM plugin handle online MXFP4 via its own kernels.
+    model_quant = getattr(hf_config, "quantization_config", None)
+    if model_quant is not None:
+        if hasattr(model_quant, "to_dict"):
+            mq_method = model_quant.to_dict().get("quant_method", "")
+        elif isinstance(model_quant, dict):
+            mq_method = model_quant.get("quant_method", "")
+        else:
+            mq_method = ""
+    else:
+        mq_method = ""
+    if mq_method and mq_method not in ("mxfp4", "fp4"):
+        logger.info("Model has existing quantization_config (%s), overriding with json_model_override_args to clear it and force MXFP4", mq_method)
+        engine_kwargs["quantization"] = "mxfp4"
+        engine_kwargs["json_model_override_args"] = '{"quantization_config": {}}'
+        engine_kwargs["kv_cache_dtype"] = "fp8_e4m3"
+        engine_kwargs["disable_cuda_graph"] = True
+        engine_kwargs["skip_server_warmup"] = True
+        engine_kwargs["pre_warm_nccl"] = False
+    else:
+        engine_kwargs["quantization"] = "mxfp4"
+        engine_kwargs["kv_cache_dtype"] = "fp8_e4m3"
+        logger.info("MXFP4 quantization enabled (ATOM/AITER ROCm): mxfp4 + fp8_e4m3 KV cache")
 
 engine = sgl.Engine(**engine_kwargs)
 
