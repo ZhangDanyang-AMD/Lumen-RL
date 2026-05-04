@@ -1,11 +1,10 @@
 """Split kimi-mtp-dataset into Phase 1 (perfectblend) and Phase 2 (mixed)."""
 import json
 import os
-import sys
 
-INPUT = "/datasets/kimi-mtp-dataset/data/train-00000-of-00001.jsonl"
-PHASE1_DIR = "/datasets/kimi-mtp-dataset-phase1"
-PHASE2_DIR = "/datasets/kimi-mtp-dataset-phase2"
+INPUT = "/dev/shm/kimi-mtp-dataset/data/train-00000-of-00001.jsonl"
+PHASE1_DIR = "/dev/shm/kimi-mtp-dataset-phase1"
+PHASE2_DIR = "/dev/shm/kimi-mtp-dataset-phase2"
 
 PHASE1_SOURCE = "perfectblend"
 

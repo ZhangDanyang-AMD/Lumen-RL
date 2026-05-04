@@ -44,7 +44,7 @@ class SpecDistillTrainer:
         self.callbacks: list[Callback] = []
 
         self._teacher_model: torch.nn.Module | None = None
-        self._teacher_engine: Any | None = None  # AtomTeacherEngine or SglangTeacherEngine
+        self._teacher_engine: Any | None = None  # AtomTeacherEngine, SglangTeacherEngine, or VllmTeacherEngine
         self._mooncake_master: Any | None = None
         self._draft_model: torch.nn.Module | None = None
         self._lm_head_weight: torch.Tensor | None = None
@@ -84,6 +84,8 @@ class SpecDistillTrainer:
         # ---- Teacher model (frozen) ----
         if teacher_cfg.inference_backend == "sglang":
             self._setup_teacher_sglang(teacher_cfg, teacher_name)
+        elif teacher_cfg.inference_backend == "vllm":
+            self._setup_teacher_vllm(teacher_cfg, teacher_name)
         elif teacher_cfg.inference_backend == "atom":
             self._setup_teacher_atom(teacher_cfg, teacher_name)
         else:
@@ -106,11 +108,14 @@ class SpecDistillTrainer:
 
             num_layers = draft_cfg.num_layers or 1
             spec_length = self.config.algorithm.spec_distill.spec_length
+            num_heads = getattr(draft_cfg, "num_heads", None) or max(1, teacher_hidden_dim // 128)
+            ffn_dim = getattr(draft_cfg, "ffn_dim", None)
             self._draft_model = Eagle3Model(
                 hidden_dim=teacher_hidden_dim,
-                num_heads=max(1, teacher_hidden_dim // 128),
+                num_heads=num_heads,
                 num_layers=num_layers,
                 length=spec_length,
+                ffn_dim=ffn_dim,
             )
         elif draft_type == "dflash":
             from lumenrl.models.dflash import DFlashModel
@@ -127,6 +132,19 @@ class SpecDistillTrainer:
             raise ValueError(
                 f"Unknown draft_type: {draft_type!r}. Use 'eagle3' or 'dflash'."
             )
+
+        resume_from = getattr(draft_cfg, "resume_from", None)
+        if resume_from and not getattr(draft_cfg, "from_scratch", False):
+            import glob as _glob
+            ckpt_files = sorted(_glob.glob(os.path.join(resume_from, "checkpoint_*.pt")))
+            if ckpt_files:
+                ckpt_path = ckpt_files[-1]
+                logger.info("[rank %d] Loading draft weights from %s", self._rank, ckpt_path)
+                payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+                sd = payload.get("model_state_dict", payload)
+                self._draft_model.load_state_dict(sd, strict=False)
+            else:
+                logger.warning("[rank %d] resume_from=%s but no checkpoints found", self._rank, resume_from)
 
         self._draft_model.to(self._device)
 
@@ -333,6 +351,111 @@ class SpecDistillTrainer:
             torch.distributed.broadcast(weight, src=0)
             self._lm_head_weight = weight.cpu()
 
+    def _setup_teacher_vllm(self, teacher_cfg: Any, teacher_name: str) -> None:
+        """Load teacher via vLLM + ATOM plugin + Mooncake."""
+        from lumenrl.engine.inference.vllm_teacher_engine import VllmTeacherEngine
+
+        gpu_ids = teacher_cfg.gpu_ids or list(range(teacher_cfg.tensor_parallel_size))
+        logger.info(
+            "[rank %d] Loading teacher (vLLM+ATOM): %s (tp=%d, gpus=%s)",
+            self._rank, teacher_name,
+            teacher_cfg.tensor_parallel_size, gpu_ids,
+        )
+
+        mc_config = getattr(self.config, "mooncake", None)
+
+        if self._rank == 0 and mc_config is not None:
+            if not mc_config.master_server_address:
+                from lumenrl.transfer.mooncake_master import launch_mooncake_master
+                self._mooncake_master = launch_mooncake_master(mc_config)
+                logger.info(
+                    "Mooncake master started: %s", mc_config.master_server_address
+                )
+
+        if self._rank == 0:
+            self._teacher_engine = VllmTeacherEngine(
+                model_name=teacher_name,
+                gpu_ids=gpu_ids,
+                mooncake_config=mc_config,
+                tensor_parallel_size=teacher_cfg.tensor_parallel_size,
+                quantization=getattr(teacher_cfg, "quantization", ""),
+                max_batch_size=max(1, int(self.config.policy.train_global_batch_size)),
+                max_seq_len=int(self.config.policy.max_total_sequence_length),
+                local_device=self._device,
+            )
+            self._teacher_engine.start()
+            self._lm_head_weight = self._teacher_engine.get_lm_head_weight()
+        else:
+            self._teacher_engine = None
+            self._lm_head_weight = None
+
+        if self._is_distributed:
+            if self._rank == 0:
+                shape = torch.tensor(
+                    list(self._lm_head_weight.shape),
+                    dtype=torch.long, device=self._device,
+                )
+            else:
+                shape = torch.zeros(2, dtype=torch.long, device=self._device)
+            torch.distributed.broadcast(shape, src=0)
+
+            if self._rank == 0:
+                weight = self._lm_head_weight.to(self._device)
+            else:
+                weight = torch.zeros(
+                    shape[0].item(), shape[1].item(),
+                    dtype=torch.bfloat16, device=self._device,
+                )
+            torch.distributed.broadcast(weight, src=0)
+            self._lm_head_weight = weight.cpu()
+
+    def _teacher_forward_vllm(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Teacher forward via vLLM+ATOM engine (rank 0 only, then broadcast).
+
+        Hidden states arrive via Mooncake (TCP or RDMA).
+        """
+        if self._rank == 0:
+            result = self._teacher_engine.extract_hidden_states(
+                input_ids, attention_mask,
+            )
+            hidden_states = result["hidden_states"]
+            token_embeds = result["token_embeds"]
+        else:
+            hidden_states = None
+            token_embeds = None
+
+        if self._is_distributed:
+            if self._rank == 0:
+                shape = torch.tensor(
+                    list(hidden_states.shape),
+                    dtype=torch.long, device=self._device,
+                )
+            else:
+                shape = torch.zeros(3, dtype=torch.long, device=self._device)
+            torch.distributed.broadcast(shape, src=0)
+
+            B, T, D = shape[0].item(), shape[1].item(), shape[2].item()
+            if self._rank == 0:
+                h = hidden_states.clone()
+                e = token_embeds.clone()
+            else:
+                h = torch.zeros(B, T, D, dtype=torch.bfloat16, device=self._device)
+                e = torch.zeros(B, T, D, dtype=torch.bfloat16, device=self._device)
+            torch.distributed.broadcast(h, src=0)
+            torch.distributed.broadcast(e, src=0)
+            hidden_states = h
+            token_embeds = e
+
+        return {
+            "hidden_states": hidden_states,
+            "token_embeds": token_embeds,
+            "input_ids": input_ids,
+        }
+
     def _load_dataset(self) -> None:
         """Load training dataset."""
         dataset_path = self.config.reward.dataset
@@ -456,6 +579,8 @@ class SpecDistillTrainer:
         - ``"input_ids"``: the original input ids
         """
         backend = self.config.algorithm.teacher.inference_backend
+        if backend == "vllm":
+            return self._teacher_forward_vllm(input_ids, attention_mask)
         if backend in ("sglang", "atom"):
             return self._teacher_forward_atom(input_ids, attention_mask)
         return self._teacher_forward_hf(input_ids, attention_mask)
@@ -678,11 +803,22 @@ class SpecDistillTrainer:
             else:
                 metrics = self._train_step_dflash(teacher_data, attention_mask)
 
+            nan_count = 0
+            for p in self._draft_model.parameters():
+                if p.grad is not None and torch.isnan(p.grad).any():
+                    p.grad.zero_()
+                    nan_count += 1
+            if nan_count > 0:
+                logger.warning("Zeroed NaN grads in %d parameters", nan_count)
+
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 self._draft_model.parameters(),
                 max_norm=self.config.policy.max_grad_norm,
             )
-            self._optimizer.step()
+            if not torch.isfinite(grad_norm):
+                logger.warning("Skipping optimizer step (grad_norm=%s)", grad_norm)
+            else:
+                self._optimizer.step()
             if self._scheduler is not None:
                 self._scheduler.step()
             self._optimizer.zero_grad(set_to_none=True)

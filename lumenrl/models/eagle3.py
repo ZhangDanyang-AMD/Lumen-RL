@@ -116,6 +116,7 @@ class Eagle3Model(nn.Module):
         num_heads: int = 16,
         num_layers: int = 1,
         length: int = 5,
+        ffn_dim: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -123,7 +124,8 @@ class Eagle3Model(nn.Module):
 
         self.fusion = Eagle3FusionLayer(hidden_dim)
         self.blocks = nn.ModuleList(
-            [Eagle3TransformerBlock(hidden_dim, num_heads) for _ in range(num_layers)]
+            [Eagle3TransformerBlock(hidden_dim, num_heads, ffn_dim=ffn_dim)
+             for _ in range(num_layers)]
         )
         self.out_norm = nn.LayerNorm(hidden_dim)
         _, self._create_block_mask = _get_flex_attention()
@@ -191,6 +193,7 @@ class Eagle3Model(nn.Module):
                     if loss_mask is not None:
                         mask_f = loss_mask[:, :tgt.shape[1]].to(dtype=ce.dtype)
                         denom = mask_f.sum().clamp(min=1.0)
+                        ce = ce.masked_fill(~mask_f.bool(), 0.0)
                         losses.append((ce * mask_f).sum() / denom)
                         preds = step_logits_for_loss.argmax(dim=-1)
                         correct = (preds == tgt).float()

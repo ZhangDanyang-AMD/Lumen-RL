@@ -1,27 +1,28 @@
-# Phase 2: Mixed Domain Training (lightseekorg/kimi-k2.5-eagle3 recipe)
+# Phase 2: Mixed Domain Training (aligned with TorchSpec/lightseekorg recipe) — MI350
 #
 # Dataset: mixed corpus (~181K samples) — llava_instruct, smoltalk_cn,
 #          continual_tool_kimi, kimi_2000x, creative_writing, dcagent, etc.
-# Steps: 20,000 (continuing from Phase 1 checkpoint)
-# Teacher: moonshotai/Kimi-K2.5 BF16 -> ATOM online MXFP4 (SGLang+ATOM, TP=4, GPUs 4-7)
-# Draft: Eagle3, 1-layer Transformer, loaded from Phase 1 (FSDP2, GPUs 0-3)
-# Transfer: Mooncake RDMA
+# Steps: 67,826 (3 epochs × 180870/8, continuing from Phase 1 checkpoint)
+# Teacher: moonshotai/Kimi-K2.5 BF16, compressed-tensors INT4 (vLLM native, TP=4, GPUs 4-7)
+# Draft: Eagle3, 1-layer Transformer, loaded from Phase 1 (FSDP2+aiter, GPUs 0-3)
+# Transfer: Mooncake TCP
+# Hardware: 8x AMD MI350
 
 cluster:
   gpus_per_node: 4
   num_nodes: 1
 
 policy:
-  model_name: /datasets/Kimi-K2.5-BF16
+  model_name: /dev/shm/Kimi-K2.5-BF16
   training_backend: fsdp2
   generation_backend: hf
-  max_total_sequence_length: 8192
+  max_total_sequence_length: 20000
   train_global_batch_size: 8
   train_micro_batch_size: 2
-  learning_rate: 1e-4
+  learning_rate: 5e-5
   weight_decay: 0.0
   max_grad_norm: 1.0
-  warmup_ratio: 0.0
+  warmup_ratio: 0.015
 
 algorithm:
   name: spec_distill
@@ -30,22 +31,23 @@ algorithm:
     loss_type: forward_kl
     position_decay: 0.8
     num_target_layers: 1
-    spec_length: 5
+    spec_length: 4
   teacher:
-    model_name: /datasets/Kimi-K2.5-BF16
-    inference_backend: sglang
+    model_name: /dev/shm/Kimi-K2.5-BF16
+    inference_backend: vllm
     tensor_parallel_size: 4
     gpu_ids: [4, 5, 6, 7]
-    atom_plugin: true
-    quantization: mxfp4
+    quantization: ""
   draft:
     from_scratch: false
     num_layers: 1
-    resume_from: /datasets/checkpoints/kimi_k25_eagle3_phase1
+    num_heads: 64
+    ffn_dim: 12288
+    resume_from: /dev/shm/checkpoints/kimi_k25_eagle3_vllm_phase1
 
 mooncake:
-  protocol: rdma
-  device_name: mlx5_8
+  protocol: tcp
+  device_name: ""
   global_segment_size: 16GB
   local_buffer_size: 4GB
 
@@ -58,11 +60,11 @@ quantization:
 reward:
   type: function
   function: math_reward
-  dataset: /datasets/kimi-mtp-dataset-phase2/train.jsonl
+  dataset: /dev/shm/kimi-mtp-dataset-phase2/train.jsonl
 
 checkpointing:
-  checkpoint_dir: /datasets/checkpoints/kimi_k25_eagle3_phase2
-  save_steps: 500
+  checkpoint_dir: /dev/shm/checkpoints/kimi_k25_eagle3_vllm_phase2
+  save_steps: 5000
   save_total_limit: 3
   resume: true
 
@@ -70,5 +72,5 @@ logger:
   wandb_enabled: false
   log_interval: 1
 
-num_training_steps: 20000
+num_training_steps: 67826
 seed: 42

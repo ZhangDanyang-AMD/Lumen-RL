@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════════
-# Kimi K2.5 Eagle3 Two-Phase Training (lightseekorg recipe)
+# Kimi K2.5 Eagle3 Two-Phase Training (lightseekorg recipe) — MI350, vLLM+ATOM
 #
 # Phase 1: Foundation — perfectblend subset (296K samples, 20K steps)
 # Phase 2: Mixed Domain — VL, Chinese, tool-call, agent, writing (181K, 20K steps)
 #
-# GPU split (8x GPU):
-#   GPUs 0-3: torchrun FSDP2 draft model training (BF16)
-#   GPUs 4-7: SGLang + ATOM teacher inference (TP=4, MXFP4)
+# GPU split (8x MI350):
+#   GPUs 0-3: torchrun FSDP2 draft model training (BF16, LumenRL + aiter)
+#   GPUs 4-7: vLLM + ATOM teacher inference (TP=4, MXFP4, aiter)
 #
 # Usage:
-#   bash examples/Kimi_K25_SDDD/run_full_training.sh
-#   bash examples/Kimi_K25_SDDD/run_full_training.sh --phase2-only
+#   bash examples/Kimi_K25_SDDD_MI350_vLLM/run_full_training.sh
+#   bash examples/Kimi_K25_SDDD_MI350_vLLM/run_full_training.sh --phase2-only
 # ═══════════════════════════════════════════════════════════════════════════════
 set -uo pipefail
 
@@ -32,16 +32,13 @@ export PYTHONUNBUFFERED=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export LUMENRL_LOG_LEVEL=INFO
 export NCCL_TIMEOUT=7200
-export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
-export SGLANG_DISABLE_CUDNN_CHECK=1
+export GLOG_minloglevel=1
 
-ATOM_REPO="${ATOM_REPO:-/home/danyzhan/ATOM_repo}"
-if [ -d "${ATOM_REPO}" ]; then
-    export PYTHONPATH="${ATOM_REPO}:${PYTHONPATH:-}"
-fi
+OUTPUT_DIR="${REPO_ROOT}/output/Kimi_K25_SDDD_MI350/kimi-k25-eagle3-sglang-mxfp4-mi350"
+mkdir -p "${OUTPUT_DIR}"
 
 # Step 0: Split dataset if not already done
-if [ ! -f /datasets/kimi-mtp-dataset-phase1/train.jsonl ]; then
+if [ ! -f /dev/shm/kimi-mtp-dataset-phase1/train.jsonl ]; then
     echo ">>> Splitting kimi-mtp-dataset into Phase 1 and Phase 2..."
     python3 "${SCRIPT_DIR}/split_dataset.py"
 fi
@@ -49,13 +46,14 @@ fi
 # Phase 1: Foundation
 if [ "${PHASE2_ONLY}" = false ]; then
     echo "═══════════════════════════════════════════════════════════════"
-    echo "  Phase 1: Foundation Training (perfectblend, 20K steps)"
-    echo "  Teacher: /datasets/Kimi-K2.5-BF16 (SGLang+ATOM, TP=4)"
+    echo "  Phase 1: Foundation Training (perfectblend, 111K steps = 3 epochs)"
+    echo "  Teacher: /dev/shm/Kimi-K2.5-BF16 (vLLM INT4, TP=4)"
     echo "  Draft:   Eagle3, 1-layer Transformer, from scratch"
+    echo "  Hardware: 8x MI350 (4 train + 4 inference)"
     echo "═══════════════════════════════════════════════════════════════"
 
-    PHASE1_LOG="/datasets/checkpoints/kimi_k25_eagle3_phase1/phase1.log"
-    mkdir -p /datasets/checkpoints/kimi_k25_eagle3_phase1
+    PHASE1_LOG="${OUTPUT_DIR}/phase1.log"
+    mkdir -p /dev/shm/checkpoints/kimi_k25_eagle3_vllm_phase1
 
     CUDA_VISIBLE_DEVICES="${TRAIN_GPUS}" \
         torchrun --nproc_per_node="${NUM_TRAIN_GPUS}" \
@@ -72,13 +70,14 @@ fi
 
 # Phase 2: Mixed Domain
 echo "═══════════════════════════════════════════════════════════════"
-echo "  Phase 2: Mixed Domain Training (VL+CN+tool+agent, 20K steps)"
-echo "  Teacher: /datasets/Kimi-K2.5-BF16 (SGLang+ATOM, TP=4)"
+echo "  Phase 2: Mixed Domain Training (VL+CN+tool+agent, 68K steps = 3 epochs)"
+echo "  Teacher: /dev/shm/Kimi-K2.5-BF16 (vLLM INT4, TP=4)"
 echo "  Draft:   Eagle3, resume from Phase 1 checkpoint"
+echo "  Hardware: 8x MI350 (4 train + 4 inference)"
 echo "═══════════════════════════════════════════════════════════════"
 
-PHASE2_LOG="/datasets/checkpoints/kimi_k25_eagle3_phase2/phase2.log"
-mkdir -p /datasets/checkpoints/kimi_k25_eagle3_phase2
+PHASE2_LOG="${OUTPUT_DIR}/phase2.log"
+mkdir -p /dev/shm/checkpoints/kimi_k25_eagle3_vllm_phase2
 
 CUDA_VISIBLE_DEVICES="${TRAIN_GPUS}" \
     torchrun --nproc_per_node="${NUM_TRAIN_GPUS}" \
@@ -92,7 +91,7 @@ if [ ${PIPESTATUS[0]} -ne 0 ]; then
 fi
 
 echo "═══════════════════════════════════════════════════════════════"
-echo "  Two-phase training completed!"
-echo "  Phase 1 checkpoint: /datasets/checkpoints/kimi_k25_eagle3_phase1"
-echo "  Phase 2 checkpoint: /datasets/checkpoints/kimi_k25_eagle3_phase2"
+echo "  Two-phase training completed! (vLLM+ATOM, MI350)"
+echo "  Phase 1 checkpoint: /dev/shm/checkpoints/kimi_k25_eagle3_vllm_phase1"
+echo "  Phase 2 checkpoint: /dev/shm/checkpoints/kimi_k25_eagle3_vllm_phase2"
 echo "═══════════════════════════════════════════════════════════════"

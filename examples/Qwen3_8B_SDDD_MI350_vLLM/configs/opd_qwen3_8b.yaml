@@ -1,0 +1,76 @@
+# Qwen3-8B Eagle3 Speculative Decoding Draft Distillation
+#
+# Disaggregated architecture (vLLM + ATOM + Mooncake TCP):
+#   GPUs 0-3: FSDP2 Eagle3 draft model training (BF16, LumenRL + aiter)
+#   GPUs 4-7: vLLM teacher inference (TP=4, MXFP4, aiter via ATOM plugin)
+#   Mooncake TCP for hidden state transfer
+#
+# Model: Qwen/Qwen3-8B -- 8B dense, 4096 hidden, 151936 vocab, 36 layers.
+# Draft: Eagle3 -- 1-layer Transformer, predicts from teacher hidden states.
+#
+# Usage:
+#   bash examples/Qwen3_8B_SDDD_MI350_vLLM/run_qwen3_8b.sh
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1
+
+policy:
+  model_name: /dev/shm/Qwen3-8B
+  training_backend: fsdp2
+  generation_backend: hf
+  max_total_sequence_length: 16384
+  train_global_batch_size: 2
+  train_micro_batch_size: 1
+  learning_rate: 1e-4
+  weight_decay: 0.0
+  max_grad_norm: 0.5
+  warmup_ratio: 0.015
+
+algorithm:
+  name: spec_distill
+  spec_distill:
+    draft_type: eagle3
+    loss_type: forward_kl
+    position_decay: 0.8
+    num_target_layers: 1
+    spec_length: 7
+  teacher:
+    model_name: /dev/shm/Qwen3-8B
+    inference_backend: vllm
+    tensor_parallel_size: 4
+    gpu_ids: [4, 5, 6, 7]
+    quantization: mxfp4
+  draft:
+    from_scratch: true
+    num_layers: 1
+
+mooncake:
+  protocol: tcp
+  device_name: ""
+  global_segment_size: 16GB
+  local_buffer_size: 4GB
+
+quantization:
+  training:
+    fp8: null
+  rollout_correction:
+    enabled: false
+
+reward:
+  type: function
+  function: math_reward
+  dataset: /home/danyzhan/TorchSpec/examples/data/sample_conversations.jsonl
+
+checkpointing:
+  checkpoint_dir: results/qwen3_8b_spec_distill_vllm
+  save_steps: 5000
+  save_total_limit: 3
+  resume: true
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 500
+seed: 42

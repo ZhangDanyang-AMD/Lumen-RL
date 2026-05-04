@@ -137,7 +137,7 @@ class TeacherConfig:
     lm_head_key: str = "lm_head.weight"
     norm_key: str = "model.norm.weight"
     load_norm: bool = False
-    inference_backend: str = "hf"           # "hf" | "atom" | "sglang"
+    inference_backend: str = "hf"           # "hf" | "atom" | "sglang" | "vllm"
     quantization: str = ""                  # "" | "fp8" | "fp4" | "mxfp4"
     tensor_parallel_size: int = 1           # ATOM tensor parallelism
     gpu_ids: Optional[list[int]] = None     # GPUs for ATOM inference
@@ -155,6 +155,9 @@ class DraftModelConfig:
     from_scratch: bool = False
     head_dim: Optional[int] = None
     num_layers: Optional[int] = None
+    num_heads: Optional[int] = None
+    ffn_dim: Optional[int] = None
+    resume_from: Optional[str] = None
 
 
 @dataclass
