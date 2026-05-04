@@ -5,11 +5,13 @@ on:
     branches: [main]
     paths:
       - 'lumenrl-docs/**'
+      - 'dashboards/**'
       - '.github/workflows/docs.yml'
   pull_request:
     branches: [main]
     paths:
       - 'lumenrl-docs/**'
+      - 'dashboards/**'
   workflow_dispatch:
 
 permissions:
@@ -34,6 +36,9 @@ jobs:
         run: |
           mkdir -p _site
           cp lumenrl-docs/site/index.html _site/index.html
+          if [ -d dashboards ]; then
+            cp -r dashboards _site/dashboards
+          fi
 
       - name: Setup Pages
         if: github.ref == 'refs/heads/main'
