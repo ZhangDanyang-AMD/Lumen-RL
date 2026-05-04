@@ -1,0 +1,73 @@
+# DeepSeek-V4 On-Policy Distillation (OPD)
+#
+# Student rollout generates sequences, teacher provides logits on those
+# sequences, student minimises KL(student || teacher).
+# Replaces the mixed RL stage in DeepSeek-V4's training pipeline.
+#
+# Model: deepseek-ai/DeepSeek-V4-Pro — 1.6T MoE (49B activated),
+#        hybrid CSA+HCA attention, 1M context, FP4+FP8 weights available.
+#
+# Hardware: 8x MI300X (192 GiB each) with FSDP2 sharding.
+#   - OPD loads both student + teacher. For same-model OPD, the teacher
+#     shares weights via lazy_logits (only lm_head cached separately).
+#   - DeepSeek-V4-Pro in BF16 is ~3.2TB; sharded 8-way = ~400 GB/GPU.
+#   - For single-node 8x MI300X, use FP8/FP4 quantized weights.
+#   - For full BF16, use 4+ nodes (32+ MI300X GPUs).
+#
+# Reference: DeepSeek-V4 Technical Report, Section 5.2
+#
+# Usage:
+#   torchrun --nproc_per_node=8 -m lumenrl.trainer.main \
+#       --config examples/DeepSeekV4_OPD_MI300/configs/opd_bf16.yaml \
+#       policy.model_name=/path/to/deepseek-v4 \
+#       algorithm.teacher.model_name=/path/to/deepseek-v4
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1                          # Increase for full DeepSeek-V4-Pro in BF16
+
+policy:
+  model_name: /dev/shm/model/deepseek-v4-pro  # Student (deepseek-ai/DeepSeek-V4-Pro)
+  training_backend: fsdp2
+  generation_backend: hf                # Student rollout backend
+  max_total_sequence_length: 4096
+  max_response_length: 2048
+  train_global_batch_size: 16
+  train_micro_batch_size: 4
+
+algorithm:
+  name: opd
+  opd:
+    kl_direction: reverse               # D_KL(student || teacher) — DeepSeek-V4 style
+    temperature: 1.0
+    opd_coeff: 1.0                      # OPD loss coefficient
+    lazy_logits: true                   # Cache hidden states, reconstruct logits
+    position_weighting: false
+    teacher_micro_batch_size: 4
+  teacher:
+    model_name: /dev/shm/model/deepseek-v4-pro  # Teacher (deepseek-ai/DeepSeek-V4-Pro)
+    inference_backend: hf
+
+quantization:
+  training:
+    fp8: null                           # BF16 training (use FP8 for single-node)
+  rollout_correction:
+    enabled: false
+
+reward:
+  type: function
+  function: math_reward
+  dataset: nvidia/OpenMathInstruct-2
+
+checkpointing:
+  checkpoint_dir: results/deepseekv4_opd_bf16
+  save_steps: 50
+  save_total_limit: 3
+  resume: true
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 500
+seed: 42

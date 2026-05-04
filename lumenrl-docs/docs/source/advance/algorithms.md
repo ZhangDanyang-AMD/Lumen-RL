@@ -1,5 +1,9 @@
 # Algorithms
 
+LumenRL supports two categories of post-training algorithms: **RL algorithms** (GRPO, DAPO, PPO) for reinforcement learning from human feedback and reward models, and **SDDD** (Speculative Decoding Draft Distillation) for training speculative decoding draft models.
+
+## RL Algorithms
+
 LumenRL ships three policy-gradient-style trainers—GRPO, DAPO, and PPO—that share the same `DataProto` batching and loss helpers. Pick the algorithm based on whether you need a critic, asymmetric clipping, or group-relative rewards.
 
 ## GRPO
@@ -41,7 +45,7 @@ PPO requires `values`, `attention_mask`, and compatible `rewards` tensors on the
 | `kl_penalty` | Reference KL penalty `mean(ref_logp - logp)` |
 | `entropy_bonus` | Sampling entropy surrogate from token log-probs |
 
-## Choosing an algorithm
+## Choosing an RL algorithm
 
 | Scenario | Suggested algorithm |
 | --- | --- |
@@ -54,3 +58,15 @@ GRPO and DAPO assume the batch is grouped in contiguous blocks of size `num_gene
 ```
 
 Python hooks and registry keys: {doc}`/api/algorithms`.
+
+## SDDD (Speculative Decoding Draft Distillation)
+
+SDDD trains lightweight draft models (Eagle3, DFlash) to predict a teacher model's hidden states, enabling speculative decoding at inference time. Unlike RL algorithms that optimize a policy via reward signals, SDDD uses direct distillation from teacher hidden states.
+
+- **Teacher inference**: A large teacher model (e.g., Kimi K2.5, Qwen3-8B) runs on ATOM/SGLang/vLLM, processing datasets and producing hidden states at each layer.
+- **Hidden-state transfer**: Teacher hidden states are transferred to training GPUs via Mooncake (async RDMA/TCP) or MORI (GPU Direct P2P RDMA).
+- **Draft model training**: An Eagle3 or DFlash draft model is trained via FSDP2 to predict the teacher's hidden states, learning to approximate the teacher's internal representations.
+
+SDDD supports a two-phase training recipe: Phase 1 for foundation training on a large general dataset, and Phase 2 for domain-specific diversity.
+
+For detailed configuration and examples, see {doc}`/advance/sddd`.

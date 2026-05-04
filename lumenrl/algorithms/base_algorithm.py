@@ -40,4 +40,6 @@ class BaseAlgorithm(ABC):
             "grpo": vars(algo.grpo),
             "dapo": vars(algo.dapo),
             "ppo": vars(algo.ppo),
+            "opd": vars(algo.opd),
+            "spec_distill": vars(algo.spec_distill),
         }

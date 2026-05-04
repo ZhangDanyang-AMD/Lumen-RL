@@ -21,6 +21,8 @@ class AlgorithmName(str, Enum):
     GRPO = "grpo"
     DAPO = "dapo"
     PPO = "ppo"
+    OPD = "opd"
+    SPEC_DISTILL = "spec_distill"
 
 
 class FP8Precision(str, Enum):

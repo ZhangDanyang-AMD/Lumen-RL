@@ -1,0 +1,662 @@
+"""vLLM + ATOM teacher engine for speculative distillation.
+
+Launches a teacher model in a subprocess using vLLM with ATOM plugin
+(auto-registered via pip entry points). TorchSpec's vLLM patches enable
+``extract_hidden_states`` speculative mode: the engine captures hidden
+states during prefill and stores them to **Mooncake** via the
+``MooncakeHiddenStatesConnector``.  The training process reads them
+via ``EagleMooncakeStore.get()``.
+
+Architecture::
+
+    Training Process                 vLLM Subprocess (ATOM plugin)
+    ─────────────────               ──────────────────────────────
+    send input_ids via /dev/shm  →  llm.generate(prompts,
+                                        sampling_params)
+                                    → vLLM extract_hidden_states
+                                    → MooncakeHiddenStatesConnector
+                                      stores to Mooncake
+    get hidden_states from       ←  returns mooncake keys + shapes
+    EagleMooncakeStore
+
+Requires:
+    - vLLM with TorchSpec patches (extract_hidden_states + MooncakeHiddenStatesConnector)
+    - ATOM pip-installed (auto-registers as vLLM platform/model plugin)
+    - Mooncake Transfer Engine (RDMA or TCP)
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+from typing import Any, Optional
+
+import torch
+
+logger = logging.getLogger(__name__)
+
+
+_WORKER_SCRIPT = textwrap.dedent("""\
+import json
+import os
+import sys
+import time
+import logging
+
+# ---- Isolate from torchrun environment ----
+for key in list(os.environ.keys()):
+    if any(key.startswith(p) for p in [
+        "MASTER_ADDR", "MASTER_PORT", "RANK", "LOCAL_RANK",
+        "WORLD_SIZE", "LOCAL_WORLD_SIZE", "GROUP_RANK",
+        "GROUP_WORLD_SIZE", "ROLE_RANK", "ROLE_WORLD_SIZE",
+        "TORCHELASTIC_", "TORCH_NCCL_", "NCCL_ASYNC",
+        "OMP_NUM_THREADS",
+    ]):
+        del os.environ[key]
+
+logging.basicConfig(stream=sys.stderr, level=logging.INFO)
+logger = logging.getLogger("vllm_atom_teacher")
+
+import torch
+from transformers import AutoConfig
+
+cmd_fifo = sys.argv[1]
+resp_fifo = sys.argv[2]
+model_path = sys.argv[3]
+tp_size = int(sys.argv[4])
+gpu_ids_str = sys.argv[5]
+quantization = sys.argv[6] if len(sys.argv) > 6 else ""
+max_seq_len = int(sys.argv[7]) if len(sys.argv) > 7 else 8192
+
+gpu_ids = [int(x) for x in gpu_ids_str.split(",")]
+os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids_str
+if "HIP_VISIBLE_DEVICES" in os.environ:
+    del os.environ["HIP_VISIBLE_DEVICES"]
+if "ROCR_VISIBLE_DEVICES" in os.environ:
+    del os.environ["ROCR_VISIBLE_DEVICES"]
+
+# When no quantization is requested, fully disable ATOM to use native vLLM
+# models (preserves vLLM's compressed-tensors INT4 MoE support).
+if not quantization:
+    os.environ["ATOM_DISABLE_VLLM_PLUGIN"] = "1"
+    os.environ["VLLM_PLUGINS"] = ""
+    logger.info("ATOM plugin disabled (no quantization requested)")
+else:
+    logger.info("ATOM plugin active for %s quantization", quantization)
+
+# Get model hidden size from config
+hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+hf_config_text = getattr(hf_config, "text_config", hf_config)
+hidden_size = getattr(hf_config_text, "hidden_size", None)
+num_layers = getattr(hf_config_text, "num_hidden_layers", 32)
+
+# Aux layer IDs: early, mid, near-end (Eagle3 convention from TorchSpec)
+aux_layer_ids = [1, num_layers // 2 - 1, num_layers - 4]
+logger.info("Model: %s, hidden=%d, layers=%d, aux_layers=%s",
+            model_path, hidden_size, num_layers, aux_layer_ids)
+
+# Create vLLM Engine with extract_hidden_states + MooncakeHiddenStatesConnector
+logger.info("Creating vLLM Engine (tp=%d, quant=%s, max_seq=%d)",
+            tp_size, quantization or "none", max_seq_len)
+
+from vllm import LLM, SamplingParams
+
+engine_kwargs = dict(
+    model=model_path,
+    tensor_parallel_size=tp_size,
+    trust_remote_code=True,
+    distributed_executor_backend="mp",
+    disable_custom_all_reduce=True,
+    enable_prefix_caching=False,
+    max_model_len=max_seq_len,
+    speculative_config={
+        "method": "extract_hidden_states",
+        "num_speculative_tokens": 1,
+        "draft_model_config": {
+            "hf_config": {
+                "eagle_aux_hidden_state_layer_ids": list(aux_layer_ids)
+            }
+        },
+    },
+    kv_transfer_config={
+        "kv_connector": "MooncakeHiddenStatesConnector",
+        "kv_connector_module_path": (
+            "torchspec.inference.engine.mooncake_hidden_states_connector"
+        ),
+        "kv_role": "kv_producer",
+    },
+    compilation_config={"cudagraph_mode": "NONE"},
+)
+
+if quantization in ("mxfp4", "fp4"):
+    engine_kwargs["quantization"] = "mxfp4"
+    engine_kwargs["kv_cache_dtype"] = "fp8_e4m3"
+    logger.info("MXFP4 online quantization enabled (ATOM/AITER ROCm)")
+elif quantization:
+    engine_kwargs["quantization"] = quantization
+    logger.info("Quantization: %s", quantization)
+
+llm = LLM(**engine_kwargs)
+
+logger.info("vLLM Engine created successfully")
+
+# Extract lm_head weight and save (from safetensors index — no GPU needed)
+lm_head_path = f"/dev/shm/lumenrl_vllm_lm_head_{os.getpid()}.pt"
+try:
+    from safetensors import safe_open
+    idx_path = os.path.join(model_path, "model.safetensors.index.json")
+    with open(idx_path) as _f:
+        weight_map = json.load(_f)["weight_map"]
+    lm_head_w = None
+    for key in ["lm_head.weight", "language_model.lm_head.weight",
+                "model.lm_head.weight"]:
+        if key in weight_map:
+            shard = weight_map[key]
+            with safe_open(os.path.join(model_path, shard),
+                           framework="pt", device="cpu") as sf:
+                lm_head_w = sf.get_tensor(key)
+            logger.info("lm_head loaded from safetensors: key=%s, shard=%s",
+                        key, shard)
+            break
+    if lm_head_w is None:
+        raise KeyError("lm_head.weight not found in safetensors index")
+    torch.save(lm_head_w, lm_head_path)
+    logger.info("lm_head.weight saved: %s", tuple(lm_head_w.shape))
+except Exception as e:
+    logger.warning("Could not extract lm_head: %s", e)
+    lm_head_path = ""
+
+num_aux = len(aux_layer_ids)
+req_counter = 0
+
+# Signal ready
+resp_f = open(resp_fifo, "w")
+resp_f.write(json.dumps({
+    "status": "ready",
+    "hidden_size": hidden_size,
+    "num_aux_layers": num_aux,
+    "aux_layer_ids": aux_layer_ids,
+    "lm_head_path": lm_head_path,
+}) + "\\n")
+resp_f.flush()
+
+# Command loop
+cmd_f = open(cmd_fifo, "r")
+sampling_params = SamplingParams(max_tokens=1, temperature=0)
+
+for line in cmd_f:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    cmd = msg["cmd"]
+
+    if cmd == "extract_hidden":
+        input_path = msg["input_path"]
+        data = torch.load(input_path, map_location="cpu", weights_only=True)
+        input_ids = data["input_ids"]
+
+        B, T = input_ids.shape
+        req_counter += 1
+
+        # Build prompts for vLLM (token IDs as prompt_token_ids)
+        prompts = [{"prompt_token_ids": input_ids[i].tolist()} for i in range(B)]
+
+        results = llm.generate(prompts, sampling_params, use_tqdm=False)
+
+        mooncake_keys = []
+        tensor_shapes_list = []
+        tensor_dtypes_list = []
+        seq_lens = []
+
+        for i, output in enumerate(results):
+            kv_params = getattr(output, "kv_transfer_params", None)
+            if kv_params is None:
+                logger.error("No kv_transfer_params for request %d", i)
+                continue
+
+            mooncake_key = kv_params.get("mooncake_key", f"lumenrl_{os.getpid()}_{req_counter}_{i}")
+            shapes = kv_params.get("tensor_shapes", {})
+            dtypes = kv_params.get("tensor_dtypes", {})
+            prompt_tokens = len(output.prompt_token_ids)
+
+            mooncake_keys.append(mooncake_key)
+            tensor_shapes_list.append(shapes)
+            tensor_dtypes_list.append(dtypes)
+            seq_lens.append(prompt_tokens)
+
+        resp_f.write(json.dumps({
+            "status": "ok",
+            "B": B,
+            "T": T,
+            "hidden_size": hidden_size,
+            "num_aux_layers": num_aux,
+            "mooncake_keys": mooncake_keys,
+            "tensor_shapes": tensor_shapes_list,
+            "tensor_dtypes": tensor_dtypes_list,
+            "seq_lens": seq_lens,
+        }) + "\\n")
+        resp_f.flush()
+
+        try:
+            os.unlink(input_path)
+        except OSError:
+            pass
+
+    elif cmd == "shutdown":
+        if lm_head_path and os.path.exists(lm_head_path):
+            os.unlink(lm_head_path)
+        resp_f.write(json.dumps({"status": "ok"}) + "\\n")
+        resp_f.flush()
+        break
+
+cmd_f.close()
+resp_f.close()
+""")
+
+
+class VllmTeacherEngine:
+    """Teacher engine: vLLM + ATOM plugin + Mooncake.
+
+    Launches vLLM in a subprocess on dedicated inference GPUs.
+    ATOM auto-registers as a vLLM plugin via pip entry points, providing
+    MXFP4 online quantization through AITER kernels on ROCm.
+    TorchSpec patches enable extract_hidden_states mode: hidden states are
+    stored to Mooncake by MooncakeHiddenStatesConnector, and the training
+    process fetches them via ``EagleMooncakeStore.get()``.
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        gpu_ids: list[int],
+        mooncake_config: Any = None,
+        *,
+        tensor_parallel_size: int = 1,
+        quantization: str = "",
+        max_batch_size: int = 32,
+        max_seq_len: int = 4096,
+        local_device: Optional[torch.device] = None,
+    ):
+        self._model_name = model_name
+        self._gpu_ids = gpu_ids
+        self._mooncake_config = mooncake_config
+        self._tp_size = tensor_parallel_size or len(gpu_ids)
+        self._quantization = quantization
+        self._max_batch_size = max_batch_size
+        self._max_seq_len = max_seq_len
+        self._local_device = local_device or torch.device("cuda:0")
+
+        self._proc: Optional[subprocess.Popen] = None
+        self._cmd_fifo: Optional[str] = None
+        self._resp_fifo: Optional[str] = None
+        self._cmd_f = None
+        self._resp_f = None
+        self._initialized = False
+
+        self._hidden_size: int = 0
+        self._num_aux_layers: int = 0
+        self._aux_layer_ids: list[int] = []
+        self._lm_head_weight: Optional[torch.Tensor] = None
+        self._mooncake_store: Any = None
+
+    @property
+    def is_alive(self) -> bool:
+        return (
+            self._initialized
+            and self._proc is not None
+            and self._proc.poll() is None
+        )
+
+    def start(self) -> None:
+        """Start vLLM+ATOM subprocess and set up Mooncake store."""
+        if self.is_alive:
+            return
+
+        fifo_dir = tempfile.mkdtemp(prefix="lumenrl_vllm_teacher_")
+        self._cmd_fifo = os.path.join(fifo_dir, "cmd")
+        self._resp_fifo = os.path.join(fifo_dir, "resp")
+        os.mkfifo(self._cmd_fifo)
+        os.mkfifo(self._resp_fifo)
+
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in self._gpu_ids)
+        env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+        for key in list(env.keys()):
+            if any(key.startswith(p) for p in [
+                "MASTER_ADDR", "MASTER_PORT", "RANK", "LOCAL_RANK",
+                "WORLD_SIZE", "LOCAL_WORLD_SIZE", "GROUP_RANK",
+                "GROUP_WORLD_SIZE", "ROLE_RANK", "ROLE_WORLD_SIZE",
+                "TORCHELASTIC_", "TORCH_NCCL_", "NCCL_ASYNC",
+                "OMP_NUM_THREADS",
+            ]):
+                del env[key]
+
+        # Skip ATOM plugin when no quantization (use native vLLM models,
+        # preserving compressed-tensors INT4 MoE support).
+        if not self._quantization:
+            env["ATOM_DISABLE_VLLM_PLUGIN"] = "1"
+            env["VLLM_PLUGINS"] = ""
+
+        # Set Mooncake env vars for MooncakeHiddenStatesConnector
+        if self._mooncake_config is not None:
+            mc = self._mooncake_config
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("8.8.8.8", 80))
+                local_ip = s.getsockname()[0]
+                s.close()
+            except Exception:
+                local_ip = socket.gethostbyname(socket.gethostname())
+
+            master_addr = getattr(mc, "master_server_address", "") or ""
+            metadata_server = getattr(mc, "metadata_server", "") or ""
+            protocol = getattr(mc, "protocol", "tcp") or "tcp"
+            device_name = getattr(mc, "device_name", "") or ""
+
+            env["MOONCAKE_LOCAL_HOSTNAME"] = local_ip
+            env["MOONCAKE_MASTER_SERVER"] = master_addr
+            env["MOONCAKE_METADATA_SERVER"] = metadata_server
+            env["MOONCAKE_PROTOCOL"] = protocol
+            env["MOONCAKE_DEVICE_NAME"] = device_name
+            env["MOONCAKE_GLOBAL_SEGMENT_SIZE"] = str(
+                mc.global_segment_size_bytes
+                if hasattr(mc, "global_segment_size_bytes")
+                else 17179869184
+            )
+            env["MOONCAKE_LOCAL_BUFFER_SIZE"] = str(
+                mc.local_buffer_size_bytes
+                if hasattr(mc, "local_buffer_size_bytes")
+                else 4294967296
+            )
+            env["MOONCAKE_ENABLE_GPU_DIRECT"] = "0"
+            env["MOONCAKE_ENABLE_HARD_PIN"] = "0"
+
+            logger.info(
+                "Mooncake env vars for vLLM subprocess: local=%s, master=%s, "
+                "metadata=%s, protocol=%s, device=%s",
+                local_ip, master_addr, metadata_server, protocol, device_name,
+            )
+
+        logger.info(
+            "VllmTeacherEngine: starting subprocess for %s "
+            "(tp=%d, gpus=%s, quant=%s)",
+            self._model_name, self._tp_size, self._gpu_ids,
+            self._quantization or "none",
+        )
+
+        self._proc = subprocess.Popen(
+            [
+                sys.executable, "-u", "-c", _WORKER_SCRIPT,
+                self._cmd_fifo, self._resp_fifo,
+                self._model_name, str(self._tp_size),
+                ",".join(str(g) for g in self._gpu_ids),
+                self._quantization or "",
+                str(self._max_seq_len),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=None,
+            stderr=None,
+            env=env,
+            start_new_session=True,
+        )
+
+        self._resp_f = open(self._resp_fifo, "r")
+        resp_line = self._resp_f.readline()
+        if not resp_line:
+            raise RuntimeError(
+                "vLLM teacher subprocess exited before ready. "
+                "Check stderr for vLLM/ATOM loading errors."
+            )
+        resp = json.loads(resp_line)
+        if resp.get("status") != "ready":
+            raise RuntimeError(f"vLLM teacher failed to start: {resp}")
+
+        self._cmd_f = open(self._cmd_fifo, "w")
+
+        self._hidden_size = resp["hidden_size"]
+        self._num_aux_layers = resp["num_aux_layers"]
+        self._aux_layer_ids = resp.get("aux_layer_ids", [])
+
+        lm_head_path = resp.get("lm_head_path", "")
+        if lm_head_path and os.path.exists(lm_head_path):
+            self._lm_head_weight = torch.load(
+                lm_head_path, map_location="cpu", weights_only=True
+            )
+            logger.info(
+                "lm_head.weight loaded: %s", tuple(self._lm_head_weight.shape)
+            )
+
+        # Set up training-side Mooncake store
+        if self._mooncake_config is not None:
+            try:
+                from lumenrl.transfer.eagle_mooncake_store import EagleMooncakeStore
+                from lumenrl.transfer.mooncake_config import MooncakeConfig
+
+                mc = self._mooncake_config
+
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    s.connect(("8.8.8.8", 80))
+                    local_ip = s.getsockname()[0]
+                    s.close()
+                except Exception:
+                    local_ip = socket.gethostbyname(socket.gethostname())
+
+                mc_cfg = MooncakeConfig(
+                    master_server_address=getattr(mc, "master_server_address", ""),
+                    metadata_server=getattr(mc, "metadata_server", ""),
+                    local_hostname=local_ip,
+                    protocol=getattr(mc, "protocol", "tcp"),
+                    device_name=getattr(mc, "device_name", ""),
+                    global_segment_size=getattr(mc, "global_segment_size", "16GB"),
+                    local_buffer_size=getattr(mc, "local_buffer_size", "4GB"),
+                )
+                self._mooncake_store = EagleMooncakeStore(mc_cfg)
+                self._mooncake_store.setup(self._local_device)
+                logger.info("Training-side EagleMooncakeStore initialized")
+            except Exception as e:
+                logger.error("Failed to init training-side Mooncake: %s", e)
+                raise
+
+        self._initialized = True
+        logger.info(
+            "VllmTeacherEngine: ready (pid=%d, hidden_size=%d, "
+            "aux_layers=%s, mooncake=%s)",
+            self._proc.pid, self._hidden_size,
+            self._aux_layer_ids, self._mooncake_store is not None,
+        )
+
+    def _send_cmd(self, cmd: dict) -> dict:
+        if not self.is_alive:
+            raise RuntimeError("vLLM teacher worker is not running")
+        self._cmd_f.write(json.dumps(cmd) + "\n")
+        self._cmd_f.flush()
+        resp_line = self._resp_f.readline()
+        if not resp_line:
+            raise RuntimeError("vLLM teacher worker closed response FIFO")
+        return json.loads(resp_line)
+
+    def extract_hidden_states(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Run teacher forward via vLLM and fetch hidden states from Mooncake.
+
+        Args:
+            input_ids: ``[B, T]`` token ids.
+            attention_mask: ``[B, T]`` mask (1 = valid, 0 = pad).
+
+        Returns:
+            Dict with ``hidden_states`` ``[B, T, D]``,
+            ``token_embeds`` ``[B, T, D]`` (first aux layer),
+            and ``input_ids``.
+        """
+        if not self.is_alive:
+            self.start()
+
+        input_path = f"/dev/shm/lumenrl_vllm_input_{os.getpid()}.pt"
+        torch.save(
+            {"input_ids": input_ids.cpu(), "attention_mask": attention_mask.cpu()},
+            input_path,
+        )
+
+        resp = self._send_cmd({
+            "cmd": "extract_hidden",
+            "input_path": input_path,
+        })
+
+        if resp.get("status") != "ok":
+            raise RuntimeError(f"extract_hidden failed: {resp}")
+
+        B = resp["B"]
+        T = resp["T"]
+        hidden_size = resp["hidden_size"]
+        num_aux = resp["num_aux_layers"]
+        mooncake_keys = resp["mooncake_keys"]
+        tensor_shapes_list = resp["tensor_shapes"]
+        tensor_dtypes_list = resp["tensor_dtypes"]
+        seq_lens = resp["seq_lens"]
+
+        concat_hidden_size = num_aux * hidden_size
+
+        all_hidden = []
+        all_embeds = []
+        all_ids = []
+
+        for i, key in enumerate(mooncake_keys):
+            seq_len = seq_lens[i]
+            shapes = {
+                "hidden_states": (seq_len, concat_hidden_size),
+                "input_ids": (seq_len,),
+                "last_hidden_states": (seq_len, hidden_size),
+            }
+            dtypes = {
+                "hidden_states": torch.bfloat16,
+                "input_ids": torch.int64,
+                "last_hidden_states": torch.bfloat16,
+            }
+
+            if self._mooncake_store is not None:
+                output = self._mooncake_store.get(
+                    key, shapes, dtypes, device=self._local_device,
+                )
+                hs_concat = output.hidden_states
+                last_hs = output.last_hidden_states if output.last_hidden_states is not None else hs_concat[:, -hidden_size:]
+                first_aux = hs_concat[:, :hidden_size]
+
+                all_hidden.append(last_hs.unsqueeze(0))
+                all_embeds.append(first_aux.unsqueeze(0))
+                all_ids.append(output.input_ids.unsqueeze(0))
+
+                self._mooncake_store.remove_eagle3_tensors(
+                    key, has_last_hidden_states=True, has_target=False,
+                )
+            else:
+                raise RuntimeError(
+                    "Mooncake store not available. vLLM extract_hidden_states "
+                    "requires Mooncake for hidden state transfer."
+                )
+
+        hidden_states = torch.cat(all_hidden, dim=0).to(self._local_device)
+        token_embeds = torch.cat(all_embeds, dim=0).to(self._local_device)
+        ret_ids = torch.cat(all_ids, dim=0).to(self._local_device)
+
+        return {
+            "hidden_states": hidden_states,
+            "token_embeds": token_embeds,
+            "input_ids": ret_ids,
+        }
+
+    def get_lm_head_weight(self) -> torch.Tensor:
+        if self._lm_head_weight is None:
+            logger.info("lm_head not from engine; loading from safetensors: %s",
+                        self._model_name)
+            from safetensors import safe_open
+            import json as _json
+
+            model_dir = self._model_name
+            idx_path = os.path.join(model_dir, "model.safetensors.index.json")
+            if not os.path.exists(idx_path):
+                from huggingface_hub import hf_hub_download
+                idx_path = hf_hub_download(model_dir, "model.safetensors.index.json")
+                model_dir = os.path.dirname(idx_path)
+
+            with open(idx_path) as f:
+                weight_map = _json.load(f)["weight_map"]
+
+            for key in ["lm_head.weight", "language_model.lm_head.weight",
+                        "model.lm_head.weight"]:
+                if key in weight_map:
+                    shard = weight_map[key]
+                    shard_path = os.path.join(model_dir, shard)
+                    if not os.path.exists(shard_path):
+                        from huggingface_hub import hf_hub_download
+                        shard_path = hf_hub_download(self._model_name, shard)
+                    with safe_open(shard_path, framework="pt", device="cpu") as sf:
+                        self._lm_head_weight = sf.get_tensor(key).to(torch.bfloat16)
+                    break
+
+            if self._lm_head_weight is None:
+                raise KeyError(
+                    f"lm_head.weight not found in {idx_path}. "
+                    f"Available keys with 'lm_head': "
+                    f"{[k for k in weight_map if 'lm_head' in k]}"
+                )
+            logger.info("lm_head.weight loaded: %s", tuple(self._lm_head_weight.shape))
+        return self._lm_head_weight
+
+    def shutdown(self) -> None:
+        """Terminate the vLLM subprocess and clean up."""
+        if self._proc is not None and self._proc.poll() is None:
+            try:
+                self._send_cmd({"cmd": "shutdown"})
+            except Exception:
+                pass
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=10)
+            except Exception:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+
+        if self._mooncake_store is not None:
+            self._mooncake_store.close()
+            self._mooncake_store = None
+
+        for f in [self._cmd_f, self._resp_f]:
+            try:
+                if f:
+                    f.close()
+            except Exception:
+                pass
+        for p in [self._cmd_fifo, self._resp_fifo]:
+            try:
+                if p:
+                    os.unlink(p)
+            except Exception:
+                pass
+
+        self._proc = None
+        self._cmd_f = None
+        self._resp_f = None
+        self._initialized = False
+        logger.info("VllmTeacherEngine: shutdown complete.")
+
+    def __del__(self) -> None:
+        proc = getattr(self, "_proc", None)
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+
+
+__all__ = ["VllmTeacherEngine"]
