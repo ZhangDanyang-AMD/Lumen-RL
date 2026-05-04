@@ -197,7 +197,7 @@ footer .links{margin-top:12px;display:flex;gap:24px;justify-content:center;flex-
       <a href="#features" class="desktop-only" onclick="showHome()">Features</a>
       <a href="#arch" class="desktop-only" onclick="showHome()">Architecture</a>
       <a href="#quickstart" class="desktop-only" onclick="showHome()">Quick Start</a>
-      <a href="#algorithms" class="desktop-only" onclick="showHome()">Algorithms</a>
+      <a href="#status" class="desktop-only" onclick="showHome()">Status</a>
       <a href="https://github.com/ZhangDanyang-AMD/Lumen-RL">GitHub</a>
     </div>
   </div>
@@ -447,35 +447,36 @@ bash examples/DAPO/run_1d_fp8_e2e_blockwise.sh</pre>
   </div>
 </section>
 
-<section class="exp" id="experiments">
+<section class="exp" id="status">
   <div class="wrap">
-    <p class="stitle">// experiments</p>
-    <h2 class="htitle">FP8 Alignment Experiments</h2>
-    <p class="hsub">DAPO on Qwen3-8B-Base, 8&times; MI350X &mdash; FP8 training alignment benchmarks</p>
+    <p class="stitle">// dashboards</p>
+    <h2 class="htitle">Models Train Status</h2>
+    <p class="hsub">Training dashboards with live metrics, loss curves, and performance data</p>
     <div class="exp-grid">
       <div class="ecard">
-        <h3>1A &mdash; BF16 Baseline</h3>
-        <p>Pure BF16 training + BF16 rollout. Reference curve for all FP8 comparisons.</p>
-        <pre>bash examples/DAPO/run_1a_bf16_baseline.sh</pre>
+        <h3>Kimi K2.5 Eagle3 &mdash; Phase 1</h3>
+        <p>SDDD phase 1 foundation training on general corpus.</p>
+        <pre><a href="dashboards/SDDD/Kimi_K25_SDDD_MI350/phase1.html" target="_blank" style="color:var(--cyan)">Open Dashboard &rarr;</a></pre>
       </div>
       <div class="ecard">
-        <h3>1B &mdash; FP8 Rollout + TIS</h3>
-        <p>BF16 training + FP8 rollout with token-level importance sampling.</p>
-        <pre>bash examples/DAPO/run_1b_fp8_rollout_tis.sh</pre>
+        <h3>Kimi K2.5 Eagle3 &mdash; Phase 2</h3>
+        <p>SDDD phase 2 mixed-domain fine-tuning.</p>
+        <pre><a href="dashboards/SDDD/Kimi_K25_SDDD_MI350/phase2.html" target="_blank" style="color:var(--cyan)">Open Dashboard &rarr;</a></pre>
       </div>
       <div class="ecard">
-        <h3>1D &mdash; FP8 E2E Blockwise</h3>
-        <p>Full Lumen FP8 training (blockwise 128) + FP8 rollout + TIS.</p>
-        <pre>bash examples/DAPO/run_1d_fp8_e2e_blockwise.sh</pre>
+        <h3>Qwen3-8B DAPO &mdash; Sync</h3>
+        <p>Synchronous DAPO training with BF16 baseline.</p>
+        <pre><a href="dashboards/DAPO/Qwen3-8B-Base_BF16_DAPO-Sync.html" target="_blank" style="color:var(--cyan)">Open Dashboard &rarr;</a></pre>
       </div>
       <div class="ecard">
-        <h3>1F &mdash; FP8 E2E Per-Tensor</h3>
-        <p>Lumen FP8 per-tensor delayed scaling. Coarsest granularity.</p>
-        <pre>bash examples/DAPO/run_1f_fp8_e2e_per_tensor.sh</pre>
+        <h3>Qwen3-8B DAPO &mdash; Async</h3>
+        <p>Fully-async DAPO training with overlapped rollout.</p>
+        <pre><a href="dashboards/DAPO/Qwen3-8B-Base_BF16_DAPO-Async.html" target="_blank" style="color:var(--cyan)">Open Dashboard &rarr;</a></pre>
       </div>
       <div class="ecard full">
-        <h3>Full Experiment Matrix</h3>
-        <p>Includes MXFP8 sweep (block=32/64/128), attention FP8, and optimizer sweep across Qwen3-8B, Qwen3-30B-A3B-Base, and Qwen3-30B-A3B. See the <a href="https://github.com/ZhangDanyang-AMD/Lumen-RL/blob/main/examples/DAPO/README.md">DAPO README</a> and the <a href="https://github.com/ZhangDanyang-AMD/Lumen/blob/dev/RL/outputs/fp8_training_alignment/FP8_TRAINING_ALIGNMENT_PLAN.md">FP8 Training Alignment Plan</a>.</p>
+        <h3>BF16 Sync Baseline</h3>
+        <p>1a-bf16-sync configuration &mdash; synchronous BF16 training baseline for comparison.</p>
+        <pre><a href="dashboards/1a-bf16-sync/dashboard.html" target="_blank" style="color:var(--cyan)">Open Dashboard &rarr;</a></pre>
       </div>
     </div>
   </div>
