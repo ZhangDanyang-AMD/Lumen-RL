@@ -1,6 +1,6 @@
 # Architecture
 
-LumenRL follows a controller/worker split: a Ray driver owns scheduling and batching, while specialized workers host ATOM inference, policy training, reference models, rewards, and critics. All cross-worker payloads are `DataProto` batches—tensor dictionaries with small metadata sidecars—so the same protocol works for dense models, FP8 paths, and MoE with R3 side channels.
+LumenRL is an AMD native Post-Training Framework for LLMs that supports both **RL post-training** and **Speculative Decoding Draft Distillation (SDDD)**. It follows a controller/worker split: a Ray driver owns scheduling and batching, while specialized workers host ATOM/SGLang/vLLM inference, policy training, reference models, rewards, and critics. For SDDD, Mooncake/MORI RDMA transfers connect teacher inference GPUs with draft model training GPUs. All cross-worker payloads are `DataProto` batches—tensor dictionaries with small metadata sidecars—so the same protocol works for dense models, quantized paths (FP8, MXFP8, MXFP4), and MoE with R3 side channels.
 
 <div align="center">
   <img src="_static/architecture.svg" alt="LumenRL architecture diagram" width="960">
@@ -37,18 +37,22 @@ Each worker receives CPU-staged tensors and moves them to GPU as needed; see {do
 
 Two engine halves share weights through the sync utilities under `lumenrl/engine/`:
 
-- **ATOM inference** wraps generation, KV-cache extensions, and weight loaders so rollout matches training naming and sharding conventions.
-- **Lumen training** selects FSDP2 or Megatron backends, applies Lumen quantization hooks, and applies MoE R3 replay during forward passes when enabled.
+- **Inference** wraps ATOM, SGLang, or vLLM for generation, KV-cache extensions, and weight loaders so rollout matches training naming and sharding conventions. Supports quantized inference with FP8, MXFP8, and MXFP4.
+- **Training** selects FSDP2 or Megatron backends, applies Lumen quantization hooks, and applies MoE R3 replay during forward passes when enabled.
 
-This split lets you tune inference for throughput (FP8, speculative decoding, TP/EP) independently from training parallelism.
+This split lets you tune inference for throughput (quantized rollout, speculative decoding, TP/EP) independently from training parallelism.
 
 ## Quantization stack
 
-Rollout quantization uses `FP8RolloutQuantizer` and `FP8KVCacheQuantizer`; training uses `FP8TrainingManager` to bridge into `lumen.quantize`. When FP8 rollouts diverge from the trainer’s BF16 policy, `apply_rollout_correction` adjusts advantages using TIS or MIS. Details: {doc}`/advance/fp8_quantization` and {doc}`/api/quantization`.
+LumenRL supports multiple quantization formats: FP8 (blockwise W8A8), MXFP8, and MXFP4. Rollout quantization uses `FP8RolloutQuantizer` and `FP8KVCacheQuantizer`; training uses `FP8TrainingManager` to bridge into `lumen.quantize`. MXFP8/MXFP4 online quantization via AITER is used for efficient SDDD teacher inference. When quantized rollouts diverge from the trainer’s BF16 policy, `apply_rollout_correction` adjusts advantages using TIS or MIS. Details: {doc}`/advance/fp8_quantization` and {doc}`/api/quantization`.
 
 ## MoE R3
 
 For MoE models, `R3Manager` coordinates `RouterRecorder` on the inference side and `RouterReplayer` during training forwards, with tensors carried alongside sequences via `DataProto.add_router_distributions`. This closes the router mismatch that otherwise spikes policy–inference KL. Details: {doc}`/advance/moe_r3` and {doc}`/api/moe`.
+
+## SDDD pipeline
+
+For Speculative Decoding Draft Distillation, LumenRL splits GPUs between teacher inference and draft model training. The teacher model runs on ATOM/SGLang/vLLM with quantized inference (MXFP4/FP8), while the Eagle3/DFlash draft model trains via FSDP2 on separate GPUs. Hidden states are transferred between the two GPU groups via Mooncake (async RDMA/TCP for SGLang) or MORI-IO (GPU Direct P2P RDMA for ATOM). The pipeline is powered by [TorchSpec](https://github.com/lightseekorg/TorchSpec). Details: {doc}`/advance/sddd` and {doc}`/examples/sddd_training`.
 
 ## Repository layout
 

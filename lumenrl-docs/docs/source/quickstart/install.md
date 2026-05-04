@@ -9,7 +9,7 @@ This page covers hardware and software requirements, container-based setup, edit
 | Python | >= 3.10 |
 | PyTorch | >= 2.4 (ROCm build recommended) |
 | ROCm | >= 6.2 |
-| GPU | AMD Instinct MI250 or MI300 series |
+| GPU | AMD Instinct MI250 / MI300 / MI350 series |
 
 ```{note}
 Match your PyTorch wheel to the ROCm version on the host or inside the container. Mismatched userspace stacks are the most common source of runtime failures on AMD clusters.
@@ -61,9 +61,11 @@ If you iterate on Ray workers or configs, keep the editable install so local cha
 | Library | PyPI / import | Role in LumenRL |
 | --- | --- | --- |
 | [Lumen](https://github.com/ZhangDanyang-AMD/Lumen) | `lumen` | Quantized training: hybrid FP8/MXFP8, AITER-backed kernels, MORI communication hooks |
-| [ATOM](https://github.com/ROCm/ATOM) | `atom` | High-throughput inference: FP8 rollout, MoE expert parallel, speculative decoding |
-| [AITER](https://github.com/ROCm/aiter) | `amd-aiter` | Low-level GPU kernels (attention, GEMM, MoE, norm) |
-| [MORI](https://github.com/ROCm/mori) | `mori` | RDMA-aware GPU collectives and MoE expert dispatch |
+| [ATOM](https://github.com/ROCm/ATOM) | `atom` | High-throughput inference: FP8, MXFP4, MoE expert parallel, speculative decoding |
+| [TorchSpec](https://github.com/lightseekorg/TorchSpec) | `torchspec` | Speculative decoding draft distillation: Eagle3, DFlash |
+| [AITER](https://github.com/ZhangDanyang-AMD/aiter) | `amd-aiter` | Low-level GPU kernels (attention, GEMM, MoE, norm) |
+| [MORI](https://github.com/ZhangDanyang-AMD/mori) | `mori` | RDMA-aware GPU collectives and MoE expert dispatch |
+| [Mooncake](https://github.com/kvcache-ai/Mooncake) | `mooncake` | Transfer engine: async RDMA/TCP hidden-state transport |
 | [Ray](https://github.com/ray-project/ray) | `ray` | Controller/worker orchestration and resource placement |
 
 ## Verify installation
