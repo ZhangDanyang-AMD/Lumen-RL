@@ -11,6 +11,25 @@ An AMD native **Post-Training Framework for LLMs**, powered by [Lumen](https://g
 - **[2026/03]** LumenRL now supports **MoE [R3](https://arxiv.org/abs/2510.11370) router alignment** — Rollout Routing Replay for stable MoE RL training
 - **[2026/03]** LumenRL now supports the **[FP8-RL](https://arxiv.org/abs/2601.18150) quantization stack** — FP8 rollout + training with TIS/MIS importance-sampling correction
 
+## 📑 Table of Contents
+
+- [Features](#-features)
+- [Architecture](#architecture)
+- [Key Features](#key-features)
+- [Supported Models](#supported-models)
+  - [RL Models](#rl-models)
+  - [SDDD Models](#sddd-models)
+- [Requirements](#requirements)
+- [Quick Start](#quick-start)
+- [Fully Async Training](#fully-async-training)
+- [Quantization](#quantization)
+- [MoE Training with R3](#moe-training-with-r3)
+- [Backend Support Matrix](#backend-support-matrix)
+- [Third-Party Libraries](#third-party-libraries)
+- [Citation](#citation)
+- [Acknowledgements](#acknowledgements)
+- [License](#license)
+
 ## 🚀 Features
 
 - **AMD-Native**: Built for ROCm with [AITER](https://github.com/ROCm/aiter) kernels (ASM / CK / Triton) and [MORI](https://github.com/ROCm/mori) communication (RDMA + GPU collective ops, MoE expert dispatch)
@@ -242,46 +261,6 @@ R3 significantly reduces training-inference policy KL divergence and prevents co
 | Multi-node | Yes | Yes |
 | Expert parallel | No | Yes (MORI-EP) |
 | Sequence parallelism | Yes | Yes |
-
-## Project Structure
-
-```
-Lumen-RL/
-├── lumenrl/                        # Main Python package
-│   ├── core/                       #   Config, DataProto, registry, types
-│   ├── controller/                 #   Ray cluster, worker groups, dispatch
-│   ├── workers/                    #   Actor, critic, ref, reward, rollout, hybrid
-│   ├── engine/
-│   │   ├── inference/              #   ATOM engine wrapper, generation, weight loader
-│   │   └── training/               #   FSDP2/Megatron backends, weight sync
-│   ├── algorithms/                 #   GRPO, DAPO, PPO, loss functions
-│   ├── quantization/               #   FP8 rollout, KV-cache, training, correction
-│   ├── moe/                        #   R3 recorder/replayer/manager, expert parallel
-│   ├── trainer/                    #   RLTrainer, AsyncRLTrainer, message queue, weight sync
-│   └── utils/                      #   Logging, checkpoint, metrics, distributed
-│
-├── configs/                        # Reference YAML configs + production recipes
-├── examples/                       # Launch scripts (run_grpo.py, run_dapo.py, etc.)
-├── scripts/                        # SLURM launchers
-├── tests/                          # Unit / integration / e2e tests
-└── docker/                         # Dockerfile, Dockerfile.dev
-```
-
-## Testing
-
-```bash
-# Unit tests (fast, CPU-only where possible)
-pytest tests/unit/ -v
-
-# Integration tests (requires 1+ GPU)
-pytest tests/integration/ -v -m gpu
-
-# End-to-end tests (requires 8 GPUs)
-pytest tests/e2e/ -v -m multigpu
-
-# All tests
-pytest tests/ -v
-```
 
 ## Third-Party Libraries
 

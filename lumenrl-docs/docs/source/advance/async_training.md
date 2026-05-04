@@ -1,6 +1,6 @@
 # Fully Async Training
 
-LumenRL supports a **fully-async training mode** that decouples rollout (generation) from policy training, inspired by [VERL's fully_async_policy](https://github.com/verl-project/verl/blob/main/docs/advance/fully_async.md) and techniques from AReaL, Magistral, StreamRL, and AsyncFlow.
+LumenRL now supports a **fully-async training mode** that decouples rollout (generation) from policy training, inspired by [VERL's fully_async_policy](https://github.com/verl-project/verl/blob/main/docs/advance/fully_async.md) and techniques from AReaL, Magistral, StreamRL, and AsyncFlow.
 
 In the default *colocate* mode, rollout and training share the same GPUs and take turns — the GPU is idle during the other phase. In async mode, a background **Rollouter** thread continuously generates samples into a **MessageQueue** while the **Trainer** consumes batches for gradient updates. Periodic **ParameterSync** pushes updated weights from trainer to rollouter.
 
