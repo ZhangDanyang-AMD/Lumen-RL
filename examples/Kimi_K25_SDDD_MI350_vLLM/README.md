@@ -40,12 +40,21 @@ LumenRL FSDP2 + aiter          <---   vLLM + ATOM plugin + aiter
 
 ## Two-Phase Training (lightseekorg recipe)
 
-| Phase | Steps | Dataset | Description |
-|-------|-------|---------|-------------|
-| Phase 1 | 0->20K | perfectblend (296K samples) | Foundation training |
-| Phase 2 | 20K->40K | Mixed (181K: VL, CN, tool-call, agent, writing) | Domain diversity |
+| Phase | Steps | Dataset | Description | Status |
+|-------|-------|---------|-------------|--------|
+| Phase 1 | 0→111K | perfectblend (296K samples, 3 epochs) | Foundation training | **Completed** |
+| Phase 2 | 0→67,826 | Mixed (181K: VL, CN, tool-call, agent, writing, 3 epochs) | Domain diversity | **Completed** |
 
 Training data: [lightseekorg/kimi-mtp-dataset](https://huggingface.co/datasets/lightseekorg/kimi-mtp-dataset)
+
+### Training Results
+
+- **Total training time**: ~18h 15m (Phase 2)
+- **Final loss**: 1.5e-6
+- **Final accuracy**: 100% at all 4 speculative positions
+- **Avg step time**: ~420 ms
+- **Exported model**: `output/Kimi_K25_eagle3_HF/` (2.92B params, BF16, safetensors)
+- **Dashboard**: `dashboards/SDDD/Kimi_K25_SDDD_MI350/phase2.html`
 
 ## Quick Start
 
@@ -102,6 +111,27 @@ bash examples/Kimi_K25_SDDD_MI350_vLLM/run_full_training_docker.sh
 | `PYTORCH_ROCM_ARCH` | `gfx950` | MI350 GPU architecture |
 | `HIP_FORCE_DEV_KERNARG` | `1` | Required for MI350 kernel args |
 | `WANDB_MODE` | `disabled` | Disable W&B logging for smoke tests |
+
+## Output Files
+
+| Path | Description |
+|------|-------------|
+| `output/Kimi_K25_eagle3_HF/` | Exported Eagle3 model (HuggingFace safetensors format) |
+| `output/Kimi_K25_SDDD_MI350/kimi-k25-eagle3-sglang-mxfp4-mi350/phase2.log` | Training log (trimmed, Mooncake noise removed) |
+| `dashboards/SDDD/Kimi_K25_SDDD_MI350/phase1.html` | Phase 1 training dashboard |
+| `dashboards/SDDD/Kimi_K25_SDDD_MI350/phase2.html` | Phase 2 training dashboard |
+
+### Exported Model Architecture
+
+The exported model at `output/Kimi_K25_eagle3_HF/` differs from [lightseekorg/kimi-k2.5-eagle3](https://huggingface.co/lightseekorg/kimi-k2.5-eagle3):
+
+| Config | Ours | lightseekorg |
+|--------|------|-------------|
+| `attention_bias` | `true` | `false` |
+| `norm_bias` | `true` | `false` |
+| `rope_theta` | 50000.0 | 1000000 |
+| `rope_scaling` | yarn (matching Kimi-K2.5 base) | none |
+| `rms_norm_eps` | 1e-5 | 1e-6 |
 
 ## Reference
 
