@@ -1,18 +1,16 @@
-# Kimi K2.5 Eagle3 Draft Distillation (vLLM + ATOM + MXFP4) — MI350
+# Kimi K2.5 Eagle3 Draft Distillation (vLLM + BF16) — MI350
 
-Train Eagle3 speculative decoding draft model using Kimi K2.5 teacher hidden states on **8x MI350 GPUs** with vLLM + ATOM plugin inference (MXFP4 online quantization via AITER on ROCm) and Mooncake TCP transfer.
+Train Eagle3 speculative decoding draft model using Kimi K2.5 teacher hidden states on **8x MI350 GPUs** with vLLM inference (BF16) and Mooncake TCP transfer.
 
 - **GPUs 0-3**: torchrun FSDP2 -- Eagle3 draft model training (BF16, LumenRL + aiter)
-- **GPUs 4-7**: vLLM + ATOM plugin -- Kimi K2.5 teacher (TP=4, BF16->MXFP4 via aiter)
-
-Both inference and training share the **same AITER version** from `third_party/aiter`.
+- **GPUs 4-7**: vLLM -- Kimi K2.5 teacher (TP=4, BF16)
 
 ## Architecture
 
 ```
 Training GPUs (0-3)                    Inference GPUs (4-7)
-LumenRL FSDP2 + aiter          <---   vLLM + ATOM plugin + aiter
-  Eagle3 draft model, BF16              TP=4, BF16->MXFP4 (AITER)
+LumenRL FSDP2 + aiter          <---   vLLM (BF16)
+  Eagle3 draft model, BF16              TP=4, BF16
        ^                                       |
   Mooncake TCP  <---------------------  hidden_states via
   EagleMooncakeStore                   MooncakeHiddenStatesConnector
@@ -22,10 +20,8 @@ LumenRL FSDP2 + aiter          <---   vLLM + ATOM plugin + aiter
 
 | Component | Source | Purpose |
 |-----------|--------|---------|
-| **aiter** | `third_party/aiter` | GPU compute kernels (shared by ATOM + LumenRL) |
-| **ATOM** | `third_party/ATOM` | vLLM plugin, MXFP4 online quantization |
-| **Lumen** | `third_party/Lumen` | Quantized training engine, aiter-patched FSDP2 |
-| **mori** | `third_party/mori` | MoE expert-parallel all-to-all communication |
+| **Lumen** | `third_party/Lumen` | FSDP2 + aiter integration for training |
+| **aiter** | `third_party/aiter` | GPU compute kernels (used by Lumen) |
 | vLLM | 0.19.1 + TorchSpec patches | `extract_hidden_states` + `MooncakeHiddenStatesConnector` |
 | Mooncake | `f2853a80` (source-built HIP) | Hidden state transfer (TCP) |
 | TorchSpec | `/home/danyzhan/TorchSpec` | vLLM patches + mooncake connectors |
@@ -35,7 +31,7 @@ LumenRL FSDP2 + aiter          <---   vLLM + ATOM plugin + aiter
 
 | Role | Model | Notes |
 |------|-------|-------|
-| **Teacher** | [moonshotai/Kimi-K2.5](https://huggingface.co/moonshotai/Kimi-K2.5) | 1T MoE, BF16, online MXFP4 via ATOM/AITER |
+| **Teacher** | [moonshotai/Kimi-K2.5](https://huggingface.co/moonshotai/Kimi-K2.5) | 1T MoE, BF16 |
 | **Draft** | Eagle3 (from scratch) | hidden=7168, 1 layer, 64 heads |
 
 ## Two-Phase Training (lightseekorg recipe)
@@ -93,16 +89,6 @@ bash examples/Kimi_K25_SDDD_MI350_vLLM/run_kimi_k25.sh --smoke-test
 bash examples/Kimi_K25_SDDD_MI350_vLLM/run_full_training_docker.sh
 ```
 
-## Key Differences from SGLang Version
-
-| Aspect | SGLang (`Kimi_K25_SDDD_MI350/`) | vLLM (`Kimi_K25_SDDD_MI350_vLLM/`) |
-|--------|----------------------------------|-------------------------------------|
-| Inference engine | SGLang + ATOM plugin | vLLM + ATOM plugin |
-| ATOM registration | `SGLANG_EXTERNAL_MODEL_PACKAGE` env var | pip entry points (automatic) |
-| Hidden state mode | `spec_training_mooncake` | `extract_hidden_states` |
-| Transfer protocol | RDMA (mlx5_8) | TCP (no RDMA hardware) |
-| Docker base | `rocm/sgl-dev:...` | `vllm/vllm-openai-rocm:v0.19.1` |
-
 ## Environment Variables
 
 | Variable | Value | Purpose |
@@ -117,7 +103,6 @@ bash examples/Kimi_K25_SDDD_MI350_vLLM/run_full_training_docker.sh
 | Path | Description |
 |------|-------------|
 | `output/Kimi_K25_eagle3_HF/` | Exported Eagle3 model (HuggingFace safetensors format) |
-| `output/Kimi_K25_SDDD_MI350/kimi-k25-eagle3-sglang-mxfp4-mi350/phase2.log` | Training log (trimmed, Mooncake noise removed) |
 | `dashboards/SDDD/Kimi_K25_SDDD_MI350/phase1.html` | Phase 1 training dashboard |
 | `dashboards/SDDD/Kimi_K25_SDDD_MI350/phase2.html` | Phase 2 training dashboard |
 
