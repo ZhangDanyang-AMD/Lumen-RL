@@ -1,7 +1,7 @@
 """Speculative Decoding Draft Model Distillation launcher for LumenRL.
 
 Trains Eagle3 or DFlash draft models using teacher hidden states,
-following the TorchSpec / KimiV2.5 approach.
+following the KimiV2.5 approach.
 
 Usage:
     python examples/run_spec_distill.py --config configs/spec_distill_eagle3.yaml

@@ -1,0 +1,23 @@
+2026-05-08 16:55:17 | step=564/111012 | loss=32.94 | step_time=4.1s | status=OK | past step 500 milestone
+2026-05-08 17:13:38 | step=592/111012 | loss=28.90 | status=CRASHED | MEMORY_APERTURE_VIOLATION rank 3 GPU 3 SIGABRT at step ~592
+2026-05-08 17:15:16 | step=592/111012 | status=DOWN | container still exited, awaiting user action
+2026-05-09 00:32:00 | step=0/111012 | status=RESTART | lumen_norm=false, lumen_linear=false, adaptive_mb=16384
+2026-05-09 01:00:11 | step=214/111012 | loss=35.37 | status=CRASHED | MEMORY_APERTURE_VIOLATION rank 0 SIGABRT backward, all AITER off
+2026-05-09 01:10:09 | step=47/111012 | loss=35.94 | status=CRASHED | MEMORY_APERTURE_VIOLATION rank 3 SIGABRT backward, adaptive_mb=16384
+2026-05-09 01:22:02 | step=47/111012 | loss=35.94 | status=CRASHED | MEMORY_APERTURE_VIOLATION rank 0 SIGABRT backward, adaptive_mb=16384
+2026-05-09 01:27:00 | step=0/111012 | status=RESTART | added backward hooks + per-step sync + BCAST logs for crash debugging
+2026-05-09 01:51:42 | step=307/111012 | loss=32.66 | step_time=6.5s | status=OK | past all prev crash points, 0 errors, 404 NaN masks
+2026-05-09 01:58:32 | step=406/111012 | loss=33.26 | step_time=2.1-10.3s | status=OK | 0 errors, past step 400
+2026-05-09 01:59:24 | step=416/111012 | loss=31.9-34.5 | step_time=3.2-5.9s | NaN=616 | status=OK | 0 errors, stable past all crash points
+2026-05-09 03:01:02 | step=1314/111012 | status=OK | dashboard cron set every 20min
+2026-05-09 03:12:09 | step=1463/111012 | loss=31.65 | status=OK
+2026-05-09 03:32:08 | step=1756/111012 | loss=32.24 | status=OK
+2026-05-09 03:52:07 | step=2049/111012 | loss=30.52 | status=OK
+2026-05-09 04:12:09 | step=2335/111012 | loss=26.01 | acc0=26.5% | status=OK
+2026-05-09 04:32:12 | step=2615/111012 | loss=30.04 | acc0=13.5% | status=OK
+2026-05-09 04:52:12 | step=2912/111012 | loss=32.50 | acc0=10.2% | status=OK
+2026-05-09 05:12:13 | step=3209/111012 | loss=30.61 | acc0=19.9% | status=OK
+2026-05-09 05:32:14 | step=3499/111012 | loss=30.25 | acc0=17.2% | status=OK
+2026-05-09 05:52:17 | step=3801/111012 | loss=28.75 | acc0=23.9% | status=OK
+2026-05-09 01:16:11 | step=4153/111012 | loss=26.12 | acc0=31.5% | status=OK
+2026-05-09 06:32:00 | step=4389/111012 | loss=30.98 | acc0=14.3% | status=OK

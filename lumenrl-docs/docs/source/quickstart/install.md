@@ -62,7 +62,6 @@ If you iterate on Ray workers or configs, keep the editable install so local cha
 | --- | --- | --- |
 | [Lumen](https://github.com/ZhangDanyang-AMD/Lumen) | `lumen` | Quantized training: hybrid FP8/MXFP8, AITER-backed kernels, MORI communication hooks |
 | [ATOM](https://github.com/ROCm/ATOM) | `atom` | High-throughput inference: FP8, MXFP4, MoE expert parallel, speculative decoding |
-| [TorchSpec](https://github.com/lightseekorg/TorchSpec) | `torchspec` | Speculative decoding draft distillation: Eagle3, DFlash |
 | [AITER](https://github.com/ZhangDanyang-AMD/aiter) | `amd-aiter` | Low-level GPU kernels (attention, GEMM, MoE, norm) |
 | [MORI](https://github.com/ZhangDanyang-AMD/mori) | `mori` | RDMA-aware GPU collectives and MoE expert dispatch |
 | [Mooncake](https://github.com/kvcache-ai/Mooncake) | `mooncake` | Transfer engine: async RDMA/TCP hidden-state transport |

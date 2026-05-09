@@ -1,6 +1,6 @@
 """Speculative Decoding Draft Model Distillation trainer.
 
-Implements the TorchSpec-style off-policy distillation loop for training
+Implements the off-policy distillation loop for training
 Eagle3 / DFlash draft models:
 
 1. Sample prompts from the dataset.
@@ -18,6 +18,8 @@ from __future__ import annotations
 import gc
 import logging
 import os
+import queue
+import threading
 import time
 from typing import Any
 
@@ -29,6 +31,59 @@ from lumenrl.core.protocol import DataProto
 from lumenrl.trainer.callbacks import Callback, LoggingCallback
 
 logger = logging.getLogger(__name__)
+
+
+_PREFETCH_SENTINEL = object()
+
+
+class _TeacherPrefetcher:
+    """Prefetch teacher inference in a single background worker thread.
+
+    All Mooncake receives happen on **CPU** to avoid concurrent GPU access
+    from the prefetch thread and the training thread (which causes
+    VM_L2_PROTECTION_FAULT on ROCm/MI350).  The main thread moves tensors
+    to GPU when it calls ``get()``.
+    """
+
+    def __init__(self, trainer: "SpecDistillTrainer") -> None:
+        self._trainer = trainer
+        self._device = trainer._device
+        self._req_queue: queue.Queue[int | object] = queue.Queue()
+        self._res_queue: queue.Queue[tuple | BaseException] = queue.Queue(maxsize=2)
+        self._worker = threading.Thread(target=self._loop, daemon=True)
+        self._worker.start()
+
+    def _loop(self) -> None:
+        while True:
+            step = self._req_queue.get()
+            if step is _PREFETCH_SENTINEL:
+                break
+            try:
+                ids, mask = self._trainer._get_batch_sequences(step)
+                data = self._trainer._teacher_inference_rank0(
+                    ids, mask, recv_device=torch.device("cpu"),
+                )
+                self._res_queue.put((data, ids, mask))
+            except Exception as e:
+                self._res_queue.put(e)
+
+    def prefetch(self, step: int) -> None:
+        """Submit a step for background processing (non-blocking)."""
+        self._req_queue.put(step)
+
+    def get(self) -> tuple:
+        """Block until the next result is ready; move tensors to GPU."""
+        item = self._res_queue.get()
+        if isinstance(item, BaseException):
+            raise item
+        data, ids, mask = item
+        if data is not None:
+            data = {k: v.to(self._device, non_blocking=True) for k, v in data.items()}
+        return data, ids, mask
+
+    def stop(self) -> None:
+        self._req_queue.put(_PREFETCH_SENTINEL)
+        self._worker.join(timeout=5)
 
 
 class SpecDistillTrainer:
@@ -110,12 +165,37 @@ class SpecDistillTrainer:
             spec_length = self.config.algorithm.spec_distill.spec_length
             num_heads = getattr(draft_cfg, "num_heads", None) or max(1, teacher_hidden_dim // 128)
             ffn_dim = getattr(draft_cfg, "ffn_dim", None)
+            head_dim = getattr(draft_cfg, "head_dim", None) or 128
+            rms_norm_eps = getattr(draft_cfg, "rms_norm_eps", 1e-6)
+            rope_theta = getattr(draft_cfg, "rope_theta", 1000000.0)
+            num_kv_heads = getattr(draft_cfg, "num_kv_heads", None)
+
+            rope_scaling = None
+            rope_scaling_type = getattr(draft_cfg, "rope_scaling_type", None)
+            if rope_scaling_type:
+                rope_scaling = {
+                    "type": rope_scaling_type,
+                    "factor": getattr(draft_cfg, "rope_scaling_factor", 64.0),
+                    "original_max_position_embeddings": getattr(draft_cfg, "rope_original_max_pos", 4096),
+                    "beta_fast": getattr(draft_cfg, "rope_beta_fast", 32.0),
+                    "beta_slow": getattr(draft_cfg, "rope_beta_slow", 1.0),
+                    "mscale": getattr(draft_cfg, "rope_mscale", 1.0),
+                    "mscale_all_dim": getattr(draft_cfg, "rope_mscale_all_dim", 1.0),
+                }
+
+            teacher_vocab_size = self._lm_head_weight.shape[0]
             self._draft_model = Eagle3Model(
                 hidden_dim=teacher_hidden_dim,
+                vocab_size=teacher_vocab_size,
                 num_heads=num_heads,
                 num_layers=num_layers,
                 length=spec_length,
                 ffn_dim=ffn_dim,
+                head_dim=head_dim,
+                rms_norm_eps=rms_norm_eps,
+                rope_theta=rope_theta,
+                num_kv_heads=num_kv_heads,
+                rope_scaling=rope_scaling,
             )
         elif draft_type == "dflash":
             from lumenrl.models.dflash import DFlashModel
@@ -146,7 +226,37 @@ class SpecDistillTrainer:
             else:
                 logger.warning("[rank %d] resume_from=%s but no checkpoints found", self._rank, resume_from)
 
-        self._draft_model.to(self._device)
+        draft_dtype_str = getattr(draft_cfg, "dtype", "bfloat16")
+        _dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
+        draft_dtype = _dtype_map.get(draft_dtype_str, torch.bfloat16)
+        self._draft_model.to(device=self._device, dtype=draft_dtype)
+        self._grad_scaler = None
+
+        # Apply Lumen AITER kernel optimizations before FSDP2 sharding
+        training_quant = {}
+        if hasattr(self.config, "quantization") and hasattr(self.config.quantization, "training"):
+            tq = self.config.quantization.training
+            if tq is not None:
+                training_quant = tq if isinstance(tq, dict) else {
+                    k: getattr(tq, k, None)
+                    for k in ["fp8", "lumen_norm", "lumen_linear",
+                              "hf_attn_patch", "fp8_param_manager"]
+                }
+        lumen_norm = training_quant.get("lumen_norm", False)
+        lumen_linear = training_quant.get("lumen_linear", False)
+        hf_attn_patch = training_quant.get("hf_attn_patch", False)
+        if lumen_norm or lumen_linear or hf_attn_patch:
+            try:
+                from lumen.config import LumenConfig
+                lumen_cfg = LumenConfig(
+                    lumen_norm=bool(lumen_norm),
+                    lumen_linear=bool(lumen_linear),
+                    hf_attn_patch=bool(hf_attn_patch),
+                    scaling="none",
+                )
+                _manager, self._draft_model = lumen_cfg.enable(self._draft_model)
+            except ImportError:
+                logger.warning("Lumen not available; using default kernels")
 
         if self._is_distributed:
             from lumenrl.engine.training.fsdp_backend import FSDP2Backend
@@ -385,76 +495,130 @@ class SpecDistillTrainer:
             )
             self._teacher_engine.start()
             self._lm_head_weight = self._teacher_engine.get_lm_head_weight()
+            self._embed_weight = self._teacher_engine.get_embed_weight()
+            self._norm_weight, self._norm_eps = self._teacher_engine.get_norm_weight()
         else:
             self._teacher_engine = None
             self._lm_head_weight = None
+            self._embed_weight = None
+            self._norm_weight = None
+            self._norm_eps = 1e-6
+
+        if self._is_distributed:
+            for attr in ("_lm_head_weight", "_embed_weight", "_norm_weight"):
+                w = getattr(self, attr)
+                if self._rank == 0:
+                    shape = torch.tensor(
+                        list(w.shape), dtype=torch.long, device=self._device,
+                    )
+                else:
+                    shape = torch.zeros(2, dtype=torch.long, device=self._device)
+                ndim_t = torch.tensor([len(w.shape) if w is not None else 0],
+                                      dtype=torch.long, device=self._device)
+                torch.distributed.broadcast(ndim_t, src=0)
+                ndim = ndim_t.item()
+                if self._rank != 0:
+                    shape = torch.zeros(ndim, dtype=torch.long, device=self._device)
+                else:
+                    shape = torch.tensor(
+                        list(w.shape), dtype=torch.long, device=self._device,
+                    )
+                torch.distributed.broadcast(shape, src=0)
+                dims = [shape[i].item() for i in range(ndim)]
+                if self._rank == 0:
+                    weight = w.to(self._device)
+                else:
+                    weight = torch.zeros(
+                        *dims,
+                        dtype=torch.bfloat16, device=self._device,
+                    )
+                torch.distributed.broadcast(weight, src=0)
+                setattr(self, attr, weight.cpu())
+
+            eps_t = torch.tensor([self._norm_eps], dtype=torch.float64, device=self._device)
+            torch.distributed.broadcast(eps_t, src=0)
+            self._norm_eps = eps_t.item()
+
+    def _teacher_inference_rank0(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        recv_device: torch.device | None = None,
+    ) -> dict[str, torch.Tensor] | None:
+        """Run teacher inference on rank 0 only (no NCCL). Thread-safe."""
+        if self._rank != 0:
+            return None
+        return self._teacher_engine.extract_hidden_states(
+            input_ids, attention_mask, recv_device=recv_device,
+        )
+
+    def _teacher_broadcast(
+        self,
+        rank0_data: dict[str, torch.Tensor] | None,
+        input_ids: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """NCCL broadcast teacher data from rank 0 to all ranks."""
+        if self._rank == 0:
+            hidden_states = rank0_data["hidden_states"]
+            token_embeds = rank0_data["token_embeds"]
+            last_hidden_states = rank0_data["last_hidden_states"]
+        else:
+            hidden_states = None
+            token_embeds = None
+            last_hidden_states = None
 
         if self._is_distributed:
             if self._rank == 0:
                 shape = torch.tensor(
-                    list(self._lm_head_weight.shape),
+                    [hidden_states.shape[0], hidden_states.shape[1],
+                     hidden_states.shape[2], token_embeds.shape[2],
+                     last_hidden_states.shape[2]],
                     dtype=torch.long, device=self._device,
                 )
             else:
-                shape = torch.zeros(2, dtype=torch.long, device=self._device)
+                shape = torch.zeros(5, dtype=torch.long, device=self._device)
             torch.distributed.broadcast(shape, src=0)
+            torch.cuda.synchronize()
+            logger.warning("[rank %d] BCAST shape OK", self._rank)
 
+            B, T = shape[0].item(), shape[1].item()
+            D_hidden, D_embed, D_last = shape[2].item(), shape[3].item(), shape[4].item()
             if self._rank == 0:
-                weight = self._lm_head_weight.to(self._device)
+                h = hidden_states.to(self._device)
+                e = token_embeds.to(self._device)
+                lhs = last_hidden_states.to(self._device)
             else:
-                weight = torch.zeros(
-                    shape[0].item(), shape[1].item(),
-                    dtype=torch.bfloat16, device=self._device,
-                )
-            torch.distributed.broadcast(weight, src=0)
-            self._lm_head_weight = weight.cpu()
+                h = torch.zeros(B, T, D_hidden, dtype=torch.bfloat16, device=self._device)
+                e = torch.zeros(B, T, D_embed, dtype=torch.bfloat16, device=self._device)
+                lhs = torch.zeros(B, T, D_last, dtype=torch.bfloat16, device=self._device)
+            torch.distributed.broadcast(h, src=0)
+            torch.cuda.synchronize()
+            logger.warning("[rank %d] BCAST hidden_states OK (B=%d T=%d D=%d, %.1fG)", self._rank, B, T, D_hidden, h.element_size()*h.nelement()/1e9)
+            torch.distributed.broadcast(e, src=0)
+            torch.cuda.synchronize()
+            logger.warning("[rank %d] BCAST token_embeds OK", self._rank)
+            torch.distributed.broadcast(lhs, src=0)
+            torch.cuda.synchronize()
+            logger.warning("[rank %d] BCAST last_hidden_states OK", self._rank)
+            hidden_states = h
+            token_embeds = e
+            last_hidden_states = lhs
+
+        return {
+            "hidden_states": hidden_states,
+            "token_embeds": token_embeds,
+            "input_ids": input_ids,
+            "last_hidden_states": last_hidden_states,
+        }
 
     def _teacher_forward_vllm(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Teacher forward via vLLM+ATOM engine (rank 0 only, then broadcast).
-
-        Hidden states arrive via Mooncake (TCP or RDMA).
-        """
-        if self._rank == 0:
-            result = self._teacher_engine.extract_hidden_states(
-                input_ids, attention_mask,
-            )
-            hidden_states = result["hidden_states"]
-            token_embeds = result["token_embeds"]
-        else:
-            hidden_states = None
-            token_embeds = None
-
-        if self._is_distributed:
-            if self._rank == 0:
-                shape = torch.tensor(
-                    list(hidden_states.shape),
-                    dtype=torch.long, device=self._device,
-                )
-            else:
-                shape = torch.zeros(3, dtype=torch.long, device=self._device)
-            torch.distributed.broadcast(shape, src=0)
-
-            B, T, D = shape[0].item(), shape[1].item(), shape[2].item()
-            if self._rank == 0:
-                h = hidden_states.clone()
-                e = token_embeds.clone()
-            else:
-                h = torch.zeros(B, T, D, dtype=torch.bfloat16, device=self._device)
-                e = torch.zeros(B, T, D, dtype=torch.bfloat16, device=self._device)
-            torch.distributed.broadcast(h, src=0)
-            torch.distributed.broadcast(e, src=0)
-            hidden_states = h
-            token_embeds = e
-
-        return {
-            "hidden_states": hidden_states,
-            "token_embeds": token_embeds,
-            "input_ids": input_ids,
-        }
+        """Teacher forward via vLLM+ATOM engine (rank 0 only, then broadcast)."""
+        rank0_data = self._teacher_inference_rank0(input_ids, attention_mask)
+        return self._teacher_broadcast(rank0_data, input_ids)
 
     def _load_dataset(self) -> None:
         """Load training dataset."""
@@ -513,8 +677,20 @@ class SpecDistillTrainer:
                 convs = s.get("conversations")
                 if convs and isinstance(convs, list) and isinstance(convs[0], dict):
                     if hasattr(self._tokenizer, "apply_chat_template"):
+                        ROLE_MAP = {"human": "user", "gpt": "assistant"}
+                        normalized = []
+                        for m in convs:
+                            if "role" in m and "content" in m:
+                                normalized.append(m)
+                            elif "from" in m and "value" in m:
+                                normalized.append({
+                                    "role": ROLE_MAP.get(m["from"], m["from"]),
+                                    "content": m["value"],
+                                })
+                            else:
+                                normalized.append(m)
                         text = self._tokenizer.apply_chat_template(
-                            convs, tokenize=False, add_generation_prompt=False
+                            normalized, tokenize=False, add_generation_prompt=False
                         )
                     else:
                         text = "\n".join(
@@ -553,11 +729,12 @@ class SpecDistillTrainer:
                 texts.append(text)
 
         max_len = self.config.policy.max_total_sequence_length
+        self._tokenizer.padding_side = "right"
         enc = self._tokenizer(
             texts,
             padding=True,
             truncation=True,
-            max_length=max_len,
+            max_length=max_len - 1,  # vLLM requires prompt + 1 < max_model_len
             return_tensors="pt",
         )
         return enc["input_ids"], enc["attention_mask"]
@@ -574,8 +751,9 @@ class SpecDistillTrainer:
         """Run teacher on dataset sequences, return hidden states.
 
         Returns a dict with:
-        - ``"hidden_states"``: last-layer hidden states ``[B, T, D]``
-        - ``"token_embeds"``: input embeddings ``[B, T, D]`` (for Eagle3)
+        - ``"hidden_states"``: 3 concatenated aux hidden states ``[B, T, 3*D]``
+          from layers [1, N//2-1, N-4] (Eagle3 convention)
+        - ``"token_embeds"``: input embeddings ``[B, T, D]``
         - ``"input_ids"``: the original input ids
         """
         backend = self.config.algorithm.teacher.inference_backend
@@ -594,13 +772,17 @@ class SpecDistillTrainer:
 
         Hidden states arrive on the training GPU via MORI-IO RDMA
         (GPU Direct), avoiding CPU round-trips.
+
+        NOTE: ATOM engine currently returns only the final hidden state
+        ``[B, T, D]``, not 3 aux layers.  For Eagle3 training, use the
+        ``vllm`` or ``hf`` backend instead until ATOM is updated.
         """
         if self._rank == 0:
             # MORI-IO returns tensors already on the training GPU
             result = self._teacher_engine.extract_hidden_states(
                 input_ids, attention_mask,
             )
-            hidden_states = result["hidden_states"]  # [B, T, D] on GPU
+            hidden_states = result["hidden_states"]  # [B, T, D] or [B, T, 3*D]
             token_embeds = result["token_embeds"]     # [B, T, D] on GPU
         else:
             hidden_states = None
@@ -610,22 +792,22 @@ class SpecDistillTrainer:
         if self._is_distributed:
             if self._rank == 0:
                 shape = torch.tensor(
-                    list(hidden_states.shape),
+                    [hidden_states.shape[0], hidden_states.shape[1],
+                     hidden_states.shape[2], token_embeds.shape[2]],
                     dtype=torch.long, device=self._device,
                 )
             else:
-                shape = torch.zeros(3, dtype=torch.long, device=self._device)
+                shape = torch.zeros(4, dtype=torch.long, device=self._device)
             torch.distributed.broadcast(shape, src=0)
 
-            B, T, D = shape[0].item(), shape[1].item(), shape[2].item()
+            B, T = shape[0].item(), shape[1].item()
+            D_hidden, D_embed = shape[2].item(), shape[3].item()
             if self._rank == 0:
-                # Already on GPU from MORI-IO, clone to avoid aliasing
-                # the pre-registered buffer during broadcast
-                h = hidden_states.clone()
-                e = token_embeds.clone()
+                h = hidden_states.to(self._device)
+                e = token_embeds.to(self._device)
             else:
-                h = torch.zeros(B, T, D, dtype=torch.bfloat16, device=self._device)
-                e = torch.zeros(B, T, D, dtype=torch.bfloat16, device=self._device)
+                h = torch.zeros(B, T, D_hidden, dtype=torch.bfloat16, device=self._device)
+                e = torch.zeros(B, T, D_embed, dtype=torch.bfloat16, device=self._device)
             torch.distributed.broadcast(h, src=0)
             torch.distributed.broadcast(e, src=0)
             hidden_states = h
@@ -642,7 +824,13 @@ class SpecDistillTrainer:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Teacher forward via HuggingFace (original path)."""
+        """Teacher forward via HuggingFace (original path).
+
+        Extracts 3 aux hidden states from layers [1, N//2-1, N-4] and
+        concatenates them to [B, T, 3*H].  HF ``output_hidden_states``
+        returns index 0 = embedding, index i+1 = layer i output, so the
+        HF indices are [2, N//2, N-3].
+        """
         if self._teacher_model is None:
             raise RuntimeError("Teacher model not loaded.")
 
@@ -665,7 +853,16 @@ class SpecDistillTrainer:
 
                 if hasattr(outputs, "hidden_states") and outputs.hidden_states:
                     all_embeds.append(outputs.hidden_states[0].cpu())
-                    all_hidden.append(outputs.hidden_states[-1].cpu())
+                    # HF hidden_states: [0]=embed, [i+1]=layer_i output
+                    # Aux layers: [1, N//2-1, N-4]
+                    # HF indices: [2, N//2, N-3]
+                    num_layers = len(outputs.hidden_states) - 1
+                    hf_aux_ids = [2, num_layers // 2, num_layers - 3]
+                    aux_concat = torch.cat(
+                        [outputs.hidden_states[i].cpu() for i in hf_aux_ids],
+                        dim=-1,
+                    )  # [micro_B, T, 3*H]
+                    all_hidden.append(aux_concat)
                 else:
                     raise RuntimeError(
                         "Teacher model did not return hidden_states."
@@ -683,32 +880,82 @@ class SpecDistillTrainer:
     # Draft model train step
     # ------------------------------------------------------------------
 
+    def _debug_sync(self, tag: str, step: int) -> None:
+        """Sync GPU and log checkpoint for crash debugging."""
+        torch.cuda.synchronize()
+        mem_alloc = torch.cuda.memory_allocated() / 1e9
+        mem_res = torch.cuda.memory_reserved() / 1e9
+        logger.warning("[rank %d] DEBUG step=%d checkpoint: %s OK (%.1fG/%.1fG)", self._rank, step, tag, mem_alloc, mem_res)
+
+    def _install_backward_hooks(self) -> None:
+        """Register backward hooks on each submodule of the draft model for crash debugging."""
+        if getattr(self, "_bwd_hooks_installed", False):
+            return
+        self._bwd_hooks_installed = True
+        rank = self._rank
+
+        def _make_hook(name):
+            def hook(module, grad_input, grad_output):
+                torch.cuda.synchronize()
+                mem = torch.cuda.memory_allocated() / 1e9
+                logger.warning("[rank %d] BWD hook: %s OK (%.1fG)", rank, name, mem)
+            return hook
+
+        model = self._draft_model
+        for name, mod in model.named_modules():
+            if name == "":
+                continue
+            mod.register_full_backward_hook(_make_hook(name))
+        logger.warning("[rank %d] Installed backward debug hooks on draft model", rank)
+
     def _train_step_eagle3(
         self,
         teacher_data: dict[str, torch.Tensor],
         attention_mask: torch.Tensor,
     ) -> dict[str, float]:
-        """Eagle3 draft model training step."""
-        self._draft_model.train()
-
-        token_embeds = teacher_data["token_embeds"].to(self._device)
-        teacher_hidden = teacher_data["hidden_states"].to(self._device)
+        """Eagle3 draft model training step (single micro-batch)."""
+        step = self.global_step
+        draft_dtype = next(self._draft_model.parameters()).dtype
+        aux_hidden = teacher_data["hidden_states"].to(device=self._device, dtype=draft_dtype)  # [B, T, 3*H]
         input_ids = teacher_data["input_ids"].to(self._device)
-        lm_head_w = self._lm_head_weight.to(self._device)
+        lm_head_w = self._lm_head_weight.to(device=self._device, dtype=draft_dtype)
+        embed_w = self._embed_weight.to(device=self._device, dtype=draft_dtype)
+        token_embeds = torch.nn.functional.embedding(input_ids, embed_w)
         loss_mask = attention_mask.to(self._device)
+        spec_cfg = self.config.algorithm.spec_distill
+        self._debug_sync("data_to_gpu", step)
+
+        target_hs = teacher_data.get("last_hidden_states")
+        if target_hs is not None:
+            target_hs = target_hs.to(device=self._device, dtype=draft_dtype)
+            # Mask out positions where teacher produced NaN hidden states
+            nan_mask = torch.isnan(target_hs).any(dim=-1)  # [B, T]
+            if nan_mask.any():
+                nan_count = nan_mask.sum().item()
+                loss_mask = loss_mask.clone()
+                loss_mask[:, :nan_mask.shape[1]][nan_mask] = 0
+                target_hs = target_hs.nan_to_num_(0.0)
+                logger.warning("Masked %d teacher NaN positions from loss", nan_count)
+            # vLLM returns pre-norm hidden states; apply teacher's final RMSNorm
+            if self._norm_weight is not None:
+                nw = self._norm_weight.to(device=self._device, dtype=draft_dtype)
+                ths_f32 = target_hs.float()
+                variance = ths_f32.pow(2).mean(-1, keepdim=True)
+                target_hs = (ths_f32 * torch.rsqrt(variance + self._norm_eps)).to(draft_dtype) * nw
+        self._debug_sync("rmsnorm_target", step)
 
         result = self._draft_model(
             token_embeds=token_embeds,
-            teacher_hidden=teacher_hidden,
-            lm_head_weight=lm_head_w,
+            aux_hidden_states=aux_hidden,
+            teacher_lm_head_weight=lm_head_w,
+            embed_weight=embed_w,
             loss_mask=loss_mask,
             target_ids=input_ids,
+            loss_type=spec_cfg.loss_type,
+            target_hidden_states=target_hs,
         )
+        self._debug_sync("draft_forward", step)
 
-        if "losses" not in result or not result["losses"]:
-            return {"loss": 0.0}
-
-        spec_cfg = self.config.algorithm.spec_distill
         total_loss = torch.tensor(0.0, device=self._device)
         metrics: dict[str, float] = {}
 
@@ -721,7 +968,12 @@ class SpecDistillTrainer:
             metrics[f"step_{i}_acc"] = float(step_acc.detach())
 
         num_accum = getattr(self, "_grad_accum_steps", 1)
-        (total_loss / num_accum).backward()
+        scaled_loss = total_loss / num_accum
+        if self._grad_scaler is not None:
+            self._grad_scaler.scale(scaled_loss).backward()
+        else:
+            scaled_loss.backward()
+        self._debug_sync("backward", step)
         metrics["loss"] = float(total_loss.detach())
         return metrics
 
@@ -730,9 +982,7 @@ class SpecDistillTrainer:
         teacher_data: dict[str, torch.Tensor],
         attention_mask: torch.Tensor,
     ) -> dict[str, float]:
-        """DFlash draft model training step."""
-        self._draft_model.train()
-
+        """DFlash draft model training step (single micro-batch)."""
         teacher_hidden = teacher_data["hidden_states"].to(self._device)
         input_ids = teacher_data["input_ids"].to(self._device)
         lm_head_w = self._lm_head_weight.to(self._device)
@@ -774,9 +1024,19 @@ class SpecDistillTrainer:
                 cb.on_train_begin(self)
 
         total_steps = int(self.config.num_training_steps)
+        logger.info("[rank %d] SpecDistill train loop: total_steps=%d", self._rank, total_steps)
         spec_cfg = self.config.algorithm.spec_distill
         draft_type = spec_cfg.draft_type.lower()
-        micro_bs = max(1, int(self.config.policy.train_micro_batch_size))
+
+        use_vllm = self.config.algorithm.teacher.inference_backend == "vllm"
+        prefetcher = _TeacherPrefetcher(self) if (use_vllm and self._rank == 0) else None
+
+        if prefetcher is not None:
+            prefetcher.prefetch(0)
+            if total_steps > 1:
+                prefetcher.prefetch(1)
+
+        self._install_backward_hooks()
 
         for step in range(total_steps):
             step_start = time.time()
@@ -785,40 +1045,78 @@ class SpecDistillTrainer:
                 for cb in self.callbacks:
                     cb.on_step_begin(self, step)
 
-            # Phase 1: Get dataset sequences
-            input_ids, attention_mask = self._get_batch_sequences(step)
-
-            # Phase 2: Teacher forward (no grad) -> hidden states
             t0 = time.time()
-            teacher_data = self._teacher_forward(input_ids, attention_mask)
+            if prefetcher is not None:
+                rank0_data, input_ids, attention_mask = prefetcher.get()
+                teacher_data = self._teacher_broadcast(rank0_data, input_ids)
+            else:
+                input_ids, attention_mask = self._get_batch_sequences(step)
+                teacher_data = self._teacher_forward(input_ids, attention_mask)
             teacher_time = time.time() - t0
+            self._debug_sync("teacher_broadcast", step)
 
-            # Phase 3: Draft model training
+            if prefetcher is not None and step + 2 < total_steps:
+                prefetcher.prefetch(step + 2)
+
             t1 = time.time()
-            self._grad_accum_steps = 1
+            B = teacher_data["input_ids"].shape[0]
+            T = teacher_data["input_ids"].shape[1]
+            adaptive_mb = max(1, 16384 // max(T, 1))
+            mb = max(1, min(adaptive_mb, B))
+            num_accum = (B + mb - 1) // mb
+            self._grad_accum_steps = num_accum
             self._optimizer.zero_grad(set_to_none=True)
 
-            if draft_type == "eagle3":
-                metrics = self._train_step_eagle3(teacher_data, attention_mask)
-            else:
-                metrics = self._train_step_dflash(teacher_data, attention_mask)
+            metrics_accum: dict[str, float] = {}
+            accum_count = 0
+            self._draft_model.train()
+
+            for mb_start in range(0, B, mb):
+                mb_end = min(mb_start + mb, B)
+                mb_teacher = {k: v[mb_start:mb_end] for k, v in teacher_data.items()}
+                mb_mask = attention_mask[mb_start:mb_end]
+
+                if draft_type == "eagle3":
+                    m = self._train_step_eagle3(mb_teacher, mb_mask)
+                else:
+                    m = self._train_step_dflash(mb_teacher, mb_mask)
+
+                for k, v in m.items():
+                    if isinstance(v, float) and v == v:
+                        metrics_accum[k] = metrics_accum.get(k, 0.0) + v
+                accum_count += 1
+
+            metrics = {k: v / accum_count for k, v in metrics_accum.items()}
+
+            if self._grad_scaler is not None:
+                self._grad_scaler.unscale_(self._optimizer)
 
             nan_count = 0
-            for p in self._draft_model.parameters():
+            nan_names = []
+            for name, p in self._draft_model.named_parameters():
                 if p.grad is not None and torch.isnan(p.grad).any():
+                    nan_frac = torch.isnan(p.grad).float().mean().item()
+                    nan_names.append(f"{name}({nan_frac:.3f})")
                     p.grad.zero_()
                     nan_count += 1
             if nan_count > 0:
-                logger.warning("Zeroed NaN grads in %d parameters", nan_count)
+                logger.warning("Zeroed NaN grads in %d params: %s", nan_count, ", ".join(nan_names[:5]))
 
+            self._debug_sync("pre_grad_clip", step)
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 self._draft_model.parameters(),
                 max_norm=self.config.policy.max_grad_norm,
             )
+            self._debug_sync("grad_clip", step)
             if not torch.isfinite(grad_norm):
                 logger.warning("Skipping optimizer step (grad_norm=%s)", grad_norm)
+            elif self._grad_scaler is not None:
+                self._grad_scaler.step(self._optimizer)
             else:
                 self._optimizer.step()
+            self._debug_sync("optimizer_step", step)
+            if self._grad_scaler is not None:
+                self._grad_scaler.update()
             if self._scheduler is not None:
                 self._scheduler.step()
             self._optimizer.zero_grad(set_to_none=True)
@@ -840,6 +1138,7 @@ class SpecDistillTrainer:
                         t, op=torch.distributed.ReduceOp.AVG
                     )
                     metrics[k] = float(t.item())
+            self._debug_sync("all_reduce", step)
 
             self.last_metrics = metrics
 

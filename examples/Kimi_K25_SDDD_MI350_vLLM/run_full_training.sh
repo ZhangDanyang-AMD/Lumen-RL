@@ -32,7 +32,8 @@ export PYTHONUNBUFFERED=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export LUMENRL_LOG_LEVEL=INFO
 export NCCL_TIMEOUT=7200
-export GLOG_minloglevel=1
+export GLOG_minloglevel=3
+export MOONCAKE_LOG_LEVEL=FATAL
 
 OUTPUT_DIR="${REPO_ROOT}/output/Kimi_K25_SDDD_MI350/kimi-k25-eagle3-sglang-mxfp4-mi350"
 mkdir -p "${OUTPUT_DIR}"
@@ -53,16 +54,23 @@ if [ "${PHASE2_ONLY}" = false ]; then
     echo "═══════════════════════════════════════════════════════════════"
 
     PHASE1_LOG="${OUTPUT_DIR}/phase1.log"
-    mkdir -p /dev/shm/checkpoints/kimi_k25_eagle3_vllm_phase1
+    mkdir -p /dev/shm/checkpoints/kimi_k25_eagle3_v2_phase1
 
     CUDA_VISIBLE_DEVICES="${TRAIN_GPUS}" \
         torchrun --nproc_per_node="${NUM_TRAIN_GPUS}" \
             -m lumenrl.trainer.main \
             --config "${SCRIPT_DIR}/configs/phase1_foundation.yaml" \
-            2>&1 | tee "${PHASE1_LOG}"
+            2>&1 | grep --line-buffered -v -E '^[IWEF][0-9]{4} [0-9:.]+\s+[0-9]+ \S+\.(cpp|cc|h):' | tee "${PHASE1_LOG}"
+    PHASE1_EXIT=${PIPESTATUS[0]}
 
-    if [ ${PIPESTATUS[0]} -ne 0 ]; then
-        echo ">>> Phase 1 FAILED." >&2
+    if [ ${PHASE1_EXIT} -ne 0 ]; then
+        echo ">>> Phase 1 FAILED (exit code ${PHASE1_EXIT})." >&2
+        exit 1
+    fi
+    # torchrun may swallow child signal exits (SIGABRT=-6) and return 0.
+    # Double-check by scanning the log for crash markers.
+    if grep -qE '(FAILED|exitcode\s*:\s*-[0-9]+|MEMORY_APERTURE_VIOLATION)' "${PHASE1_LOG}" 2>/dev/null; then
+        echo ">>> Phase 1 FAILED (crash detected in log despite exit code 0)." >&2
         exit 1
     fi
     echo ">>> Phase 1 completed."
@@ -77,21 +85,22 @@ echo "  Hardware: 8x MI350 (4 train + 4 inference)"
 echo "═══════════════════════════════════════════════════════════════"
 
 PHASE2_LOG="${OUTPUT_DIR}/phase2.log"
-mkdir -p /dev/shm/checkpoints/kimi_k25_eagle3_vllm_phase2
+mkdir -p /dev/shm/checkpoints/kimi_k25_eagle3_v2_phase2
 
 CUDA_VISIBLE_DEVICES="${TRAIN_GPUS}" \
     torchrun --nproc_per_node="${NUM_TRAIN_GPUS}" \
         -m lumenrl.trainer.main \
         --config "${SCRIPT_DIR}/configs/phase2_mixed.yaml" \
-        2>&1 | tee "${PHASE2_LOG}"
+        2>&1 | grep --line-buffered -v -E '^[IWEF][0-9]{4} [0-9:.]+\s+[0-9]+ \S+\.(cpp|cc|h):' | tee "${PHASE2_LOG}"
+PHASE2_EXIT=${PIPESTATUS[0]}
 
-if [ ${PIPESTATUS[0]} -ne 0 ]; then
-    echo ">>> Phase 2 FAILED." >&2
+if [ ${PHASE2_EXIT} -ne 0 ]; then
+    echo ">>> Phase 2 FAILED (exit code ${PHASE2_EXIT})." >&2
     exit 1
 fi
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Two-phase training completed! (vLLM+ATOM, MI350)"
-echo "  Phase 1 checkpoint: /dev/shm/checkpoints/kimi_k25_eagle3_vllm_phase1"
-echo "  Phase 2 checkpoint: /dev/shm/checkpoints/kimi_k25_eagle3_vllm_phase2"
+echo "  Phase 1 checkpoint: /dev/shm/checkpoints/kimi_k25_eagle3_v2_phase1"
+echo "  Phase 2 checkpoint: /dev/shm/checkpoints/kimi_k25_eagle3_v2_phase2"
 echo "═══════════════════════════════════════════════════════════════"

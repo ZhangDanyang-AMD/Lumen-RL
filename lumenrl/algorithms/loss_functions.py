@@ -174,7 +174,7 @@ def opd_kl_divergence(
         teacher_logits: Raw logits from the teacher model, ``[B, T, V]`` (detached).
         mask: Optional ``[B, T]`` mask (1 = include token in loss).
         kl_direction: ``"reverse"`` for ``D_KL(student || teacher)`` (DeepSeek-V4),
-            ``"forward"`` for ``D_KL(teacher || student)`` (TorchSpec Eagle3).
+            ``"forward"`` for ``D_KL(teacher || student)`` (Eagle3).
         temperature: Softmax temperature applied to both distributions.
         position_weights: Optional ``[T]`` weights (e.g. ``0.8 ** i``) for
             position-dependent weighting.

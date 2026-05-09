@@ -8,15 +8,13 @@
 #   - Lumen:  Quantized training engine with aiter-patched FSDP2 (uses aiter)
 #
 # Also includes:
-#   - vLLM 0.19.1 + TorchSpec patches (extract_hidden_states + MooncakeHiddenStatesConnector)
+#   - vLLM 0.19.1 + extract_hidden_states patches
 #   - Mooncake Transfer Engine (source-built HIP, TCP)
-#   - TorchSpec (mooncake connectors for vLLM)
-#   - LumenRL (training framework)
+#   - LumenRL (training framework, includes MooncakeHiddenStatesConnector)
 #
-# Build (docker buildx with additional context for TorchSpec):
+# Build:
 #   docker buildx build \
 #       -f examples/Qwen3_8B_SDDD_MI350_vLLM/docker/Dockerfile \
-#       --build-context torchspec=/home/danyzhan/TorchSpec \
 #       -t lumenrl-vllm-mi350:latest .
 #
 # Or use the build script:
@@ -70,8 +68,8 @@ RUN git clone https://github.com/kvcache-ai/Mooncake.git /tmp/mooncake && \
     if [ -n "$SRC_MASTER" ]; then cp -v "$SRC_MASTER" "$SITE/mooncake_master"; fi && \
     rm -rf /tmp/mooncake
 
-# ---- Apply TorchSpec patches to vLLM (extract_hidden_states + MooncakeHiddenStatesConnector) ----
-COPY --from=torchspec patches/vllm/v0.19.1/*.patch /tmp/patches/
+# ---- Apply vLLM patches (extract_hidden_states + CacheOnlyAttentionLayer) ----
+COPY examples/Qwen3_8B_SDDD_MI350_vLLM/docker/patches/vllm/v0.19.1/*.patch /tmp/patches/
 RUN VLLM_DIR=$(python3 -c "import vllm, os; print(os.path.dirname(os.path.dirname(vllm.__file__)))") && \
     cd "$VLLM_DIR" && \
     for p in /tmp/patches/*.patch; do patch -p1 < "$p"; done && \
@@ -94,15 +92,11 @@ COPY third_party/Lumen /root/Lumen
 RUN cd /root/Lumen && pip install --no-deps -e . && \
     echo "Lumen installed: $(python3 -c 'import lumen; print(lumen.__version__)')"
 
-# ---- TorchSpec: mooncake connectors used by vLLM's MooncakeHiddenStatesConnector ----
-COPY --from=torchspec . /root/torchspec
-RUN cd /root/torchspec && pip install --no-deps -e . && \
+# ---- LumenRL: training framework (includes MooncakeHiddenStatesConnector) ----
+COPY . /root/lumenrl
+RUN cd /root/lumenrl && pip install --no-deps -e . && \
     pip install --no-cache-dir omegaconf ray accelerate wandb pyzmq qwen-vl-utils \
     datasets transformers huggingface_hub safetensors pydantic openai numba
-
-# ---- LumenRL: training framework ----
-COPY . /root/lumenrl
-RUN cd /root/lumenrl && pip install --no-deps -e .
 
 # ---- Uninstall SGLang if present (not needed for vLLM path) ----
 RUN pip uninstall -y sglang sglkernel 2>/dev/null || true

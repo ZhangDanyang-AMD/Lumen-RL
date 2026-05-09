@@ -60,7 +60,7 @@ quantization:
 reward:
   type: function
   function: math_reward
-  dataset: /home/danyzhan/TorchSpec/examples/data/sample_conversations.jsonl
+  dataset: /root/lumenrl/examples/Qwen3_8B_SDDD_MI350_vLLM/data/sample_conversations.jsonl
 
 checkpointing:
   checkpoint_dir: results/qwen3_8b_spec_distill_vllm

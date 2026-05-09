@@ -4,16 +4,16 @@ Architecture aligned with lightseekorg/kimi-k2.5-eagle3:
 - Trained weights in float16
 - Base model weights (embed_tokens, lm_head) in bfloat16
 - No bias in any layer
-- config: attention_bias=false, rms_norm_eps=1e-6, rope_theta=1000000, rope_scaling=YaRN(64)
+- config: attention_bias=false, rms_norm_eps=1e-6, rope_theta=1000000
 """
 import torch
 import json
 import os
 from safetensors.torch import save_file
 
-CKPT_PATH = "/dev/shm/checkpoints/kimi_k25_eagle3_v2_phase2/checkpoint_65000.pt"
+CKPT_PATH = "/dev/shm/checkpoints/kimi_k25_eagle3_v2_phase1/checkpoint_110000.pt"
 BASE_MODEL_DIR = "/dev/shm/Kimi-K2.5-BF16"
-OUTPUT_DIR = "/root/lumenrl/output/Kimi_K25_eagle3_v2_HF"
+OUTPUT_DIR = "/dev/shm/Kimi_K25_eagle3_v2_phase1_HF"
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -127,15 +127,7 @@ config = {
     "num_key_value_heads": 64,
     "pretraining_tp": 1,
     "rms_norm_eps": 1e-06,
-    "rope_scaling": {
-        "type": "yarn",
-        "factor": 64.0,
-        "original_max_position_embeddings": 4096,
-        "beta_fast": 32.0,
-        "beta_slow": 1.0,
-        "mscale": 1.0,
-        "mscale_all_dim": 1.0,
-    },
+    "rope_scaling": None,
     "rope_theta": 1000000.0,
     "sliding_window": None,
     "tie_word_embeddings": False,
@@ -191,7 +183,7 @@ Final checkpoint at step {step}.
 - attention_bias: false
 - rms_norm_eps: 1e-6
 - rope_theta: 1000000.0
-- rope_scaling: YaRN (factor=64)
+- rope_scaling: none
 - dtype: float16 (trained weights), bfloat16 (embed_tokens, lm_head)
 """
 with open(os.path.join(OUTPUT_DIR, "README.md"), "w") as f:

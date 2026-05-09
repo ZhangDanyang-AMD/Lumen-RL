@@ -119,7 +119,7 @@ class OPDConfig:
 
 @dataclass
 class SpecDistillConfig:
-    """Speculative Decoding draft model distillation (TorchSpec style)."""
+    """Speculative Decoding draft model distillation."""
     draft_type: str = "eagle3"
     loss_type: str = "forward_kl"
     position_decay: float = 0.8
@@ -156,7 +156,18 @@ class DraftModelConfig:
     head_dim: Optional[int] = None
     num_layers: Optional[int] = None
     num_heads: Optional[int] = None
+    num_kv_heads: Optional[int] = None
     ffn_dim: Optional[int] = None
+    rms_norm_eps: float = 1e-6
+    rope_theta: float = 1000000.0
+    rope_scaling_type: Optional[str] = None
+    rope_scaling_factor: float = 64.0
+    rope_original_max_pos: int = 4096
+    rope_beta_fast: float = 32.0
+    rope_beta_slow: float = 1.0
+    rope_mscale: float = 1.0
+    rope_mscale_all_dim: float = 1.0
+    dtype: str = "float16"
     resume_from: Optional[str] = None
 
 
@@ -185,6 +196,9 @@ class TrainingQuantConfig:
     fp8: Optional[str] = None
     fp8_recipe: str = "blockwise"
     fp8_weight_cache: bool = False
+    lumen_norm: bool = False
+    lumen_linear: bool = False
+    hf_attn_patch: bool = False
 
 
 @dataclass

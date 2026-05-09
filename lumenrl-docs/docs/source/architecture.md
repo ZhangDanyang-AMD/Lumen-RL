@@ -52,7 +52,7 @@ For MoE models, `R3Manager` coordinates `RouterRecorder` on the inference side a
 
 ## SDDD pipeline
 
-For Speculative Decoding Draft Distillation, LumenRL splits GPUs between teacher inference and draft model training. The teacher model runs on ATOM/SGLang/vLLM with quantized inference (MXFP4/FP8), while the Eagle3/DFlash draft model trains via FSDP2 on separate GPUs. Hidden states are transferred between the two GPU groups via Mooncake (async RDMA/TCP for SGLang) or MORI-IO (GPU Direct P2P RDMA for ATOM). The pipeline is powered by [TorchSpec](https://github.com/lightseekorg/TorchSpec). Details: {doc}`/advance/sddd` and {doc}`/examples/sddd_training`.
+For Speculative Decoding Draft Distillation, LumenRL splits GPUs between teacher inference and draft model training. The teacher model runs on ATOM/SGLang/vLLM with quantized inference (MXFP4/FP8), while the Eagle3/DFlash draft model trains via FSDP2 on separate GPUs. Hidden states are transferred between the two GPU groups via Mooncake (async RDMA/TCP for SGLang) or MORI-IO (GPU Direct P2P RDMA for ATOM). Details: {doc}`/advance/sddd` and {doc}`/examples/sddd_training`.
 
 ## Repository layout
 
