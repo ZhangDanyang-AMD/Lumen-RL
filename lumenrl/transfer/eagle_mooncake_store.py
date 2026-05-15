@@ -1,6 +1,6 @@
 """Eagle3 Mooncake store for speculative decoding hidden state transfer.
 
-Integrated from TorchSpec's EagleMooncakeStore. Provides async RDMA/TCP
+Eagle3 Mooncake store. Provides async RDMA/TCP
 transfers of hidden states between SGLang inference and FSDP2 training.
 """
 

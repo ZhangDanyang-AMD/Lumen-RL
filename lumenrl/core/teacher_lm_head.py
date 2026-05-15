@@ -2,7 +2,7 @@
 
 Loads only the teacher's ``lm_head`` (and optionally final layer norm) so that
 full-vocabulary logits can be reconstructed on the training side without loading
-the entire teacher model.  Adapted from TorchSpec's ``TargetLMHead``.
+the entire teacher model.
 """
 
 from __future__ import annotations

@@ -1,9 +1,9 @@
-# Phase 1: Foundation Training (aligned with TorchSpec/lightseekorg recipe) — MI350
+# Phase 1: Foundation Training (v2, aligned with lightseekorg/kimi-k2.5-eagle3) — MI350
 #
 # Dataset: perfectblend subset (~296K samples) from kimi-mtp-dataset
-# Steps: 111,012 (3 epochs × 296034/8)
+# Steps: 111,012 (3 epochs × 296034/8, batch_size=8)
 # Teacher: moonshotai/Kimi-K2.5 BF16, compressed-tensors INT4 (vLLM native, TP=4, GPUs 4-7)
-# Draft: Eagle3, 1-layer Transformer, from scratch (FSDP2+aiter, GPUs 0-3)
+# Draft: Eagle3 v2, 1-layer Transformer, from scratch (FSDP2, float16, GPUs 0-3)
 # Transfer: Mooncake TCP
 # Hardware: 8x AMD MI350
 
@@ -17,7 +17,6 @@ policy:
   generation_backend: hf
   max_total_sequence_length: 20000
   train_global_batch_size: 8
-  train_micro_batch_size: 2
   learning_rate: 5e-5
   weight_decay: 0.0
   max_grad_norm: 1.0
@@ -41,7 +40,18 @@ algorithm:
     from_scratch: true
     num_layers: 1
     num_heads: 64
+    head_dim: 128
     ffn_dim: 12288
+    rms_norm_eps: 1e-6
+    rope_theta: 50000.0
+    rope_scaling_type: yarn
+    rope_scaling_factor: 64.0
+    rope_original_max_pos: 4096
+    rope_beta_fast: 32.0
+    rope_beta_slow: 1.0
+    rope_mscale: 1.0
+    rope_mscale_all_dim: 1.0
+    dtype: bfloat16
 
 mooncake:
   protocol: tcp
@@ -52,6 +62,9 @@ mooncake:
 quantization:
   training:
     fp8: null
+    lumen_norm: false
+    lumen_linear: false
+    hf_attn_patch: false
   rollout_correction:
     enabled: false
 
@@ -61,8 +74,8 @@ reward:
   dataset: /dev/shm/kimi-mtp-dataset-phase1/train.jsonl
 
 checkpointing:
-  checkpoint_dir: /dev/shm/checkpoints/kimi_k25_eagle3_vllm_phase1
-  save_steps: 5000
+  checkpoint_dir: /dev/shm/checkpoints/kimi_k25_eagle3_v2_phase1
+  save_steps: 1000
   save_total_limit: 3
   resume: true
 

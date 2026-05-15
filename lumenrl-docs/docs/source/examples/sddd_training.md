@@ -59,7 +59,6 @@ tail -f /datasets/checkpoints/kimi_k25_eagle3_phase1/phase1.log
 
 ## References
 
-- [TorchSpec](https://github.com/lightseekorg/TorchSpec) — Draft distillation framework
 - [lightseekorg/kimi-k2.5-eagle3](https://huggingface.co/lightseekorg/kimi-k2.5-eagle3) — Training recipe
 - [KimiV2.5 Technical Report](https://arxiv.org/abs/2505.01759)
 

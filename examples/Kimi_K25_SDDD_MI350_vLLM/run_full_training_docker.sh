@@ -3,7 +3,7 @@
 # Kimi K2.5 Eagle3 Two-Phase Training — Docker Launch (vLLM+ATOM, MI350)
 #
 # Uses self-contained Docker image with:
-#   - vLLM 0.19.1 + TorchSpec patches (extract_hidden_states + MooncakeHiddenStatesConnector)
+#   - vLLM 0.19.1 + extract_hidden_states patches
 #   - ATOM (vLLM plugin, MXFP4 online quantization) from third_party/ATOM
 #   - AITER (GPU kernels, shared by ATOM and LumenRL) from third_party/aiter
 #   - LumenRL (FSDP2 training, aiter-patched) from third_party/Lumen
@@ -26,7 +26,7 @@ for arg in "$@"; do
 done
 
 DOCKER_IMAGE="${DOCKER_IMAGE:-lumenrl-vllm-mi350:latest}"
-CONTAINER_NAME="kimi_k25_eagle3_vllm_training_mi350"
+CONTAINER_NAME="kimi_k25_eagle3_v2_phase1"
 
 LUMENRL_DIR="/home/danyzhan/Lumen-RL"
 
@@ -76,11 +76,17 @@ docker run --rm \
     -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     -e LUMENRL_LOG_LEVEL=INFO \
     -e NCCL_TIMEOUT=7200 \
-    -e GLOG_minloglevel=1 \
+    -e GLOG_minloglevel=3 \
+    -e MOONCAKE_LOG_LEVEL=FATAL \
     -e WANDB_MODE=disabled \
     -e HF_TOKEN="${HF_TOKEN:-}" \
+    --log-opt max-size=500m \
+    --log-opt max-file=2 \
     -v /dev/shm:/dev/shm \
+    -v "${LUMENRL_DIR}/lumenrl:/root/lumenrl/lumenrl" \
+    -v "${LUMENRL_DIR}/examples:/root/lumenrl/examples" \
     -v "${LUMENRL_DIR}/output:/root/lumenrl/output" \
+    -v "${LUMENRL_DIR}/third_party/Lumen/lumen:/root/Lumen/lumen" \
     -w /root/lumenrl \
     "${DOCKER_IMAGE}" \
     bash -c "${RUN_CMD}"

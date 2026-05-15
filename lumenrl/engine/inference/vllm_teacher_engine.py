@@ -1,9 +1,9 @@
 """vLLM + ATOM teacher engine for speculative distillation.
 
 Launches a teacher model in a subprocess using vLLM with ATOM plugin
-(auto-registered via pip entry points). TorchSpec's vLLM patches enable
+(auto-registered via pip entry points). Patched vLLM enables
 ``extract_hidden_states`` speculative mode: the engine captures hidden
-states during prefill and stores them to **Mooncake** via the
+states during prefill and stores them to **Mooncake** via LumenRL's
 ``MooncakeHiddenStatesConnector``.  The training process reads them
 via ``EagleMooncakeStore.get()``.
 
@@ -20,7 +20,7 @@ Architecture::
     EagleMooncakeStore
 
 Requires:
-    - vLLM with TorchSpec patches (extract_hidden_states + MooncakeHiddenStatesConnector)
+    - vLLM with extract_hidden_states patches
     - ATOM pip-installed (auto-registers as vLLM platform/model plugin)
     - Mooncake Transfer Engine (RDMA or TCP)
 """
@@ -97,8 +97,10 @@ hf_config_text = getattr(hf_config, "text_config", hf_config)
 hidden_size = getattr(hf_config_text, "hidden_size", None)
 num_layers = getattr(hf_config_text, "num_hidden_layers", 32)
 
-# Aux layer IDs: early, mid, near-end (Eagle3 convention from TorchSpec)
-aux_layer_ids = [1, num_layers // 2 - 1, num_layers - 4]
+# Aux layer IDs in vLLM convention (capture-before-layer).
+# vLLM captures input to [2, N//2, N-3] which yields the same hidden state
+# as hooking layer output at [1, N//2-1, N-4].
+aux_layer_ids = [2, num_layers // 2, num_layers - 3]
 logger.info("Model: %s, hidden=%d, layers=%d, aux_layers=%s",
             model_path, hidden_size, num_layers, aux_layer_ids)
 
@@ -115,7 +117,11 @@ engine_kwargs = dict(
     distributed_executor_backend="mp",
     disable_custom_all_reduce=True,
     enable_prefix_caching=False,
+    enforce_eager=True,
     max_model_len=max_seq_len,
+    max_num_batched_tokens=max_seq_len,
+    max_num_seqs=8,
+    gpu_memory_utilization=0.80,
     speculative_config={
         "method": "extract_hidden_states",
         "num_speculative_tokens": 1,
@@ -128,7 +134,7 @@ engine_kwargs = dict(
     kv_transfer_config={
         "kv_connector": "MooncakeHiddenStatesConnector",
         "kv_connector_module_path": (
-            "torchspec.inference.engine.mooncake_hidden_states_connector"
+            "lumenrl.engine.inference.mooncake_hidden_states_connector"
         ),
         "kv_role": "kv_producer",
     },
@@ -202,19 +208,29 @@ for line in cmd_f:
         input_path = msg["input_path"]
         data = torch.load(input_path, map_location="cpu", weights_only=True)
         input_ids = data["input_ids"]
+        attention_mask = data.get("attention_mask", None)
 
         B, T = input_ids.shape
         req_counter += 1
 
-        # Build prompts for vLLM (token IDs as prompt_token_ids)
-        prompts = [{"prompt_token_ids": input_ids[i].tolist()} for i in range(B)]
-
-        results = llm.generate(prompts, sampling_params, use_tqdm=False)
+        # Strip padding using attention_mask so vLLM only processes real tokens.
+        # Use bool indexing — works regardless of left or right padding.
+        unpadded_prompts = []
+        for i in range(B):
+            if attention_mask is not None:
+                ids = input_ids[i][attention_mask[i].bool()].tolist()
+            else:
+                ids = input_ids[i].tolist()
+            unpadded_prompts.append({"prompt_token_ids": ids})
 
         mooncake_keys = []
         tensor_shapes_list = []
         tensor_dtypes_list = []
         seq_lens = []
+
+        # Send all sequences at once — vLLM continuous batching handles
+        # variable-length prefill efficiently without padding waste.
+        results = llm.generate(unpadded_prompts, sampling_params, use_tqdm=False)
 
         for i, output in enumerate(results):
             kv_params = getattr(output, "kv_transfer_params", None)
@@ -268,7 +284,7 @@ class VllmTeacherEngine:
     Launches vLLM in a subprocess on dedicated inference GPUs.
     ATOM auto-registers as a vLLM plugin via pip entry points, providing
     MXFP4 online quantization through AITER kernels on ROCm.
-    TorchSpec patches enable extract_hidden_states mode: hidden states are
+    Patched vLLM enables extract_hidden_states mode: hidden states are
     stored to Mooncake by MooncakeHiddenStatesConnector, and the training
     process fetches them via ``EagleMooncakeStore.get()``.
     """
@@ -328,6 +344,8 @@ class VllmTeacherEngine:
 
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in self._gpu_ids)
+        env.pop("HIP_VISIBLE_DEVICES", None)
+        env.pop("ROCR_VISIBLE_DEVICES", None)
         env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
         for key in list(env.keys()):
             if any(key.startswith(p) for p in [
@@ -378,6 +396,22 @@ class VllmTeacherEngine:
             )
             env["MOONCAKE_ENABLE_GPU_DIRECT"] = "0"
             env["MOONCAKE_ENABLE_HARD_PIN"] = "0"
+
+            try:
+                from transformers import AutoConfig as _AC
+                _hf = _AC.from_pretrained(self._model_name, trust_remote_code=True)
+                _hf_text = getattr(_hf, "text_config", _hf)
+                _hdim = getattr(_hf_text, "hidden_size", 4096)
+            except Exception:
+                _hdim = 4096
+            from lumenrl.transfer.eagle_mooncake_store import calculate_eagle3_buffer_size
+            vllm_host_buf = calculate_eagle3_buffer_size(
+                max_seq_len=self._max_seq_len, batch_size=1,
+                hidden_dim=_hdim, safety_margin=2.0,
+            )
+            env["MOONCAKE_HOST_BUFFER_SIZE"] = str(vllm_host_buf)
+            logger.info("MOONCAKE_HOST_BUFFER_SIZE for vLLM subprocess: %d (%.1fGB)",
+                        vllm_host_buf, vllm_host_buf / 1024**3)
 
             logger.info(
                 "Mooncake env vars for vLLM subprocess: local=%s, master=%s, "
@@ -458,6 +492,8 @@ class VllmTeacherEngine:
                     device_name=getattr(mc, "device_name", ""),
                     global_segment_size=getattr(mc, "global_segment_size", "16GB"),
                     local_buffer_size=getattr(mc, "local_buffer_size", "4GB"),
+                    max_seq_len=self._max_seq_len,
+                    hidden_dim=self._hidden_size,
                 )
                 self._mooncake_store = EagleMooncakeStore(mc_cfg)
                 self._mooncake_store.setup(self._local_device)
@@ -488,16 +524,18 @@ class VllmTeacherEngine:
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
+        recv_device: torch.device | None = None,
     ) -> dict[str, torch.Tensor]:
         """Run teacher forward via vLLM and fetch hidden states from Mooncake.
 
         Args:
             input_ids: ``[B, T]`` token ids.
             attention_mask: ``[B, T]`` mask (1 = valid, 0 = pad).
+            recv_device: Device for received tensors. Defaults to local GPU.
 
         Returns:
-            Dict with ``hidden_states`` ``[B, T, D]``,
-            ``token_embeds`` ``[B, T, D]`` (first aux layer),
+            Dict with ``hidden_states`` ``[B, T, 3*D]`` (3 concatenated aux layers),
+            ``token_embeds`` ``[B, T, D]`` (first aux layer as embed proxy),
             and ``input_ids``.
         """
         if not self.is_alive:
@@ -526,16 +564,22 @@ class VllmTeacherEngine:
         tensor_dtypes_list = resp["tensor_dtypes"]
         seq_lens = resp["seq_lens"]
 
-        concat_hidden_size = num_aux * hidden_size
+        # MooncakeHiddenStatesConnector splits aux layers: first N-1 → _hs,
+        # last → _lhs.  We retrieve both and concatenate to [T, N*H].
+        training_hidden_size = max(num_aux - 1, 1) * hidden_size
 
         all_hidden = []
         all_embeds = []
         all_ids = []
+        all_last_hs = []
+
+        if recv_device is None:
+            recv_device = self._local_device
 
         for i, key in enumerate(mooncake_keys):
             seq_len = seq_lens[i]
             shapes = {
-                "hidden_states": (seq_len, concat_hidden_size),
+                "hidden_states": (seq_len, training_hidden_size),
                 "input_ids": (seq_len,),
                 "last_hidden_states": (seq_len, hidden_size),
             }
@@ -547,15 +591,18 @@ class VllmTeacherEngine:
 
             if self._mooncake_store is not None:
                 output = self._mooncake_store.get(
-                    key, shapes, dtypes, device=self._local_device,
+                    key, shapes, dtypes, device=recv_device,
                 )
-                hs_concat = output.hidden_states
-                last_hs = output.last_hidden_states if output.last_hidden_states is not None else hs_concat[:, -hidden_size:]
-                first_aux = hs_concat[:, :hidden_size]
+                hs_training = output.hidden_states      # [T, (N-1)*H]
+                hs_last = output.last_hidden_states      # [T, H]
+                hs_concat = torch.cat([hs_training, hs_last], dim=-1)  # [T, N*H]
 
-                all_hidden.append(last_hs.unsqueeze(0))
-                all_embeds.append(first_aux.unsqueeze(0))
+                all_hidden.append(hs_concat.unsqueeze(0))  # [1, T, N*H]
+                all_embeds.append(
+                    hs_training[:, :hidden_size].unsqueeze(0)  # first aux as embed proxy
+                )
                 all_ids.append(output.input_ids.unsqueeze(0))
+                all_last_hs.append(hs_last.unsqueeze(0))  # [1, T, H]
 
                 self._mooncake_store.remove_eagle3_tensors(
                     key, has_last_hidden_states=True, has_target=False,
@@ -566,14 +613,30 @@ class VllmTeacherEngine:
                     "requires Mooncake for hidden state transfer."
                 )
 
-        hidden_states = torch.cat(all_hidden, dim=0).to(self._local_device)
-        token_embeds = torch.cat(all_embeds, dim=0).to(self._local_device)
-        ret_ids = torch.cat(all_ids, dim=0).to(self._local_device)
+        # Pad variable-length results to max seq_len for batched training.
+        max_T = max(seq_lens)
+        D_hidden = all_hidden[0].shape[-1]
+        D_embed = all_embeds[0].shape[-1]
+        D_last = all_last_hs[0].shape[-1]
+        B_out = len(all_hidden)
+
+        hidden_states = torch.zeros(B_out, max_T, D_hidden, dtype=torch.bfloat16, device=recv_device)
+        token_embeds = torch.zeros(B_out, max_T, D_embed, dtype=torch.bfloat16, device=recv_device)
+        ret_ids = torch.zeros(B_out, max_T, dtype=torch.int64, device=recv_device)
+        last_hidden_states = torch.zeros(B_out, max_T, D_last, dtype=torch.bfloat16, device=recv_device)
+
+        for i in range(B_out):
+            slen = seq_lens[i]
+            hidden_states[i, :slen] = all_hidden[i].squeeze(0)
+            token_embeds[i, :slen] = all_embeds[i].squeeze(0)
+            ret_ids[i, :slen] = all_ids[i].squeeze(0)
+            last_hidden_states[i, :slen] = all_last_hs[i].squeeze(0)
 
         return {
             "hidden_states": hidden_states,
             "token_embeds": token_embeds,
             "input_ids": ret_ids,
+            "last_hidden_states": last_hidden_states,
         }
 
     def get_lm_head_weight(self) -> torch.Tensor:
@@ -613,6 +676,98 @@ class VllmTeacherEngine:
                 )
             logger.info("lm_head.weight loaded: %s", tuple(self._lm_head_weight.shape))
         return self._lm_head_weight
+
+    def get_embed_weight(self) -> torch.Tensor:
+        """Return the teacher's embed_tokens.weight (lazy-loaded from safetensors)."""
+        if not hasattr(self, "_embed_weight") or self._embed_weight is None:
+            from safetensors import safe_open
+            import json as _json
+
+            model_dir = self._model_name
+            idx_path = os.path.join(model_dir, "model.safetensors.index.json")
+            if not os.path.exists(idx_path):
+                from huggingface_hub import hf_hub_download
+                idx_path = hf_hub_download(model_dir, "model.safetensors.index.json")
+                model_dir = os.path.dirname(idx_path)
+
+            with open(idx_path) as f:
+                weight_map = _json.load(f)["weight_map"]
+
+            self._embed_weight = None
+            for key in ["model.embed_tokens.weight",
+                        "language_model.model.embed_tokens.weight",
+                        "embed_tokens.weight"]:
+                if key in weight_map:
+                    shard = weight_map[key]
+                    shard_path = os.path.join(model_dir, shard)
+                    if not os.path.exists(shard_path):
+                        from huggingface_hub import hf_hub_download
+                        shard_path = hf_hub_download(self._model_name, shard)
+                    with safe_open(shard_path, framework="pt", device="cpu") as sf:
+                        self._embed_weight = sf.get_tensor(key).to(torch.bfloat16)
+                    break
+
+            if self._embed_weight is None:
+                raise KeyError(
+                    f"embed_tokens.weight not found in {idx_path}. "
+                    f"Available keys with 'embed': "
+                    f"{[k for k in weight_map if 'embed' in k.lower()]}"
+                )
+            logger.info("embed_tokens.weight loaded: %s", tuple(self._embed_weight.shape))
+        return self._embed_weight
+
+    def get_norm_weight(self) -> tuple[torch.Tensor, float]:
+        """Return (norm_weight, rms_norm_eps) from the teacher model.
+
+        vLLM extract_hidden_states returns pre-norm hidden states.
+        These are needed to norm them before computing teacher logits.
+        """
+        if not hasattr(self, "_norm_weight") or self._norm_weight is None:
+            from safetensors import safe_open
+            import json as _json
+
+            model_dir = self._model_name
+            idx_path = os.path.join(model_dir, "model.safetensors.index.json")
+            if not os.path.exists(idx_path):
+                from huggingface_hub import hf_hub_download
+                idx_path = hf_hub_download(model_dir, "model.safetensors.index.json")
+                model_dir = os.path.dirname(idx_path)
+
+            with open(idx_path) as f:
+                weight_map = _json.load(f)["weight_map"]
+
+            self._norm_weight = None
+            for key in ["model.norm.weight",
+                        "language_model.model.norm.weight",
+                        "norm.weight"]:
+                if key in weight_map:
+                    shard = weight_map[key]
+                    shard_path = os.path.join(model_dir, shard)
+                    if not os.path.exists(shard_path):
+                        from huggingface_hub import hf_hub_download
+                        shard_path = hf_hub_download(self._model_name, shard)
+                    with safe_open(shard_path, framework="pt", device="cpu") as sf:
+                        self._norm_weight = sf.get_tensor(key).to(torch.bfloat16)
+                    break
+
+            if self._norm_weight is None:
+                raise KeyError(
+                    f"norm.weight not found in {idx_path}. "
+                    f"Available keys with 'norm': "
+                    f"{[k for k in weight_map if 'norm' in k.lower()]}"
+                )
+
+            cfg_path = os.path.join(self._model_name, "config.json")
+            self._rms_norm_eps = 1e-6
+            if os.path.exists(cfg_path):
+                with open(cfg_path) as f:
+                    cfg = _json.load(f)
+                tc = cfg.get("text_config", cfg)
+                self._rms_norm_eps = tc.get("rms_norm_eps", 1e-6)
+
+            logger.info("norm.weight loaded: %s, eps=%e",
+                        tuple(self._norm_weight.shape), self._rms_norm_eps)
+        return self._norm_weight, self._rms_norm_eps
 
     def shutdown(self) -> None:
         """Terminate the vLLM subprocess and clean up."""

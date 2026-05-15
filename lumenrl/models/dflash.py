@@ -1,6 +1,6 @@
 """DFlash draft model for speculative decoding.
 
-Adapted from TorchSpec's DFlashModel.  DFlash uses multi-layer teacher hidden
+DFlash draft model.  DFlash uses multi-layer teacher hidden
 states with anchor sampling and block-causal masking.
 
 Architecture

@@ -2,8 +2,8 @@
 
 Launches a teacher model in a subprocess using SGLang Engine with ATOM
 plugin (``SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models``).
-TorchSpec's SGLang patches enable spec_training mode: the engine captures
-hidden states during prefill and stores them to **Mooncake RDMA**.
+Patched SGLang enables spec_training mode: the engine captures hidden
+states during prefill and stores them to **Mooncake RDMA**.
 The training process reads them via ``MooncakeStore.get_tensors()``.
 
 Architecture::
@@ -19,7 +19,7 @@ Architecture::
     MooncakeStore
 
 Requires:
-    - SGLang with TorchSpec spec_training patches applied
+    - SGLang with spec_training patches applied
     - ATOM installed (provides optimized Aiter kernels via plugin)
     - Mooncake Transfer Engine (RDMA or TCP)
 """
@@ -96,7 +96,7 @@ if hidden_size is None:
         hidden_size = getattr(text_config, "hidden_size", None)
 num_layers = getattr(hf_config, "num_hidden_layers", 32)
 
-# Aux layer IDs: early, mid, near-end (Eagle3 convention from TorchSpec)
+# Aux layer IDs: early, mid, near-end (Eagle3 convention)
 aux_layer_ids = [1, num_layers // 2 - 1, num_layers - 4]
 logger.info("Model: %s, hidden=%d, layers=%d, aux_layers=%s",
             model_path, hidden_size, num_layers, aux_layer_ids)
@@ -253,7 +253,7 @@ class SglangTeacherEngine:
 
     Launches SGLang Engine in a subprocess on dedicated inference GPUs.
     ATOM provides optimized Aiter kernels via its SGLang plugin.
-    TorchSpec patches enable spec_training_mooncake: hidden states are
+    Patched SGLang enables spec_training_mooncake: hidden states are
     stored directly to Mooncake RDMA by SGLang, and the training process
     fetches them via ``MooncakeStore.get_tensors()``.
     """

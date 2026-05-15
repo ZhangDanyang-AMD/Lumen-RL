@@ -52,15 +52,6 @@ Following the [lightseekorg recipe](https://huggingface.co/lightseekorg/kimi-k2.
 | Kimi K2.5 (1T MoE) | Eagle3 | SGLang+ATOM / vLLM | Mooncake / MORI |
 | Qwen3-8B | Eagle3 | vLLM | MORI |
 
-## Integration with TorchSpec
-
-SDDD is powered by [TorchSpec](https://github.com/lightseekorg/TorchSpec), which provides:
-
-- Eagle3 and DFlash model definitions and training loops
-- Dataset processing and hidden-state extraction
-- Integration with SGLang and vLLM inference backends
-- Checkpoint management for multi-phase training
-
 ## Example Configurations
 
 See the runnable examples:
