@@ -258,7 +258,7 @@
   Step 140-149: acc <span class="val">16.3%</span> avg |
   Step 150-159: acc <span class="val">15.6%</span> avg |
   Step 160-169 block in progress.
-  Step 163: acc <span class="val">21.1%</span>, respLen <span class="val">1648</span> (2nd consecutive 20%+ step, grad 0.17 low). Step 164 in progress.
+  Step 164: acc <span class="val">11.7%</span>, respLen <span class="val">1720</span> (grad 0.74 spike again, acc crashed from 21.1%). Step 165 in progress.
 </div>
 
 <div class="charts">
@@ -486,6 +486,7 @@ const DATA = [
   { step: 161, acc: 0.132812, reward: -0.734375, loss: 0.03564, grad: 0.2478, mkl: -0.000009, lr: 1e-6, genTok: 1387.13, genS: 2044.93, trainS: 479.71, stepS: 2760.06, respLen: 1846.74, syncS: 66.67, time: "May15 05:38" },
   { step: 162, acc: 0.233073, reward: -0.533854, loss: 0.01818, grad: 0.2056, mkl: -0.000289, lr: 1e-6, genTok: 1281.54, genS: 1841.46, trainS: 452.21, stepS: 2516.37, respLen: 1536.40, syncS: 69.91, time: "May15 06:22" },
   { step: 163, acc: 0.210938, reward: -0.578125, loss: 0.03377, grad: 0.1674, mkl: 0.000036, lr: 1e-6, genTok: 1354.86, genS: 1868.54, trainS: 445.97, stepS: 2547.75, respLen: 1648.19, syncS: 69.80, time: "May15 07:05" },
+  { step: 164, acc: 0.117187, reward: -0.765625, loss: 0.05549, grad: 0.7383, mkl: -0.000359, lr: 1e-6, genTok: 1267.40, genS: 2084.67, trainS: 533.97, stepS: 2876.19, respLen: 1720.13, syncS: 68.01, time: "May15 07:54" },
 ];
 
 
@@ -557,7 +558,7 @@ DATA.forEach(d => {
   tbody.appendChild(tr);
 });
 
-document.getElementById('updateTs').textContent = 'Last updated: 2026-05-15 07:07 UTC | Run 20 (resumed from ckpt_110) | Step 163/275 (59.3%) | Peak 24.7% (step 105) | Step 163: 21.1% acc, 1648 respLen';
+document.getElementById('updateTs').textContent = 'Last updated: 2026-05-15 08:37 UTC | Run 20 (resumed from ckpt_110) | Step 164/275 (59.6%) | Peak 24.7% (step 105) | Step 164: 11.7% acc, 1720 respLen';
 
 const chartDefaults = {
   responsive: true,
