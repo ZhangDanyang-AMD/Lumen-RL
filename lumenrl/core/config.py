@@ -71,6 +71,9 @@ class PolicyConfig:
     ppo_mini_batch_size: int = 0
     learning_rate: float = 1e-6
     lr_warmup_steps: int = 10
+    weight_decay: float = 0.01
+    max_grad_norm: float = 1.0
+    warmup_ratio: float = 0.0
 
 
 @dataclass
@@ -106,11 +109,81 @@ class PPOConfig:
 
 
 @dataclass
+class OPDConfig:
+    """On-Policy Distillation (DeepSeek-V4 style)."""
+    kl_direction: str = "reverse"
+    temperature: float = 1.0
+    position_weighting: bool = False
+    position_decay: float = 0.8
+    opd_coeff: float = 1.0
+    lazy_logits: bool = True
+    teacher_micro_batch_size: int = 4
+
+
+@dataclass
+class SpecDistillConfig:
+    """Speculative Decoding draft model distillation."""
+    draft_type: str = "eagle3"
+    loss_type: str = "forward_kl"
+    position_decay: float = 0.8
+    loss_decay_gamma: float = 7.0
+    num_target_layers: int = 1
+    aux_hidden_state_layer_ids: Optional[list[int]] = None
+    anchor_num: int = 512
+    spec_length: int = 5
+
+
+@dataclass
+class TeacherConfig:
+    """Teacher / target model configuration."""
+    model_name: str = ""
+    lm_head_key: str = "lm_head.weight"
+    norm_key: str = "model.norm.weight"
+    load_norm: bool = False
+    inference_backend: str = "hf"           # "hf" | "atom" | "sglang" | "vllm"
+    quantization: str = ""                  # "" | "fp8" | "fp4" | "mxfp4"
+    tensor_parallel_size: int = 1           # ATOM tensor parallelism
+    gpu_ids: Optional[list[int]] = None     # GPUs for ATOM inference
+    # MORI-IO P2P RDMA for GPU-direct hidden state transfer
+    mori_io_host: str = "127.0.0.1"         # OOB communication address
+    mori_io_port: int = 0                   # 0 = auto-assign
+    mori_io_qp_per_transfer: int = 2        # RDMA queue pairs per transfer
+    atom_plugin: bool = False               # Use ATOM as SGLang model plugin
+
+
+@dataclass
+class DraftModelConfig:
+    """Draft model (student) configuration for speculative distillation."""
+    model_name: str = ""
+    from_scratch: bool = False
+    head_dim: Optional[int] = None
+    num_layers: Optional[int] = None
+    num_heads: Optional[int] = None
+    num_kv_heads: Optional[int] = None
+    ffn_dim: Optional[int] = None
+    rms_norm_eps: float = 1e-6
+    rope_theta: float = 1000000.0
+    rope_scaling_type: Optional[str] = None
+    rope_scaling_factor: float = 64.0
+    rope_original_max_pos: int = 4096
+    rope_beta_fast: float = 32.0
+    rope_beta_slow: float = 1.0
+    rope_mscale: float = 1.0
+    rope_mscale_all_dim: float = 1.0
+    dtype: str = "float16"
+    resume_from: Optional[str] = None
+
+
+@dataclass
 class AlgorithmConfig:
     name: str = AlgorithmName.GRPO.value
     grpo: GRPOConfig = field(default_factory=GRPOConfig)
     dapo: DAPOConfig = field(default_factory=DAPOConfig)
     ppo: PPOConfig = field(default_factory=PPOConfig)
+    opd: OPDConfig = field(default_factory=OPDConfig)
+    spec_distill: SpecDistillConfig = field(default_factory=SpecDistillConfig)
+    teacher: TeacherConfig = field(default_factory=TeacherConfig)
+    draft: DraftModelConfig = field(default_factory=DraftModelConfig)
 
 
 @dataclass
@@ -129,6 +202,8 @@ class TrainingQuantConfig:
     lumen_norm: bool = False
     fused_mlp: bool = False
     fused_rope: bool = False
+    lumen_linear: bool = False
+    hf_attn_patch: bool = False
 
 
 @dataclass
@@ -191,6 +266,24 @@ class LoggerConfig:
 
 
 @dataclass
+class MooncakeTransferConfig:
+    """Mooncake distributed KV store for hidden state transfer."""
+    master_server_address: Optional[str] = None
+    metadata_server: Optional[str] = None
+    local_hostname: str = ""
+    protocol: str = "rdma"
+    device_name: str = ""
+    global_segment_size: str = "16GB"
+    local_buffer_size: str = "4GB"
+    host_buffer_size: int = 536870912   # 512 MB
+    gpu_buffer_size: int = 536870912
+    async_put_pool_size: int = 4
+    enable_gpu_direct: bool = False
+    enable_hard_pin: bool = False
+    kv_lease_ttl_s: float = 5.0
+
+
+@dataclass
 class AsyncTrainingConfig:
     """Configuration for fully-async separated rollout + training."""
     enabled: bool = False
@@ -217,6 +310,7 @@ class LumenRLConfig:
     moe: MoEConfig = field(default_factory=MoEConfig)
     checkpointing: CheckpointConfig = field(default_factory=CheckpointConfig)
     logger: LoggerConfig = field(default_factory=LoggerConfig)
+    mooncake: MooncakeTransferConfig = field(default_factory=MooncakeTransferConfig)
     async_training: AsyncTrainingConfig = field(default_factory=AsyncTrainingConfig)
     num_training_steps: int = 1000
     seed: int = 42

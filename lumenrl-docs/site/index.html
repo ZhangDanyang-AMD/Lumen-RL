@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>LumenRL — RL Post-Training for LLMs on AMD GPUs</title>
+<title>LumenRL — AMD Native Post-Training Framework for LLMs</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700;9..40,800&display=swap" rel="stylesheet">
@@ -197,7 +197,7 @@ footer .links{margin-top:12px;display:flex;gap:24px;justify-content:center;flex-
       <a href="#features" class="desktop-only" onclick="showHome()">Features</a>
       <a href="#arch" class="desktop-only" onclick="showHome()">Architecture</a>
       <a href="#quickstart" class="desktop-only" onclick="showHome()">Quick Start</a>
-      <a href="#algorithms" class="desktop-only" onclick="showHome()">Algorithms</a>
+      <a href="#status" class="desktop-only" onclick="showHome()">Status</a>
       <a href="https://github.com/ZhangDanyang-AMD/Lumen-RL">GitHub</a>
     </div>
   </div>
@@ -210,13 +210,14 @@ footer .links{margin-top:12px;display:flex;gap:24px;justify-content:center;flex-
 
 <section class="hero">
   <div class="wrap">
-    <h1><em>LumenRL</em><br>RL Post-Training<br>for LLMs</h1>
-    <p class="sub">FP8 quantized rollout &amp; training, MoE R3 router alignment, GRPO / DAPO / PPO &mdash; built for AMD Instinct GPUs with Lumen + ATOM.</p>
+    <h1><em>LumenRL</em><br>AMD Native Post-Training<br>Framework for LLMs</h1>
+    <p class="sub">RL post-training (GRPO / DAPO / PPO) &amp; Speculative Decoding Draft Distillation (SDDD) &mdash; built for AMD Instinct GPUs with Lumen + ATOM + TorchSpec.</p>
     <div class="pill-row">
-      <span class="pill"><i style="background:var(--amd-red)"></i>FP8 E4M3 / MXFP8</span>
+      <span class="pill"><i style="background:var(--amd-red)"></i>FP8 / MXFP8 / MXFP4</span>
       <span class="pill"><i style="background:var(--lime)"></i>AITER Kernels</span>
       <span class="pill"><i style="background:var(--cyan)"></i>R3 MoE Routing</span>
-      <span class="pill"><i style="background:var(--amber)"></i>MI300X &bull; MI355X</span>
+      <span class="pill"><i style="background:var(--violet)"></i>SDDD Eagle3</span>
+      <span class="pill"><i style="background:var(--amber)"></i>MI300X &bull; MI350X</span>
     </div>
     <div class="btns">
       <a class="btn btn-red" href="#" onclick="showDocs();navigateDoc('install');return false">Get Started</a>
@@ -230,7 +231,7 @@ footer .links{margin-top:12px;display:flex;gap:24px;justify-content:center;flex-
   <div class="wrap">
     <p class="stitle">// capabilities</p>
     <h2 class="htitle">Key Features</h2>
-    <p class="hsub">Everything you need for high-performance RL post-training on AMD GPUs</p>
+    <p class="hsub">Everything you need for high-performance post-training on AMD GPUs</p>
     <div class="fgrid">
       <div class="fcard">
         <div class="ic" style="background:rgba(237,28,36,0.12);color:var(--amd-red)">&#9889;</div>
@@ -239,8 +240,8 @@ footer .links{margin-top:12px;display:flex;gap:24px;justify-content:center;flex-
       </div>
       <div class="fcard">
         <div class="ic" style="background:rgba(0,229,255,0.1);color:var(--cyan)">&#9881;</div>
-        <h3>FP8 End-to-End</h3>
-        <p>FP8 W8A8 rollout plus FP8 training with blockwise, MXFP8, or per-tensor scaling. Rollout correction via TIS/MIS for train-inference alignment.</p>
+        <h3>Quantization End-to-End</h3>
+        <p>Quantized rollout (FP8, MXFP8, MXFP4) plus quantized training with blockwise or per-tensor scaling. Rollout correction via TIS/MIS for train-inference alignment.</p>
       </div>
       <div class="fcard">
         <div class="ic" style="background:rgba(184,255,87,0.1);color:var(--lime)">&#9650;</div>
@@ -249,13 +250,13 @@ footer .links{margin-top:12px;display:flex;gap:24px;justify-content:center;flex-
       </div>
       <div class="fcard">
         <div class="ic" style="background:rgba(167,139,250,0.1);color:var(--violet)">&#9850;</div>
-        <h3>Flexible Backends</h3>
-        <p>FSDP2 or Megatron-Core for training with Lumen FP8. ATOM for rollout with tensor, expert, and data parallelism.</p>
+        <h3>SDDD (Draft Distillation)</h3>
+        <p>Train Eagle3/DFlash draft models via teacher hidden-state distillation with Mooncake/MORI RDMA transfer and TorchSpec.</p>
       </div>
       <div class="fcard">
         <div class="ic" style="background:rgba(251,191,36,0.1);color:var(--amber)">&#9783;</div>
-        <h3>GRPO &bull; DAPO &bull; PPO</h3>
-        <p>Clipped surrogate, asymmetric clip, and value-based objectives with group-relative baselines and GAE-Lambda.</p>
+        <h3>Flexible Backends</h3>
+        <p>FSDP2 or Megatron-Core training. ATOM / SGLang / vLLM inference with tensor, expert, and data parallelism.</p>
       </div>
       <div class="fcard">
         <div class="ic" style="background:rgba(255,255,255,0.05);color:var(--text-dim)">&#9879;</div>
@@ -270,19 +271,20 @@ footer .links{margin-top:12px;display:flex;gap:24px;justify-content:center;flex-
   <div class="wrap">
     <p class="stitle">// system design</p>
     <h2 class="htitle">Architecture</h2>
-    <p class="hsub">Ray controller orchestrates ATOM inference and Lumen training, connected by DataProto</p>
+    <p class="hsub">Ray / Mooncake / MORI orchestrate ATOM inference, Lumen training, and SDDD pipelines via DataProto</p>
     <div class="arch-box">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 680">
         <rect width="960" height="680" rx="12" fill="#0a0a0f"/>
         <text x="480" y="28" text-anchor="middle" fill="#8b8ba0" font-size="10" font-weight="700" font-family="monospace" letter-spacing="3">LUMENRL ARCHITECTURE</text>
         <rect x="30" y="44" width="900" height="48" rx="8" fill="none" stroke="#a78bfa" stroke-width="1.2" stroke-dasharray="4,3"/>
-        <text x="480" y="62" text-anchor="middle" fill="#a78bfa" font-size="9" font-weight="700" font-family="monospace" letter-spacing="2">RL ALGORITHMS</text>
-        <text x="240" y="80" text-anchor="middle" fill="#e8e8ef" font-size="13" font-weight="700" font-family="system-ui">GRPO</text>
-        <text x="480" y="80" text-anchor="middle" fill="#e8e8ef" font-size="13" font-weight="700" font-family="system-ui">DAPO</text>
-        <text x="720" y="80" text-anchor="middle" fill="#e8e8ef" font-size="13" font-weight="700" font-family="system-ui">PPO</text>
+        <text x="480" y="62" text-anchor="middle" fill="#a78bfa" font-size="9" font-weight="700" font-family="monospace" letter-spacing="2">RL ALGORITHMS  &middot;  SDDD</text>
+        <text x="168" y="80" text-anchor="middle" fill="#e8e8ef" font-size="13" font-weight="700" font-family="system-ui">GRPO</text>
+        <text x="384" y="80" text-anchor="middle" fill="#e8e8ef" font-size="13" font-weight="700" font-family="system-ui">DAPO</text>
+        <text x="576" y="80" text-anchor="middle" fill="#e8e8ef" font-size="13" font-weight="700" font-family="system-ui">PPO</text>
+        <text x="792" y="80" text-anchor="middle" fill="#fbbf24" font-size="13" font-weight="700" font-family="system-ui">SDDD</text>
         <line x1="480" y1="92" x2="480" y2="108" stroke="#5e5e74" stroke-width="1.2"/><polygon points="480,112 476,106 484,106" fill="#5e5e74"/>
         <rect x="30" y="112" width="900" height="68" rx="8" fill="#12121a" stroke="#1976d2" stroke-width="1.2"/>
-        <text x="480" y="130" text-anchor="middle" fill="#42a5f5" font-size="9" font-weight="700" font-family="monospace" letter-spacing="2">RAY CONTROLLER</text>
+        <text x="480" y="130" text-anchor="middle" fill="#42a5f5" font-size="9" font-weight="700" font-family="monospace" letter-spacing="2">RAY / MOONCAKE / MORI  &middot;  ORCHESTRATION</text>
         <rect x="50" y="138" width="130" height="30" rx="5" fill="#1a237e" stroke="#42a5f5" stroke-width="1"/><text x="115" y="158" text-anchor="middle" fill="#90caf9" font-size="10" font-weight="600" font-family="system-ui">RLTrainer</text>
         <rect x="195" y="138" width="130" height="30" rx="5" fill="#1a237e" stroke="#42a5f5" stroke-width="1"/><text x="260" y="158" text-anchor="middle" fill="#90caf9" font-size="10" font-weight="600" font-family="system-ui">DataManager</text>
         <rect x="340" y="138" width="130" height="30" rx="5" fill="#1a237e" stroke="#42a5f5" stroke-width="1"/><text x="405" y="158" text-anchor="middle" fill="#90caf9" font-size="10" font-weight="600" font-family="system-ui">WorkerGroups</text>
@@ -326,7 +328,7 @@ footer .links{margin-top:12px;display:flex;gap:24px;justify-content:center;flex-
         <line x1="480" y1="544" x2="480" y2="562" stroke="#5e5e74" stroke-width="1.2"/><polygon points="480,566 476,560 484,560" fill="#5e5e74"/>
         <rect x="30" y="566" width="900" height="48" rx="8" fill="none" stroke="#d32f2f" stroke-width="1.2"/>
         <text x="480" y="584" text-anchor="middle" fill="#ef5350" font-size="9" font-weight="700" font-family="monospace" letter-spacing="2">HARDWARE</text>
-        <text x="480" y="602" text-anchor="middle" fill="#e8e8ef" font-size="14" font-weight="700" font-family="system-ui">AMD Instinct MI300X / MI355X &mdash; ROCm</text>
+        <text x="480" y="602" text-anchor="middle" fill="#e8e8ef" font-size="14" font-weight="700" font-family="system-ui">AMD Instinct MI300X / MI350X / MI355X &mdash; ROCm</text>
         <text x="480" y="644" text-anchor="middle" fill="#5e5e74" font-size="9" font-style="italic" font-family="system-ui">All cross-worker communication via DataProto &bull; Ray-orchestrated &bull; AMD-native</text>
       </svg>
     </div>
@@ -403,14 +405,15 @@ bash examples/DAPO/run_1d_fp8_e2e_blockwise.sh</pre>
 <section class="tbl-section bg-raised" id="algorithms">
   <div class="wrap">
     <p class="stitle">// algorithms</p>
-    <h2 class="htitle">RL Algorithms</h2>
-    <p class="hsub">Policy optimization objectives under <code>lumenrl/algorithms/</code></p>
+    <h2 class="htitle">Algorithms</h2>
+    <p class="hsub">RL policy optimization and speculative decoding draft distillation</p>
     <table class="tbl">
-      <thead><tr><th>Algorithm</th><th>Source</th><th>Loss</th><th>Advantages</th></tr></thead>
+      <thead><tr><th>Algorithm</th><th>Category</th><th>Method</th><th>Key Feature</th></tr></thead>
       <tbody>
-        <tr><td>GRPO</td><td><code>grpo.py</code></td><td>Clipped Surrogate</td><td><span class="tag tag-l">Group-relative</span></td></tr>
-        <tr><td>DAPO</td><td><code>dapo.py</code></td><td>Asymmetric Clip</td><td><span class="tag tag-g">Group-relative + Dynamic Sampling</span></td></tr>
-        <tr><td>PPO</td><td><code>ppo.py</code></td><td>Clipped Surrogate + Value</td><td><span class="tag tag-v">GAE-Lambda</span></td></tr>
+        <tr><td>GRPO</td><td><span class="tag tag-l">RL</span></td><td>Clipped Surrogate</td><td><span class="tag tag-l">Group-relative advantages</span></td></tr>
+        <tr><td>DAPO</td><td><span class="tag tag-l">RL</span></td><td>Asymmetric Clip</td><td><span class="tag tag-g">Dynamic Sampling</span></td></tr>
+        <tr><td>PPO</td><td><span class="tag tag-l">RL</span></td><td>Clipped Surrogate + Value</td><td><span class="tag tag-v">GAE-Lambda</span></td></tr>
+        <tr><td>SDDD</td><td><span class="tag tag-a">Distillation</span></td><td>Hidden-state Distillation</td><td><span class="tag tag-a">Eagle3 / DFlash via TorchSpec</span></td></tr>
       </tbody>
     </table>
   </div>
@@ -420,8 +423,9 @@ bash examples/DAPO/run_1d_fp8_e2e_blockwise.sh</pre>
   <div class="wrap">
     <p class="stitle">// models</p>
     <h2 class="htitle">Supported Models</h2>
-    <p class="hsub">Dense and MoE architectures with FP8 rollout, FP8 training, and R3 router alignment</p>
-    <table class="tbl">
+    <p class="hsub">RL models with quantized rollout and R3, plus SDDD draft distillation targets</p>
+    <h3 style="color:var(--text-dim);font-size:13px;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:12px;font-family:var(--mono)">RL Models</h3>
+    <table class="tbl" style="margin-bottom:28px">
       <thead><tr><th>Model</th><th>Architecture</th><th>Type</th><th>FP8</th><th>R3</th></tr></thead>
       <tbody>
         <tr><td>Llama 3.x</td><td><code>LlamaForCausalLM</code></td><td>Dense</td><td><span class="tag tag-g">Yes</span></td><td>&mdash;</td></tr>
@@ -429,40 +433,50 @@ bash examples/DAPO/run_1d_fp8_e2e_blockwise.sh</pre>
         <tr><td>Qwen3-MoE</td><td><code>Qwen3MoeForCausalLM</code></td><td>MoE</td><td><span class="tag tag-g">Yes</span></td><td><span class="tag tag-v">Yes</span></td></tr>
         <tr><td>DeepSeek V2/V3</td><td><code>DeepseekV3ForCausalLM</code></td><td>MoE</td><td><span class="tag tag-g">Yes</span></td><td><span class="tag tag-v">Yes</span></td></tr>
         <tr><td>Mixtral</td><td><code>MixtralForCausalLM</code></td><td>MoE</td><td><span class="tag tag-g">Yes</span></td><td><span class="tag tag-v">Yes</span></td></tr>
+        <tr><td>GLM-4-MoE</td><td><code>Glm4MoeForCausalLM</code></td><td>MoE</td><td><span class="tag tag-g">Yes</span></td><td><span class="tag tag-v">Yes</span></td></tr>
+      </tbody>
+    </table>
+    <h3 style="color:var(--text-dim);font-size:13px;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:12px;font-family:var(--mono)">SDDD Models</h3>
+    <table class="tbl">
+      <thead><tr><th>Teacher Model</th><th>Draft Architecture</th><th>Inference Backend</th><th>Transfer</th></tr></thead>
+      <tbody>
+        <tr><td>Kimi K2.5 (1T MoE)</td><td>Eagle3</td><td>SGLang+ATOM / vLLM</td><td><span class="tag tag-a">Mooncake / MORI</span></td></tr>
+        <tr><td>Qwen3-8B</td><td>Eagle3</td><td>vLLM</td><td><span class="tag tag-a">MORI</span></td></tr>
       </tbody>
     </table>
   </div>
 </section>
 
-<section class="exp" id="experiments">
+<section class="exp" id="status">
   <div class="wrap">
-    <p class="stitle">// experiments</p>
-    <h2 class="htitle">FP8 Alignment Experiments</h2>
-    <p class="hsub">DAPO on Qwen3-8B-Base, 8&times; MI350X &mdash; FP8 training alignment benchmarks</p>
+    <p class="stitle">// dashboards</p>
+    <h2 class="htitle">Models Train Status</h2>
+    <p class="hsub">Training dashboards with live metrics, loss curves, and performance data</p>
     <div class="exp-grid">
       <div class="ecard">
-        <h3>1A &mdash; BF16 Baseline</h3>
-        <p>Pure BF16 training + BF16 rollout. Reference curve for all FP8 comparisons.</p>
-        <pre>bash examples/DAPO/run_1a_bf16_baseline.sh</pre>
+        <h3>Kimi K2.5 Eagle3 &mdash; Phase 1</h3>
+        <p>SDDD phase 1 foundation training on general corpus.</p>
+        <pre><a href="dashboards/SDDD/Kimi_K25_SDDD_MI350/phase1.html" target="_blank" style="color:var(--cyan)">Open Dashboard &rarr;</a></pre>
       </div>
       <div class="ecard">
-        <h3>1B &mdash; FP8 Rollout + TIS</h3>
-        <p>BF16 training + FP8 rollout with token-level importance sampling.</p>
-        <pre>bash examples/DAPO/run_1b_fp8_rollout_tis.sh</pre>
+        <h3>Kimi K2.5 Eagle3 &mdash; Phase 2</h3>
+        <p>SDDD phase 2 mixed-domain fine-tuning.</p>
+        <pre><a href="dashboards/SDDD/Kimi_K25_SDDD_MI350/phase2.html" target="_blank" style="color:var(--cyan)">Open Dashboard &rarr;</a></pre>
       </div>
       <div class="ecard">
-        <h3>1D &mdash; FP8 E2E Blockwise</h3>
-        <p>Full Lumen FP8 training (blockwise 128) + FP8 rollout + TIS.</p>
-        <pre>bash examples/DAPO/run_1d_fp8_e2e_blockwise.sh</pre>
+        <h3>Qwen3-8B DAPO &mdash; Sync</h3>
+        <p>Synchronous DAPO training with BF16 baseline.</p>
+        <pre><a href="dashboards/DAPO/Qwen3-8B-Base_BF16_DAPO-Sync.html" target="_blank" style="color:var(--cyan)">Open Dashboard &rarr;</a></pre>
       </div>
       <div class="ecard">
-        <h3>1F &mdash; FP8 E2E Per-Tensor</h3>
-        <p>Lumen FP8 per-tensor delayed scaling. Coarsest granularity.</p>
-        <pre>bash examples/DAPO/run_1f_fp8_e2e_per_tensor.sh</pre>
+        <h3>Qwen3-8B DAPO &mdash; Async</h3>
+        <p>Fully-async DAPO training with overlapped rollout.</p>
+        <pre><a href="dashboards/DAPO/Qwen3-8B-Base_BF16_DAPO-Async.html" target="_blank" style="color:var(--cyan)">Open Dashboard &rarr;</a></pre>
       </div>
       <div class="ecard full">
-        <h3>Full Experiment Matrix</h3>
-        <p>Includes MXFP8 sweep (block=32/64/128), attention FP8, and optimizer sweep across Qwen3-8B, Qwen3-30B-A3B-Base, and Qwen3-30B-A3B. See the <a href="https://github.com/ZhangDanyang-AMD/Lumen-RL/blob/main/examples/DAPO/README.md">DAPO README</a> and the <a href="https://github.com/ZhangDanyang-AMD/Lumen/blob/dev/RL/outputs/fp8_training_alignment/FP8_TRAINING_ALIGNMENT_PLAN.md">FP8 Training Alignment Plan</a>.</p>
+        <h3>BF16 Sync Baseline</h3>
+        <p>1a-bf16-sync configuration &mdash; synchronous BF16 training baseline for comparison.</p>
+        <pre><a href="dashboards/1a-bf16-sync/dashboard.html" target="_blank" style="color:var(--cyan)">Open Dashboard &rarr;</a></pre>
       </div>
     </div>
   </div>
@@ -493,13 +507,20 @@ bash examples/DAPO/run_1d_fp8_e2e_blockwise.sh</pre>
     <a class="sidebar-link" data-doc="ex_ppo" onclick="navigateDoc('ex_ppo')">PPO Training</a>
     <a class="sidebar-link" data-doc="ex_fp8" onclick="navigateDoc('ex_fp8')">FP8 Training</a>
     <a class="sidebar-link" data-doc="ex_moe" onclick="navigateDoc('ex_moe')">MoE R3 Training</a>
+    <a class="sidebar-link" data-doc="ex_sddd" onclick="navigateDoc('ex_sddd')">SDDD Training</a>
   </div>
   <div class="sidebar-group">
     <div class="sidebar-group-title">Advanced</div>
-    <a class="sidebar-link" data-doc="adv_fp8" onclick="navigateDoc('adv_fp8')">FP8 Quantization</a>
+    <a class="sidebar-link" data-doc="adv_fp8" onclick="navigateDoc('adv_fp8')">Quantization</a>
     <a class="sidebar-link" data-doc="adv_moe" onclick="navigateDoc('adv_moe')">MoE R3</a>
+    <a class="sidebar-link" data-doc="adv_sddd" onclick="navigateDoc('adv_sddd')">SDDD</a>
     <a class="sidebar-link" data-doc="adv_dist" onclick="navigateDoc('adv_dist')">Distributed Training</a>
+    <a class="sidebar-link" data-doc="adv_async" onclick="navigateDoc('adv_async')">Async Training</a>
     <a class="sidebar-link" data-doc="adv_algo" onclick="navigateDoc('adv_algo')">Algorithms</a>
+  </div>
+  <div class="sidebar-group">
+    <div class="sidebar-group-title">Models Train Status</div>
+    <a class="sidebar-link" data-doc="status" onclick="navigateDoc('status')">Training Dashboards</a>
   </div>
   <div class="sidebar-group">
     <div class="sidebar-group-title">API Reference</div>
@@ -523,7 +544,7 @@ bash examples/DAPO/run_1d_fp8_e2e_blockwise.sh</pre>
 <tr><td>Python</td><td>&gt;= 3.10</td></tr>
 <tr><td>PyTorch</td><td>&gt;= 2.4 (ROCm build recommended)</td></tr>
 <tr><td>ROCm</td><td>&gt;= 6.2</td></tr>
-<tr><td>GPU</td><td>AMD Instinct MI250 or MI300 series</td></tr>
+<tr><td>GPU</td><td>AMD Instinct MI250, MI300, or MI350 series</td></tr>
 </tbody></table>
 <div class="callout info"><strong>Note:</strong> Match your PyTorch wheel to the ROCm version on the host or inside the container. Mismatched userspace stacks are the most common source of runtime failures on AMD clusters.</div>
 
@@ -557,6 +578,8 @@ pip install -e "."</pre>
 <tr><td><a href="https://github.com/ROCm/aiter">AITER</a></td><td><code>amd-aiter</code></td><td>Low-level GPU kernels (attention, GEMM, MoE, norm)</td></tr>
 <tr><td><a href="https://github.com/ROCm/mori">MORI</a></td><td><code>mori</code></td><td>RDMA-aware GPU collectives and MoE expert dispatch</td></tr>
 <tr><td><a href="https://github.com/ray-project/ray">Ray</a></td><td><code>ray</code></td><td>Controller/worker orchestration and resource placement</td></tr>
+<tr><td><a href="https://github.com/lightseekorg/TorchSpec">TorchSpec</a></td><td><code>torchspec</code></td><td>Speculative decoding draft distillation (Eagle3, DFlash)</td></tr>
+<tr><td><a href="https://github.com/kvcache-ai/Mooncake">Mooncake</a></td><td><code>mooncake</code></td><td>Async RDMA/TCP hidden-state transport for SDDD</td></tr>
 </tbody></table>
 
 <h2>Verify Installation</h2>
@@ -635,12 +658,32 @@ COMMAND="python examples/run_grpo_moe.py \
     moe.r3.enabled=true"
 
 sbatch --nodes=$NUM_NODES --gres=gpu:8 scripts/ray.sub</pre>
+
+<h2>Run SDDD (Eagle3 Draft Distillation)</h2>
+<p>Train an Eagle3 draft model for Qwen3-8B via teacher hidden-state distillation:</p>
+<pre>torchrun --nproc_per_node=8 -m lumenrl.sddd.train \
+  --config configs/sddd_qwen3_8b.yaml</pre>
+<pre>sddd:
+  teacher_model: Qwen/Qwen3-8B
+  draft_architecture: eagle3
+  inference_backend: vllm
+  transfer_backend: mori
+  teacher_quantization: fp8
+  num_distill_steps: 5000</pre>
+<p>For Kimi K2.5 with Mooncake RDMA transfer across GPU groups, see the <a href="#" onclick="navigateDoc('ex_sddd'); return false;">SDDD Training Example</a>.</p>
+
+<h2>Where to Go Next</h2>
+<ul>
+<li><strong>RL examples</strong> &mdash; <a href="#" onclick="navigateDoc('ex_grpo'); return false;">GRPO</a>, <a href="#" onclick="navigateDoc('ex_dapo'); return false;">DAPO</a>, <a href="#" onclick="navigateDoc('ex_ppo'); return false;">PPO</a></li>
+<li><strong>SDDD</strong> &mdash; <a href="#" onclick="navigateDoc('adv_sddd'); return false;">SDDD Guide</a> and <a href="#" onclick="navigateDoc('ex_sddd'); return false;">SDDD Training Example</a></li>
+<li><strong>Advanced</strong> &mdash; <a href="#" onclick="navigateDoc('adv_fp8'); return false;">Quantization</a>, <a href="#" onclick="navigateDoc('adv_moe'); return false;">MoE R3</a>, <a href="#" onclick="navigateDoc('adv_async'); return false;">Async Training</a></li>
+</ul>
 </div>
 
 <!-- ─── ARCHITECTURE ─── -->
 <div class="doc-section" id="doc-architecture">
 <h1>Architecture</h1>
-<p>LumenRL follows a controller/worker split: a Ray driver owns scheduling and batching, while specialized workers host ATOM inference, policy training, reference models, rewards, and critics. All cross-worker payloads are <code>DataProto</code> batches.</p>
+<p>LumenRL is an AMD native Post-Training Framework for LLMs that supports both <strong>RL post-training</strong> and <strong>Speculative Decoding Draft Distillation (SDDD)</strong>. It follows a controller/worker split: a Ray driver owns scheduling and batching, while specialized workers host ATOM/SGLang/vLLM inference, policy training, reference models, rewards, and critics. For SDDD, Mooncake/MORI RDMA transfers connect teacher inference GPUs with draft model training GPUs. All cross-worker payloads are <code>DataProto</code> batches&mdash;tensor dictionaries with small metadata sidecars&mdash;so the same protocol works for dense models, quantized paths (FP8, MXFP8, MXFP4), and MoE with R3 side channels.</p>
 
 <h2>Ray Controller</h2>
 <p>The controller (<code>lumenrl/controller/</code>) connects Ray clusters, builds worker groups, and dispatches <code>DataProto</code> batches. It handles: bootstrapping Ray, grouping GPUs into actor/rollout/ref/reward/critic pools, and sequencing the RL outer loop: generate &rarr; score &rarr; ref/KL &rarr; train.</p>
@@ -660,12 +703,15 @@ sbatch --nodes=$NUM_NODES --gres=gpu:8 scripts/ray.sub</pre>
 
 <h2>Engine Layer</h2>
 <ul>
-<li><strong>ATOM inference</strong> &mdash; wraps generation, KV-cache extensions, and weight loaders so rollout matches training naming and sharding.</li>
-<li><strong>Lumen training</strong> &mdash; selects FSDP2 or Megatron, applies Lumen quantization hooks, and applies MoE R3 replay during forward passes.</li>
+<li><strong>Inference</strong> &mdash; wraps ATOM, SGLang, or vLLM for generation, KV-cache extensions, and weight loaders so rollout matches training naming and sharding conventions. Supports quantized inference with FP8, MXFP8, and MXFP4.</li>
+<li><strong>Training</strong> &mdash; selects FSDP2 or Megatron backends, applies Lumen quantization hooks, and applies MoE R3 replay during forward passes when enabled.</li>
 </ul>
 
 <h2>Quantization Stack</h2>
-<p>Rollout quantization uses <code>FP8RolloutQuantizer</code> and <code>FP8KVCacheQuantizer</code>; training uses <code>FP8TrainingManager</code>. When FP8 rollouts diverge from BF16, <code>apply_rollout_correction</code> adjusts advantages using TIS or MIS.</p>
+<p>LumenRL supports multiple quantization formats: FP8 (blockwise W8A8), MXFP8, and MXFP4. Rollout quantization uses <code>FP8RolloutQuantizer</code> and <code>FP8KVCacheQuantizer</code>; training uses <code>FP8TrainingManager</code> to bridge into <code>lumen.quantize</code>. MXFP8/MXFP4 online quantization via AITER is used for efficient SDDD teacher inference. When quantized rollouts diverge from the trainer&rsquo;s BF16 policy, <code>apply_rollout_correction</code> adjusts advantages using TIS or MIS.</p>
+
+<h2>SDDD Pipeline</h2>
+<p>For Speculative Decoding Draft Distillation, LumenRL splits GPUs between teacher inference and draft model training. The teacher model runs on ATOM/SGLang/vLLM with quantized inference (MXFP4/FP8), while the Eagle3/DFlash draft model trains via FSDP2 on separate GPUs. Hidden states are transferred between the two GPU groups via Mooncake (async RDMA/TCP for SGLang) or MORI-IO (GPU Direct P2P RDMA for ATOM). The pipeline is powered by <a href="https://github.com/lightseekorg/TorchSpec">TorchSpec</a>.</p>
 
 <h2>MoE R3</h2>
 <p><code>R3Manager</code> coordinates <code>RouterRecorder</code> (inference) and <code>RouterReplayer</code> (training), with tensors carried via <code>DataProto.add_router_distributions</code>. This closes the router mismatch that otherwise spikes policy&ndash;inference KL.</p>
@@ -936,10 +982,61 @@ print(summary["argmax_expert_mass_mean"], float(entropy))</pre>
 <div class="callout info"><strong>Note:</strong> R3 tensors travel inside <code>DataProto</code> under keys <code>router_dist_layer_{idx}</code>. Preserve them across merge/split boundaries when scaling DP workers.</div>
 </div>
 
+<!-- ─── EXAMPLE: SDDD ─── -->
+<div class="doc-section" id="doc-ex_sddd">
+<h1>SDDD Training Example</h1>
+<p>Train Eagle3 speculative decoding draft models using LumenRL's SDDD pipeline powered by <a href="https://github.com/lightseekorg/TorchSpec">TorchSpec</a>.</p>
+
+<h2>Kimi K2.5 Eagle3 (SGLang + Mooncake)</h2>
+<p>Train an Eagle3 draft model for Kimi K2.5 on 8 GPUs with SGLang + ATOM inference and Mooncake RDMA transfer.</p>
+
+<h3>GPU Layout</h3>
+<ul>
+<li><strong>GPUs 0&ndash;3</strong>: FSDP2 Eagle3 draft model training (BF16)</li>
+<li><strong>GPUs 4&ndash;7</strong>: SGLang + ATOM plugin &mdash; Kimi K2.5 teacher (TP=4, BF16 to MXFP4)</li>
+</ul>
+
+<h3>Quick Start</h3>
+<pre><span class="c"># Smoke test</span>
+bash examples/Kimi_K25_SDDD/run_kimi_k25.sh --smoke-test
+
+<span class="c"># Full two-phase training (Docker)</span>
+bash examples/Kimi_K25_SDDD/run_full_training_docker.sh
+
+<span class="c"># Custom model path</span>
+MODEL_PATH=/path/to/kimi-k2.5 bash examples/Kimi_K25_SDDD/run_kimi_k25.sh</pre>
+
+<h3>Models</h3>
+<table class="dtbl"><thead><tr><th>Role</th><th>Model</th><th>Notes</th></tr></thead><tbody>
+<tr><td>Teacher</td><td><a href="https://huggingface.co/moonshotai/Kimi-K2.5">moonshotai/Kimi-K2.5</a></td><td>1T MoE, BF16, online MXFP4 via ATOM/AITER</td></tr>
+<tr><td>Draft</td><td>Eagle3 (from scratch)</td><td>hidden=7168, 1 layer, 64 heads</td></tr>
+</tbody></table>
+
+<h2>Qwen3-8B Eagle3 (vLLM + MORI)</h2>
+<p>Train an Eagle3 draft model for Qwen3-8B using vLLM inference backend with MORI RDMA transfer on MI350.</p>
+<pre><span class="c"># See the example directory for full scripts</span>
+ls examples/Qwen3_8B_SDDD_MI350_vLLM/</pre>
+
+<h2>MI350-Specific Examples</h2>
+<ul>
+<li><code>examples/Kimi_K25_SDDD_MI350/</code> &mdash; Kimi K2.5 on MI350 with SGLang</li>
+<li><code>examples/Kimi_K25_SDDD_MI350_vLLM/</code> &mdash; Kimi K2.5 on MI350 with vLLM</li>
+<li><code>examples/Qwen3_8B_SDDD_MI350_vLLM/</code> &mdash; Qwen3-8B on MI350 with vLLM</li>
+</ul>
+
+<h2>References</h2>
+<ul>
+<li><a href="https://github.com/lightseekorg/TorchSpec">TorchSpec</a> &mdash; Draft distillation framework</li>
+<li><a href="https://huggingface.co/lightseekorg/kimi-k2.5-eagle3">lightseekorg/kimi-k2.5-eagle3</a> &mdash; Training recipe</li>
+<li><a href="https://arxiv.org/abs/2505.01759">KimiV2.5 Technical Report</a></li>
+</ul>
+<p>For architecture details and configuration options, see the <a href="#" onclick="navigateDoc('adv_sddd'); return false;">SDDD Guide</a>.</p>
+</div>
+
 <!-- ─── ADV: FP8 ─── -->
 <div class="doc-section" id="doc-adv_fp8">
-<h1>FP8 Quantization</h1>
-<p>LumenRL implements an FP8-RL style stack: low-precision rollouts for throughput, hybrid FP8 training in Lumen, and importance-sampling correction.</p>
+<h1>Quantization</h1>
+<p>LumenRL implements a comprehensive quantization stack supporting FP8, MXFP8, and MXFP4. The <a href="https://arxiv.org/abs/2601.18150">FP8-RL</a> stack provides low-precision rollouts and hybrid FP8 training in Lumen with importance-sampling correction. MXFP8 and MXFP4 online quantization via AITER enables efficient inference for SDDD teacher models.</p>
 
 <h2>FP8 Rollout (ATOM Path)</h2>
 <h3>W8A8 Linear Layers</h3>
@@ -1033,6 +1130,58 @@ adv_corrected = token_level_mis(bf16_logprobs, fp8_logprobs, advantages)</pre>
 </ul>
 </div>
 
+<!-- ─── ADV: SDDD ─── -->
+<div class="doc-section" id="doc-adv_sddd">
+<h1>Speculative Decoding Draft Distillation (SDDD)</h1>
+<p>SDDD trains lightweight draft models for speculative decoding by distilling teacher hidden states. The draft model learns to approximate the teacher&rsquo;s internal representations, enabling speculative decoding that accelerates inference without sacrificing output quality.</p>
+
+<h2>Architecture</h2>
+<pre>Training GPUs                          Inference GPUs
+FSDP2 Eagle3/DFlash draft model  &lt;---  Teacher model (ATOM / SGLang / vLLM)
+  BF16 training                          Quantized inference (FP8/MXFP8/MXFP4)
+       ^                                       |
+  Mooncake/MORI RDMA  &lt;---  hidden_states transfer</pre>
+<ul>
+<li><strong>Inference GPUs</strong>: Run the teacher model with tensor parallelism, processing dataset samples and extracting hidden states at each transformer layer.</li>
+<li><strong>Training GPUs</strong>: Train the draft model via FSDP2, receiving teacher hidden states through Mooncake or MORI RDMA transfers.</li>
+</ul>
+
+<h2>Draft Architectures</h2>
+<h3>Eagle3</h3>
+<p>Eagle3 uses iterative refinement to predict the teacher&rsquo;s next-token hidden states. It takes the teacher&rsquo;s hidden states from the previous position and refines them through a single transformer layer to predict the next position&rsquo;s hidden state.</p>
+<h3>DFlash</h3>
+<p>DFlash uses block-causal masking to train on multiple positions simultaneously. It enables efficient per-position train/eval metrics and supports <code>eval_from_cache</code> for faster evaluation during training.</p>
+
+<h2>Hidden-State Transfer</h2>
+<table class="dtbl"><thead><tr><th>Backend</th><th>Protocol</th><th>Use Case</th></tr></thead><tbody>
+<tr><td>Mooncake</td><td>Async RDMA / TCP</td><td>SGLang-based inference with batched scheduling and KV cache management</td></tr>
+<tr><td>MORI-IO</td><td>GPU Direct P2P RDMA</td><td>Direct ATOM inference with minimal latency</td></tr>
+</tbody></table>
+
+<h2>Two-Phase Training</h2>
+<p>Following the <a href="https://huggingface.co/lightseekorg/kimi-k2.5-eagle3">lightseekorg recipe</a>, SDDD uses a two-phase training strategy:</p>
+<table class="dtbl"><thead><tr><th>Phase</th><th>Steps</th><th>Dataset</th><th>Description</th></tr></thead><tbody>
+<tr><td>Phase 1</td><td>0 &ndash; 20K</td><td>Large general corpus</td><td>Foundation training on broad data distribution</td></tr>
+<tr><td>Phase 2</td><td>20K &ndash; 40K</td><td>Mixed domain samples</td><td>Domain diversity (VL, CN, tool-call, agent, writing)</td></tr>
+</tbody></table>
+
+<h2>Supported Models</h2>
+<table class="dtbl"><thead><tr><th>Teacher Model</th><th>Draft Architecture</th><th>Inference Backend</th><th>Transfer</th></tr></thead><tbody>
+<tr><td>Kimi K2.5 (1T MoE)</td><td>Eagle3</td><td>SGLang+ATOM / vLLM</td><td>Mooncake / MORI</td></tr>
+<tr><td>Qwen3-8B</td><td>Eagle3</td><td>vLLM</td><td>MORI</td></tr>
+</tbody></table>
+
+<h2>Integration with TorchSpec</h2>
+<p>SDDD is powered by <a href="https://github.com/lightseekorg/TorchSpec">TorchSpec</a>, which provides:</p>
+<ul>
+<li>Eagle3 and DFlash model definitions and training loops</li>
+<li>Dataset processing and hidden-state extraction</li>
+<li>Integration with SGLang and vLLM inference backends</li>
+<li>Checkpoint management for multi-phase training</li>
+</ul>
+<p>For a step-by-step walkthrough, see the <a href="#" onclick="navigateDoc('ex_sddd'); return false;">SDDD Training Example</a>.</p>
+</div>
+
 <!-- ─── ADV: DISTRIBUTED ─── -->
 <div class="doc-section" id="doc-adv_dist">
 <h1>Distributed Training</h1>
@@ -1077,10 +1226,67 @@ sbatch --nodes=$NUM_NODES --gres=gpu:8 scripts/ray.sub</pre>
 <p>Ensure object store memory and <code>/dev/shm</code> are adequate for <code>DataProto</code> payloads containing long responses and MoE router tensors.</p>
 </div>
 
+<!-- ─── ADV: ASYNC ─── -->
+<div class="doc-section" id="doc-adv_async">
+<h1>Fully Async Training</h1>
+<p>LumenRL now supports a <strong>fully-async training mode</strong> that decouples rollout (generation) from policy training, inspired by <a href="https://github.com/verl-project/verl">VERL</a> and techniques from AReaL, Magistral, StreamRL, and AsyncFlow.</p>
+
+<h2>How It Works</h2>
+<p>In the default <em>colocate</em> mode, rollout and training share the same GPUs and take turns. In async mode, a background <strong>Rollouter</strong> thread continuously generates samples into a <strong>MessageQueue</strong> while the <strong>Trainer</strong> consumes batches for gradient updates. Periodic <strong>ParameterSync</strong> pushes updated weights from trainer to rollouter.</p>
+
+<h2>Supported Modes</h2>
+<table class="dtbl"><thead><tr><th>Mode</th><th>Settings</th><th>Description</th></tr></thead><tbody>
+<tr><td>On-policy</td><td><code>staleness=0, sync_step=1</code></td><td>Rollouter produces one batch, Trainer trains and syncs immediately</td></tr>
+<tr><td>Stream off-policy</td><td><code>staleness=0, sync_step&gt;1</code></td><td>Synchronous streaming &mdash; multiple local updates between syncs</td></tr>
+<tr><td>Async + stale</td><td><code>staleness&gt;0, partial=False</code></td><td>Allows stale samples up to threshold</td></tr>
+<tr><td>Async + partial</td><td><code>staleness&gt;0, partial=True</code></td><td>Rollouter interrupts active generation on sync</td></tr>
+</tbody></table>
+
+<h2>Configuration</h2>
+<pre>async_training:
+  enabled: true
+  require_batches: 4
+  trigger_parameter_sync_step: 4
+  staleness_threshold: 0.5
+  partial_rollout: true
+  use_rollout_log_probs: true
+  queue_maxsize: 64
+  weight_sync_dir: /tmp/lumenrl_weight_sync</pre>
+
+<h2>Key Parameters</h2>
+<table class="dtbl"><thead><tr><th>Parameter</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>enabled</code></td><td><code>false</code></td><td>Enable async training mode</td></tr>
+<tr><td><code>require_batches</code></td><td><code>4</code></td><td>Mini-batch-sized chunks fetched per training step</td></tr>
+<tr><td><code>trigger_parameter_sync_step</code></td><td><code>4</code></td><td>Local gradient updates between weight syncs</td></tr>
+<tr><td><code>staleness_threshold</code></td><td><code>0.0</code></td><td>Max stale sample fraction (0 = synchronous)</td></tr>
+<tr><td><code>partial_rollout</code></td><td><code>false</code></td><td>Interrupt in-progress generation on weight sync</td></tr>
+<tr><td><code>queue_maxsize</code></td><td><code>64</code></td><td>Maximum samples buffered in the message queue</td></tr>
+</tbody></table>
+
+<h2>Comparison with Colocate Mode</h2>
+<table class="dtbl"><thead><tr><th>Aspect</th><th>Colocate (default)</th><th>Async</th></tr></thead><tbody>
+<tr><td>Pipeline bubble</td><td>Rollout and training are sequential</td><td>Overlapped</td></tr>
+<tr><td>Memory efficiency</td><td>Must offload optimizer during rollout</td><td>No offload needed</td></tr>
+<tr><td>Staleness</td><td>Always on-policy</td><td>Configurable</td></tr>
+<tr><td>Throughput</td><td>1&times; baseline</td><td>1.6&ndash;2.7&times;</td></tr>
+</tbody></table>
+
+<h2>Quick Start</h2>
+<pre>torchrun --nproc_per_node=8 -m lumenrl.trainer.main \
+  --config configs/1a_bf16_async.yaml</pre>
+
+<h2>Tuning Recommendations</h2>
+<ul>
+<li><strong>Resource balance</strong>: Monitor <code>trainer_idle_s</code> and <code>rollout_idle_s</code>. If the trainer idles, the rollouter is too slow &mdash; consider reducing generation length or using FP8 rollout.</li>
+<li><strong>Staleness</strong>: Start with <code>staleness_threshold=0</code> and increase to 0.3&ndash;0.5 if the rollouter underfeeds the trainer.</li>
+<li><strong>Sync frequency</strong>: <code>trigger_parameter_sync_step=4</code> is a good default. Lower values keep the policy fresher but increase sync overhead.</li>
+</ul>
+</div>
+
 <!-- ─── ADV: ALGORITHMS ─── -->
 <div class="doc-section" id="doc-adv_algo">
 <h1>Algorithms</h1>
-<p>Three policy-gradient trainers&mdash;GRPO, DAPO, and PPO&mdash;sharing the same <code>DataProto</code> batching and loss helpers.</p>
+<p>LumenRL supports both <strong>RL post-training algorithms</strong> (GRPO, DAPO, PPO) and <strong>Speculative Decoding Draft Distillation (SDDD)</strong>. RL algorithms share the same <code>DataProto</code> batching and loss helpers, while SDDD uses a separate teacher&ndash;draft distillation pipeline powered by <a href="https://github.com/lightseekorg/TorchSpec">TorchSpec</a>.</p>
 
 <h2>GRPO</h2>
 <p>Group Relative Policy Optimization: normalizes scalar rewards within each prompt's <code>num_generations</code> group. Uses <code>policy_gradient_loss</code> with symmetric clip.</p>
@@ -1121,6 +1327,15 @@ sbatch --nodes=$NUM_NODES --gres=gpu:8 scripts/ray.sub</pre>
 <tr><td>Classic actor&ndash;critic with value bootstrapping</td><td>PPO</td></tr>
 </tbody></table>
 <div class="callout"><strong>Warning:</strong> GRPO and DAPO assume contiguous blocks of size <code>num_generations</code>. If your sampler interleaves prompts, normalize ordering before calling <code>compute_advantages</code>.</div>
+
+<h2>SDDD</h2>
+<p><strong>Speculative Decoding Draft Distillation</strong> trains lightweight draft models (Eagle3, DFlash) by distilling teacher hidden states. Unlike RL algorithms that optimize a policy via reward signals, SDDD optimizes a draft model to predict the teacher&rsquo;s next-token distribution for speculative decoding acceleration.</p>
+<ul>
+<li><strong>Eagle3</strong> &mdash; iterative refinement draft architecture with hidden-state injection from the teacher</li>
+<li><strong>DFlash</strong> &mdash; block-causal masking for parallel draft verification</li>
+<li><strong>Transfer backends</strong> &mdash; Mooncake (async RDMA/TCP) or MORI-IO (GPU Direct P2P RDMA) for hidden-state transfer between teacher and draft GPUs</li>
+</ul>
+<p>See the <a href="#" onclick="navigateDoc('adv_sddd'); return false;">SDDD Guide</a> for architecture details and the <a href="#" onclick="navigateDoc('ex_sddd'); return false;">SDDD Training Example</a> for walkthroughs.</p>
 </div>
 
 <!-- ─── API: CONFIG ─── -->
@@ -1402,6 +1617,29 @@ new_sd = epm.reshard_for_inference(state_dict, train_ep_size=4, infer_ep_size=2)
 <div class="callout info"><strong>Note:</strong> <code>RouterRecorder</code> / <code>RouterReplayer</code> rely on heuristics in <code>iter_moe_modules</code>; exotic MoE block names may need additional patterns.</div>
 </div>
 
+<!-- ─── MODELS TRAIN STATUS ─── -->
+<div class="doc-section" id="doc-status">
+<h1>Models Train Status</h1>
+<p>Training dashboards for LumenRL experiments. Click a dashboard to view detailed training metrics, loss curves, and performance data.</p>
+
+<h2>SDDD Dashboards</h2>
+<table class="dtbl"><thead><tr><th>Model</th><th>Dashboard</th><th>Description</th></tr></thead><tbody>
+<tr><td>Kimi K2.5 Eagle3</td><td><a href="dashboards/SDDD/Kimi_K25_SDDD_MI350/phase1.html" target="_blank">Phase 1 Dashboard</a></td><td>Phase 1 foundation training on general corpus</td></tr>
+<tr><td>Kimi K2.5 Eagle3</td><td><a href="dashboards/SDDD/Kimi_K25_SDDD_MI350/phase2.html" target="_blank">Phase 2 Dashboard</a></td><td>Phase 2 mixed-domain fine-tuning</td></tr>
+</tbody></table>
+
+<h2>DAPO Dashboards</h2>
+<table class="dtbl"><thead><tr><th>Model</th><th>Dashboard</th><th>Description</th></tr></thead><tbody>
+<tr><td>Qwen3-8B-Base</td><td><a href="dashboards/DAPO/Qwen3-8B-Base_BF16_DAPO-Sync.html" target="_blank">BF16 DAPO Sync</a></td><td>Synchronous DAPO training (BF16 baseline)</td></tr>
+<tr><td>Qwen3-8B-Base</td><td><a href="dashboards/DAPO/Qwen3-8B-Base_BF16_DAPO-Async.html" target="_blank">BF16 DAPO Async</a></td><td>Fully-async DAPO training</td></tr>
+</tbody></table>
+
+<h2>Async Training Dashboards</h2>
+<table class="dtbl"><thead><tr><th>Config</th><th>Dashboard</th><th>Description</th></tr></thead><tbody>
+<tr><td>1a-bf16-sync</td><td><a href="dashboards/1a-bf16-sync/dashboard.html" target="_blank">BF16 Sync Baseline</a></td><td>Synchronous BF16 training baseline</td></tr>
+</tbody></table>
+</div>
+
 </main>
 </div><!-- /docs-layout -->
 </div><!-- /page-docs -->
@@ -1415,6 +1653,8 @@ new_sd = epm.reshard_for_inference(state_dict, train_ep_size=4, infer_ep_size=2)
       <a href="https://github.com/ROCm/ATOM">ATOM</a>
       <a href="https://github.com/ROCm/aiter">AITER</a>
       <a href="https://github.com/ROCm/mori">MORI</a>
+      <a href="https://github.com/lightseekorg/TorchSpec">TorchSpec</a>
+      <a href="https://github.com/kvcache-ai/Mooncake">Mooncake</a>
       <a href="https://rocm.docs.amd.com/">ROCm Docs</a>
     </div>
   </div>

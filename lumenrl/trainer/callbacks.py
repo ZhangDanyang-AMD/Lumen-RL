@@ -85,6 +85,8 @@ class CheckpointCallback(Callback):
             "algo": trainer.config.algorithm.name,
         }
 
+        model = getattr(trainer, "_actor_model", None) or getattr(trainer, "_draft_model", None)
+
         if trainer._is_distributed:
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
             try:
@@ -95,16 +97,16 @@ class CheckpointCallback(Callback):
                 )
                 opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
                 state["model_state_dict"] = get_model_state_dict(
-                    trainer._actor_model, options=opts,
+                    model, options=opts,
                 )
                 state["optimizer_state_dict"] = get_optimizer_state_dict(
-                    trainer._actor_model, trainer._optimizer, options=opts,
+                    model, trainer._optimizer, options=opts,
                 )
             except Exception as exc:
                 logger.warning("FSDP2 state_dict extraction failed (%s); saving metrics only.", exc)
         else:
-            if trainer._actor_model is not None:
-                state["model_state_dict"] = trainer._actor_model.state_dict()
+            if model is not None:
+                state["model_state_dict"] = model.state_dict()
             if trainer._optimizer is not None:
                 state["optimizer_state_dict"] = trainer._optimizer.state_dict()
 

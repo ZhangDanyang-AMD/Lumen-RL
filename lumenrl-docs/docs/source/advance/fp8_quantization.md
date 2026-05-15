@@ -1,6 +1,6 @@
-# FP8 quantization
+# Quantization
 
-LumenRL implements an FP8-RL style stack: low-precision rollouts for throughput, hybrid FP8 training in Lumen, and optional importance-sampling correction so FP8 behavior policies remain compatible with BF16 training objectives.
+LumenRL implements a comprehensive quantization stack supporting FP8, MXFP8, and MXFP4. The [FP8-RL](https://arxiv.org/abs/2601.18150) stack provides low-precision rollouts and hybrid FP8 training in Lumen with importance-sampling correction. MXFP8 and MXFP4 online quantization via AITER enables efficient inference for SDDD teacher models.
 
 ## FP8 rollout (ATOM path)
 

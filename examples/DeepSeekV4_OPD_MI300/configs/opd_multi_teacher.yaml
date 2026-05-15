@@ -1,0 +1,68 @@
+# DeepSeek-V4 OPD with separate teacher model (cross-architecture)
+#
+# Demonstrates distillation from a domain expert teacher into a smaller student.
+# This is the typical OPD use case in DeepSeek-V4: domain experts (math, code,
+# etc.) distill knowledge into the general-purpose model.
+#
+# In this config, teacher and student have different architectures, so
+# lazy_logits is disabled (hidden dim mismatch prevents lazy reconstruction).
+#
+# Hardware: 8x MI300X — both student and teacher must fit in GPU memory.
+#   Adjust num_nodes and micro_batch_size based on actual model sizes.
+#
+# Usage:
+#   torchrun --nproc_per_node=8 -m lumenrl.trainer.main \
+#       --config examples/DeepSeekV4_OPD_MI300/configs/opd_multi_teacher.yaml \
+#       policy.model_name=/path/to/student \
+#       algorithm.teacher.model_name=/path/to/teacher
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
+
+policy:
+  model_name: /dev/shm/model/deepseek-v4-pro  # Student model
+  training_backend: fsdp2
+  generation_backend: hf
+  max_total_sequence_length: 4096
+  max_response_length: 2048
+  train_global_batch_size: 16
+  train_micro_batch_size: 4
+
+algorithm:
+  name: opd
+  opd:
+    kl_direction: reverse
+    temperature: 1.0
+    opd_coeff: 1.0
+    lazy_logits: false                  # Full logits (different architectures)
+    position_weighting: true            # Position-weighted KL
+    position_decay: 0.8
+    teacher_micro_batch_size: 2         # Smaller batch for larger teacher
+  teacher:
+    model_name: /dev/shm/model/math-expert  # Domain expert teacher
+    inference_backend: hf
+
+quantization:
+  training:
+    fp8: null
+  rollout_correction:
+    enabled: false
+
+reward:
+  type: function
+  function: math_reward
+  dataset: nvidia/OpenMathInstruct-2
+
+checkpointing:
+  checkpoint_dir: results/opd_multi_teacher
+  save_steps: 50
+  save_total_limit: 3
+  resume: true
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 500
+seed: 42

@@ -1,15 +1,42 @@
 # LumenRL
 
-A high-performance RL post-training framework for LLMs on **AMD GPUs**, powered by [Lumen](https://github.com/ZhangDanyang-AMD/Lumen) (quantized training) and [ATOM](https://github.com/ROCm/ATOM) (optimized inference).
+An AMD native **Post-Training Framework for LLMs**, powered by [Lumen](https://github.com/ZhangDanyang-AMD/Lumen) (quantized training) and [ATOM](https://github.com/ROCm/ATOM) (optimized inference). LumenRL supports both **RL post-training** (GRPO, DAPO, PPO) and **Speculative Decoding Draft Distillation (SDDD)** on AMD GPUs.
 
 ---
 
-## Highlights
+## 📢 News
 
-- **AMD-Native** — Built for ROCm with [AITER](https://github.com/ROCm/aiter) kernels (ASM / CK / Triton) and [MORI](https://github.com/ROCm/mori) communication (RDMA + GPU collective ops, MoE expert dispatch)
-- **FP8 End-to-End** — FP8 rollout (W8A8 + KV-cache) and FP8 training with importance-sampling rollout correction (TIS/MIS) — up to 44% throughput gain over BF16
-- **MoE-Stable RL** — Rollout Routing Replay (R3) aligns train/inference routers to prevent MoE training collapse
-- **Flexible Backends** — FSDP2 or Megatron-Core training, ATOM inference with TP/EP/DP parallelism
+- **[2026/05]** LumenRL now supports **Speculative Decoding Draft Distillation (SDDD)** — Eagle3 draft distillation for Kimi K2.5 and Qwen3-8B on MI350 with [Mooncake](https://github.com/kvcache-ai/Mooncake)/MORI RDMA transfer
+- **[2026/04]** LumenRL now supports **fully async training** — inspired by [VERL](https://github.com/verl-project/verl), decouples rollout and training for up to 2.7× throughput improvement
+- **[2026/03]** LumenRL now supports **MoE [R3](https://arxiv.org/abs/2510.11370) router alignment** — Rollout Routing Replay for stable MoE RL training
+- **[2026/03]** LumenRL now supports the **[FP8-RL](https://arxiv.org/abs/2601.18150) quantization stack** — FP8 rollout + training with TIS/MIS importance-sampling correction
+
+## 📑 Table of Contents
+
+- [Features](#-features)
+- [Architecture](#architecture)
+- [Key Features](#key-features)
+- [Supported Models](#supported-models)
+  - [RL Models](#rl-models)
+  - [SDDD Models](#sddd-models)
+- [Requirements](#requirements)
+- [Quick Start](#quick-start)
+- [Fully Async Training](#fully-async-training)
+- [Quantization](#quantization)
+- [MoE Training with R3](#moe-training-with-r3)
+- [Backend Support Matrix](#backend-support-matrix)
+- [Third-Party Libraries](#third-party-libraries)
+- [Citation](#citation)
+- [Acknowledgements](#acknowledgements)
+- [License](#license)
+
+## 🚀 Features
+
+- **AMD-Native**: Built for ROCm with [AITER](https://github.com/ROCm/aiter) kernels (ASM / CK / Triton) and [MORI](https://github.com/ROCm/mori) communication (RDMA + GPU collective ops, MoE expert dispatch)
+- **Quantization End-to-End**: Quantized rollout (FP8, MXFP8, MXFP4) and quantized training with importance-sampling rollout correction (TIS/MIS) — up to 44% throughput gain over BF16
+- **MoE-Stable RL**: Rollout Routing Replay (R3) aligns train/inference routers to prevent MoE training collapse
+- **Speculative Decoding Draft Distillation (SDDD)**: Train Eagle3/DFlash draft models via teacher hidden-state distillation with [Mooncake](https://github.com/kvcache-ai/Mooncake)/MORI RDMA transfer
+- **Flexible Backends**: FSDP2 or Megatron-Core training, ATOM/SGLang/vLLM inference with TP/EP/DP parallelism
 
 ## Architecture
 
@@ -21,15 +48,18 @@ A high-performance RL post-training framework for LLMs on **AMD GPUs**, powered 
 
 | Category | Features |
 |---|---|
-| **Training Backends** | FSDP2, Megatron-Core — with Lumen FP8 quantization and AITER kernels |
-| **Inference Engine** | ATOM — FP8 rollout, MoE expert parallel, speculative decoding, piecewise torch.compile |
+| **Training Backends** | FSDP2, Megatron-Core — with Lumen quantized training and AITER kernels |
+| **Inference Engine** | ATOM / SGLang / vLLM — quantized rollout, MoE expert parallel, speculative decoding, piecewise torch.compile |
 | **RL Algorithms** | GRPO, DAPO, PPO |
-| **Quantization** | FP8 rollout (blockwise W8A8), FP8 KV-cache, FP8 training (hybrid E4M3/E5M2, MXFP8), rollout correction (TIS/MIS) |
+| **SDDD** | Eagle3/DFlash draft distillation, Mooncake/MORI RDMA hidden-state transfer |
+| **Quantization** | FP8 (blockwise W8A8), MXFP8, MXFP4, FP8 KV-cache, FP8 training (hybrid E4M3/E5M2), rollout correction (TIS/MIS) |
 | **MoE** | R3 router alignment, MORI-EP expert parallel, fused routing + aux loss |
 | **Parallelism** | TP, EP, DP, FSDP2, sequence parallelism, context parallelism |
-| **Hardware** | AMD Instinct MI250/MI300 (ROCm) |
+| **Hardware** | AMD Instinct MI250/MI300/MI350 (ROCm) |
 
 ## Supported Models
+
+### RL Models
 
 | Model Family | Architecture | Dense/MoE | FP8 Rollout | FP8 Training | R3 |
 |---|---|---|---|---|---|
@@ -40,9 +70,16 @@ A high-performance RL post-training framework for LLMs on **AMD GPUs**, powered 
 | Mixtral | `MixtralForCausalLM` | MoE | Yes | Yes | Yes |
 | GLM-4-MoE | `Glm4MoeForCausalLM` | MoE | Yes | Yes | Yes |
 
+### SDDD Models
+
+| Teacher Model | Draft Architecture | Inference Backend | Transfer |
+|---|---|---|---|
+| Kimi K2.5 (1T MoE) | Eagle3 | SGLang+ATOM / vLLM | Mooncake / MORI |
+| Qwen3-8B | Eagle3 | vLLM | MORI |
+
 ## Requirements
 
-- AMD GPU with ROCm support (MI250 / MI300 series)
+- AMD GPU with ROCm support (MI250 / MI300 / MI350 series)
 - Docker (recommended) or bare-metal ROCm installation
 - Python >= 3.10
 
@@ -146,9 +183,9 @@ Four modes supported:
 
 See [docs/advance/async_training.md](lumenrl-docs/docs/source/advance/async_training.md) for detailed configuration and tuning.
 
-## FP8 Quantization
+## Quantization
 
-LumenRL implements the [FP8-RL](https://arxiv.org/abs/2601.18150) stack for low-precision RL training:
+LumenRL implements a comprehensive quantization stack for low-precision post-training, including FP8, MXFP8, and MXFP4. The [FP8-RL](https://arxiv.org/abs/2601.18150) stack powers RL training, while MXFP8/MXFP4 online quantization via AITER enables efficient SDDD inference:
 
 ### FP8 Rollout (Inference)
 
@@ -225,54 +262,15 @@ R3 significantly reduces training-inference policy KL divergence and prevents co
 | Expert parallel | No | Yes (MORI-EP) |
 | Sequence parallelism | Yes | Yes |
 
-## Project Structure
-
-```
-Lumen-RL/
-├── lumenrl/                        # Main Python package
-│   ├── core/                       #   Config, DataProto, registry, types
-│   ├── controller/                 #   Ray cluster, worker groups, dispatch
-│   ├── workers/                    #   Actor, critic, ref, reward, rollout, hybrid
-│   ├── engine/
-│   │   ├── inference/              #   ATOM engine wrapper, generation, weight loader
-│   │   └── training/               #   FSDP2/Megatron backends, weight sync
-│   ├── algorithms/                 #   GRPO, DAPO, PPO, loss functions
-│   ├── quantization/               #   FP8 rollout, KV-cache, training, correction
-│   ├── moe/                        #   R3 recorder/replayer/manager, expert parallel
-│   ├── trainer/                    #   RLTrainer, AsyncRLTrainer, message queue, weight sync
-│   └── utils/                      #   Logging, checkpoint, metrics, distributed
-│
-├── configs/                        # Reference YAML configs + production recipes
-├── examples/                       # Launch scripts (run_grpo.py, run_dapo.py, etc.)
-├── scripts/                        # SLURM launchers
-├── tests/                          # Unit / integration / e2e tests
-└── docker/                         # Dockerfile, Dockerfile.dev
-```
-
-## Testing
-
-```bash
-# Unit tests (fast, CPU-only where possible)
-pytest tests/unit/ -v
-
-# Integration tests (requires 1+ GPU)
-pytest tests/integration/ -v -m gpu
-
-# End-to-end tests (requires 8 GPUs)
-pytest tests/e2e/ -v -m multigpu
-
-# All tests
-pytest tests/ -v
-```
-
 ## Third-Party Libraries
 
 | Library | Package | Purpose |
 |---|---|---|
 | [Lumen](https://github.com/ZhangDanyang-AMD/Lumen) | `lumen` | AMD-native quantized training: FP8/MXFP8, AITER kernels, MORI comms |
-| [ATOM](https://github.com/ROCm/ATOM) | `atom` | AITER-optimized inference: FP8, MoE EP, speculative decoding |
+| [ATOM](https://github.com/ROCm/ATOM) | `atom` | AITER-optimized inference: FP8, MXFP4, MoE EP, speculative decoding |
 | [AITER](https://github.com/ZhangDanyang-AMD/aiter) | `amd-aiter` | GPU kernels: attention, GEMM, MoE, normalization (ASM/CK/Triton) |
 | [MORI](https://github.com/ZhangDanyang-AMD/mori) | `mori` | RDMA + GPU communication: collectives, MoE expert dispatch |
+| [Mooncake](https://github.com/kvcache-ai/Mooncake) | `mooncake` | Transfer engine: async RDMA/TCP hidden-state transport |
 | [Ray](https://github.com/ray-project/ray) | `ray` | Distributed orchestration, resource management |
 
 ## Citation
@@ -281,7 +279,7 @@ If you use LumenRL in your research, please cite:
 
 ```bibtex
 @misc{lumenrl,
-  title   = {LumenRL: High-Performance RL Post-Training for LLMs on AMD GPUs},
+  title   = {LumenRL: AMD Native Post-Training Framework for LLMs},
   year    = {2026},
   url     = {https://github.com/ZhangDanyang-AMD/Lumen-RL}
 }
@@ -314,9 +312,10 @@ MoE R3 router alignment:
 LumenRL builds on the work of many open-source projects:
 
 - [Lumen](https://github.com/ZhangDanyang-AMD/Lumen) — Quantized training lifecycle, AITER/MORI integration
-- [ATOM](https://github.com/ROCm/ATOM) — Optimized inference engine, FP8/MoE support
+- [ATOM](https://github.com/ROCm/ATOM) — Optimized inference engine, FP8/MXFP4/MoE support
 - [AITER](https://github.com/ZhangDanyang-AMD/aiter) — AMD GPU kernels (ASM/CK/Triton)
 - [MORI](https://github.com/ZhangDanyang-AMD/mori) — RDMA + GPU communication
+- [Mooncake](https://github.com/kvcache-ai/Mooncake) — Async RDMA/TCP transfer engine
 
 ## License
 

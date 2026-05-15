@@ -1,6 +1,6 @@
 # Quick start
 
-This guide runs GRPO in three regimes—BF16 baseline, FP8 end-to-end, and MoE with R3—then shows how to scale out with SLURM.
+This guide runs GRPO in three regimes—BF16 baseline, FP8 end-to-end, and MoE with R3—then shows SDDD draft distillation and multi-node SLURM launch.
 
 ## Run GRPO (BF16 baseline)
 
@@ -74,6 +74,20 @@ seed: 42
 
 Full recipes live under `configs/` in the repository; multi-node variants append `cluster.num_nodes` and Megatron parallelism blocks as needed.
 
+## Run SDDD (Eagle3 Draft Distillation)
+
+Train an Eagle3 draft model for speculative decoding using teacher hidden-state distillation:
+
+```bash
+# Kimi K2.5 SDDD smoke test (8 GPUs)
+bash examples/Kimi_K25_SDDD/run_kimi_k25.sh --smoke-test
+
+# Qwen3-8B SDDD on MI350 with vLLM
+bash examples/Qwen3_8B_SDDD_MI350_vLLM/run_vllm_mi350.sh
+```
+
+See {doc}`/examples/sddd_training` and {doc}`/advance/sddd` for architecture details and configuration.
+
 ## Multi-node SLURM launch
 
 The README pattern parameterizes node count and forwards OmegaConf overrides after the script entrypoint:
@@ -97,6 +111,7 @@ Adapt `scripts/ray.sub` to your site’s partition, account, and module loads. R
 
 ## Where to go next
 
-- Hands-on walkthroughs: {doc}`/examples/grpo_training`, {doc}`/examples/fp8_training`, {doc}`/examples/moe_r3_training`
+- RL walkthroughs: {doc}`/examples/grpo_training`, {doc}`/examples/fp8_training`, {doc}`/examples/moe_r3_training`
+- SDDD walkthroughs: {doc}`/examples/sddd_training`, {doc}`/advance/sddd`
 - Systems topics: {doc}`/advance/distributed`, {doc}`/advance/algorithms`, {doc}`/architecture`
 - Python APIs: {doc}`/api/config`, {doc}`/api/protocol`, {doc}`/api/algorithms`

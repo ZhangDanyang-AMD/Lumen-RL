@@ -1,0 +1,55 @@
+# Smoke test: 2-step OPD to verify pipeline on 8x MI300X.
+#
+# Uses Qwen3-8B as a stand-in for quick pipeline verification.
+# For real training, use the full configs with deepseek-ai/DeepSeek-V4-Pro.
+#
+# Usage:
+#   torchrun --nproc_per_node=8 -m lumenrl.trainer.main --config examples/DeepSeekV4_OPD_MI300/configs/smoke_test.yaml
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
+
+policy:
+  model_name: Qwen/Qwen3-8B            # Stand-in for smoke test (DeepSeek-V4-Pro too large)
+  training_backend: fsdp2
+  generation_backend: hf
+  max_total_sequence_length: 2048
+  max_response_length: 512
+  train_global_batch_size: 8
+  train_micro_batch_size: 1
+
+algorithm:
+  name: opd
+  opd:
+    kl_direction: reverse
+    temperature: 1.0
+    opd_coeff: 1.0
+    lazy_logits: true
+    teacher_micro_batch_size: 2
+  teacher:
+    model_name: Qwen/Qwen3-8B          # Stand-in for smoke test
+    inference_backend: hf
+
+quantization:
+  training:
+    fp8: null
+  rollout_correction:
+    enabled: false
+
+reward:
+  type: function
+  function: math_reward
+  dataset: nvidia/OpenMathInstruct-2
+
+checkpointing:
+  checkpoint_dir: results/smoke_opd
+  save_steps: 999
+  resume: false
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 2
+seed: 42
