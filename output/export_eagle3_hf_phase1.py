@@ -11,7 +11,7 @@ import json
 import os
 from safetensors.torch import save_file
 
-CKPT_PATH = "/dev/shm/checkpoints/kimi_k25_eagle3_v2_phase1/checkpoint_110000.pt"
+CKPT_PATH = "/dev/shm/checkpoints/kimi_k25_eagle3_v2_phase1/checkpoint_111000.pt"
 BASE_MODEL_DIR = "/dev/shm/Kimi-K2.5-BF16"
 OUTPUT_DIR = "/dev/shm/Kimi_K25_eagle3_v2_phase1_HF"
 
@@ -128,7 +128,7 @@ config = {
     "pretraining_tp": 1,
     "rms_norm_eps": 1e-06,
     "rope_scaling": None,
-    "rope_theta": 1000000.0,
+    "rope_theta": 50000.0,
     "sliding_window": None,
     "tie_word_embeddings": False,
     "use_cache": True,
