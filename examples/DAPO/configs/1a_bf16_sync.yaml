@@ -23,6 +23,7 @@ policy:
   train_global_batch_size: 1536       # 96 prompts × 16 gens (matches verl 32×3×16)
   train_micro_batch_size: 1
   max_token_len_per_gpu: 20480
+  ppo_mini_batch_size: 32             # matches verl; yields ~48 optimizer steps
   training:
     fsdp_cfg:
       param_offload: true
@@ -36,12 +37,13 @@ algorithm:
   dapo:
     num_generations: 16
     kl_coeff: 0.0
-    clip_ratio_low: 0.2
-    clip_ratio_high: 0.28
-    clip_ratio_c: 10.0
-    dynamic_sampling: true
+    clip_ratio_low: 0.4
+    clip_ratio_high: 0.4
+    clip_ratio_c: 3.0
+    dynamic_sampling: false
     token_level_pg: true
     overlong_reward_shaping: true
+    loss_mode: token_level
 
 reward:
   type: function
@@ -53,12 +55,15 @@ quantization:
     precision: bf16
   training:
     fp8: null
+    lumen_norm: true
+    fused_mlp: true
+    fused_rope: true
 
 checkpointing:
   checkpoint_dir: /home/danyzhan/ckpts/lumenrl-dapo/1a-bf16-sync
   save_steps: 5
   save_total_limit: 3
-  resume: false
+  resume: true
 
 logger:
   wandb_enabled: false

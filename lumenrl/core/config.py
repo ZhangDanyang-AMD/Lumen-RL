@@ -68,6 +68,9 @@ class PolicyConfig:
     train_global_batch_size: int = 64
     train_micro_batch_size: int = 8
     max_token_len_per_gpu: int = 0
+    ppo_mini_batch_size: int = 0
+    learning_rate: float = 1e-6
+    lr_warmup_steps: int = 10
 
 
 @dataclass
@@ -89,6 +92,7 @@ class DAPOConfig:
     dynamic_sampling: bool = True
     token_level_pg: bool = True
     overlong_reward_shaping: bool = True
+    loss_mode: str = "token_level"  # "token_level" (standard DAPO) or "gmpo" (geometric mean PO)
 
 
 @dataclass
@@ -122,6 +126,9 @@ class TrainingQuantConfig:
     fp8: Optional[str] = None
     fp8_recipe: str = "blockwise"
     fp8_weight_cache: bool = False
+    lumen_norm: bool = False
+    fused_mlp: bool = False
+    fused_rope: bool = False
 
 
 @dataclass

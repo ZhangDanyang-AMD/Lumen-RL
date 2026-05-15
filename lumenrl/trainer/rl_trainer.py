@@ -84,6 +84,9 @@ class RLTrainer:
         if tq.fp8:
             quant["fp8"] = tq.fp8
         quant["fp8_weight_cache"] = tq.fp8_weight_cache
+        quant["lumen_norm"] = tq.lumen_norm
+        quant["fused_mlp"] = tq.fused_mlp
+        quant["fused_rope"] = tq.fused_rope
 
         from lumenrl.engine.training.fsdp_backend import FSDP2Backend
 
@@ -104,7 +107,9 @@ class RLTrainer:
             self._actor_model = FSDP2Backend.apply_fsdp2(self._actor_model, fsdp_cfg)
         else:
             self._actor_model.to(self._device)
-        lr = 1e-6
+        lr = getattr(self.config.policy, "learning_rate", 1e-6)
+        self._base_lr = lr
+        self._lr_warmup_steps = getattr(self.config.policy, "lr_warmup_steps", 10)
         self._param_offload = False
         if hasattr(self.config.policy, "training") and hasattr(self.config.policy.training, "fsdp_cfg"):
             _fc = self.config.policy.training.fsdp_cfg
@@ -207,6 +212,14 @@ class RLTrainer:
         logger.info("[rank %d] Resuming from checkpoint: %s", self._rank, latest)
         payload = CheckpointManager.load(latest)
         self._resume_step = int(payload.get("step", 0)) + 1
+
+        # Unwrap nested structure: CheckpointManager.save wraps state in
+        # {"step": N, "state_dict": {actual_data}}, so model_state_dict and
+        # optimizer_state_dict live one level deeper than expected.
+        inner = payload.get("state_dict", {})
+        if isinstance(inner, dict) and "model_state_dict" in inner:
+            logger.info("[rank %d] Unwrapping nested checkpoint structure.", self._rank)
+            payload = inner
 
         model_sd = payload.get("model_state_dict")
         if model_sd and self._actor_model is not None:
@@ -779,12 +792,21 @@ class RLTrainer:
     ) -> torch.Tensor:
         """Compute per-token log-probs from model for given sequences.
 
-        Uses row-chunked F.log_softmax for numerical stability with
-        bf16, avoiding float32 promotion of the full vocab dimension.
+        Uses the same packed forward path as ``_train_step`` to ensure
+        numerical consistency between ``old_log_probs`` and ``log_probs``.
+        This is critical: if the two paths differ (e.g. padded SDPA vs
+        packed varlen attention), the importance ratio deviates from 1.0
+        even with identical weights, causing all ratios to be clipped
+        and gradients to vanish.
 
         When ``move_to_gpu`` is True, moves the model to GPU before forward
         and back to CPU afterward (for CPU-offloaded reference model).
         """
+        from lumenrl.engine.training.packing import (
+            PackingContext, pack_sequences, packed_token_log_probs,
+            unpack_log_probs,
+        )
+
         if move_to_gpu:
             model.to(self._device)
 
@@ -792,19 +814,62 @@ class RLTrainer:
         attention_mask = attention_mask.to(self._device)
 
         model.eval()
-        micro_bs = max(1, int(self.config.policy.train_micro_batch_size))
+        S = sequences.shape[1]
+
+        # Use _dynamic_mini_batches-style chunking by actual token count
+        max_tok = int(self.config.policy.max_token_len_per_gpu)
+        seq_lens = attention_mask.sum(dim=1).long()
         all_log_probs = []
 
+        # Build chunk boundaries by actual token budget
+        chunks: list[tuple[int, int]] = []
+        start = 0
+        n = sequences.shape[0]
+        while start < n:
+            tok_count = 0
+            end = start
+            while end < n:
+                sl = int(seq_lens[end].item())
+                if tok_count + sl > max_tok and end > start:
+                    break
+                tok_count += sl
+                end += 1
+            chunks.append((start, end))
+            start = end
+
+        # FSDP2: equalize chunk count across ranks (same fix as _train_step)
+        real_chunk_count = len(chunks)
+        if self._is_distributed and self._world_size > 1:
+            import torch.distributed as dist
+            count_t = torch.tensor([real_chunk_count], device=self._device)
+            dist.all_reduce(count_t, op=dist.ReduceOp.MAX)
+            global_max = int(count_t.item())
+            while len(chunks) < global_max:
+                chunks.append(chunks[-1])  # dummy: reuse last chunk for FSDP2 collectives
+
         with torch.no_grad():
-            for start in range(0, sequences.shape[0], micro_bs):
-                end = min(start + micro_bs, sequences.shape[0])
-                ids_chunk = sequences[start:end]
-                mask_chunk = attention_mask[start:end]
-                outputs = model(input_ids=ids_chunk, attention_mask=mask_chunk)
-                logits = outputs.logits if hasattr(outputs, "logits") else outputs
-                token_lp = self._fused_token_log_probs(logits, ids_chunk)
-                all_log_probs.append(token_lp)
-                del outputs, logits
+            for ci, (cs, ce) in enumerate(chunks):
+                ids_chunk = sequences[cs:ce]
+                mask_chunk = attention_mask[cs:ce]
+
+                packed = pack_sequences(ids_chunk, mask_chunk)
+                with PackingContext(packed.cu_seqlens, packed.max_seqlen):
+                    outputs = model(
+                        input_ids=packed.input_ids,
+                        position_ids=packed.position_ids,
+                        attention_mask=None,
+                    )
+                    logits = outputs.logits if hasattr(outputs, "logits") else outputs
+                    logits = logits.squeeze(0)
+                    flat_lp = packed_token_log_probs(
+                        logits, packed.input_ids.squeeze(0), packed.cu_seqlens,
+                    )
+                    token_lp = unpack_log_probs(
+                        flat_lp, packed.cu_seqlens, packed.seq_lens, S,
+                    )
+                    if ci < real_chunk_count:
+                        all_log_probs.append(token_lp)
+                    del outputs, logits
 
         if move_to_gpu:
             model.cpu()
@@ -866,11 +931,30 @@ class RLTrainer:
         attention_mask: torch.Tensor,
         prompt_lengths: list[int],
     ) -> torch.Tensor:
-        """Create a mask that is 1 only for response tokens (excluding prompt)."""
+        """Create a mask that is 1 only for response tokens (excluding prompt).
+
+        For left-padded sequences, prompt tokens start at the first non-pad
+        position.  We must zero out prompt positions correctly, not just the
+        first ``plen`` columns (which are padding for left-padded inputs).
+        The returned mask is ``[:, 1:]`` to align with shifted log-probs.
+        """
+        B, S = attention_mask.shape
         mask = attention_mask.clone()
         for i, plen in enumerate(prompt_lengths):
-            mask[i, :plen] = 0
+            # Find where actual tokens start (first 1 in attention_mask)
+            actual_start = int((attention_mask[i] == 1).nonzero(as_tuple=True)[0][0].item())
+            # Prompt spans [actual_start, actual_start + plen)
+            mask[i, actual_start:actual_start + plen] = 0
         return mask[:, 1:]
+
+    def _update_lr(self, step: int) -> None:
+        """Linear warmup for lr_warmup_steps, then constant."""
+        if step < self._lr_warmup_steps:
+            warmup_lr = self._base_lr * (step + 1) / self._lr_warmup_steps
+        else:
+            warmup_lr = self._base_lr
+        for pg in self._optimizer.param_groups:
+            pg["lr"] = warmup_lr
 
     def _dynamic_mini_batches(
         self,
@@ -878,19 +962,24 @@ class RLTrainer:
         max_token_len: int,
         fallback_bs: int,
     ) -> list[DataProto]:
-        """Split batch into mini-batches capped by total token count.
+        """Split batch into mini-batches capped by total *actual* token count.
 
-        Each mini-batch has at most ``max_token_len`` total tokens
-        (sum of sequence lengths across all rows). Falls back to
-        fixed ``fallback_bs`` if ``max_token_len <= 0``.
+        Uses actual sequence lengths (from ``attention_mask``) and sorts by
+        length for efficient packing.  With sequence packing, each
+        mini-batch contains multiple sequences whose total actual tokens
+        fit within ``max_token_len``.
         """
         if max_token_len <= 0:
             return list(batch.mini_batches(fallback_bs))
 
-        # Use padded length (not actual tokens) to bound GPU memory correctly.
-        # With padding, each row costs seq_dim tokens of compute/memory.
-        padded_len = batch.tensors["input_ids"].shape[1]
-        seq_lens = torch.full((batch.batch_size,), padded_len, dtype=torch.long)
+        # Use actual token lengths for packing (not padded length).
+        seq_lens = batch.tensors["attention_mask"].sum(dim=1).long()
+
+        # Sort by length for better packing (similar lengths together).
+        sorted_idx = torch.argsort(seq_lens)
+        sorted_lens = seq_lens[sorted_idx]
+        sorted_tensors = {k: v[sorted_idx] for k, v in batch.tensors.items()}
+
         batches: list[DataProto] = []
         start = 0
         n = batch.batch_size
@@ -898,42 +987,101 @@ class RLTrainer:
             tok_count = 0
             end = start
             while end < n:
-                sl = int(seq_lens[end].item())
+                sl = int(sorted_lens[end].item())
                 if tok_count + sl > max_token_len and end > start:
                     break
                 tok_count += sl
                 end += 1
-            chunk = {k: v[start:end] for k, v in batch.tensors.items()}
+            chunk = {k: v[start:end] for k, v in sorted_tensors.items()}
             batches.append(DataProto(tensors=chunk, meta=batch.meta.copy()))
             start = end
         return batches
 
-    def _train_step(self, batch: DataProto) -> dict[str, float]:
-        """One gradient step on the actor model."""
+    def _train_step(
+        self,
+        batch: DataProto,
+        loss_scale: float = 1.0,
+        dp_size: int = 1,
+    ) -> dict[str, float]:
+        """One gradient step on the actor model (with sequence packing)."""
         if self._actor_model is None or self._optimizer is None:
             raise RuntimeError("setup() must be called first.")
+
+        from lumenrl.engine.training.packing import (
+            PackingContext, pack_sequences, packed_token_log_probs,
+            unpack_log_probs,
+        )
 
         self._actor_model.train()
         sequences = batch["input_ids"].to(self._device)
         attention_mask = batch["attention_mask"].to(self._device)
 
-        outputs = self._actor_model(input_ids=sequences, attention_mask=attention_mask)
-        logits = outputs.logits if hasattr(outputs, "logits") else outputs
-        token_log_probs = self._fused_token_log_probs(logits, sequences)
-        del outputs, logits
+        # Compute per-mini-batch batch_num_tokens via all-reduce (Verl pattern).
+        # Each mini-batch normalizes by its own global token count, not the
+        # total across all mini-batches.
+        _resp = batch.tensors.get("response_mask")
+        if _resp is not None:
+            _local_mb_tokens = int(_resp.sum())
+        else:
+            _local_mb_tokens = int(attention_mask.sum())
+        if self._is_distributed:
+            _tok_t = torch.tensor(_local_mb_tokens, device=self._device)
+            torch.distributed.all_reduce(_tok_t, op=torch.distributed.ReduceOp.SUM)
+            mb_batch_num_tokens = int(_tok_t.item())
+        else:
+            mb_batch_num_tokens = _local_mb_tokens
 
-        batch.tensors["log_probs"] = token_log_probs
+        # Pack multiple sequences into a single flat tensor for the forward pass
+        packed = pack_sequences(sequences, attention_mask)
 
-        loss, metrics = self._algorithm.compute_loss(batch)
-        loss = loss.to(self._device)
+        # PackingContext stays alive through backward (gradient checkpointing)
+        with PackingContext(packed.cu_seqlens, packed.max_seqlen):
+            outputs = self._actor_model(
+                input_ids=packed.input_ids,
+                position_ids=packed.position_ids,
+                attention_mask=None,  # varlen attention handles masking
+            )
+            logits = outputs.logits if hasattr(outputs, "logits") else outputs
+            logits = logits.squeeze(0)  # (total_tokens, V)
 
-        if loss.isnan():
-            metrics["loss"] = float("nan")
-            return metrics
+            flat_lp = packed_token_log_probs(
+                logits, packed.input_ids.squeeze(0), packed.cu_seqlens,
+            )
+            del outputs, logits
 
-        loss.backward()
+            # Unpack to [B, S-1] padded format (matches old_log_probs shape)
+            token_log_probs = unpack_log_probs(
+                flat_lp, packed.cu_seqlens, packed.seq_lens, sequences.shape[1],
+            )
+            batch.tensors["log_probs"] = token_log_probs
+
+            # Mismatch KL: divergence between rollout (old) and training log_probs.
+            # Should be ~0 when both use the same computation path and policy.
+            if _resp is not None:
+                _diff = (token_log_probs - batch.tensors["old_log_probs"]).detach()
+                _rm = _resp.to(dtype=_diff.dtype)
+                _denom = _rm.sum().clamp(min=1.0)
+                _mismatch_kl = float((_diff * _rm).sum() / _denom)
+            else:
+                _mismatch_kl = float((token_log_probs - batch.tensors["old_log_probs"]).detach().mean())
+
+            # Attach per-mini-batch global normalization info for Verl-aligned loss
+            batch.meta["batch_num_tokens"] = mb_batch_num_tokens
+            batch.meta["dp_size"] = dp_size
+
+            loss, metrics = self._algorithm.compute_loss(batch)
+            loss = loss.to(self._device)
+
+            if loss.isnan():
+                metrics["loss"] = float("nan")
+                return metrics
+
+            # dp_size compensation is now inside the loss (via batch_num_tokens),
+            # so we only apply loss_scale for gradient accumulation here.
+            (loss * loss_scale).backward()
 
         metrics["loss"] = float(loss.detach())
+        metrics["mismatch_kl"] = _mismatch_kl
         return metrics
 
     def train(self) -> None:
@@ -1078,17 +1226,90 @@ class RLTrainer:
             micro_bs = max(1, int(self.config.policy.train_micro_batch_size))
             max_tok = int(self.config.policy.max_token_len_per_gpu)
             mini_batches = self._dynamic_mini_batches(batch, max_tok, micro_bs)
+
+            # FSDP2: all ranks MUST run the same number of forward/backward passes.
+            # Packing by actual length can yield different counts per rank.
+            # Synchronize by padding ranks with fewer mini-batches.
+            if self._is_distributed and self._world_size > 1:
+                import torch.distributed as dist
+                my_count = len(mini_batches)
+                count_t = torch.tensor([my_count], device=self._device)
+                dist.all_reduce(count_t, op=dist.ReduceOp.MAX)
+                global_max = int(count_t.item())
+                if my_count < global_max:
+                    # Pad with dummy mini-batches: reuse last batch but zero response_mask
+                    # so loss = 0 while FSDP2 collectives still execute.
+                    pad_batch = mini_batches[-1]
+                    dummy_tensors = {k: v.clone() for k, v in pad_batch.tensors.items()}
+                    dummy_tensors["response_mask"] = torch.zeros_like(dummy_tensors["response_mask"])
+                    dummy_mb = DataProto(tensors=dummy_tensors, meta=pad_batch.meta.copy())
+                    while len(mini_batches) < global_max:
+                        mini_batches.append(dummy_mb)
+                    logger.info("[rank %d] Padded mini-batches: %d -> %d for FSDP2 sync",
+                                self._rank, my_count, global_max)
+
             metrics_accum: dict[str, float] = {}
             step_count = 0
             nan_mb_count = 0
-            grad_norm = torch.tensor(0.0)
+            grad_norm = 0.0
+            mismatch_kl_initial: float | None = None  # first real mini-batch's mismatch KL
             nan_param_count = 0
             total_param_count = 0
-            for mini in mini_batches:
-                self._optimizer.zero_grad(set_to_none=True)
-                m = self._train_step(mini)
+            optimizer_steps = 0
+
+            # Each packed mini-batch is one optimizer step (Verl alignment).
+            accum_steps = 1
+            _dp_size = self._world_size if self._is_distributed else 1
+            # LR warmup (Verl: lr_warmup_steps=10)
+            self._update_lr(step)
+            _cur_lr = self._optimizer.param_groups[0]["lr"]
+            if self._rank == 0:
+                logger.info(
+                    "[step %d] Training: %d mini-batches, accum_steps=%d, dp_size=%d, lr=%.2e",
+                    step, len(mini_batches), accum_steps, _dp_size, _cur_lr,
+                )
+
+            # FSDP2 gradient accumulation: disable reduce-scatter on intermediate
+            # micro-batches, re-enable on the last micro-batch of each group.
+            _fsdp_grad_sync = accum_steps > 1 and self._is_distributed
+            if _fsdp_grad_sync:
+                from lumenrl.engine.training.fsdp_backend import set_requires_gradient_sync
+
+            for i, mini in enumerate(mini_batches):
+                if i % accum_steps == 0:
+                    self._optimizer.zero_grad(set_to_none=True)
+                # Use correct scale for partial final group
+                group_start = (i // accum_steps) * accum_steps
+                group_size = min(accum_steps, len(mini_batches) - group_start)
+                cur_loss_scale = 1.0 / group_size
+                # Toggle FSDP2 gradient sync: off for intermediate, on for last in group
+                is_last_in_group = (i + 1) % accum_steps == 0 or i == len(mini_batches) - 1
+                if _fsdp_grad_sync:
+                    set_requires_gradient_sync(self._actor_model, is_last_in_group)
+                m = self._train_step(
+                    mini, loss_scale=cur_loss_scale, dp_size=_dp_size,
+                )
                 if m.get("loss") is not None and (m["loss"] != m["loss"]):
                     nan_mb_count += 1
+                    # NaN loss: backward was skipped, no grads to corrupt accumulation
+                    # Continue accumulating remaining micro-batches
+                    for k, v in m.items():
+                        if v == v:
+                            metrics_accum[k] = metrics_accum.get(k, 0.0) + v
+                    step_count += 1
+                    # Still need to step at accumulation boundary even if some were NaN
+                    if (i + 1) % accum_steps == 0 or i == len(mini_batches) - 1:
+                        _gn = float(torch.nn.utils.clip_grad_norm_(
+                            self._actor_model.parameters(), max_norm=1.0,
+                        ))
+                        grad_norm = max(grad_norm, _gn)
+                        # Verl-aligned: skip optimizer step if grad_norm is not finite
+                        if not torch.isfinite(torch.tensor(_gn)):
+                            logger.warning("[step %d] Non-finite grad_norm=%.4f, skipping optimizer step.", step, _gn)
+                            self._optimizer.zero_grad(set_to_none=True)
+                        else:
+                            self._optimizer.step()
+                        optimizer_steps += 1
                     continue
                 # Clean NaN grads before stepping
                 _nan_cnt = 0
@@ -1103,15 +1324,32 @@ class RLTrainer:
                             )
                 nan_param_count = max(nan_param_count, _nan_cnt)
                 total_param_count = _total_cnt
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self._actor_model.parameters(), max_norm=1.0,
-                )
-                self._optimizer.step()
+                # Only clip + step at accumulation boundaries
+                if (i + 1) % accum_steps == 0 or i == len(mini_batches) - 1:
+                    _gn = float(torch.nn.utils.clip_grad_norm_(
+                        self._actor_model.parameters(), max_norm=1.0,
+                    ))
+                    grad_norm = max(grad_norm, _gn)
+                    # Verl-aligned: skip optimizer step if grad_norm is not finite
+                    if not torch.isfinite(torch.tensor(_gn)):
+                        logger.warning("[step %d] Non-finite grad_norm=%.4f, skipping optimizer step.", step, _gn)
+                        self._optimizer.zero_grad(set_to_none=True)
+                    else:
+                        self._optimizer.step()
+                    optimizer_steps += 1
+                if mismatch_kl_initial is None and "mismatch_kl" in m:
+                    mismatch_kl_initial = m["mismatch_kl"]
                 for k, v in m.items():
                     if v == v:
                         metrics_accum[k] = metrics_accum.get(k, 0.0) + v
                 step_count += 1
             self._optimizer.zero_grad(set_to_none=True)
+            # Restore gradient sync after accumulation loop
+            if _fsdp_grad_sync:
+                set_requires_gradient_sync(self._actor_model, True)
+            if self._rank == 0:
+                logger.info("[step %d] Completed %d optimizer steps (from %d mini-batches).",
+                            step, optimizer_steps, len(mini_batches))
             train_time = time.time() - t2
             self._log_gpu_mem("post_train", step)
 
@@ -1125,6 +1363,8 @@ class RLTrainer:
             metrics = {k: v / denom for k, v in metrics_accum.items()}
             metrics["grad_norm"] = float(grad_norm)
             metrics["nan_params"] = nan_param_count
+            if mismatch_kl_initial is not None:
+                metrics["mismatch_kl"] = mismatch_kl_initial
 
             step_time = time.time() - step_start
             metrics["timing/step_s"] = step_time

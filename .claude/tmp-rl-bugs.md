@@ -525,3 +525,16 @@ Reference numbers from Lumen FP8 experiments. Useful for validating LumenRL FP8 
 - Next check:
 - Status: open | ruled out | resolved
 ```
+
+### [2026-05-13 nccl-allgather-hang-rocm-svm]
+- Symptom: NCCL _ALLGATHER_BASE timeout (7200s) on all 8 ranks at SeqNum=1207 during step 111 old_log_probs computation. NumelIn=24118304, NumelOut=192946432 (one transformer layer, 8-way FSDP2 shard). Both resume-from-checkpoint and fresh-start reproduced the hang.
+- Origin: ROCm driver (amdgpu kernel module)
+- Root cause: GPU SVM state corruption in the amdgpu kernel module. Evidence from kernel logs:
+  - `svm_range_restore_work [amdgpu]` hogged CPU >10000us over 2048 times
+  - `amdgpu_amdkfd_restore_userptr_worker` hogged CPU over 1024 times
+  - 3x segfaults in `libhsa-runtime64.so` (addresses 0x40, 0x7c, 0x20)
+  - Corruption accumulated during the previous 111-step training run
+- Why fresh start also hung: The driver state corruption is in the kernel module, not in any user-space process or checkpoint. Restarting the container only restarts user-space; the corrupted SVM page tables persist in the kernel.
+- Fix applied: `sudo modprobe -r amdgpu && sudo modprobe amdgpu` (kernel module reload). Container restart alone is insufficient.
+- Prevention: Monitor `dmesg` for `svm_range_restore_work` hogging warnings during long runs.
+- Status: resolved

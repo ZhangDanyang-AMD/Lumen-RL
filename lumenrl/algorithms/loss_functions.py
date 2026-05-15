@@ -56,6 +56,8 @@ def asymmetric_clip_loss(
     *,
     mask: Optional[Tensor] = None,
     clip_ratio_c: float = 0.0,
+    batch_num_tokens: Optional[int] = None,
+    dp_size: int = 1,
 ) -> Tensor:
     """Policy-gradient surrogate with asymmetric ratio clipping (DAPO-style).
 
@@ -75,6 +77,9 @@ def asymmetric_clip_loss(
         clip_high: Upper epsilon; ratio upper bound is ``1 + clip_high`` (e.g. 0.28 → 1.28).
         mask: Optional token mask for masked mean reduction.
         clip_ratio_c: Dual-clip bound C (DAPO). 0 disables. Typical value: 3.0.
+        batch_num_tokens: Global token count across all GPUs. When provided,
+            uses Verl-aligned normalization: ``pg.sum() / batch_num_tokens * dp_size``.
+        dp_size: Data-parallel world size (for FSDP all-reduce compensation).
 
     Returns:
         Scalar loss tensor to minimize.
@@ -95,9 +100,72 @@ def asymmetric_clip_loss(
     if mask is not None:
         w = mask.to(dtype=pg.dtype)
         pg = torch.where(w.bool(), pg, torch.zeros_like(pg))
+        if batch_num_tokens is not None:
+            # Verl-aligned: normalize by global token count, compensate FSDP all-reduce
+            return pg.sum() / max(batch_num_tokens, 1) * dp_size
         denom = torch.clamp(w.sum(), min=1.0)
         return pg.sum() / denom
     return pg.mean()
+
+
+def gmpo_loss(
+    logprobs: Tensor,
+    old_logprobs: Tensor,
+    advantages: Tensor,
+    clip_low: float,
+    clip_high: float,
+    *,
+    mask: Optional[Tensor] = None,
+) -> Tensor:
+    """Geometric-Mean Policy Optimization (GMPO) loss.
+
+    Instead of clipping the importance ratio in probability space, GMPO clips
+    the log-ratio at the token level, computes a geometric mean ratio per
+    sequence, and multiplies by the sequence-level advantage.
+
+    Reference: https://arxiv.org/abs/2507.20673
+    Matches verl's ``compute_policy_loss_geo_mean`` implementation.
+
+    Args:
+        logprobs: Current log-probabilities ``[B, T]``.
+        old_logprobs: Reference log-probabilities ``[B, T]``.
+        advantages: Advantage tensor ``[B, T]`` (token-level, but typically
+            the same scalar broadcast across the sequence).
+        clip_low: Lower clip bound on log-ratio (e.g. 0.4).
+        clip_high: Upper clip bound on log-ratio (e.g. 0.4).
+        mask: Response mask ``[B, T]`` (1 for response tokens, 0 for prompt/pad).
+
+    Returns:
+        Scalar loss tensor to minimize.
+    """
+    neg_approx_kl = logprobs - old_logprobs
+
+    # Token-level clipping in log-space with sign-aware min (GMPO trick):
+    # For positive advantage tokens: keep the smaller of (kl, clipped_kl)
+    # For negative advantage tokens: keep the larger of (kl, clipped_kl)
+    # This is equivalent to: clip toward zero when the update is too large.
+    sgn_adv = torch.sign(advantages)
+    neg_approx_kl_clamped = torch.clamp(neg_approx_kl, -clip_low, clip_high)
+    neg_approx_kl_min = torch.min(
+        sgn_adv * neg_approx_kl, sgn_adv * neg_approx_kl_clamped
+    )
+    neg_approx_kl_min = sgn_adv * neg_approx_kl_min
+
+    if mask is not None:
+        w = mask.to(dtype=neg_approx_kl_min.dtype)
+        mask_sum = w.sum(dim=-1)  # [B]
+        # Geometric mean of token-level ratios → sequence-level ratio
+        ratio = torch.exp(
+            (neg_approx_kl_min * w).sum(dim=-1) / (mask_sum + 1e-8)
+        )
+        # Sequence-level advantage: mean of token advantages
+        seq_adv = (advantages * w).sum(dim=-1) / (mask_sum + 1e-8)
+    else:
+        ratio = torch.exp(neg_approx_kl_min.mean(dim=-1))
+        seq_adv = advantages.mean(dim=-1)
+
+    pg_losses = -seq_adv * ratio
+    return pg_losses.mean()
 
 
 def value_loss(

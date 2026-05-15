@@ -36,6 +36,8 @@ def _patch_hf_attention_with_lumen() -> None:
     Uses ``lumen.ops.attention.hf_patch`` which replaces the ``sdpa``
     entry in HF's ``ALL_ATTENTION_FUNCTIONS`` with an AITER-backed
     implementation that supports both forward and backward.
+
+    Then installs a varlen wrapper on top for sequence packing support.
     """
     try:
         from lumen.ops.attention.hf_patch import patch_hf_sdpa
@@ -44,6 +46,13 @@ def _patch_hf_attention_with_lumen() -> None:
         logger.warning("Lumen HF attention patch not available; using default SDPA/AOTriton.")
     except Exception as exc:
         logger.error("Lumen HF attention patch failed: %s", exc, exc_info=True)
+
+    # Install varlen-aware wrapper for sequence packing (must come AFTER patch_hf_sdpa)
+    try:
+        from lumenrl.engine.training.packing import patch_attention_for_packing
+        patch_attention_for_packing()
+    except Exception as exc:
+        logger.warning("Packing attention patch failed: %s", exc)
 
 
 def _load_hf_model(model_name: str, torch_dtype: torch.dtype = torch.bfloat16) -> nn.Module:
@@ -75,10 +84,9 @@ def _load_hf_model(model_name: str, torch_dtype: torch.dtype = torch.bfloat16) -
 
 
 def _apply_lumen_fp8(model: nn.Module, quant_config: dict[str, Any]) -> nn.Module:
-    """Apply Lumen FP8 optimizations to the model before FSDP2 sharding.
+    """Apply Lumen optimizations to the model before FSDP2 sharding.
 
-    This replicates what ``lumen.rl.verl.verl_entry.patch_verl_fsdp_workers``
-    did via monkey-patching, but called directly without any VERL dependency.
+    Supports both FP8 and BF16 Lumen features (norm, fused_mlp, fused_rope).
     """
     if not quant_config:
         return model
@@ -86,32 +94,46 @@ def _apply_lumen_fp8(model: nn.Module, quant_config: dict[str, Any]) -> nn.Modul
     fp8_enabled = quant_config.get("fp8") or os.environ.get("LUMEN_FP8", "0") == "1"
     fp8_pm = quant_config.get("fp8_param_manager") or os.environ.get("FP8_PARAM_MANAGER", "0") == "1"
     lumen_norm = quant_config.get("lumen_norm") or os.environ.get("LUMEN_NORM", "0") == "1"
+    fused_mlp = quant_config.get("fused_mlp") or os.environ.get("LUMEN_FUSED_MLP", "0") == "1"
+    fused_rope = quant_config.get("fused_rope") or os.environ.get("LUMEN_FUSED_ROPE", "0") == "1"
 
-    if not (fp8_enabled or fp8_pm or lumen_norm):
+    if not (fp8_enabled or fp8_pm or lumen_norm or fused_mlp or fused_rope):
         return model
 
     try:
         from lumen.config import LumenConfig
 
-        cfg = LumenConfig(
-            linear_fp8=bool(fp8_enabled),
+        kwargs = dict(
             fp8_param_manager=bool(fp8_pm),
             lumen_norm=bool(lumen_norm),
+            fused_mlp=bool(fused_mlp),
+            fused_rope=bool(fused_rope),
             hf_attn_patch=True,
-            scaling=os.environ.get("LUMEN_FP8_SCALING", "delayed"),
-            format=os.environ.get("LUMEN_FP8_FORMAT", "fp8_e4m3"),
-            block_size=int(os.environ.get("LUMEN_FP8_BLOCK_SIZE", "128")),
-            fp8_activation_store=os.environ.get("LUMEN_FP8_ACTIVATION_STORE", "0") == "1",
-            fp8_param_gather=os.environ.get("LUMEN_FP8_PARAM_GATHER", "0") == "1",
             fp8_weight_cache=quant_config.get("fp8_weight_cache", False),
         )
+        if fp8_enabled:
+            # FP8 mode: enable quantized linear and related features
+            kwargs.update(
+                scaling=os.environ.get("LUMEN_FP8_SCALING", "delayed"),
+                format=os.environ.get("LUMEN_FP8_FORMAT", "fp8_e4m3"),
+                block_size=int(os.environ.get("LUMEN_FP8_BLOCK_SIZE", "128")),
+                fp8_activation_store=os.environ.get("LUMEN_FP8_ACTIVATION_STORE", "0") == "1",
+                fp8_param_gather=os.environ.get("LUMEN_FP8_PARAM_GATHER", "0") == "1",
+            )
+        else:
+            # BF16 mode: disable FP8 quantized linear to avoid unsupported GEMM errors
+            kwargs.update(
+                quantize_activation=False,
+                fp8_wgrad=False,
+            )
+        cfg = LumenConfig(**kwargs)
         _manager, model = cfg.enable(model)
-        logger.info("Lumen FP8 optimizations applied (fp8=%s, fp8pm=%s, norm=%s)",
-                     fp8_enabled, fp8_pm, lumen_norm)
+        logger.info("Lumen optimizations applied (fp8=%s, fp8pm=%s, norm=%s, fused_mlp=%s, fused_rope=%s)",
+                     fp8_enabled, fp8_pm, lumen_norm, fused_mlp, fused_rope)
     except ImportError:
-        logger.warning("lumen package not installed; skipping FP8 optimizations.")
+        logger.warning("lumen package not installed; skipping Lumen optimizations.")
     except Exception as exc:
-        logger.error("Lumen FP8 enable() failed: %s", exc, exc_info=True)
+        logger.error("Lumen enable() failed: %s", exc, exc_info=True)
 
     return model
 
@@ -148,7 +170,7 @@ def _apply_fsdp2_sharding(
     else:
         mp_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
-            reduce_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
         )
 
     reshard = fsdp_config.get("reshard_after_forward", True)
@@ -177,6 +199,25 @@ def _apply_fsdp2_sharding(
     logger.info("[rank %d] FSDP2 fully_shard applied (fp8_reduce=%s, offload=%s)",
                 rank, fp8_linear, fsdp_config.get("param_offload", False))
     return model
+
+
+def set_requires_gradient_sync(model: nn.Module, requires_sync: bool) -> None:
+    """Toggle gradient sync on all FSDP2 units in *model*.
+
+    For gradient accumulation: set to ``False`` on intermediate
+    micro-batches so that FSDP2 skips the reduce-scatter in backward,
+    letting gradients accumulate locally.  Set back to ``True`` on the
+    last micro-batch of each accumulation group so that the final
+    backward performs the reduce-scatter.
+    """
+    from torch.distributed._composable.fsdp import FSDPModule
+    if isinstance(model, FSDPModule):
+        model.set_requires_gradient_sync(requires_sync, recurse=True)
+    else:
+        for mod in model.modules():
+            if isinstance(mod, FSDPModule):
+                mod.set_requires_gradient_sync(requires_sync, recurse=True)
+                break
 
 
 def set_reshard_after_forward(model: nn.Module, reshard: bool) -> None:

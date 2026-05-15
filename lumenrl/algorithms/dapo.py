@@ -9,7 +9,7 @@ import torch
 from torch import Tensor
 
 from lumenrl.algorithms.base_algorithm import BaseAlgorithm
-from lumenrl.algorithms.loss_functions import asymmetric_clip_loss, kl_penalty
+from lumenrl.algorithms.loss_functions import asymmetric_clip_loss, gmpo_loss, kl_penalty
 from lumenrl.core.config import LumenRLConfig
 from lumenrl.core.protocol import DataProto
 from lumenrl.core.registry import ALGORITHM_REGISTRY
@@ -76,7 +76,7 @@ class DAPOAlgorithm(BaseAlgorithm):
             )
 
         grouped = rewards.view(-1, g)
-        std = grouped.std(dim=1, unbiased=False)
+        std = grouped.std(dim=1)
 
         if cfg.dynamic_sampling:
             keep = std > 1e-6
@@ -88,22 +88,25 @@ class DAPOAlgorithm(BaseAlgorithm):
             row_mask = torch.ones(rewards.shape[0], dtype=torch.bool, device=rewards.device)
 
         mean = grouped.mean(dim=1, keepdim=True)
-        std_safe = grouped.std(dim=1, unbiased=False, keepdim=True).clamp_min(1e-8)
+        std_safe = grouped.std(dim=1, keepdim=True).clamp_min(1e-8)
         adv = (grouped - mean) / std_safe
         adv_flat = adv.reshape(-1)
 
         batch.tensors["advantages"] = adv_flat
         batch.tensors["dapo_sample_mask"] = row_mask.to(dtype=torch.float32)
-        logger.info(
-            "NaN-DEBUG DAPO advantages: active_frac=%.4f, adv nan=%d inf=%d "
-            "min=%.4f max=%.4f mean=%.4f, rewards min=%.4f max=%.4f mean=%.4f, "
-            "std min=%.6f max=%.6f",
-            float(row_mask.float().mean().cpu()),
-            adv_flat.isnan().sum().item(), adv_flat.isinf().sum().item(),
-            adv_flat.min().item(), adv_flat.max().item(), adv_flat.mean().item(),
-            rewards.min().item(), rewards.max().item(), rewards.mean().item(),
-            std.min().item(), std.max().item(),
-        )
+        if adv_flat.numel() > 0:
+            logger.info(
+                "NaN-DEBUG DAPO advantages: active_frac=%.4f, adv nan=%d inf=%d "
+                "min=%.4f max=%.4f mean=%.4f, rewards min=%.4f max=%.4f mean=%.4f, "
+                "std min=%.6f max=%.6f",
+                float(row_mask.float().mean().cpu()),
+                adv_flat.isnan().sum().item(), adv_flat.isinf().sum().item(),
+                adv_flat.min().item(), adv_flat.max().item(), adv_flat.mean().item(),
+                rewards.min().item(), rewards.max().item(), rewards.mean().item(),
+                std.min().item(), std.max().item(),
+            )
+        else:
+            logger.warning("DAPO advantages: adv_flat is empty (batch_size=%d, num_gen=%d)", B, G)
         return batch
 
     def compute_loss(self, batch: DataProto) -> tuple[Tensor, dict[str, Any]]:
@@ -119,6 +122,8 @@ class DAPOAlgorithm(BaseAlgorithm):
         sample_mask = batch.tensors.get("dapo_sample_mask")
 
         cfg = self._config.algorithm.dapo
+        batch_num_tokens = batch.meta.get("batch_num_tokens")
+        dp_size = batch.meta.get("dp_size", 1)
 
         # Expand sequence-level advantages [B] -> [B, T] for token-level loss.
         # Multiply by response_mask so prompt tokens get zero advantage
@@ -144,9 +149,15 @@ class DAPOAlgorithm(BaseAlgorithm):
         low = float(cfg.clip_ratio_low)
         high = float(cfg.clip_ratio_high)
         clip_c = float(getattr(cfg, "clip_ratio_c", 0.0))
-        if cfg.token_level_pg:
+        loss_mode = getattr(cfg, "loss_mode", "token_level")
+
+        if loss_mode == "gmpo":
+            # GMPO: token-level log-ratio clip → geometric mean ratio → seq-level advantage
+            pg = gmpo_loss(logp, old_logp, adv, low, high, mask=sm)
+        elif cfg.token_level_pg:
             pg = asymmetric_clip_loss(
                 logp, old_logp, adv, low, high, mask=sm, clip_ratio_c=clip_c,
+                batch_num_tokens=batch_num_tokens, dp_size=dp_size,
             )
         else:
             # Sequence-level: mean logp per row, scalar adv per row

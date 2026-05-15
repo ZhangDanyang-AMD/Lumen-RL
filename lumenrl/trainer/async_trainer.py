@@ -132,6 +132,9 @@ class AsyncRLTrainer:
         if tq.fp8:
             quant["fp8"] = tq.fp8
         quant["fp8_weight_cache"] = tq.fp8_weight_cache
+        quant["lumen_norm"] = tq.lumen_norm
+        quant["fused_mlp"] = tq.fused_mlp
+        quant["fused_rope"] = tq.fused_rope
 
         from lumenrl.engine.training.fsdp_backend import FSDP2Backend
 
