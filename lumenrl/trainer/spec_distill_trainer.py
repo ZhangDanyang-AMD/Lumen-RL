@@ -1165,12 +1165,30 @@ class SpecDistillTrainer:
     # ------------------------------------------------------------------
 
     def cleanup(self) -> None:
-        """Release all resources."""
+        """Release all resources.
+
+        Teacher engine must shut down BEFORE the mooncake master so the
+        vLLM-side Mooncake producer client disconnects while its master
+        is still up; otherwise its background Ping/FetchTasks threads
+        enter an infinite RPC_FAIL retry loop and prevent process exit.
+        """
         if self._teacher_engine is not None:
-            self._teacher_engine.shutdown()
+            try:
+                self._teacher_engine.shutdown()
+            except Exception as e:
+                logger.warning(
+                    "[rank %d] teacher_engine.shutdown failed: %s",
+                    self._rank, e,
+                )
             self._teacher_engine = None
         if self._mooncake_master is not None:
-            self._mooncake_master.shutdown()
+            try:
+                self._mooncake_master.shutdown()
+            except Exception as e:
+                logger.warning(
+                    "[rank %d] mooncake_master.shutdown failed: %s",
+                    self._rank, e,
+                )
             self._mooncake_master = None
         del self._teacher_model, self._draft_model
         self._teacher_model = None
