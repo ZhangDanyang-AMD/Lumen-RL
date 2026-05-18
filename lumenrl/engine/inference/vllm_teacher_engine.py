@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -770,23 +771,51 @@ class VllmTeacherEngine:
         return self._norm_weight, self._rms_norm_eps
 
     def shutdown(self) -> None:
-        """Terminate the vLLM subprocess and clean up."""
-        if self._proc is not None and self._proc.poll() is None:
-            try:
-                self._send_cmd({"cmd": "shutdown"})
-            except Exception:
-                pass
-            try:
-                self._proc.terminate()
-                self._proc.wait(timeout=10)
-            except Exception:
+        """Terminate the vLLM subprocess tree and clean up.
+
+        vLLM spawns EngineCore + per-rank Worker_TP* processes that share
+        the wrapper subprocess's session (``start_new_session=True``).
+        SIGTERM to the wrapper alone leaves the workers orphaned, and
+        their Mooncake C++ Ping/FetchTasks threads then poll the dead
+        master forever. Signal the whole process group instead.
+        """
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            # Best-effort graceful shutdown — fire-and-forget so we never
+            # block on a wedged worker's response.
+            cmd_f = self._cmd_f
+            if cmd_f is not None:
                 try:
-                    self._proc.kill()
+                    cmd_f.write(json.dumps({"cmd": "shutdown"}) + "\n")
+                    cmd_f.flush()
                 except Exception:
                     pass
 
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
+
+            if proc.poll() is None:
+                self._killpg(proc.pid, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self._killpg(proc.pid, signal.SIGKILL)
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        logger.warning(
+                            "vLLM teacher subprocess pid=%d did not exit "
+                            "after SIGKILL; orphan workers may remain.",
+                            proc.pid,
+                        )
+
         if self._mooncake_store is not None:
-            self._mooncake_store.close()
+            try:
+                self._mooncake_store.close()
+            except Exception:
+                pass
             self._mooncake_store = None
 
         for f in [self._cmd_f, self._resp_f]:
@@ -808,10 +837,17 @@ class VllmTeacherEngine:
         self._initialized = False
         logger.info("VllmTeacherEngine: shutdown complete.")
 
+    @staticmethod
+    def _killpg(pid: int, sig: int) -> None:
+        try:
+            os.killpg(os.getpgid(pid), sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
     def __del__(self) -> None:
         proc = getattr(self, "_proc", None)
         if proc is not None and proc.poll() is None:
-            proc.kill()
+            self._killpg(proc.pid, signal.SIGKILL)
 
 
 __all__ = ["VllmTeacherEngine"]
