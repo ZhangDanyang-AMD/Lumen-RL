@@ -121,10 +121,11 @@ def _apply_fsdp2_sharding(
     fsdp_config: dict[str, Any],
     fp8_linear: bool = False,
 ) -> nn.Module:
-    """Apply PyTorch FSDP2 ``fully_shard`` to the model.
+    """Apply PyTorch FSDP2 to the model.
 
-    All ranks must have identical, fully-loaded parameters on their
-    local CUDA device before this call. FSDP2 will then shard them.
+    Strategy is controlled by ``fsdp_config["strategy"]``:
+      - ``"replicate"`` (default): Pure DDP-like gradient all-reduce.
+      - ``"full_shard"``: Full FSDP2 sharding on all layers + root.
     """
     import torch.distributed as dist
 
@@ -140,16 +141,10 @@ def _apply_fsdp2_sharding(
 
     model.to(local_device)
 
-    if fp8_linear:
-        mp_policy = MixedPrecisionPolicy(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
-        )
-    else:
-        mp_policy = MixedPrecisionPolicy(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.bfloat16,
-        )
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.float32,
+    )
 
     reshard = fsdp_config.get("reshard_after_forward", True)
     offload_policy = None
@@ -157,25 +152,38 @@ def _apply_fsdp2_sharding(
         from torch.distributed._composable.fsdp import CPUOffloadPolicy
         offload_policy = CPUOffloadPolicy(pin_memory=True)
 
-    for module in model.modules():
-        if hasattr(module, "layers") and isinstance(module.layers, nn.ModuleList):
-            for layer in module.layers:
-                fully_shard(
-                    layer,
-                    mp_policy=mp_policy,
-                    reshard_after_forward=reshard,
-                    offload_policy=offload_policy,
-                )
+    strategy = fsdp_config.get("strategy", "replicate").lower()
 
-    fully_shard(
-        model,
-        mp_policy=mp_policy,
-        reshard_after_forward=reshard,
-        offload_policy=offload_policy,
-    )
+    if strategy == "replicate":
+        from torch.distributed._composable.replicate import replicate
 
-    logger.info("[rank %d] FSDP2 fully_shard applied (fp8_reduce=%s, offload=%s)",
-                rank, fp8_linear, fsdp_config.get("param_offload", False))
+        replicate(model, device_mesh=dist.init_device_mesh("cuda", (dist.get_world_size(),)))
+
+        logger.info(
+            "[rank %d] FSDP2 replicate applied (pure DDP, reduce_dtype=float32)",
+            rank,
+        )
+    else:
+        for module in model.modules():
+            if hasattr(module, "layers") and isinstance(module.layers, nn.ModuleList):
+                for layer in module.layers:
+                    fully_shard(
+                        layer,
+                        mp_policy=mp_policy,
+                        reshard_after_forward=reshard,
+                        offload_policy=offload_policy,
+                    )
+
+        fully_shard(
+            model,
+            mp_policy=mp_policy,
+            reshard_after_forward=reshard,
+            offload_policy=offload_policy,
+        )
+
+        logger.info("[rank %d] FSDP2 full_shard applied (reduce_dtype=float32, offload=%s)",
+                    rank, fsdp_config.get("param_offload", False))
+
     return model
 
 

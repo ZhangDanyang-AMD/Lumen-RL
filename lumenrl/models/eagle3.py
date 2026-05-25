@@ -23,6 +23,26 @@ from torch import Tensor
 
 logger = logging.getLogger(__name__)
 
+
+def _make_causal_mask(
+    bsz: int, tgt_len: int, dtype: torch.dtype, device: torch.device,
+) -> Tensor:
+    mask = torch.full((tgt_len, tgt_len), torch.finfo(dtype).min, device=device)
+    mask_cond = torch.arange(tgt_len, device=device)
+    mask.masked_fill_(mask_cond < (mask_cond + 1).view(tgt_len, 1), 0)
+    return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len)
+
+
+def _prepare_attention_mask(
+    attention_mask: Tensor, bsz: int, tgt_len: int, dtype: torch.dtype, device: torch.device,
+) -> Tensor:
+    """Build [B, 1, T, T] causal + padding mask from [B, T] attention_mask."""
+    causal = _make_causal_mask(bsz, tgt_len, dtype, device)
+    expanded = attention_mask[:, None, None, :].expand(bsz, 1, tgt_len, tgt_len).to(dtype)
+    inverted = (1.0 - expanded).masked_fill((1.0 - expanded).bool(), torch.finfo(dtype).min)
+    return causal + inverted
+
+
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -225,30 +245,132 @@ class Eagle3Attention(nn.Module):
         hidden_states: Tensor,
         position_ids: Tensor,
         attn_mask: Optional[Tensor] = None,
-    ) -> Tensor:
+        cache_keys: Optional[Tensor] = None,
+        cache_values: Optional[Tensor] = None,
+        use_cache: bool = False,
+    ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
         B, T, _ = hidden_states.shape
 
         q = self.q_proj(hidden_states).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(hidden_states).view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(hidden_states).view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
-        cos, sin = self.rotary_emb(q, T)
-        q, k = _apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+        if not use_cache:
+            cos, sin = self.rotary_emb(q, T)
+            q, k = _apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+
+            if self.num_kv_groups > 1:
+                k = k.unsqueeze(2).expand(-1, -1, self.num_kv_groups, -1, -1).reshape(B, self.num_heads, T, self.head_dim)
+                v = v.unsqueeze(2).expand(-1, -1, self.num_kv_groups, -1, -1).reshape(B, self.num_heads, T, self.head_dim)
+
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                is_causal=(attn_mask is None),
+                scale=self._softmax_scale,
+            )
+            attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, self.num_heads * self.head_dim)
+            return self.o_proj(attn_out), None, None
+
+        # --- Cached path: diagonal attention (matches TorchSpec) ---
+        lck = 0 if cache_keys is None else cache_keys.shape[2]
+
+        cos, sin = self.rotary_emb(q, T + lck)
+        q, k = _apply_rotary_pos_emb(q, k, cos, sin, position_ids + lck)
 
         if self.num_kv_groups > 1:
             k = k.unsqueeze(2).expand(-1, -1, self.num_kv_groups, -1, -1).reshape(B, self.num_heads, T, self.head_dim)
             v = v.unsqueeze(2).expand(-1, -1, self.num_kv_groups, -1, -1).reshape(B, self.num_heads, T, self.head_dim)
 
-        if self._softmax_scale is not None:
-            attn_out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask,
-                is_causal=(attn_mask is None),
-                scale=self._softmax_scale,
+        if cache_keys is None:
+            cache_keys = k.unsqueeze(2)
+            cache_values = v.unsqueeze(2)
+        else:
+            cache_keys = torch.cat([cache_keys, k.unsqueeze(2)], dim=2)
+            cache_values = torch.cat([cache_values, v.unsqueeze(2)], dim=2)
+
+        lck = cache_keys.shape[2]
+        k0 = cache_keys[:, :, 0]
+        v0 = cache_values[:, :, 0]
+
+        scale = self._softmax_scale or (1.0 / math.sqrt(self.head_dim))
+
+        from lumenrl.utils.flash_attn import is_available as _fa_available
+
+        if _fa_available() and attn_mask is not None and attn_mask.dim() == 2:
+            attn_out = self._cached_attn_flash(
+                q, k0, v0, cache_keys, cache_values, lck, attn_mask, scale, B, T,
             )
         else:
-            attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=(attn_mask is None))
+            attn_out = self._cached_attn_matmul(
+                q, k0, v0, cache_keys, cache_values, lck, attn_mask, scale, B, T,
+            )
+
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, self.num_heads * self.head_dim)
-        return self.o_proj(attn_out)
+        return self.o_proj(attn_out), cache_keys, cache_values
+
+    def _cached_attn_flash(
+        self, q, k0, v0, cache_keys, cache_values, lck, attn_mask, scale, B, T,
+    ):
+        """Flash attention for k0 + online softmax combination with diagonal steps."""
+        from lumenrl.utils.flash_attn import varlen_causal_attn_with_lse
+
+        out0, lse0 = varlen_causal_attn_with_lse(q, k0, v0, attn_mask, scale)
+
+        if lck <= 1:
+            return out0
+
+        # Diagonal scores for steps 1..lck-1
+        pad_mask = ~attn_mask.bool()  # [B, T]
+        diag_scores = []
+        for i in range(1, lck):
+            ki = cache_keys[:, :, i]
+            s_i = (q * ki).sum(-1) * scale  # [B, H, T]
+            s_i = s_i.masked_fill(pad_mask.unsqueeze(1), float('-inf'))
+            diag_scores.append(s_i)
+
+        # Combined LSE: logsumexp(lse0, s_1, ..., s_{lck-1})
+        all_lse = torch.stack([lse0] + diag_scores, dim=-1).float()  # [B, H, T, lck]
+        lse_all = torch.logsumexp(all_lse, dim=-1)  # [B, H, T]
+        lse_all = lse_all.masked_fill(lse_all == float('-inf'), 0.0)
+
+        # Reweight flash attention output
+        w0 = torch.exp(lse0 - lse_all)  # [B, H, T]
+        attn_out = out0 * w0.unsqueeze(-1).to(out0.dtype)
+
+        # Add diagonal value contributions
+        for i in range(1, lck):
+            vi = cache_values[:, :, i]
+            wi = torch.exp(diag_scores[i - 1] - lse_all).to(vi.dtype)
+            attn_out = attn_out + wi.unsqueeze(-1) * vi
+
+        return attn_out
+
+    def _cached_attn_matmul(
+        self, q, k0, v0, cache_keys, cache_values, lck, attn_mask, scale, B, T,
+    ):
+        """Fallback: manual matmul with O(T^2) 4D mask."""
+        if attn_mask is not None and attn_mask.dim() == 2:
+            attn_mask = _prepare_attention_mask(attn_mask, B, T, q.dtype, q.device)
+
+        attn_weights = torch.matmul(q, k0.transpose(2, 3)) * scale
+        if attn_mask is not None:
+            attn_weights = attn_weights + attn_mask
+
+        for i in range(1, lck):
+            ki = cache_keys[:, :, i]
+            w_i = (q * ki).sum(-1) * scale
+            attn_weights = torch.cat((attn_weights, w_i[..., None]), dim=-1)
+
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+
+        attn_out = torch.matmul(attn_weights[..., :T], v0)
+        for i in range(1, lck):
+            vi = cache_values[:, :, i]
+            wi = attn_weights[..., T + i - 1]
+            attn_out = attn_out + wi[..., None] * vi
+
+        return attn_out
 
 
 class Eagle3MLP(nn.Module):
@@ -294,14 +416,21 @@ class Eagle3DecoderLayer(nn.Module):
         hidden_states: Tensor,
         position_ids: Tensor,
         attn_mask: Optional[Tensor] = None,
-    ) -> Tensor:
+        cache_keys: Optional[Tensor] = None,
+        cache_values: Optional[Tensor] = None,
+        use_cache: bool = False,
+    ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
         residual = hidden_states
 
         normed_hidden = self.hidden_norm(hidden_states)
         normed_emb = self.input_layernorm(input_emb)
         concat = torch.cat((normed_emb, normed_hidden), dim=-1)
 
-        hidden_states = self.self_attn(concat, position_ids, attn_mask=attn_mask)
+        hidden_states, cache_keys, cache_values = self.self_attn(
+            concat, position_ids, attn_mask=attn_mask,
+            cache_keys=cache_keys, cache_values=cache_values,
+            use_cache=use_cache,
+        )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -309,7 +438,7 @@ class Eagle3DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        return hidden_states
+        return hidden_states, cache_keys, cache_values
 
 
 class Eagle3Model(nn.Module):
@@ -358,7 +487,6 @@ class Eagle3Model(nn.Module):
         ])
 
         self.out_norm = RMSNorm(hidden_dim, eps=rms_norm_eps)
-        self.lm_head = nn.Linear(hidden_dim, vocab_size, bias=False)
 
     def forward(
         self,
@@ -370,6 +498,7 @@ class Eagle3Model(nn.Module):
         target_ids: Optional[Tensor] = None,
         loss_type: str = "cross_entropy",
         target_hidden_states: Optional[Tensor] = None,
+        attention_mask: Optional[Tensor] = None,
     ) -> dict[str, Tensor]:
         """
         Aligned with TorchSpec Eagle3Model.forward:
@@ -387,6 +516,7 @@ class Eagle3Model(nn.Module):
             target_ids: [B, T] — input token ids (left-shifted each step for off-policy)
             loss_type: "cross_entropy" or "forward_kl"
             target_hidden_states: [B, T+length, H] — teacher last hidden states (post-norm)
+            attention_mask: [B, T] — 1 for real tokens, 0 for padding
         """
         B, T, D = token_embeds.shape
         logits_list: list[Tensor] = []
@@ -394,6 +524,10 @@ class Eagle3Model(nn.Module):
         accuracies: list[Tensor] = []
 
         position_ids = torch.arange(T, device=token_embeds.device).unsqueeze(0).expand(B, -1)
+
+        # Pass raw 2D mask — Eagle3Attention routes to flash attention or builds
+        # 4D mask internally as needed
+        attn_mask = attention_mask
 
         if target_hidden_states is not None:
             target_hidden_states = F.pad(target_hidden_states, (0, 0, 0, self.length), value=0.0)
@@ -403,54 +537,80 @@ class Eagle3Model(nn.Module):
         current_ids = target_ids
         current_mask = loss_mask
 
+        cache_keys = None
+        cache_values = None
+
         for step in range(self.length):
             for layer in self.layers:
-                h = layer(input_emb=token_embeds, hidden_states=h, position_ids=position_ids)
+                h, cache_keys, cache_values = layer(
+                    input_emb=token_embeds, hidden_states=h,
+                    position_ids=position_ids, attn_mask=attn_mask,
+                    cache_keys=cache_keys, cache_values=cache_values,
+                    use_cache=True,
+                )
 
-            normed = self.out_norm(h)
+            _fused_fn = getattr(self, '_fused_kl_loss_fn', None)
+            if (_fused_fn is not None
+                    and loss_type == "forward_kl"
+                    and target_hidden_states is not None
+                    and current_mask is not None):
+                ths = target_hidden_states[:, step:step + T]
+                loss, acc = _fused_fn(
+                    draft_hidden_states=h,
+                    target_hidden_states=ths,
+                    loss_mask=current_mask[:, :T],
+                    norm_weight=self.out_norm.weight,
+                    draft_lm_head_weight=teacher_lm_head_weight,
+                    target_lm_head_weight=teacher_lm_head_weight,
+                    norm_eps=getattr(self.out_norm, 'eps', getattr(self.out_norm, 'variance_epsilon', 1e-6)),
+                )
+                losses.append(loss)
+                accuracies.append(acc)
+            else:
+                normed = self.out_norm(h)
 
-            if current_mask is not None:
-                hs_flat = normed.reshape(-1, D)
-                mask_flat = current_mask[:, :T].reshape(-1).bool()
-                valid_idx = mask_flat.nonzero(as_tuple=True)[0]
+                if current_mask is not None:
+                    hs_flat = normed.reshape(-1, D)
+                    mask_flat = current_mask[:, :T].reshape(-1).bool()
+                    valid_idx = mask_flat.nonzero(as_tuple=True)[0]
 
-                N_valid = valid_idx.shape[0]
-                if N_valid > 0:
-                    normed_valid = hs_flat.index_select(0, valid_idx)
+                    N_valid = valid_idx.shape[0]
+                    if N_valid > 0:
+                        normed_valid = hs_flat.index_select(0, valid_idx)
 
-                    draft_lm_head_w = self.lm_head.weight
+                        draft_lm_head_w = teacher_lm_head_weight
 
-                    if loss_type == "forward_kl" and target_hidden_states is not None:
-                        ths = target_hidden_states[:, step:step + T]
-                        ths_flat = ths.reshape(-1, target_hidden_states.shape[-1])
-                        ths_valid = ths_flat.index_select(0, valid_idx)
+                        if loss_type == "forward_kl" and target_hidden_states is not None:
+                            ths = target_hidden_states[:, step:step + T]
+                            ths_flat = ths.reshape(-1, target_hidden_states.shape[-1])
+                            ths_valid = ths_flat.index_select(0, valid_idx)
 
-                        CHUNK = 512
-                        kl_parts: list[Tensor] = []
-                        acc_parts: list[Tensor] = []
-                        for cs in range(0, N_valid, CHUNK):
-                            ce = min(cs + CHUNK, N_valid)
-                            with torch.no_grad():
-                                teacher_logits = F.linear(ths_valid[cs:ce], teacher_lm_head_weight)
-                                tp = F.softmax(teacher_logits.float(), dim=-1)
-                                teacher_pred = teacher_logits.argmax(dim=-1)
-                                del teacher_logits
-                            draft_logits = F.linear(normed_valid[cs:ce], draft_lm_head_w)
-                            log_p = F.log_softmax(draft_logits.float(), dim=-1)
-                            kl_parts.append(-(tp.clamp(min=1e-8) * log_p).sum(-1))
-                            acc_parts.append((draft_logits.argmax(dim=-1) == teacher_pred).float())
-                            del tp, draft_logits, log_p
-                        losses.append(torch.cat(kl_parts).mean())
-                        accuracies.append(torch.cat(acc_parts).mean())
-                    elif current_ids is not None:
-                        tgt_flat = current_ids[:, :T].reshape(-1)
-                        tgt_valid = tgt_flat.index_select(0, valid_idx)
-                        logits_valid = F.linear(normed_valid, draft_lm_head_w)
-                        ce_valid = F.cross_entropy(logits_valid.float(), tgt_valid, reduction="none")
-                        acc_valid = (logits_valid.argmax(dim=-1) == tgt_valid).float()
-                        losses.append(ce_valid.mean())
-                        accuracies.append(acc_valid.mean())
-                        del logits_valid
+                            CHUNK = 512
+                            kl_parts: list[Tensor] = []
+                            acc_parts: list[Tensor] = []
+                            for cs in range(0, N_valid, CHUNK):
+                                ce = min(cs + CHUNK, N_valid)
+                                with torch.no_grad():
+                                    teacher_logits = F.linear(ths_valid[cs:ce], teacher_lm_head_weight)
+                                    tp = F.softmax(teacher_logits.float(), dim=-1)
+                                    teacher_pred = teacher_logits.argmax(dim=-1)
+                                    del teacher_logits
+                                draft_logits = F.linear(normed_valid[cs:ce], draft_lm_head_w)
+                                log_p = F.log_softmax(draft_logits.float(), dim=-1)
+                                kl_parts.append(-(tp * log_p).sum(-1))
+                                acc_parts.append((draft_logits.argmax(dim=-1) == teacher_pred).float())
+                                del tp, draft_logits, log_p
+                            losses.append(torch.cat(kl_parts).mean())
+                            accuracies.append(torch.cat(acc_parts).mean())
+                        elif current_ids is not None:
+                            tgt_flat = current_ids[:, :T].reshape(-1)
+                            tgt_valid = tgt_flat.index_select(0, valid_idx)
+                            logits_valid = F.linear(normed_valid, draft_lm_head_w)
+                            ce_valid = F.cross_entropy(logits_valid.float(), tgt_valid, reduction="none")
+                            acc_valid = (logits_valid.argmax(dim=-1) == tgt_valid).float()
+                            losses.append(ce_valid.mean())
+                            accuracies.append(acc_valid.mean())
+                            del logits_valid
 
             if step < self.length - 1:
                 # Off-policy left-shift (TorchSpec: padding(input_ids, left=False))

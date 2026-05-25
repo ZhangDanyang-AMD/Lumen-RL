@@ -72,6 +72,10 @@ class PolicyConfig:
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
     warmup_ratio: float = 0.0
+    min_lr: float = 0.0
+    lr_decay_style: str = "cosine"
+    wsd_decay_ratio: float = 0.2
+    wsd_decay_style: str = "cosine"
 
 
 @dataclass
@@ -167,6 +171,7 @@ class DraftModelConfig:
     rope_beta_slow: float = 1.0
     rope_mscale: float = 1.0
     rope_mscale_all_dim: float = 1.0
+    max_window_layers: Optional[int] = None
     dtype: str = "float16"
     resume_from: Optional[str] = None
 
@@ -238,6 +243,14 @@ class RewardConfig:
 
 
 @dataclass
+class EvalConfig:
+    enabled: bool = False
+    interval: int = 1000
+    num_samples: int = 256
+    micro_batch_size: int = 8
+
+
+@dataclass
 class CheckpointConfig:
     checkpoint_dir: str = "results/default"
     save_steps: int = 50
@@ -275,7 +288,9 @@ class MooncakeTransferConfig:
     async_put_pool_size: int = 4
     enable_gpu_direct: bool = False
     enable_hard_pin: bool = False
-    kv_lease_ttl_s: float = 5.0
+    kv_lease_ttl_s: float = 120.0
+    get_retry_wait_seconds: float = 1.0
+    get_retry_max_wait_seconds: float = 90.0
 
 
 @dataclass
@@ -303,6 +318,7 @@ class LumenRLConfig:
     reward: RewardConfig = field(default_factory=RewardConfig)
     quantization: QuantizationConfig = field(default_factory=QuantizationConfig)
     moe: MoEConfig = field(default_factory=MoEConfig)
+    eval: EvalConfig = field(default_factory=EvalConfig)
     checkpointing: CheckpointConfig = field(default_factory=CheckpointConfig)
     logger: LoggerConfig = field(default_factory=LoggerConfig)
     mooncake: MooncakeTransferConfig = field(default_factory=MooncakeTransferConfig)

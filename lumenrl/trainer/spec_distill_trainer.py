@@ -17,12 +17,14 @@ from __future__ import annotations
 
 import gc
 import logging
+import mmap
 import os
 import queue
 import threading
 import time
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -72,18 +74,207 @@ class _TeacherPrefetcher:
         self._req_queue.put(step)
 
     def get(self) -> tuple:
-        """Block until the next result is ready; move tensors to GPU."""
+        """Block until the next result is ready. Keep rank0_data on CPU for streaming."""
         item = self._res_queue.get()
         if isinstance(item, BaseException):
             raise item
         data, ids, mask = item
-        if data is not None:
-            data = {k: v.to(self._device, non_blocking=True) for k, v in data.items()}
         return data, ids, mask
 
     def stop(self) -> None:
         self._req_queue.put(_PREFETCH_SENTINEL)
         self._worker.join(timeout=5)
+
+
+_SHM_SLOTS = 3
+_SHM_POLL_MS = 0.001
+_SHM_TIMEOUT = 300.0
+
+
+class _ShmWriterThread:
+    """Rank-0 only. Consumes from _TeacherPrefetcher, writes teacher tensors
+    + input_ids + attention_mask to a double-buffered SHM slot, then creates
+    a sentinel file to signal other ranks.
+
+    Pure CPU/file I/O — no CUDA or NCCL calls — safe on ROCm.
+    """
+
+    def __init__(self, prefetcher: _TeacherPrefetcher, teacher_keys: tuple[str, ...]) -> None:
+        self._prefetcher = prefetcher
+        self._teacher_keys = teacher_keys
+        self._slot_free = [threading.Event() for _ in range(_SHM_SLOTS)]
+        for ev in self._slot_free:
+            ev.set()
+        self._mmap_cache: list[dict] = [{} for _ in range(_SHM_SLOTS)]
+        self._work: queue.Queue = queue.Queue()
+        self._rank0_buffer: queue.Queue = queue.Queue(maxsize=_SHM_SLOTS)
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="shm-writer")
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while True:
+            item = self._work.get()
+            if item is _PREFETCH_SENTINEL:
+                break
+            step, slot = item
+            try:
+                logger.info("[shm-writer] step=%d slot=%d: waiting prefetcher.get()...", step, slot)
+                rank0_data, ids, mask = self._prefetcher.get()
+                logger.info("[shm-writer] step=%d slot=%d: got prefetch data, enqueue rank0_buffer...", step, slot)
+                buf_entry = {k: rank0_data[k] for k in self._teacher_keys}
+                buf_entry["input_ids"] = ids
+                buf_entry["attention_mask"] = mask
+                buf_entry["_slot"] = slot
+                self._rank0_buffer.put(buf_entry)
+                if not self._slot_free[slot].wait(timeout=_SHM_TIMEOUT):
+                    logger.error("[shm-writer] slot %d not free after %ds, step=%d", slot, _SHM_TIMEOUT, step)
+                    del rank0_data
+                    continue
+                self._slot_free[slot].clear()
+                self._publish(slot, step, rank0_data, ids, mask)
+                logger.info("[shm-writer] step=%d slot=%d: published", step, slot)
+                del rank0_data
+            except Exception:
+                logger.exception("[shm-writer] step=%d slot=%d failed", step, slot)
+
+    def _get_mmap_buf(self, slot: int, key: str, path: str, nbytes: int) -> np.ndarray:
+        cache = self._mmap_cache[slot]
+        if key in cache:
+            fd, mm, arr, cached_size = cache[key]
+            if cached_size >= nbytes:
+                return arr[:nbytes]
+            del arr
+            del cache[key]
+            mm.close()
+            os.close(fd)
+        alloc = nbytes + nbytes // 8  # 12.5% headroom
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+        os.ftruncate(fd, alloc)
+        mm = mmap.mmap(fd, alloc)
+        arr = np.frombuffer(mm, dtype=np.uint8)
+        cache[key] = (fd, mm, arr, alloc)
+        return arr[:nbytes]
+
+    def _publish(self, slot: int, step: int, rank0_data: dict, input_ids, attention_mask) -> None:
+        slot_dir = f"/dev/shm/_teacher_{slot}"
+        os.makedirs(slot_dir, exist_ok=True)
+        for fname in os.listdir(slot_dir):
+            if fname.startswith("READY_"):
+                try:
+                    os.remove(os.path.join(slot_dir, fname))
+                except FileNotFoundError:
+                    pass
+        meta: dict = {}
+        for key in self._teacher_keys:
+            t = rank0_data[key].contiguous()
+            raw = t.view(torch.uint8).numpy().ravel()
+            dst = self._get_mmap_buf(slot, key, f"{slot_dir}/{key}.bin", raw.nbytes)
+            np.copyto(dst, raw)
+            meta[key] = list(t.shape)
+        for name, tensor in (("input_ids", input_ids), ("attention_mask", attention_mask)):
+            c = tensor.contiguous()
+            c.numpy().tofile(f"{slot_dir}/{name}.bin")
+            meta[name] = list(c.shape)
+        torch.save(meta, f"{slot_dir}/meta.pt")
+        open(f"{slot_dir}/READY_{step}", "w").close()
+
+    def submit(self, step: int, slot: int) -> None:
+        self._work.put((step, slot))
+
+    def get_rank0(self) -> dict:
+        return self._rank0_buffer.get()
+
+    def release_slot(self, slot: int) -> None:
+        self._slot_free[slot].set()
+
+    def stop(self) -> None:
+        for ev in self._slot_free:
+            ev.set()
+        self._work.put(_PREFETCH_SENTINEL)
+        self._thread.join(timeout=10)
+        for slot_cache in self._mmap_cache:
+            for key, (fd, mm, arr, sz) in slot_cache.items():
+                try:
+                    mm.close()
+                    os.close(fd)
+                except Exception:
+                    pass
+            slot_cache.clear()
+
+
+class _ShmLoaderThread:
+    """All ranks. Polls for sentinel file, mmap-loads teacher data from SHM slot.
+
+    Pure CPU/file I/O — no CUDA or NCCL calls — safe on ROCm.
+    """
+
+    def __init__(self, rank: int, teacher_keys: tuple[str, ...]) -> None:
+        self._rank = rank
+        self._teacher_keys = teacher_keys
+        self._work: queue.Queue = queue.Queue()
+        self._ready: queue.Queue = queue.Queue(maxsize=_SHM_SLOTS)
+        self._thread = threading.Thread(target=self._loop, daemon=True, name=f"shm-loader-r{rank}")
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while True:
+            item = self._work.get()
+            if item is _PREFETCH_SENTINEL:
+                break
+            step, slot = item
+            try:
+                self._wait_sentinel(slot, step)
+                result = self._load(slot)
+                result["_slot"] = slot
+                self._ready.put(result)
+            except Exception as exc:
+                self._ready.put(exc)
+
+    def _wait_sentinel(self, slot: int, step: int) -> None:
+        path = f"/dev/shm/_teacher_{slot}/READY_{step}"
+        deadline = time.time() + _SHM_TIMEOUT
+        while not os.path.exists(path):
+            if time.time() > deadline:
+                raise TimeoutError(f"[rank {self._rank}] shm-loader timeout: {path}")
+            time.sleep(_SHM_POLL_MS)
+
+    def _load(self, slot: int) -> dict:
+        slot_dir = f"/dev/shm/_teacher_{slot}"
+        meta = torch.load(f"{slot_dir}/meta.pt", weights_only=True)
+        result: dict = {}
+        for key in self._teacher_keys:
+            shape = meta[key]
+            nbytes = 2
+            for d in shape:
+                nbytes *= d
+            path = f"{slot_dir}/{key}.bin"
+            fd = os.open(path, os.O_RDONLY)
+            mm = mmap.mmap(fd, nbytes, access=mmap.ACCESS_READ)
+            t = torch.empty(nbytes, dtype=torch.uint8)
+            t.numpy()[:] = np.frombuffer(mm, dtype=np.uint8, count=nbytes)
+            mm.close()
+            os.close(fd)
+            result[key] = t.view(torch.bfloat16).reshape(shape)
+        for name in ("input_ids", "attention_mask"):
+            shape = meta[name]
+            t = torch.empty(shape, dtype=torch.int64)
+            with open(f"{slot_dir}/{name}.bin", "rb") as f:
+                f.readinto(t.numpy())
+            result[name] = t
+        return result
+
+    def submit(self, step: int, slot: int) -> None:
+        self._work.put((step, slot))
+
+    def get(self) -> dict:
+        item = self._ready.get()
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    def stop(self) -> None:
+        self._work.put(_PREFETCH_SENTINEL)
+        self._thread.join(timeout=10)
 
 
 class SpecDistillTrainer:
@@ -118,6 +309,44 @@ class SpecDistillTrainer:
         self._device = torch.device(
             f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
         )
+
+    # ------------------------------------------------------------------
+    # Distributed wrapping check
+    # ------------------------------------------------------------------
+
+    _SKIP_FSDP_MAX_GPU_GB = 80.0  # model BF16 + FP32 master + Adam states
+
+    def _can_skip_distributed_wrapping(self, model: torch.nn.Module) -> bool:
+        """Decide whether FSDP2/replicate can be safely skipped.
+
+        Safe to skip when ALL of:
+          1. training_backend is explicitly "none", OR
+          2. All three auto-detect conditions hold:
+             a. Model memory footprint (BF16 + FP32 master + optimizer)
+                fits on a single GPU (< 80GB)
+             b. No Dropout/DropPath modules — forward is deterministic
+             c. All ranks receive identical data (broadcast from rank 0)
+                which is always true in spec_distill training
+        """
+        backend = getattr(self.config.policy, "training_backend", "fsdp2")
+        if backend == "none":
+            return True
+
+        num_params = sum(p.numel() for p in model.parameters())
+        # BF16 model (2B/param) + FP32 master (4B) + Adam m+v (8B) = 14B/param
+        est_gpu_gb = num_params * 14.0 / (1024 ** 3)
+        if est_gpu_gb >= self._SKIP_FSDP_MAX_GPU_GB:
+            return False
+
+        has_dropout = any(
+            isinstance(m, (torch.nn.Dropout, torch.nn.Dropout1d,
+                           torch.nn.Dropout2d, torch.nn.Dropout3d))
+            for m in model.modules()
+        )
+        if has_dropout:
+            return False
+
+        return True
 
     # ------------------------------------------------------------------
     # Setup
@@ -232,6 +461,14 @@ class SpecDistillTrainer:
         self._draft_model.to(device=self._device, dtype=draft_dtype)
         self._grad_scaler = None
 
+        if draft_type == "eagle3":
+            trainable = sum(p.numel() for p in self._draft_model.parameters() if p.requires_grad)
+            logger.info(
+                "[rank %d] Eagle3 draft model: %d trainable params "
+                "(lm_head removed, uses teacher lm_head at forward time)",
+                self._rank, trainable,
+            )
+
         # Apply Lumen AITER kernel optimizations before FSDP2 sharding
         training_quant = {}
         if hasattr(self.config, "quantization") and hasattr(self.config.quantization, "training"):
@@ -248,47 +485,65 @@ class SpecDistillTrainer:
         if lumen_norm or lumen_linear or hf_attn_patch:
             try:
                 from lumen.config import LumenConfig
-                lumen_cfg = LumenConfig(
-                    lumen_norm=bool(lumen_norm),
-                    lumen_linear=bool(lumen_linear),
-                    hf_attn_patch=bool(hf_attn_patch),
-                    scaling="none",
-                )
+                import inspect as _inspect
+                _lumen_params = _inspect.signature(LumenConfig.__init__).parameters
+                lumen_kwargs: dict[str, object] = {"scaling": "none"}
+                if "lumen_norm" in _lumen_params:
+                    lumen_kwargs["lumen_norm"] = bool(lumen_norm)
+                if "lumen_linear" in _lumen_params:
+                    lumen_kwargs["lumen_linear"] = bool(lumen_linear)
+                if "hf_attn_patch" in _lumen_params:
+                    lumen_kwargs["hf_attn_patch"] = bool(hf_attn_patch)
+                spec_cfg = getattr(self.config.algorithm, "spec_distill", None)
+                if spec_cfg is not None and getattr(spec_cfg, "loss_type", "") == "forward_kl":
+                    if "fused_kl_loss" in _lumen_params:
+                        lumen_kwargs["fused_kl_loss"] = True
+                lumen_cfg = LumenConfig(**lumen_kwargs)
                 _manager, self._draft_model = lumen_cfg.enable(self._draft_model)
             except ImportError:
                 logger.warning("Lumen not available; using default kernels")
 
         if self._is_distributed:
-            from lumenrl.engine.training.fsdp_backend import FSDP2Backend
-
-            self._draft_model = FSDP2Backend.apply_fsdp2(
-                self._draft_model, {"enabled": True}
-            )
-
-        self._optimizer = torch.optim.AdamW(
-            [p for p in self._draft_model.parameters() if p.requires_grad],
-            lr=self.config.policy.learning_rate,
-            weight_decay=self.config.policy.weight_decay,
-        )
-
-        total_steps = self.config.num_training_steps
-        warmup_ratio = self.config.policy.warmup_ratio
-        warmup_steps = int(total_steps * warmup_ratio)
-        if warmup_steps > 0 or warmup_ratio > 0:
-            from torch.optim.lr_scheduler import LambdaLR
-            import math as _math
-
-            def _cosine_with_warmup(current_step: int) -> float:
-                if current_step < warmup_steps:
-                    return float(current_step) / max(1, warmup_steps)
-                progress = (current_step - warmup_steps) / max(
-                    1, total_steps - warmup_steps
+            skip_fsdp = self._can_skip_distributed_wrapping(self._draft_model)
+            if skip_fsdp:
+                self._draft_model.to(device=self._device)
+                if self._world_size > 1:
+                    from torch.distributed._composable.replicate import replicate
+                    replicate(self._draft_model)
+                    logger.info(
+                        "[rank %d] Using composable replicate for gradient sync (%d params)",
+                        self._rank,
+                        sum(p.numel() for p in self._draft_model.parameters()),
+                    )
+                else:
+                    logger.info(
+                        "[rank %d] Single GPU — no distributed wrapping needed",
+                        self._rank,
+                    )
+            else:
+                from lumenrl.engine.training.fsdp_backend import FSDP2Backend
+                self._draft_model = FSDP2Backend.apply_fsdp2(
+                    self._draft_model, {"enabled": True}
                 )
-                return max(0.0, 0.5 * (1.0 + _math.cos(_math.pi * progress)))
 
-            self._scheduler = LambdaLR(self._optimizer, _cosine_with_warmup)
-        else:
-            self._scheduler = None
+        from lumenrl.trainer.bf16_optimizer import BF16Optimizer
+
+        policy = self.config.policy
+        wsd_decay_ratio = policy.wsd_decay_ratio
+        wsd_decay_style = policy.wsd_decay_style
+        self._optimizer = BF16Optimizer(
+            model=self._draft_model,
+            lr=policy.learning_rate,
+            weight_decay=policy.weight_decay,
+            max_grad_norm=policy.max_grad_norm,
+            total_steps=self.config.num_training_steps,
+            warmup_ratio=policy.warmup_ratio,
+            decay_style=policy.lr_decay_style,
+            min_lr=policy.min_lr,
+            wsd_decay_ratio=wsd_decay_ratio,
+            wsd_decay_style=wsd_decay_style,
+        )
+        self._scheduler = None
 
         # ---- Tokenizer ----
         from transformers import AutoTokenizer
@@ -300,8 +555,18 @@ class SpecDistillTrainer:
             self._tokenizer.pad_token = self._tokenizer.eos_token
         self._tokenizer.padding_side = "left"
 
+        # ---- Resume from checkpoint ----
+        ckpt_cfg = self.config.checkpointing
+        if ckpt_cfg.resume and ckpt_cfg.checkpoint_dir:
+            self._resume_from_checkpoint(ckpt_cfg.checkpoint_dir)
+
         # ---- Dataset ----
         self._load_dataset()
+
+        # ---- Eval cache ----
+        eval_cfg = self.config.eval
+        if eval_cfg.enabled:
+            self._build_eval_cache(num_samples=eval_cfg.num_samples)
 
         if not self.callbacks:
             self.callbacks.append(
@@ -620,6 +885,59 @@ class SpecDistillTrainer:
         rank0_data = self._teacher_inference_rank0(input_ids, attention_mask)
         return self._teacher_broadcast(rank0_data, input_ids)
 
+    def _broadcast_batch_info(
+        self, input_ids: torch.Tensor | None,
+    ) -> tuple[int, int]:
+        """Broadcast (B, T) from rank 0 so all ranks agree on batch shape."""
+        if self._is_distributed:
+            if self._rank == 0:
+                info = torch.tensor(
+                    [input_ids.shape[0], input_ids.shape[1]],
+                    dtype=torch.long, device=self._device,
+                )
+            else:
+                info = torch.zeros(2, dtype=torch.long, device=self._device)
+            torch.distributed.broadcast(info, src=0)
+            return info[0].item(), info[1].item()
+        return input_ids.shape[0], input_ids.shape[1]
+
+    _TEACHER_KEYS = ("hidden_states", "token_embeds", "last_hidden_states")
+    _SHM_DIR = "/dev/shm/_teacher"
+
+    def _publish_to_shm(self, rank0_data: dict[str, torch.Tensor]) -> None:
+        """Rank 0: write teacher data to shared memory. Other ranks wait."""
+        import os as _os
+        _os.makedirs(self._SHM_DIR, exist_ok=True)
+        meta = {}
+        for key in self._TEACHER_KEYS:
+            t = rank0_data[key].contiguous()
+            t.view(torch.uint8).numpy().tofile(f"{self._SHM_DIR}/{key}.bin")
+            meta[key] = list(t.shape)
+        torch.save(meta, f"{self._SHM_DIR}/meta.pt")
+
+    def _load_from_shm(self) -> dict[str, torch.Tensor]:
+        """All ranks: mmap teacher data from shared memory (zero-copy read)."""
+        meta = torch.load(f"{self._SHM_DIR}/meta.pt", weights_only=True)
+        result = {}
+        for key in self._TEACHER_KEYS:
+            shape = meta[key]
+            nbytes = 2
+            for d in shape:
+                nbytes *= d
+            storage = torch.UntypedStorage.from_file(
+                f"{self._SHM_DIR}/{key}.bin", shared=True, nbytes=nbytes,
+            )
+            result[key] = torch.empty(0, dtype=torch.bfloat16).set_(storage).reshape(shape)
+        return result
+
+    def _cleanup_shm(self) -> None:
+        import os as _os
+        for f in ("hidden_states.bin", "token_embeds.bin", "last_hidden_states.bin", "meta.pt"):
+            try:
+                _os.remove(f"{self._SHM_DIR}/{f}")
+            except FileNotFoundError:
+                pass
+
     def _load_dataset(self) -> None:
         """Load training dataset."""
         dataset_path = self.config.reward.dataset
@@ -649,6 +967,287 @@ class SpecDistillTrainer:
             "Loaded dataset: %d samples (shuffled, seed=%d) from %s",
             len(self._dataset), self.config.seed, dataset_path,
         )
+
+    # ------------------------------------------------------------------
+    # Checkpoint resume
+    # ------------------------------------------------------------------
+
+    def _resume_from_checkpoint(self, checkpoint_dir: str) -> None:
+        """Resume training from the latest checkpoint in ``checkpoint_dir``."""
+        import glob as _glob
+        ckpt_files = _glob.glob(os.path.join(checkpoint_dir, "checkpoint_*.pt"))
+        if not ckpt_files:
+            logger.info("[rank %d] No checkpoints found in %s; starting from scratch.", self._rank, checkpoint_dir)
+            return
+
+        import re as _re
+        def _ckpt_step(p: str) -> int:
+            m = _re.search(r"checkpoint_(\d+)\.pt$", p)
+            return int(m.group(1)) if m else -1
+        ckpt_path = max(ckpt_files, key=_ckpt_step)
+        logger.info("[rank %d] Resuming from %s", self._rank, ckpt_path)
+        payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+
+        # CheckpointManager wraps state inside {"step": ..., "state_dict": {...}}
+        if "state_dict" in payload and isinstance(payload["state_dict"], dict):
+            inner = payload["state_dict"]
+            resumed_step = inner.get("step", payload.get("step", 0))
+            payload = inner
+        else:
+            resumed_step = payload.get("step", 0)
+
+        self.global_step = resumed_step
+        logger.info("[rank %d] Checkpoint payload keys: %s", self._rank, list(payload.keys()))
+
+        sd = payload.get("model_state_dict")
+        if sd and self._draft_model is not None:
+            info = self._draft_model.load_state_dict(sd, strict=False)
+            logger.info("[rank %d] Loaded model weights from step %d (%d keys, missing=%s, unexpected=%s)",
+                        self._rank, resumed_step, len(sd), info.missing_keys, info.unexpected_keys)
+
+        opt_sd = payload.get("optimizer_state_dict")
+        if opt_sd and self._optimizer is not None:
+            self._optimizer.load_state_dict(opt_sd)
+            logger.info("[rank %d] Loaded optimizer state from step %d", self._rank, resumed_step)
+
+        fp32_params = payload.get("fp32_params")
+        if fp32_params and hasattr(self._optimizer, "fp32_params"):
+            for dst, src in zip(self._optimizer.fp32_params, fp32_params):
+                dst.data.copy_(src.data.to(dst.device))
+            logger.info("[rank %d] Loaded %d FP32 master params", self._rank, len(fp32_params))
+        elif sd and hasattr(self._optimizer, "sync_fp32_params_from_model"):
+            self._optimizer.sync_fp32_params_from_model()
+            logger.info("[rank %d] Synced FP32 params from loaded model weights", self._rank)
+
+        sched_epoch = payload.get("scheduler_last_epoch")
+        if sched_epoch is not None and hasattr(self._optimizer, "scheduler"):
+            self._optimizer.scheduler.last_epoch = sched_epoch
+            self._optimizer.scheduler.step()
+            logger.info("[rank %d] Restored scheduler to epoch %d (lr=%.2e)",
+                        self._rank, sched_epoch, self._optimizer.get_learning_rate())
+        elif hasattr(self._optimizer, "scheduler") and resumed_step > 0:
+            for _ in range(resumed_step):
+                self._optimizer.scheduler.step()
+            logger.info("[rank %d] LR scheduler advanced to step %d (lr=%.2e)",
+                        self._rank, resumed_step, self._optimizer.get_learning_rate())
+
+        logger.info("[rank %d] Resumed training from step %d", self._rank, resumed_step)
+
+    # ------------------------------------------------------------------
+    # Eval cache
+    # ------------------------------------------------------------------
+
+    def _build_eval_cache(self, num_samples: int = 256) -> None:
+        """Cache the last ``num_samples`` from the shuffled dataset for eval.
+
+        Stored on CPU as list of (input_ids, attention_mask) pairs.
+        Non-overlapping with early training batches (takes from the tail).
+        """
+        if self._dataset is None:
+            logger.warning("No dataset; eval cache not built.")
+            self._eval_cache: list[tuple[torch.Tensor, torch.Tensor]] = []
+            return
+
+        import json as _json
+
+        ds_len = len(self._dataset)
+        num_samples = min(num_samples, ds_len)
+        start_idx = ds_len - num_samples
+        max_len = self.config.policy.max_total_sequence_length
+        self._tokenizer.padding_side = "right"
+
+        cache: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for idx in range(start_idx, ds_len):
+            s = self._dataset[idx]
+            convs = s.get("conversations")
+            if convs and isinstance(convs, list) and isinstance(convs[0], dict):
+                if hasattr(self._tokenizer, "apply_chat_template"):
+                    ROLE_MAP = {"human": "user", "gpt": "assistant"}
+                    normalized = []
+                    for m in convs:
+                        if "role" in m and "content" in m:
+                            normalized.append(m)
+                        elif "from" in m and "value" in m:
+                            normalized.append({
+                                "role": ROLE_MAP.get(m["from"], m["from"]),
+                                "content": m["value"],
+                            })
+                        else:
+                            normalized.append(m)
+                    text = self._tokenizer.apply_chat_template(
+                        normalized, tokenize=False, add_generation_prompt=False
+                    )
+                else:
+                    text = "\n".join(
+                        m.get("content", "") for m in convs if isinstance(m, dict)
+                    )
+            else:
+                raw = (
+                    s.get("prompt") or s.get("question") or s.get("input")
+                    or s.get("problem") or ""
+                )
+                answer = (
+                    s.get("answer") or s.get("solution")
+                    or s.get("generated_solution") or s.get("target")
+                    or s.get("output") or ""
+                )
+                if isinstance(raw, list):
+                    text = "\n".join(
+                        m.get("content", "") for m in raw if isinstance(m, dict)
+                    )
+                elif isinstance(raw, str) and raw.startswith("["):
+                    try:
+                        msgs = _json.loads(raw)
+                        text = "\n".join(
+                            m.get("content", "") for m in msgs if isinstance(m, dict)
+                        )
+                    except (_json.JSONDecodeError, TypeError):
+                        text = raw
+                else:
+                    text = str(raw)
+                if answer:
+                    text = text + " " + str(answer)
+
+            enc = self._tokenizer(
+                [text], padding=True, truncation=True,
+                max_length=max_len - 1, return_tensors="pt",
+            )
+            cache.append((enc["input_ids"], enc["attention_mask"]))
+
+        self._eval_cache = cache
+        logger.info(
+            "[rank %d] Eval cache built: %d samples (indices %d..%d)",
+            self._rank, len(cache), start_idx, ds_len - 1,
+        )
+
+    def run_validation(self) -> dict[str, float]:
+        """Run eval on cached samples. Returns eval/* metrics.
+
+        Must run on all ranks (teacher forward + FSDP need collective ops).
+        """
+        if not hasattr(self, "_eval_cache") or not self._eval_cache:
+            return {}
+
+        spec_cfg = self.config.algorithm.spec_distill
+        draft_dtype = next(self._draft_model.parameters()).dtype
+        eval_cfg = self.config.eval
+        mb_size = eval_cfg.micro_batch_size
+
+        self._draft_model.eval()
+
+        all_losses: list[list[float]] = []
+        all_accs: list[list[float]] = []
+
+        # Batch eval samples
+        all_ids = [c[0] for c in self._eval_cache]
+        all_masks = [c[1] for c in self._eval_cache]
+
+        for mb_start in range(0, len(all_ids), mb_size):
+            mb_end = min(mb_start + mb_size, len(all_ids))
+            mb_ids_list = all_ids[mb_start:mb_end]
+            mb_masks_list = all_masks[mb_start:mb_end]
+
+            max_len = max(ids.shape[1] for ids in mb_ids_list)
+            padded_ids = []
+            padded_masks = []
+            for ids, mask in zip(mb_ids_list, mb_masks_list):
+                pad_len = max_len - ids.shape[1]
+                if pad_len > 0:
+                    ids = F.pad(ids, (0, pad_len), value=self._tokenizer.pad_token_id)
+                    mask = F.pad(mask, (0, pad_len), value=0)
+                padded_ids.append(ids)
+                padded_masks.append(mask)
+
+            input_ids = torch.cat(padded_ids, dim=0).to(self._device)
+            attention_mask = torch.cat(padded_masks, dim=0).to(self._device)
+
+            teacher_data = self._teacher_forward(input_ids, attention_mask)
+
+            with torch.no_grad():
+                aux_hidden = teacher_data["hidden_states"].to(device=self._device, dtype=draft_dtype)
+                t_ids = teacher_data["input_ids"].to(self._device)
+                lm_head_w = self._lm_head_weight.to(device=self._device, dtype=draft_dtype)
+                embed_w = self._embed_weight.to(device=self._device, dtype=draft_dtype)
+                token_embeds = F.embedding(t_ids, embed_w)
+                loss_mask = attention_mask.to(self._device)
+
+                target_hs = teacher_data.get("last_hidden_states")
+                if target_hs is not None:
+                    target_hs = target_hs.to(device=self._device, dtype=draft_dtype)
+                    nan_mask = torch.isnan(target_hs).any(dim=-1)
+                    if nan_mask.any():
+                        loss_mask = loss_mask.clone()
+                        loss_mask[:, :nan_mask.shape[1]][nan_mask] = 0
+                        target_hs = target_hs.nan_to_num_(0.0)
+                    if self._norm_weight is not None:
+                        nw = self._norm_weight.to(device=self._device, dtype=draft_dtype)
+                        ths_f32 = target_hs.float()
+                        variance = ths_f32.pow(2).mean(-1, keepdim=True)
+                        target_hs = (ths_f32 * torch.rsqrt(variance + self._norm_eps)).to(draft_dtype) * nw
+
+                result = self._draft_model(
+                    token_embeds=token_embeds,
+                    aux_hidden_states=aux_hidden,
+                    teacher_lm_head_weight=lm_head_w,
+                    embed_weight=embed_w,
+                    loss_mask=loss_mask,
+                    target_ids=t_ids,
+                    loss_type=spec_cfg.loss_type,
+                    target_hidden_states=target_hs,
+                    attention_mask=attention_mask.to(self._device),
+                )
+
+            step_losses = [float(l.detach()) for l in result["losses"]]
+            step_accs = [float(a.detach()) for a in result["accuracies"]]
+            all_losses.append(step_losses)
+            all_accs.append(step_accs)
+
+            del teacher_data, result
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        self._draft_model.train()
+
+        num_positions = max(len(row) for row in all_losses) if all_losses else 0
+        avg_loss_per_pos = []
+        avg_acc_per_pos = []
+        for i in range(num_positions):
+            vals = [row[i] for row in all_losses if i < len(row)]
+            avg_loss_per_pos.append(sum(vals) / len(vals) if vals else 0.0)
+            vals = [row[i] for row in all_accs if i < len(row)]
+            avg_acc_per_pos.append(sum(vals) / len(vals) if vals else 0.0)
+
+        # All-reduce across ranks
+        if self._is_distributed:
+            for i in range(num_positions):
+                for arr in (avg_loss_per_pos, avg_acc_per_pos):
+                    t = torch.tensor(arr[i], dtype=torch.float64, device=self._device)
+                    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.AVG)
+                    arr[i] = float(t.item())
+
+        # Compute weighted loss and simulated accept length
+        total_loss = 0.0
+        total_weight = 0.0
+        for i, l in enumerate(avg_loss_per_pos):
+            w = spec_cfg.position_decay ** i
+            total_loss += w * l
+            total_weight += w
+
+        cum_prod = 1.0
+        simulated_acc_len = 1.0
+        for acc in avg_acc_per_pos:
+            cum_prod *= acc
+            simulated_acc_len += cum_prod
+
+        metrics: dict[str, float] = {
+            "eval/loss": total_loss / total_weight if total_weight > 0 else 0.0,
+            "eval/simulated_acc_len": simulated_acc_len,
+        }
+        for i, (l, a) in enumerate(zip(avg_loss_per_pos, avg_acc_per_pos)):
+            metrics[f"eval/step_{i}_loss"] = l
+            metrics[f"eval/step_{i}_acc"] = a
+
+        return metrics
 
     # ------------------------------------------------------------------
     # Data loading helpers
@@ -908,6 +1507,7 @@ class SpecDistillTrainer:
             mod.register_full_backward_hook(_make_hook(name))
         logger.warning("[rank %d] Installed backward debug hooks on draft model", rank)
 
+
     def _train_step_eagle3(
         self,
         teacher_data: dict[str, torch.Tensor],
@@ -918,31 +1518,50 @@ class SpecDistillTrainer:
         draft_dtype = next(self._draft_model.parameters()).dtype
         aux_hidden = teacher_data["hidden_states"].to(device=self._device, dtype=draft_dtype)  # [B, T, 3*H]
         input_ids = teacher_data["input_ids"].to(self._device)
-        lm_head_w = self._lm_head_weight.to(device=self._device, dtype=draft_dtype)
-        embed_w = self._embed_weight.to(device=self._device, dtype=draft_dtype)
+        input_ids = torch.cat([input_ids[:, 1:], torch.zeros_like(input_ids[:, :1])], dim=1)
+
+        if not hasattr(self, "_lm_head_w_gpu") or self._lm_head_w_gpu is None:
+            self._lm_head_w_gpu = self._lm_head_weight.to(device=self._device, dtype=draft_dtype)
+            self._embed_w_gpu = self._embed_weight.to(device=self._device, dtype=draft_dtype)
+        lm_head_w = self._lm_head_w_gpu
+        embed_w = self._embed_w_gpu
         token_embeds = torch.nn.functional.embedding(input_ids, embed_w)
+
         loss_mask = attention_mask.to(self._device)
         spec_cfg = self.config.algorithm.spec_distill
-        self._debug_sync("data_to_gpu", step)
-
         target_hs = teacher_data.get("last_hidden_states")
+
+        aux_nan = torch.isnan(aux_hidden).any(dim=-1)  # [B, T]
+        target_nan = torch.zeros_like(aux_nan)
         if target_hs is not None:
             target_hs = target_hs.to(device=self._device, dtype=draft_dtype)
-            # Mask out positions where teacher produced NaN hidden states
-            nan_mask = torch.isnan(target_hs).any(dim=-1)  # [B, T]
-            if nan_mask.any():
-                nan_count = nan_mask.sum().item()
-                loss_mask = loss_mask.clone()
-                loss_mask[:, :nan_mask.shape[1]][nan_mask] = 0
+            target_hs = torch.cat([target_hs[:, 1:], torch.zeros_like(target_hs[:, :1])], dim=1)
+            target_nan = torch.isnan(target_hs).any(dim=-1)
+
+
+        nan_mask = aux_nan | target_nan
+        if nan_mask.any():
+            nan_count = nan_mask.sum().item()
+            aux_only = (aux_nan & ~target_nan).sum().item()
+            tgt_only = (target_nan & ~aux_nan).sum().item()
+            both = (aux_nan & target_nan).sum().item()
+            loss_mask = loss_mask.clone()
+            loss_mask[:, :nan_mask.shape[1]][nan_mask] = 0
+            aux_hidden = aux_hidden.nan_to_num_(0.0)
+            if target_hs is not None:
                 target_hs = target_hs.nan_to_num_(0.0)
-                logger.warning("Masked %d teacher NaN positions from loss", nan_count)
-            # vLLM returns pre-norm hidden states; apply teacher's final RMSNorm
-            if self._norm_weight is not None:
-                nw = self._norm_weight.to(device=self._device, dtype=draft_dtype)
-                ths_f32 = target_hs.float()
-                variance = ths_f32.pow(2).mean(-1, keepdim=True)
-                target_hs = (ths_f32 * torch.rsqrt(variance + self._norm_eps)).to(draft_dtype) * nw
-        self._debug_sync("rmsnorm_target", step)
+            logger.warning(
+                "Masked %d teacher NaN positions (aux_only=%d tgt_only=%d both=%d)",
+                nan_count, aux_only, tgt_only, both,
+            )
+
+        if target_hs is not None and self._norm_weight is not None:
+            nw = self._norm_weight.to(device=self._device, dtype=draft_dtype)
+            ths_f32 = target_hs.float()
+            variance = ths_f32.pow(2).mean(-1, keepdim=True)
+            target_hs = (ths_f32 * torch.rsqrt(variance + self._norm_eps)).to(draft_dtype) * nw
+
+
 
         result = self._draft_model(
             token_embeds=token_embeds,
@@ -953,8 +1572,9 @@ class SpecDistillTrainer:
             target_ids=input_ids,
             loss_type=spec_cfg.loss_type,
             target_hidden_states=target_hs,
+            attention_mask=attention_mask.to(self._device),
         )
-        self._debug_sync("draft_forward", step)
+
 
         total_loss = torch.tensor(0.0, device=self._device)
         metrics: dict[str, float] = {}
@@ -969,11 +1589,9 @@ class SpecDistillTrainer:
 
         num_accum = getattr(self, "_grad_accum_steps", 1)
         scaled_loss = total_loss / num_accum
-        if self._grad_scaler is not None:
-            self._grad_scaler.scale(scaled_loss).backward()
-        else:
-            scaled_loss.backward()
-        self._debug_sync("backward", step)
+
+        scaled_loss.backward()
+
         metrics["loss"] = float(total_loss.detach())
         return metrics
 
@@ -1024,21 +1642,57 @@ class SpecDistillTrainer:
                 cb.on_train_begin(self)
 
         total_steps = int(self.config.num_training_steps)
+        start_step = self.global_step
+        if start_step > 0:
+            logger.info("[rank %d] Resuming from step %d / %d", self._rank, start_step, total_steps)
         logger.info("[rank %d] SpecDistill train loop: total_steps=%d", self._rank, total_steps)
         spec_cfg = self.config.algorithm.spec_distill
         draft_type = spec_cfg.draft_type.lower()
 
         use_vllm = self.config.algorithm.teacher.inference_backend == "vllm"
         prefetcher = _TeacherPrefetcher(self) if (use_vllm and self._rank == 0) else None
+        shm_writer = _ShmWriterThread(prefetcher, self._TEACHER_KEYS) if (use_vllm and self._rank == 0) else None
+        shm_loader = _ShmLoaderThread(self._rank, self._TEACHER_KEYS) if use_vllm else None
 
-        if prefetcher is not None:
-            prefetcher.prefetch(0)
-            if total_steps > 1:
-                prefetcher.prefetch(1)
+        if use_vllm:
+            if self._rank == 0:
+                for _slot in range(_SHM_SLOTS):
+                    _sd = f"/dev/shm/_teacher_{_slot}"
+                    if os.path.exists(_sd):
+                        for _fn in os.listdir(_sd):
+                            if _fn.startswith("READY_"):
+                                try:
+                                    os.remove(os.path.join(_sd, _fn))
+                                except FileNotFoundError:
+                                    pass
+            if self._is_distributed:
+                torch.distributed.barrier()
 
-        self._install_backward_hooks()
+            for s in range(start_step, min(start_step + _SHM_SLOTS, total_steps)):
+                if prefetcher is not None:
+                    prefetcher.prefetch(s)
+                _slot = s % _SHM_SLOTS
+                if shm_writer is not None:
+                    shm_writer.submit(s, _slot)
+                if shm_loader is not None:
+                    shm_loader.submit(s, _slot)
 
-        for step in range(total_steps):
+            if shm_writer is not None:
+                _pipeline_data = shm_writer.get_rank0()
+            elif shm_loader is not None:
+                _pipeline_data = shm_loader.get()
+            else:
+                _pipeline_data = None
+            logger.info("[rank %d] Pipeline primed — first step data ready", self._rank)
+            from concurrent.futures import ThreadPoolExecutor
+            _loader_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="shm-async")
+            _loader_future = None
+        elif prefetcher is not None:
+            prefetcher.prefetch(start_step)
+            if start_step + 1 < total_steps:
+                prefetcher.prefetch(start_step + 1)
+
+        for step in range(start_step, total_steps):
             step_start = time.time()
             self.global_step = step
             if self._rank == 0:
@@ -1046,90 +1700,223 @@ class SpecDistillTrainer:
                     cb.on_step_begin(self, step)
 
             t0 = time.time()
-            if prefetcher is not None:
-                rank0_data, input_ids, attention_mask = prefetcher.get()
-                teacher_data = self._teacher_broadcast(rank0_data, input_ids)
+
+            if use_vllm and shm_loader is not None:
+                if step == start_step:
+                    loaded = _pipeline_data
+                elif shm_writer is not None:
+                    loaded = _loader_future.result()
+                else:
+                    loaded = _loader_future.result()
+                cpu_data = {k: loaded[k] for k in self._TEACHER_KEYS}
+                input_ids = loaded["input_ids"]
+                attention_mask = loaded["attention_mask"]
+                _consumed_slot = loaded["_slot"]
+                teacher_time = time.time() - t0
+                if shm_writer is not None:
+                    shm_writer.release_slot(_consumed_slot)
+                _next_step = step + _SHM_SLOTS
+                if _next_step < total_steps:
+                    if prefetcher is not None:
+                        prefetcher.prefetch(_next_step)
+                    if shm_writer is not None:
+                        shm_writer.submit(_next_step, _consumed_slot)
+                    shm_loader.submit(_next_step, _consumed_slot)
+                if step + 1 < total_steps:
+                    if shm_writer is not None:
+                        _loader_future = _loader_executor.submit(shm_writer.get_rank0)
+                    else:
+                        _loader_future = _loader_executor.submit(shm_loader.get)
             else:
                 input_ids, attention_mask = self._get_batch_sequences(step)
-                teacher_data = self._teacher_forward(input_ids, attention_mask)
-            teacher_time = time.time() - t0
-            self._debug_sync("teacher_broadcast", step)
+                if prefetcher is not None:
+                    rank0_data, _, _ = prefetcher.get()
+                elif use_vllm:
+                    rank0_data = self._teacher_inference_rank0(
+                        input_ids, attention_mask, recv_device=torch.device("cpu"),
+                    )
+                else:
+                    teacher_data = self._teacher_forward(input_ids, attention_mask)
+                teacher_time = time.time() - t0
+                if prefetcher is not None and step + 2 < total_steps:
+                    prefetcher.prefetch(step + 2)
 
-            if prefetcher is not None and step + 2 < total_steps:
-                prefetcher.prefetch(step + 2)
-
+            # --- Micro-batch streaming loop (double-buffer + async broadcast) ---
+            _dbg = (step <= start_step + 3)
             t1 = time.time()
-            B = teacher_data["input_ids"].shape[0]
-            T = teacher_data["input_ids"].shape[1]
-            adaptive_mb = max(1, 16384 // max(T, 1))
-            mb = max(1, min(adaptive_mb, B))
+            B, T = input_ids.shape[0], input_ids.shape[1]
+            configured_mb = getattr(self.config.policy, "train_micro_batch_size", 0)
+            if configured_mb > 0:
+                mb = min(configured_mb, B)
+            else:
+                adaptive_mb = max(1, 16384 // max(T, 1))
+                mb = max(1, min(adaptive_mb, B))
+            world_size = self._world_size if self._is_distributed else 1
             num_accum = (B + mb - 1) // mb
-            self._grad_accum_steps = num_accum
+            local_accum = (num_accum + world_size - 1) // world_size
+            self._grad_accum_steps = local_accum
             self._optimizer.zero_grad(set_to_none=True)
 
             metrics_accum: dict[str, float] = {}
             accum_count = 0
             self._draft_model.train()
 
-            for mb_start in range(0, B, mb):
-                mb_end = min(mb_start + mb, B)
-                mb_teacher = {k: v[mb_start:mb_end] for k, v in teacher_data.items()}
-                mb_mask = attention_mask[mb_start:mb_end]
+            if use_vllm:
+                # This rank's micro-batch indices (round-robin)
+                my_mbs = [i for i in range(num_accum) if i % world_size == self._rank]
 
-                if draft_type == "eagle3":
-                    m = self._train_step_eagle3(mb_teacher, mb_mask)
-                else:
-                    m = self._train_step_dflash(mb_teacher, mb_mask)
+                # Discover dimensions from shared data
+                D_hidden = cpu_data["hidden_states"].shape[2]
+                D_embed = cpu_data["token_embeds"].shape[2]
+                D_last = cpu_data["last_hidden_states"].shape[2]
 
-                for k, v in m.items():
-                    if isinstance(v, float) and v == v:
-                        metrics_accum[k] = metrics_accum.get(k, 0.0) + v
-                accum_count += 1
+                # Ping-pong GPU buffers
+                def _alloc_gpu_buf():
+                    return {
+                        "hidden_states": torch.empty(mb, T, D_hidden, dtype=torch.bfloat16, device=self._device),
+                        "token_embeds": torch.empty(mb, T, D_embed, dtype=torch.bfloat16, device=self._device),
+                        "last_hidden_states": torch.empty(mb, T, D_last, dtype=torch.bfloat16, device=self._device),
+                    }
+                bufs = [_alloc_gpu_buf(), _alloc_gpu_buf()]
+                xfer_stream = torch.cuda.Stream(device=self._device)
 
-            metrics = {k: v / accum_count for k, v in metrics_accum.items()}
+                # Pre-fill buf[0] with first micro-batch (sync, default stream)
+                if my_mbs:
+                    mb0 = my_mbs[0]
+                    s0 = mb0 * mb
+                    e0 = min(s0 + mb, B)
+                    for key in self._TEACHER_KEYS:
+                        bufs[0][key][:e0 - s0].copy_(cpu_data[key][s0:e0].to(self._device))
 
-            if self._grad_scaler is not None:
-                self._grad_scaler.unscale_(self._optimizer)
+                _use_grad_sync = (
+                    self._is_distributed and self._world_size > 1
+                    and len(my_mbs) > 1
+                    and hasattr(self._draft_model, "set_requires_gradient_sync")
+                )
+                cur = 0
+                if _dbg:
+                    logger.info("[rank %d] step=%d micro-batch loop: B=%d T=%d mb=%d num_accum=%d my_mbs=%d",
+                                self._rank, step, B, T, mb, num_accum, len(my_mbs))
+                for local_idx, mb_idx in enumerate(my_mbs):
+                    if _use_grad_sync:
+                        self._draft_model.set_requires_gradient_sync(
+                            local_idx == len(my_mbs) - 1
+                        )
+                    mb_start = mb_idx * mb
+                    mb_end = min(mb_start + mb, B)
+                    actual_mb = mb_end - mb_start
+                    nxt = 1 - cur
 
-            nan_count = 0
-            nan_names = []
-            for name, p in self._draft_model.named_parameters():
-                if p.grad is not None and torch.isnan(p.grad).any():
-                    nan_frac = torch.isnan(p.grad).float().mean().item()
-                    nan_names.append(f"{name}({nan_frac:.3f})")
-                    p.grad.zero_()
-                    nan_count += 1
-            if nan_count > 0:
-                logger.warning("Zeroed NaN grads in %d params: %s", nan_count, ", ".join(nan_names[:5]))
+                    # Async H2D next micro-batch on xfer_stream (no NCCL)
+                    if local_idx + 1 < len(my_mbs):
+                        next_mb = my_mbs[local_idx + 1]
+                        ns = next_mb * mb
+                        ne = min(ns + mb, B)
+                        with torch.cuda.stream(xfer_stream):
+                            for key in self._TEACHER_KEYS:
+                                bufs[nxt][key][:ne - ns].copy_(
+                                    cpu_data[key][ns:ne].to(self._device),
+                                    non_blocking=True,
+                                )
 
-            self._debug_sync("pre_grad_clip", step)
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                self._draft_model.parameters(),
-                max_norm=self.config.policy.max_grad_norm,
-            )
-            self._debug_sync("grad_clip", step)
-            if not torch.isfinite(grad_norm):
-                logger.warning("Skipping optimizer step (grad_norm=%s)", grad_norm)
-            elif self._grad_scaler is not None:
-                self._grad_scaler.step(self._optimizer)
+                    # Compute on buf[cur] (default stream)
+                    mb_ids = input_ids[mb_start:mb_end]
+                    mb_mask = attention_mask[mb_start:mb_end]
+                    mb_teacher = {
+                        "hidden_states": bufs[cur]["hidden_states"][:actual_mb],
+                        "token_embeds": bufs[cur]["token_embeds"][:actual_mb],
+                        "input_ids": mb_ids,
+                        "last_hidden_states": bufs[cur]["last_hidden_states"][:actual_mb],
+                    }
+
+                    mb_actual_len = int(mb_mask.sum(dim=-1).max().item())
+                    if mb_actual_len < mb_mask.shape[1]:
+                        mb_mask = mb_mask[:, :mb_actual_len].contiguous()
+                        trimmed = {}
+                        for k, v in mb_teacher.items():
+                            if v.dim() >= 2:
+                                trimmed[k] = v[:, :mb_actual_len].contiguous()
+                            else:
+                                trimmed[k] = v
+                        mb_teacher = trimmed
+
+                    if _dbg and (local_idx == 0 or local_idx == len(my_mbs) - 1):
+                        logger.info("[rank %d] step=%d mb[%d/%d]: start train_step (T_trim=%d, grad_sync=%s)",
+                                    self._rank, step, local_idx, len(my_mbs), mb_actual_len,
+                                    local_idx == len(my_mbs) - 1)
+
+                    if draft_type == "eagle3":
+                        m = self._train_step_eagle3(mb_teacher, mb_mask)
+                    else:
+                        m = self._train_step_dflash(mb_teacher, mb_mask)
+
+                    if _dbg and (local_idx == 0 or local_idx == len(my_mbs) - 1):
+                        logger.info("[rank %d] step=%d mb[%d/%d]: done", self._rank, step, local_idx, len(my_mbs))
+
+                    for k, v in m.items():
+                        if isinstance(v, float) and v == v:
+                            metrics_accum[k] = metrics_accum.get(k, 0.0) + v
+                    accum_count += 1
+                    del mb_teacher, mb_mask
+
+                    if local_idx + 1 < len(my_mbs):
+                        torch.cuda.current_stream().wait_stream(xfer_stream)
+                    cur = nxt
+
+                del bufs, cpu_data
             else:
-                self._optimizer.step()
-            self._debug_sync("optimizer_step", step)
-            if self._grad_scaler is not None:
-                self._grad_scaler.update()
-            if self._scheduler is not None:
-                self._scheduler.step()
-            self._optimizer.zero_grad(set_to_none=True)
+                _num_mbs_novm = (B + mb - 1) // mb
+                _use_grad_sync_novm = (
+                    self._is_distributed and self._world_size > 1
+                    and _num_mbs_novm > 1
+                    and hasattr(self._draft_model, "set_requires_gradient_sync")
+                )
+                for mb_idx, mb_start in enumerate(range(0, B, mb)):
+                    if _use_grad_sync_novm:
+                        self._draft_model.set_requires_gradient_sync(
+                            mb_idx == _num_mbs_novm - 1
+                        )
+                    mb_end = min(mb_start + mb, B)
+                    mb_teacher = {
+                        k: v[mb_start:mb_end] for k, v in teacher_data.items()
+                    }
+                    mb_mask = attention_mask[mb_start:mb_end]
+                    mb_actual_len = int(mb_mask.sum(dim=-1).max().item())
+                    if mb_actual_len < mb_mask.shape[1]:
+                        mb_mask = mb_mask[:, :mb_actual_len].contiguous()
+                        trimmed = {}
+                        for k, v in mb_teacher.items():
+                            if v.dim() >= 2:
+                                trimmed[k] = v[:, :mb_actual_len].contiguous()
+                            else:
+                                trimmed[k] = v
+                        mb_teacher = trimmed
+                    if draft_type == "eagle3":
+                        m = self._train_step_eagle3(mb_teacher, mb_mask)
+                    else:
+                        m = self._train_step_dflash(mb_teacher, mb_mask)
+                    for k, v in m.items():
+                        if isinstance(v, float) and v == v:
+                            metrics_accum[k] = metrics_accum.get(k, 0.0) + v
+                    accum_count += 1
+                    del mb_teacher, mb_mask
+
+            metrics = {k: v / max(accum_count, 1) for k, v in metrics_accum.items()}
+
+
+            grad_norm = self._optimizer.step()
+
             train_time = time.time() - t1
 
             metrics["grad_norm"] = float(grad_norm)
-            metrics["lr"] = self._optimizer.param_groups[0]["lr"]
+            metrics["lr"] = self._optimizer.get_learning_rate()
             metrics["timing/step_s"] = time.time() - step_start
             metrics["timing/teacher_s"] = teacher_time
             metrics["timing/train_s"] = train_time
             metrics["seq/max_len"] = int(input_ids.shape[1])
 
             if self._is_distributed:
+
                 for k in list(metrics.keys()):
                     t = torch.tensor(
                         metrics[k], dtype=torch.float64, device=self._device
@@ -1138,17 +1925,31 @@ class SpecDistillTrainer:
                         t, op=torch.distributed.ReduceOp.AVG
                     )
                     metrics[k] = float(t.item())
-            self._debug_sync("all_reduce", step)
+
 
             self.last_metrics = metrics
 
             for cb in self.callbacks:
                 cb.on_step_end(self, step, metrics)
 
-            del teacher_data
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            if use_vllm and shm_loader is not None:
+                del loaded
+                logger.info("[rank %d] step=%d end: slot=%d done",
+                            self._rank, step, _consumed_slot)
+            elif use_vllm:
+                del rank0_data
+            else:
+                del teacher_data
+            del input_ids, attention_mask
+
+        if use_vllm and shm_loader is not None:
+            _loader_executor.shutdown(wait=False)
+        if shm_writer is not None:
+            shm_writer.stop()
+        if shm_loader is not None:
+            shm_loader.stop()
+        if prefetcher is not None:
+            prefetcher.stop()
 
         if self._rank == 0:
             for cb in self.callbacks:

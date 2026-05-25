@@ -31,6 +31,7 @@ docker run -d \
     -v /home/danyzhan:/home/danyzhan \
     -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
     -e ROCR_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+    -e VLLM_PLUGINS='' \
     "${DOCKER_IMAGE}" \
     bash -c "
 set -e
@@ -41,6 +42,7 @@ vllm serve ${BASE_MODEL} \
     --tensor-parallel-size 8 \
     --trust-remote-code \
     --dtype bfloat16 \
+    --gpu-memory-utilization 0.85 \
     --max-model-len 8192 \
     --host 0.0.0.0 \
     --port 8000 &

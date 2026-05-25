@@ -1,12 +1,5 @@
-# Phase 2: Mixed Domain Training (v2, aligned with lightseekorg/kimi-k2.5-eagle3) — MI350
-#
-# Dataset: mixed corpus (~181K samples) — llava_instruct, smoltalk_cn,
-#          continual_tool_kimi, kimi_2000x, creative_writing, dcagent, etc.
-# Steps: 67,826 (3 epochs × 180870/8, continuing from Phase 1 v2 checkpoint)
-# Teacher: moonshotai/Kimi-K2.5 BF16, compressed-tensors INT4 (vLLM native, TP=4, GPUs 4-7)
-# Draft: Eagle3 v2, 1-layer Transformer, loaded from Phase 1 v2 (FSDP2, float16, GPUs 0-3)
-# Transfer: Mooncake TCP
-# Hardware: 8x AMD MI350
+# Phase 1: OOM test with global_batch_size=24, micro_batch_size=1
+# Only runs 20 steps to verify memory fits after streaming refactor
 
 cluster:
   gpus_per_node: 4
@@ -17,8 +10,8 @@ policy:
   training_backend: fsdp2
   generation_backend: hf
   max_total_sequence_length: 20000
-  train_global_batch_size: 8
-  train_micro_batch_size: 2
+  train_global_batch_size: 128
+  train_micro_batch_size: 1
   learning_rate: 5e-5
   weight_decay: 0.0
   max_grad_norm: 1.0
@@ -39,7 +32,7 @@ algorithm:
     gpu_ids: [4, 5, 6, 7]
     quantization: ""
   draft:
-    from_scratch: false
+    from_scratch: true
     num_layers: 1
     num_heads: 64
     head_dim: 128
@@ -48,7 +41,6 @@ algorithm:
     rope_theta: 1000000.0
     max_window_layers: 36
     dtype: bfloat16
-    resume_from: /dev/shm/checkpoints/kimi_k25_eagle3_v2_phase1
 
 mooncake:
   protocol: tcp
@@ -68,17 +60,20 @@ quantization:
 reward:
   type: function
   function: math_reward
-  dataset: /dev/shm/kimi-mtp-dataset-phase2/train.jsonl
+  dataset: /dev/shm/kimi-mtp-dataset-phase1/train.jsonl
+
+eval:
+  enabled: false
 
 checkpointing:
-  checkpoint_dir: /dev/shm/checkpoints/kimi_k25_eagle3_v2_phase2
-  save_steps: 5000
-  save_total_limit: 3
-  resume: true
+  checkpoint_dir: /dev/shm/checkpoints/kimi_k25_eagle3_bs24_test
+  save_steps: 100
+  save_total_limit: 1
+  resume: false
 
 logger:
   wandb_enabled: false
   log_interval: 1
 
-num_training_steps: 67826
+num_training_steps: 10
 seed: 42

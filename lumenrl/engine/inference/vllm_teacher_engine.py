@@ -118,11 +118,10 @@ engine_kwargs = dict(
     distributed_executor_backend="mp",
     disable_custom_all_reduce=True,
     enable_prefix_caching=False,
-    enforce_eager=True,
     max_model_len=max_seq_len,
-    max_num_batched_tokens=max_seq_len,
-    max_num_seqs=8,
-    gpu_memory_utilization=0.80,
+    max_num_batched_tokens=40000,
+    max_num_seqs=128,
+    gpu_memory_utilization=0.90,
     speculative_config={
         "method": "extract_hidden_states",
         "num_speculative_tokens": 1,
@@ -139,7 +138,6 @@ engine_kwargs = dict(
         ),
         "kv_role": "kv_producer",
     },
-    compilation_config={"cudagraph_mode": "NONE"},
 )
 
 if quantization in ("mxfp4", "fp4"):
@@ -495,6 +493,8 @@ class VllmTeacherEngine:
                     local_buffer_size=getattr(mc, "local_buffer_size", "4GB"),
                     max_seq_len=self._max_seq_len,
                     hidden_dim=self._hidden_size,
+                    get_retry_wait_seconds=getattr(mc, "get_retry_wait_seconds", 1.0),
+                    get_retry_max_wait_seconds=getattr(mc, "get_retry_max_wait_seconds", 90.0),
                 )
                 self._mooncake_store = EagleMooncakeStore(mc_cfg)
                 self._mooncake_store.setup(self._local_device)
@@ -596,14 +596,36 @@ class VllmTeacherEngine:
                 )
                 hs_training = output.hidden_states      # [T, (N-1)*H]
                 hs_last = output.last_hidden_states      # [T, H]
+
+                # NaN diagnostic: check received data per aux layer
+                for li in range(hs_training.shape[-1] // hidden_size):
+                    chunk = hs_training[:, li * hidden_size : (li + 1) * hidden_size]
+                    nans = torch.isnan(chunk).any(dim=-1).sum().item()
+                    if nans > 0:
+                        logger.warning(
+                            "NaN from Mooncake hs_training layer[%d]: %d/%d tokens, "
+                            "seq=%d, key=%s",
+                            li, nans, seq_len, i, key,
+                        )
+                nans_last = torch.isnan(hs_last).any(dim=-1).sum().item()
+                if nans_last > 0:
+                    logger.warning(
+                        "NaN from Mooncake last_hidden_states: %d/%d tokens, "
+                        "seq=%d, key=%s",
+                        nans_last, seq_len, i, key,
+                    )
+
+                # cat() copies both tensors, so hs_concat survives buffer free.
                 hs_concat = torch.cat([hs_training, hs_last], dim=-1)  # [T, N*H]
 
                 all_hidden.append(hs_concat.unsqueeze(0))  # [1, T, N*H]
                 all_embeds.append(
-                    hs_training[:, :hidden_size].unsqueeze(0)  # first aux as embed proxy
+                    hs_concat[:, :hidden_size].unsqueeze(0)  # first aux as embed proxy
                 )
-                all_ids.append(output.input_ids.unsqueeze(0))
-                all_last_hs.append(hs_last.unsqueeze(0))  # [1, T, H]
+                all_ids.append(output.input_ids.clone().unsqueeze(0))
+                # Use slice of hs_concat (already a copy) instead of hs_last
+                # (which wraps a Mooncake buffer freed by remove below).
+                all_last_hs.append(hs_concat[:, -hidden_size:].clone().unsqueeze(0))
 
                 self._mooncake_store.remove_eagle3_tensors(
                     key, has_last_hidden_states=True, has_target=False,

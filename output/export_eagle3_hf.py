@@ -2,7 +2,7 @@
 
 Architecture aligned with lightseekorg/kimi-k2.5-eagle3:
 - Trained weights in float16
-- Base model weights (embed_tokens, lm_head) in bfloat16
+- Base model weights (embed_tokens only) in bfloat16
 - No bias in any layer
 - config: attention_bias=false, rms_norm_eps=1e-6, rope_theta=1000000, rope_scaling=YaRN(64)
 """
@@ -24,15 +24,13 @@ msd = ckpt["state_dict"]["model_state_dict"]
 step = ckpt["state_dict"].get("step", ckpt.get("step", "unknown"))
 print(f"Checkpoint step: {step}")
 
-# --- 2. Load embed_tokens and lm_head from base model ---
-print("Loading embed_tokens and lm_head from base model...")
+# --- 2. Load embed_tokens from base model (frozen, not in checkpoint) ---
+print("Loading embed_tokens from base model...")
 from safetensors import safe_open
 base_shard = os.path.join(BASE_MODEL_DIR, "model-00062-of-000064.safetensors")
 with safe_open(base_shard, framework="pt", device="cpu") as f:
     embed_tokens = f.get_tensor("language_model.model.embed_tokens.weight")
-    lm_head = f.get_tensor("language_model.lm_head.weight")
 print(f"  embed_tokens: {list(embed_tokens.shape)} {embed_tokens.dtype}")
-print(f"  lm_head: {list(lm_head.shape)} {lm_head.dtype}")
 
 # --- 3. Map LumenRL keys to HF keys ---
 # v2 architecture: no bias, separate Q/K/V, RMSNorm, 3×hidden fc
@@ -40,9 +38,11 @@ print(f"  lm_head: {list(lm_head.shape)} {lm_head.dtype}")
 
 hf_state_dict = {}
 
-# embed_tokens and lm_head (from base model, keep bfloat16)
+# embed_tokens (from base model, frozen — keep bfloat16)
 hf_state_dict["embed_tokens.weight"] = embed_tokens
-hf_state_dict["lm_head.weight"] = lm_head
+
+# lm_head (trained draft head — NOT teacher's; convert to float16)
+hf_state_dict["lm_head.weight"] = msd["lm_head.weight"].to(torch.float16)
 
 # fc: 3×hidden projection (float16)
 hf_state_dict["fc.weight"] = msd["fc.weight"].to(torch.float16)
@@ -192,7 +192,7 @@ Final checkpoint at step {step}.
 - rms_norm_eps: 1e-6
 - rope_theta: 1000000.0
 - rope_scaling: YaRN (factor=64)
-- dtype: float16 (trained weights), bfloat16 (embed_tokens, lm_head)
+- dtype: float16 (trained weights incl. lm_head), bfloat16 (embed_tokens from base model)
 """
 with open(os.path.join(OUTPUT_DIR, "README.md"), "w") as f:
     f.write(readme)

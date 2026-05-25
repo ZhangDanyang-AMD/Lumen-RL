@@ -1,7 +1,7 @@
 # Phase 1: Foundation Training (v2, aligned with lightseekorg/kimi-k2.5-eagle3) — MI350
 #
 # Dataset: perfectblend subset (~296K samples) from kimi-mtp-dataset
-# Steps: 111,012 (3 epochs × 296034/8, batch_size=8)
+# Steps: 37,005 (3 epochs × ceil(296034/24), batch_size=24)
 # Teacher: moonshotai/Kimi-K2.5 BF16, compressed-tensors INT4 (vLLM native, TP=4, GPUs 4-7)
 # Draft: Eagle3 v2, 1-layer Transformer, from scratch (FSDP2, float16, GPUs 0-3)
 # Transfer: Mooncake TCP
@@ -16,7 +16,8 @@ policy:
   training_backend: fsdp2
   generation_backend: hf
   max_total_sequence_length: 20000
-  train_global_batch_size: 8
+  train_global_batch_size: 24
+  train_micro_batch_size: 1
   learning_rate: 5e-5
   weight_decay: 0.0
   max_grad_norm: 1.0
@@ -43,14 +44,8 @@ algorithm:
     head_dim: 128
     ffn_dim: 12288
     rms_norm_eps: 1e-6
-    rope_theta: 50000.0
-    rope_scaling_type: yarn
-    rope_scaling_factor: 64.0
-    rope_original_max_pos: 4096
-    rope_beta_fast: 32.0
-    rope_beta_slow: 1.0
-    rope_mscale: 1.0
-    rope_mscale_all_dim: 1.0
+    rope_theta: 1000000.0
+    max_window_layers: 36
     dtype: bfloat16
 
 mooncake:
@@ -58,13 +53,16 @@ mooncake:
   device_name: ""
   global_segment_size: 16GB
   local_buffer_size: 4GB
+  kv_lease_ttl_s: 120.0
+  get_retry_max_wait_seconds: 90.0
+  get_retry_wait_seconds: 1.0
 
 quantization:
   training:
     fp8: null
-    lumen_norm: false
-    lumen_linear: false
-    hf_attn_patch: false
+    lumen_norm: true
+    lumen_linear: true
+    hf_attn_patch: true
   rollout_correction:
     enabled: false
 
@@ -73,9 +71,15 @@ reward:
   function: math_reward
   dataset: /dev/shm/kimi-mtp-dataset-phase1/train.jsonl
 
+eval:
+  enabled: false
+  interval: 100
+  num_samples: 256
+  micro_batch_size: 8
+
 checkpointing:
   checkpoint_dir: /dev/shm/checkpoints/kimi_k25_eagle3_v2_phase1
-  save_steps: 1000
+  save_steps: 100
   save_total_limit: 3
   resume: true
 
@@ -83,5 +87,5 @@ logger:
   wandb_enabled: false
   log_interval: 1
 
-num_training_steps: 111012
+num_training_steps: 37005
 seed: 42
