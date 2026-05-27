@@ -8,7 +8,7 @@ container = "kimi_k25_eagle3_v2_phase1"
 dir_path = "/home/danyzhan/Lumen-RL/dashboards/SDDD/Kimi_K25_SDDD_MI350"
 dashboard = os.path.join(dir_path, "phase1.html")
 data_file = os.path.join(dir_path, "phase1_data.json")
-total_steps = 37005
+total_steps = 20000
 
 # --- Load existing ---
 existing = {}
@@ -64,6 +64,11 @@ try:
     else:
         os.system(f"docker logs {container} 2>&1 | grep -F 'callbacks: step=' > {tmp}")
         os.system(f"docker logs {container} 2>&1 | grep -F 'callbacks: eval step=' > {tmp_eval}")
+    # Also try reading from container's log file if docker logs are empty
+    if os.path.getsize(tmp) == 0:
+        os.system(f"docker exec {container} grep -F 'callbacks: step=' /dev/shm/phase1_bs8_20k.log > {tmp} 2>/dev/null")
+    if os.path.getsize(tmp_eval) == 0:
+        os.system(f"docker exec {container} grep -F 'callbacks: eval step=' /dev/shm/phase1_bs8_20k.log > {tmp_eval} 2>/dev/null")
     with open(tmp) as f:
         raw = f.read()
     with open(tmp_eval) as f:
@@ -260,7 +265,7 @@ h1{{color:#58a6ff;margin:0 0 4px 0;font-size:22px;font-weight:600}}
 </head><body>
 <div class="header">
 <h1>Kimi K2.5 Eagle3 SDDD v2 - Phase 1</h1>
-<p class="sub">perfectblend | lr=5e-5 | spec_length=4 | bfloat16 | 8x MI350 (FSDP2 + vLLM)</p>
+<p class="sub">perfectblend | lr=5e-5 | bs=8 | spec_length=4 | 8x MI350 (FSDP2 + ATOM MXFP4)</p>
 <p class="st st-{status.lower()}">{status}</p>
 <div class="stats">
 <div class="s"><div class="sv">{cur:,} / {total_steps:,}</div><div class="sl">Step ({pct:.1f}%)</div></div>

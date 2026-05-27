@@ -1,9 +1,8 @@
 """
-Benchmark Eagle3 speculative decoding with vLLM.
+Benchmark Eagle3 speculative decoding with ATOM.
 
 Measures accept_length (average accepted tokens per speculation step) across
-multiple benchmark datasets. Matches the reference performance table from
-lightseekorg/kimi-k2.5-eagle3.
+multiple benchmark datasets using ATOM's /debug/mtp_stats endpoint.
 """
 
 import argparse
@@ -38,7 +37,7 @@ def get_model_name(base_url):
         data = resp.json()
         return data["data"][0]["id"]
     except Exception:
-        return "/dev/shm/Kimi-K2.5-BF16"
+        return "/dev/shm/Kimi-K2.5-MXFP4"
 
 
 def load_mtbench(n):
@@ -140,7 +139,6 @@ def load_bfcl_v3(variant, n):
     url = f"{BFCL_BASE_URL}/{fname}"
     path = download_file(url, fname)
 
-    # BFCL files are JSONL (one JSON object per line)
     data = []
     with open(path) as f:
         for line in f:
@@ -168,7 +166,7 @@ def load_bfcl_v3(variant, n):
     return prompts[:n]
 
 
-def query_vllm(base_url, model_name, messages, max_tokens=2048):
+def query_server(base_url, model_name, messages, max_tokens=2048):
     resp = requests.post(
         f"{base_url}/v1/chat/completions",
         json={
@@ -176,7 +174,6 @@ def query_vllm(base_url, model_name, messages, max_tokens=2048):
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": 0,
-            "chat_template_kwargs": {"thinking": False},
         },
         timeout=300,
     )
@@ -184,19 +181,10 @@ def query_vllm(base_url, model_name, messages, max_tokens=2048):
     return resp.json()
 
 
-def get_prometheus_metrics(base_url):
+def get_atom_mtp_stats(base_url):
     try:
-        resp = requests.get(f"{base_url}/metrics", timeout=10)
-        metrics = {}
-        for line in resp.text.split("\n"):
-            if "spec_decode" in line and not line.startswith("#"):
-                # Handle labels: vllm:spec_decode_num_drafts_total{engine_id="0"} 123.0
-                match = re.match(r'^([^\s{]+)(?:\{[^}]*\})?\s+([\d.eE+-]+)', line)
-                if match:
-                    key = match.group(1)
-                    val = float(match.group(2))
-                    metrics[key] = metrics.get(key, 0) + val
-        return metrics
+        resp = requests.get(f"{base_url}/debug/mtp_stats", timeout=10)
+        return resp.json()
     except Exception:
         return {}
 
@@ -206,11 +194,9 @@ def run_benchmark(base_url, model_name, name, prompts, max_tokens=2048):
     print(f"Running: {name} ({len(prompts)} samples)")
     print(f"{'='*60}")
 
-    # Get metrics before
-    m_before = get_prometheus_metrics(base_url)
-    drafts_before = m_before.get("vllm:spec_decode_num_drafts_total", 0)
-    accepted_before = m_before.get("vllm:spec_decode_num_accepted_tokens_total", 0)
-    draft_tokens_before = m_before.get("vllm:spec_decode_num_draft_tokens_total", 0)
+    stats_before = get_atom_mtp_stats(base_url)
+    draft_before = stats_before.get("total_draft_tokens", 0)
+    accepted_before = stats_before.get("total_accepted_tokens", 0)
 
     total_output_tokens = 0
     errors = 0
@@ -218,7 +204,7 @@ def run_benchmark(base_url, model_name, name, prompts, max_tokens=2048):
 
     for i, msgs in enumerate(prompts):
         try:
-            result = query_vllm(base_url, model_name, msgs, max_tokens=max_tokens)
+            result = query_server(base_url, model_name, msgs, max_tokens=max_tokens)
             usage = result.get("usage", {})
             total_output_tokens += usage.get("completion_tokens", 0)
             if (i + 1) % 50 == 0:
@@ -233,19 +219,24 @@ def run_benchmark(base_url, model_name, name, prompts, max_tokens=2048):
     if errors > 3:
         print(f"  ... {errors} total errors")
 
-    # Get metrics after
-    m_after = get_prometheus_metrics(base_url)
-    drafts_after = m_after.get("vllm:spec_decode_num_drafts_total", 0)
-    accepted_after = m_after.get("vllm:spec_decode_num_accepted_tokens_total", 0)
-    draft_tokens_after = m_after.get("vllm:spec_decode_num_draft_tokens_total", 0)
+    stats_after = get_atom_mtp_stats(base_url)
+    draft_after = stats_after.get("total_draft_tokens", 0)
+    accepted_after = stats_after.get("total_accepted_tokens", 0)
 
-    num_drafts = drafts_after - drafts_before
+    num_draft_tokens = draft_after - draft_before
     num_accepted = accepted_after - accepted_before
-    num_draft_tokens = draft_tokens_after - draft_tokens_before
 
-    # accept_length = 1 + (accepted / drafts) per vLLM convention
-    accept_length = 1.0 + (num_accepted / num_drafts) if num_drafts > 0 else 1.0
+    mtp_k = 4
+    num_steps = num_draft_tokens // mtp_k if mtp_k > 0 else 0
+    accept_length = 1.0 + (num_accepted / num_steps) if num_steps > 0 else 1.0
     acceptance_rate = (num_accepted / num_draft_tokens * 100) if num_draft_tokens > 0 else 0
+
+    # Per-position acceptance from distribution
+    dist_before = stats_before.get("distribution", {})
+    dist_after = stats_after.get("distribution", {})
+    distribution = {}
+    for k in dist_after:
+        distribution[k] = dist_after[k] - dist_before.get(k, 0)
 
     throughput = total_output_tokens / elapsed if elapsed > 0 else 0
 
@@ -257,9 +248,9 @@ def run_benchmark(base_url, model_name, name, prompts, max_tokens=2048):
         "total_output_tokens": total_output_tokens,
         "throughput_tps": round(throughput, 1),
         "latency_s": round(elapsed, 1),
-        "num_drafts": int(num_drafts),
-        "num_accepted": int(num_accepted),
         "num_draft_tokens": int(num_draft_tokens),
+        "num_accepted": int(num_accepted),
+        "distribution": distribution,
         "errors": errors,
     }
 
@@ -267,6 +258,8 @@ def run_benchmark(base_url, model_name, name, prompts, max_tokens=2048):
     print(f"  Acceptance rate: {acceptance_rate:.1f}%")
     print(f"  Throughput: {throughput:.1f} tok/s")
     print(f"  Total time: {elapsed:.1f}s")
+    if distribution:
+        print(f"  Distribution: {distribution}")
 
     return result
 
@@ -281,9 +274,13 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Auto-detect model name
     model_name = get_model_name(args.base_url)
     print(f"Using model: {model_name}")
+    print(f"Backend: ATOM")
+
+    initial_stats = get_atom_mtp_stats(args.base_url)
+    if not initial_stats.get("enabled", False):
+        print("WARNING: MTP/Eagle3 stats not enabled — acceptance metrics will be unavailable")
 
     benchmark_configs = {
         "mtbench": (load_mtbench, 80, 2048),
@@ -322,20 +319,30 @@ def main():
             import traceback
             traceback.print_exc()
 
-    # Save results
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    result_file = os.path.join(args.output_dir, f"phase1_v2_vllm_results_{timestamp}.json")
+    result_file = os.path.join(args.output_dir, f"phase1_atom_eagle3_step19900_{timestamp}.json")
     with open(result_file, "w") as f:
-        json.dump(all_results, f, indent=2)
+        json.dump({
+            "backend": "atom",
+            "target_model": "/dev/shm/Kimi-K2.5-MXFP4",
+            "draft_model": "/dev/shm/Kimi_K25_eagle3_v2_phase1_HF",
+            "checkpoint_step": 19900,
+            "num_speculative_tokens": 4,
+            "benchmarks": all_results,
+        }, f, indent=2)
     print(f"\nResults saved to {result_file}")
 
-    # Print summary table
     print(f"\n{'='*70}")
-    print(f"{'Benchmark':<35} {'n':>5} {'Accept Len':>12} {'Tok/s':>8}")
+    print(f"{'Benchmark':<35} {'n':>5} {'Accept Len':>12} {'Acc Rate':>10} {'Tok/s':>8}")
     print(f"{'='*70}")
     for name, r in all_results.items():
-        print(f"{name:<35} {r['num_samples']:>5} {r['accept_length']:>12.3f} {r['throughput_tps']:>8.1f}")
+        print(f"{name:<35} {r['num_samples']:>5} {r['accept_length']:>12.3f} {r['acceptance_rate']:>9.1f}% {r['throughput_tps']:>8.1f}")
     print(f"{'='*70}")
+
+    if all_results:
+        avg_accept = sum(r["accept_length"] for r in all_results.values()) / len(all_results)
+        avg_rate = sum(r["acceptance_rate"] for r in all_results.values()) / len(all_results)
+        print(f"{'AVERAGE':<35} {'':>5} {avg_accept:>12.3f} {avg_rate:>9.1f}%")
 
 
 if __name__ == "__main__":

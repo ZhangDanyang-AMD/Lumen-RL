@@ -145,6 +145,8 @@ class TeacherConfig:
     quantization: str = ""                  # "" | "fp8" | "fp4" | "mxfp4"
     tensor_parallel_size: int = 1           # ATOM tensor parallelism
     gpu_ids: Optional[list[int]] = None     # GPUs for ATOM inference
+    transport: str = "mooncake"              # "mooncake" | "mori"
+    atom: Any = None                        # ATOM Config extra args
     # MORI-IO P2P RDMA for GPU-direct hidden state transfer
     mori_io_host: str = "127.0.0.1"         # OOB communication address
     mori_io_port: int = 0                   # 0 = auto-assign

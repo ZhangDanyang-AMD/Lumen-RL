@@ -609,59 +609,109 @@ class SpecDistillTrainer:
         self._lm_head_weight = lm_head_weight
 
     def _setup_teacher_atom(self, teacher_cfg: Any, teacher_name: str) -> None:
-        """Load teacher model via ATOM engine (subprocess, TP, quantization).
+        """Load teacher model via ATOM engine + Mooncake TCP.
 
-        Hidden states are transferred via MORI-IO P2P RDMA (GPU Direct).
+        Hidden states (3 aux layers + last hidden + token embeds) are
+        transferred via Mooncake TCP, same as VllmTeacherEngine.
         """
         from lumenrl.engine.inference.atom_teacher_engine import AtomTeacherEngine
 
         gpu_ids = teacher_cfg.gpu_ids or list(range(teacher_cfg.tensor_parallel_size))
+        mc_config = getattr(self.config, "mooncake", None)
+        transport = getattr(teacher_cfg, "transport", "mooncake")
+
         logger.info(
-            "[rank %d] Loading teacher model (ATOM): %s (tp=%d, gpus=%s)",
+            "[rank %d] Loading teacher model (ATOM): %s (tp=%d, gpus=%s, transport=%s)",
             self._rank, teacher_name,
-            teacher_cfg.tensor_parallel_size, gpu_ids,
+            teacher_cfg.tensor_parallel_size, gpu_ids, transport,
         )
+
+        # Launch Mooncake master if needed
+        if self._rank == 0 and mc_config is not None and transport == "mooncake":
+            if not mc_config.master_server_address:
+                from lumenrl.transfer.mooncake_master import launch_mooncake_master
+                self._mooncake_master = launch_mooncake_master(mc_config)
+                logger.info(
+                    "Mooncake master started: %s", mc_config.master_server_address
+                )
+
         # Only rank 0 starts the ATOM subprocess
         if self._rank == 0:
             max_bs = max(1, int(self.config.policy.train_global_batch_size))
             max_seq = int(self.config.policy.max_total_sequence_length)
+            # Build ATOM-specific config dict from teacher.atom sub-section
+            atom_cfg_raw = getattr(teacher_cfg, "atom", None)
+            atom_config = {}
+            if atom_cfg_raw is not None:
+                if isinstance(atom_cfg_raw, dict):
+                    atom_config = dict(atom_cfg_raw)
+                else:
+                    for k in dir(atom_cfg_raw):
+                        if not k.startswith("_"):
+                            atom_config[k] = getattr(atom_cfg_raw, k)
+                # Merge extra_args into top-level
+                extra = atom_config.pop("extra_args", None)
+                if extra and isinstance(extra, dict):
+                    atom_config.update(extra)
+
             self._teacher_engine = AtomTeacherEngine(
                 model_name=teacher_name,
                 tensor_parallel_size=teacher_cfg.tensor_parallel_size,
                 gpu_ids=gpu_ids,
-                mori_io_host=getattr(teacher_cfg, "mori_io_host", "127.0.0.1"),
-                mori_io_port=getattr(teacher_cfg, "mori_io_port", 0),
-                mori_io_qp_per_transfer=getattr(teacher_cfg, "mori_io_qp_per_transfer", 2),
+                mooncake_config=mc_config,
+                transport=transport,
+                quantization=getattr(teacher_cfg, "quantization", ""),
+                atom_config=atom_config,
                 max_batch_size=max_bs,
                 max_seq_len=max_seq,
                 local_device=self._device,
             )
             self._teacher_engine.start()
             self._lm_head_weight = self._teacher_engine.get_lm_head_weight()
+            self._embed_weight = self._teacher_engine.get_embed_weight()
+            self._norm_weight, self._norm_eps = self._teacher_engine.get_norm_weight()
         else:
             self._teacher_engine = None
             self._lm_head_weight = None
+            self._embed_weight = None
+            self._norm_weight = None
+            self._norm_eps = 1e-6
 
-        # Broadcast lm_head_weight to all ranks
+        # Broadcast weights to all ranks (same pattern as _setup_teacher_vllm)
         if self._is_distributed:
-            if self._rank == 0:
-                shape = torch.tensor(
-                    list(self._lm_head_weight.shape),
-                    dtype=torch.long, device=self._device,
-                )
-            else:
-                shape = torch.zeros(2, dtype=torch.long, device=self._device)
-            torch.distributed.broadcast(shape, src=0)
+            for attr in ("_lm_head_weight", "_embed_weight", "_norm_weight"):
+                w = getattr(self, attr)
+                if self._rank == 0:
+                    shape = torch.tensor(
+                        list(w.shape), dtype=torch.long, device=self._device,
+                    )
+                else:
+                    shape = torch.zeros(2, dtype=torch.long, device=self._device)
+                ndim_t = torch.tensor([len(w.shape) if w is not None else 0],
+                                      dtype=torch.long, device=self._device)
+                torch.distributed.broadcast(ndim_t, src=0)
+                ndim = ndim_t.item()
+                if self._rank != 0:
+                    shape = torch.zeros(ndim, dtype=torch.long, device=self._device)
+                else:
+                    shape = torch.tensor(
+                        list(w.shape), dtype=torch.long, device=self._device,
+                    )
+                torch.distributed.broadcast(shape, src=0)
+                dims = [shape[i].item() for i in range(ndim)]
+                if self._rank == 0:
+                    weight = w.to(self._device)
+                else:
+                    weight = torch.zeros(
+                        *dims,
+                        dtype=torch.bfloat16, device=self._device,
+                    )
+                torch.distributed.broadcast(weight, src=0)
+                setattr(self, attr, weight.cpu())
 
-            if self._rank == 0:
-                weight = self._lm_head_weight.to(self._device)
-            else:
-                weight = torch.zeros(
-                    shape[0].item(), shape[1].item(),
-                    dtype=torch.bfloat16, device=self._device,
-                )
-            torch.distributed.broadcast(weight, src=0)
-            self._lm_head_weight = weight.cpu()
+            eps_t = torch.tensor([self._norm_eps], dtype=torch.float64, device=self._device)
+            torch.distributed.broadcast(eps_t, src=0)
+            self._norm_eps = eps_t.item()
 
     def _setup_teacher_sglang(self, teacher_cfg: Any, teacher_name: str) -> None:
         """Load teacher via SGLang Engine + ATOM plugin + Mooncake RDMA."""
@@ -1174,6 +1224,7 @@ class SpecDistillTrainer:
                 target_hs = teacher_data.get("last_hidden_states")
                 if target_hs is not None:
                     target_hs = target_hs.to(device=self._device, dtype=draft_dtype)
+                    target_hs = torch.cat([target_hs[:, 1:], torch.zeros_like(target_hs[:, :1])], dim=1)
                     nan_mask = torch.isnan(target_hs).any(dim=-1)
                     if nan_mask.any():
                         loss_mask = loss_mask.clone()
@@ -1367,56 +1418,13 @@ class SpecDistillTrainer:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Teacher forward via ATOM engine (rank 0 only, then broadcast).
+        """Teacher forward via ATOM engine + Mooncake TCP (rank 0, then broadcast).
 
-        Hidden states arrive on the training GPU via MORI-IO RDMA
-        (GPU Direct), avoiding CPU round-trips.
-
-        NOTE: ATOM engine currently returns only the final hidden state
-        ``[B, T, D]``, not 3 aux layers.  For Eagle3 training, use the
-        ``vllm`` or ``hf`` backend instead until ATOM is updated.
+        Returns 3 aux hidden states [B,T,3*D], token_embeds [B,T,D],
+        last_hidden_states [B,T,D] — same format as vLLM path.
         """
-        if self._rank == 0:
-            # MORI-IO returns tensors already on the training GPU
-            result = self._teacher_engine.extract_hidden_states(
-                input_ids, attention_mask,
-            )
-            hidden_states = result["hidden_states"]  # [B, T, D] or [B, T, 3*D]
-            token_embeds = result["token_embeds"]     # [B, T, D] on GPU
-        else:
-            hidden_states = None
-            token_embeds = None
-
-        # Broadcast from rank 0 to all training ranks
-        if self._is_distributed:
-            if self._rank == 0:
-                shape = torch.tensor(
-                    [hidden_states.shape[0], hidden_states.shape[1],
-                     hidden_states.shape[2], token_embeds.shape[2]],
-                    dtype=torch.long, device=self._device,
-                )
-            else:
-                shape = torch.zeros(4, dtype=torch.long, device=self._device)
-            torch.distributed.broadcast(shape, src=0)
-
-            B, T = shape[0].item(), shape[1].item()
-            D_hidden, D_embed = shape[2].item(), shape[3].item()
-            if self._rank == 0:
-                h = hidden_states.to(self._device)
-                e = token_embeds.to(self._device)
-            else:
-                h = torch.zeros(B, T, D_hidden, dtype=torch.bfloat16, device=self._device)
-                e = torch.zeros(B, T, D_embed, dtype=torch.bfloat16, device=self._device)
-            torch.distributed.broadcast(h, src=0)
-            torch.distributed.broadcast(e, src=0)
-            hidden_states = h
-            token_embeds = e
-
-        return {
-            "hidden_states": hidden_states,
-            "token_embeds": token_embeds,
-            "input_ids": input_ids,
-        }
+        rank0_data = self._teacher_inference_rank0(input_ids, attention_mask)
+        return self._teacher_broadcast(rank0_data, input_ids)
 
     def _teacher_forward_hf(
         self,
@@ -1649,7 +1657,7 @@ class SpecDistillTrainer:
         spec_cfg = self.config.algorithm.spec_distill
         draft_type = spec_cfg.draft_type.lower()
 
-        use_vllm = self.config.algorithm.teacher.inference_backend == "vllm"
+        use_vllm = self.config.algorithm.teacher.inference_backend in ("vllm", "atom", "sglang")
         prefetcher = _TeacherPrefetcher(self) if (use_vllm and self._rank == 0) else None
         shm_writer = _ShmWriterThread(prefetcher, self._TEACHER_KEYS) if (use_vllm and self._rank == 0) else None
         shm_loader = _ShmLoaderThread(self._rank, self._TEACHER_KEYS) if use_vllm else None

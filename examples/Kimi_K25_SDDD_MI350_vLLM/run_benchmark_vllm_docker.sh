@@ -5,7 +5,7 @@ set -uo pipefail
 DOCKER_IMAGE="lumenrl-vllm-mi350:latest"
 CONTAINER_NAME="kimi_k25_eagle3_v2_benchmark"
 DRAFT_MODEL="/dev/shm/Kimi_K25_eagle3_v2_phase1_HF"
-BASE_MODEL="/dev/shm/Kimi-K2.5-BF16"
+BASE_MODEL="/dev/shm/Kimi-K2.5-MXFP4"
 BENCH_SCRIPT="/home/danyzhan/Lumen-RL/examples/Kimi_K25_SDDD_MI350_vLLM/bench_eagle3_vllm.py"
 OUTPUT_DIR="/home/danyzhan/Lumen-RL/examples/Kimi_K25_SDDD_MI350_vLLM/benchmark_results"
 
@@ -31,17 +31,15 @@ docker run -d \
     -v /home/danyzhan:/home/danyzhan \
     -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
     -e ROCR_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-    -e VLLM_PLUGINS='' \
     "${DOCKER_IMAGE}" \
     bash -c "
 set -e
 
 echo '=== Starting vLLM server with Eagle3 speculative decoding ==='
 vllm serve ${BASE_MODEL} \
-    --speculative-config '{\"model\": \"${DRAFT_MODEL}\", \"method\": \"eagle3\", \"num_speculative_tokens\": 4}' \
+    --speculative-config '{\"model\": \"${DRAFT_MODEL}\", \"method\": \"eagle3\", \"num_speculative_tokens\": 3}' \
     --tensor-parallel-size 8 \
     --trust-remote-code \
-    --dtype bfloat16 \
     --gpu-memory-utilization 0.85 \
     --max-model-len 8192 \
     --host 0.0.0.0 \

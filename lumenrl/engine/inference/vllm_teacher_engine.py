@@ -140,9 +140,10 @@ engine_kwargs = dict(
     },
 )
 
+engine_kwargs["kv_cache_dtype"] = "fp8_e4m3"
+
 if quantization in ("mxfp4", "fp4"):
     engine_kwargs["quantization"] = "mxfp4"
-    engine_kwargs["kv_cache_dtype"] = "fp8_e4m3"
     logger.info("MXFP4 online quantization enabled (ATOM/AITER ROCm)")
 elif quantization:
     engine_kwargs["quantization"] = quantization

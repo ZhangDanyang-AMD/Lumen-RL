@@ -1,5 +1,5 @@
-# Phase 1: OOM test with global_batch_size=24, micro_batch_size=1
-# Only runs 20 steps to verify memory fits after streaming refactor
+# Phase 1: ATOM backend correctness test
+# Resume from checkpoint_19200, run 10 steps, verify accuracy matches vLLM
 
 cluster:
   gpus_per_node: 4
@@ -10,7 +10,7 @@ policy:
   training_backend: fsdp2
   generation_backend: hf
   max_total_sequence_length: 20000
-  train_global_batch_size: 128
+  train_global_batch_size: 8
   train_micro_batch_size: 1
   learning_rate: 5e-5
   weight_decay: 0.0
@@ -26,11 +26,21 @@ algorithm:
     num_target_layers: 1
     spec_length: 4
   teacher:
-    model_name: /dev/shm/Kimi-K2.5-BF16
-    inference_backend: vllm
+    model_name: /dev/shm/Kimi-K2.5-MXFP4
+    inference_backend: atom
     tensor_parallel_size: 4
     gpu_ids: [4, 5, 6, 7]
     quantization: ""
+    transport: mooncake
+    atom:
+      enforce_eager: true
+      trust_remote_code: true
+      extra_args:
+        kv_cache_dtype: fp8
+        max_num_batched_tokens: 20000
+        max_model_len: 20016
+        gpu_memory_utilization: 0.9
+        level: 0
   draft:
     from_scratch: true
     num_layers: 1
@@ -66,14 +76,14 @@ eval:
   enabled: false
 
 checkpointing:
-  checkpoint_dir: /dev/shm/checkpoints/kimi_k25_eagle3_bs24_test
+  checkpoint_dir: /dev/shm/checkpoints/kimi_k25_eagle3_v2_phase1
   save_steps: 100
-  save_total_limit: 1
-  resume: false
+  save_total_limit: 3
+  resume: true
 
 logger:
   wandb_enabled: false
   log_interval: 1
 
-num_training_steps: 10
+num_training_steps: 19210  # resume from 19200, run 10 test steps
 seed: 42
