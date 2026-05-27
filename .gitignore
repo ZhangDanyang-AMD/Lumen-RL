@@ -15,7 +15,7 @@ build/
 wandb/
 outputs/
 checkpoints/
-docs/build/
+docs/
 _site/
 results/
 
@@ -29,3 +29,4 @@ output/DAPO/1a-bf16-8gpu-opt/ckpts/
 
 output/Kimi_K25_SDDD_MI350/kimi-k25-eagle3-sglang-mxfp4-mi350/docker_run.log
 output/Kimi_K25_eagle3_bkp/
+.worktrees/
