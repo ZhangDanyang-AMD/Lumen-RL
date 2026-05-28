@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Iterator, Optional
+from typing import Any, Iterator
 
 import torch
 
@@ -22,8 +22,10 @@ class DataProto:
         self.tensors: dict[str, torch.Tensor] = tensors or {}
         self.meta: dict[str, Any] = meta or {}
 
-    def __getitem__(self, key: str) -> torch.Tensor:
-        return self.tensors[key]
+    def __getitem__(self, item: str | int | slice | list[int] | torch.Tensor) -> torch.Tensor | "DataProto":
+        if isinstance(item, str):
+            return self.tensors[item]
+        return self.select_idxs(item)
 
     def __setitem__(self, key: str, value: torch.Tensor) -> None:
         self.tensors[key] = value
@@ -44,6 +46,19 @@ class DataProto:
     def keys(self) -> list[str]:
         return list(self.tensors.keys())
 
+    def check_consistency(self) -> None:
+        """Validate that all tensors share the same dim-0 batch size."""
+        if not self.tensors:
+            return
+        first_key = next(iter(self.tensors))
+        first_size = self.tensors[first_key].shape[0]
+        for key, tensor in self.tensors.items():
+            if tensor.shape[0] != first_size:
+                raise ValueError(
+                    "DataProto has inconsistent batch dimensions: "
+                    f"{first_key} has {first_size}, {key} has {tensor.shape[0]}"
+                )
+
     def to(self, device: str | torch.device) -> "DataProto":
         """Move all tensors to the given device."""
         return DataProto(
@@ -57,6 +72,46 @@ class DataProto:
     def cuda(self, device: int = 0) -> "DataProto":
         return self.to(f"cuda:{device}")
 
+    def _normalize_indices(self, idxs: int | slice | list[int] | torch.Tensor) -> torch.Tensor:
+        """Normalize user indices to a 1D tensor of bool or long."""
+        if isinstance(idxs, int):
+            if idxs < 0:
+                idxs += self.batch_size
+            idx_tensor = torch.tensor([idxs], dtype=torch.long)
+        elif isinstance(idxs, slice):
+            idx_tensor = torch.arange(self.batch_size)[idxs]
+        elif isinstance(idxs, list):
+            idx_tensor = torch.as_tensor(idxs)
+        elif isinstance(idxs, torch.Tensor):
+            idx_tensor = idxs
+        else:
+            raise TypeError(f"Unsupported index type for DataProto: {type(idxs)}")
+
+        if idx_tensor.dtype == torch.bool:
+            if idx_tensor.ndim != 1:
+                raise ValueError("Boolean index tensor for DataProto must be 1-dimensional")
+            if idx_tensor.numel() != self.batch_size:
+                raise ValueError(
+                    "Boolean index tensor length mismatch: "
+                    f"expected {self.batch_size}, got {idx_tensor.numel()}"
+                )
+            return idx_tensor
+
+        idx_tensor = idx_tensor.to(dtype=torch.long).reshape(-1)
+        idx_tensor = torch.where(idx_tensor < 0, idx_tensor + self.batch_size, idx_tensor)
+        return idx_tensor
+
+    def select_idxs(self, idxs: int | slice | list[int] | torch.Tensor) -> "DataProto":
+        """Select rows by integer/slice/list/tensor indices."""
+        if self.batch_size == 0:
+            return DataProto(meta=self.meta.copy())
+        norm = self._normalize_indices(idxs)
+        out: dict[str, torch.Tensor] = {}
+        for key, tensor in self.tensors.items():
+            index = norm.to(device=tensor.device)
+            out[key] = tensor[index]
+        return DataProto(tensors=out, meta=self.meta.copy())
+
     def split(self, num_chunks: int) -> list["DataProto"]:
         """Split batch into num_chunks equal parts along dim 0."""
         if self.batch_size == 0:
@@ -69,6 +124,22 @@ class DataProto:
             chunk_tensors = {k: v[start:end] for k, v in self.tensors.items()}
             result.append(DataProto(tensors=chunk_tensors, meta=self.meta.copy()))
         return result
+
+    @staticmethod
+    def concat(protos: list["DataProto"]) -> "DataProto":
+        """Concatenate DataProtos along dim-0 without sequence auto-padding."""
+        if not protos:
+            return DataProto()
+        non_empty = [p for p in protos if p.batch_size > 0]
+        if not non_empty:
+            return DataProto(meta=protos[0].meta.copy())
+
+        ref_keys = non_empty[0].keys()
+        merged_tensors = {
+            key: torch.cat([p.tensors[key] for p in non_empty], dim=0)
+            for key in ref_keys
+        }
+        return DataProto(tensors=merged_tensors, meta=non_empty[0].meta.copy())
 
     @staticmethod
     def merge(protos: list["DataProto"]) -> "DataProto":
@@ -125,6 +196,84 @@ class DataProto:
         """Update tensors and meta from another DataProto."""
         self.tensors.update(other.tensors)
         self.meta.update(other.meta)
+
+    def reorder(self, idxs: int | slice | list[int] | torch.Tensor) -> None:
+        """Reorder rows in-place according to indices."""
+        if self.batch_size == 0:
+            return
+        norm = self._normalize_indices(idxs)
+        for key, tensor in self.tensors.items():
+            index = norm.to(device=tensor.device)
+            self.tensors[key] = tensor[index]
+
+    def pad_to_divisor(self, size_divisor: int) -> tuple["DataProto", int]:
+        """Pad rows so batch size becomes divisible by ``size_divisor``."""
+        if size_divisor <= 0:
+            raise ValueError(f"size_divisor must be positive, got {size_divisor}")
+        if self.batch_size == 0:
+            return DataProto(meta=self.meta.copy()), 0
+
+        remainder = self.batch_size % size_divisor
+        if remainder == 0:
+            return DataProto(
+                tensors={k: v.clone() for k, v in self.tensors.items()},
+                meta=self.meta.copy(),
+            ), 0
+
+        pad_size = size_divisor - remainder
+        idxs = torch.arange(pad_size, dtype=torch.long) % self.batch_size
+        padding_part = self.select_idxs(idxs)
+        return DataProto.concat([self, padding_part]), pad_size
+
+    def unpad(self, pad_size: int) -> "DataProto":
+        """Remove trailing padded rows from a DataProto."""
+        if pad_size < 0:
+            raise ValueError(f"pad_size must be non-negative, got {pad_size}")
+        if pad_size == 0 or self.batch_size == 0:
+            return DataProto(
+                tensors={k: v.clone() for k, v in self.tensors.items()},
+                meta=self.meta.copy(),
+            )
+        keep = max(self.batch_size - pad_size, 0)
+        return self.select_idxs(slice(0, keep))
+
+    def repeat(self, repeat_times: int = 2, interleave: bool = True) -> "DataProto":
+        """Repeat all rows by a scalar repeat factor."""
+        if repeat_times <= 0:
+            raise ValueError(f"repeat_times must be positive, got {repeat_times}")
+        repeated: dict[str, torch.Tensor] = {}
+        for key, tensor in self.tensors.items():
+            if interleave:
+                repeated[key] = tensor.repeat_interleave(repeat_times, dim=0)
+            else:
+                repeated[key] = tensor.unsqueeze(0).expand(repeat_times, *tensor.shape).reshape(-1, *tensor.shape[1:])
+        return DataProto(tensors=repeated, meta=self.meta.copy())
+
+    def sample_level_repeat(self, repeat_times: list[int] | tuple[int, ...] | torch.Tensor) -> "DataProto":
+        """Repeat each row with per-sample repeat factors."""
+        if isinstance(repeat_times, tuple):
+            repeat_times = list(repeat_times)
+        if isinstance(repeat_times, list):
+            repeats = torch.as_tensor(repeat_times, dtype=torch.long)
+        elif isinstance(repeat_times, torch.Tensor):
+            repeats = repeat_times.to(dtype=torch.long)
+        else:
+            raise TypeError(f"Unsupported repeat_times type: {type(repeat_times)}")
+
+        if repeats.ndim != 1:
+            raise ValueError("repeat_times must be 1-dimensional")
+        if repeats.numel() != self.batch_size:
+            raise ValueError(
+                f"repeat_times length mismatch: expected {self.batch_size}, got {repeats.numel()}"
+            )
+        if (repeats < 0).any():
+            raise ValueError("repeat_times values must be non-negative")
+
+        repeated = {
+            key: tensor.repeat_interleave(repeats.to(device=tensor.device), dim=0)
+            for key, tensor in self.tensors.items()
+        }
+        return DataProto(tensors=repeated, meta=self.meta.copy())
 
     def mini_batches(self, batch_size: int) -> Iterator["DataProto"]:
         """Yield mini-batches of the given size."""

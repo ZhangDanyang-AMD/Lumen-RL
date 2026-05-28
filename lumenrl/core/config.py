@@ -10,6 +10,7 @@ from typing import Any, Optional
 
 from omegaconf import DictConfig, OmegaConf
 
+from lumenrl.architecture.config.assembly_config import RuntimeAssemblyConfig
 from lumenrl.core.types import (
     AlgorithmName,
     GenerationBackend,
@@ -24,6 +25,38 @@ class ClusterConfig:
     num_nodes: int = 1
     gpus_per_node: int = 1
     ray_address: Optional[str] = None
+
+
+@dataclass
+class RayWorkerRoleConfig:
+    """Per-role worker-group orchestration knobs for Ray controller path."""
+
+    # 0 means auto-infer from pool world size.
+    num_workers: int = 0
+    dispatch_mode: str = "dp_compute_proto"
+    mesh_mapping: Optional[list[int]] = None
+    lazy_dispatch_key: Optional[str] = None
+    detached: bool = False
+    process_on_nodes: Optional[list[int]] = None
+    max_colocate_count: int = 1
+    topology_tags: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class RayControllerConfig:
+    """Ray-controller runtime options for the trainer main path."""
+
+    enabled: bool = False
+    fuse_actor_ref: bool = False
+    actor: RayWorkerRoleConfig = field(default_factory=RayWorkerRoleConfig)
+    ref: RayWorkerRoleConfig = field(default_factory=RayWorkerRoleConfig)
+    # Optional role->pool name mapping for complex topology routing.
+    topology_map: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class ControllerConfig:
+    ray: RayControllerConfig = field(default_factory=RayControllerConfig)
 
 
 @dataclass
@@ -299,6 +332,80 @@ class AsyncTrainingConfig:
 
 
 @dataclass
+class TorchProfilerToolConfig:
+    """Configuration for torch.profiler backend."""
+
+    # Supported values: "cpu", "cuda", "memory", "shapes", "stack"
+    contents: list[str] = field(default_factory=lambda: ["cpu", "cuda"])
+
+
+@dataclass
+class RocprofToolConfig:
+    """Configuration for ROCm `rocprof` command-line profiling."""
+
+    # Trace toggles.
+    hip_trace: bool = True
+    hsa_trace: bool = True
+    kernel_trace: bool = False
+    memory_copy_trace: bool = False
+    sys_trace: bool = False
+    timestamp_on: bool = True
+
+    # Optional summary/statistics dump.
+    stats: bool = False
+
+    # Output control.
+    output_file: str = "rocprof_trace"
+    output_format: str = "csv"  # csv | json
+
+    # Optional kernel filter (regex), only when kernel tracing is enabled.
+    kernel_regex: Optional[str] = None
+
+    # Extra raw CLI arguments appended at the end.
+    extra_args: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ProfilerConfig:
+    """Global profiler configuration for trainer/controller process.
+
+    Example (rocprof):
+
+    ```yaml
+    profiler:
+      tool: rocprof
+      enable: true
+      all_ranks: false
+      ranks: [0]
+      save_path: outputs/profile
+      steps: [10, 20, 30]
+      profile_continuous_steps: false
+      tool_config:
+        hip_trace: true
+        hsa_trace: true
+        kernel_trace: true
+        memory_copy_trace: true
+        sys_trace: false
+        timestamp_on: true
+        stats: true
+        output_file: rocprof_trace
+        output_format: csv
+        kernel_regex: null
+        extra_args: []
+    ```
+    """
+
+    tool: str = "torch"
+    enable: bool = False
+    all_ranks: bool = False
+    ranks: list[int] = field(default_factory=list)
+    save_path: str = "outputs/profile"
+    steps: Optional[list[int]] = None
+    profile_continuous_steps: bool = False
+    tool_config: TorchProfilerToolConfig | RocprofToolConfig = field(default_factory=TorchProfilerToolConfig)
+
+
+@dataclass
 class LumenRLConfig:
     """Top-level configuration for LumenRL."""
 
@@ -312,6 +419,9 @@ class LumenRLConfig:
     logger: LoggerConfig = field(default_factory=LoggerConfig)
     mooncake: MooncakeTransferConfig = field(default_factory=MooncakeTransferConfig)
     async_training: AsyncTrainingConfig = field(default_factory=AsyncTrainingConfig)
+    profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
+    controller: ControllerConfig = field(default_factory=ControllerConfig)
+    assembly: RuntimeAssemblyConfig = field(default_factory=RuntimeAssemblyConfig)
     num_training_steps: int = 1000
     seed: int = 42
 

@@ -320,3 +320,12 @@ LumenRL builds on the work of many open-source projects:
 ## License
 
 Apache License 2.0
+
+## Runtime Assembly Policy
+
+LumenRL validates runtime assembly backends at startup when `assembly.strict_policy=true`:
+
+- Training backend: `fsdp`, `fsdp2`, or `megatron`
+- Inference backend: `atom`
+
+Set `assembly.use_new_assembler=true` to use assembler-driven trainer construction.

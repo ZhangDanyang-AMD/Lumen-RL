@@ -22,6 +22,8 @@ def test_default_config() -> None:
     assert cfg.policy.train_micro_batch_size == 8
     assert cfg.checkpointing.save_steps == 50
     assert cfg.logger.wandb_enabled is False
+    assert cfg.assembly.training_backend == "fsdp2"
+    assert cfg.assembly.inference_backend == "atom"
 
 
 def test_from_yaml() -> None:
@@ -73,3 +75,36 @@ def test_moe_config_values() -> None:
 
     schema = OmegaConf.structured(LumenRLConfig)
     assert OmegaConf.select(schema, "moe.r3.enabled") is not None
+
+
+def test_ray_controller_config_defaults() -> None:
+    cfg = LumenRLConfig()
+    assert cfg.controller.ray.enabled is False
+    assert cfg.controller.ray.actor.dispatch_mode == "dp_compute_proto"
+    assert cfg.controller.ray.actor.detached is False
+    assert cfg.controller.ray.actor.num_workers == 0
+    assert cfg.controller.ray.actor.mesh_mapping is None
+    assert cfg.controller.ray.fuse_actor_ref is False
+
+
+def test_ray_controller_config_overrides() -> None:
+    cfg = LumenRLConfig()
+    cfg.controller.ray.enabled = True
+    cfg.controller.ray.actor.dispatch_mode = "one_to_all"
+    cfg.controller.ray.actor.detached = True
+    cfg.controller.ray.actor.num_workers = 4
+    cfg.controller.ray.actor.mesh_mapping = [0, 0, 1, 1]
+    cfg.controller.ray.actor.lazy_dispatch_key = "actor_mesh"
+    cfg.controller.ray.ref.dispatch_mode = "all_to_all"
+    cfg.controller.ray.fuse_actor_ref = True
+    cfg.controller.ray.topology_map["actor"] = "actor"
+
+    assert cfg.controller.ray.enabled is True
+    assert cfg.controller.ray.actor.dispatch_mode == "one_to_all"
+    assert cfg.controller.ray.actor.detached is True
+    assert cfg.controller.ray.actor.num_workers == 4
+    assert cfg.controller.ray.actor.mesh_mapping == [0, 0, 1, 1]
+    assert cfg.controller.ray.actor.lazy_dispatch_key == "actor_mesh"
+    assert cfg.controller.ray.ref.dispatch_mode == "all_to_all"
+    assert cfg.controller.ray.fuse_actor_ref is True
+    assert cfg.controller.ray.topology_map["actor"] == "actor"

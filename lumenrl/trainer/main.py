@@ -35,8 +35,11 @@ def _setup_logging() -> None:
     root.addHandler(handler)
 
 
-def _setup_distributed() -> None:
+def _setup_distributed(use_ray_controller: bool) -> None:
     """Initialize torch.distributed when launched via torchrun."""
+    if use_ray_controller:
+        logging.getLogger(__name__).info("Skipping torch.distributed init (Ray controller mode).")
+        return
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         torch.cuda.set_device(local_rank)
@@ -53,12 +56,10 @@ def _setup_distributed() -> None:
 
 def main() -> None:
     _setup_logging()
-    _setup_distributed()
 
     from lumenrl.core.config import LumenRLConfig
+    from lumenrl.architecture.assembly.runtime_assembler import RuntimeAssembler
     from lumenrl.core.types import AlgorithmName
-    from lumenrl.trainer.rl_trainer import RLTrainer
-    from lumenrl.trainer.async_trainer import AsyncRLTrainer
     from lumenrl.trainer.callbacks import (
         LoggingCallback,
         CheckpointCallback,
@@ -66,23 +67,34 @@ def main() -> None:
     )
 
     config = LumenRLConfig.from_cli()
+    use_ray_controller = bool(config.controller.ray.enabled) or os.environ.get("LUMENRL_USE_RAY_CONTROLLER", "0") == "1"
+    _setup_distributed(use_ray_controller=use_ray_controller)
     logger = logging.getLogger("lumenrl.main")
     logger.info("LumenRL starting: algo=%s, model=%s, steps=%d, async=%s",
                 config.algorithm.name, config.policy.model_name,
                 config.num_training_steps, config.async_training.enabled)
 
     algo_name = config.algorithm.name.lower()
-
-    if algo_name == AlgorithmName.OPD.value:
-        from lumenrl.trainer.opd_trainer import OPDTrainer
-        trainer = OPDTrainer(config)
-    elif algo_name == AlgorithmName.SPEC_DISTILL.value:
-        from lumenrl.trainer.spec_distill_trainer import SpecDistillTrainer
-        trainer = SpecDistillTrainer(config)
-    elif config.async_training.enabled:
-        trainer = AsyncRLTrainer(config)
+    if config.assembly.use_new_assembler:
+        assembler = RuntimeAssembler(config)
+        graph = assembler.build_graph()
+        trainer = graph["trainer_cls"](config)
     else:
-        trainer = RLTrainer(config)
+        from lumenrl.trainer.rl_trainer import RLTrainer
+        from lumenrl.trainer.async_trainer import AsyncRLTrainer
+
+        if algo_name == AlgorithmName.OPD.value:
+            from lumenrl.trainer.opd_trainer import OPDTrainer
+
+            trainer = OPDTrainer(config)
+        elif algo_name == AlgorithmName.SPEC_DISTILL.value:
+            from lumenrl.trainer.spec_distill_trainer import SpecDistillTrainer
+
+            trainer = SpecDistillTrainer(config)
+        elif config.async_training.enabled:
+            trainer = AsyncRLTrainer(config)
+        else:
+            trainer = RLTrainer(config)
 
     cbs: list = [LoggingCallback(interval=max(1, config.logger.log_interval))]
 

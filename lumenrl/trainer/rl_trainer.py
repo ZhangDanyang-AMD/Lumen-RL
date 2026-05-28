@@ -10,6 +10,7 @@ Supports three modes:
 
 from __future__ import annotations
 
+from dataclasses import asdict, is_dataclass
 import gc
 import json
 import logging
@@ -25,9 +26,13 @@ import lumenrl.algorithms  # noqa: F401  — populate ALGORITHM_REGISTRY
 from lumenrl.core.config import LumenRLConfig
 from lumenrl.core.protocol import DataProto
 from lumenrl.core.registry import ALGORITHM_REGISTRY
+from lumenrl.controller import DispatchMode, RayCluster, RayWorkerGroup, create_fused_worker_cls
+from lumenrl.controller.dispatch import dispatch_proto
 from lumenrl.quantization.rollout_correction import apply_rollout_correction
 from lumenrl.trainer.callbacks import Callback, LoggingCallback
 from lumenrl.utils.metrics import MetricsTracker, compute_kl_divergence
+from lumenrl.utils.profiler import DistProfiler
+from lumenrl.workers import LumenActorWorker, RefPolicyWorker
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +69,20 @@ class RLTrainer:
         self._dataset: Any = None
         self._atom_engine: Any = None
         self._use_atom: bool = config.policy.generation_backend.lower() == "atom"
+        # Ray controller orchestration path is opt-in via config/env/ray address.
+        self._use_ray_controller: bool = (
+            bool(getattr(config.controller.ray, "enabled", False))
+            or
+            os.environ.get("LUMENRL_USE_RAY_CONTROLLER", "0") == "1"
+            or bool(getattr(config.cluster, "ray_address", None))
+        )
+        self._ray_cluster: RayCluster | None = None
+        self._actor_wg: RayWorkerGroup | None = None
+        self._ref_wg: RayWorkerGroup | None = None
+        self._ray_dispatch_state: dict[str, Any] = {}
+        self._profiler: DistProfiler | None = None
+        self._prev_step_profile: bool = False
+        self._curr_step_profile: bool = False
         self._is_distributed: bool = torch.distributed.is_initialized()
         self._rank: int = torch.distributed.get_rank() if self._is_distributed else 0
         self._world_size: int = torch.distributed.get_world_size() if self._is_distributed else 1
@@ -78,6 +97,10 @@ class RLTrainer:
 
         algo_cls: Type[Any] = ALGORITHM_REGISTRY.get(self.config.algorithm.name)
         self._algorithm = algo_cls(self.config)
+
+        if self._use_ray_controller:
+            self._setup_ray_controller()
+            return
 
         quant = {}
         tq = self.config.quantization.training
@@ -176,6 +199,174 @@ class RLTrainer:
 
         logger.info("[rank %d] RLTrainer.setup complete: algo=%s, model=%s, world_size=%d, atom=%s, resume_step=%d",
                      self._rank, self.config.algorithm.name, model_name, self._world_size, self._use_atom, self._resume_step)
+        self._init_profiler()
+
+    def _setup_ray_controller(self) -> None:
+        """Initialize Ray cluster + worker groups for actor/ref orchestration."""
+        if RayCluster is None or RayWorkerGroup is None:
+            raise RuntimeError("Ray controller modules are unavailable in this environment.")
+        if not self._use_atom:
+            raise NotImplementedError(
+                "Ray controller path currently requires policy.generation_backend=atom."
+            )
+
+        # Main path should not depend on torch.distributed collectives.
+        self._is_distributed = False
+        self._rank = 0
+        self._world_size = 1
+
+        model_name = self.config.policy.model_name
+        cfg_dict = self._to_plain_dict(self.config)
+        default_workers = max(1, self.config.cluster.num_nodes * self.config.cluster.gpus_per_node)
+        ray_cfg = self.config.controller.ray
+
+        self._ray_cluster = RayCluster(self.config.cluster)
+        self._ray_cluster.init()
+
+        kl_coeff = 0.0
+        algo_name = self.config.algorithm.name.lower()
+        if algo_name == "dapo":
+            kl_coeff = self.config.algorithm.dapo.kl_coeff
+        elif algo_name == "grpo":
+            kl_coeff = self.config.algorithm.grpo.kl_coeff
+        elif algo_name == "ppo":
+            kl_coeff = self.config.algorithm.ppo.kl_coeff
+        actor_role = ray_cfg.actor
+        ref_role = ray_cfg.ref
+        actor_workers = actor_role.num_workers if actor_role.num_workers > 0 else default_workers
+        ref_workers = ref_role.num_workers if ref_role.num_workers > 0 else default_workers
+        actor_pool_name = ray_cfg.topology_map.get("actor", "actor")
+        ref_pool_name = ray_cfg.topology_map.get("ref", "ref")
+
+        actor_pool = self._ray_cluster.create_pool(
+            actor_pool_name,
+            num_gpus=max(1, actor_workers),
+            process_on_nodes=actor_role.process_on_nodes,
+            max_colocate_count=max(1, actor_role.max_colocate_count),
+            detached=actor_role.detached,
+            topology_tags=actor_role.topology_tags,
+        )
+
+        use_ref = kl_coeff > 0.0
+        if ray_cfg.fuse_actor_ref and use_ref:
+            if ref_workers != actor_workers:
+                raise ValueError("controller.ray.fuse_actor_ref requires actor/ref num_workers to match.")
+            fused_cls = create_fused_worker_cls(
+                {"actor": LumenActorWorker, "ref": RefPolicyWorker},
+                name="ActorRefFusedWorker",
+            )
+            fused_wg = RayWorkerGroup(
+                worker_cls=fused_cls,
+                pool=actor_pool,
+                num_workers=actor_workers,
+                worker_kwargs={"config": cfg_dict},
+                dispatch_mode=DispatchMode(actor_role.dispatch_mode),
+                detached=actor_role.detached,
+            )
+            fused_wg.start()
+            spawned = fused_wg.spawn(["actor", "ref"])
+            self._actor_wg = spawned["actor"]
+            self._ref_wg = spawned["ref"]
+            self._actor_wg.call_all("init_model")
+            self._ref_wg.call_all("init_model")
+        else:
+            self._actor_wg = RayWorkerGroup(
+                worker_cls=LumenActorWorker,
+                pool=actor_pool,
+                num_workers=actor_workers,
+                worker_kwargs={"config": cfg_dict},
+                dispatch_mode=DispatchMode(actor_role.dispatch_mode),
+                detached=actor_role.detached,
+            )
+            self._actor_wg.start()
+            self._actor_wg.call_all("init_model")
+
+        if use_ref and self._ref_wg is None:
+            ref_pool = self._ray_cluster.create_pool(
+                ref_pool_name,
+                num_gpus=max(1, ref_workers),
+                process_on_nodes=ref_role.process_on_nodes,
+                max_colocate_count=max(1, ref_role.max_colocate_count),
+                detached=ref_role.detached,
+                topology_tags=ref_role.topology_tags,
+            )
+            self._ref_wg = RayWorkerGroup(
+                worker_cls=RefPolicyWorker,
+                pool=ref_pool,
+                num_workers=ref_workers,
+                worker_kwargs={"config": cfg_dict},
+                dispatch_mode=DispatchMode(ref_role.dispatch_mode),
+                detached=ref_role.detached,
+            )
+            self._ref_wg.start()
+            self._ref_wg.call_all("init_model")
+
+        from transformers import AutoTokenizer
+        self._tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        if self._tokenizer.pad_token is None:
+            self._tokenizer.pad_token = self._tokenizer.eos_token
+        self._tokenizer.padding_side = "left"
+
+        from lumenrl.engine.inference.atom_engine import AtomEngine
+        atom_cfg = self.config.policy.generation.atom_cfg
+        self._atom_engine = AtomEngine(config=atom_cfg, model_name=model_name)
+        self._load_dataset()
+
+        if not self.callbacks:
+            self.callbacks.append(LoggingCallback(interval=max(1, self.config.logger.log_interval)))
+        self._resume_step = 0
+        logger.info(
+            "RLTrainer.setup (ray-controller) complete: algo=%s, model=%s, actor_workers=%d, ref=%s",
+            self.config.algorithm.name,
+            model_name,
+            actor_workers,
+            self._ref_wg is not None,
+        )
+        self._init_profiler()
+
+    @staticmethod
+    def _to_plain_dict(config: Any) -> dict[str, Any]:
+        if is_dataclass(config):
+            return asdict(config)
+        if isinstance(config, dict):
+            return dict(config)
+        return dict(vars(config))
+
+    def _init_profiler(self) -> None:
+        """Initialize trainer-side profiler dispatcher from config."""
+        self._profiler = DistProfiler(rank=self._rank, config=self.config.profiler)
+        self._prev_step_profile = False
+        self._curr_step_profile = False
+
+    def _is_profile_step(self, step: int) -> bool:
+        if self._profiler is None or not self._profiler.check_enable():
+            return False
+        steps = self.config.profiler.steps
+        return True if steps is None else (step in steps)
+
+    def _maybe_start_profile(self, step: int) -> None:
+        curr = self._is_profile_step(step)
+        self._curr_step_profile = curr
+        if not curr or self._profiler is None:
+            return
+        if self.config.profiler.profile_continuous_steps:
+            if not self._prev_step_profile:
+                self._profiler.start(profile_step=step)
+        else:
+            self._profiler.start(profile_step=step)
+
+    def _maybe_stop_profile(self, step: int) -> None:
+        if self._profiler is None:
+            return
+        next_step_profile = self._is_profile_step(step + 1)
+        if self._curr_step_profile:
+            if self.config.profiler.profile_continuous_steps:
+                if not next_step_profile:
+                    self._profiler.stop()
+            else:
+                self._profiler.stop()
+        self._prev_step_profile = self._curr_step_profile
+        self._curr_step_profile = next_step_profile
 
     def _load_dataset(self) -> None:
         """Load the training dataset from config."""
@@ -399,10 +590,8 @@ class RLTrainer:
         2. All ranks: FSDP2 ``full_tensor()`` all-gather (needs GPU headroom)
         3. Rank 0: save gathered weights, update ``_weight_dir``
         """
-        if self._atom_engine is None or self._actor_model is None:
+        if self._atom_engine is None:
             return
-
-        from torch.distributed._tensor import DTensor
 
         t0 = time.time()
 
@@ -414,17 +603,9 @@ class RLTrainer:
             torch.distributed.barrier()
         torch.cuda.empty_cache()
 
-        sd = self._actor_model.state_dict()
-
-        cpu_state: dict[str, torch.Tensor] = {}
-        for name, param in sd.items():
-            if isinstance(param, DTensor):
-                full = param.full_tensor()
-            else:
-                full = param
-            cpu_state[name] = full.detach().cpu().contiguous()
-
-        del sd
+        cpu_state = self._fetch_actor_cpu_state()
+        if cpu_state is None:
+            return
         torch.cuda.empty_cache()
 
         sync_dir = Path(os.environ.get(
@@ -486,6 +667,26 @@ class RLTrainer:
 
         if self._is_distributed:
             torch.distributed.barrier()
+
+    def _fetch_actor_cpu_state(self) -> dict[str, torch.Tensor] | None:
+        """Fetch actor weights as CPU tensors for rollout sync."""
+        if self._use_ray_controller:
+            if self._actor_wg is None:
+                return None
+            state = self._actor_wg.call_single(0, "get_state_dict")
+            return {k: v.detach().cpu().contiguous() for k, v in state.items()}
+
+        if self._actor_model is None:
+            return None
+
+        from torch.distributed._tensor import DTensor
+
+        sd = self._actor_model.state_dict()
+        cpu_state: dict[str, torch.Tensor] = {}
+        for name, param in sd.items():
+            full = param.full_tensor() if isinstance(param, DTensor) else param
+            cpu_state[name] = full.detach().cpu().contiguous()
+        return cpu_state
 
     def _rollout_with_atom(
         self,
@@ -1086,6 +1287,10 @@ class RLTrainer:
 
     def train(self) -> None:
         """Main training loop: rollout → ref → reward → advantages → train → sync."""
+        if self._use_ray_controller:
+            self._train_with_ray_controller()
+            return
+
         if self._algorithm is None or self._actor_model is None:
             raise RuntimeError("Call setup() before train().")
 
@@ -1102,6 +1307,7 @@ class RLTrainer:
         for step in range(start_step, total_steps):
             step_start = time.time()
             self.global_step = step
+            self._maybe_start_profile(step)
             if self._rank == 0:
                 for cb in self.callbacks:
                     cb.on_step_begin(self, step)
@@ -1401,6 +1607,8 @@ class RLTrainer:
             for cb in self.callbacks:
                 cb.on_step_end(self, step, metrics)
 
+            self._maybe_stop_profile(step)
+
             del sequences, seq_mask, old_log_probs, ref_log_probs
             del rewards, responses, response_mask, batch, mini_batches
             gc.collect()
@@ -1413,6 +1621,167 @@ class RLTrainer:
 
         logger.info("[rank %d] RLTrainer.train finished after %d steps.", self._rank, total_steps)
 
+    def _compute_log_probs_with_worker_group(
+        self,
+        wg: RayWorkerGroup,
+        sequences: torch.Tensor,
+        role: str,
+    ) -> torch.Tensor:
+        req = DataProto(tensors={"input_ids": sequences.detach().cpu()}, meta={})
+        role_cfg = self.config.controller.ray.actor if role == "actor" else self.config.controller.ray.ref
+        out = wg.dispatch_and_call(
+            "compute_log_probs",
+            req,
+            mode=role_cfg.dispatch_mode,
+            mesh_mapping=role_cfg.mesh_mapping,
+            lazy_key=role_cfg.lazy_dispatch_key,
+        )
+        if "log_probs" in out.tensors:
+            return out["log_probs"].to(self._device)
+        if "ref_log_probs" in out.tensors:
+            return out["ref_log_probs"].to(self._device)
+        raise KeyError(f"Expected log_probs/ref_log_probs in worker output, got keys={list(out.tensors.keys())}")
+
+    def _update_actor_with_ray(self, batch: DataProto) -> dict[str, float]:
+        if self._actor_wg is None:
+            raise RuntimeError("Ray actor worker group is not initialized.")
+        actor_role_cfg = self.config.controller.ray.actor
+        chunks = dispatch_proto(
+            batch,
+            self._actor_wg.num_workers,
+            mode=actor_role_cfg.dispatch_mode,
+            mesh_mapping=actor_role_cfg.mesh_mapping,
+            lazy_state=self._ray_dispatch_state,
+            lazy_key=actor_role_cfg.lazy_dispatch_key,
+        )
+        outputs: list[dict[str, float]] = []
+        for i, chunk in enumerate(chunks):
+            if chunk.batch_size == 0:
+                continue
+            outputs.append(self._actor_wg.call_single(i, "train_step", chunk))
+        if not outputs:
+            return {"loss": 0.0}
+        merged: dict[str, float] = {}
+        keys = set().union(*(o.keys() for o in outputs))
+        for key in keys:
+            vals = [float(o[key]) for o in outputs if key in o]
+            merged[key] = float(sum(vals) / max(1, len(vals)))
+        return merged
+
+    def _train_with_ray_controller(self) -> None:
+        """Ray worker orchestration path (no torch.distributed collectives)."""
+        if self._algorithm is None or self._actor_wg is None:
+            raise RuntimeError("Call setup() before train().")
+        if self._atom_engine is None:
+            raise RuntimeError("Ray controller path currently requires ATOM rollout.")
+
+        for cb in self.callbacks:
+            cb.on_train_begin(self)
+
+        num_generations = _algo_num_generations(self.config)
+        total_steps = int(self.config.num_training_steps)
+        start_step = self._resume_step
+
+        for step in range(start_step, total_steps):
+            step_start = time.time()
+            self.global_step = step
+            self._maybe_start_profile(step)
+            for cb in self.callbacks:
+                cb.on_step_begin(self, step)
+
+            prompts, ground_truths = self._get_batch_prompts(step)
+            input_ids, attention_mask = self._tokenize_prompts(prompts)
+
+            gen_t0 = time.time()
+            sequences, seq_mask, prompt_lengths = self._rollout_with_atom(prompts, num_generations)
+            gen_time = time.time() - gen_t0
+
+            old_log_probs = self._compute_log_probs_with_worker_group(self._actor_wg, sequences, role="actor")
+            if self._ref_wg is not None:
+                ref_log_probs = self._compute_log_probs_with_worker_group(self._ref_wg, sequences, role="ref")
+            else:
+                ref_log_probs = torch.zeros_like(old_log_probs)
+
+            ref_time = max(0.0, time.time() - (gen_t0 + gen_time))
+            rewards, responses = self._compute_rewards(
+                sequences, prompt_lengths, ground_truths, num_generations,
+            )
+            response_mask = self._build_response_mask(sequences, seq_mask, prompt_lengths)
+            response_lengths = [int(response_mask[i].sum().item()) for i in range(response_mask.shape[0])]
+
+            batch = DataProto(
+                tensors={
+                    "input_ids": sequences,
+                    "attention_mask": seq_mask,
+                    "old_log_probs": old_log_probs,
+                    "ref_log_probs": ref_log_probs,
+                    "rewards": rewards,
+                    "response_mask": response_mask,
+                },
+                meta={
+                    "algorithm": self.config.algorithm.name,
+                    "response_lengths": response_lengths,
+                    "responses": responses,
+                    "ground_truths": ground_truths * num_generations,
+                    "algo_config": self._to_plain_dict(self.config.algorithm),
+                },
+            )
+
+            batch = self._algorithm.compute_advantages(batch)
+            batch = apply_rollout_correction(batch, self.config)
+
+            train_t0 = time.time()
+            micro_bs = max(1, int(self.config.policy.train_micro_batch_size))
+            max_tok = int(self.config.policy.max_token_len_per_gpu)
+            mini_batches = self._dynamic_mini_batches(batch, max_tok, micro_bs)
+
+            metrics_accum: dict[str, float] = {}
+            for mini in mini_batches:
+                m = self._update_actor_with_ray(mini)
+                for k, v in m.items():
+                    metrics_accum[k] = metrics_accum.get(k, 0.0) + float(v)
+            train_time = time.time() - train_t0
+            denom = max(1, len(mini_batches))
+            metrics = {k: v / denom for k, v in metrics_accum.items()}
+
+            prompt_tok = int(attention_mask.repeat_interleave(num_generations, dim=0).to(seq_mask.device).sum().item())
+            gen_tokens = int(seq_mask.sum().item()) - prompt_tok
+            metrics["timing/step_s"] = time.time() - step_start
+            metrics["timing/gen_s"] = gen_time
+            metrics["timing/ref_s"] = ref_time
+            metrics["timing/train_s"] = train_time
+            if gen_tokens > 0 and gen_time > 0:
+                metrics["throughput/gen_tok_per_s"] = gen_tokens / gen_time
+            metrics["reward/mean"] = float(rewards.mean().item())
+            metrics["reward/accuracy"] = float(sum(1 for r in rewards if r > 0) / max(1, len(rewards)))
+            metrics["seq/max_len"] = int(sequences.shape[1])
+            metrics["seq/mean_response_len"] = float(sum(response_lengths) / max(1, len(response_lengths)))
+
+            self.last_metrics = metrics
+            for k, v in metrics.items():
+                self._metrics.update(k, v)
+
+            t_sync = time.time()
+            self._sync_rollout_weights()
+            sync_time = time.time() - t_sync
+            if sync_time > 1.0:
+                metrics["timing/weight_sync_s"] = sync_time
+
+            for cb in self.callbacks:
+                cb.on_step_end(self, step, metrics)
+
+            self._maybe_stop_profile(step)
+
+            del sequences, seq_mask, old_log_probs, ref_log_probs
+            del rewards, responses, response_mask, batch, mini_batches
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        for cb in self.callbacks:
+            cb.on_train_end(self)
+        logger.info("RLTrainer.train (ray-controller) finished after %d steps.", total_steps)
+
     def _sync_rollout_weights(self) -> None:
         """Sync actor weights to ATOM rollout engine if configured."""
         if self._use_atom and self._atom_engine is not None:
@@ -1424,6 +1793,22 @@ class RLTrainer:
 
     def cleanup(self) -> None:
         """Release all resources."""
+        if self._profiler is not None:
+            # Best-effort stop in case an exception interrupted the loop.
+            try:
+                self._profiler.stop()
+            except Exception:
+                pass
+            self._profiler = None
+        if self._actor_wg is not None:
+            self._actor_wg.stop()
+            self._actor_wg = None
+        if self._ref_wg is not None:
+            self._ref_wg.stop()
+            self._ref_wg = None
+        if self._ray_cluster is not None:
+            self._ray_cluster.shutdown()
+            self._ray_cluster = None
         if self._atom_engine is not None:
             self._atom_engine.shutdown()
             self._atom_engine = None

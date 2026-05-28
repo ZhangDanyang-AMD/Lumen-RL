@@ -15,6 +15,7 @@ from lumenrl.utils.metrics import (
     compute_entropy,
     compute_kl_divergence,
 )
+from lumenrl.utils.profiler import DistProfiler
 
 __all__ = [
     "CheckpointManager",
@@ -23,6 +24,7 @@ __all__ = [
     "broadcast_state_dict",
     "compute_entropy",
     "compute_kl_divergence",
+    "DistProfiler",
     "get_rank",
     "get_world_size",
     "setup_logging",
