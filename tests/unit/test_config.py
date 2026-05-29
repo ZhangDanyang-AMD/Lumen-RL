@@ -90,21 +90,21 @@ def test_ray_controller_config_defaults() -> None:
 def test_ray_controller_config_overrides() -> None:
     cfg = LumenRLConfig()
     cfg.controller.ray.enabled = True
-    cfg.controller.ray.actor.dispatch_mode = "one_to_all"
+    cfg.controller.ray.actor.dispatch_mode = "dp_compute_proto_with_func"
     cfg.controller.ray.actor.detached = True
     cfg.controller.ray.actor.num_workers = 4
     cfg.controller.ray.actor.mesh_mapping = [0, 0, 1, 1]
     cfg.controller.ray.actor.lazy_dispatch_key = "actor_mesh"
-    cfg.controller.ray.ref.dispatch_mode = "all_to_all"
+    cfg.controller.ray.ref.dispatch_mode = "rank_zero"
     cfg.controller.ray.fuse_actor_ref = True
     cfg.controller.ray.topology_map["actor"] = "actor"
 
     assert cfg.controller.ray.enabled is True
-    assert cfg.controller.ray.actor.dispatch_mode == "one_to_all"
+    assert cfg.controller.ray.actor.dispatch_mode == "dp_compute_proto_with_func"
     assert cfg.controller.ray.actor.detached is True
     assert cfg.controller.ray.actor.num_workers == 4
     assert cfg.controller.ray.actor.mesh_mapping == [0, 0, 1, 1]
     assert cfg.controller.ray.actor.lazy_dispatch_key == "actor_mesh"
-    assert cfg.controller.ray.ref.dispatch_mode == "all_to_all"
+    assert cfg.controller.ray.ref.dispatch_mode == "rank_zero"
     assert cfg.controller.ray.fuse_actor_ref is True
     assert cfg.controller.ray.topology_map["actor"] == "actor"

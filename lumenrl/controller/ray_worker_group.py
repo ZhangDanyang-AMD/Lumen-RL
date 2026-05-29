@@ -180,10 +180,21 @@ class RayWorkerGroup:
             lazy_key=lazy_key,
         )
         target_method = _prefixed_method(self.method_prefix, method)
-        refs = [
-            getattr(self._actors[i], target_method).remote(chunks[i], **kwargs)
-            for i in range(self.num_workers)
-        ]
+        if not chunks:
+            return DataProto()
+
+        if len(chunks) == 1:
+            refs = [getattr(self._actors[0], target_method).remote(chunks[0], **kwargs)]
+        elif len(chunks) == self.num_workers:
+            refs = [
+                getattr(self._actors[i], target_method).remote(chunks[i], **kwargs)
+                for i in range(self.num_workers)
+            ]
+        else:
+            raise ValueError(
+                f"dispatch produced {len(chunks)} chunks for {self.num_workers} workers; "
+                "expected 1 (rank-zero) or num_workers."
+            )
         results = ray.get(refs)
         return collect_proto(results, mode=dispatch_mode)
 

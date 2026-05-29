@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any
+from typing import Any, Callable
 
 from lumenrl.core.protocol import DataProto
 
@@ -11,9 +11,14 @@ from lumenrl.core.protocol import DataProto
 class DispatchMode(str, Enum):
     """Supported dispatch semantics for worker calls."""
 
+    RANK_ZERO = "rank_zero"
     DP_COMPUTE_PROTO = "dp_compute_proto"
+    DP_COMPUTE = "dp_compute"
+    DP_COMPUTE_PROTO_WITH_FUNC = "dp_compute_proto_with_func"
+    DP_COMPUTE_METRIC = "dp_compute_metric"
     ONE_TO_ALL = "one_to_all"
     ALL_TO_ALL = "all_to_all"
+    DIRECT_ROLLOUT_METHOD = "direct_rollout_method"
 
 
 def _normalize_mode(mode: DispatchMode | str | None) -> DispatchMode:
@@ -21,6 +26,9 @@ def _normalize_mode(mode: DispatchMode | str | None) -> DispatchMode:
         return DispatchMode.DP_COMPUTE_PROTO
     if isinstance(mode, DispatchMode):
         return mode
+    if mode == "broadcast":
+        # Backward-compatible alias used by some older config schemas.
+        return DispatchMode.ONE_TO_ALL
     return DispatchMode(mode)
 
 
@@ -49,6 +57,222 @@ def _build_nd_dispatch(
     return [grouped[group_id] for group_id in mesh_mapping]
 
 
+def dispatch_rank_zero(
+    data: DataProto,
+    num_workers: int,
+    *,
+    mesh_mapping: list[int] | None = None,
+    lazy_state: dict[str, Any] | None = None,
+    lazy_key: str | None = None,
+) -> list[DataProto]:
+    del mesh_mapping, lazy_state, lazy_key
+    if num_workers <= 0:
+        return []
+    return [data]
+
+
+def dispatch_one_to_all(
+    data: DataProto,
+    num_workers: int,
+    *,
+    mesh_mapping: list[int] | None = None,
+    lazy_state: dict[str, Any] | None = None,
+    lazy_key: str | None = None,
+) -> list[DataProto]:
+    del mesh_mapping, lazy_state, lazy_key
+    return [data for _ in range(num_workers)]
+
+
+def dispatch_all_to_all(
+    data: DataProto,
+    num_workers: int,
+    *,
+    mesh_mapping: list[int] | None = None,
+    lazy_state: dict[str, Any] | None = None,
+    lazy_key: str | None = None,
+) -> list[DataProto]:
+    del mesh_mapping, lazy_state, lazy_key
+    chunks = data.split(num_workers)
+    return _round_robin_chunks(chunks, num_workers)
+
+
+def dispatch_dp_compute_data_proto(
+    data: DataProto,
+    num_workers: int,
+    *,
+    mesh_mapping: list[int] | None = None,
+    lazy_state: dict[str, Any] | None = None,
+    lazy_key: str | None = None,
+) -> list[DataProto]:
+    mapping = mesh_mapping
+    if lazy_state is not None and lazy_key is not None:
+        cached = lazy_state.get(lazy_key)
+        if cached is not None and isinstance(cached, list):
+            mapping = cached
+        elif mesh_mapping is not None:
+            lazy_state[lazy_key] = mesh_mapping
+    return _build_nd_dispatch(data, num_workers, mapping)
+
+
+def dispatch_dp_compute(
+    data: DataProto,
+    num_workers: int,
+    *,
+    mesh_mapping: list[int] | None = None,
+    lazy_state: dict[str, Any] | None = None,
+    lazy_key: str | None = None,
+) -> list[DataProto]:
+    return dispatch_dp_compute_data_proto(
+        data,
+        num_workers,
+        mesh_mapping=mesh_mapping,
+        lazy_state=lazy_state,
+        lazy_key=lazy_key,
+    )
+
+
+def dispatch_dp_compute_data_proto_with_func(
+    data: DataProto,
+    num_workers: int,
+    *,
+    mesh_mapping: list[int] | None = None,
+    lazy_state: dict[str, Any] | None = None,
+    lazy_key: str | None = None,
+) -> list[DataProto]:
+    return dispatch_dp_compute_data_proto(
+        data,
+        num_workers,
+        mesh_mapping=mesh_mapping,
+        lazy_state=lazy_state,
+        lazy_key=lazy_key,
+    )
+
+
+def dispatch_dp_compute_metric(
+    data: DataProto,
+    num_workers: int,
+    *,
+    mesh_mapping: list[int] | None = None,
+    lazy_state: dict[str, Any] | None = None,
+    lazy_key: str | None = None,
+) -> list[DataProto]:
+    return dispatch_dp_compute_data_proto(
+        data,
+        num_workers,
+        mesh_mapping=mesh_mapping,
+        lazy_state=lazy_state,
+        lazy_key=lazy_key,
+    )
+
+
+def dispatch_direct_rollout_forbidden(
+    data: DataProto,
+    num_workers: int,
+    *,
+    mesh_mapping: list[int] | None = None,
+    lazy_state: dict[str, Any] | None = None,
+    lazy_key: str | None = None,
+) -> list[DataProto]:
+    del data, num_workers, mesh_mapping, lazy_state, lazy_key
+    raise RuntimeError("Direct rollout call is forbidden.")
+
+
+def collect_direct_rollout_forbidden(
+    results: list[DataProto],
+    *,
+    deduplicate_by_identity: bool = False,
+) -> DataProto:
+    del results, deduplicate_by_identity
+    raise RuntimeError("Direct rollout call is forbidden.")
+
+
+def collect_all_to_all(
+    results: list[DataProto],
+    *,
+    deduplicate_by_identity: bool = False,
+) -> DataProto:
+    if deduplicate_by_identity:
+        unique: list[DataProto] = []
+        seen: set[int] = set()
+        for result in results:
+            marker = id(result)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            unique.append(result)
+        return DataProto.merge(unique)
+    return DataProto.merge(results)
+
+
+def collect_dp_compute_data_proto(
+    results: list[DataProto],
+    *,
+    deduplicate_by_identity: bool = False,
+) -> DataProto:
+    del deduplicate_by_identity
+    return DataProto.merge(results)
+
+
+def collect_dp_compute(
+    results: list[DataProto],
+    *,
+    deduplicate_by_identity: bool = False,
+) -> DataProto:
+    del deduplicate_by_identity
+    return DataProto.merge(results)
+
+
+def collect_rank_zero(
+    results: list[DataProto],
+    *,
+    deduplicate_by_identity: bool = False,
+) -> DataProto:
+    del deduplicate_by_identity
+    if not results:
+        return DataProto()
+    return results[0]
+
+
+DispatchFn = Callable[..., list[DataProto]]
+CollectFn = Callable[..., DataProto]
+
+
+DISPATCH_MODE_FN_REGISTRY: dict[DispatchMode, dict[str, DispatchFn | CollectFn]] = {
+    DispatchMode.RANK_ZERO: {
+        "dispatch_fn": dispatch_rank_zero,
+        "collect_fn": collect_rank_zero,
+    },
+    DispatchMode.ONE_TO_ALL: {
+        "dispatch_fn": dispatch_one_to_all,
+        "collect_fn": collect_all_to_all,
+    },
+    DispatchMode.ALL_TO_ALL: {
+        "dispatch_fn": dispatch_all_to_all,
+        "collect_fn": collect_all_to_all,
+    },
+    DispatchMode.DP_COMPUTE: {
+        "dispatch_fn": dispatch_dp_compute,
+        "collect_fn": collect_dp_compute,
+    },
+    DispatchMode.DP_COMPUTE_PROTO: {
+        "dispatch_fn": dispatch_dp_compute_data_proto,
+        "collect_fn": collect_dp_compute_data_proto,
+    },
+    DispatchMode.DP_COMPUTE_PROTO_WITH_FUNC: {
+        "dispatch_fn": dispatch_dp_compute_data_proto_with_func,
+        "collect_fn": collect_dp_compute_data_proto,
+    },
+    DispatchMode.DP_COMPUTE_METRIC: {
+        "dispatch_fn": dispatch_dp_compute_metric,
+        "collect_fn": collect_dp_compute,
+    },
+    DispatchMode.DIRECT_ROLLOUT_METHOD: {
+        "dispatch_fn": dispatch_direct_rollout_forbidden,
+        "collect_fn": collect_direct_rollout_forbidden,
+    },
+}
+
+
 def dispatch_proto(
     data: DataProto,
     num_workers: int,
@@ -65,21 +289,14 @@ def dispatch_proto(
     dispatch_mode = _normalize_mode(mode)
     if num_workers <= 0:
         return []
-
-    if dispatch_mode == DispatchMode.ONE_TO_ALL:
-        return [data for _ in range(num_workers)]
-    if dispatch_mode == DispatchMode.ALL_TO_ALL:
-        chunks = data.split(num_workers)
-        return _round_robin_chunks(chunks, num_workers)
-
-    mapping = mesh_mapping
-    if lazy_state is not None and lazy_key is not None:
-        cached = lazy_state.get(lazy_key)
-        if cached is not None and isinstance(cached, list):
-            mapping = cached
-        elif mesh_mapping is not None:
-            lazy_state[lazy_key] = mesh_mapping
-    return _build_nd_dispatch(data, num_workers, mapping)
+    dispatch_fn = DISPATCH_MODE_FN_REGISTRY[dispatch_mode]["dispatch_fn"]
+    return dispatch_fn(
+        data,
+        num_workers,
+        mesh_mapping=mesh_mapping,
+        lazy_state=lazy_state,
+        lazy_key=lazy_key,
+    )
 
 
 def collect_proto(
@@ -95,16 +312,5 @@ def collect_proto(
     dispatch_mode = _normalize_mode(mode)
     if not results:
         return DataProto()
-
-    if dispatch_mode == DispatchMode.ONE_TO_ALL and deduplicate_by_identity:
-        unique: list[DataProto] = []
-        seen: set[int] = set()
-        for result in results:
-            marker = id(result)
-            if marker in seen:
-                continue
-            seen.add(marker)
-            unique.append(result)
-        return DataProto.merge(unique)
-
-    return DataProto.merge(results)
+    collect_fn = DISPATCH_MODE_FN_REGISTRY[dispatch_mode]["collect_fn"]
+    return collect_fn(results, deduplicate_by_identity=deduplicate_by_identity)

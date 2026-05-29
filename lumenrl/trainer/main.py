@@ -68,7 +68,13 @@ def main() -> None:
 
     config = LumenRLConfig.from_cli()
     use_ray_controller = bool(config.controller.ray.enabled) or os.environ.get("LUMENRL_USE_RAY_CONTROLLER", "0") == "1"
-    _setup_distributed(use_ray_controller=use_ray_controller)
+    algo_name = config.algorithm.name.lower()
+    # Only pure RLTrainer ray-controller path replaces torch.distributed init.
+    # Other trainers may enable RayCluster lifecycle but still rely on torch.distributed.
+    skip_torch_distributed = use_ray_controller and (not config.async_training.enabled) and (
+        algo_name in {"grpo", "dapo", "ppo"}
+    )
+    _setup_distributed(use_ray_controller=skip_torch_distributed)
     logger = logging.getLogger("lumenrl.main")
     logger.info("LumenRL starting: algo=%s, model=%s, steps=%d, async=%s",
                 config.algorithm.name, config.policy.model_name,

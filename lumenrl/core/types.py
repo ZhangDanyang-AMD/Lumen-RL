@@ -47,8 +47,14 @@ class R3ReplayMode(str, Enum):
 
 class DispatchMode(str, Enum):
     """How DataProto is dispatched across DP workers."""
+    RANK_ZERO = "rank_zero"
+    DP_COMPUTE = "dp_compute"
     DP_COMPUTE_PROTO = "dp_compute_proto"
+    DP_COMPUTE_PROTO_WITH_FUNC = "dp_compute_proto_with_func"
+    DP_COMPUTE_METRIC = "dp_compute_metric"
+    ONE_TO_ALL = "one_to_all"
     ALL_TO_ALL = "all_to_all"
+    DIRECT_ROLLOUT_METHOD = "direct_rollout_method"
     BROADCAST = "broadcast"
 
 

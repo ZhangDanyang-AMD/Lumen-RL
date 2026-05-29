@@ -26,6 +26,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from lumenrl.controller import RayCluster
 from lumenrl.core.config import LumenRLConfig
 from lumenrl.core.protocol import DataProto
 from lumenrl.trainer.callbacks import Callback, LoggingCallback
@@ -106,6 +107,7 @@ class SpecDistillTrainer:
         self._optimizer: torch.optim.Optimizer | None = None
         self._tokenizer: Any = None
         self._dataset: Any = None
+        self._ray_cluster: RayCluster | None = None
 
         self._is_distributed: bool = torch.distributed.is_initialized()
         self._rank: int = (
@@ -125,6 +127,12 @@ class SpecDistillTrainer:
 
     def setup(self) -> None:
         """Initialize teacher, draft model, optimizer, and dataset."""
+        if bool(getattr(self.config.controller.ray, "enabled", False)):
+            if RayCluster is None:
+                raise RuntimeError("Ray controller is enabled but RayCluster is unavailable.")
+            self._ray_cluster = RayCluster(self.config.cluster)
+            self._ray_cluster.init()
+
         teacher_cfg = self.config.algorithm.teacher
         spec_cfg = self.config.algorithm.spec_distill
         draft_cfg = self.config.algorithm.draft
@@ -1177,6 +1185,9 @@ class SpecDistillTrainer:
         self._draft_model = None
         self._lm_head_weight = None
         self._optimizer = None
+        if self._ray_cluster is not None:
+            self._ray_cluster.shutdown()
+            self._ray_cluster = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()

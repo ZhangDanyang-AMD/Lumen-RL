@@ -33,6 +33,7 @@ from typing import Any, Type
 import torch
 
 import lumenrl.algorithms  # noqa: F401
+from lumenrl.controller import RayCluster
 from lumenrl.core.config import LumenRLConfig
 from lumenrl.core.protocol import DataProto
 from lumenrl.core.registry import ALGORITHM_REGISTRY
@@ -79,6 +80,7 @@ class AsyncRLTrainer:
         self._tokenizer: Any = None
         self._dataset: Any = None
         self._atom_engine: Any = None
+        self._ray_cluster: RayCluster | None = None
         self._use_atom: bool = config.policy.generation_backend.lower() == "atom"
 
         self._is_distributed: bool = torch.distributed.is_initialized()
@@ -118,6 +120,12 @@ class AsyncRLTrainer:
 
         Delegates to the same model-building logic as ``RLTrainer``.
         """
+        if bool(getattr(self.config.controller.ray, "enabled", False)):
+            if RayCluster is None:
+                raise RuntimeError("Ray controller is enabled but RayCluster is unavailable.")
+            self._ray_cluster = RayCluster(self.config.cluster)
+            self._ray_cluster.init()
+
         from lumenrl.trainer.rl_trainer import RLTrainer
 
         model_name = self.config.policy.model_name
@@ -767,6 +775,9 @@ class AsyncRLTrainer:
         self._actor_model = None
         self._ref_model = None
         self._optimizer = None
+        if self._ray_cluster is not None:
+            self._ray_cluster.shutdown()
+            self._ray_cluster = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()

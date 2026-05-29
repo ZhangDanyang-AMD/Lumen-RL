@@ -8,12 +8,13 @@ except ModuleNotFoundError:  # Optional in unit test env without ray.
     RayWorkerGroup = None
 
 from lumenrl.controller.colocation import create_colocated_worker_cls, create_fused_worker_cls
-from lumenrl.controller.dispatch import DispatchMode, collect_proto, dispatch_proto
+from lumenrl.controller.dispatch import DISPATCH_MODE_FN_REGISTRY, DispatchMode, collect_proto, dispatch_proto
 
 __all__ = [
     "RayCluster",
     "RayWorkerGroup",
     "DispatchMode",
+    "DISPATCH_MODE_FN_REGISTRY",
     "dispatch_proto",
     "collect_proto",
     "create_fused_worker_cls",

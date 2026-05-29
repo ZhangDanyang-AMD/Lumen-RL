@@ -23,6 +23,7 @@ from typing import Any
 import torch
 
 import lumenrl.algorithms  # noqa: F401 -- populate ALGORITHM_REGISTRY
+from lumenrl.controller import RayCluster
 from lumenrl.core.config import LumenRLConfig
 from lumenrl.core.protocol import DataProto
 from lumenrl.core.registry import ALGORITHM_REGISTRY
@@ -51,6 +52,7 @@ class OPDTrainer:
         self._tokenizer: Any = None
         self._dataset: Any = None
         self._atom_engine: Any = None
+        self._ray_cluster: RayCluster | None = None
         self._use_atom: bool = config.policy.generation_backend.lower() == "atom"
         self._is_distributed: bool = torch.distributed.is_initialized()
         self._rank: int = torch.distributed.get_rank() if self._is_distributed else 0
@@ -68,6 +70,12 @@ class OPDTrainer:
 
     def setup(self) -> None:
         """Initialize student, teacher, optimizer, dataset, and algorithm."""
+        if bool(getattr(self.config.controller.ray, "enabled", False)):
+            if RayCluster is None:
+                raise RuntimeError("Ray controller is enabled but RayCluster is unavailable.")
+            self._ray_cluster = RayCluster(self.config.cluster)
+            self._ray_cluster.init()
+
         model_name = self.config.policy.model_name
         if not model_name:
             raise ValueError("config.policy.model_name is required (student model).")
@@ -584,6 +592,9 @@ class OPDTrainer:
         if self._atom_engine is not None:
             self._atom_engine.shutdown()
             self._atom_engine = None
+        if self._ray_cluster is not None:
+            self._ray_cluster.shutdown()
+            self._ray_cluster = None
         del self._student_model, self._teacher_model, self._teacher_lm_head
         self._student_model = None
         self._teacher_model = None

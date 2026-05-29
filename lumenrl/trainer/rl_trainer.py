@@ -1654,8 +1654,22 @@ class RLTrainer:
             lazy_state=self._ray_dispatch_state,
             lazy_key=actor_role_cfg.lazy_dispatch_key,
         )
+        if not chunks:
+            return {"loss": 0.0}
+
+        if len(chunks) == 1:
+            worker_and_chunks = [(0, chunks[0])]
+        elif len(chunks) == self._actor_wg.num_workers:
+            worker_and_chunks = list(enumerate(chunks))
+        else:
+            raise ValueError(
+                f"actor dispatch produced {len(chunks)} chunks for "
+                f"{self._actor_wg.num_workers} workers; expected 1 (rank-zero) "
+                "or num_workers."
+            )
+
         outputs: list[dict[str, float]] = []
-        for i, chunk in enumerate(chunks):
+        for i, chunk in worker_and_chunks:
             if chunk.batch_size == 0:
                 continue
             outputs.append(self._actor_wg.call_single(i, "train_step", chunk))

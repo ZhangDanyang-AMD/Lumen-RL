@@ -129,7 +129,25 @@ python examples/run_grpo.py --config configs/grpo_dense_fp8_8gpu.yaml
 
 # MoE model with R3 + FP8
 python examples/run_grpo.py --config configs/grpo_moe_fp8_r3.yaml
+
+# Ray-controller recipe with extended dispatch modes
+python examples/run_grpo.py --config configs/recipes/ray_controller_dispatch_modes_1n8g.yaml
 ```
+
+### Ray Controller Dispatch Modes
+
+When `controller.ray.enabled=true`, role-level dispatch can be configured with:
+
+- `dp_compute_proto` (default)
+- `dp_compute`
+- `dp_compute_proto_with_func`
+- `dp_compute_metric`
+- `one_to_all`
+- `all_to_all`
+- `rank_zero`
+- `direct_rollout_method` (intentionally forbidden in controller dispatch path)
+
+Legacy alias: `broadcast` is accepted and normalized to `one_to_all`.
 
 ### Multi-Node with SLURM
 

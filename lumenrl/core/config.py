@@ -33,6 +33,16 @@ class RayWorkerRoleConfig:
 
     # 0 means auto-infer from pool world size.
     num_workers: int = 0
+    # Supported dispatch modes:
+    # - dp_compute_proto (default)
+    # - dp_compute
+    # - dp_compute_proto_with_func
+    # - dp_compute_metric
+    # - one_to_all
+    # - all_to_all
+    # - rank_zero
+    # - direct_rollout_method (forbidden in controller dispatch path)
+    # Legacy alias accepted at runtime: broadcast -> one_to_all
     dispatch_mode: str = "dp_compute_proto"
     mesh_mapping: Optional[list[int]] = None
     lazy_dispatch_key: Optional[str] = None
