@@ -38,6 +38,16 @@ export MOONCAKE_LOG_LEVEL=FATAL
 OUTPUT_DIR="${REPO_ROOT}/output/Kimi_K25_SDDD_MI350/kimi-k25-eagle3-sglang-mxfp4-mi350"
 mkdir -p "${OUTPUT_DIR}"
 
+# Step 0a: Clean stale lock files and compile caches to prevent AITER JIT deadlocks
+echo ">>> Cleaning stale lock files and compile caches..."
+find /tmp -name '*.lock' -path '*aiter*' -delete 2>/dev/null || true
+find /tmp -name '*.lock' -path '*hiprtc*' -delete 2>/dev/null || true
+rm -rf /root/.cache/atom/* 2>/dev/null || true
+# Clean AITER JIT build directory (stale locks + partial .o/.tmp from image build cause deadlock)
+rm -rf /root/aiter/aiter/jit/build 2>/dev/null || true
+rm -rf /root/Lumen/third_party/aiter/aiter/jit/build 2>/dev/null || true
+echo ">>> Lock and build cache cleanup done."
+
 # Step 0: Split dataset if not already done
 if [ ! -f /dev/shm/kimi-mtp-dataset-phase1/train.jsonl ]; then
     echo ">>> Splitting kimi-mtp-dataset into Phase 1 and Phase 2..."
@@ -60,7 +70,7 @@ if [ "${PHASE2_ONLY}" = false ]; then
         torchrun --nproc_per_node="${NUM_TRAIN_GPUS}" \
             -m lumenrl.trainer.main \
             --config "${SCRIPT_DIR}/configs/phase1_foundation.yaml" \
-            2>&1 | grep --line-buffered -v -E '^[IWEF][0-9]{4} [0-9:.]+\s+[0-9]+ \S+\.(cpp|cc|h):' | tee "${PHASE1_LOG}"
+            2>&1 | grep --line-buffered -v -E '^[IWEF][0-9]{4} |scoped_vlog_timer|MasterClient::|^\[aiter\] shape is' | tee "${PHASE1_LOG}"
     PHASE1_EXIT=${PIPESTATUS[0]}
 
     if [ ${PHASE1_EXIT} -ne 0 ]; then
@@ -69,7 +79,7 @@ if [ "${PHASE2_ONLY}" = false ]; then
     fi
     # torchrun may swallow child signal exits (SIGABRT=-6) and return 0.
     # Double-check by scanning the log for crash markers.
-    if grep -qE '(FAILED|exitcode\s*:\s*-[0-9]+|MEMORY_APERTURE_VIOLATION)' "${PHASE1_LOG}" 2>/dev/null; then
+    if grep -qE '(FAILED|exitcode\s*:\s*-[0-9]+|MEMORY_APERTURE_VIOLATION|Training failed)' "${PHASE1_LOG}" 2>/dev/null; then
         echo ">>> Phase 1 FAILED (crash detected in log despite exit code 0)." >&2
         exit 1
     fi
@@ -91,7 +101,7 @@ CUDA_VISIBLE_DEVICES="${TRAIN_GPUS}" \
     torchrun --nproc_per_node="${NUM_TRAIN_GPUS}" \
         -m lumenrl.trainer.main \
         --config "${SCRIPT_DIR}/configs/phase2_mixed.yaml" \
-        2>&1 | grep --line-buffered -v -E '^[IWEF][0-9]{4} [0-9:.]+\s+[0-9]+ \S+\.(cpp|cc|h):' | tee "${PHASE2_LOG}"
+        2>&1 | grep --line-buffered -v -E '^[IWEF][0-9]{4} |scoped_vlog_timer|MasterClient::|^\[aiter\] shape is' | tee "${PHASE2_LOG}"
 PHASE2_EXIT=${PIPESTATUS[0]}
 
 if [ ${PHASE2_EXIT} -ne 0 ]; then

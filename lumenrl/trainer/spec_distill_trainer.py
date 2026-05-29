@@ -61,11 +61,11 @@ class _TeacherPrefetcher:
             if step is _PREFETCH_SENTINEL:
                 break
             try:
-                ids, mask = self._trainer._get_batch_sequences(step)
+                ids, mask, loss_mask = self._trainer._get_batch_sequences(step)
                 data = self._trainer._teacher_inference_rank0(
                     ids, mask, recv_device=torch.device("cpu"),
                 )
-                self._res_queue.put((data, ids, mask))
+                self._res_queue.put((data, ids, mask, loss_mask))
             except Exception as e:
                 self._res_queue.put(e)
 
@@ -78,8 +78,8 @@ class _TeacherPrefetcher:
         item = self._res_queue.get()
         if isinstance(item, BaseException):
             raise item
-        data, ids, mask = item
-        return data, ids, mask
+        data, ids, mask, loss_mask = item
+        return data, ids, mask, loss_mask
 
     def stop(self) -> None:
         self._req_queue.put(_PREFETCH_SENTINEL)
@@ -88,7 +88,7 @@ class _TeacherPrefetcher:
 
 _SHM_SLOTS = 3
 _SHM_POLL_MS = 0.001
-_SHM_TIMEOUT = 300.0
+_SHM_TIMEOUT = float(os.environ.get("LUMENRL_SHM_TIMEOUT", "1800"))
 
 
 class _ShmWriterThread:
@@ -119,11 +119,13 @@ class _ShmWriterThread:
             step, slot = item
             try:
                 logger.info("[shm-writer] step=%d slot=%d: waiting prefetcher.get()...", step, slot)
-                rank0_data, ids, mask = self._prefetcher.get()
+                rank0_data, ids, mask, loss_mask = self._prefetcher.get()
                 logger.info("[shm-writer] step=%d slot=%d: got prefetch data, enqueue rank0_buffer...", step, slot)
+                teacher_ids = rank0_data.get("input_ids", ids)
                 buf_entry = {k: rank0_data[k] for k in self._teacher_keys}
-                buf_entry["input_ids"] = ids
+                buf_entry["input_ids"] = teacher_ids
                 buf_entry["attention_mask"] = mask
+                buf_entry["loss_mask"] = loss_mask
                 buf_entry["_slot"] = slot
                 self._rank0_buffer.put(buf_entry)
                 if not self._slot_free[slot].wait(timeout=_SHM_TIMEOUT):
@@ -131,7 +133,7 @@ class _ShmWriterThread:
                     del rank0_data
                     continue
                 self._slot_free[slot].clear()
-                self._publish(slot, step, rank0_data, ids, mask)
+                self._publish(slot, step, rank0_data, teacher_ids, mask, loss_mask)
                 logger.info("[shm-writer] step=%d slot=%d: published", step, slot)
                 del rank0_data
             except Exception:
@@ -155,7 +157,7 @@ class _ShmWriterThread:
         cache[key] = (fd, mm, arr, alloc)
         return arr[:nbytes]
 
-    def _publish(self, slot: int, step: int, rank0_data: dict, input_ids, attention_mask) -> None:
+    def _publish(self, slot: int, step: int, rank0_data: dict, input_ids, attention_mask, loss_mask) -> None:
         slot_dir = f"/dev/shm/_teacher_{slot}"
         os.makedirs(slot_dir, exist_ok=True)
         for fname in os.listdir(slot_dir):
@@ -171,7 +173,7 @@ class _ShmWriterThread:
             dst = self._get_mmap_buf(slot, key, f"{slot_dir}/{key}.bin", raw.nbytes)
             np.copyto(dst, raw)
             meta[key] = list(t.shape)
-        for name, tensor in (("input_ids", input_ids), ("attention_mask", attention_mask)):
+        for name, tensor in (("input_ids", input_ids), ("attention_mask", attention_mask), ("loss_mask", loss_mask)):
             c = tensor.contiguous()
             c.numpy().tofile(f"{slot_dir}/{name}.bin")
             meta[name] = list(c.shape)
@@ -255,12 +257,16 @@ class _ShmLoaderThread:
             mm.close()
             os.close(fd)
             result[key] = t.view(torch.bfloat16).reshape(shape)
-        for name in ("input_ids", "attention_mask"):
+        for name in ("input_ids", "attention_mask", "loss_mask"):
+            if name not in meta:
+                continue
             shape = meta[name]
             t = torch.empty(shape, dtype=torch.int64)
             with open(f"{slot_dir}/{name}.bin", "rb") as f:
                 f.readinto(t.numpy())
             result[name] = t
+        if "loss_mask" not in result:
+            result["loss_mask"] = result["attention_mask"].clone()
         return result
 
     def submit(self, step: int, slot: int) -> None:
@@ -994,8 +1000,39 @@ class SpecDistillTrainer:
         if not dataset_path:
             logger.warning("No dataset configured; using synthetic prompts.")
             self._dataset = None
+            self._preprocessed = None
             return
 
+        ds_cfg = self.config.dataset
+        if ds_cfg.chat_template:
+            from lumenrl.data.dataset import load_and_preprocess_dataset
+
+            tokenizer_path = self.config.policy.model_name
+            if not os.path.isdir(tokenizer_path) and hasattr(self._tokenizer, "name_or_path"):
+                tokenizer_path = self._tokenizer.name_or_path
+            if not os.path.isdir(tokenizer_path):
+                teacher_path = self.config.algorithm.teacher.model_name
+                if os.path.isdir(teacher_path):
+                    tokenizer_path = teacher_path
+            self._preprocessed = load_and_preprocess_dataset(
+                dataset_path=dataset_path,
+                tokenizer_path=tokenizer_path,
+                max_length=self.config.policy.max_total_sequence_length,
+                chat_template=ds_cfg.chat_template,
+                seed=self.config.seed,
+                last_turn_loss_only=ds_cfg.last_turn_loss_only,
+                min_loss_tokens=ds_cfg.min_loss_tokens,
+                num_workers=ds_cfg.num_preprocess_workers,
+                cache_dir=ds_cfg.cache_dir,
+            )
+            self._dataset = None
+            logger.info(
+                "Preprocessed dataset: %d samples with chat_template=%s from %s",
+                len(self._preprocessed), ds_cfg.chat_template, dataset_path,
+            )
+            return
+
+        self._preprocessed = None
         from datasets import load_dataset
 
         if os.path.isfile(dataset_path) or os.path.isdir(dataset_path):
@@ -1090,12 +1127,42 @@ class SpecDistillTrainer:
     def _build_eval_cache(self, num_samples: int = 256) -> None:
         """Cache the last ``num_samples`` from the shuffled dataset for eval.
 
-        Stored on CPU as list of (input_ids, attention_mask) pairs.
+        Stored on CPU as list of (input_ids, attention_mask, loss_mask) tuples.
         Non-overlapping with early training batches (takes from the tail).
         """
+        if self._preprocessed is not None:
+            from lumenrl.data.kimi_k25_parser import unpack_loss_mask
+
+            ds_len = len(self._preprocessed)
+            num_samples = min(num_samples, ds_len)
+            start_idx = ds_len - num_samples
+            max_len = self.config.policy.max_total_sequence_length
+            pad_id = self._tokenizer.pad_token_id or 0
+
+            cache: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+            for idx in range(start_idx, ds_len):
+                item = self._preprocessed[idx]
+                ids = item["input_ids"]
+                if isinstance(ids, list):
+                    ids = torch.tensor(ids, dtype=torch.long)
+                ids = ids[:max_len - 1]
+                lm = unpack_loss_mask(item["packed_loss_mask"])
+                lm = lm[:len(ids)]
+                if len(lm) < len(ids):
+                    lm = torch.cat([lm, torch.zeros(len(ids) - len(lm), dtype=torch.long)])
+                attn = torch.ones(len(ids), dtype=torch.long)
+                cache.append((ids.unsqueeze(0), attn.unsqueeze(0), lm.unsqueeze(0)))
+
+            self._eval_cache = cache
+            logger.info(
+                "[rank %d] Eval cache built (preprocessed): %d samples (indices %d..%d)",
+                self._rank, len(cache), start_idx, ds_len - 1,
+            )
+            return
+
         if self._dataset is None:
             logger.warning("No dataset; eval cache not built.")
-            self._eval_cache: list[tuple[torch.Tensor, torch.Tensor]] = []
+            self._eval_cache: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
             return
 
         import json as _json
@@ -1106,7 +1173,7 @@ class SpecDistillTrainer:
         max_len = self.config.policy.max_total_sequence_length
         self._tokenizer.padding_side = "right"
 
-        cache: list[tuple[torch.Tensor, torch.Tensor]] = []
+        cache: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         for idx in range(start_idx, ds_len):
             s = self._dataset[idx]
             convs = s.get("conversations")
@@ -1162,7 +1229,7 @@ class SpecDistillTrainer:
                 [text], padding=True, truncation=True,
                 max_length=max_len - 1, return_tensors="pt",
             )
-            cache.append((enc["input_ids"], enc["attention_mask"]))
+            cache.append((enc["input_ids"], enc["attention_mask"], enc["attention_mask"].clone()))
 
         self._eval_cache = cache
         logger.info(
@@ -1191,25 +1258,31 @@ class SpecDistillTrainer:
         # Batch eval samples
         all_ids = [c[0] for c in self._eval_cache]
         all_masks = [c[1] for c in self._eval_cache]
+        all_lm = [c[2] for c in self._eval_cache]
 
         for mb_start in range(0, len(all_ids), mb_size):
             mb_end = min(mb_start + mb_size, len(all_ids))
             mb_ids_list = all_ids[mb_start:mb_end]
             mb_masks_list = all_masks[mb_start:mb_end]
+            mb_lm_list = all_lm[mb_start:mb_end]
 
             max_len = max(ids.shape[1] for ids in mb_ids_list)
             padded_ids = []
             padded_masks = []
-            for ids, mask in zip(mb_ids_list, mb_masks_list):
+            padded_lm = []
+            for ids, mask, lm in zip(mb_ids_list, mb_masks_list, mb_lm_list):
                 pad_len = max_len - ids.shape[1]
                 if pad_len > 0:
                     ids = F.pad(ids, (0, pad_len), value=self._tokenizer.pad_token_id)
                     mask = F.pad(mask, (0, pad_len), value=0)
+                    lm = F.pad(lm, (0, pad_len), value=0)
                 padded_ids.append(ids)
                 padded_masks.append(mask)
+                padded_lm.append(lm)
 
             input_ids = torch.cat(padded_ids, dim=0).to(self._device)
             attention_mask = torch.cat(padded_masks, dim=0).to(self._device)
+            eval_loss_mask = torch.cat(padded_lm, dim=0).to(self._device)
 
             teacher_data = self._teacher_forward(input_ids, attention_mask)
 
@@ -1218,8 +1291,18 @@ class SpecDistillTrainer:
                 t_ids = teacher_data["input_ids"].to(self._device)
                 lm_head_w = self._lm_head_weight.to(device=self._device, dtype=draft_dtype)
                 embed_w = self._embed_weight.to(device=self._device, dtype=draft_dtype)
-                token_embeds = F.embedding(t_ids, embed_w)
-                loss_mask = attention_mask.to(self._device)
+                T_teacher = aux_hidden.shape[1]
+                if "token_embeds" in teacher_data:
+                    token_embeds = teacher_data["token_embeds"].to(device=self._device, dtype=draft_dtype)
+                else:
+                    token_embeds = F.embedding(t_ids, embed_w)
+                if token_embeds.shape[1] != T_teacher:
+                    token_embeds = token_embeds[:, :T_teacher]
+                if t_ids.shape[1] != T_teacher:
+                    t_ids = t_ids[:, :T_teacher]
+                loss_mask = eval_loss_mask
+                if loss_mask.shape[1] != T_teacher:
+                    loss_mask = loss_mask[:, :T_teacher]
 
                 target_hs = teacher_data.get("last_hidden_states")
                 if target_hs is not None:
@@ -1236,6 +1319,9 @@ class SpecDistillTrainer:
                         variance = ths_f32.pow(2).mean(-1, keepdim=True)
                         target_hs = (ths_f32 * torch.rsqrt(variance + self._norm_eps)).to(draft_dtype) * nw
 
+                eval_attn_mask = attention_mask.to(self._device)
+                if eval_attn_mask.shape[1] != T_teacher:
+                    eval_attn_mask = eval_attn_mask[:, :T_teacher]
                 result = self._draft_model(
                     token_embeds=token_embeds,
                     aux_hidden_states=aux_hidden,
@@ -1245,7 +1331,7 @@ class SpecDistillTrainer:
                     target_ids=t_ids,
                     loss_type=spec_cfg.loss_type,
                     target_hidden_states=target_hs,
-                    attention_mask=attention_mask.to(self._device),
+                    attention_mask=eval_attn_mask,
                 )
 
             step_losses = [float(l.detach()) for l in result["losses"]]
@@ -1306,11 +1392,61 @@ class SpecDistillTrainer:
 
     def _get_batch_sequences(
         self, step: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Tokenize dataset samples into (input_ids, attention_mask)."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return (input_ids, attention_mask, loss_mask) for a training step.
+
+        When preprocessed data is available, loss_mask is the assistant-only mask.
+        Otherwise, loss_mask = attention_mask (legacy behavior).
+        """
         import json as _json
 
         bs = max(1, self.config.policy.train_global_batch_size)
+
+        if self._preprocessed is not None:
+            from lumenrl.data.kimi_k25_parser import unpack_loss_mask
+
+            ds_len = len(self._preprocessed)
+            start = (step * bs) % ds_len
+            indices = [(start + i) % ds_len for i in range(bs)]
+            max_len = self.config.policy.max_total_sequence_length
+
+            batch_ids = []
+            batch_loss_masks = []
+            for idx in indices:
+                item = self._preprocessed[idx]
+                ids = item["input_ids"]
+                if isinstance(ids, list):
+                    ids = torch.tensor(ids, dtype=torch.long)
+                lm = unpack_loss_mask(item["packed_loss_mask"])
+                if len(lm) > len(ids):
+                    lm = lm[:len(ids)]
+                elif len(lm) < len(ids):
+                    lm = torch.cat([lm, torch.zeros(len(ids) - len(lm), dtype=torch.long)])
+                batch_ids.append(ids)
+                batch_loss_masks.append(lm)
+
+            max_seq = min(max(len(t) for t in batch_ids), max_len - 1)
+            padded_ids = []
+            padded_masks = []
+            padded_loss_masks = []
+            pad_id = self._tokenizer.pad_token_id or 0
+            for ids, lm in zip(batch_ids, batch_loss_masks):
+                ids = ids[:max_seq]
+                lm = lm[:max_seq]
+                pad_len = max_seq - len(ids)
+                if pad_len > 0:
+                    ids = torch.cat([ids, torch.full((pad_len,), pad_id, dtype=torch.long)])
+                    lm = torch.cat([lm, torch.zeros(pad_len, dtype=torch.long)])
+                attn = (ids != pad_id).long()
+                padded_ids.append(ids.unsqueeze(0))
+                padded_masks.append(attn.unsqueeze(0))
+                padded_loss_masks.append(lm.unsqueeze(0))
+
+            return (
+                torch.cat(padded_ids, dim=0),
+                torch.cat(padded_masks, dim=0),
+                torch.cat(padded_loss_masks, dim=0),
+            )
 
         if self._dataset is None:
             texts = [
@@ -1384,10 +1520,12 @@ class SpecDistillTrainer:
             texts,
             padding=True,
             truncation=True,
-            max_length=max_len - 1,  # vLLM requires prompt + 1 < max_model_len
+            max_length=max_len - 1,
             return_tensors="pt",
         )
-        return enc["input_ids"], enc["attention_mask"]
+        input_ids = enc["input_ids"]
+        attention_mask = enc["attention_mask"]
+        return input_ids, attention_mask, attention_mask.clone()
 
     # ------------------------------------------------------------------
     # Teacher forward
@@ -1520,6 +1658,7 @@ class SpecDistillTrainer:
         self,
         teacher_data: dict[str, torch.Tensor],
         attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor | None = None,
     ) -> dict[str, float]:
         """Eagle3 draft model training step (single micro-batch)."""
         step = self.global_step
@@ -1535,7 +1674,10 @@ class SpecDistillTrainer:
         embed_w = self._embed_w_gpu
         token_embeds = torch.nn.functional.embedding(input_ids, embed_w)
 
-        loss_mask = attention_mask.to(self._device)
+        if loss_mask is not None:
+            loss_mask = loss_mask.to(self._device)
+        else:
+            loss_mask = attention_mask.to(self._device)
         spec_cfg = self.config.algorithm.spec_distill
         target_hs = teacher_data.get("last_hidden_states")
 
@@ -1607,12 +1749,16 @@ class SpecDistillTrainer:
         self,
         teacher_data: dict[str, torch.Tensor],
         attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor | None = None,
     ) -> dict[str, float]:
         """DFlash draft model training step (single micro-batch)."""
         teacher_hidden = teacher_data["hidden_states"].to(self._device)
         input_ids = teacher_data["input_ids"].to(self._device)
         lm_head_w = self._lm_head_weight.to(self._device)
-        loss_mask = attention_mask.to(self._device)
+        if loss_mask is not None:
+            loss_mask = loss_mask.to(self._device)
+        else:
+            loss_mask = attention_mask.to(self._device)
 
         spec_cfg = self.config.algorithm.spec_distill
 
@@ -1719,6 +1865,7 @@ class SpecDistillTrainer:
                 cpu_data = {k: loaded[k] for k in self._TEACHER_KEYS}
                 input_ids = loaded["input_ids"]
                 attention_mask = loaded["attention_mask"]
+                loss_mask = loaded.get("loss_mask", attention_mask.clone())
                 _consumed_slot = loaded["_slot"]
                 teacher_time = time.time() - t0
                 if shm_writer is not None:
@@ -1736,15 +1883,17 @@ class SpecDistillTrainer:
                     else:
                         _loader_future = _loader_executor.submit(shm_loader.get)
             else:
-                input_ids, attention_mask = self._get_batch_sequences(step)
+                input_ids, attention_mask, loss_mask = self._get_batch_sequences(step)
                 if prefetcher is not None:
-                    rank0_data, _, _ = prefetcher.get()
+                    rank0_data, _, _, _ = prefetcher.get()
                 elif use_vllm:
                     rank0_data = self._teacher_inference_rank0(
                         input_ids, attention_mask, recv_device=torch.device("cpu"),
                     )
                 else:
                     teacher_data = self._teacher_forward(input_ids, attention_mask)
+                if use_vllm and rank0_data is not None and "input_ids" in rank0_data:
+                    input_ids = rank0_data["input_ids"]
                 teacher_time = time.time() - t0
                 if prefetcher is not None and step + 2 < total_steps:
                     prefetcher.prefetch(step + 2)
@@ -1830,6 +1979,7 @@ class SpecDistillTrainer:
                     # Compute on buf[cur] (default stream)
                     mb_ids = input_ids[mb_start:mb_end]
                     mb_mask = attention_mask[mb_start:mb_end]
+                    mb_lm = loss_mask[mb_start:mb_end]
                     mb_teacher = {
                         "hidden_states": bufs[cur]["hidden_states"][:actual_mb],
                         "token_embeds": bufs[cur]["token_embeds"][:actual_mb],
@@ -1840,6 +1990,7 @@ class SpecDistillTrainer:
                     mb_actual_len = int(mb_mask.sum(dim=-1).max().item())
                     if mb_actual_len < mb_mask.shape[1]:
                         mb_mask = mb_mask[:, :mb_actual_len].contiguous()
+                        mb_lm = mb_lm[:, :mb_actual_len].contiguous()
                         trimmed = {}
                         for k, v in mb_teacher.items():
                             if v.dim() >= 2:
@@ -1854,9 +2005,9 @@ class SpecDistillTrainer:
                                     local_idx == len(my_mbs) - 1)
 
                     if draft_type == "eagle3":
-                        m = self._train_step_eagle3(mb_teacher, mb_mask)
+                        m = self._train_step_eagle3(mb_teacher, mb_mask, mb_lm)
                     else:
-                        m = self._train_step_dflash(mb_teacher, mb_mask)
+                        m = self._train_step_dflash(mb_teacher, mb_mask, mb_lm)
 
                     if _dbg and (local_idx == 0 or local_idx == len(my_mbs) - 1):
                         logger.info("[rank %d] step=%d mb[%d/%d]: done", self._rank, step, local_idx, len(my_mbs))
@@ -1865,7 +2016,7 @@ class SpecDistillTrainer:
                         if isinstance(v, float) and v == v:
                             metrics_accum[k] = metrics_accum.get(k, 0.0) + v
                     accum_count += 1
-                    del mb_teacher, mb_mask
+                    del mb_teacher, mb_mask, mb_lm
 
                     if local_idx + 1 < len(my_mbs):
                         torch.cuda.current_stream().wait_stream(xfer_stream)
@@ -1889,9 +2040,11 @@ class SpecDistillTrainer:
                         k: v[mb_start:mb_end] for k, v in teacher_data.items()
                     }
                     mb_mask = attention_mask[mb_start:mb_end]
+                    mb_lm = loss_mask[mb_start:mb_end]
                     mb_actual_len = int(mb_mask.sum(dim=-1).max().item())
                     if mb_actual_len < mb_mask.shape[1]:
                         mb_mask = mb_mask[:, :mb_actual_len].contiguous()
+                        mb_lm = mb_lm[:, :mb_actual_len].contiguous()
                         trimmed = {}
                         for k, v in mb_teacher.items():
                             if v.dim() >= 2:
@@ -1900,14 +2053,14 @@ class SpecDistillTrainer:
                                 trimmed[k] = v
                         mb_teacher = trimmed
                     if draft_type == "eagle3":
-                        m = self._train_step_eagle3(mb_teacher, mb_mask)
+                        m = self._train_step_eagle3(mb_teacher, mb_mask, mb_lm)
                     else:
-                        m = self._train_step_dflash(mb_teacher, mb_mask)
+                        m = self._train_step_dflash(mb_teacher, mb_mask, mb_lm)
                     for k, v in m.items():
                         if isinstance(v, float) and v == v:
                             metrics_accum[k] = metrics_accum.get(k, 0.0) + v
                     accum_count += 1
-                    del mb_teacher, mb_mask
+                    del mb_teacher, mb_mask, mb_lm
 
             metrics = {k: v / max(accum_count, 1) for k, v in metrics_accum.items()}
 
@@ -1948,7 +2101,7 @@ class SpecDistillTrainer:
                 del rank0_data
             else:
                 del teacher_data
-            del input_ids, attention_mask
+            del input_ids, attention_mask, loss_mask
 
         if use_vllm and shm_loader is not None:
             _loader_executor.shutdown(wait=False)

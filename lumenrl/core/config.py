@@ -245,6 +245,15 @@ class RewardConfig:
 
 
 @dataclass
+class DatasetConfig:
+    chat_template: str = ""
+    last_turn_loss_only: str = "false"
+    min_loss_tokens: int = 0
+    num_preprocess_workers: int = 16
+    cache_dir: str = "/dev/shm/lumenrl_cache"
+
+
+@dataclass
 class EvalConfig:
     enabled: bool = False
     interval: int = 1000
@@ -325,6 +334,7 @@ class LumenRLConfig:
     logger: LoggerConfig = field(default_factory=LoggerConfig)
     mooncake: MooncakeTransferConfig = field(default_factory=MooncakeTransferConfig)
     async_training: AsyncTrainingConfig = field(default_factory=AsyncTrainingConfig)
+    dataset: DatasetConfig = field(default_factory=DatasetConfig)
     num_training_steps: int = 1000
     seed: int = 42
 

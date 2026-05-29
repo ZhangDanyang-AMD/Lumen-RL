@@ -58,6 +58,11 @@ else
     echo "═══════════════════════════════════════════════════════════════"
 fi
 
+# Clean stale lock files and compile caches that can deadlock AITER JIT
+find /tmp -name '*.lock' -path '*aiter*' -delete 2>/dev/null || true
+find /tmp -name '*.lock' -path '*hiprtc*' -delete 2>/dev/null || true
+rm -rf /root/.cache/atom/* 2>/dev/null || true
+
 docker run --rm \
     --name "${CONTAINER_NAME}" \
     --network host \
@@ -76,6 +81,8 @@ docker run --rm \
     -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     -e LUMENRL_LOG_LEVEL=INFO \
     -e NCCL_TIMEOUT=7200 \
+    -e LUMENRL_TEACHER_READY_TIMEOUT_SECONDS=1800 \
+    -e ATOM_WARMUP_MAX_TOKENS=8192 \
     -e GLOG_minloglevel=3 \
     -e MOONCAKE_LOG_LEVEL=FATAL \
     -e WANDB_MODE=disabled \
@@ -87,6 +94,7 @@ docker run --rm \
     -v "${LUMENRL_DIR}/examples:/root/lumenrl/examples" \
     -v "${LUMENRL_DIR}/output:/root/lumenrl/output" \
     -v "${LUMENRL_DIR}/third_party/Lumen/lumen:/root/Lumen/lumen" \
+    -v "${LUMENRL_DIR}/third_party/ATOM/atom:/root/ATOM/atom" \
     -w /root/lumenrl \
     "${DOCKER_IMAGE}" \
     bash -c "${RUN_CMD}"

@@ -39,6 +39,8 @@ algorithm:
       enforce_eager: true
       trust_remote_code: true
       extra_args:
+        default_chat_template_kwargs:
+          enable_thinking: false
         kv_cache_dtype: fp8
         max_num_batched_tokens: 20000
         max_model_len: 20016
@@ -69,6 +71,12 @@ quantization:
     hf_attn_patch: true
   rollout_correction:
     enabled: false
+
+dataset:
+  chat_template: kimi-k25
+  last_turn_loss_only: false
+  num_preprocess_workers: 16
+  cache_dir: /dev/shm/lumenrl_cache
 
 reward:
   type: function

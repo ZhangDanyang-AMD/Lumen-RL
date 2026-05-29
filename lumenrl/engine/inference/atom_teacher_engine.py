@@ -29,6 +29,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import errno
+import select
+import signal
 import socket
 import subprocess
 import sys
@@ -45,6 +48,13 @@ _HIDDEN_XFER_DIR = os.environ.get(
     "LUMENRL_TEACHER_HIDDEN_DIR",
     "/dev/shm/lumenrl_teacher_hidden",
 )
+_READY_TIMEOUT_SECONDS = float(
+    os.environ.get("LUMENRL_TEACHER_READY_TIMEOUT_SECONDS", "600"),
+)
+_CMD_FIFO_OPEN_TIMEOUT_SECONDS = 10.0
+_DEFAULT_COMMAND_TIMEOUT_SECONDS = 600.0
+_SHUTDOWN_COMMAND_TIMEOUT_SECONDS = 5.0
+_WORKER_TERMINATE_GRACE_SECONDS = 10.0
 
 # ---------------------------------------------------------------------------
 # Worker subprocess script
@@ -282,6 +292,7 @@ class AtomTeacherEngine:
         self._local_device = local_device or torch.device("cuda:0")
 
         self._proc: subprocess.Popen | None = None
+        self._fifo_dir: str | None = None
         self._cmd_fifo: str | None = None
         self._resp_fifo: str | None = None
         self._cmd_f = None
@@ -302,6 +313,183 @@ class AtomTeacherEngine:
             and self._proc.poll() is None
         )
 
+    def _describe_worker_exit(self, exit_code: int) -> str:
+        if exit_code < 0:
+            sig = -exit_code
+            signal_name = signal.Signals(sig).name if sig in signal.Signals._value2member_map_ else f"SIG{sig}"
+            return f"exited by signal {signal_name} ({sig})"
+        return f"exited with code {exit_code}"
+
+    def _terminate_worker(self, reason: str) -> None:
+        if self._proc is None:
+            return
+
+        if self._proc.poll() is None:
+            logger.warning(
+                "AtomTeacherEngine: terminating worker pid=%d (%s).",
+                self._proc.pid,
+                reason,
+            )
+            try:
+                os.killpg(self._proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except Exception as exc:
+                logger.debug("Failed to SIGTERM worker group: %s", exc)
+            try:
+                self._proc.wait(timeout=_WORKER_TERMINATE_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                logger.warning(
+                    "AtomTeacherEngine: worker pid=%d did not exit after %.1fs; sending SIGKILL.",
+                    self._proc.pid,
+                    _WORKER_TERMINATE_GRACE_SECONDS,
+                )
+                try:
+                    os.killpg(self._proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except Exception as exc:
+                    logger.debug("Failed to SIGKILL worker group: %s", exc)
+                try:
+                    self._proc.wait(timeout=5)
+                except Exception:
+                    pass
+
+    def _cleanup_ipc_resources(self) -> None:
+        for f in [self._cmd_f, self._resp_f]:
+            try:
+                if f:
+                    f.close()
+            except Exception:
+                pass
+        self._cmd_f = None
+        self._resp_f = None
+
+        for p in [self._cmd_fifo, self._resp_fifo]:
+            try:
+                if p and os.path.exists(p):
+                    os.unlink(p)
+            except Exception:
+                pass
+        self._cmd_fifo = None
+        self._resp_fifo = None
+
+        try:
+            if self._fifo_dir and os.path.isdir(self._fifo_dir):
+                os.rmdir(self._fifo_dir)
+        except Exception:
+            pass
+        self._fifo_dir = None
+
+    def _wait_for_ready(self, timeout_s: float) -> dict[str, Any]:
+        if self._resp_fifo is None:
+            raise RuntimeError("Response FIFO path is missing")
+        if self._proc is None:
+            raise RuntimeError("Teacher worker process is not started")
+
+        fd = os.open(self._resp_fifo, os.O_RDONLY | os.O_NONBLOCK)
+        deadline = time.monotonic() + timeout_s
+        buf = ""
+
+        try:
+            while True:
+                poll_code = self._proc.poll()
+                if poll_code is not None:
+                    raise RuntimeError(
+                        f"teacher worker {self._describe_worker_exit(poll_code)} before READY",
+                    )
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"teacher worker did not send READY within {timeout_s:.1f}s",
+                    )
+
+                ready, _, _ = select.select([fd], [], [], min(0.5, remaining))
+                if not ready:
+                    continue
+
+                try:
+                    chunk = os.read(fd, 4096)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    continue
+
+                buf += chunk.decode("utf-8", errors="replace")
+                if "\n" not in buf:
+                    continue
+
+                line, _, _ = buf.partition("\n")
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    return json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"teacher worker sent invalid READY payload: {line[:200]!r}",
+                    ) from exc
+        finally:
+            os.close(fd)
+
+    def _open_cmd_writer(self, timeout_s: float) -> Any:
+        if self._cmd_fifo is None:
+            raise RuntimeError("Command FIFO path is missing")
+        if self._proc is None:
+            raise RuntimeError("Teacher worker process is not started")
+
+        deadline = time.monotonic() + timeout_s
+        while True:
+            poll_code = self._proc.poll()
+            if poll_code is not None:
+                raise RuntimeError(
+                    f"teacher worker {self._describe_worker_exit(poll_code)} before command channel setup",
+                )
+            try:
+                fd = os.open(self._cmd_fifo, os.O_WRONLY | os.O_NONBLOCK)
+                return os.fdopen(fd, "w")
+            except OSError as exc:
+                if exc.errno != errno.ENXIO:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"teacher worker did not open command FIFO within {timeout_s:.1f}s",
+                    ) from exc
+                time.sleep(0.1)
+
+    def _read_response_line(self, *, timeout_s: float, context: str) -> str:
+        if self._resp_f is None:
+            raise RuntimeError("Response FIFO is not open")
+        if self._proc is None:
+            raise RuntimeError("Teacher worker process is not started")
+
+        deadline = time.monotonic() + timeout_s
+        resp_fd = self._resp_f.fileno()
+        while True:
+            poll_code = self._proc.poll()
+            if poll_code is not None:
+                raise RuntimeError(
+                    f"teacher worker {self._describe_worker_exit(poll_code)} while waiting for {context}",
+                )
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"timed out waiting for {context} after {timeout_s:.1f}s",
+                )
+
+            ready, _, _ = select.select([resp_fd], [], [], min(0.5, remaining))
+            if not ready:
+                continue
+
+            resp_line = self._resp_f.readline()
+            if not resp_line:
+                raise RuntimeError(
+                    f"response FIFO closed while waiting for {context}; worker likely crashed",
+                )
+            return resp_line
+
     def start(self) -> None:
         """Start the teacher worker subprocess and set up Mooncake store."""
         if self.is_alive:
@@ -309,9 +497,9 @@ class AtomTeacherEngine:
 
         os.makedirs(self._hidden_dir, exist_ok=True)
 
-        fifo_dir = tempfile.mkdtemp(prefix="lumenrl_teacher_fifo_")
-        self._cmd_fifo = os.path.join(fifo_dir, "cmd")
-        self._resp_fifo = os.path.join(fifo_dir, "resp")
+        self._fifo_dir = tempfile.mkdtemp(prefix="lumenrl_teacher_fifo_")
+        self._cmd_fifo = os.path.join(self._fifo_dir, "cmd")
+        self._resp_fifo = os.path.join(self._fifo_dir, "resp")
         os.mkfifo(self._cmd_fifo)
         os.mkfifo(self._resp_fifo)
 
@@ -336,6 +524,15 @@ class AtomTeacherEngine:
         env["GLOG_v"] = "0"
         env["MOONCAKE_LOG_LEVEL"] = "FATAL"
         env["AITER_LOG_LEVEL"] = "WARNING"
+        if "AITER_CONFIG_GEMM_BF16" not in env:
+            _bf16_cfg = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "..", "..", "..", "third_party", "aiter", "aiter",
+                "configs", "model_configs", "kimik2_bf16_tuned_gemm.csv",
+            )
+            if not os.path.exists(_bf16_cfg):
+                _bf16_cfg = "/root/aiter/aiter/configs/model_configs/kimik2_bf16_tuned_gemm.csv"
+            env["AITER_CONFIG_GEMM_BF16"] = _bf16_cfg
 
         attn_backend = os.environ.get("VLLM_ROCM_ATTN_BACKEND")
         if attn_backend:
@@ -414,25 +611,32 @@ class AtomTeacherEngine:
                 atom_args_json,
             ],
             stdin=subprocess.DEVNULL,
-            stdout=None,
-            stderr=None,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             env=env,
             start_new_session=True,
         )
-
-        self._resp_f = open(self._resp_fifo, "r")
-
-        resp_line = self._resp_f.readline()
-        if not resp_line:
-            raise RuntimeError(
-                "Teacher worker subprocess exited before ready. "
-                "Check stderr for model loading errors."
+        try:
+            resp = self._wait_for_ready(timeout_s=_READY_TIMEOUT_SECONDS)
+            if resp.get("status") != "ready":
+                raise RuntimeError(f"worker reported non-ready startup status: {resp}")
+            self._cmd_f = self._open_cmd_writer(
+                timeout_s=_CMD_FIFO_OPEN_TIMEOUT_SECONDS,
             )
-        resp = json.loads(resp_line)
-        if resp.get("status") != "ready":
-            raise RuntimeError(f"Teacher worker failed to start: {resp}")
-
-        self._cmd_f = open(self._cmd_fifo, "w")
+            self._resp_f = open(self._resp_fifo, "r")
+        except Exception as exc:
+            logger.error(
+                "AtomTeacherEngine: startup failed before READY or channel setup (%s). "
+                "Root-cause hint: worker crash, missing READY, or startup timeout.",
+                exc,
+            )
+            self._terminate_worker("startup failure")
+            self._cleanup_ipc_resources()
+            self._proc = None
+            self._initialized = False
+            raise RuntimeError(
+                f"Failed to start AtomTeacherEngine worker: {exc}",
+            ) from exc
 
         self._hidden_dim = resp["hidden_dim"]
         self._num_layers = resp.get("num_layers", 0)
@@ -471,6 +675,10 @@ class AtomTeacherEngine:
                 logger.info("Training-side EagleMooncakeStore initialized (ATOM)")
             except Exception as e:
                 logger.error("Failed to init training-side Mooncake: %s", e)
+                self._terminate_worker("mooncake initialization failure")
+                self._cleanup_ipc_resources()
+                self._proc = None
+                self._initialized = False
                 raise
 
         self._initialized = True
@@ -481,15 +689,26 @@ class AtomTeacherEngine:
             self._aux_layer_indices, self._transport,
         )
 
-    def _send_cmd(self, cmd: dict) -> dict:
+    def _send_cmd(
+        self,
+        cmd: dict[str, Any],
+        *,
+        timeout_s: float = _DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    ) -> dict:
         """Send a JSON command and read the response."""
         if not self.is_alive:
             raise RuntimeError("Teacher worker is not running")
-        self._cmd_f.write(json.dumps(cmd) + "\n")
-        self._cmd_f.flush()
-        resp_line = self._resp_f.readline()
-        if not resp_line:
-            raise RuntimeError("Teacher worker closed response FIFO")
+        try:
+            self._cmd_f.write(json.dumps(cmd) + "\n")
+            self._cmd_f.flush()
+        except BrokenPipeError as exc:
+            raise RuntimeError(
+                "Teacher worker command FIFO is broken; worker likely crashed",
+            ) from exc
+        resp_line = self._read_response_line(
+            timeout_s=timeout_s,
+            context=f"response to cmd={cmd.get('cmd', 'unknown')}",
+        )
         return json.loads(resp_line)
 
     def extract_hidden_states(
@@ -633,35 +852,27 @@ class AtomTeacherEngine:
         """Terminate the teacher worker subprocess and clean up."""
         if self._proc is not None and self._proc.poll() is None:
             try:
-                self._send_cmd({"cmd": "shutdown"})
-            except Exception:
-                pass
-            try:
-                self._proc.terminate()
-                self._proc.wait(timeout=30)
-            except Exception:
-                try:
-                    self._proc.kill()
-                except Exception:
-                    pass
+                self._send_cmd(
+                    {"cmd": "shutdown"},
+                    timeout_s=_SHUTDOWN_COMMAND_TIMEOUT_SECONDS,
+                )
+            except Exception as exc:
+                logger.warning("AtomTeacherEngine: graceful shutdown command failed: %s", exc)
+            self._terminate_worker("shutdown requested")
 
-        self._mooncake_store = None
+        if self._mooncake_store is not None:
+            try:
+                if hasattr(self._mooncake_store, "close"):
+                    self._mooncake_store.close()
+                elif hasattr(self._mooncake_store, "shutdown"):
+                    self._mooncake_store.shutdown()
+            except Exception as exc:
+                logger.warning("AtomTeacherEngine: failed to close Mooncake store: %s", exc)
+            finally:
+                self._mooncake_store = None
 
-        for f in [self._cmd_f, self._resp_f]:
-            try:
-                if f:
-                    f.close()
-            except Exception:
-                pass
-        for p in [self._cmd_fifo, self._resp_fifo]:
-            try:
-                if p:
-                    os.unlink(p)
-            except Exception:
-                pass
+        self._cleanup_ipc_resources()
         self._proc = None
-        self._cmd_f = None
-        self._resp_f = None
         self._initialized = False
         logger.info("AtomTeacherEngine: shutdown complete.")
 
