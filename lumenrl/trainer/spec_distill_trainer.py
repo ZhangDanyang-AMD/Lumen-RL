@@ -1289,13 +1289,11 @@ class SpecDistillTrainer:
             with torch.no_grad():
                 aux_hidden = teacher_data["hidden_states"].to(device=self._device, dtype=draft_dtype)
                 t_ids = teacher_data["input_ids"].to(self._device)
+                t_ids = torch.cat([t_ids[:, 1:], torch.zeros_like(t_ids[:, :1])], dim=1)
                 lm_head_w = self._lm_head_weight.to(device=self._device, dtype=draft_dtype)
                 embed_w = self._embed_weight.to(device=self._device, dtype=draft_dtype)
                 T_teacher = aux_hidden.shape[1]
-                if "token_embeds" in teacher_data:
-                    token_embeds = teacher_data["token_embeds"].to(device=self._device, dtype=draft_dtype)
-                else:
-                    token_embeds = F.embedding(t_ids, embed_w)
+                token_embeds = F.embedding(t_ids, embed_w)
                 if token_embeds.shape[1] != T_teacher:
                     token_embeds = token_embeds[:, :T_teacher]
                 if t_ids.shape[1] != T_teacher:
@@ -1371,7 +1369,7 @@ class SpecDistillTrainer:
             total_weight += w
 
         cum_prod = 1.0
-        simulated_acc_len = 1.0
+        simulated_acc_len = 0.0
         for acc in avg_acc_per_pos:
             cum_prod *= acc
             simulated_acc_len += cum_prod

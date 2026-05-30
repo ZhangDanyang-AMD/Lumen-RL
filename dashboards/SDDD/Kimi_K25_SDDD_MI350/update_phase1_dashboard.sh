@@ -8,7 +8,7 @@ container = "kimi_k25_eagle3_v2_phase1"
 dir_path = "/home/danyzhan/Lumen-RL/dashboards/SDDD/Kimi_K25_SDDD_MI350"
 dashboard = os.path.join(dir_path, "phase1.html")
 data_file = os.path.join(dir_path, "phase1_data.json")
-total_steps = 20000
+total_steps = 37005
 
 # --- Load existing ---
 existing = {}

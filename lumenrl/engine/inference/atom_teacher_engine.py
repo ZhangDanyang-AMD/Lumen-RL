@@ -73,6 +73,11 @@ _WORKER_TERMINATE_GRACE_SECONDS = 10.0
 _TEACHER_WORKER_SCRIPT = textwrap.dedent("""\
 import gc, json, os, sys, logging, time, socket, glob
 
+# ---- Ensure lumenrl is importable (for ATOM's fallback imports) ----
+for _p in ["/root/lumenrl", os.getcwd()]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 # ---- Isolate from torchrun environment ----
 os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
 for key in list(os.environ.keys()):
@@ -356,6 +361,12 @@ class AtomTeacherEngine:
                     pass
 
     def _cleanup_ipc_resources(self) -> None:
+        if hasattr(self, "_worker_log_f") and self._worker_log_f:
+            try:
+                self._worker_log_f.close()
+            except Exception:
+                pass
+            self._worker_log_f = None
         for f in [self._cmd_f, self._resp_f]:
             try:
                 if f:
@@ -601,6 +612,10 @@ class AtomTeacherEngine:
 
         atom_args_json = json.dumps(self._atom_config)
 
+        worker_log_path = os.path.join(self._hidden_dir, "atom_teacher_worker.log")
+        self._worker_log_f = open(worker_log_path, "w")
+        logger.info("AtomTeacherEngine: worker log -> %s", worker_log_path)
+
         self._proc = subprocess.Popen(
             [
                 sys.executable, "-u", "-c", _TEACHER_WORKER_SCRIPT,
@@ -611,8 +626,8 @@ class AtomTeacherEngine:
                 atom_args_json,
             ],
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=self._worker_log_f,
+            stderr=subprocess.STDOUT,
             env=env,
             start_new_session=True,
         )
@@ -625,10 +640,20 @@ class AtomTeacherEngine:
             )
             self._resp_f = open(self._resp_fifo, "r")
         except Exception as exc:
+            worker_log_tail = ""
+            try:
+                worker_log_path = os.path.join(self._hidden_dir, "atom_teacher_worker.log")
+                if os.path.exists(worker_log_path):
+                    with open(worker_log_path) as wlf:
+                        lines = wlf.readlines()
+                    worker_log_tail = "".join(lines[-50:])
+            except Exception:
+                pass
             logger.error(
                 "AtomTeacherEngine: startup failed before READY or channel setup (%s). "
-                "Root-cause hint: worker crash, missing READY, or startup timeout.",
-                exc,
+                "Root-cause hint: worker crash, missing READY, or startup timeout.\n"
+                "--- worker log (last 50 lines) ---\n%s\n--- end worker log ---",
+                exc, worker_log_tail,
             )
             self._terminate_worker("startup failure")
             self._cleanup_ipc_resources()

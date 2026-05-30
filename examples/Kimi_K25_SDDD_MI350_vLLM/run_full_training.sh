@@ -34,6 +34,7 @@ export LUMENRL_LOG_LEVEL=INFO
 export NCCL_TIMEOUT=7200
 export GLOG_minloglevel=3
 export MOONCAKE_LOG_LEVEL=FATAL
+export MOONCAKE_VLOG_LEVEL=-1
 
 OUTPUT_DIR="${REPO_ROOT}/output/Kimi_K25_SDDD_MI350/kimi-k25-eagle3-sglang-mxfp4-mi350"
 mkdir -p "${OUTPUT_DIR}"
@@ -70,7 +71,7 @@ if [ "${PHASE2_ONLY}" = false ]; then
         torchrun --nproc_per_node="${NUM_TRAIN_GPUS}" \
             -m lumenrl.trainer.main \
             --config "${SCRIPT_DIR}/configs/phase1_foundation.yaml" \
-            2>&1 | grep --line-buffered -v -E '^[IWEF][0-9]{4} |scoped_vlog_timer|MasterClient::|^\[aiter\] shape is' | tee "${PHASE1_LOG}"
+            2>&1 | grep --line-buffered -v -E '^[IWEF][0-9]{4} |scoped_vlog_timer|MasterClient::|^\[aiter\] shape is|mooncake|Mooncake|TransferEngine|transfer_engine|segment_desc' | tee "${PHASE1_LOG}"
     PHASE1_EXIT=${PIPESTATUS[0]}
 
     if [ ${PHASE1_EXIT} -ne 0 ]; then
@@ -84,6 +85,7 @@ if [ "${PHASE2_ONLY}" = false ]; then
         exit 1
     fi
     echo ">>> Phase 1 completed."
+    exit 0
 fi
 
 # Phase 2: Mixed Domain

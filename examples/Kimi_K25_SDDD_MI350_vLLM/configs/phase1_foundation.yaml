@@ -1,6 +1,6 @@
 # Phase 1: Foundation Training (ATOM MXFP4 teacher, bs=8 perf test)
 # Dataset: perfectblend subset (~296K samples)
-# Steps: 111,012 (3 epochs × 296034//8)
+# Steps: 37005 (1 epoch × ceil(296034/8))
 # Teacher: Kimi-K2.5-MXFP4 via ATOM AsyncLLMEngine (TP=4, GPUs 4-7)
 # Draft: Eagle3 v2, 1-layer Transformer, from scratch (FSDP2, GPUs 0-3)
 
@@ -9,7 +9,7 @@ cluster:
   num_nodes: 1
 
 policy:
-  model_name: /dev/shm/Kimi-K2.5-BF16
+  model_name: /dev/shm/Kimi-K2.5-MXFP4
   training_backend: fsdp2
   generation_backend: hf
   max_total_sequence_length: 20000
@@ -99,5 +99,5 @@ logger:
   wandb_enabled: false
   log_interval: 1
 
-num_training_steps: 20000
+num_training_steps: 37005
 seed: 42

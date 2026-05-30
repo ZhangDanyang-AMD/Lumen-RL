@@ -596,10 +596,10 @@ class Eagle3Model(nn.Module):
                                     teacher_pred = teacher_logits.argmax(dim=-1)
                                     del teacher_logits
                                 draft_logits = F.linear(normed_valid[cs:ce], draft_lm_head_w)
-                                log_p = F.log_softmax(draft_logits.float(), dim=-1)
-                                kl_parts.append(-(tp * log_p).sum(-1))
+                                logits_f32 = draft_logits.float()
+                                kl_parts.append(torch.logsumexp(logits_f32, dim=-1) - (tp * logits_f32).sum(-1))
                                 acc_parts.append((draft_logits.argmax(dim=-1) == teacher_pred).float())
-                                del tp, draft_logits, log_p
+                                del tp, draft_logits, logits_f32
                             losses.append(torch.cat(kl_parts).mean())
                             accuracies.append(torch.cat(acc_parts).mean())
                         elif current_ids is not None:
