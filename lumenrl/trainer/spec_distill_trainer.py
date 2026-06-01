@@ -1420,6 +1420,22 @@ class SpecDistillTrainer:
                     lm = lm[:len(ids)]
                 elif len(lm) < len(ids):
                     lm = torch.cat([lm, torch.zeros(len(ids) - len(lm), dtype=torch.long)])
+                if lm.sum() < 1:
+                    replacement = (idx + bs) % ds_len
+                    for _ in range(ds_len):
+                        r_item = self._preprocessed[replacement]
+                        r_ids = r_item["input_ids"]
+                        if isinstance(r_ids, list):
+                            r_ids = torch.tensor(r_ids, dtype=torch.long)
+                        r_lm = unpack_loss_mask(r_item["packed_loss_mask"])
+                        if len(r_lm) > len(r_ids):
+                            r_lm = r_lm[:len(r_ids)]
+                        elif len(r_lm) < len(r_ids):
+                            r_lm = torch.cat([r_lm, torch.zeros(len(r_ids) - len(r_lm), dtype=torch.long)])
+                        if r_lm.sum() >= 1:
+                            ids, lm = r_ids, r_lm
+                            break
+                        replacement = (replacement + 1) % ds_len
                 batch_ids.append(ids)
                 batch_loss_masks.append(lm)
 

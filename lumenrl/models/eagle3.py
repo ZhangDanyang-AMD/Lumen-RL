@@ -535,6 +535,8 @@ class Eagle3Model(nn.Module):
         h = self.fc(aux_hidden_states)
 
         current_ids = target_ids
+        if current_ids is not None and embed_weight is not None:
+            current_ids = current_ids.clamp(min=0, max=embed_weight.shape[0] - 1)
         current_mask = loss_mask
 
         cache_keys = None
@@ -600,16 +602,16 @@ class Eagle3Model(nn.Module):
                                 kl_parts.append(torch.logsumexp(logits_f32, dim=-1) - (tp * logits_f32).sum(-1))
                                 acc_parts.append((draft_logits.argmax(dim=-1) == teacher_pred).float())
                                 del tp, draft_logits, logits_f32
-                            losses.append(torch.cat(kl_parts).mean())
-                            accuracies.append(torch.cat(acc_parts).mean())
+                            losses.append(torch.cat(kl_parts).sum() / max(N_valid, 1))
+                            accuracies.append(torch.cat(acc_parts).sum() / max(N_valid, 1))
                         elif current_ids is not None:
                             tgt_flat = current_ids[:, :T].reshape(-1)
                             tgt_valid = tgt_flat.index_select(0, valid_idx)
                             logits_valid = F.linear(normed_valid, draft_lm_head_w)
                             ce_valid = F.cross_entropy(logits_valid.float(), tgt_valid, reduction="none")
                             acc_valid = (logits_valid.argmax(dim=-1) == tgt_valid).float()
-                            losses.append(ce_valid.mean())
-                            accuracies.append(acc_valid.mean())
+                            losses.append(ce_valid.sum() / max(N_valid, 1))
+                            accuracies.append(acc_valid.sum() / max(N_valid, 1))
                             del logits_valid
 
             if step < self.length - 1:

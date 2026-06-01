@@ -320,13 +320,13 @@ def main():
             traceback.print_exc()
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    result_file = os.path.join(args.output_dir, f"phase1_atom_eagle3_step19900_{timestamp}.json")
+    result_file = os.path.join(args.output_dir, f"phase1_atom_eagle3_step37000_{timestamp}.json")
     with open(result_file, "w") as f:
         json.dump({
             "backend": "atom",
             "target_model": "/dev/shm/Kimi-K2.5-MXFP4",
             "draft_model": "/dev/shm/Kimi_K25_eagle3_v2_phase1_HF",
-            "checkpoint_step": 19900,
+            "checkpoint_step": 37000,
             "num_speculative_tokens": 4,
             "benchmarks": all_results,
         }, f, indent=2)

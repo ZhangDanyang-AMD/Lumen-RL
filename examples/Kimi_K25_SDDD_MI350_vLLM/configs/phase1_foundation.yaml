@@ -17,7 +17,7 @@ policy:
   train_micro_batch_size: 1
   learning_rate: 5e-5
   weight_decay: 0.0
-  max_grad_norm: 1.0
+  max_grad_norm: 0.5
   warmup_ratio: 0.015
 
 algorithm:

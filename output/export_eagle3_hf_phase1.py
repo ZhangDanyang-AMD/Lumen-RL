@@ -11,8 +11,8 @@ import json
 import os
 from safetensors.torch import save_file
 
-CKPT_PATH = "/dev/shm/checkpoints/kimi_k25_eagle3_v2_phase1/checkpoint_111000.pt"
-BASE_MODEL_DIR = "/dev/shm/Kimi-K2.5-BF16"
+CKPT_PATH = "/dev/shm/checkpoints/kimi_k25_eagle3_v2_phase1/checkpoint_37000.pt"
+BASE_MODEL_DIR = "/dev/shm/Kimi-K2.5-MXFP4"
 OUTPUT_DIR = "/dev/shm/Kimi_K25_eagle3_v2_phase1_HF"
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -24,13 +24,15 @@ msd = ckpt["state_dict"]["model_state_dict"]
 step = ckpt["state_dict"].get("step", ckpt.get("step", "unknown"))
 print(f"Checkpoint step: {step}")
 
-# --- 2. Load embed_tokens from base model (frozen, not in checkpoint) ---
-print("Loading embed_tokens from base model...")
+# --- 2. Load embed_tokens and lm_head from base model (frozen, not in checkpoint) ---
+print("Loading embed_tokens and lm_head from base model...")
 from safetensors import safe_open
 base_shard = os.path.join(BASE_MODEL_DIR, "model-00062-of-000064.safetensors")
 with safe_open(base_shard, framework="pt", device="cpu") as f:
     embed_tokens = f.get_tensor("language_model.model.embed_tokens.weight")
+    lm_head = f.get_tensor("language_model.lm_head.weight")
 print(f"  embed_tokens: {list(embed_tokens.shape)} {embed_tokens.dtype}")
+print(f"  lm_head: {list(lm_head.shape)} {lm_head.dtype}")
 
 # --- 3. Map LumenRL keys to HF keys ---
 # v2 architecture: no bias, separate Q/K/V, RMSNorm, 3×hidden fc
@@ -41,8 +43,8 @@ hf_state_dict = {}
 # embed_tokens (from base model, frozen — keep bfloat16)
 hf_state_dict["embed_tokens.weight"] = embed_tokens
 
-# lm_head (trained draft head — NOT teacher's; convert to float16)
-hf_state_dict["lm_head.weight"] = msd["lm_head.weight"].to(torch.float16)
+# lm_head (from teacher model, frozen — keep original dtype)
+hf_state_dict["lm_head.weight"] = lm_head.to(torch.float16)
 
 # fc: 3×hidden projection (float16)
 hf_state_dict["fc.weight"] = msd["fc.weight"].to(torch.float16)

@@ -37,6 +37,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 from typing import Any, Optional
 
@@ -307,6 +308,7 @@ class AtomTeacherEngine:
 
         self._hidden_dim: int = 0
         self._num_layers: int = 0
+        self._cmd_lock = threading.Lock()
         self._aux_layer_indices: list[int] = []
         self._mooncake_store: Any = None
 
@@ -714,13 +716,13 @@ class AtomTeacherEngine:
             self._aux_layer_indices, self._transport,
         )
 
-    def _send_cmd(
+    def _send_cmd_unlocked(
         self,
         cmd: dict[str, Any],
         *,
         timeout_s: float = _DEFAULT_COMMAND_TIMEOUT_SECONDS,
     ) -> dict:
-        """Send a JSON command and read the response."""
+        """Send a JSON command and read the response (caller holds _cmd_lock)."""
         if not self.is_alive:
             raise RuntimeError("Teacher worker is not running")
         try:
@@ -735,6 +737,16 @@ class AtomTeacherEngine:
             context=f"response to cmd={cmd.get('cmd', 'unknown')}",
         )
         return json.loads(resp_line)
+
+    def _send_cmd(
+        self,
+        cmd: dict[str, Any],
+        *,
+        timeout_s: float = _DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    ) -> dict:
+        """Send a JSON command and read the response (thread-safe)."""
+        with self._cmd_lock:
+            return self._send_cmd_unlocked(cmd, timeout_s=timeout_s)
 
     def extract_hidden_states(
         self,
@@ -759,19 +771,20 @@ class AtomTeacherEngine:
         if not self.is_alive:
             self.start()
 
-        self._req_counter += 1
-        tag = f"req_{self._req_counter}"
-        input_path = os.path.join(self._hidden_dir, f"{tag}_input.pt")
+        with self._cmd_lock:
+            self._req_counter += 1
+            tag = f"req_{self._req_counter}"
+            input_path = os.path.join(self._hidden_dir, f"{tag}_input.pt")
 
-        torch.save(
-            {"input_ids": input_ids.cpu(), "attention_mask": attention_mask.cpu()},
-            input_path,
-        )
+            torch.save(
+                {"input_ids": input_ids.cpu(), "attention_mask": attention_mask.cpu()},
+                input_path,
+            )
 
-        resp = self._send_cmd({
-            "cmd": "extract_hidden",
-            "input_path": input_path,
-        })
+            resp = self._send_cmd_unlocked({
+                "cmd": "extract_hidden",
+                "input_path": input_path,
+            })
 
         if resp.get("status") != "ok":
             raise RuntimeError(f"extract_hidden failed: {resp}")
