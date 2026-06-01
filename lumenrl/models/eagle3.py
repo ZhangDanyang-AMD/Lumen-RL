@@ -101,6 +101,9 @@ class RotaryEmbedding(nn.Module):
         beta_slow: float = 1.0,
         mscale: float = 1.0,
         mscale_all_dim: float = 0.0,
+        rope_type: str = "yarn",
+        low_freq_factor: float = 1.0,
+        high_freq_factor: float = 4.0,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -112,23 +115,42 @@ class RotaryEmbedding(nn.Module):
         self.beta_slow = beta_slow
         self.mscale = mscale
         self.mscale_all_dim = mscale_all_dim
+        self.rope_type = rope_type
+        self.low_freq_factor = low_freq_factor
+        self.high_freq_factor = high_freq_factor
 
         self._cos_cached: Optional[Tensor] = None
         self._sin_cached: Optional[Tensor] = None
         self._cached_seq_len = 0
 
-    def _build_inv_freq(self, device: torch.device) -> Tensor:
-        if self.scaling_factor <= 1.0:
-            inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, device=device, dtype=torch.float32) / self.dim))
-            return inv_freq
-
-        freq_extra = 1.0 / (
+    def _base_inv_freq(self, device: torch.device) -> Tensor:
+        return 1.0 / (
             self.base ** (torch.arange(0, self.dim, 2, device=device, dtype=torch.float32) / self.dim)
         )
-        freq_inter = 1.0 / (
-            self.scaling_factor
-            * self.base ** (torch.arange(0, self.dim, 2, device=device, dtype=torch.float32) / self.dim)
-        )
+
+    def _build_inv_freq(self, device: torch.device) -> Tensor:
+        if self.scaling_factor <= 1.0:
+            return self._base_inv_freq(device)
+
+        if self.rope_type == "llama3":
+            inv_freq = self._base_inv_freq(device)
+            old_ctx = float(self.original_max_position_embeddings)
+            low_wl = old_ctx / self.low_freq_factor
+            high_wl = old_ctx / self.high_freq_factor
+            wavelen = 2 * math.pi / inv_freq
+
+            inv_freq_llama = torch.where(
+                wavelen > low_wl, inv_freq / self.scaling_factor, inv_freq
+            )
+            smooth = (old_ctx / wavelen - self.low_freq_factor) / (
+                self.high_freq_factor - self.low_freq_factor
+            )
+            smoothed = (1 - smooth) * inv_freq_llama / self.scaling_factor + smooth * inv_freq_llama
+            in_smooth_band = (wavelen >= high_wl) & (wavelen <= low_wl)
+            return torch.where(in_smooth_band, smoothed, inv_freq_llama)
+
+        freq_extra = self._base_inv_freq(device)
+        freq_inter = freq_extra / self.scaling_factor
 
         low, high = _yarn_find_correction_range(
             self.beta_fast, self.beta_slow, self.dim, self.base,
@@ -140,6 +162,8 @@ class RotaryEmbedding(nn.Module):
 
     def _compute_mscale(self) -> float:
         if self.scaling_factor <= 1.0:
+            return 1.0
+        if self.rope_type == "llama3":
             return 1.0
         return _yarn_get_mscale(self.scaling_factor, self.mscale) / _yarn_get_mscale(
             self.scaling_factor, self.mscale_all_dim
@@ -214,14 +238,20 @@ class Eagle3Attention(nn.Module):
         beta_slow = 1.0
         mscale = 1.0
         mscale_all_dim = 0.0
+        rope_type = "yarn"
+        low_freq_factor = 1.0
+        high_freq_factor = 4.0
 
         if rope_scaling is not None:
+            rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", "yarn"))
             scaling_factor = rope_scaling.get("factor", 1.0)
             original_max_pos = rope_scaling.get("original_max_position_embeddings", 4096)
             beta_fast = rope_scaling.get("beta_fast", 32.0)
             beta_slow = rope_scaling.get("beta_slow", 1.0)
             mscale = rope_scaling.get("mscale", 1.0)
             mscale_all_dim = rope_scaling.get("mscale_all_dim", 0.0)
+            low_freq_factor = rope_scaling.get("low_freq_factor", 1.0)
+            high_freq_factor = rope_scaling.get("high_freq_factor", 4.0)
 
         self.rotary_emb = RotaryEmbedding(
             head_dim,
@@ -233,10 +263,14 @@ class Eagle3Attention(nn.Module):
             beta_slow=beta_slow,
             mscale=mscale,
             mscale_all_dim=mscale_all_dim,
+            rope_type=rope_type,
+            low_freq_factor=low_freq_factor,
+            high_freq_factor=high_freq_factor,
         )
 
+        # YaRN scales softmax by mscale^2/sqrt(d); llama3 / no-scaling use SDPA default.
         self._softmax_scale: Optional[float] = None
-        if rope_scaling is not None and scaling_factor > 1.0:
+        if rope_scaling is not None and scaling_factor > 1.0 and rope_type == "yarn":
             ms = _yarn_get_mscale(scaling_factor, mscale_all_dim)
             self._softmax_scale = (ms * ms) / math.sqrt(head_dim)
 

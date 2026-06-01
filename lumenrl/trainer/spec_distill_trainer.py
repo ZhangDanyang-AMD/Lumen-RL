@@ -404,12 +404,15 @@ class SpecDistillTrainer:
             if rope_scaling_type:
                 rope_scaling = {
                     "type": rope_scaling_type,
+                    "rope_type": rope_scaling_type,
                     "factor": getattr(draft_cfg, "rope_scaling_factor", 64.0),
                     "original_max_position_embeddings": getattr(draft_cfg, "rope_original_max_pos", 4096),
                     "beta_fast": getattr(draft_cfg, "rope_beta_fast", 32.0),
                     "beta_slow": getattr(draft_cfg, "rope_beta_slow", 1.0),
                     "mscale": getattr(draft_cfg, "rope_mscale", 1.0),
                     "mscale_all_dim": getattr(draft_cfg, "rope_mscale_all_dim", 1.0),
+                    "low_freq_factor": getattr(draft_cfg, "rope_low_freq_factor", 1.0),
+                    "high_freq_factor": getattr(draft_cfg, "rope_high_freq_factor", 4.0),
                 }
 
             teacher_vocab_size = self._lm_head_weight.shape[0]
@@ -450,8 +453,21 @@ class SpecDistillTrainer:
                 ckpt_path = ckpt_files[-1]
                 logger.info("[rank %d] Loading draft weights from %s", self._rank, ckpt_path)
                 payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+                # CheckpointManager wraps state inside {step, state_dict: {model_state_dict, ...}}.
+                # Without this unwrap, payload.get("model_state_dict") returns None and
+                # the strict=False load silently keeps the random init.
+                if "state_dict" in payload and isinstance(payload["state_dict"], dict):
+                    payload = payload["state_dict"]
                 sd = payload.get("model_state_dict", payload)
-                self._draft_model.load_state_dict(sd, strict=False)
+                info = self._draft_model.load_state_dict(sd, strict=False)
+                if info.missing_keys or info.unexpected_keys:
+                    logger.warning(
+                        "[rank %d] resume_from load_state_dict mismatch: missing=%d, unexpected=%d (first missing: %s)",
+                        self._rank, len(info.missing_keys), len(info.unexpected_keys),
+                        info.missing_keys[:3],
+                    )
+                else:
+                    logger.info("[rank %d] resume_from: loaded %d tensors cleanly", self._rank, len(sd))
             else:
                 logger.warning("[rank %d] resume_from=%s but no checkpoints found", self._rank, resume_from)
 
@@ -748,6 +764,11 @@ class SpecDistillTrainer:
                 )
 
         if self._rank == 0:
+            # If algorithm.spec_distill.aux_hidden_state_layer_ids is set the
+            # draft model was built for those exact teacher layers; the teacher
+            # must capture from the same list, not the auto-picked default.
+            spec_cfg = getattr(self.config.algorithm, "spec_distill", None)
+            aux_override = getattr(spec_cfg, "aux_hidden_state_layer_ids", None) if spec_cfg else None
             self._teacher_engine = VllmTeacherEngine(
                 model_name=teacher_name,
                 gpu_ids=gpu_ids,
@@ -757,6 +778,7 @@ class SpecDistillTrainer:
                 max_batch_size=max(1, int(self.config.policy.train_global_batch_size)),
                 max_seq_len=int(self.config.policy.max_total_sequence_length),
                 local_device=self._device,
+                aux_layer_ids=list(aux_override) if aux_override else None,
             )
             self._teacher_engine.start()
             self._lm_head_weight = self._teacher_engine.get_lm_head_weight()
@@ -947,20 +969,48 @@ class SpecDistillTrainer:
             return
 
         from datasets import load_dataset
+        dataset_split = getattr(self.config.reward, "dataset_split", "train")
 
         if os.path.isfile(dataset_path) or os.path.isdir(dataset_path):
             if dataset_path.endswith(".parquet"):
                 self._dataset = load_dataset(
-                    "parquet", data_files=dataset_path, split="train"
+                    "parquet", data_files=dataset_path, split=dataset_split
                 )
             elif dataset_path.endswith((".jsonl", ".json")):
                 self._dataset = load_dataset(
-                    "json", data_files=dataset_path, split="train"
+                    "json", data_files=dataset_path, split=dataset_split
                 )
             else:
-                self._dataset = load_dataset(dataset_path, split="train")
+                self._dataset = load_dataset(dataset_path, split=dataset_split)
         else:
-            self._dataset = load_dataset(dataset_path, split="train")
+            self._dataset = load_dataset(dataset_path, split=dataset_split)
+
+        def _has_nonempty_prompt(s: dict) -> bool:
+            convs = s.get("conversations")
+            if convs and isinstance(convs, list) and isinstance(convs[0], dict):
+                return any(
+                    isinstance(m, dict)
+                    and str(m.get("content") or m.get("value") or "").strip()
+                    for m in convs
+                )
+            for key in ("prompt", "question", "input", "problem"):
+                raw = s.get(key)
+                if isinstance(raw, str) and raw.strip():
+                    return True
+                if isinstance(raw, list) and any(
+                    isinstance(m, dict) and str(m.get("content") or "").strip()
+                    for m in raw
+                ):
+                    return True
+            return False
+
+        n_before = len(self._dataset)
+        self._dataset = self._dataset.filter(_has_nonempty_prompt)
+        n_after = len(self._dataset)
+        if n_after < n_before:
+            logger.warning(
+                "Dropped %d/%d samples with empty prompt", n_before - n_after, n_before
+            )
 
         self._dataset = self._dataset.shuffle(seed=self.config.seed)
         logger.info(
@@ -1515,17 +1565,34 @@ class SpecDistillTrainer:
     ) -> dict[str, float]:
         """Eagle3 draft model training step (single micro-batch)."""
         step = self.global_step
+        # Probe: first few steps log fine-grained progress + peak mem to localize hangs/OOM.
+        _probe = step < 3
+        def _mem(tag: str) -> None:
+            if not _probe:
+                return
+            try:
+                alloc = torch.cuda.memory_allocated(self._device) / (1024**3)
+                peak = torch.cuda.max_memory_allocated(self._device) / (1024**3)
+                logger.info("[rank %d] step=%d eagle3-probe %s: alloc=%.2fGiB peak=%.2fGiB",
+                            self._rank, step, tag, alloc, peak)
+            except Exception:
+                logger.info("[rank %d] step=%d eagle3-probe %s", self._rank, step, tag)
+        _mem("enter")
         draft_dtype = next(self._draft_model.parameters()).dtype
         aux_hidden = teacher_data["hidden_states"].to(device=self._device, dtype=draft_dtype)  # [B, T, 3*H]
         input_ids = teacher_data["input_ids"].to(self._device)
         input_ids = torch.cat([input_ids[:, 1:], torch.zeros_like(input_ids[:, :1])], dim=1)
+        _mem(f"inputs-on-gpu (aux={tuple(aux_hidden.shape)} ids={tuple(input_ids.shape)})")
 
         if not hasattr(self, "_lm_head_w_gpu") or self._lm_head_w_gpu is None:
+            _mem("before-lazy-lm_head-materialize")
             self._lm_head_w_gpu = self._lm_head_weight.to(device=self._device, dtype=draft_dtype)
             self._embed_w_gpu = self._embed_weight.to(device=self._device, dtype=draft_dtype)
+            _mem("after-lazy-lm_head-materialize")
         lm_head_w = self._lm_head_w_gpu
         embed_w = self._embed_w_gpu
         token_embeds = torch.nn.functional.embedding(input_ids, embed_w)
+        _mem("after-embed")
 
         loss_mask = attention_mask.to(self._device)
         spec_cfg = self.config.algorithm.spec_distill
@@ -1563,6 +1630,7 @@ class SpecDistillTrainer:
 
 
 
+        _mem("before-forward")
         result = self._draft_model(
             token_embeds=token_embeds,
             aux_hidden_states=aux_hidden,
@@ -1574,6 +1642,7 @@ class SpecDistillTrainer:
             target_hidden_states=target_hs,
             attention_mask=attention_mask.to(self._device),
         )
+        _mem("after-forward")
 
 
         total_loss = torch.tensor(0.0, device=self._device)
@@ -1590,7 +1659,9 @@ class SpecDistillTrainer:
         num_accum = getattr(self, "_grad_accum_steps", 1)
         scaled_loss = total_loss / num_accum
 
+        _mem("before-backward")
         scaled_loss.backward()
+        _mem("after-backward")
 
         metrics["loss"] = float(total_loss.detach())
         return metrics
@@ -1713,6 +1784,12 @@ class SpecDistillTrainer:
                 attention_mask = loaded["attention_mask"]
                 _consumed_slot = loaded["_slot"]
                 teacher_time = time.time() - t0
+                # Ensure every rank has finished copying this slot out of SHM
+                # before rank 0 frees it; otherwise the writer can overwrite
+                # the slot (deleting READY_{step}) before slower ranks' loader
+                # observes the sentinel, leaving them stuck in _wait_sentinel.
+                if self._is_distributed:
+                    torch.distributed.barrier()
                 if shm_writer is not None:
                     shm_writer.release_slot(_consumed_slot)
                 _next_step = step + _SHM_SLOTS
@@ -1829,12 +1906,20 @@ class SpecDistillTrainer:
                         "last_hidden_states": bufs[cur]["last_hidden_states"][:actual_mb],
                     }
 
+                    # Clamp into [1, T] defensively. The raw value should always
+                    # already satisfy 0 <= sum.max() <= T for a 0/1 mask, but
+                    # torch occasionally fires "Truncating the start/stop/step
+                    # of slice" UserWarnings here, suggesting a stale traced
+                    # shape sees mb_actual_len as out of bounds. The clamp
+                    # prevents the trim from ever producing a malformed slice
+                    # and silences the symbolic-shape warning regardless.
                     mb_actual_len = int(mb_mask.sum(dim=-1).max().item())
+                    mb_actual_len = max(1, min(mb_actual_len, mb_mask.shape[1]))
                     if mb_actual_len < mb_mask.shape[1]:
                         mb_mask = mb_mask[:, :mb_actual_len].contiguous()
                         trimmed = {}
                         for k, v in mb_teacher.items():
-                            if v.dim() >= 2:
+                            if v.dim() >= 2 and v.shape[1] >= mb_actual_len:
                                 trimmed[k] = v[:, :mb_actual_len].contiguous()
                             else:
                                 trimmed[k] = v
@@ -1881,12 +1966,20 @@ class SpecDistillTrainer:
                         k: v[mb_start:mb_end] for k, v in teacher_data.items()
                     }
                     mb_mask = attention_mask[mb_start:mb_end]
+                    # Clamp into [1, T] defensively. The raw value should always
+                    # already satisfy 0 <= sum.max() <= T for a 0/1 mask, but
+                    # torch occasionally fires "Truncating the start/stop/step
+                    # of slice" UserWarnings here, suggesting a stale traced
+                    # shape sees mb_actual_len as out of bounds. The clamp
+                    # prevents the trim from ever producing a malformed slice
+                    # and silences the symbolic-shape warning regardless.
                     mb_actual_len = int(mb_mask.sum(dim=-1).max().item())
+                    mb_actual_len = max(1, min(mb_actual_len, mb_mask.shape[1]))
                     if mb_actual_len < mb_mask.shape[1]:
                         mb_mask = mb_mask[:, :mb_actual_len].contiguous()
                         trimmed = {}
                         for k, v in mb_teacher.items():
-                            if v.dim() >= 2:
+                            if v.dim() >= 2 and v.shape[1] >= mb_actual_len:
                                 trimmed[k] = v[:, :mb_actual_len].contiguous()
                             else:
                                 trimmed[k] = v

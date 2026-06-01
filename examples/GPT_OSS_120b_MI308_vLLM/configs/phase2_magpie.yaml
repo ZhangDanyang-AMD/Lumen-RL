@@ -1,0 +1,135 @@
+# GPT-OSS-120B Eagle3 Speculative Decoding Draft Distillation — Phase 2
+#
+# Continuation of phase 1 (phase1_ultrachat.yaml, trained on ultrachat_200k).
+# Switches the prompt source to Magpie-Llama-3.1-Pro-300K-Filtered to match
+# the second leg of NVIDIA's nvidia/gpt-oss-120b-Eagle3-long-context recipe.
+#
+# Phase 1 -> Phase 2 differences (everything else identical to phase1_ultrachat.yaml):
+#   - reward.dataset       : ultrachat_200k         -> Magpie-Llama-3.1-Pro-300K-Filtered
+#   - reward.dataset_split : train_sft              -> train  (Magpie has only `train`)
+#   - policy.learning_rate : 5e-5                   -> 2e-5   (lower for fine-tune phase)
+#   - warmup_ratio         : 0.015                  -> 0.005  (already-warm draft)
+#   - checkpoint_dir       : gpt_oss_120b_eagle3_vllm -> ..._phase2  (don't overwrite phase 1)
+#   - draft.from_scratch   : true                   -> false  (load phase 1 weights)
+#   - draft.resume_from    : (unset)                -> phase 1 ckpt dir
+#   - num_training_steps   : 19488 (3 epochs ultrachat)
+#                            -> 28125 (3 epochs Magpie)
+#
+# Schema note (Magpie):
+#   Magpie samples have a `conversations` field (ShareGPT format with from/value),
+#   so spec_distill_trainer's loader hits the `convs` branch at line 1314 and
+#   applies the chat template, producing full user+assistant text per sample.
+#   Phase 1 (ultrachat) had no `conversations` field, so the loader fell back
+#   to `s["prompt"]` (user turn only). This is a behavioral difference; full
+#   alignment with the NVIDIA "prompts only" recipe would require strip-assistant
+#   preprocessing in _load_dataset. Training Eagle3 on full conversations is
+#   still valid (draft just learns next-token on more text), and tends to be
+#   closer to inference distribution where the draft continues assistant text.
+#
+# Usage:
+#   bash examples/GPT_OSS_120b_MI308_vLLM/run_gpt_oss_120b.sh --phase2
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1
+
+policy:
+  model_name: /dev/shm/gpt-oss-120b
+  training_backend: fsdp2
+  generation_backend: hf
+  max_total_sequence_length: 8192
+  # Same GBS=32 across 4 ranks -> num_accum=8 per rank, micro=1.
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  # Phase 2: lower LR, smaller warmup. Draft is already converged on phase 1
+  # data; we just want to specialize it on Magpie's instruction distribution
+  # without erasing the foundation.
+  learning_rate: 2e-5
+  weight_decay: 0.0
+  max_grad_norm: 0.5
+  warmup_ratio: 0.005
+
+algorithm:
+  name: spec_distill
+  spec_distill:
+    draft_type: eagle3
+    loss_type: forward_kl
+    position_decay: 0.8
+    num_target_layers: 1
+    spec_length: 4
+    # MUST match phase 1's value -- changing aux layer ids is equivalent to
+    # changing the input distribution of the draft, which would invalidate the
+    # phase 1 weights we're resuming from.
+    aux_hidden_state_layer_ids: [1, 17, 32]
+  teacher:
+    model_name: /dev/shm/gpt-oss-120b
+    inference_backend: vllm
+    tensor_parallel_size: 4
+    gpu_ids: [4, 5, 6, 7]
+    quantization: ""
+  draft:
+    # Phase 2: load phase 1's final checkpoint as the starting point.
+    # _resume_from_checkpoint at spec_distill_trainer.py:448 reads
+    # algorithm.spec_distill.draft.resume_from when from_scratch=false.
+    from_scratch: false
+    resume_from: /dev/shm/checkpoints/gpt_oss_120b_eagle3_vllm
+    # ---- Architecture: MUST match phase 1 exactly so phase 1 weights load. ----
+    num_layers: 1                  # num_hidden_layers
+    num_heads: 64                  # num_attention_heads
+    num_kv_heads: 8                # num_key_value_heads  (GQA 8:1)
+    head_dim: 64                   # head_dim
+    ffn_dim: 17280                 # intermediate_size
+    rms_norm_eps: 1.0e-5           # rms_norm_eps
+    rope_theta: 500000.0           # rope_theta
+    rope_scaling_type: llama3      # rope_scaling.rope_type
+    rope_scaling_factor: 8.0       # rope_scaling.factor
+    rope_original_max_pos: 8192    # rope_scaling.original_max_position_embeddings
+    rope_low_freq_factor: 1.0      # rope_scaling.low_freq_factor   (llama3-only)
+    rope_high_freq_factor: 4.0     # rope_scaling.high_freq_factor  (llama3-only)
+    use_aux_hidden_state: true
+    use_input_layernorm_in_first_layer: true
+    use_last_layernorm: true
+    use_mtp_layernorm: false
+    attention_bias: false
+    mlp_bias: false
+    dtype: bfloat16
+
+mooncake:
+  protocol: tcp
+  device_name: ""
+  global_segment_size: 16GB
+  local_buffer_size: 4GB
+
+quantization:
+  training:
+    fp8: null
+  rollout_correction:
+    enabled: false
+
+# Magpie-Llama-3.1-Pro-300K-Filtered has ~300K rows in `train` (no train_sft).
+# Each row carries `conversations` (ShareGPT format), `instruction`, `response`.
+reward:
+  type: function
+  function: math_reward
+  dataset: Magpie-Align/Magpie-Llama-3.1-Pro-300K-Filtered
+  dataset_split: train
+
+checkpointing:
+  # Separate dir so phase 2 progress does NOT overwrite phase 1 finals
+  # (phase 1's checkpoint_5000/.../21000.pt remain available for re-export
+  # or rollback). `resume: true` here means phase 2 resumes itself on crash;
+  # the initial weight load from phase 1 happens via draft.resume_from above.
+  checkpoint_dir: /dev/shm/checkpoints/gpt_oss_120b_eagle3_vllm_phase2
+  save_steps: 100
+  save_total_limit: 3
+  resume: true
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+# Magpie 300K samples / global_bs=32 = 9,375 steps/epoch.
+# 3 epochs = 28,125 (full NVIDIA-style budget; drop to 18,750 for 2 epochs
+# if you want a cheaper run).
+num_training_steps: 28125
+seed: 42
