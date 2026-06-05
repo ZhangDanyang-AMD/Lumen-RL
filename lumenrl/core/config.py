@@ -21,6 +21,83 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class FSDPEngineConfig:
+    """Configuration for the FSDP2 training engine."""
+    strategy: str = "fsdp2"
+    fsdp_size: int = -1
+    param_offload: bool = False
+    optimizer_offload: bool = False
+    grad_offload: bool = False
+    reshard_after_forward: bool = True
+    forward_only: bool = False
+    seed: int = 42
+    model_dtype: str = "bf16"
+    mixed_precision: Optional[dict] = None
+    use_remove_padding: bool = True
+    ulysses_sequence_parallel_size: int = 1
+    forward_prefetch: bool = False
+    use_orig_params: bool = True
+    use_torch_compile: bool = False
+
+
+@dataclass
+class McoreEngineConfig:
+    """Configuration for the Megatron-Core training engine."""
+    tensor_model_parallel_size: int = 1
+    pipeline_model_parallel_size: int = 1
+    virtual_pipeline_model_parallel_size: Optional[int] = None
+    context_parallel_size: int = 1
+    expert_model_parallel_size: int = 1
+    sequence_parallel: bool = False
+    param_offload: bool = False
+    optimizer_offload: bool = False
+    grad_offload: bool = False
+    forward_only: bool = False
+    seed: int = 42
+    dtype: str = "bf16"
+    use_distributed_optimizer: bool = False
+
+
+@dataclass
+class OptimizerConfig:
+    """Optimizer and LR scheduler configuration."""
+    optimizer_type: str = "adamw"
+    lr: float = 1e-6
+    weight_decay: float = 0.01
+    clip_grad: float = 1.0
+    lr_scheduler_type: str = "cosine"
+    lr_warmup_steps: int = 10
+    lr_warmup_steps_ratio: float = 0.0
+    total_training_steps: int = 1000
+    min_lr_ratio: float = 0.0
+    num_cycles: float = 0.5
+
+
+@dataclass
+class LoRAConfig:
+    """LoRA / PEFT configuration."""
+    enabled: bool = False
+    rank: int = 0
+    alpha: int = 16
+    target_modules: Optional[list] = None
+    exclude_modules: Optional[list] = None
+    merge: bool = False
+    adapter_path: Optional[str] = None
+
+
+@dataclass
+class HFModelConfig:
+    """HuggingFace model loading configuration."""
+    local_path: str = ""
+    model_type: str = "language_model"
+    trust_remote_code: bool = True
+    use_remove_padding: bool = True
+    enable_gradient_checkpointing: bool = True
+    lora: LoRAConfig = field(default_factory=LoRAConfig)
+    use_liger: bool = False
+
+
+@dataclass
 class ClusterConfig:
     num_nodes: int = 1
     gpus_per_node: int = 1
@@ -92,6 +169,11 @@ class AtomConfig:
 class TrainingConfig:
     megatron_cfg: MegatronConfig = field(default_factory=MegatronConfig)
     fsdp_cfg: Optional[dict] = None
+    # Training dtype controls both model param storage and FSDP2 MixedPrecision
+    # param_dtype. The optimizer (AdamW) keeps master weights and momentum/variance
+    # in this dtype. Use "fp32" for full FP32 training, "bf16" for mixed precision.
+    # Reduce dtype is always FP32 for numerical stability.
+    optimizer_dtype: str = "bf16"
 
 
 @dataclass

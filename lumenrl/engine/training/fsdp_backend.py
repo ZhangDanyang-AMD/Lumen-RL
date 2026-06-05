@@ -55,6 +55,31 @@ def _patch_hf_attention_with_lumen() -> None:
         logger.warning("Packing attention patch failed: %s", exc)
 
 
+_DTYPE_ALIASES = {
+    "fp32": torch.float32,
+    "float32": torch.float32,
+    "f32": torch.float32,
+    "bf16": torch.bfloat16,
+    "bfloat16": torch.bfloat16,
+    "fp16": torch.float16,
+    "float16": torch.float16,
+}
+
+
+def _resolve_dtype(value: Any, default: torch.dtype = torch.bfloat16) -> torch.dtype:
+    """Resolve a string or torch.dtype config value to a torch.dtype."""
+    if value is None:
+        return default
+    if isinstance(value, torch.dtype):
+        return value
+    if isinstance(value, str):
+        try:
+            return _DTYPE_ALIASES[value.lower()]
+        except KeyError as exc:
+            raise ValueError(f"Unsupported dtype string: {value!r}") from exc
+    raise TypeError(f"Cannot resolve dtype from {value!r}")
+
+
 def _load_hf_model(model_name: str, torch_dtype: torch.dtype = torch.bfloat16) -> nn.Module:
     """Load a HuggingFace causal LM with gradient checkpointing.
 
@@ -162,15 +187,17 @@ def _apply_fsdp2_sharding(
 
     model.to(local_device)
 
+    param_dtype = _resolve_dtype(fsdp_config.get("param_dtype"), torch.bfloat16)
+    reduce_dtype = _resolve_dtype(fsdp_config.get("reduce_dtype"), torch.float32)
     if fp8_linear:
         mp_policy = MixedPrecisionPolicy(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
+            param_dtype=param_dtype,
+            reduce_dtype=reduce_dtype,
         )
     else:
         mp_policy = MixedPrecisionPolicy(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
+            param_dtype=param_dtype,
+            reduce_dtype=reduce_dtype,
         )
 
     reshard = fsdp_config.get("reshard_after_forward", True)
@@ -261,7 +288,8 @@ class FSDP2Backend:
             logger.info("FSDP2Backend.build_model: TinyLM (vocab=%d, dim=%d)", vocab, dim)
             return _TinyLM(vocab_size=vocab, dim=dim, n_layers=n_layers)
 
-        return _load_hf_model(model_name, torch_dtype=torch.bfloat16)
+        model_dtype = _resolve_dtype(cfg.get("model_dtype"), torch.bfloat16)
+        return _load_hf_model(model_name, torch_dtype=model_dtype)
 
     @staticmethod
     def apply_lumen_optimizations(model: nn.Module, quant_config: dict[str, Any] | None) -> nn.Module:

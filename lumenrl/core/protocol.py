@@ -15,12 +15,49 @@ class DataProto:
 
     All cross-worker data exchange uses this format. Tensors are stored on
     CPU for serialization; workers move them to GPU as needed.
+
+    Supports variable-length (remove-padding) sequences via optional
+    ``cu_seqlens`` and ``seq_lens`` metadata tensors.
     """
 
     def __init__(self, tensors: dict[str, torch.Tensor] | None = None,
                  meta: dict[str, Any] | None = None) -> None:
         self.tensors: dict[str, torch.Tensor] = tensors or {}
         self.meta: dict[str, Any] = meta or {}
+
+    # ------------------------------------------------------------------
+    # Variable-length / remove-padding helpers
+    # ------------------------------------------------------------------
+
+    @property
+    def cu_seqlens(self) -> torch.Tensor | None:
+        """Cumulative sequence lengths ``(B+1,)`` for packed/remove-padding input."""
+        return self.tensors.get("cu_seqlens")
+
+    @cu_seqlens.setter
+    def cu_seqlens(self, value: torch.Tensor) -> None:
+        self.tensors["cu_seqlens"] = value
+
+    @property
+    def seq_lens(self) -> torch.Tensor | None:
+        """Per-sequence lengths ``(B,)``."""
+        return self.tensors.get("seq_lens")
+
+    @seq_lens.setter
+    def seq_lens(self, value: torch.Tensor) -> None:
+        self.tensors["seq_lens"] = value
+
+    @property
+    def max_seqlen(self) -> int:
+        """Maximum sequence length in the batch (0 if not set)."""
+        if self.seq_lens is not None:
+            return int(self.seq_lens.max().item())
+        return self.meta.get("max_seqlen", 0)
+
+    @property
+    def is_packed(self) -> bool:
+        """Whether this batch uses packed/remove-padding format."""
+        return self.cu_seqlens is not None
 
     def __getitem__(self, item: str | int | slice | list[int] | torch.Tensor) -> torch.Tensor | "DataProto":
         if isinstance(item, str):
@@ -299,3 +336,42 @@ class DataProto:
 
     def has_router_distributions(self) -> bool:
         return any(k.startswith("router_dist_layer_") for k in self.tensors)
+
+    # ------------------------------------------------------------------
+    # Packing convenience constructors
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_packed(
+        cls,
+        packed_input_ids: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        extra_tensors: dict[str, torch.Tensor] | None = None,
+        meta: dict[str, Any] | None = None,
+    ) -> "DataProto":
+        """Create a DataProto from already-packed (remove-padding) tensors.
+
+        Args:
+            packed_input_ids: ``(1, total_tokens)`` or ``(total_tokens,)``
+            cu_seqlens: ``(B+1,)`` cumulative sequence lengths
+            position_ids: ``(1, total_tokens)`` or ``(total_tokens,)`` optional
+            extra_tensors: additional tensors to include
+            meta: metadata dict
+        """
+        B = cu_seqlens.shape[0] - 1
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+
+        tensors: dict[str, torch.Tensor] = {
+            "input_ids": packed_input_ids,
+            "cu_seqlens": cu_seqlens,
+            "seq_lens": seq_lens,
+        }
+        if position_ids is not None:
+            tensors["position_ids"] = position_ids
+        if extra_tensors:
+            tensors.update(extra_tensors)
+
+        m = dict(meta or {})
+        m["max_seqlen"] = int(seq_lens.max().item())
+        return cls(tensors=tensors, meta=m)

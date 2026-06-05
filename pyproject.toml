@@ -21,6 +21,17 @@ dependencies = [
 [project.optional-dependencies]
 # NOTE: lumen and atom are installed from source (submodules), not from PyPI.
 # See docker/Dockerfile or README.md for full install instructions.
+megatron = [
+    "megatron-core>=0.9",
+    "megatron-bridge>=0.1",
+]
+peft = [
+    "peft>=0.10",
+]
+engine = [
+    "safetensors>=0.4",
+    "peft>=0.10",
+]
 test = [
     "pytest>=8.0",
     "pytest-xdist>=3.5",

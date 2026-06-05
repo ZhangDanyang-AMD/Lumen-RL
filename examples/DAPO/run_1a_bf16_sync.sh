@@ -29,9 +29,9 @@ LOG_FILE="${OUTPUT_DIR}/${EXP_NAME}.log"
 NUM_GPUS="${NUM_GPUS:-8}"
 
 # ─── Data / model paths ─────────────────────────────────────────────────────
-MODEL_DIR="${MODEL_DIR:-/home/danyzhan/model}"
-DATA_DIR="${DATA_DIR:-/home/danyzhan/data}"
-CKPT_DIR="${CKPT_DIR:-/home/danyzhan/ckpts/lumenrl-dapo/1a-bf16-sync}"
+MODEL_DIR="${MODEL_DIR:-/mnt/raid0/danyzhan/model}"
+DATA_DIR="${DATA_DIR:-/mnt/raid0/danyzhan/data}"
+CKPT_DIR="${CKPT_DIR:-/mnt/raid0/danyzhan/ckpts/lumenrl-dapo/1a-bf16-sync}"
 
 # Preflight
 if [ ! -d "${MODEL_DIR}/qwen3-8b-base" ]; then

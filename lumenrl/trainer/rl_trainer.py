@@ -28,6 +28,7 @@ from lumenrl.core.protocol import DataProto
 from lumenrl.core.registry import ALGORITHM_REGISTRY
 from lumenrl.controller import DispatchMode, RayCluster, RayWorkerGroup, create_fused_worker_cls
 from lumenrl.controller.dispatch import dispatch_proto
+from lumenrl.engine.training.base_engine import BaseEngine, EngineRegistry
 from lumenrl.quantization.rollout_correction import apply_rollout_correction
 from lumenrl.trainer.callbacks import Callback, LoggingCallback
 from lumenrl.utils.metrics import MetricsTracker, compute_kl_divergence
@@ -61,6 +62,7 @@ class RLTrainer:
         self._algorithm: Any = None
         self._metrics = MetricsTracker()
 
+        self._engine: BaseEngine | None = None
         self._actor_model: torch.nn.Module | None = None
         self._ref_model: torch.nn.Module | None = None
         self._ref_on_cpu: bool = True
@@ -111,39 +113,66 @@ class RLTrainer:
         quant["fused_mlp"] = tq.fused_mlp
         quant["fused_rope"] = tq.fused_rope
 
-        from lumenrl.engine.training.fsdp_backend import FSDP2Backend
-
-        logger.info("[rank %d] Building actor model: %s", self._rank, model_name)
-        self._actor_model = FSDP2Backend.build_model(model_name)
-        self._actor_model = FSDP2Backend.apply_lumen_optimizations(self._actor_model, quant)
-
-        if hasattr(self._actor_model, "gradient_checkpointing_enable"):
-            self._actor_model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False},
-            )
-            logger.info("[rank %d] Gradient checkpointing enabled.", self._rank)
-
-        if self._is_distributed:
-            fsdp_cfg = {"enabled": True}
-            if hasattr(self.config.policy, "training") and hasattr(self.config.policy.training, "fsdp_cfg") and self.config.policy.training.fsdp_cfg:
-                fsdp_cfg.update(self.config.policy.training.fsdp_cfg)
-            self._actor_model = FSDP2Backend.apply_fsdp2(self._actor_model, fsdp_cfg)
-        else:
-            self._actor_model.to(self._device)
+        optimizer_dtype_str = getattr(self.config.policy.training, "optimizer_dtype", "bf16")
         lr = getattr(self.config.policy, "learning_rate", 1e-6)
         self._base_lr = lr
         self._lr_warmup_steps = getattr(self.config.policy, "lr_warmup_steps", 10)
         self._param_offload = False
+
+        fsdp_cfg_dict: dict = {}
         if hasattr(self.config.policy, "training") and hasattr(self.config.policy.training, "fsdp_cfg"):
             _fc = self.config.policy.training.fsdp_cfg
             if isinstance(_fc, dict):
+                fsdp_cfg_dict = _fc
                 self._param_offload = _fc.get("param_offload", False)
-        self._optimizer = torch.optim.AdamW(
-            [p for p in self._actor_model.parameters() if p.requires_grad],
-            lr=lr,
-            weight_decay=0.1,
-            foreach=not self._param_offload,
+
+        backend_str = getattr(self.config.policy, "training_backend", "fsdp2").lower()
+        if backend_str in ("fsdp", "fsdp2"):
+            backend_key = "fsdp2"
+        elif backend_str == "megatron":
+            backend_key = "megatron"
+        else:
+            backend_key = "fsdp2"
+
+        logger.info("[rank %d] Building actor model via Engine layer: %s (backend=%s, optimizer_dtype=%s)",
+                    self._rank, model_name, backend_key, optimizer_dtype_str)
+
+        engine_config = {
+            "param_offload": fsdp_cfg_dict.get("param_offload", False),
+            "optimizer_offload": fsdp_cfg_dict.get("optimizer_offload", False),
+            "grad_offload": fsdp_cfg_dict.get("grad_offload", False),
+            "reshard_after_forward": fsdp_cfg_dict.get("reshard_after_forward", True),
+            "model_dtype": optimizer_dtype_str,
+            "seed": getattr(self.config, "seed", 42),
+        }
+        optimizer_config = {
+            "lr": lr,
+            "weight_decay": getattr(self.config.policy, "weight_decay", 0.01),
+            "clip_grad": getattr(self.config.policy, "max_grad_norm", 1.0),
+            "lr_scheduler_type": "cosine",
+            "lr_warmup_steps": self._lr_warmup_steps,
+            "lr_warmup_steps_ratio": getattr(self.config.policy, "warmup_ratio", 0.0),
+            "total_training_steps": int(self.config.num_training_steps),
+        }
+        model_config = {
+            "local_path": model_name,
+            "trust_remote_code": True,
+        }
+
+        engine_cls = EngineRegistry.get_engine_cls(
+            model_type="language_model",
+            backend=backend_key,
         )
+        self._engine = engine_cls(
+            model_config=model_config,
+            engine_config=engine_config,
+            optimizer_config=optimizer_config,
+            model_name=model_name,
+            quant_config=quant,
+        )
+        self._engine.initialize()
+        self._actor_model = self._engine.module
+        self._optimizer = self._engine.optimizer
 
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -550,10 +579,12 @@ class RLTrainer:
     def _offload_optimizer_to_cpu(self) -> None:
         """Move optimizer state tensors to CPU to free GPU for ATOM rollout.
 
-        Skipped when FSDP2 ``param_offload`` is active because FSDP2's
-        ``CPUOffloadPolicy`` already keeps parameters and gradients on CPU
-        and manages the GPU ↔ CPU lifecycle automatically.
+        Delegates to Engine.to() when available.
         """
+        if self._engine is not None:
+            self._engine.to(device="cpu", model=False, optimizer=True, grad=False)
+            torch.cuda.empty_cache()
+            return
         if self._optimizer is None:
             return
         if self._param_offload:
@@ -569,8 +600,11 @@ class RLTrainer:
     def _reload_optimizer_to_gpu(self) -> None:
         """Move optimizer state tensors back to GPU for the next training step.
 
-        No-op when FSDP2 ``param_offload`` is active.
+        Delegates to Engine.to() when available.
         """
+        if self._engine is not None:
+            self._engine.to(device="cuda", model=False, optimizer=True, grad=False)
+            return
         if self._optimizer is None or self._param_offload:
             return
         for state in self._optimizer.state.values():
@@ -1149,7 +1183,9 @@ class RLTrainer:
         return mask[:, 1:]
 
     def _update_lr(self, step: int) -> None:
-        """Linear warmup for lr_warmup_steps, then constant."""
+        """Advance LR scheduler via Engine, falling back to manual warmup."""
+        if self._engine is not None and self._engine.lr_scheduler is not None:
+            return
         if step < self._lr_warmup_steps:
             warmup_lr = self._base_lr * (step + 1) / self._lr_warmup_steps
         else:
@@ -1481,9 +1517,14 @@ class RLTrainer:
             if _fsdp_grad_sync:
                 from lumenrl.engine.training.fsdp_backend import set_requires_gradient_sync
 
+            _do_engine_step = self._engine is not None
+
             for i, mini in enumerate(mini_batches):
                 if i % accum_steps == 0:
-                    self._optimizer.zero_grad(set_to_none=True)
+                    if _do_engine_step:
+                        self._engine.optimizer_zero_grad()
+                    else:
+                        self._optimizer.zero_grad(set_to_none=True)
                 # Use correct scale for partial final group
                 group_start = (i // accum_steps) * accum_steps
                 group_size = min(accum_steps, len(mini_batches) - group_start)
@@ -1497,24 +1538,22 @@ class RLTrainer:
                 )
                 if m.get("loss") is not None and (m["loss"] != m["loss"]):
                     nan_mb_count += 1
-                    # NaN loss: backward was skipped, no grads to corrupt accumulation
-                    # Continue accumulating remaining micro-batches
                     for k, v in m.items():
                         if v == v:
                             metrics_accum[k] = metrics_accum.get(k, 0.0) + v
                     step_count += 1
-                    # Still need to step at accumulation boundary even if some were NaN
                     if (i + 1) % accum_steps == 0 or i == len(mini_batches) - 1:
-                        _gn = float(torch.nn.utils.clip_grad_norm_(
-                            self._actor_model.parameters(), max_norm=1.0,
-                        ))
-                        grad_norm = max(grad_norm, _gn)
-                        # Verl-aligned: skip optimizer step if grad_norm is not finite
-                        if not torch.isfinite(torch.tensor(_gn)):
-                            logger.warning("[step %d] Non-finite grad_norm=%.4f, skipping optimizer step.", step, _gn)
-                            self._optimizer.zero_grad(set_to_none=True)
+                        if _do_engine_step:
+                            _gn = self._engine.optimizer_step()
                         else:
-                            self._optimizer.step()
+                            _gn = float(torch.nn.utils.clip_grad_norm_(
+                                self._actor_model.parameters(), max_norm=1.0,
+                            ))
+                            if not torch.isfinite(torch.tensor(_gn)):
+                                self._optimizer.zero_grad(set_to_none=True)
+                            else:
+                                self._optimizer.step()
+                        grad_norm = max(grad_norm, _gn)
                         optimizer_steps += 1
                     continue
                 # Clean NaN grads before stepping
@@ -1532,16 +1571,17 @@ class RLTrainer:
                 total_param_count = _total_cnt
                 # Only clip + step at accumulation boundaries
                 if (i + 1) % accum_steps == 0 or i == len(mini_batches) - 1:
-                    _gn = float(torch.nn.utils.clip_grad_norm_(
-                        self._actor_model.parameters(), max_norm=1.0,
-                    ))
-                    grad_norm = max(grad_norm, _gn)
-                    # Verl-aligned: skip optimizer step if grad_norm is not finite
-                    if not torch.isfinite(torch.tensor(_gn)):
-                        logger.warning("[step %d] Non-finite grad_norm=%.4f, skipping optimizer step.", step, _gn)
-                        self._optimizer.zero_grad(set_to_none=True)
+                    if _do_engine_step:
+                        _gn = self._engine.optimizer_step()
                     else:
-                        self._optimizer.step()
+                        _gn = float(torch.nn.utils.clip_grad_norm_(
+                            self._actor_model.parameters(), max_norm=1.0,
+                        ))
+                        if not torch.isfinite(torch.tensor(_gn)):
+                            self._optimizer.zero_grad(set_to_none=True)
+                        else:
+                            self._optimizer.step()
+                    grad_norm = max(grad_norm, _gn)
                     optimizer_steps += 1
                 if mismatch_kl_initial is None and "mismatch_kl" in m:
                     mismatch_kl_initial = m["mismatch_kl"]
@@ -1549,7 +1589,11 @@ class RLTrainer:
                     if v == v:
                         metrics_accum[k] = metrics_accum.get(k, 0.0) + v
                 step_count += 1
-            self._optimizer.zero_grad(set_to_none=True)
+            if _do_engine_step:
+                self._engine.optimizer_zero_grad()
+                _cur_lr = self._engine.lr_scheduler_step()
+            else:
+                self._optimizer.zero_grad(set_to_none=True)
             # Restore gradient sync after accumulation loop
             if _fsdp_grad_sync:
                 set_requires_gradient_sync(self._actor_model, True)
@@ -1826,6 +1870,9 @@ class RLTrainer:
         if self._atom_engine is not None:
             self._atom_engine.shutdown()
             self._atom_engine = None
+        if self._engine is not None:
+            del self._engine
+            self._engine = None
         if self._actor_model is not None:
             del self._actor_model
         if self._ref_model is not None:

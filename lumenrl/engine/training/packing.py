@@ -92,6 +92,47 @@ class PackedBatch(NamedTuple):
     max_seqlen: int
 
 
+def pack_from_nested(
+    input_ids: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    seq_lens: torch.Tensor,
+) -> PackedBatch:
+    """Create a :class:`PackedBatch` from pre-packed (remove-padding) tensors.
+
+    Unlike :func:`pack_sequences` which takes padded ``(B, S)`` inputs,
+    this accepts already-concatenated tokens (e.g. from nested tensors or
+    an upstream packing pass).
+
+    Args:
+        input_ids: ``(1, total_tokens)`` or ``(total_tokens,)`` already-packed tokens.
+        cu_seqlens: ``(B+1,)`` int32 cumulative sequence lengths.
+        seq_lens: ``(B,)`` long per-sequence actual lengths.
+
+    Returns:
+        A :class:`PackedBatch` ready for model forward + ``PackingContext``.
+    """
+    if input_ids.dim() == 1:
+        input_ids = input_ids.unsqueeze(0)
+    total_tokens = input_ids.shape[-1]
+    device = input_ids.device
+    max_seqlen = int(seq_lens.max().item())
+
+    position_ids = torch.empty(total_tokens, dtype=torch.long, device=device)
+    B = seq_lens.shape[0]
+    for i in range(B):
+        start = int(cu_seqlens[i].item())
+        sl = int(seq_lens[i].item())
+        position_ids[start:start + sl] = torch.arange(sl, device=device)
+
+    return PackedBatch(
+        input_ids=input_ids,
+        position_ids=position_ids.unsqueeze(0),
+        cu_seqlens=cu_seqlens,
+        seq_lens=seq_lens,
+        max_seqlen=max_seqlen,
+    )
+
+
 def pack_sequences(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
