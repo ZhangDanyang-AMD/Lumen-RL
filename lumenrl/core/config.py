@@ -169,10 +169,21 @@ class DraftModelConfig:
     rope_scaling_type: Optional[str] = None
     rope_scaling_factor: float = 64.0
     rope_original_max_pos: int = 4096
+    # YaRN-specific (kimi-k2.5 layout)
     rope_beta_fast: float = 32.0
     rope_beta_slow: float = 1.0
     rope_mscale: float = 1.0
     rope_mscale_all_dim: float = 1.0
+    # Llama3-specific (nvidia/gpt-oss-120b-Eagle3 layout)
+    rope_low_freq_factor: float = 1.0
+    rope_high_freq_factor: float = 4.0
+    # HF eagle_config toggles — defaults match nvidia/gpt-oss-120b-Eagle3
+    use_aux_hidden_state: bool = True
+    use_input_layernorm_in_first_layer: bool = True
+    use_last_layernorm: bool = True
+    use_mtp_layernorm: bool = False
+    attention_bias: bool = False
+    mlp_bias: bool = False
     max_window_layers: Optional[int] = None
     dtype: str = "float16"
     resume_from: Optional[str] = None
@@ -241,6 +252,7 @@ class RewardConfig:
     type: str = "function"
     function: str = "math_reward"
     dataset: str = ""
+    dataset_split: str = "train"
     model_name: Optional[str] = None
 
 

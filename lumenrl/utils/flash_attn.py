@@ -11,20 +11,31 @@ centralised — Eagle3 never imports aiter directly.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 
+# Backend selector: "aiter" (default) uses aiter's Triton flash attention.
+# Anything else (e.g. "matmul" / "off") forces Eagle3 onto its matmul fallback
+# in eagle3.py:_cached_attn_matmul. aiter triton _attn_fwd hits HIP "invalid
+# argument" → HSA memory access fault on certain (B, T, H) combos on MI308
+# (gfx942); flipping this env to "matmul" trades a few % of draft attention
+# throughput for stability.
+_BACKEND = os.environ.get("LUMENRL_DRAFT_FLASH_BACKEND", "aiter").lower()
+
 _flash_attn_varlen = None
-try:
-    from aiter.ops.triton.attention.mha import (
-        flash_attn_varlen_func as _flash_attn_varlen,
-    )
-except ImportError:
-    pass
+if _BACKEND == "aiter":
+    try:
+        from aiter.ops.triton.attention.mha import (
+            flash_attn_varlen_func as _flash_attn_varlen,
+        )
+    except ImportError:
+        pass
 
 
 def is_available() -> bool:
-    """True when aiter Triton flash attention is importable."""
+    """True when aiter Triton flash attention is importable AND enabled."""
     return _flash_attn_varlen is not None
 
 

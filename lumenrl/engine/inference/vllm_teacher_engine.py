@@ -75,6 +75,8 @@ tp_size = int(sys.argv[4])
 gpu_ids_str = sys.argv[5]
 quantization = sys.argv[6] if len(sys.argv) > 6 else ""
 max_seq_len = int(sys.argv[7]) if len(sys.argv) > 7 else 8192
+# argv[8]: JSON-encoded aux_layer_ids override (empty string => use auto).
+aux_layer_ids_override_json = sys.argv[8] if len(sys.argv) > 8 else ""
 
 gpu_ids = [int(x) for x in gpu_ids_str.split(",")]
 os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids_str
@@ -99,11 +101,20 @@ hidden_size = getattr(hf_config_text, "hidden_size", None)
 num_layers = getattr(hf_config_text, "num_hidden_layers", 32)
 
 # Aux layer IDs in vLLM convention (capture-before-layer).
-# vLLM captures input to [2, N//2, N-3] which yields the same hidden state
+# Default vLLM auto-pick: [2, N//2, N-3] — yields the same hidden state
 # as hooking layer output at [1, N//2-1, N-4].
-aux_layer_ids = [2, num_layers // 2, num_layers - 3]
-logger.info("Model: %s, hidden=%d, layers=%d, aux_layers=%s",
-            model_path, hidden_size, num_layers, aux_layer_ids)
+# Config override wins when provided (e.g. NVIDIA gpt-oss-120b-Eagle3 uses
+# [1, 17, 32]). The override is the literal list the draft model was built
+# for; we pass it through unchanged so the captured features line up with
+# the draft architecture.
+if aux_layer_ids_override_json:
+    aux_layer_ids = json.loads(aux_layer_ids_override_json)
+    logger.info("Model: %s, hidden=%d, layers=%d, aux_layers=%s (config override)",
+                model_path, hidden_size, num_layers, aux_layer_ids)
+else:
+    aux_layer_ids = [2, num_layers // 2, num_layers - 3]
+    logger.info("Model: %s, hidden=%d, layers=%d, aux_layers=%s (auto)",
+                model_path, hidden_size, num_layers, aux_layer_ids)
 
 # Create vLLM Engine with extract_hidden_states + MooncakeHiddenStatesConnector
 logger.info("Creating vLLM Engine (tp=%d, quant=%s, max_seq=%d)",
@@ -300,6 +311,7 @@ class VllmTeacherEngine:
         max_batch_size: int = 32,
         max_seq_len: int = 4096,
         local_device: Optional[torch.device] = None,
+        aux_layer_ids: Optional[list[int]] = None,
     ):
         self._model_name = model_name
         self._gpu_ids = gpu_ids
@@ -308,6 +320,10 @@ class VllmTeacherEngine:
         self._quantization = quantization
         self._max_batch_size = max_batch_size
         self._max_seq_len = max_seq_len
+        # When None, the worker auto-picks [2, N//2, N-3]. Otherwise this list
+        # is the literal eagle_aux_hidden_state_layer_ids passed to vLLM ──
+        # must match what the draft model was constructed for.
+        self._aux_layer_ids_override = aux_layer_ids
         self._local_device = local_device or torch.device("cuda:0")
 
         self._proc: Optional[subprocess.Popen] = None
@@ -426,6 +442,10 @@ class VllmTeacherEngine:
             self._quantization or "none",
         )
 
+        aux_override_arg = (
+            json.dumps(list(self._aux_layer_ids_override))
+            if self._aux_layer_ids_override else ""
+        )
         self._proc = subprocess.Popen(
             [
                 sys.executable, "-u", "-c", _WORKER_SCRIPT,
@@ -434,6 +454,7 @@ class VllmTeacherEngine:
                 ",".join(str(g) for g in self._gpu_ids),
                 self._quantization or "",
                 str(self._max_seq_len),
+                aux_override_arg,
             ],
             stdin=subprocess.DEVNULL,
             stdout=None,
@@ -803,35 +824,57 @@ class VllmTeacherEngine:
         master forever. Signal the whole process group instead.
         """
         proc = self._proc
-        if proc is not None and proc.poll() is None:
-            # Best-effort graceful shutdown — fire-and-forget so we never
-            # block on a wedged worker's response.
-            cmd_f = self._cmd_f
-            if cmd_f is not None:
-                try:
-                    cmd_f.write(json.dumps({"cmd": "shutdown"}) + "\n")
-                    cmd_f.flush()
-                except Exception:
-                    pass
-
+        if proc is not None:
+            # Capture pgid up-front: even if the wrapper exits cleanly, vLLM's
+            # multiproc_executor grandchildren (EngineCore / Worker_TP*) stay
+            # alive in the same process group with the wrapper's pid as pgid.
+            # Linux keeps a pgid valid as long as any member exists.
+            pgid = None
             try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
+                pgid = os.getpgid(proc.pid)
+            except (ProcessLookupError, PermissionError):
                 pass
 
             if proc.poll() is None:
-                self._killpg(proc.pid, signal.SIGTERM)
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self._killpg(proc.pid, signal.SIGKILL)
+                # Best-effort graceful shutdown — fire-and-forget so we never
+                # block on a wedged worker's response.
+                cmd_f = self._cmd_f
+                if cmd_f is not None:
                     try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
+                        cmd_f.write(json.dumps({"cmd": "shutdown"}) + "\n")
+                        cmd_f.flush()
+                    except Exception:
+                        pass
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    pass
+
+            # Always nuke the whole process group, even if `proc` itself
+            # already exited.  The wrapper exits as soon as it forwards the
+            # shutdown signal, but its multiproc_executor grandchildren can
+            # hang in mooncake C++ destructors and survive as orphans.
+            if pgid is not None:
+                self._killpg_by_pgid(pgid, signal.SIGTERM)
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    if not self._pgid_has_members(pgid):
+                        break
+                    time.sleep(0.2)
+
+                if self._pgid_has_members(pgid):
+                    self._killpg_by_pgid(pgid, signal.SIGKILL)
+                    deadline = time.monotonic() + 5.0
+                    while time.monotonic() < deadline:
+                        if not self._pgid_has_members(pgid):
+                            break
+                        time.sleep(0.2)
+
+                    if self._pgid_has_members(pgid):
                         logger.warning(
-                            "vLLM teacher subprocess pid=%d did not exit "
-                            "after SIGKILL; orphan workers may remain.",
-                            proc.pid,
+                            "vLLM teacher pgid=%d still has members after "
+                            "SIGKILL; orphan workers may remain.",
+                            pgid,
                         )
 
         if self._mooncake_store is not None:
@@ -867,10 +910,43 @@ class VllmTeacherEngine:
         except (ProcessLookupError, PermissionError):
             pass
 
+    @staticmethod
+    def _killpg_by_pgid(pgid: int, sig: int) -> None:
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    @staticmethod
+    def _pgid_has_members(pgid: int) -> bool:
+        """Return True if any process is still in the given process group."""
+        try:
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit():
+                    continue
+                try:
+                    if os.getpgid(int(entry)) == pgid:
+                        return True
+                except (ProcessLookupError, PermissionError):
+                    continue
+        except OSError:
+            # /proc missing — fall back to signal-0 probe on the pgid itself.
+            try:
+                os.killpg(pgid, 0)
+                return True
+            except (ProcessLookupError, PermissionError):
+                return False
+        return False
+
     def __del__(self) -> None:
         proc = getattr(self, "_proc", None)
-        if proc is not None and proc.poll() is None:
-            self._killpg(proc.pid, signal.SIGKILL)
+        if proc is None:
+            return
+        try:
+            pgid = os.getpgid(proc.pid)
+        except (ProcessLookupError, PermissionError):
+            return
+        self._killpg_by_pgid(pgid, signal.SIGKILL)
 
 
 __all__ = ["VllmTeacherEngine"]
