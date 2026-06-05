@@ -6,8 +6,8 @@ DOCKER_IMAGE="lumenrl-vllm-mi350:latest"
 CONTAINER_NAME="kimi_k25_eagle3_v2_benchmark"
 DRAFT_MODEL="/dev/shm/Kimi_K25_eagle3_v2_phase1_HF"
 BASE_MODEL="/dev/shm/Kimi-K2.5-MXFP4"
-BENCH_SCRIPT="/home/danyzhan/Lumen-RL/examples/Kimi_K25_SDDD_MI350_vLLM/bench_eagle3_vllm.py"
-OUTPUT_DIR="/home/danyzhan/Lumen-RL/examples/Kimi_K25_SDDD_MI350_vLLM/benchmark_results"
+BENCH_SCRIPT="/home/danyzhan/Lumen-RL/examples/Kimi_K25_SDDD_MI350_ATOM/bench_eagle3_vllm.py"
+OUTPUT_DIR="/home/danyzhan/Lumen-RL/examples/Kimi_K25_SDDD_MI350_ATOM/benchmark_results"
 
 # Kill any existing benchmark container
 docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true

@@ -91,7 +91,7 @@ huggingface-cli download lightseekorg/kimi-mtp-dataset --local-dir /dev/shm/kimi
 ### 2. Build Docker Image
 
 ```bash
-bash examples/Kimi_K25_SDDD_MI350_vLLM/docker/build.sh
+bash examples/Kimi_K25_SDDD_MI350_ATOM/docker/build.sh
 ```
 
 The Docker image bundles: vLLM 0.19.1 (patched for `extract_hidden_states`), ATOM, AITER, LumenRL, Lumen, Mooncake (source-built HIP), MORI (MoE all-to-all).
@@ -100,20 +100,20 @@ The Docker image bundles: vLLM 0.19.1 (patched for `extract_hidden_states`), ATO
 
 ```bash
 # Both phases (Phase 1 + Phase 2)
-bash examples/Kimi_K25_SDDD_MI350_vLLM/run_full_training_docker.sh
+bash examples/Kimi_K25_SDDD_MI350_ATOM/run_full_training_docker.sh
 
 # Phase 2 only (resume from Phase 1 checkpoint)
-bash examples/Kimi_K25_SDDD_MI350_vLLM/run_full_training_docker.sh --phase2-only
+bash examples/Kimi_K25_SDDD_MI350_ATOM/run_full_training_docker.sh --phase2-only
 
 # Smoke test (Qwen3-8B, single GPU, 2 steps, no vLLM/Mooncake)
 CUDA_VISIBLE_DEVICES=0 python -m lumenrl.trainer.main \
-    --config examples/Kimi_K25_SDDD_MI350_vLLM/configs/smoke_test_hf.yaml
+    --config examples/Kimi_K25_SDDD_MI350_ATOM/configs/smoke_test_hf.yaml
 ```
 
 ### 4. Benchmark (after training)
 
 ```bash
-bash examples/Kimi_K25_SDDD_MI350_vLLM/run_benchmark_vllm_docker.sh
+bash examples/Kimi_K25_SDDD_MI350_ATOM/run_benchmark_vllm_docker.sh
 ```
 
 ## Configuration

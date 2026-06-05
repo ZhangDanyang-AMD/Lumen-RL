@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Benchmark GPT-OSS-120B Eagle3 draft using vLLM with speculative decoding on MI308.
 #
-# Mirrors examples/Kimi_K25_SDDD_MI350_vLLM/run_benchmark_vllm_docker.sh but
+# Mirrors examples/Kimi_K25_SDDD_MI350_ATOM/run_benchmark_vllm_docker.sh but
 # adapted for gpt-oss-120b (native MXFP4 MoE) on lumenrl-vllm-mi308.
 #
 # Prerequisites:
@@ -14,8 +14,8 @@
 #   2. Base model present at ${BASE_MODEL} (native MXFP4 ~196 GB).
 #
 # Usage:
-#   bash examples/GPT_OSS_120b_MI308_vLLM/run_benchmark_vllm_docker.sh
-#   DRAFT_MODEL=/path/to/draft_HF bash examples/GPT_OSS_120b_MI308_vLLM/run_benchmark_vllm_docker.sh
+#   bash examples/GPT_OSS_120b_MI308_ATOM/run_benchmark_vllm_docker.sh
+#   DRAFT_MODEL=/path/to/draft_HF bash examples/GPT_OSS_120b_MI308_ATOM/run_benchmark_vllm_docker.sh
 set -uo pipefail
 
 DOCKER_IMAGE="${DOCKER_IMAGE:-lumenrl-vllm-mi308:latest}"
@@ -25,8 +25,8 @@ BASE_MODEL="${BASE_MODEL:-/dev/shm/gpt-oss-120b}"
 LUMENRL_DIR="${LUMENRL_DIR:-/home/leiwu/Lumen-RL}"
 # Reuse the Kimi bench script — it is provider-agnostic (POSTs OpenAI-style
 # completions to vLLM and counts accept_length from usage stats).
-BENCH_SCRIPT="${BENCH_SCRIPT:-${LUMENRL_DIR}/examples/Kimi_K25_SDDD_MI350_vLLM/bench_eagle3_vllm.py}"
-OUTPUT_DIR="${OUTPUT_DIR:-${LUMENRL_DIR}/examples/GPT_OSS_120b_MI308_vLLM/benchmark_results}"
+BENCH_SCRIPT="${BENCH_SCRIPT:-${LUMENRL_DIR}/examples/Kimi_K25_SDDD_MI350_ATOM/bench_eagle3_vllm.py}"
+OUTPUT_DIR="${OUTPUT_DIR:-${LUMENRL_DIR}/examples/GPT_OSS_120b_MI308_ATOM/benchmark_results}"
 
 # vLLM serve params
 TP_SIZE="${TP_SIZE:-8}"

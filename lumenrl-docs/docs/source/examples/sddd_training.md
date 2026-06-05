@@ -47,7 +47,7 @@ ls examples/Qwen3_8B_SDDD_MI350_vLLM/
 LumenRL includes MI350-optimized SDDD configurations:
 
 - `examples/Kimi_K25_SDDD_MI350/` — Kimi K2.5 on MI350 with SGLang
-- `examples/Kimi_K25_SDDD_MI350_vLLM/` — Kimi K2.5 on MI350 with vLLM
+- `examples/Kimi_K25_SDDD_MI350_ATOM/` — Kimi K2.5 on MI350 with vLLM
 - `examples/Qwen3_8B_SDDD_MI350_vLLM/` — Qwen3-8B on MI350 with vLLM
 
 ## Monitoring

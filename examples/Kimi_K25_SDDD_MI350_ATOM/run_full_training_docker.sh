@@ -32,7 +32,7 @@ LUMENRL_DIR="/home/danyzhan/Lumen-RL"
 
 # Select run command
 if [ "${SMOKE_TEST}" = true ]; then
-    RUN_CMD="bash examples/Kimi_K25_SDDD_MI350_vLLM/run_kimi_k25.sh --smoke-test"
+    RUN_CMD="bash examples/Kimi_K25_SDDD_MI350_ATOM/run_kimi_k25.sh --smoke-test"
     echo "═══════════════════════════════════════════════════════════════"
     echo "  Kimi K2.5 Eagle3 Smoke Test (Docker) — vLLM+ATOM, MI350"
     echo "  Image:    ${DOCKER_IMAGE}"
@@ -41,7 +41,7 @@ if [ "${SMOKE_TEST}" = true ]; then
     echo "  Transfer: Mooncake TCP"
     echo "═══════════════════════════════════════════════════════════════"
 elif [ "${PHASE2_ONLY}" = true ]; then
-    RUN_CMD="bash examples/Kimi_K25_SDDD_MI350_vLLM/run_full_training.sh --phase2-only"
+    RUN_CMD="bash examples/Kimi_K25_SDDD_MI350_ATOM/run_full_training.sh --phase2-only"
     echo "═══════════════════════════════════════════════════════════════"
     echo "  Kimi K2.5 Eagle3 Training (Docker) — vLLM+ATOM, MI350"
     echo "  Image:    ${DOCKER_IMAGE}"
@@ -49,7 +49,7 @@ elif [ "${PHASE2_ONLY}" = true ]; then
     echo "  Phase:    Phase 2 only"
     echo "═══════════════════════════════════════════════════════════════"
 else
-    RUN_CMD="bash examples/Kimi_K25_SDDD_MI350_vLLM/run_full_training.sh"
+    RUN_CMD="bash examples/Kimi_K25_SDDD_MI350_ATOM/run_full_training.sh"
     echo "═══════════════════════════════════════════════════════════════"
     echo "  Kimi K2.5 Eagle3 Training (Docker) — vLLM+ATOM, MI350"
     echo "  Image:    ${DOCKER_IMAGE}"
