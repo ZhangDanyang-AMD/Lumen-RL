@@ -45,27 +45,6 @@ class GRPOAlgorithm(BaseAlgorithm):
     ``config.algorithm.grpo.num_generations``.
     """
 
-    def compute_advantages(self, batch: DataProto) -> DataProto:
-        if "rewards" not in batch.tensors:
-            raise KeyError("GRPO requires tensor key 'rewards' on the batch.")
-        rewards = batch.tensors["rewards"]
-        if rewards.dim() > 1:
-            rewards = rewards.squeeze(-1)
-        cfg = self._config.algorithm.grpo
-        g = cfg.num_generations
-        if rewards.shape[0] % g != 0:
-            raise ValueError(
-                f"Batch size {rewards.shape[0]} not divisible by num_generations={g}."
-            )
-        grouped = rewards.view(-1, g)
-        mean = grouped.mean(dim=1, keepdim=True)
-        std = grouped.std(dim=1, unbiased=False, keepdim=True).clamp_min(1e-8)
-        adv = (grouped - mean) / std
-        adv_flat = adv.reshape(-1)
-        batch.tensors["advantages"] = adv_flat
-        logger.debug("GRPO advantages: mean=%.6f std=%.6f", adv_flat.mean().item(), adv_flat.std().item())
-        return batch
-
     def compute_loss(self, batch: DataProto) -> tuple[Tensor, dict[str, Any]]:
         if "log_probs" not in batch.tensors or "old_log_probs" not in batch.tensors:
             raise KeyError("GRPO loss requires 'log_probs' and 'old_log_probs'.")

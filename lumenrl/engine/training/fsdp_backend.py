@@ -280,6 +280,15 @@ class FSDP2Backend:
         """
         cfg = config or {}
 
+        # Apply Liger kernel monkey-patches BEFORE model loading
+        if cfg.get("use_liger", False):
+            try:
+                from liger_kernel.transformers import apply_liger_kernel_to_llama
+                apply_liger_kernel_to_llama()
+                logger.info("Applied Liger kernel optimizations.")
+            except ImportError:
+                logger.warning("use_liger=True but liger-kernel not installed. Skipping.")
+
         if cfg.get("use_tiny_lm", False) or not model_name:
             arch = cfg.get("tiny_lm", {})
             vocab = int(arch.get("vocab_size", 32000))

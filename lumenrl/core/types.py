@@ -25,6 +25,14 @@ class AlgorithmName(str, Enum):
     SPEC_DISTILL = "spec_distill"
 
 
+class AdvantageEstimator(str, Enum):
+    GAE = "gae"
+    GRPO = "grpo"
+    REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
+    RLOO = "rloo"
+    DAPO = "dapo"
+
+
 class FP8Precision(str, Enum):
     FP8 = "fp8"
     BF16 = "bf16"

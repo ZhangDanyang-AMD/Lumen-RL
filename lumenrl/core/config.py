@@ -95,6 +95,9 @@ class HFModelConfig:
     enable_gradient_checkpointing: bool = True
     lora: LoRAConfig = field(default_factory=LoRAConfig)
     use_liger: bool = False
+    use_fused_kernels: bool = False
+    calculate_entropy: bool = False
+    calculate_sum_pi_squared: bool = False
 
 
 @dataclass
@@ -208,6 +211,7 @@ class GRPOConfig:
     clip_ratio: float = 0.2
     num_ppo_epochs: int = 1
     num_mini_batches: int = 1
+    discount: float = 1.0
 
 
 @dataclass
@@ -221,6 +225,7 @@ class DAPOConfig:
     token_level_pg: bool = True
     overlong_reward_shaping: bool = True
     loss_mode: str = "token_level"  # "token_level" (standard DAPO) or "gmpo" (geometric mean PO)
+    discount: float = 1.0
 
 
 @dataclass
@@ -262,6 +267,7 @@ class SpecDistillConfig:
 class TeacherConfig:
     """Teacher / target model configuration."""
     model_name: str = ""
+    key: str = ""                               # routing key for multi-teacher
     lm_head_key: str = "lm_head.weight"
     norm_key: str = "model.norm.weight"
     load_norm: bool = False
@@ -300,8 +306,21 @@ class DraftModelConfig:
 
 
 @dataclass
+class DistillationConfig:
+    """Multi-teacher distillation configuration."""
+    enabled: bool = False
+    teacher_key: str = "data_source"           # field name in dataset used to route samples
+    teachers: dict = field(default_factory=dict)  # key -> teacher config overrides
+    loss_mode: str = "reverse_kl"               # k1, k3, forward_kl, reverse_kl
+    topk: Optional[int] = None                  # for top-k distillation losses
+    use_task_rewards: bool = False               # combine with task rewards
+    distillation_loss_coef: float = 1.0          # coefficient for distillation loss
+
+
+@dataclass
 class AlgorithmConfig:
     name: str = AlgorithmName.GRPO.value
+    adv_estimator: str = ""  # empty = auto-infer from algorithm.name
     grpo: GRPOConfig = field(default_factory=GRPOConfig)
     dapo: DAPOConfig = field(default_factory=DAPOConfig)
     ppo: PPOConfig = field(default_factory=PPOConfig)
@@ -309,6 +328,7 @@ class AlgorithmConfig:
     spec_distill: SpecDistillConfig = field(default_factory=SpecDistillConfig)
     teacher: TeacherConfig = field(default_factory=TeacherConfig)
     draft: DraftModelConfig = field(default_factory=DraftModelConfig)
+    distillation: DistillationConfig = field(default_factory=DistillationConfig)
 
 
 @dataclass
@@ -365,6 +385,19 @@ class RewardConfig:
     function: str = "math_reward"
     dataset: str = ""
     model_name: Optional[str] = None
+
+
+@dataclass
+class CriticConfig:
+    """Configuration for the critic (value) network used by PPO/GAE."""
+    enabled: bool = False
+    model_name: str = ""
+    training_backend: str = "fsdp2"
+    learning_rate: float = 1e-5
+    weight_decay: float = 0.01
+    max_grad_norm: float = 1.0
+    value_clip_ratio: float = 0.2
+    num_critic_epochs: int = 1
 
 
 @dataclass
@@ -507,6 +540,7 @@ class LumenRLConfig:
     reward: RewardConfig = field(default_factory=RewardConfig)
     quantization: QuantizationConfig = field(default_factory=QuantizationConfig)
     moe: MoEConfig = field(default_factory=MoEConfig)
+    critic: CriticConfig = field(default_factory=CriticConfig)
     checkpointing: CheckpointConfig = field(default_factory=CheckpointConfig)
     logger: LoggerConfig = field(default_factory=LoggerConfig)
     mooncake: MooncakeTransferConfig = field(default_factory=MooncakeTransferConfig)
@@ -516,6 +550,9 @@ class LumenRLConfig:
     assembly: RuntimeAssemblyConfig = field(default_factory=RuntimeAssemblyConfig)
     num_training_steps: int = 1000
     seed: int = 42
+    val_dataset: str = ""
+    val_steps: int = 0        # validate every N steps; 0 = no validation
+    val_batch_size: int = 16
 
     @classmethod
     def from_yaml(cls, path: str | Path, overrides: list[str] | None = None) -> "LumenRLConfig":

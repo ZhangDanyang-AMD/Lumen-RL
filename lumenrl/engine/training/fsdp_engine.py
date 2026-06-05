@@ -140,6 +140,9 @@ class FSDP2Engine(BaseEngine):
             cfg["model_dtype"] = self.engine_config.model_dtype
         else:
             cfg["use_tiny_lm"] = True
+        # Propagate Liger kernel flag so build_model can apply it before loading
+        if self.model_config.use_liger:
+            cfg["use_liger"] = True
         return cfg
 
     def _make_fsdp_config(self) -> dict[str, Any]:

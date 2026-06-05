@@ -20,13 +20,31 @@ class BaseAlgorithm(ABC):
     def __init__(self, config: LumenRLConfig) -> None:
         self._config = config
 
-    @abstractmethod
     def compute_advantages(self, batch: DataProto) -> DataProto:
         """Populate ``advantages`` (and optionally related tensors) on ``batch``.
 
-        Implementations may return the same object with updated tensors or a
-        shallow clone; callers should use the returned ``DataProto``.
+        Default implementation delegates to the pluggable advantage estimator
+        registry.  Subclasses may override for custom behaviour.
         """
+        from lumenrl.algorithms.advantage_estimators import ADV_ESTIMATOR_REGISTRY
+
+        estimator_name = self._resolve_estimator()
+        if estimator_name not in ADV_ESTIMATOR_REGISTRY:
+            raise KeyError(
+                f"Unknown advantage estimator '{estimator_name}'. "
+                f"Available: {list(ADV_ESTIMATOR_REGISTRY.keys())}"
+            )
+        estimator_fn = ADV_ESTIMATOR_REGISTRY[estimator_name]
+        return estimator_fn(batch, self._config)
+
+    def _resolve_estimator(self) -> str:
+        """Choose an estimator name from explicit config or algorithm name."""
+        explicit = self._config.algorithm.adv_estimator
+        if explicit:
+            return explicit
+        name = self._config.algorithm.name.lower()
+        mapping = {"grpo": "grpo", "dapo": "dapo", "ppo": "gae", "opd": "grpo"}
+        return mapping.get(name, "grpo")
 
     @abstractmethod
     def compute_loss(self, batch: DataProto) -> tuple[Tensor, dict[str, Any]]:

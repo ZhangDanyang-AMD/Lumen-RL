@@ -32,6 +32,154 @@ from lumenrl.trainer.callbacks import Callback, LoggingCallback
 logger = logging.getLogger(__name__)
 
 
+class MultiTeacherManager:
+    """Manages multiple teacher models, routes samples by key."""
+
+    def __init__(
+        self,
+        teachers_config: dict,
+        default_teacher_name: str,
+        device: torch.device,
+        lazy_logits: bool,
+        teacher_cfg: Any,
+    ) -> None:
+        self._teachers: dict[str, torch.nn.Module] = {}
+        self._teacher_lm_heads: dict[str, Any] = {}
+        self._device = device
+        self._lazy_logits = lazy_logits
+        self._teacher_cfg = teacher_cfg
+        self._default_teacher_name = default_teacher_name
+        self._teachers_config = teachers_config
+
+    def load_teachers(self) -> None:
+        """Load all teacher models."""
+        from transformers import AutoModelForCausalLM
+
+        for key, cfg in self._teachers_config.items():
+            model_name = cfg.get("model_name", "") or self._default_teacher_name
+            logger.info("Loading teacher model '%s': %s", key, model_name)
+
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.bfloat16,
+                attn_implementation="sdpa",
+                trust_remote_code=True,
+            )
+            model.eval()
+            for p in model.parameters():
+                p.requires_grad_(False)
+
+            self._teachers[key] = model
+
+            if self._lazy_logits:
+                from lumenrl.core.teacher_lm_head import TeacherLMHead
+
+                lm_head_weight = None
+                for name, param in model.named_parameters():
+                    if "lm_head" in name and "weight" in name:
+                        lm_head_weight = param.detach().clone()
+                        break
+                if lm_head_weight is not None:
+                    head = TeacherLMHead(lm_head_weight)
+                    head.to(self._device)
+                    self._teacher_lm_heads[key] = head
+
+    def forward(
+        self,
+        sequences: torch.Tensor,
+        seq_mask: torch.Tensor,
+        routing_keys: list[str],
+        micro_bs: int = 4,
+    ) -> torch.Tensor:
+        """Run teacher forward, routing each sample to the appropriate teacher.
+
+        Args:
+            sequences: [B, T] input token ids.
+            seq_mask: [B, T] attention mask.
+            routing_keys: list of B routing keys (one per sample).
+            micro_bs: micro-batch size for teacher forward.
+
+        Returns:
+            Teacher logits [B, T-1, V].
+        """
+        B = sequences.shape[0]
+
+        # Group samples by teacher key
+        groups: dict[str, list[int]] = {}
+        for i, key in enumerate(routing_keys):
+            resolved = key if key in self._teachers else "default"
+            if resolved not in groups:
+                groups[resolved] = []
+            groups[resolved].append(i)
+
+        # Pre-allocate output (will be filled per-group)
+        all_logits: list[torch.Tensor | None] = [None] * B
+
+        for teacher_key, indices in groups.items():
+            if teacher_key not in self._teachers:
+                if len(self._teachers) == 1:
+                    teacher_key = next(iter(self._teachers))
+                else:
+                    raise ValueError(
+                        f"No teacher for key '{teacher_key}'. "
+                        f"Available: {list(self._teachers.keys())}"
+                    )
+
+            teacher = self._teachers[teacher_key]
+            lm_head = self._teacher_lm_heads.get(teacher_key)
+
+            # Move teacher to GPU
+            teacher_on_cpu = next(teacher.parameters()).device.type == "cpu"
+            if teacher_on_cpu:
+                teacher.to(self._device)
+
+            sub_seqs = sequences[indices]
+            sub_mask = seq_mask[indices]
+
+            with torch.no_grad():
+                for start in range(0, len(indices), micro_bs):
+                    end = min(start + micro_bs, len(indices))
+                    ids_chunk = sub_seqs[start:end].to(self._device)
+                    mask_chunk = sub_mask[start:end].to(self._device)
+
+                    if self._lazy_logits and lm_head is not None:
+                        outputs = teacher(
+                            input_ids=ids_chunk,
+                            attention_mask=mask_chunk,
+                            output_hidden_states=True,
+                        )
+                        hidden = outputs.hidden_states[-1][:, :-1]
+                        chunk_logits = lm_head(hidden)
+                    else:
+                        outputs = teacher(
+                            input_ids=ids_chunk, attention_mask=mask_chunk
+                        )
+                        logits = (
+                            outputs.logits
+                            if hasattr(outputs, "logits")
+                            else outputs
+                        )
+                        chunk_logits = logits[:, :-1]
+
+                    for j, global_idx in enumerate(indices[start:end]):
+                        all_logits[global_idx] = chunk_logits[j].cpu()
+
+                    del outputs
+
+            if teacher_on_cpu:
+                teacher.cpu()
+                torch.cuda.empty_cache()
+
+        return torch.stack(all_logits, dim=0)  # type: ignore[arg-type]
+
+    def cleanup(self) -> None:
+        """Release all teacher models."""
+        for key in list(self._teachers.keys()):
+            del self._teachers[key]
+        self._teachers.clear()
+        self._teacher_lm_heads.clear()
+
+
 class OPDTrainer:
     """Coordinates student rollout, teacher forward, and OPD training.
 
@@ -48,6 +196,7 @@ class OPDTrainer:
         self._student_model: torch.nn.Module | None = None
         self._teacher_model: torch.nn.Module | None = None
         self._teacher_lm_head: Any = None
+        self._multi_teacher_manager: MultiTeacherManager | None = None
         self._optimizer: torch.optim.Optimizer | None = None
         self._tokenizer: Any = None
         self._dataset: Any = None
@@ -130,6 +279,23 @@ class OPDTrainer:
             self._load_teacher_lazy(teacher_name, teacher_cfg)
         else:
             self._load_teacher_full(teacher_name)
+
+        # ---- Multi-teacher support ----
+        distill_cfg = getattr(self.config.algorithm, "distillation", None)
+        if distill_cfg and distill_cfg.enabled and distill_cfg.teachers:
+            self._multi_teacher_manager = MultiTeacherManager(
+                teachers_config=distill_cfg.teachers,
+                default_teacher_name=teacher_name,
+                device=self._device,
+                lazy_logits=opd_cfg.lazy_logits,
+                teacher_cfg=teacher_cfg,
+            )
+            self._multi_teacher_manager.load_teachers()
+            logger.info(
+                "[rank %d] Multi-teacher manager initialized with %d teachers.",
+                self._rank,
+                len(distill_cfg.teachers),
+            )
 
         # ---- Tokenizer ----
         from transformers import AutoTokenizer
@@ -247,16 +413,24 @@ class OPDTrainer:
     # Prompt helpers (shared with RLTrainer pattern)
     # ------------------------------------------------------------------
 
-    def _get_batch_prompts(self, step: int) -> list[str]:
-        """Return a list of prompt strings for the current step."""
+    def _get_batch_prompts(
+        self, step: int
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        """Return a list of prompt strings and raw samples for the current step.
+
+        Returns:
+            Tuple of (prompts, samples) where *samples* is a list of dicts
+            from the dataset (empty dicts when using synthetic prompts).
+        """
         import json as _json
 
         bs = max(1, self.config.policy.train_global_batch_size)
 
         if self._dataset is None:
-            return [
+            prompts = [
                 f"What is {i + step * bs} + {i + step * bs + 1}?" for i in range(bs)
             ]
+            return prompts, [{} for _ in range(bs)]
 
         dataset_len = len(self._dataset)
         start = (step * bs) % dataset_len
@@ -294,7 +468,7 @@ class OPDTrainer:
                         pass
 
             prompts.append(text)
-        return prompts
+        return prompts, samples
 
     def _tokenize_prompts(
         self, prompts: list[str]
@@ -366,12 +540,26 @@ class OPDTrainer:
         self,
         sequences: torch.Tensor,
         seq_mask: torch.Tensor,
+        routing_keys: list[str] | None = None,
     ) -> torch.Tensor:
         """Run teacher on student-generated sequences, return logits [B, T-1, V].
 
         In lazy mode: teacher returns hidden states, then TeacherLMHead
         reconstructs logits from them.
+
+        When multi-teacher is enabled and *routing_keys* is provided, each
+        sample is routed to the appropriate teacher via
+        :class:`MultiTeacherManager`.
         """
+        # ---- Multi-teacher path ----
+        if self._multi_teacher_manager is not None and routing_keys is not None:
+            opd_cfg = self.config.algorithm.opd
+            micro_bs = max(1, opd_cfg.teacher_micro_batch_size)
+            return self._multi_teacher_manager.forward(
+                sequences, seq_mask, routing_keys, micro_bs=micro_bs,
+            )
+
+        # ---- Single-teacher path (original) ----
         if self._teacher_model is None:
             raise RuntimeError("Teacher model not loaded.")
 
@@ -489,8 +677,17 @@ class OPDTrainer:
                     cb.on_step_begin(self, step)
 
             # Phase 1: Get prompts
-            prompts = self._get_batch_prompts(step)
+            prompts, samples = self._get_batch_prompts(step)
             input_ids, attention_mask = self._tokenize_prompts(prompts)
+
+            # Extract routing keys for multi-teacher routing
+            routing_keys: list[str] | None = None
+            distill_cfg = getattr(self.config.algorithm, "distillation", None)
+            if self._multi_teacher_manager is not None and distill_cfg:
+                teacher_key_field = distill_cfg.teacher_key  # e.g. "data_source"
+                routing_keys = []
+                for s in samples:
+                    routing_keys.append(str(s.get(teacher_key_field, "default")))
 
             # Phase 2: Student rollout (no grad)
             t0 = time.time()
@@ -501,7 +698,9 @@ class OPDTrainer:
 
             # Phase 3: Teacher forward on student sequences
             t1 = time.time()
-            teacher_logits = self._teacher_forward(sequences, seq_mask)
+            teacher_logits = self._teacher_forward(
+                sequences, seq_mask, routing_keys=routing_keys
+            )
             teacher_time = time.time() - t1
 
             # Build response mask (loss only on response tokens)
@@ -595,6 +794,9 @@ class OPDTrainer:
         if self._ray_cluster is not None:
             self._ray_cluster.shutdown()
             self._ray_cluster = None
+        if self._multi_teacher_manager is not None:
+            self._multi_teacher_manager.cleanup()
+            self._multi_teacher_manager = None
         del self._student_model, self._teacher_model, self._teacher_lm_head
         self._student_model = None
         self._teacher_model = None
@@ -606,4 +808,4 @@ class OPDTrainer:
         logger.info("[rank %d] OPDTrainer.cleanup complete.", self._rank)
 
 
-__all__ = ["OPDTrainer"]
+__all__ = ["MultiTeacherManager", "OPDTrainer"]

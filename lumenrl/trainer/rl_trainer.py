@@ -78,6 +78,7 @@ class RLTrainer:
             os.environ.get("LUMENRL_USE_RAY_CONTROLLER", "0") == "1"
             or bool(getattr(config.cluster, "ray_address", None))
         )
+        self._critic_worker: Any = None
         self._ray_cluster: RayCluster | None = None
         self._actor_wg: RayWorkerGroup | None = None
         self._ref_wg: RayWorkerGroup | None = None
@@ -85,6 +86,7 @@ class RLTrainer:
         self._profiler: DistProfiler | None = None
         self._prev_step_profile: bool = False
         self._curr_step_profile: bool = False
+        self._val_dataset: Any = None
         self._is_distributed: bool = torch.distributed.is_initialized()
         self._rank: int = torch.distributed.get_rank() if self._is_distributed else 0
         self._world_size: int = torch.distributed.get_world_size() if self._is_distributed else 1
@@ -216,8 +218,35 @@ class RLTrainer:
 
         self._load_dataset()
 
+        # ---- Validation dataset ----
+        val_path = getattr(self.config, 'val_dataset', '')
+        if val_path:
+            self._load_val_dataset(val_path)
+
         if not self.callbacks:
             self.callbacks.append(LoggingCallback(interval=max(1, self.config.logger.log_interval)))
+
+        # ---- Critic worker (value model for PPO/GAE) ----
+        if getattr(self.config, 'critic', None) and self.config.critic.enabled:
+            from lumenrl.workers import CriticWorker
+            critic_config_dict = {
+                "critic": {
+                    "model_name": self.config.critic.model_name or self.config.policy.model_name,
+                    "training_backend": self.config.critic.training_backend,
+                    "learning_rate": self.config.critic.learning_rate,
+                    "weight_decay": self.config.critic.weight_decay,
+                    "max_grad_norm": self.config.critic.max_grad_norm,
+                    "value_clip_ratio": self.config.critic.value_clip_ratio,
+                },
+                "policy": {
+                    "model_name": self.config.critic.model_name or self.config.policy.model_name,
+                    "training": vars(self.config.policy.training) if hasattr(self.config.policy.training, '__dict__') else {},
+                    "seed": getattr(self.config, 'seed', 42),
+                },
+            }
+            self._critic_worker = CriticWorker(self._rank, self._world_size, critic_config_dict)
+            self._critic_worker.init_model()
+            logger.info("[rank %d] CriticWorker initialized.", self._rank)
 
         self._resume_step = 0
         if getattr(self.config.checkpointing, "resume", True):
@@ -341,6 +370,11 @@ class RLTrainer:
         self._atom_engine = AtomEngine(config=atom_cfg, model_name=model_name)
         self._load_dataset()
 
+        # ---- Validation dataset ----
+        val_path = getattr(self.config, 'val_dataset', '')
+        if val_path:
+            self._load_val_dataset(val_path)
+
         if not self.callbacks:
             self.callbacks.append(LoggingCallback(interval=max(1, self.config.logger.log_interval)))
         self._resume_step = 0
@@ -418,6 +452,22 @@ class RLTrainer:
             self._dataset = load_dataset(dataset_path, split="train")
 
         logger.info("Loaded dataset: %d samples from %s", len(self._dataset), dataset_path)
+
+    def _load_val_dataset(self, path: str) -> None:
+        """Load validation dataset."""
+        from datasets import load_dataset
+
+        if os.path.isfile(path) or os.path.isdir(path):
+            if path.endswith(".parquet"):
+                self._val_dataset = load_dataset("parquet", data_files=path, split="train")
+            elif path.endswith((".jsonl", ".json")):
+                self._val_dataset = load_dataset("json", data_files=path, split="train")
+            else:
+                self._val_dataset = load_dataset(path, split="train")
+        else:
+            self._val_dataset = load_dataset(path, split="train")
+
+        logger.info("Loaded validation dataset: %d samples from %s", len(self._val_dataset), path)
 
     def _try_resume_checkpoint(self) -> None:
         """Load model + optimizer state from the latest checkpoint if available."""
@@ -1457,6 +1507,11 @@ class RLTrainer:
                 },
             )
 
+            # --- Critic: compute values (needed for GAE) ---
+            if self._critic_worker is not None:
+                values_out = self._critic_worker.compute_values(batch)
+                batch.tensors["values"] = values_out.tensors["values"]
+
             batch = self._algorithm.compute_advantages(batch)
             batch = apply_rollout_correction(batch, self.config)
 
@@ -1603,6 +1658,12 @@ class RLTrainer:
             train_time = time.time() - t2
             self._log_gpu_mem("post_train", step)
 
+            # --- Critic: update value network ---
+            if self._critic_worker is not None:
+                for _critic_epoch in range(getattr(self.config.critic, 'num_critic_epochs', 1)):
+                    critic_metrics = self._critic_worker.train_step(batch)
+                metrics_accum.update(critic_metrics)
+
             if nan_param_count > 0 and self._rank == 0:
                 logger.warning(
                     "[step %d] Zeroed NaN grads in %d/%d params, grad_norm=%.4f",
@@ -1637,6 +1698,12 @@ class RLTrainer:
                     t = torch.tensor(metrics[k], dtype=torch.float64, device=self._device)
                     torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.AVG)
                     metrics[k] = float(t.item())
+
+            # Validation
+            val_steps = getattr(self.config, 'val_steps', 0)
+            if val_steps > 0 and (step + 1) % val_steps == 0:
+                val_metrics = self.run_validation()
+                metrics.update(val_metrics)
 
             self.last_metrics = metrics
             for k, v in metrics.items():
@@ -1815,6 +1882,12 @@ class RLTrainer:
             metrics["seq/max_len"] = int(sequences.shape[1])
             metrics["seq/mean_response_len"] = float(sum(response_lengths) / max(1, len(response_lengths)))
 
+            # Validation
+            val_steps = getattr(self.config, 'val_steps', 0)
+            if val_steps > 0 and (step + 1) % val_steps == 0:
+                val_metrics = self.run_validation()
+                metrics.update(val_metrics)
+
             self.last_metrics = metrics
             for k, v in metrics.items():
                 self._metrics.update(k, v)
@@ -1846,8 +1919,101 @@ class RLTrainer:
             self._sync_weights_to_atom()
 
     def run_validation(self) -> dict[str, float]:
-        """Run a lightweight validation pass."""
-        return {"val/kl_proxy": 0.0}
+        """Run validation: generate responses, compute rewards, aggregate metrics."""
+        if self._val_dataset is None or len(self._val_dataset) == 0:
+            return {}
+
+        val_bs = getattr(self.config, 'val_batch_size', 16)
+        num_samples = len(self._val_dataset)
+        all_scores: list[float] = []
+        all_response_lengths: list[int] = []
+        all_responses: list[str] = []
+
+        # Iterate through validation dataset in batches
+        for start in range(0, num_samples, val_bs):
+            end = min(start + val_bs, num_samples)
+            indices = list(range(start, end))
+            samples = [self._val_dataset[idx] for idx in indices]
+
+            # Extract prompts and ground truths (same logic as _get_batch_prompts)
+            import json as _json
+            prompts: list[str] = []
+            ground_truths: list[str] = []
+            for s in samples:
+                raw = s.get("prompt") or s.get("question") or s.get("input") or ""
+                if isinstance(raw, list):
+                    text = "\n".join(m.get("content", "") for m in raw if isinstance(m, dict))
+                elif isinstance(raw, str) and raw.startswith("["):
+                    try:
+                        msgs = _json.loads(raw)
+                        text = "\n".join(m.get("content", "") for m in msgs if isinstance(m, dict))
+                    except (_json.JSONDecodeError, TypeError):
+                        text = raw
+                else:
+                    text = str(raw)
+
+                if self._tokenizer is not None and hasattr(self._tokenizer, "apply_chat_template"):
+                    orig = s.get("prompt") or s.get("question") or s.get("input") or ""
+                    if isinstance(orig, list):
+                        try:
+                            text = self._tokenizer.apply_chat_template(orig, tokenize=False, add_generation_prompt=True)
+                        except Exception:
+                            pass
+
+                prompts.append(text)
+                gt = s.get("answer") or s.get("ground_truth") or s.get("solution") or ""
+                ground_truths.append(str(gt))
+
+            input_ids, attention_mask = self._tokenize_prompts(prompts)
+
+            # Generate with greedy decoding for reproducibility
+            if self._use_atom and self._atom_engine is not None:
+                sequences, seq_mask, prompt_lengths = self._rollout_with_atom(prompts, num_generations=1)
+            else:
+                sequences, seq_mask, prompt_lengths = self._rollout_phase(input_ids, attention_mask, num_generations=1)
+
+            # Compute rewards
+            rewards, responses = self._compute_rewards(sequences, prompt_lengths, ground_truths, num_generations=1)
+
+            # Collect results
+            if rewards.dim() > 1:
+                scores = rewards.squeeze(-1).tolist()
+            else:
+                scores = rewards.tolist()
+            all_scores.extend(scores)
+            all_responses.extend(responses)
+
+            # Response lengths
+            response_mask = self._build_response_mask(sequences, seq_mask, prompt_lengths)
+            lengths = response_mask.sum(dim=-1).tolist()
+            all_response_lengths.extend([int(x) for x in lengths])
+
+        if not all_scores:
+            return {}
+
+        scores_t = torch.tensor(all_scores, dtype=torch.float32)
+        lengths_t = torch.tensor(all_response_lengths, dtype=torch.float32)
+
+        metrics: dict[str, float] = {
+            "val/score_mean": float(scores_t.mean()),
+            "val/score_max": float(scores_t.max()),
+            "val/score_min": float(scores_t.min()),
+            "val/score_std": float(scores_t.std()) if len(all_scores) > 1 else 0.0,
+            "val/response_length_mean": float(lengths_t.mean()),
+            "val/num_samples": float(len(all_scores)),
+        }
+
+        # Print sample responses (rank 0 only)
+        if self._rank == 0:
+            num_print = min(getattr(self.config.logger, 'num_val_samples_to_print', 5), len(all_responses))
+            for i in range(num_print):
+                logger.info(
+                    "Val sample %d: score=%.3f len=%d response=%s",
+                    i, all_scores[i], all_response_lengths[i],
+                    all_responses[i][:200],
+                )
+
+        return metrics
 
     def cleanup(self) -> None:
         """Release all resources."""
@@ -1867,6 +2033,9 @@ class RLTrainer:
         if self._ray_cluster is not None:
             self._ray_cluster.shutdown()
             self._ray_cluster = None
+        if self._critic_worker is not None:
+            self._critic_worker.cleanup()
+            self._critic_worker = None
         if self._atom_engine is not None:
             self._atom_engine.shutdown()
             self._atom_engine = None
