@@ -32,7 +32,7 @@ fi
 LUMENRL_DIR="/home/leiwu/Lumen-RL"
 
 if [ "${SMOKE_TEST}" = true ]; then
-    RUN_CMD="bash examples/GPT_OSS_120b_MI308_vLLM/run_gpt_oss_120b.sh --smoke-test"
+    RUN_CMD="bash examples/GPT_OSS_120b_MI308_ATOM/run_gpt_oss_120b.sh --smoke-test"
     echo "═══════════════════════════════════════════════════════════════"
     echo "  GPT-OSS-120B Eagle3 Smoke Test (Docker) — vLLM, MI308"
     echo "  Image:    ${DOCKER_IMAGE}"
@@ -40,7 +40,7 @@ if [ "${SMOKE_TEST}" = true ]; then
     echo "  Transfer: Mooncake TCP"
     echo "═══════════════════════════════════════════════════════════════"
 elif [ "${PHASE2}" = true ]; then
-    RUN_CMD="bash examples/GPT_OSS_120b_MI308_vLLM/run_gpt_oss_120b.sh --phase2"
+    RUN_CMD="bash examples/GPT_OSS_120b_MI308_ATOM/run_gpt_oss_120b.sh --phase2"
     echo "═══════════════════════════════════════════════════════════════"
     echo "  GPT-OSS-120B Eagle3 Training (Docker) — Phase 2, vLLM, MI308"
     echo "  Image:    ${DOCKER_IMAGE}"
@@ -48,7 +48,7 @@ elif [ "${PHASE2}" = true ]; then
     echo "  GPUs:     8x MI308 (0-3 training, 4-7 inference)"
     echo "═══════════════════════════════════════════════════════════════"
 else
-    RUN_CMD="bash examples/GPT_OSS_120b_MI308_vLLM/run_gpt_oss_120b.sh"
+    RUN_CMD="bash examples/GPT_OSS_120b_MI308_ATOM/run_gpt_oss_120b.sh"
     echo "═══════════════════════════════════════════════════════════════"
     echo "  GPT-OSS-120B Eagle3 Training (Docker) — Phase 1, vLLM, MI308"
     echo "  Image:    ${DOCKER_IMAGE}"

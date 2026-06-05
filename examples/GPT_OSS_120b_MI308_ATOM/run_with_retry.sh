@@ -20,7 +20,7 @@
 #
 # Usage:
 #   LUMENRL_DRAFT_FLASH_BACKEND=matmul \
-#       bash examples/GPT_OSS_120b_MI308_vLLM/run_with_retry.sh
+#       bash examples/GPT_OSS_120b_MI308_ATOM/run_with_retry.sh
 #   MAX_ATTEMPTS=50 HANG_IDLE_SEC=900 HF_TOKEN=hf_xxx \
 #       bash examples/.../run_with_retry.sh
 # ═══════════════════════════════════════════════════════════════════════════════

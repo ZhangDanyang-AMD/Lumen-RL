@@ -45,7 +45,7 @@ bash examples/Qwen3_8B_SDDD_MI350_vLLM/docker/build.sh
 ### 2. Smoke test (5 steps, synthetic prompts)
 
 ```bash
-bash examples/GPT_OSS_120b_MI308_vLLM/run_docker.sh --smoke-test
+bash examples/GPT_OSS_120b_MI308_ATOM/run_docker.sh --smoke-test
 # logs → output/GPT_OSS_120b_SDDD/LumenRL/
 ```
 
@@ -54,13 +54,13 @@ bash examples/GPT_OSS_120b_MI308_vLLM/run_docker.sh --smoke-test
 ```bash
 # HF_TOKEN strongly recommended — anonymous Hub API gets 429-rate-limited
 # after a few container restarts and the trainer dies on dataset load.
-HF_TOKEN=hf_xxx bash examples/GPT_OSS_120b_MI308_vLLM/run_docker.sh
+HF_TOKEN=hf_xxx bash examples/GPT_OSS_120b_MI308_ATOM/run_docker.sh
 ```
 
 ### 4. Phase 2 — Specialize on Magpie-300K (28,125 steps ≈ 3 epochs, resumes phase 1)
 
 ```bash
-HF_TOKEN=hf_xxx bash examples/GPT_OSS_120b_MI308_vLLM/run_docker.sh --phase2
+HF_TOKEN=hf_xxx bash examples/GPT_OSS_120b_MI308_ATOM/run_docker.sh --phase2
 ```
 
 Loads the latest `checkpoint_*.pt` from phase 1's directory (`/dev/shm/checkpoints/gpt_oss_120b_eagle3_vllm/`) and continues into a separate `..._phase2/` dir so phase 1 finals are preserved. Same draft arch + aux layer IDs as phase 1 — only dataset, LR (2e-5), and warmup change. Aborts if phase 1 ckpts are missing.
@@ -69,7 +69,7 @@ Loads the latest `checkpoint_*.pt` from phase 1's directory (`/dev/shm/checkpoin
 
 ```bash
 LUMENRL_DRAFT_FLASH_BACKEND=matmul \
-    bash examples/GPT_OSS_120b_MI308_vLLM/run_with_retry.sh
+    bash examples/GPT_OSS_120b_MI308_ATOM/run_with_retry.sh
 ```
 
 `run_with_retry.sh` wraps `run_docker.sh` with two safety nets specific to MI308/ROCm:
@@ -98,7 +98,7 @@ MODEL_PATH=/some/other/path \
 CKPT_DIR=/some/checkpoint/dir \
 DOCKER_IMAGE=lumenrl-vllm-mi308:my-tag \
 HF_TOKEN=hf_xxx \
-bash examples/GPT_OSS_120b_MI308_vLLM/run_docker.sh
+bash examples/GPT_OSS_120b_MI308_ATOM/run_docker.sh
 ```
 
 ## Model facts (gpt-oss-120b)

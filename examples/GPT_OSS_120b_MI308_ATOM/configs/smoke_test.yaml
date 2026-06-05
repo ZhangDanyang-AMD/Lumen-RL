@@ -8,7 +8,7 @@
 #   GPUs 4-7: vLLM teacher inference (TP=4, native MXFP4 MoE)
 #
 # Usage:
-#   bash examples/GPT_OSS_120b_MI308_vLLM/run_gpt_oss_120b.sh --smoke-test
+#   bash examples/GPT_OSS_120b_MI308_ATOM/run_gpt_oss_120b.sh --smoke-test
 
 cluster:
   gpus_per_node: 4

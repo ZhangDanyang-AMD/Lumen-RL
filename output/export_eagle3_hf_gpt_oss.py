@@ -1,7 +1,7 @@
 """Export LumenRL Eagle3 checkpoint for gpt-oss-120b to HuggingFace safetensors.
 
 Parallel to output/export_eagle3_hf.py (Kimi). Adapted for the gpt-oss-120b
-draft trained by examples/GPT_OSS_120b_MI308_vLLM:
+draft trained by examples/GPT_OSS_120b_MI308_ATOM:
 
 - 1-layer Llama-style decoder, GQA 64:8, head_dim=64, ffn=17280
 - llama3 RoPE (theta=500000, factor=8, ctx 8192 -> 65536)
@@ -138,7 +138,7 @@ def main() -> None:
     print(f"[save] index: {total_params:,} params, {total_size/1e9:.2f} GB")
 
     # ---- config.json ----
-    # Matches the draft block in examples/GPT_OSS_120b_MI308_vLLM/configs/opd_gpt_oss_120b.yaml
+    # Matches the draft block in examples/GPT_OSS_120b_MI308_ATOM/configs/opd_gpt_oss_120b.yaml
     # and the o200k_harmony vocab from the gpt-oss-120b base.
     base_cfg_path = os.path.join(args.base, "config.json")
     with open(base_cfg_path) as f:

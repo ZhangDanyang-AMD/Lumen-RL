@@ -12,10 +12,10 @@
 #   GPUs 4-7: vLLM teacher inference (TP=4, native MXFP4 MoE)
 #
 # Usage:
-#   bash examples/GPT_OSS_120b_MI308_vLLM/run_gpt_oss_120b.sh                  # phase 1 (ultrachat)
-#   bash examples/GPT_OSS_120b_MI308_vLLM/run_gpt_oss_120b.sh --phase2          # phase 2 (Magpie, resumes phase 1)
-#   bash examples/GPT_OSS_120b_MI308_vLLM/run_gpt_oss_120b.sh --smoke-test      # 5-step synthetic-prompt pipeline test
-#   MODEL_PATH=/path/to/model bash examples/GPT_OSS_120b_MI308_vLLM/run_gpt_oss_120b.sh
+#   bash examples/GPT_OSS_120b_MI308_ATOM/run_gpt_oss_120b.sh                  # phase 1 (ultrachat)
+#   bash examples/GPT_OSS_120b_MI308_ATOM/run_gpt_oss_120b.sh --phase2          # phase 2 (Magpie, resumes phase 1)
+#   bash examples/GPT_OSS_120b_MI308_ATOM/run_gpt_oss_120b.sh --smoke-test      # 5-step synthetic-prompt pipeline test
+#   MODEL_PATH=/path/to/model bash examples/GPT_OSS_120b_MI308_ATOM/run_gpt_oss_120b.sh
 # ═══════════════════════════════════════════════════════════════════════════════
 set -uo pipefail
 
