@@ -9,7 +9,22 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+# agg_loss: verl/trainer/ppo/core_algos.py L1138-1199
+from lumenrl.algorithms.policy_losses import agg_loss  # re-export
+
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "agg_loss",
+    "policy_gradient_loss",
+    "asymmetric_clip_loss",
+    "gmpo_loss",
+    "value_loss",
+    "kl_penalty",
+    "opd_kl_divergence",
+    "hidden_state_loss",
+    "entropy_bonus",
+]
 
 
 def policy_gradient_loss(

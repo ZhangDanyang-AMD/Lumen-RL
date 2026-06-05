@@ -79,6 +79,7 @@ class RLTrainer:
             or bool(getattr(config.cluster, "ray_address", None))
         )
         self._critic_worker: Any = None
+        self._kl_ctrl: Any = None
         self._ray_cluster: RayCluster | None = None
         self._actor_wg: RayWorkerGroup | None = None
         self._ref_wg: RayWorkerGroup | None = None
@@ -247,6 +248,27 @@ class RLTrainer:
             self._critic_worker = CriticWorker(self._rank, self._world_size, critic_config_dict)
             self._critic_worker.init_model()
             logger.info("[rank %d] CriticWorker initialized.", self._rank)
+
+        # --- KL controller (verl/trainer/ppo/ray_trainer.py L316) ---
+        algo_cfg = self.config.algorithm
+        _kl_coef = 0.0
+        algo_name_lc = algo_cfg.name.lower()
+        if algo_name_lc == "dapo":
+            _kl_coef = algo_cfg.dapo.kl_coeff
+        elif algo_name_lc == "grpo":
+            _kl_coef = algo_cfg.grpo.kl_coeff
+        elif algo_name_lc == "ppo":
+            _kl_coef = algo_cfg.ppo.kl_coeff
+        if _kl_coef > 0.0 and algo_cfg.use_kl_in_reward:
+            from lumenrl.algorithms.kl_controller import get_kl_controller
+            self._kl_ctrl = get_kl_controller(
+                kl_ctrl_type=algo_cfg.kl_ctrl_type,
+                kl_coef=_kl_coef,
+                target_kl=algo_cfg.kl_target,
+                horizon=algo_cfg.kl_horizon,
+            )
+            logger.info("[rank %d] KL controller: type=%s, coef=%.4f, use_kl_in_reward=True",
+                        self._rank, algo_cfg.kl_ctrl_type, _kl_coef)
 
         self._resume_step = 0
         if getattr(self.config.checkpointing, "resume", True):
@@ -1243,6 +1265,28 @@ class RLTrainer:
         for pg in self._optimizer.param_groups:
             pg["lr"] = warmup_lr
 
+    def _balance_batch(self, batch: DataProto) -> dict[str, float]:
+        """Seqlen-balanced partitioning across DP ranks.
+        (verl/utils/seqlen_balancing.py, verl/trainer/ppo/ray_trainer.py L1098-1165)
+        """
+        from lumenrl.utils.seqlen_balancing import (
+            calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance,
+        )
+        mask = batch.tensors.get("response_mask", batch.tensors.get("attention_mask"))
+        if mask is None:
+            return {}
+        seq_lens = mask.float().sum(dim=-1).long()
+        workloads = calculate_workload(seq_lens).cpu().tolist()
+        dp_size = self._world_size
+        if batch.batch_size < dp_size:
+            return {}
+        partitions = get_seqlen_balanced_partitions(workloads, dp_size, equal_size=False)
+        stats = log_seqlen_unbalance(workloads, partitions, prefix="balance")
+        my_indices = partitions[self._rank]
+        perm = torch.tensor(my_indices, device=self._device, dtype=torch.long)
+        batch.reorder(perm)
+        return stats
+
     def _dynamic_mini_batches(
         self,
         batch: DataProto,
@@ -1507,6 +1551,15 @@ class RLTrainer:
                 },
             )
 
+            # --- KL penalty in reward (verl/trainer/ppo/ray_trainer.py L1546-1553) ---
+            kl_metrics = {}
+            if self._kl_ctrl is not None:
+                from lumenrl.algorithms.kl_controller import apply_kl_penalty as _apply_kl
+                batch, kl_metrics = _apply_kl(
+                    batch, kl_ctrl=self._kl_ctrl,
+                    kl_penalty_type=self.config.algorithm.kl_penalty,
+                )
+
             # --- Critic: compute values (needed for GAE) ---
             if self._critic_worker is not None:
                 values_out = self._critic_worker.compute_values(batch)
@@ -1515,6 +1568,32 @@ class RLTrainer:
             batch = self._algorithm.compute_advantages(batch)
             batch = apply_rollout_correction(batch, self.config)
 
+            # --- Extended rollout correction: IS weights + rejection sampling ---
+            # (verl/trainer/ppo/ray_trainer.py L1481-1567)
+            _rc_cfg = self.config.quantization.rollout_correction
+            _rc_metrics = {}
+            if _rc_cfg.rollout_is and "old_log_probs" in batch.tensors:
+                _rollout_lp = batch.tensors.get("rollout_log_probs", batch.tensors.get("fp8_logprobs"))
+                if _rollout_lp is not None:
+                    from lumenrl.quantization.rollout_correction import compute_rollout_is_weights, apply_rejection_sampling
+                    _rmask = batch.tensors.get("response_mask", batch.tensors.get("attention_mask"))
+                    _is_w, _rc_metrics = compute_rollout_is_weights(
+                        batch.tensors["old_log_probs"], _rollout_lp, _rmask,
+                        rollout_is=_rc_cfg.rollout_is,
+                        rollout_is_threshold=_rc_cfg.rollout_is_threshold,
+                        rollout_is_batch_normalize=_rc_cfg.rollout_is_batch_normalize,
+                    )
+                    batch.tensors["rollout_is_weights"] = _is_w
+                    if _rc_cfg.rollout_rs and _rc_cfg.rollout_rs_threshold > 0:
+                        _rmask = apply_rejection_sampling(_rmask, _is_w, _rc_cfg.rollout_rs_threshold)
+                        batch.tensors["response_mask"] = _rmask
+
+            # --- Seqlen balanced partitioning ---
+            # (verl/utils/seqlen_balancing.py, verl/trainer/ppo/ray_trainer.py L1098-1165)
+            _balance_metrics = {}
+            if self.config.policy.balance_batch and self._is_distributed and self._world_size > 1:
+                _balance_metrics = self._balance_batch(batch)
+
             if self._use_atom and self._atom_engine is not None:
                 self._reload_optimizer_to_gpu()
 
@@ -1522,81 +1601,116 @@ class RLTrainer:
             t2 = time.time()
             micro_bs = max(1, int(self.config.policy.train_micro_batch_size))
             max_tok = int(self.config.policy.max_token_len_per_gpu)
-            mini_batches = self._dynamic_mini_batches(batch, max_tok, micro_bs)
 
-            # FSDP2: all ranks MUST run the same number of forward/backward passes.
-            # Packing by actual length can yield different counts per rank.
-            # Synchronize by padding ranks with fewer mini-batches.
-            if self._is_distributed and self._world_size > 1:
-                import torch.distributed as dist
-                my_count = len(mini_batches)
-                count_t = torch.tensor([my_count], device=self._device)
-                dist.all_reduce(count_t, op=dist.ReduceOp.MAX)
-                global_max = int(count_t.item())
-                if my_count < global_max:
-                    # Pad with dummy mini-batches: reuse last batch but zero response_mask
-                    # so loss = 0 while FSDP2 collectives still execute.
-                    pad_batch = mini_batches[-1]
-                    dummy_tensors = {k: v.clone() for k, v in pad_batch.tensors.items()}
-                    dummy_tensors["response_mask"] = torch.zeros_like(dummy_tensors["response_mask"])
-                    dummy_mb = DataProto(tensors=dummy_tensors, meta=pad_batch.meta.copy())
-                    while len(mini_batches) < global_max:
-                        mini_batches.append(dummy_mb)
-                    logger.info("[rank %d] Padded mini-batches: %d -> %d for FSDP2 sync",
-                                self._rank, my_count, global_max)
+            # PPO multi-epoch: iterate over same batch multiple times
+            # (verl/trainer/ppo/ray_trainer.py L1262-1271)
+            _algo_lc = self.config.algorithm.name.lower()
+            if _algo_lc == "ppo":
+                _ppo_epochs = self.config.algorithm.ppo.num_ppo_epochs
+            elif _algo_lc == "grpo":
+                _ppo_epochs = self.config.algorithm.grpo.num_ppo_epochs
+            else:
+                _ppo_epochs = 1
+            _ppo_epochs = max(1, _ppo_epochs)
 
             metrics_accum: dict[str, float] = {}
             step_count = 0
             nan_mb_count = 0
             grad_norm = 0.0
-            mismatch_kl_initial: float | None = None  # first real mini-batch's mismatch KL
+            mismatch_kl_initial: float | None = None
             nan_param_count = 0
             total_param_count = 0
             optimizer_steps = 0
 
-            # Each packed mini-batch is one optimizer step (Verl alignment).
             accum_steps = 1
             _dp_size = self._world_size if self._is_distributed else 1
-            # LR warmup (Verl: lr_warmup_steps=10)
             self._update_lr(step)
             _cur_lr = self._optimizer.param_groups[0]["lr"]
-            if self._rank == 0:
-                logger.info(
-                    "[step %d] Training: %d mini-batches, accum_steps=%d, dp_size=%d, lr=%.2e",
-                    step, len(mini_batches), accum_steps, _dp_size, _cur_lr,
-                )
 
-            # FSDP2 gradient accumulation: disable reduce-scatter on intermediate
-            # micro-batches, re-enable on the last micro-batch of each group.
             _fsdp_grad_sync = accum_steps > 1 and self._is_distributed
             if _fsdp_grad_sync:
                 from lumenrl.engine.training.fsdp_backend import set_requires_gradient_sync
 
             _do_engine_step = self._engine is not None
 
-            for i, mini in enumerate(mini_batches):
-                if i % accum_steps == 0:
-                    if _do_engine_step:
-                        self._engine.optimizer_zero_grad()
-                    else:
-                        self._optimizer.zero_grad(set_to_none=True)
-                # Use correct scale for partial final group
-                group_start = (i // accum_steps) * accum_steps
-                group_size = min(accum_steps, len(mini_batches) - group_start)
-                cur_loss_scale = 1.0 / group_size
-                # Toggle FSDP2 gradient sync: off for intermediate, on for last in group
-                is_last_in_group = (i + 1) % accum_steps == 0 or i == len(mini_batches) - 1
-                if _fsdp_grad_sync:
-                    set_requires_gradient_sync(self._actor_model, is_last_in_group)
-                m = self._train_step(
-                    mini, loss_scale=cur_loss_scale, dp_size=_dp_size,
-                )
-                if m.get("loss") is not None and (m["loss"] != m["loss"]):
-                    nan_mb_count += 1
-                    for k, v in m.items():
-                        if v == v:
-                            metrics_accum[k] = metrics_accum.get(k, 0.0) + v
-                    step_count += 1
+            # PPO multi-epoch loop (verl/trainer/ppo/ray_trainer.py L1262-1271)
+            for _epoch in range(_ppo_epochs):
+                if _epoch > 0:
+                    perm = torch.randperm(batch.batch_size)
+                    batch.reorder(perm)
+
+                mini_batches = self._dynamic_mini_batches(batch, max_tok, micro_bs)
+
+                # FSDP2: all ranks MUST run the same number of forward/backward passes.
+                if self._is_distributed and self._world_size > 1:
+                    import torch.distributed as dist
+                    my_count = len(mini_batches)
+                    count_t = torch.tensor([my_count], device=self._device)
+                    dist.all_reduce(count_t, op=dist.ReduceOp.MAX)
+                    global_max = int(count_t.item())
+                    if my_count < global_max:
+                        pad_batch = mini_batches[-1]
+                        dummy_tensors = {k: v.clone() for k, v in pad_batch.tensors.items()}
+                        dummy_tensors["response_mask"] = torch.zeros_like(dummy_tensors["response_mask"])
+                        dummy_mb = DataProto(tensors=dummy_tensors, meta=pad_batch.meta.copy())
+                        while len(mini_batches) < global_max:
+                            mini_batches.append(dummy_mb)
+                        logger.info("[rank %d] Padded mini-batches: %d -> %d for FSDP2 sync",
+                                    self._rank, my_count, global_max)
+
+                if self._rank == 0:
+                    logger.info(
+                        "[step %d epoch %d/%d] Training: %d mini-batches, accum_steps=%d, dp_size=%d, lr=%.2e",
+                        step, _epoch + 1, _ppo_epochs, len(mini_batches), accum_steps, _dp_size, _cur_lr,
+                    )
+
+                for i, mini in enumerate(mini_batches):
+                    if i % accum_steps == 0:
+                        if _do_engine_step:
+                            self._engine.optimizer_zero_grad()
+                        else:
+                            self._optimizer.zero_grad(set_to_none=True)
+                    group_start = (i // accum_steps) * accum_steps
+                    group_size = min(accum_steps, len(mini_batches) - group_start)
+                    cur_loss_scale = 1.0 / group_size
+                    is_last_in_group = (i + 1) % accum_steps == 0 or i == len(mini_batches) - 1
+                    if _fsdp_grad_sync:
+                        set_requires_gradient_sync(self._actor_model, is_last_in_group)
+                    m = self._train_step(
+                        mini, loss_scale=cur_loss_scale, dp_size=_dp_size,
+                    )
+                    if m.get("loss") is not None and (m["loss"] != m["loss"]):
+                        nan_mb_count += 1
+                        for k, v in m.items():
+                            if v == v:
+                                metrics_accum[k] = metrics_accum.get(k, 0.0) + v
+                        step_count += 1
+                        if (i + 1) % accum_steps == 0 or i == len(mini_batches) - 1:
+                            if _do_engine_step:
+                                _gn = self._engine.optimizer_step()
+                            else:
+                                _gn = float(torch.nn.utils.clip_grad_norm_(
+                                    self._actor_model.parameters(), max_norm=1.0,
+                                ))
+                                if not torch.isfinite(torch.tensor(_gn)):
+                                    self._optimizer.zero_grad(set_to_none=True)
+                                else:
+                                    self._optimizer.step()
+                            grad_norm = max(grad_norm, _gn)
+                            optimizer_steps += 1
+                        continue
+                    _nan_cnt = 0
+                    _total_cnt = 0
+                    for p in self._actor_model.parameters():
+                        if p.grad is not None:
+                            _total_cnt += 1
+                            if p.grad.isnan().any():
+                                _nan_cnt += 1
+                                p.grad = torch.where(
+                                    p.grad.isnan(), torch.zeros_like(p.grad), p.grad,
+                                )
+                    nan_param_count = max(nan_param_count, _nan_cnt)
+                    total_param_count = _total_cnt
                     if (i + 1) % accum_steps == 0 or i == len(mini_batches) - 1:
                         if _do_engine_step:
                             _gn = self._engine.optimizer_step()
@@ -1610,51 +1724,23 @@ class RLTrainer:
                                 self._optimizer.step()
                         grad_norm = max(grad_norm, _gn)
                         optimizer_steps += 1
-                    continue
-                # Clean NaN grads before stepping
-                _nan_cnt = 0
-                _total_cnt = 0
-                for p in self._actor_model.parameters():
-                    if p.grad is not None:
-                        _total_cnt += 1
-                        if p.grad.isnan().any():
-                            _nan_cnt += 1
-                            p.grad = torch.where(
-                                p.grad.isnan(), torch.zeros_like(p.grad), p.grad,
-                            )
-                nan_param_count = max(nan_param_count, _nan_cnt)
-                total_param_count = _total_cnt
-                # Only clip + step at accumulation boundaries
-                if (i + 1) % accum_steps == 0 or i == len(mini_batches) - 1:
-                    if _do_engine_step:
-                        _gn = self._engine.optimizer_step()
-                    else:
-                        _gn = float(torch.nn.utils.clip_grad_norm_(
-                            self._actor_model.parameters(), max_norm=1.0,
-                        ))
-                        if not torch.isfinite(torch.tensor(_gn)):
-                            self._optimizer.zero_grad(set_to_none=True)
-                        else:
-                            self._optimizer.step()
-                    grad_norm = max(grad_norm, _gn)
-                    optimizer_steps += 1
-                if mismatch_kl_initial is None and "mismatch_kl" in m:
-                    mismatch_kl_initial = m["mismatch_kl"]
-                for k, v in m.items():
-                    if v == v:
-                        metrics_accum[k] = metrics_accum.get(k, 0.0) + v
-                step_count += 1
+                    if mismatch_kl_initial is None and "mismatch_kl" in m:
+                        mismatch_kl_initial = m["mismatch_kl"]
+                    for k, v in m.items():
+                        if v == v:
+                            metrics_accum[k] = metrics_accum.get(k, 0.0) + v
+                    step_count += 1
+
             if _do_engine_step:
                 self._engine.optimizer_zero_grad()
                 _cur_lr = self._engine.lr_scheduler_step()
             else:
                 self._optimizer.zero_grad(set_to_none=True)
-            # Restore gradient sync after accumulation loop
             if _fsdp_grad_sync:
                 set_requires_gradient_sync(self._actor_model, True)
             if self._rank == 0:
-                logger.info("[step %d] Completed %d optimizer steps (from %d mini-batches).",
-                            step, optimizer_steps, len(mini_batches))
+                logger.info("[step %d] Completed %d optimizer steps (%d epochs x mini-batches).",
+                            step, optimizer_steps, _ppo_epochs)
             train_time = time.time() - t2
             self._log_gpu_mem("post_train", step)
 
@@ -1688,6 +1774,21 @@ class RLTrainer:
             metrics["reward/accuracy"] = float(
                 sum(1 for r in rewards if r > 0) / max(1, len(rewards))
             )
+            if kl_metrics:
+                metrics.update(kl_metrics)
+            if _rc_metrics:
+                metrics.update(_rc_metrics)
+            if _balance_metrics:
+                metrics.update(_balance_metrics)
+
+            # Comprehensive data metrics (verl/trainer/ppo/metric_utils.py L89-268)
+            try:
+                from lumenrl.trainer.metric_utils import compute_data_metrics
+                _data_m = compute_data_metrics(batch, use_critic=self._critic_worker is not None)
+                metrics.update(_data_m)
+            except Exception:
+                pass
+
             metrics["seq/max_len"] = int(sequences.shape[1])
             metrics["seq/mean_response_len"] = float(
                 sum(response_lengths) / max(1, len(response_lengths))

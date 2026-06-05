@@ -31,6 +31,15 @@ class AdvantageEstimator(str, Enum):
     REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
     RLOO = "rloo"
     DAPO = "dapo"
+    # New estimators (verl/trainer/ppo/core_algos.py L334-865)
+    GRPO_VECTORIZED = "grpo_vectorized"
+    GDPO = "gdpo"
+    GRPO_PASSK = "grpo_passk"
+    REINFORCE_PLUS_PLUS_BASELINE = "reinforce_plus_plus_baseline"
+    REMAX = "remax"
+    OPO = "opo"
+    GPG = "gpg"
+    RLOO_VECTORIZED = "rloo_vectorized"
 
 
 class FP8Precision(str, Enum):

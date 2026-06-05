@@ -202,6 +202,7 @@ class PolicyConfig:
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
     warmup_ratio: float = 0.0
+    balance_batch: bool = False         # seqlen-balanced partitioning across DP ranks
 
 
 @dataclass
@@ -329,6 +330,20 @@ class AlgorithmConfig:
     teacher: TeacherConfig = field(default_factory=TeacherConfig)
     draft: DraftModelConfig = field(default_factory=DraftModelConfig)
     distillation: DistillationConfig = field(default_factory=DistillationConfig)
+    # KL controller settings (verl/trainer/ppo/core_algos.py L193-212)
+    kl_ctrl_type: str = "fixed"         # "fixed" | "adaptive"
+    kl_penalty: str = "kl"              # kl, abs, mse, k3, k3+, etc.
+    kl_target: float = 0.01             # target KL for adaptive controller
+    kl_horizon: int = 10000             # horizon for adaptive controller
+    use_kl_in_reward: bool = False      # apply KL penalty to token rewards before advantages
+    # Policy loss registry (verl/trainer/ppo/core_algos.py L50-85)
+    loss_mode: str = ""                 # "" = use algorithm default; or "vanilla", "gspo", etc.
+    loss_agg_mode: str = "token-mean"   # token-mean, seq-mean-token-sum, seq-mean-token-sum-norm, seq-mean-token-mean
+    # Unified clip ratios for policy loss registry
+    clip_ratio: float = 0.2
+    clip_ratio_low: Optional[float] = None
+    clip_ratio_high: Optional[float] = None
+    clip_ratio_c: float = 3.0
 
 
 @dataclass
@@ -356,6 +371,12 @@ class RolloutCorrectionConfig:
     enabled: bool = False
     method: str = "tis"
     clip: float = 1.5
+    # Extended rollout correction (verl/trainer/ppo/rollout_corr_helper.py)
+    rollout_is: str = ""                # "token" | "sequence" | "" (importance sampling level)
+    rollout_is_threshold: float = 2.0   # upper truncation for IS weights
+    rollout_is_batch_normalize: bool = False
+    rollout_rs: str = ""                # rejection sampling mode
+    rollout_rs_threshold: float = 0.0
 
 
 @dataclass

@@ -15,13 +15,17 @@
 
 Each estimator has signature ``(batch: DataProto, config: LumenRLConfig) -> DataProto``
 and populates ``batch.tensors["advantages"]`` (and optionally ``batch.tensors["returns"]``).
+
+New estimators derived from verl/trainer/ppo/core_algos.py L334-865.
 """
 
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from typing import Callable
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -380,4 +384,299 @@ def compute_rloo_advantage(batch: DataProto, config: LumenRLConfig) -> DataProto
         adv_flat.mean().item(),
         adv_flat.std().item(),
     )
+    return batch
+
+
+# ---------------------------------------------------------------------------
+# Helpers for group-based estimators
+# ---------------------------------------------------------------------------
+
+def _get_group_index(batch: DataProto, config: LumenRLConfig) -> np.ndarray:
+    """Build per-sample group index from num_generations."""
+    g = batch.meta.get("num_generations", config.algorithm.grpo.num_generations)
+    bs = next(iter(batch.tensors.values())).shape[0]
+    return np.arange(bs) // g
+
+
+def _get_token_level_rewards(batch: DataProto) -> Tensor:
+    """Get token-level rewards from batch, handling scalar vs token-level."""
+    rewards = batch.tensors["rewards"]
+    mask = _response_mask_from_batch(batch)
+    if rewards.dim() == 1 or (rewards.dim() == 2 and rewards.shape[-1] == 1):
+        return _scalar_rewards_to_token_rewards(
+            rewards.squeeze(-1) if rewards.dim() == 2 else rewards, mask
+        )
+    return rewards
+
+
+# ---------------------------------------------------------------------------
+# New estimators  (verl/trainer/ppo/core_algos.py L334-865)
+# ---------------------------------------------------------------------------
+
+@register_adv_est("grpo_vectorized")
+def compute_grpo_vectorized_advantage(batch: DataProto, config: LumenRLConfig) -> DataProto:
+    """Vectorized GRPO with optional Dr.GRPO mode.
+    (verl/trainer/ppo/core_algos.py L334-358)
+    """
+    rewards = batch.tensors["rewards"]
+    if rewards.dim() > 1:
+        rewards = rewards.squeeze(-1)
+    cfg = config.algorithm.grpo
+    g = cfg.num_generations
+    grouped = rewards.view(-1, g)
+    mean = grouped.mean(dim=1, keepdim=True)
+    std = grouped.std(dim=1, unbiased=False, keepdim=True).clamp_min(1e-8)
+
+    norm_by_std = batch.meta.get("norm_adv_by_std_in_grpo", True)
+    if norm_by_std:
+        adv = (grouped - mean) / std
+    else:
+        adv = grouped - mean
+
+    mask = _response_mask_from_batch(batch)
+    adv_flat = adv.reshape(-1)
+    if mask is not None and mask.dim() > 1:
+        batch.tensors["advantages"] = adv_flat.unsqueeze(-1) * mask.float()
+    else:
+        batch.tensors["advantages"] = adv_flat
+    return batch
+
+
+@register_adv_est("gdpo")
+def compute_gdpo_advantage(batch: DataProto, config: LumenRLConfig) -> DataProto:
+    """GDPO: Group reward-Decoupled normalization (arxiv 2601.05242).
+    Normalizes each reward dimension independently before aggregation.
+    (verl/trainer/ppo/core_algos.py L361-468)
+    """
+    rewards = batch.tensors["rewards"]
+    if rewards.dim() > 1:
+        rewards = rewards.squeeze(-1)
+    cfg = config.algorithm.grpo
+    g = cfg.num_generations
+
+    mask = _response_mask_from_batch(batch)
+    mask_f = mask.float() if mask is not None else torch.ones_like(rewards).unsqueeze(-1) if rewards.dim() == 1 else torch.ones_like(rewards)
+
+    token_rewards = _get_token_level_rewards(batch)
+    score_list = [token_rewards]
+
+    adv_sum = None
+    for scores in score_list:
+        s = scores.sum(dim=-1) if scores.dim() > 1 else scores
+        grouped = s.view(-1, g)
+        mean = grouped.mean(dim=1, keepdim=True)
+        std = grouped.std(dim=1, unbiased=False, keepdim=True).clamp_min(1e-8)
+        normed = ((grouped - mean) / std).reshape(-1)
+        if mask is not None and mask.dim() > 1:
+            normed_tok = normed.unsqueeze(-1) * mask_f
+        else:
+            normed_tok = normed
+        adv_sum = normed_tok if adv_sum is None else adv_sum + normed_tok
+
+    if mask is not None and mask.dim() > 1:
+        advantages = _masked_whiten(adv_sum, mask_f, shift_mean=True) * mask_f
+    else:
+        advantages = adv_sum
+    batch.tensors["advantages"] = advantages
+    return batch
+
+
+@register_adv_est("grpo_passk")
+def compute_grpo_passk_advantage(batch: DataProto, config: LumenRLConfig) -> DataProto:
+    """Pass@K variant: only best response per group gets advantage.
+    (verl/trainer/ppo/core_algos.py L471-530, arxiv 2503.19595)
+    """
+    rewards = batch.tensors["rewards"]
+    if rewards.dim() > 1:
+        rewards = rewards.squeeze(-1)
+    cfg = config.algorithm.grpo
+    g = cfg.num_generations
+    index = _get_group_index(batch, config)
+
+    scores = rewards.clone()
+    advantages = torch.zeros_like(scores)
+    id2scores: dict[int, list] = defaultdict(list)
+    id2indices: dict[int, list] = defaultdict(list)
+
+    with torch.no_grad():
+        for i in range(scores.shape[0]):
+            id2scores[index[i]].append(scores[i])
+            id2indices[index[i]].append(i)
+
+        for idx in id2scores:
+            r = torch.stack(id2scores[idx])
+            if r.numel() < 2:
+                continue
+            topk, topk_idx = torch.topk(r, 2)
+            i_max = id2indices[idx][topk_idx[0].item()]
+            adv = topk[0] - topk[1]
+            std = torch.std(r).clamp_min(1e-8)
+            advantages[i_max] = adv / std
+
+    mask = _response_mask_from_batch(batch)
+    if mask is not None and mask.dim() > 1:
+        batch.tensors["advantages"] = advantages.unsqueeze(-1) * mask.float()
+    else:
+        batch.tensors["advantages"] = advantages
+    return batch
+
+
+@register_adv_est("reinforce_plus_plus_baseline")
+def compute_reinforce_pp_baseline_advantage(batch: DataProto, config: LumenRLConfig) -> DataProto:
+    """RF++ with group baseline subtraction and whitening.
+    (verl/trainer/ppo/core_algos.py L533-584, arxiv 2501.03262)
+    """
+    rewards = batch.tensors["rewards"]
+    if rewards.dim() > 1:
+        rewards = rewards.squeeze(-1)
+    index = _get_group_index(batch, config)
+    mask = _response_mask_from_batch(batch)
+    mask_f = mask.float() if mask is not None else None
+
+    scores = rewards.clone()
+    id2score: dict[int, list] = defaultdict(list)
+    id2mean: dict[int, Tensor] = {}
+
+    with torch.no_grad():
+        for i in range(scores.shape[0]):
+            id2score[index[i]].append(scores[i])
+        for idx in id2score:
+            if len(id2score[idx]) <= 1:
+                id2mean[idx] = torch.tensor(0.0, device=scores.device)
+            else:
+                id2mean[idx] = torch.mean(torch.stack(id2score[idx]))
+        for i in range(scores.shape[0]):
+            scores[i] = scores[i] - id2mean[index[i]]
+
+        if mask_f is not None and mask_f.dim() > 1:
+            adv = scores.unsqueeze(-1).expand_as(mask_f) * mask_f
+            adv = _masked_whiten(adv, mask_f, shift_mean=True) * mask_f
+        else:
+            adv = scores
+
+    batch.tensors["advantages"] = adv
+    return batch
+
+
+@register_adv_est("remax")
+def compute_remax_advantage(batch: DataProto, config: LumenRLConfig) -> DataProto:
+    """ReMax with reward baseline subtraction.
+    (verl/trainer/ppo/core_algos.py L732-765, arxiv 2310.10505)
+    """
+    rewards = _get_token_level_rewards(batch)
+    mask = _response_mask_from_batch(batch)
+    mask_f = mask.float() if mask is not None else torch.ones_like(rewards)
+
+    baselines = batch.tensors.get("reward_baselines")
+    if baselines is None:
+        baselines = torch.zeros(rewards.shape[0], device=rewards.device)
+    if baselines.dim() > 1:
+        baselines = baselines.squeeze(-1)
+
+    with torch.no_grad():
+        returns = (rewards * mask_f).flip(dims=[-1]).cumsum(dim=-1).flip(dims=[-1])
+        advantages = returns - baselines.unsqueeze(-1) * mask_f
+
+    batch.tensors["advantages"] = advantages
+    batch.tensors["returns"] = returns
+    return batch
+
+
+@register_adv_est("opo")
+def compute_opo_advantage(batch: DataProto, config: LumenRLConfig) -> DataProto:
+    """OPO length-weighted baseline (arxiv 2505.23585).
+    (verl/trainer/ppo/core_algos.py L639-690)
+    """
+    rewards = batch.tensors["rewards"]
+    if rewards.dim() > 1:
+        rewards = rewards.squeeze(-1)
+    index = _get_group_index(batch, config)
+    mask = _response_mask_from_batch(batch)
+    resp_len = mask.float().sum(dim=-1) if mask is not None and mask.dim() > 1 else torch.ones_like(rewards)
+
+    scores = rewards.clone()
+    id2score: dict[int, list] = defaultdict(list)
+    id2len: dict[int, list] = defaultdict(list)
+    id2bsl: dict[int, Tensor] = {}
+
+    with torch.no_grad():
+        for i in range(scores.shape[0]):
+            id2score[index[i]].append(scores[i])
+            id2len[index[i]].append(resp_len[i])
+        for idx in id2score:
+            if len(id2score[idx]) <= 1:
+                id2bsl[idx] = torch.tensor(0.0, device=scores.device)
+            else:
+                st = torch.stack(id2score[idx])
+                lt = torch.stack(id2len[idx])
+                id2bsl[idx] = (lt * st).sum() / lt.sum().clamp(min=1)
+        for i in range(scores.shape[0]):
+            scores[i] = scores[i] - id2bsl[index[i]]
+
+    if mask is not None and mask.dim() > 1:
+        batch.tensors["advantages"] = scores.unsqueeze(-1) * mask.float()
+    else:
+        batch.tensors["advantages"] = scores
+    return batch
+
+
+@register_adv_est("gpg")
+def compute_gpg_advantage(batch: DataProto, config: LumenRLConfig) -> DataProto:
+    """GPG advantage with alpha scaling.
+    (verl/trainer/ppo/core_algos.py L768-828)
+    """
+    rewards = batch.tensors["rewards"]
+    if rewards.dim() > 1:
+        rewards = rewards.squeeze(-1)
+    index = _get_group_index(batch, config)
+    mask = _response_mask_from_batch(batch)
+
+    scores = rewards.clone()
+    id2score: dict[int, list] = defaultdict(list)
+    id2mean: dict[int, Tensor] = {}
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        m = torch.count_nonzero(scores)
+        alpha = float(bsz) / max(int(m.item()), 1)
+
+        for i in range(bsz):
+            id2score[index[i]].append(scores[i])
+        for idx in id2score:
+            if len(id2score[idx]) <= 1:
+                id2mean[idx] = torch.tensor(0.0, device=scores.device)
+            else:
+                id2mean[idx] = torch.mean(torch.stack(id2score[idx]))
+        for i in range(bsz):
+            scores[i] = alpha * (scores[i] - id2mean[index[i]])
+
+    if mask is not None and mask.dim() > 1:
+        batch.tensors["advantages"] = scores.unsqueeze(-1) * mask.float()
+    else:
+        batch.tensors["advantages"] = scores
+    return batch
+
+
+@register_adv_est("rloo_vectorized")
+def compute_rloo_vectorized_advantage(batch: DataProto, config: LumenRLConfig) -> DataProto:
+    """Vectorized RLOO advantage estimation.
+    (verl/trainer/ppo/core_algos.py L831-865)
+    """
+    rewards = batch.tensors["rewards"]
+    if rewards.dim() > 1:
+        rewards = rewards.squeeze(-1)
+    index = _get_group_index(batch, config)
+    mask = _response_mask_from_batch(batch)
+
+    with torch.no_grad():
+        inv = torch.from_numpy(np.unique(index, return_inverse=True)[1]).to(rewards.device)
+        c = torch.bincount(inv)[inv].float()
+        group_sum = torch.zeros(inv.max() + 1, device=rewards.device, dtype=rewards.dtype)
+        group_sum.scatter_add_(0, inv, rewards)
+        adv = ((c * rewards - group_sum[inv]) / (c - 1).clamp_min(1)) * (c > 1)
+
+    if mask is not None and mask.dim() > 1:
+        batch.tensors["advantages"] = adv.unsqueeze(-1) * mask.float()
+    else:
+        batch.tensors["advantages"] = adv
     return batch

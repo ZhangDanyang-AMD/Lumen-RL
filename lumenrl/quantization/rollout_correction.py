@@ -1,4 +1,9 @@
-"""Token-level rollout correction (TIS / MIS) for FP8 vs BF16 log-probability mismatch."""
+"""Token-level rollout correction (TIS / MIS) for FP8 vs BF16 log-probability mismatch.
+
+Extended with IS weight computation and rejection sampling.
+Derived from verl/trainer/ppo/rollout_corr_helper.py and
+verl/trainer/ppo/ray_trainer.py L1481-1567.
+"""
 
 from __future__ import annotations
 
@@ -118,3 +123,84 @@ def apply_rollout_correction(batch: DataProto, config: Any) -> DataProto:
     out.meta["rollout_correction"] = {"method": method, "clip": rcfg.clip}
     logger.debug("apply_rollout_correction: method=%s", method)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Extended rollout correction: IS weights & rejection sampling
+# (verl/trainer/ppo/rollout_corr_helper.py, verl/trainer/ppo/ray_trainer.py L1481-1567)
+# ---------------------------------------------------------------------------
+
+def compute_rollout_is_weights(
+    old_log_probs: Tensor,
+    rollout_log_probs: Tensor,
+    response_mask: Tensor,
+    rollout_is: str = "token",
+    rollout_is_threshold: float = 2.0,
+    rollout_is_batch_normalize: bool = False,
+) -> tuple[Tensor, dict[str, float]]:
+    """Compute importance sampling weights between current and rollout policies.
+
+    Derived from verl/trainer/ppo/rollout_corr_helper.py
+    ``compute_rollout_correction_and_rejection_mask()``.
+
+    Args:
+        old_log_probs: Log-probs from current training policy [B, T].
+        rollout_log_probs: Log-probs from rollout policy [B, T].
+        response_mask: Valid token mask [B, T].
+        rollout_is: Aggregation level — ``"token"`` or ``"sequence"``.
+        rollout_is_threshold: Upper truncation threshold.
+        rollout_is_batch_normalize: If True, normalize weights to mean=1.
+
+    Returns:
+        ``(is_weights, metrics)`` where ``is_weights`` is [B, T].
+    """
+    log_ratio = old_log_probs - rollout_log_probs
+    log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)
+    mask_f = response_mask.float()
+
+    if rollout_is == "token":
+        raw_weights = torch.exp(log_ratio)
+        weights = torch.clamp(raw_weights, max=rollout_is_threshold)
+    elif rollout_is == "sequence":
+        seq_len = mask_f.sum(dim=-1).clamp(min=1)
+        seq_log_ratio = (log_ratio * mask_f).sum(dim=-1) / seq_len
+        seq_weights = torch.exp(seq_log_ratio)
+        seq_weights = torch.clamp(seq_weights, max=rollout_is_threshold)
+        weights = seq_weights.unsqueeze(-1).expand_as(response_mask)
+    else:
+        weights = torch.ones_like(response_mask, dtype=torch.float32)
+
+    if rollout_is_batch_normalize and weights.numel() > 0:
+        w_mean = (weights * mask_f).sum() / mask_f.sum().clamp(min=1)
+        weights = weights / w_mean.clamp(min=1e-8)
+
+    metrics = {
+        "rollout_correction/is_weight_mean": float((weights * mask_f).sum() / mask_f.sum().clamp(min=1)),
+        "rollout_correction/is_weight_max": float(weights.max()),
+    }
+    return weights * mask_f, metrics
+
+
+def apply_rejection_sampling(
+    response_mask: Tensor,
+    is_weights: Tensor,
+    threshold: float = 0.0,
+) -> Tensor:
+    """Zero out response_mask entries where IS weight exceeds threshold.
+
+    Derived from verl/trainer/ppo/rollout_corr_helper.py rejection sampling logic.
+
+    Args:
+        response_mask: Original response mask [B, T].
+        is_weights: Importance sampling weights [B, T].
+        threshold: Rejection threshold.  0 = disabled.
+
+    Returns:
+        Modified response mask with rejected tokens zeroed.
+    """
+    if threshold <= 0.0:
+        return response_mask
+    reject = is_weights > threshold
+    modified = response_mask.clone()
+    modified[reject] = 0
+    return modified
