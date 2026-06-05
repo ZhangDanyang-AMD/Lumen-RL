@@ -74,7 +74,7 @@ docker run -d \
     -v /home/danyzhan/Kimi_K25_eagle3_v2_phase1_HF:/home/danyzhan/Kimi_K25_eagle3_v2_phase1_HF:ro \
     -w /root/lumenrl \
     "${DOCKER_IMAGE}" \
-    bash -c "pip install -e /root/triton_kernels 2>/dev/null; find /root/aiter -name 'amd_buffer_addressing_builtins.hpp' -exec sed -i 's/#if __clang_major__ >= 21 && __clang_major__ < 23/#if 0/' {} \; 2>/dev/null; rm -rf /root/aiter/aiter/jit/build/module_moe_ck2stages* 2>/dev/null; rm -rf /root/aiter/aiter/jit/build 2>/dev/null; rm -rf /root/.cache/atom/* 2>/dev/null; mkdir -p /dev/shm/checkpoints/kimi_k25_eagle3_v2_phase2_atom; CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 -m lumenrl.trainer.main --config examples/Kimi_K25_SDDD_MI350_vLLM/configs/phase2_atom.yaml"
+    bash -c "pip install -e /root/triton_kernels 2>/dev/null; find /root/aiter -name 'amd_buffer_addressing_builtins.hpp' -exec sed -i 's/#if __clang_major__ >= 21 && __clang_major__ < 23/#if 0/' {} \; 2>/dev/null; rm -rf /root/aiter/aiter/jit/build/module_moe_ck2stages* 2>/dev/null; rm -rf /root/aiter/aiter/jit/build 2>/dev/null; rm -rf /root/.cache/atom/* 2>/dev/null; mkdir -p /dev/shm/checkpoints/kimi_k25_eagle3_v2_phase2_atom; CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 -m lumenrl.trainer.main --config examples/Kimi_K25_SDDD_MI350_ATOM/configs/phase2_atom.yaml"
 
 echo ""
 echo ">>> Container '${CONTAINER_NAME}' started in detached mode."

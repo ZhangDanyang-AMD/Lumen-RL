@@ -2,7 +2,7 @@
 # Build the LumenRL + vLLM + ATOM Docker image for MI350 (ROCm gfx950)
 #
 # Usage:
-#   bash examples/Kimi_K25_SDDD_MI350_vLLM/docker/build.sh
+#   bash examples/Kimi_K25_SDDD_MI350_ATOM/docker/build.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

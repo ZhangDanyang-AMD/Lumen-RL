@@ -10,8 +10,8 @@
 #   GPUs 4-7: vLLM + ATOM teacher inference (TP=4, MXFP4, aiter)
 #
 # Usage:
-#   bash examples/Kimi_K25_SDDD_MI350_vLLM/run_full_training.sh
-#   bash examples/Kimi_K25_SDDD_MI350_vLLM/run_full_training.sh --phase2-only
+#   bash examples/Kimi_K25_SDDD_MI350_ATOM/run_full_training.sh
+#   bash examples/Kimi_K25_SDDD_MI350_ATOM/run_full_training.sh --phase2-only
 # ═══════════════════════════════════════════════════════════════════════════════
 set -uo pipefail
 

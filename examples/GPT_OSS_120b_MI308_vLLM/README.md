@@ -175,4 +175,4 @@ No `docker/` subdir: the image is shared with `Qwen3_8B_SDDD_MI350_vLLM`.
 
 - [openai/gpt-oss-120b on Hugging Face](https://huggingface.co/openai/gpt-oss-120b)
 - [vLLM gpt-oss recipe](https://docs.vllm.ai/projects/recipes/en/latest/OpenAI/GPT-OSS.html)
-- Sibling examples: `examples/Qwen3_8B_SDDD_MI350_vLLM/`, `examples/Kimi_K25_SDDD_MI350_vLLM/`
+- Sibling examples: `examples/Qwen3_8B_SDDD_MI350_vLLM/`, `examples/Kimi_K25_SDDD_MI350_ATOM/`
