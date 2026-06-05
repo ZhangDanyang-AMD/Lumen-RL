@@ -15,11 +15,11 @@
 #
 # Build:
 #   docker buildx build \
-#       -f examples/Kimi_K25_SDDD_MI350_vLLM/docker/Dockerfile \
+#       -f examples/Kimi_K25_SDDD_MI350_ATOM/docker/Dockerfile \
 #       -t lumenrl-vllm-mi350:latest .
 #
 # Or use the build script:
-#   bash examples/Kimi_K25_SDDD_MI350_vLLM/docker/build.sh
+#   bash examples/Kimi_K25_SDDD_MI350_ATOM/docker/build.sh
 #
 # (primary build context = Lumen-RL repo root)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -70,7 +70,7 @@ RUN git clone https://github.com/kvcache-ai/Mooncake.git /tmp/mooncake && \
     rm -rf /tmp/mooncake
 
 # ---- Apply vLLM patches (extract_hidden_states + CacheOnlyAttentionLayer) ----
-COPY examples/Kimi_K25_SDDD_MI350_vLLM/docker/patches/vllm/v0.19.1/*.patch /tmp/patches/
+COPY examples/Kimi_K25_SDDD_MI350_ATOM/docker/patches/vllm/v0.19.1/*.patch /tmp/patches/
 RUN VLLM_DIR=$(python3 -c "import vllm, os; print(os.path.dirname(os.path.dirname(vllm.__file__)))") && \
     cd "$VLLM_DIR" && \
     for p in /tmp/patches/*.patch; do patch -p1 < "$p"; done && \
