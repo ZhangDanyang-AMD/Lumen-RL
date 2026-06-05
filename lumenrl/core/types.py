@@ -11,6 +11,7 @@ from typing_extensions import NotRequired
 class TrainingBackend(str, Enum):
     FSDP2 = "fsdp2"
     MEGATRON = "megatron"
+    NONE = "none"
 
 
 class GenerationBackend(str, Enum):

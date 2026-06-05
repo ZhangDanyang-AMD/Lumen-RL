@@ -1,34 +1,44 @@
-"""ATOM-based teacher inference engine for draft model distillation.
+"""ATOM-based teacher inference engine for Eagle3 speculative distillation.
 
 Runs the teacher model in a **separate subprocess** on dedicated GPUs
 with tensor parallelism and optional MXFP4/FP8 quantization.  Designed
 for the 4+4 GPU split strategy:
 
-- GPUs 0-3: ATOM subprocess, TP=4, teacher model (frozen, forward-only)
-- GPUs 4-7: torchrun training ranks, FSDP2, draft model training
+- GPUs 0-3: training ranks (FSDP2, draft model)
+- GPUs 4-7: ATOM subprocess (TP=4, teacher model, forward-only)
 
-Hidden states are transferred via **MORI-IO P2P RDMA** — the teacher
-subprocess writes forward-pass outputs to pre-registered GPU buffers,
-and the training process pulls them directly to its own GPU via
-``session.read()``.  No CPU round-trip, no ``torch.save``/``torch.load``.
+The subprocess uses ATOM's ``AsyncLLMEngine`` (with ``RLHFModelRunner``)
+which handles TP process spawning internally via ``AsyncIOProcManager``.
+Hidden states (3 aux layers + last hidden) are captured via
+``register_forward_hook`` on decoder layers and transferred via
+**Mooncake TCP** — the same transport used by ``VllmTeacherEngine``.
 
-The subprocess directly instantiates ATOM's ``Config`` + model class
-for pure prefill forward passes -- it **does not** go through
-``LLMEngine`` (no scheduler, no KV cache, no generation loop).
+Three auxiliary hidden states from layers [1, N//2-1, N-4] are captured
+by ``RLHFModelRunner.configure_hidden_states()`` which registers hooks
+on the decoder layers without modifying any ``@support_torch_compile``
+model files.
+
+Requires ATOM from the ``sijyang/torchspec_dev`` branch which adds:
+- ``atom.rollout.async_engine.AsyncLLMEngine``
+- ``atom.rollout.model_runner_ext.RLHFModelRunner``
+- ``atom.rollout.engine_utility.EngineUtilityHandler``
 """
 
 from __future__ import annotations
 
-import gc
 import json
 import logging
 import os
+import errno
+import select
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
-from pathlib import Path
 from typing import Any, Optional
 
 import torch
@@ -39,23 +49,35 @@ _HIDDEN_XFER_DIR = os.environ.get(
     "LUMENRL_TEACHER_HIDDEN_DIR",
     "/dev/shm/lumenrl_teacher_hidden",
 )
+_READY_TIMEOUT_SECONDS = float(
+    os.environ.get("LUMENRL_TEACHER_READY_TIMEOUT_SECONDS", "600"),
+)
+_CMD_FIFO_OPEN_TIMEOUT_SECONDS = 10.0
+_DEFAULT_COMMAND_TIMEOUT_SECONDS = 600.0
+_SHUTDOWN_COMMAND_TIMEOUT_SECONDS = 5.0
+_WORKER_TERMINATE_GRACE_SECONDS = 10.0
 
 # ---------------------------------------------------------------------------
 # Worker subprocess script
 #
-# This runs in a separate process on the teacher GPUs.  It loads the model
-# via ATOM's infrastructure (Config -> model class -> load_model) which
-# handles TP, MXFP4/FP8 quantization, and expert fusion automatically.
+# Runs in a separate process on the teacher GPUs.  Uses ATOM's
+# AsyncLLMEngine which internally spawns tp_size ModelRunner processes
+# via AsyncIOProcManager, handling NCCL distributed init correctly.
 #
 # Communication:
 # - Named FIFOs for JSON commands + responses (small control messages)
-# - MORI-IO P2P RDMA for GPU-to-GPU hidden state transfer (large tensors)
+# - Mooncake TCP for hidden state transfer (via RLHFModelRunner)
 # - /dev/shm for input_ids (small, a few KB per batch)
+# - /dev/shm for teacher weights (lm_head, embed, norm)
 # ---------------------------------------------------------------------------
 
 _TEACHER_WORKER_SCRIPT = textwrap.dedent("""\
-import gc, json, os, sys, logging, time
-import numpy as np
+import gc, json, os, sys, logging, time, socket, glob
+
+# ---- Ensure lumenrl is importable (for ATOM's fallback imports) ----
+for _p in ["/root/lumenrl", os.getcwd()]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 # ---- Isolate from torchrun environment ----
 os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
@@ -69,10 +91,17 @@ for key in list(os.environ.keys()):
     ]):
         del os.environ[key]
 
+# Suppress noisy logs from mooncake C++ (glog) and aiter
+os.environ["GLOG_minloglevel"] = "3"
+os.environ["GLOG_v"] = "0"
+os.environ["MOONCAKE_LOG_LEVEL"] = "FATAL"
+os.environ["AITER_LOG_LEVEL"] = "WARNING"
+
 logging.basicConfig(stream=sys.stderr, level=logging.INFO)
 logger = logging.getLogger("atom_teacher")
 
 import torch
+from transformers import AutoConfig
 
 # Parse arguments
 cmd_fifo = sys.argv[1]
@@ -80,134 +109,109 @@ resp_fifo = sys.argv[2]
 model_path = sys.argv[3]
 tp_size = int(sys.argv[4])
 hidden_dir = sys.argv[5]
-mori_host = sys.argv[6]
-mori_port = int(sys.argv[7])
-mori_qp = int(sys.argv[8])
-max_batch = int(sys.argv[9])
-max_seq = int(sys.argv[10])
+max_batch = int(sys.argv[6])
+max_seq = int(sys.argv[7])
+atom_args_json = sys.argv[8] if len(sys.argv) > 8 else "{}"
+atom_extra = json.loads(atom_args_json)
 
 os.makedirs(hidden_dir, exist_ok=True)
 
-# ---- Load model via ATOM infrastructure ----
-from atom.config import Config
-from atom.model_loader.loader import load_model
-from atom.utils import resolve_obj_by_qualname
+# ---- Extract weights from checkpoint (CPU only, before engine) ----
+hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+hf_text = getattr(hf_config, "text_config", hf_config)
+num_layers = hf_text.num_hidden_layers
+hidden_dim = hf_text.hidden_size
+norm_eps = getattr(hf_text, "rms_norm_eps", 1e-6)
 
-# Import support_model_arch_dict to resolve model class
-from atom.model_engine.model_runner import support_model_arch_dict
+from safetensors.torch import load_file as st_load
+st_files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
 
-config = Config(
-    model_path,
-    tensor_parallel_size=tp_size,
-    enforce_eager=True,
-    trust_remote_code=True,
-    max_num_batched_tokens=32768,
-    max_num_seqs=64,
-)
+lm_head_weight = embed_weight = norm_weight = None
 
-hf_config = config.hf_config
-arch = hf_config.architectures[0]
-if arch not in support_model_arch_dict:
-    raise ValueError(f"Unsupported architecture: {arch}")
-
-model_class = resolve_obj_by_qualname(support_model_arch_dict[arch])
-
-# Remap quantization layers before model construction
-config.quant_config.remap_layer_name(
-    config.hf_config,
-    packed_modules_mapping=getattr(model_class, "packed_modules_mapping", {}),
-    quant_exclude_name_mapping=getattr(model_class, "quant_exclude_name_mapping", {}),
-)
-
-# For TP > 1, we need distributed init.  For TP = 1, run directly.
-if tp_size > 1:
-    from atom.utils import init_dist_env, get_distributed_init_method
-    init_method = get_distributed_init_method(config.master_addr, config.port)
-    init_dist_env(tp_size, rankID=0, backend="nccl",
-                  distributed_init_method=init_method)
-
-device = torch.device("cuda:0")
-torch.cuda.set_device(device)
-torch.set_default_dtype(config.torch_dtype)
-torch.set_default_device(device)
-
-logger.info(f"Loading teacher model: {model_path} (tp={tp_size})")
-model = model_class(config)
-
-fused_fn = None
-if hasattr(model, "load_fused_expert_weights"):
-    fused_fn = model.load_fused_expert_weights
-
-torch.set_default_device(None)
-load_model(model, config.model, config.hf_config, config.load_dummy,
-           load_fused_expert_weights_fn=fused_fn)
-
-model.eval()
-for p in model.parameters():
-    p.requires_grad_(False)
-
-logger.info(f"Teacher model loaded: {arch}")
-
-# Determine hidden dim from model
-D = None
-for name, param in model.named_parameters():
-    if "lm_head" in name and "weight" in name:
-        D = param.shape[1]
-        break
-if D is None:
-    raise RuntimeError("Could not determine hidden_dim from lm_head.weight")
-
-# Extract lm_head weight and save to shared memory
-lm_head_weight = None
-for name, param in model.named_parameters():
-    if "lm_head" in name and "weight" in name:
-        lm_head_weight = param.detach().cpu()
+for sf in st_files:
+    tensors = st_load(sf, device="cpu")
+    for name, tensor in tensors.items():
+        if "lm_head" in name and "weight" in name and lm_head_weight is None:
+            lm_head_weight = tensor
+        if "embed_tokens" in name and "weight" in name and embed_weight is None:
+            embed_weight = tensor
+        if norm_weight is None and "norm.weight" in name and "layer" not in name:
+            if any(p in name for p in ["model.norm.weight",
+                                        "language_model.model.norm.weight"]):
+                norm_weight = tensor
+    del tensors
+    if all(w is not None for w in [lm_head_weight, embed_weight, norm_weight]):
         break
 
-if lm_head_weight is not None:
-    lm_head_path = os.path.join(hidden_dir, "lm_head_weight.pt")
-    torch.save(lm_head_weight, lm_head_path)
-    logger.info(f"lm_head.weight saved: {lm_head_weight.shape}")
+if lm_head_weight is None or embed_weight is None:
+    raise RuntimeError(
+        f"Could not find lm_head/embed_tokens weights in {model_path}. "
+        f"Searched {len(st_files)} safetensors files."
+    )
 
-# ---- Initialize MORI-IO (target role) ----
-from mori.io import (
-    IOEngine, IOEngineConfig, BackendType, RdmaBackendConfig,
-    EngineDesc, MemoryDesc,
-)
-
-mori_config = IOEngineConfig(host=mori_host, port=mori_port)
-mori_engine = IOEngine(key="teacher_worker", config=mori_config)
-mori_engine.create_backend(BackendType.RDMA, RdmaBackendConfig(
-    qp_per_transfer=mori_qp,
-))
-
-# Pre-allocate GPU buffers for hidden state transfer
-max_elems = max_batch * max_seq * D
-hidden_buf = torch.zeros(max_elems, dtype=torch.bfloat16, device=device)
-embed_buf = torch.zeros(max_elems, dtype=torch.bfloat16, device=device)
-
-hidden_mem = mori_engine.register_torch_tensor(hidden_buf)
-embed_mem = mori_engine.register_torch_tensor(embed_buf)
-
+torch.save(lm_head_weight, os.path.join(hidden_dir, "lm_head_weight.pt"))
+torch.save(embed_weight, os.path.join(hidden_dir, "embed_weight.pt"))
+if norm_weight is not None:
+    torch.save({"weight": norm_weight, "eps": norm_eps},
+               os.path.join(hidden_dir, "norm_weight.pt"))
 logger.info(
-    f"MORI-IO initialized: max_elems={max_elems}, "
-    f"buf_size={max_elems * 2 / 1024**2:.1f} MB each"
+    "Weights saved: lm_head=%s, embed=%s, norm=%s",
+    lm_head_weight.shape, embed_weight.shape,
+    norm_weight.shape if norm_weight is not None else "N/A",
 )
+del lm_head_weight, embed_weight, norm_weight
 
-# ---- Signal ready with MORI-IO metadata ----
+# ---- Create AsyncLLMEngine (handles TP internally) ----
+from atom.rollout.async_engine import AsyncLLMEngine
+logging.getLogger("atom").setLevel(logging.WARNING)
+
+engine_kwargs = dict(
+    tensor_parallel_size=tp_size,
+    enforce_eager=atom_extra.pop("enforce_eager", True),
+    trust_remote_code=atom_extra.pop("trust_remote_code", True),
+    max_num_batched_tokens=atom_extra.pop("max_num_batched_tokens", 32768),
+    max_num_seqs=atom_extra.pop("max_num_seqs", 64),
+)
+for k, v in atom_extra.items():
+    engine_kwargs[k] = v
+
+logger.info("Creating AsyncLLMEngine: %s", engine_kwargs)
+engine = AsyncLLMEngine(model_path, **engine_kwargs)
+logger.info("AsyncLLMEngine created successfully")
+
+# ---- Configure hidden states extraction ----
+aux_layer_ids = [1, num_layers // 2 - 1, num_layers - 4]
+max_seq = engine_kwargs.get("max_model_len", max_seq)
+mooncake_config = {
+    "local_hostname": os.environ.get("MOONCAKE_LOCAL_HOSTNAME", "localhost"),
+    "metadata_server": os.environ.get("MOONCAKE_METADATA_SERVER", ""),
+    "master_server_address": os.environ.get("MOONCAKE_MASTER_SERVER", ""),
+    "protocol": os.environ.get("MOONCAKE_PROTOCOL", "tcp"),
+    "device_name": os.environ.get("MOONCAKE_DEVICE_NAME", ""),
+    "global_segment_size": int(os.environ.get(
+        "MOONCAKE_GLOBAL_SEGMENT_SIZE", str(16 * 1024**3))),
+    "local_buffer_size": int(os.environ.get(
+        "MOONCAKE_LOCAL_BUFFER_SIZE", str(4 * 1024**3))),
+    "enable_gpu_direct": os.environ.get("MOONCAKE_ENABLE_GPU_DIRECT", "0") == "1",
+    "enable_hard_pin": os.environ.get("MOONCAKE_ENABLE_HARD_PIN", "0") == "1",
+    "max_seq_len": max_seq,
+    "hidden_dim": hidden_dim,
+}
+engine.configure_hidden_states(aux_layer_ids, mooncake_config)
+logger.info("Hidden states configured: aux_layers=%s", aux_layer_ids)
+
+# ---- Signal ready ----
 resp_f = open(resp_fifo, "w")
 resp_f.write(json.dumps({
     "status": "ready",
-    "mori_engine_desc": mori_engine.get_engine_desc().pack().hex(),
-    "mori_hidden_mem": hidden_mem.pack().hex(),
-    "mori_embed_mem": embed_mem.pack().hex(),
-    "hidden_dim": D,
-    "max_batch": max_batch,
-    "max_seq": max_seq,
+    "hidden_dim": hidden_dim,
+    "num_layers": num_layers,
+    "aux_layer_indices": aux_layer_ids,
 }) + "\\n")
 resp_f.flush()
 
 cmd_f = open(cmd_fifo, "r")
+req_counter = 0
 
 # ---- Command loop ----
 for line in cmd_f:
@@ -217,67 +221,33 @@ for line in cmd_f:
     msg = json.loads(line)
     cmd = msg["cmd"]
 
-    if cmd == "register_engine":
-        # Register the reader's (training rank 0) engine for RDMA
-        reader_desc_bytes = bytes.fromhex(msg["engine_desc"])
-        reader_desc = EngineDesc.unpack(reader_desc_bytes)
-        mori_engine.register_remote_engine(reader_desc)
-        logger.info("Registered reader engine for RDMA")
-        resp_f.write(json.dumps({"status": "ok"}) + "\\n")
-        resp_f.flush()
-
-    elif cmd == "extract_hidden":
+    if cmd == "extract_hidden":
         input_path = msg["input_path"]
-
         data = torch.load(input_path, map_location="cpu", weights_only=True)
-        input_ids = data["input_ids"].to(device)
+        input_ids_batch = data["input_ids"]  # [B, T]
+        B, T = input_ids_batch.shape
+        req_counter += 1
 
-        B, T = input_ids.shape
-        positions = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
-        positions = positions.reshape(-1)
-        flat_ids = input_ids.reshape(-1)
+        input_ids_list = [input_ids_batch[i].tolist() for i in range(B)]
+        data_ids = [f"atom_{os.getpid()}_{req_counter}_{i}" for i in range(B)]
 
-        with torch.no_grad():
-            # Get input embeddings
-            token_embeds = model.model.get_input_embeddings(flat_ids)
-
-            # Forward pass through the model
-            hidden_states = model.model(flat_ids, positions)
-
-            # Handle aux_hidden_states return
-            if isinstance(hidden_states, tuple):
-                hidden_states, aux = hidden_states
-            else:
-                aux = []
-
-        # Write directly into pre-registered GPU buffers (no CPU copy)
-        actual_elems = B * T * D
-        hidden_buf[:actual_elems].copy_(hidden_states.reshape(-1))
-        embed_buf[:actual_elems].copy_(token_embeds.reshape(-1)[:actual_elems])
-
-        # Synchronize to ensure writes are visible for RDMA read
-        torch.cuda.synchronize(device)
+        t0 = time.monotonic()
+        engine.generate_hidden_states(input_ids_list, data_ids)
+        elapsed = time.monotonic() - t0
+        logger.info("extract_hidden: B=%d, T=%d, %.2fs", B, T, elapsed)
 
         resp_f.write(json.dumps({
-            "status": "ok", "B": B, "T": T, "D": D,
+            "status": "ok", "B": B, "T": T, "D": hidden_dim,
+            "mooncake_keys": data_ids,
         }) + "\\n")
         resp_f.flush()
-
-        del data, input_ids, positions, flat_ids, hidden_states, token_embeds
-        torch.cuda.empty_cache()
+        del data, input_ids_batch, input_ids_list
 
     elif cmd == "shutdown":
-        # Cleanup MORI-IO
         try:
-            mori_engine.deregister_memory(hidden_mem)
-            mori_engine.deregister_memory(embed_mem)
+            engine.shutdown()
         except Exception:
             pass
-        try:
-            del model
-        except Exception:
-            pass
-        torch.cuda.empty_cache()
         gc.collect()
         resp_f.write(json.dumps({"status": "ok"}) + "\\n")
         resp_f.flush()
@@ -289,16 +259,16 @@ resp_f.close()
 
 
 class AtomTeacherEngine:
-    """ATOM-based teacher inference for draft model distillation.
+    """ATOM-based teacher inference for Eagle3 speculative distillation.
 
     Runs the teacher model in a separate subprocess on dedicated GPUs,
     with tensor parallelism and MXFP4/FP8 quantization.  Hidden states
-    are transferred via MORI-IO P2P RDMA (GPU Direct).
+    (3 aux layers + last hidden) are transferred via Mooncake TCP.
 
     Communication protocol:
     - Named FIFOs for JSON commands (small control messages)
-    - MORI-IO ``session.read()`` for GPU-to-GPU tensor transfer
-    - ``/dev/shm`` files for ``input_ids`` (a few KB, not worth RDMA)
+    - Mooncake TCP ``EagleMooncakeStore`` for hidden state transfer
+    - ``/dev/shm`` files for ``input_ids`` (a few KB, not worth Mooncake)
     """
 
     def __init__(
@@ -307,9 +277,10 @@ class AtomTeacherEngine:
         tensor_parallel_size: int = 4,
         gpu_ids: list[int] | None = None,
         *,
-        mori_io_host: str = "127.0.0.1",
-        mori_io_port: int = 0,
-        mori_io_qp_per_transfer: int = 2,
+        mooncake_config: Any = None,
+        transport: str = "mooncake",
+        quantization: str = "",
+        atom_config: dict[str, Any] | None = None,
         max_batch_size: int = 32,
         max_seq_len: int = 4096,
         local_device: torch.device | None = None,
@@ -318,14 +289,16 @@ class AtomTeacherEngine:
         self._tp_size = tensor_parallel_size
         self._gpu_ids = gpu_ids or list(range(tensor_parallel_size))
         self._hidden_dir = _HIDDEN_XFER_DIR
-        self._mori_host = mori_io_host
-        self._mori_port = mori_io_port
-        self._mori_qp = mori_io_qp_per_transfer
+        self._mooncake_config = mooncake_config
+        self._transport = transport
+        self._quantization = quantization
+        self._atom_config = atom_config or {}
         self._max_batch = max_batch_size
         self._max_seq = max_seq_len
         self._local_device = local_device or torch.device("cuda:0")
 
         self._proc: subprocess.Popen | None = None
+        self._fifo_dir: str | None = None
         self._cmd_fifo: str | None = None
         self._resp_fifo: str | None = None
         self._cmd_f = None
@@ -333,15 +306,11 @@ class AtomTeacherEngine:
         self._initialized = False
         self._req_counter = 0
 
-        # MORI-IO state
-        self._mori_engine = None
-        self._hidden_session = None
-        self._embed_session = None
-        self._hidden_buf: torch.Tensor | None = None
-        self._embed_buf: torch.Tensor | None = None
-        self._local_hidden_mem = None
-        self._local_embed_mem = None
         self._hidden_dim: int = 0
+        self._num_layers: int = 0
+        self._cmd_lock = threading.Lock()
+        self._aux_layer_indices: list[int] = []
+        self._mooncake_store: Any = None
 
     @property
     def is_alive(self) -> bool:
@@ -351,22 +320,208 @@ class AtomTeacherEngine:
             and self._proc.poll() is None
         )
 
+    def _describe_worker_exit(self, exit_code: int) -> str:
+        if exit_code < 0:
+            sig = -exit_code
+            signal_name = signal.Signals(sig).name if sig in signal.Signals._value2member_map_ else f"SIG{sig}"
+            return f"exited by signal {signal_name} ({sig})"
+        return f"exited with code {exit_code}"
+
+    def _terminate_worker(self, reason: str) -> None:
+        if self._proc is None:
+            return
+
+        if self._proc.poll() is None:
+            logger.warning(
+                "AtomTeacherEngine: terminating worker pid=%d (%s).",
+                self._proc.pid,
+                reason,
+            )
+            try:
+                os.killpg(self._proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except Exception as exc:
+                logger.debug("Failed to SIGTERM worker group: %s", exc)
+            try:
+                self._proc.wait(timeout=_WORKER_TERMINATE_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                logger.warning(
+                    "AtomTeacherEngine: worker pid=%d did not exit after %.1fs; sending SIGKILL.",
+                    self._proc.pid,
+                    _WORKER_TERMINATE_GRACE_SECONDS,
+                )
+                try:
+                    os.killpg(self._proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except Exception as exc:
+                    logger.debug("Failed to SIGKILL worker group: %s", exc)
+                try:
+                    self._proc.wait(timeout=5)
+                except Exception:
+                    pass
+
+    def _cleanup_ipc_resources(self) -> None:
+        if hasattr(self, "_worker_log_f") and self._worker_log_f:
+            try:
+                self._worker_log_f.close()
+            except Exception:
+                pass
+            self._worker_log_f = None
+        for f in [self._cmd_f, self._resp_f]:
+            try:
+                if f:
+                    f.close()
+            except Exception:
+                pass
+        self._cmd_f = None
+        self._resp_f = None
+
+        for p in [self._cmd_fifo, self._resp_fifo]:
+            try:
+                if p and os.path.exists(p):
+                    os.unlink(p)
+            except Exception:
+                pass
+        self._cmd_fifo = None
+        self._resp_fifo = None
+
+        try:
+            if self._fifo_dir and os.path.isdir(self._fifo_dir):
+                os.rmdir(self._fifo_dir)
+        except Exception:
+            pass
+        self._fifo_dir = None
+
+    def _wait_for_ready(self, timeout_s: float) -> dict[str, Any]:
+        if self._resp_fifo is None:
+            raise RuntimeError("Response FIFO path is missing")
+        if self._proc is None:
+            raise RuntimeError("Teacher worker process is not started")
+
+        fd = os.open(self._resp_fifo, os.O_RDONLY | os.O_NONBLOCK)
+        deadline = time.monotonic() + timeout_s
+        buf = ""
+
+        try:
+            while True:
+                poll_code = self._proc.poll()
+                if poll_code is not None:
+                    raise RuntimeError(
+                        f"teacher worker {self._describe_worker_exit(poll_code)} before READY",
+                    )
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"teacher worker did not send READY within {timeout_s:.1f}s",
+                    )
+
+                ready, _, _ = select.select([fd], [], [], min(0.5, remaining))
+                if not ready:
+                    continue
+
+                try:
+                    chunk = os.read(fd, 4096)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    continue
+
+                buf += chunk.decode("utf-8", errors="replace")
+                if "\n" not in buf:
+                    continue
+
+                line, _, _ = buf.partition("\n")
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    return json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"teacher worker sent invalid READY payload: {line[:200]!r}",
+                    ) from exc
+        finally:
+            os.close(fd)
+
+    def _open_cmd_writer(self, timeout_s: float) -> Any:
+        if self._cmd_fifo is None:
+            raise RuntimeError("Command FIFO path is missing")
+        if self._proc is None:
+            raise RuntimeError("Teacher worker process is not started")
+
+        deadline = time.monotonic() + timeout_s
+        while True:
+            poll_code = self._proc.poll()
+            if poll_code is not None:
+                raise RuntimeError(
+                    f"teacher worker {self._describe_worker_exit(poll_code)} before command channel setup",
+                )
+            try:
+                fd = os.open(self._cmd_fifo, os.O_WRONLY | os.O_NONBLOCK)
+                return os.fdopen(fd, "w")
+            except OSError as exc:
+                if exc.errno != errno.ENXIO:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"teacher worker did not open command FIFO within {timeout_s:.1f}s",
+                    ) from exc
+                time.sleep(0.1)
+
+    def _read_response_line(self, *, timeout_s: float, context: str) -> str:
+        if self._resp_f is None:
+            raise RuntimeError("Response FIFO is not open")
+        if self._proc is None:
+            raise RuntimeError("Teacher worker process is not started")
+
+        deadline = time.monotonic() + timeout_s
+        resp_fd = self._resp_f.fileno()
+        while True:
+            poll_code = self._proc.poll()
+            if poll_code is not None:
+                raise RuntimeError(
+                    f"teacher worker {self._describe_worker_exit(poll_code)} while waiting for {context}",
+                )
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"timed out waiting for {context} after {timeout_s:.1f}s",
+                )
+
+            ready, _, _ = select.select([resp_fd], [], [], min(0.5, remaining))
+            if not ready:
+                continue
+
+            resp_line = self._resp_f.readline()
+            if not resp_line:
+                raise RuntimeError(
+                    f"response FIFO closed while waiting for {context}; worker likely crashed",
+                )
+            return resp_line
+
     def start(self) -> None:
-        """Start the teacher worker subprocess and set up MORI-IO RDMA."""
+        """Start the teacher worker subprocess and set up Mooncake store."""
         if self.is_alive:
             return
 
         os.makedirs(self._hidden_dir, exist_ok=True)
 
-        fifo_dir = tempfile.mkdtemp(prefix="lumenrl_teacher_fifo_")
-        self._cmd_fifo = os.path.join(fifo_dir, "cmd")
-        self._resp_fifo = os.path.join(fifo_dir, "resp")
+        self._fifo_dir = tempfile.mkdtemp(prefix="lumenrl_teacher_fifo_")
+        self._cmd_fifo = os.path.join(self._fifo_dir, "cmd")
+        self._resp_fifo = os.path.join(self._fifo_dir, "resp")
         os.mkfifo(self._cmd_fifo)
         os.mkfifo(self._resp_fifo)
 
         # Build environment: isolate from torchrun, set teacher GPUs
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in self._gpu_ids)
+        gpu_str = ",".join(str(g) for g in self._gpu_ids)
+        env["CUDA_VISIBLE_DEVICES"] = gpu_str
+        env["HIP_VISIBLE_DEVICES"] = gpu_str
+        env.pop("ROCR_VISIBLE_DEVICES", None)
         env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
         for key in list(env.keys()):
             if any(key.startswith(p) for p in [
@@ -378,16 +533,90 @@ class AtomTeacherEngine:
             ]):
                 del env[key]
 
+        env["GLOG_minloglevel"] = "3"
+        env["GLOG_v"] = "0"
+        env["MOONCAKE_LOG_LEVEL"] = "FATAL"
+        env["AITER_LOG_LEVEL"] = "WARNING"
+        if "AITER_CONFIG_GEMM_BF16" not in env:
+            _bf16_cfg = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "..", "..", "..", "third_party", "aiter", "aiter",
+                "configs", "model_configs", "kimik2_bf16_tuned_gemm.csv",
+            )
+            if not os.path.exists(_bf16_cfg):
+                _bf16_cfg = "/root/aiter/aiter/configs/model_configs/kimik2_bf16_tuned_gemm.csv"
+            env["AITER_CONFIG_GEMM_BF16"] = _bf16_cfg
+
         attn_backend = os.environ.get("VLLM_ROCM_ATTN_BACKEND")
         if attn_backend:
             env["VLLM_ROCM_ATTN_BACKEND"] = attn_backend
 
+        # Set Mooncake env vars for worker subprocess
+        if self._transport == "mooncake" and self._mooncake_config is not None:
+            mc = self._mooncake_config
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("8.8.8.8", 80))
+                local_ip = s.getsockname()[0]
+                s.close()
+            except Exception:
+                local_ip = socket.gethostbyname(socket.gethostname())
+
+            master_addr = getattr(mc, "master_server_address", "") or ""
+            metadata_server = getattr(mc, "metadata_server", "") or ""
+            protocol = getattr(mc, "protocol", "tcp") or "tcp"
+            device_name = getattr(mc, "device_name", "") or ""
+
+            env["MOONCAKE_LOCAL_HOSTNAME"] = local_ip
+            env["MOONCAKE_MASTER_SERVER"] = master_addr
+            env["MOONCAKE_METADATA_SERVER"] = metadata_server
+            env["MOONCAKE_PROTOCOL"] = protocol
+            env["MOONCAKE_DEVICE_NAME"] = device_name
+            env["MOONCAKE_GLOBAL_SEGMENT_SIZE"] = str(
+                mc.global_segment_size_bytes
+                if hasattr(mc, "global_segment_size_bytes")
+                else 17179869184
+            )
+            env["MOONCAKE_LOCAL_BUFFER_SIZE"] = str(
+                mc.local_buffer_size_bytes
+                if hasattr(mc, "local_buffer_size_bytes")
+                else 4294967296
+            )
+            env["MOONCAKE_ENABLE_GPU_DIRECT"] = "0"
+            env["MOONCAKE_ENABLE_HARD_PIN"] = "0"
+
+            try:
+                from transformers import AutoConfig as _AC
+                _hf = _AC.from_pretrained(self._model_name, trust_remote_code=True)
+                _hf_text = getattr(_hf, "text_config", _hf)
+                _hdim = getattr(_hf_text, "hidden_size", 4096)
+            except Exception:
+                _hdim = 4096
+            from lumenrl.transfer.eagle_mooncake_store import calculate_eagle3_buffer_size
+            worker_host_buf = calculate_eagle3_buffer_size(
+                max_seq_len=self._max_seq, batch_size=self._max_batch,
+                hidden_dim=_hdim, safety_margin=2.0,
+            )
+            env["MOONCAKE_HOST_BUFFER_SIZE"] = str(worker_host_buf)
+
+            logger.info(
+                "Mooncake env vars for ATOM worker: local=%s, master=%s, "
+                "metadata=%s, protocol=%s",
+                local_ip, master_addr, metadata_server, protocol,
+            )
+
         logger.info(
             "AtomTeacherEngine: starting teacher worker for %s "
-            "(tp=%d, gpus=%s, mori=%s:%d)",
+            "(tp=%d, gpus=%s, transport=%s, quant=%s)",
             self._model_name, self._tp_size, self._gpu_ids,
-            self._mori_host, self._mori_port,
+            self._transport, self._quantization or "none",
         )
+
+        atom_args_json = json.dumps(self._atom_config)
+
+        worker_log_path = os.path.join(self._hidden_dir, "atom_teacher_worker.log")
+        self._worker_log_f = open(worker_log_path, "w")
+        logger.info("AtomTeacherEngine: worker log -> %s", worker_log_path)
 
         self._proc = subprocess.Popen(
             [
@@ -395,149 +624,167 @@ class AtomTeacherEngine:
                 self._cmd_fifo, self._resp_fifo,
                 self._model_name, str(self._tp_size),
                 self._hidden_dir,
-                self._mori_host, str(self._mori_port), str(self._mori_qp),
                 str(self._max_batch), str(self._max_seq),
+                atom_args_json,
             ],
             stdin=subprocess.DEVNULL,
-            stdout=None,
-            stderr=None,
+            stdout=self._worker_log_f,
+            stderr=subprocess.STDOUT,
             env=env,
             start_new_session=True,
         )
-
-        self._resp_f = open(self._resp_fifo, "r")
-
-        resp_line = self._resp_f.readline()
-        if not resp_line:
-            raise RuntimeError(
-                "Teacher worker subprocess exited before ready. "
-                "Check stderr for model loading errors."
+        try:
+            resp = self._wait_for_ready(timeout_s=_READY_TIMEOUT_SECONDS)
+            if resp.get("status") != "ready":
+                raise RuntimeError(f"worker reported non-ready startup status: {resp}")
+            self._cmd_f = self._open_cmd_writer(
+                timeout_s=_CMD_FIFO_OPEN_TIMEOUT_SECONDS,
             )
-        resp = json.loads(resp_line)
-        if resp.get("status") != "ready":
-            raise RuntimeError(f"Teacher worker failed to start: {resp}")
-
-        self._cmd_f = open(self._cmd_fifo, "w")
-
-        # ---- Set up MORI-IO (initiator / reader role) ----
-        from mori.io import (
-            IOEngine, IOEngineConfig, BackendType, RdmaBackendConfig,
-            EngineDesc, MemoryDesc,
-        )
+            self._resp_f = open(self._resp_fifo, "r")
+        except Exception as exc:
+            worker_log_tail = ""
+            try:
+                worker_log_path = os.path.join(self._hidden_dir, "atom_teacher_worker.log")
+                if os.path.exists(worker_log_path):
+                    with open(worker_log_path) as wlf:
+                        lines = wlf.readlines()
+                    worker_log_tail = "".join(lines[-50:])
+            except Exception:
+                pass
+            logger.error(
+                "AtomTeacherEngine: startup failed before READY or channel setup (%s). "
+                "Root-cause hint: worker crash, missing READY, or startup timeout.\n"
+                "--- worker log (last 50 lines) ---\n%s\n--- end worker log ---",
+                exc, worker_log_tail,
+            )
+            self._terminate_worker("startup failure")
+            self._cleanup_ipc_resources()
+            self._proc = None
+            self._initialized = False
+            raise RuntimeError(
+                f"Failed to start AtomTeacherEngine worker: {exc}",
+            ) from exc
 
         self._hidden_dim = resp["hidden_dim"]
-        max_elems = self._max_batch * self._max_seq * self._hidden_dim
+        self._num_layers = resp.get("num_layers", 0)
+        self._aux_layer_indices = resp.get("aux_layer_indices", [])
 
-        # Parse remote (worker) MORI-IO metadata
-        remote_engine_desc = EngineDesc.unpack(
-            bytes.fromhex(resp["mori_engine_desc"])
-        )
-        remote_hidden_mem = MemoryDesc.unpack(
-            bytes.fromhex(resp["mori_hidden_mem"])
-        )
-        remote_embed_mem = MemoryDesc.unpack(
-            bytes.fromhex(resp["mori_embed_mem"])
-        )
+        # Set up training-side Mooncake store
+        if self._transport == "mooncake" and self._mooncake_config is not None:
+            try:
+                from lumenrl.transfer.eagle_mooncake_store import EagleMooncakeStore
+                from lumenrl.transfer.mooncake_config import MooncakeConfig
 
-        # Initialize local MORI-IO engine
-        local_config = IOEngineConfig(host=self._mori_host, port=0)
-        self._mori_engine = IOEngine(key="teacher_reader", config=local_config)
-        self._mori_engine.create_backend(
-            BackendType.RDMA, RdmaBackendConfig(qp_per_transfer=self._mori_qp)
-        )
+                mc = self._mooncake_config
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    s.connect(("8.8.8.8", 80))
+                    local_ip = s.getsockname()[0]
+                    s.close()
+                except Exception:
+                    local_ip = socket.gethostbyname(socket.gethostname())
 
-        # Exchange engine descriptors
-        local_desc = self._mori_engine.get_engine_desc()
-        self._mori_engine.register_remote_engine(remote_engine_desc)
-
-        # Tell worker to register our engine
-        resp2 = self._send_cmd({
-            "cmd": "register_engine",
-            "engine_desc": local_desc.pack().hex(),
-        })
-        if resp2.get("status") != "ok":
-            raise RuntimeError(f"Failed to register reader engine: {resp2}")
-
-        # Pre-allocate local GPU buffers on training device
-        self._hidden_buf = torch.zeros(
-            max_elems, dtype=torch.bfloat16, device=self._local_device,
-        )
-        self._embed_buf = torch.zeros(
-            max_elems, dtype=torch.bfloat16, device=self._local_device,
-        )
-        self._local_hidden_mem = self._mori_engine.register_torch_tensor(
-            self._hidden_buf
-        )
-        self._local_embed_mem = self._mori_engine.register_torch_tensor(
-            self._embed_buf
-        )
-
-        # Create RDMA sessions (local <- remote)
-        self._hidden_session = self._mori_engine.create_session(
-            self._local_hidden_mem, remote_hidden_mem,
-        )
-        self._embed_session = self._mori_engine.create_session(
-            self._local_embed_mem, remote_embed_mem,
-        )
-
-        if self._hidden_session is None or self._embed_session is None:
-            raise RuntimeError(
-                "Failed to create MORI-IO RDMA sessions. "
-                "Check RDMA backend configuration."
-            )
+                mc_cfg = MooncakeConfig(
+                    master_server_address=getattr(mc, "master_server_address", ""),
+                    metadata_server=getattr(mc, "metadata_server", ""),
+                    local_hostname=local_ip,
+                    protocol=getattr(mc, "protocol", "tcp"),
+                    device_name=getattr(mc, "device_name", ""),
+                    global_segment_size=getattr(mc, "global_segment_size", "16GB"),
+                    local_buffer_size=getattr(mc, "local_buffer_size", "4GB"),
+                    max_seq_len=self._max_seq,
+                    hidden_dim=self._hidden_dim,
+                    get_retry_wait_seconds=getattr(mc, "get_retry_wait_seconds", 1.0),
+                    get_retry_max_wait_seconds=getattr(mc, "get_retry_max_wait_seconds", 90.0),
+                )
+                self._mooncake_store = EagleMooncakeStore(mc_cfg)
+                self._mooncake_store.setup(self._local_device)
+                logger.info("Training-side EagleMooncakeStore initialized (ATOM)")
+            except Exception as e:
+                logger.error("Failed to init training-side Mooncake: %s", e)
+                self._terminate_worker("mooncake initialization failure")
+                self._cleanup_ipc_resources()
+                self._proc = None
+                self._initialized = False
+                raise
 
         self._initialized = True
         logger.info(
             "AtomTeacherEngine: teacher worker ready (pid=%d, hidden_dim=%d, "
-            "MORI-IO RDMA sessions established).",
+            "aux_layers=%s, transport=%s).",
             self._proc.pid, self._hidden_dim,
+            self._aux_layer_indices, self._transport,
         )
 
-    def _send_cmd(self, cmd: dict) -> dict:
-        """Send a JSON command and read the response."""
+    def _send_cmd_unlocked(
+        self,
+        cmd: dict[str, Any],
+        *,
+        timeout_s: float = _DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    ) -> dict:
+        """Send a JSON command and read the response (caller holds _cmd_lock)."""
         if not self.is_alive:
             raise RuntimeError("Teacher worker is not running")
-        self._cmd_f.write(json.dumps(cmd) + "\n")
-        self._cmd_f.flush()
-        resp_line = self._resp_f.readline()
-        if not resp_line:
-            raise RuntimeError("Teacher worker closed response FIFO")
+        try:
+            self._cmd_f.write(json.dumps(cmd) + "\n")
+            self._cmd_f.flush()
+        except BrokenPipeError as exc:
+            raise RuntimeError(
+                "Teacher worker command FIFO is broken; worker likely crashed",
+            ) from exc
+        resp_line = self._read_response_line(
+            timeout_s=timeout_s,
+            context=f"response to cmd={cmd.get('cmd', 'unknown')}",
+        )
         return json.loads(resp_line)
+
+    def _send_cmd(
+        self,
+        cmd: dict[str, Any],
+        *,
+        timeout_s: float = _DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    ) -> dict:
+        """Send a JSON command and read the response (thread-safe)."""
+        with self._cmd_lock:
+            return self._send_cmd_unlocked(cmd, timeout_s=timeout_s)
 
     def extract_hidden_states(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
+        recv_device: torch.device | None = None,
     ) -> dict[str, torch.Tensor]:
         """Run teacher forward pass, return hidden states on training GPU.
 
         Args:
             input_ids: ``[B, T]`` token ids.
             attention_mask: ``[B, T]`` mask (1 = valid, 0 = pad).
+            recv_device: Device for received tensors. Defaults to local GPU.
 
         Returns:
-            Dict with ``hidden_states`` ``[B, T, D]``,
-            ``token_embeds`` ``[B, T, D]``, and ``input_ids``.
-            All tensors are on ``self._local_device`` (training GPU).
+            Dict with ``hidden_states`` ``[B, T, 3*D]`` (3 aux layers),
+            ``token_embeds`` ``[B, T, D]``,
+            ``last_hidden_states`` ``[B, T, D]``,
+            and ``input_ids``.
+            All tensors on ``recv_device`` or ``self._local_device``.
         """
         if not self.is_alive:
             self.start()
 
-        self._req_counter += 1
-        tag = f"req_{self._req_counter}"
-        input_path = os.path.join(self._hidden_dir, f"{tag}_input.pt")
+        with self._cmd_lock:
+            self._req_counter += 1
+            tag = f"req_{self._req_counter}"
+            input_path = os.path.join(self._hidden_dir, f"{tag}_input.pt")
 
-        # Save input_ids to shared memory (small, a few KB)
-        torch.save(
-            {"input_ids": input_ids.cpu(), "attention_mask": attention_mask.cpu()},
-            input_path,
-        )
+            torch.save(
+                {"input_ids": input_ids.cpu(), "attention_mask": attention_mask.cpu()},
+                input_path,
+            )
 
-        # Tell worker to run forward pass
-        resp = self._send_cmd({
-            "cmd": "extract_hidden",
-            "input_path": input_path,
-        })
+            resp = self._send_cmd_unlocked({
+                "cmd": "extract_hidden",
+                "input_path": input_path,
+            })
 
         if resp.get("status") != "ok":
             raise RuntimeError(f"extract_hidden failed: {resp}")
@@ -545,108 +792,125 @@ class AtomTeacherEngine:
         B = resp["B"]
         T = resp["T"]
         D = resp["D"]
-        actual_bytes = B * T * D * 2  # bfloat16 = 2 bytes
 
-        # MORI-IO RDMA read: pull hidden_states from worker GPU to local GPU
-        uid_h = self._hidden_session.allocate_transfer_uid()
-        status_h = self._hidden_session.read(0, 0, actual_bytes, uid_h)
-        uid_e = self._embed_session.allocate_transfer_uid()
-        status_e = self._embed_session.read(0, 0, actual_bytes, uid_e)
+        if recv_device is None:
+            recv_device = self._local_device
 
-        # Wait for both transfers to complete
-        status_h.Wait()
-        status_e.Wait()
+        if self._transport == "mooncake":
+            mooncake_keys = resp["mooncake_keys"]
+            num_aux = len(self._aux_layer_indices)
+            training_hidden_size = num_aux * D
 
-        if not status_h.Succeeded():
-            raise RuntimeError(
-                f"MORI-IO hidden_states read failed: {status_h.Message()}"
-            )
-        if not status_e.Succeeded():
-            raise RuntimeError(
-                f"MORI-IO token_embeds read failed: {status_e.Message()}"
-            )
+            # Fetch per-request hidden states from Mooncake and stack
+            all_hs = []
+            all_ids = []
+            all_last_hs = []
 
-        # Cleanup input file
-        try:
-            os.unlink(input_path)
-        except OSError:
-            pass
+            for key in mooncake_keys:
+                shapes = {
+                    "hidden_states": (T, training_hidden_size),
+                    "input_ids": (T,),
+                    "last_hidden_states": (T, D),
+                }
+                dtypes = {
+                    "hidden_states": torch.bfloat16,
+                    "input_ids": torch.int64,
+                    "last_hidden_states": torch.bfloat16,
+                }
 
-        # Return views of local GPU buffers (zero-copy)
-        return {
-            "hidden_states": self._hidden_buf[:B * T * D].reshape(B, T, D),
-            "token_embeds": self._embed_buf[:B * T * D].reshape(B, T, D),
-            "input_ids": input_ids,
-        }
+                output = self._mooncake_store.get(
+                    key, shapes, dtypes, device=recv_device,
+                )
+
+                all_hs.append(output.hidden_states)
+                all_last_hs.append(output.last_hidden_states)
+                all_ids.append(output.input_ids)
+
+                self._mooncake_store.remove_eagle3_tensors(
+                    key, has_last_hidden_states=True, has_target=False,
+                )
+
+            hidden_states = torch.stack(all_hs)         # [B, T, 3*D]
+            last_hidden_states = torch.stack(all_last_hs)  # [B, T, D]
+            ret_ids = torch.stack(all_ids)               # [B, T]
+
+            # First aux layer as embed proxy (same convention as VllmTeacherEngine)
+            token_embeds = hidden_states[:, :, :D].clone()
+
+            return {
+                "hidden_states": hidden_states,
+                "token_embeds": token_embeds,
+                "input_ids": ret_ids,
+                "last_hidden_states": last_hidden_states,
+            }
+        else:
+            raise AssertionError("MORI-IO transport not implemented for 3 aux layers")
 
     def get_lm_head_weight(self) -> torch.Tensor:
-        """Load the teacher's lm_head.weight from shared memory.
-
-        Must be called after ``start()`` -- the worker saves lm_head
-        weight during model loading.  This is a one-time transfer
-        (small enough that /dev/shm is fine).
-        """
+        """Load the teacher's lm_head.weight from shared memory."""
         if not self.is_alive:
             self.start()
-
         path = os.path.join(self._hidden_dir, "lm_head_weight.pt")
         for _ in range(30):
             if os.path.exists(path):
                 return torch.load(path, map_location="cpu", weights_only=True)
             time.sleep(0.5)
         raise FileNotFoundError(
-            f"lm_head_weight.pt not found at {path} after 15s. "
-            "Teacher worker may have failed to load the model."
+            f"lm_head_weight.pt not found at {path} after 15s."
+        )
+
+    def get_embed_weight(self) -> torch.Tensor:
+        """Load the teacher's embed_tokens.weight from shared memory."""
+        if not self.is_alive:
+            self.start()
+        path = os.path.join(self._hidden_dir, "embed_weight.pt")
+        for _ in range(30):
+            if os.path.exists(path):
+                return torch.load(path, map_location="cpu", weights_only=True)
+            time.sleep(0.5)
+        raise FileNotFoundError(
+            f"embed_weight.pt not found at {path} after 15s."
+        )
+
+    def get_norm_weight(self) -> tuple[torch.Tensor, float]:
+        """Load the teacher's final norm weight and eps from shared memory."""
+        if not self.is_alive:
+            self.start()
+        path = os.path.join(self._hidden_dir, "norm_weight.pt")
+        for _ in range(30):
+            if os.path.exists(path):
+                data = torch.load(path, map_location="cpu", weights_only=False)
+                return data["weight"], data["eps"]
+            time.sleep(0.5)
+        raise FileNotFoundError(
+            f"norm_weight.pt not found at {path} after 15s."
         )
 
     def shutdown(self) -> None:
-        """Terminate the teacher worker subprocess and clean up MORI-IO."""
+        """Terminate the teacher worker subprocess and clean up."""
         if self._proc is not None and self._proc.poll() is None:
             try:
-                self._send_cmd({"cmd": "shutdown"})
-            except Exception:
-                pass
-            try:
-                self._proc.terminate()
-                self._proc.wait(timeout=10)
-            except Exception:
-                try:
-                    self._proc.kill()
-                except Exception:
-                    pass
+                self._send_cmd(
+                    {"cmd": "shutdown"},
+                    timeout_s=_SHUTDOWN_COMMAND_TIMEOUT_SECONDS,
+                )
+            except Exception as exc:
+                logger.warning("AtomTeacherEngine: graceful shutdown command failed: %s", exc)
+            self._terminate_worker("shutdown requested")
 
-        # Clean up MORI-IO resources
-        if self._mori_engine is not None:
+        if self._mooncake_store is not None:
             try:
-                if self._local_hidden_mem is not None:
-                    self._mori_engine.deregister_memory(self._local_hidden_mem)
-                if self._local_embed_mem is not None:
-                    self._mori_engine.deregister_memory(self._local_embed_mem)
-            except Exception:
-                pass
-        self._mori_engine = None
-        self._hidden_session = None
-        self._embed_session = None
-        self._hidden_buf = None
-        self._embed_buf = None
-        self._local_hidden_mem = None
-        self._local_embed_mem = None
+                if hasattr(self._mooncake_store, "close"):
+                    self._mooncake_store.close()
+                elif hasattr(self._mooncake_store, "shutdown"):
+                    self._mooncake_store.shutdown()
+            except Exception as exc:
+                logger.warning("AtomTeacherEngine: failed to close Mooncake store: %s", exc)
+            finally:
+                self._mooncake_store = None
 
-        for f in [self._cmd_f, self._resp_f]:
-            try:
-                if f:
-                    f.close()
-            except Exception:
-                pass
-        for p in [self._cmd_fifo, self._resp_fifo]:
-            try:
-                if p:
-                    os.unlink(p)
-            except Exception:
-                pass
+        self._cleanup_ipc_resources()
         self._proc = None
-        self._cmd_f = None
-        self._resp_f = None
         self._initialized = False
         logger.info("AtomTeacherEngine: shutdown complete.")
 

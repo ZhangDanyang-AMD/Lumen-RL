@@ -119,6 +119,7 @@ class AsyncPutManager:
         self._in_flight: Dict[int, Future] = {}
         self._last_error: Optional[BaseException] = None
         self._put_lock = threading.Lock()
+        self._flight_lock = threading.Lock()
 
     def check_last_error(self) -> None:
         if self._last_error is not None:
@@ -127,7 +128,8 @@ class AsyncPutManager:
             raise err
 
     def wait_for_buffer(self, buffer_ptr: int) -> None:
-        future = self._in_flight.pop(buffer_ptr, None)
+        with self._flight_lock:
+            future = self._in_flight.pop(buffer_ptr, None)
         if future is None:
             return
         try:
@@ -141,7 +143,8 @@ class AsyncPutManager:
         future = self._executor.submit(
             self._do_put, keys, buffer_ptrs, sizes, wait_event, device_index
         )
-        self._in_flight[owner_buffer_ptr] = future
+        with self._flight_lock:
+            self._in_flight[owner_buffer_ptr] = future
 
     def _do_put(self, keys, buffer_ptrs, sizes, wait_event=None, device_index=None):
         if wait_event is not None:
@@ -164,13 +167,16 @@ class AsyncPutManager:
             raise RuntimeError(f"async batch_put_from failed: {detail}")
 
     def drain(self) -> None:
-        for _, future in list(self._in_flight.items()):
+        with self._flight_lock:
+            items = list(self._in_flight.items())
+        for _, future in items:
             try:
                 future.result()
             except Exception as exc:
                 if self._last_error is None:
                     self._last_error = exc
-        self._in_flight.clear()
+        with self._flight_lock:
+            self._in_flight.clear()
 
     def shutdown(self) -> None:
         self.drain()

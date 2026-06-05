@@ -1,0 +1,221 @@
+{
+  "backend": "atom",
+  "benchmark": "SPEED-Bench",
+  "target_model": "/dev/shm/Kimi-K2.5-MXFP4",
+  "draft_model": "/dev/shm/Kimi_K25_eagle3_v2_phase2_HF",
+  "phase": "phase2",
+  "checkpoint_step": "22000",
+  "num_speculative_tokens": 3,
+  "batch_size": 32,
+  "categories": {
+    "coding": {
+      "category": "coding",
+      "num_samples": 80,
+      "batch_size": 32,
+      "accept_length": 2.479,
+      "acceptance_rate": 49.3,
+      "total_output_tokens": 163646,
+      "throughput_tps": 958.5,
+      "latency_s": 170.7,
+      "num_draft_tokens": 197898,
+      "num_accepted": 97591,
+      "distribution": {
+        "0": 17666,
+        "1": 17418,
+        "2": 12473,
+        "3": 18409
+      },
+      "errors": 0
+    },
+    "humanities": {
+      "category": "humanities",
+      "num_samples": 8,
+      "batch_size": 32,
+      "accept_length": 1.902,
+      "acceptance_rate": 30.1,
+      "total_output_tokens": 28644,
+      "throughput_tps": 767.8,
+      "latency_s": 37.3,
+      "num_draft_tokens": 45153,
+      "num_accepted": 13577,
+      "distribution": {
+        "0": 6817,
+        "1": 4488,
+        "2": 2149,
+        "3": 1597
+      },
+      "errors": 0
+    },
+    "math": {
+      "category": "math",
+      "num_samples": 18,
+      "batch_size": 32,
+      "accept_length": 3.045,
+      "acceptance_rate": 68.2,
+      "total_output_tokens": 20731,
+      "throughput_tps": 1050.6,
+      "latency_s": 19.7,
+      "num_draft_tokens": 20391,
+      "num_accepted": 13898,
+      "distribution": {
+        "0": 975,
+        "1": 1172,
+        "2": 1224,
+        "3": 3426
+      },
+      "errors": 0
+    },
+    "multilingual": {
+      "category": "multilingual",
+      "num_samples": 80,
+      "batch_size": 32,
+      "accept_length": 1.975,
+      "acceptance_rate": 32.5,
+      "total_output_tokens": 124149,
+      "throughput_tps": 1957.3,
+      "latency_s": 63.4,
+      "num_draft_tokens": 188454,
+      "num_accepted": 61251,
+      "distribution": {
+        "0": 30025,
+        "1": 14508,
+        "2": 8112,
+        "3": 10173
+      },
+      "errors": 0
+    },
+    "qa": {
+      "category": "qa",
+      "num_samples": 80,
+      "batch_size": 32,
+      "accept_length": 2.153,
+      "acceptance_rate": 38.4,
+      "total_output_tokens": 64354,
+      "throughput_tps": 1859.2,
+      "latency_s": 34.6,
+      "num_draft_tokens": 89571,
+      "num_accepted": 34417,
+      "distribution": {
+        "0": 11178,
+        "1": 8254,
+        "2": 5112,
+        "3": 5313
+      },
+      "errors": 0
+    },
+    "rag": {
+      "category": "rag",
+      "num_samples": 80,
+      "batch_size": 32,
+      "accept_length": 2.428,
+      "acceptance_rate": 47.6,
+      "total_output_tokens": 80901,
+      "throughput_tps": 1676.5,
+      "latency_s": 48.3,
+      "num_draft_tokens": 99837,
+      "num_accepted": 47517,
+      "distribution": {
+        "0": 9284,
+        "1": 9070,
+        "2": 6328,
+        "3": 8597
+      },
+      "errors": 0
+    },
+    "reasoning": {
+      "category": "reasoning",
+      "num_samples": 80,
+      "batch_size": 32,
+      "accept_length": 2.305,
+      "acceptance_rate": 43.5,
+      "total_output_tokens": 190090,
+      "throughput_tps": 2019.7,
+      "latency_s": 94.1,
+      "num_draft_tokens": 247158,
+      "num_accepted": 107514,
+      "distribution": {
+        "0": 26844,
+        "1": 22299,
+        "2": 14514,
+        "3": 18729
+      },
+      "errors": 0
+    },
+    "roleplay": {
+      "category": "roleplay",
+      "num_samples": 80,
+      "batch_size": 32,
+      "accept_length": 1.914,
+      "acceptance_rate": 30.5,
+      "total_output_tokens": 164226,
+      "throughput_tps": 1724.4,
+      "latency_s": 95.2,
+      "num_draft_tokens": 257160,
+      "num_accepted": 78348,
+      "distribution": {
+        "0": 38214,
+        "1": 25549,
+        "2": 13072,
+        "3": 8885
+      },
+      "errors": 0
+    },
+    "stem": {
+      "category": "stem",
+      "num_samples": 6,
+      "batch_size": 32,
+      "accept_length": 2.028,
+      "acceptance_rate": 34.3,
+      "total_output_tokens": 18469,
+      "throughput_tps": 579.4,
+      "latency_s": 31.9,
+      "num_draft_tokens": 27297,
+      "num_accepted": 9358,
+      "distribution": {
+        "0": 3800,
+        "1": 2570,
+        "2": 1399,
+        "3": 1330
+      },
+      "errors": 0
+    },
+    "summarization": {
+      "category": "summarization",
+      "num_samples": 80,
+      "batch_size": 32,
+      "accept_length": 2.309,
+      "acceptance_rate": 43.6,
+      "total_output_tokens": 48272,
+      "throughput_tps": 1744.0,
+      "latency_s": 27.7,
+      "num_draft_tokens": 62607,
+      "num_accepted": 27323,
+      "distribution": {
+        "0": 6359,
+        "1": 5946,
+        "2": 4315,
+        "3": 4249
+      },
+      "errors": 0
+    },
+    "writing": {
+      "category": "writing",
+      "num_samples": 80,
+      "batch_size": 32,
+      "accept_length": 1.945,
+      "acceptance_rate": 31.5,
+      "total_output_tokens": 160673,
+      "throughput_tps": 2072.4,
+      "latency_s": 77.5,
+      "num_draft_tokens": 247707,
+      "num_accepted": 78020,
+      "distribution": {
+        "0": 36326,
+        "1": 24205,
+        "2": 12299,
+        "3": 9739
+      },
+      "errors": 0
+    }
+  }
+}

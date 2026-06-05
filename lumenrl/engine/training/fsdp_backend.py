@@ -168,10 +168,11 @@ def _apply_fsdp2_sharding(
     fsdp_config: dict[str, Any],
     fp8_linear: bool = False,
 ) -> nn.Module:
-    """Apply PyTorch FSDP2 ``fully_shard`` to the model.
+    """Apply PyTorch FSDP2 to the model.
 
-    All ranks must have identical, fully-loaded parameters on their
-    local CUDA device before this call. FSDP2 will then shard them.
+    Strategy is controlled by ``fsdp_config["strategy"]``:
+      - ``"full_shard"`` (default): Full FSDP2 sharding on all layers + root.
+      - ``"replicate"``: Pure DDP-like gradient all-reduce via composable replicate.
     """
     import torch.distributed as dist
 
@@ -179,26 +180,32 @@ def _apply_fsdp2_sharding(
         logger.warning("torch.distributed not initialized; returning unsharded model.")
         return model
 
-    from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
-
     rank = dist.get_rank()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     local_device = torch.device(f"cuda:{local_rank}")
 
     model.to(local_device)
 
+    strategy = fsdp_config.get("strategy", "full_shard").lower()
+
+    if strategy == "replicate":
+        from torch.distributed._composable.replicate import replicate
+
+        replicate(model, device_mesh=dist.init_device_mesh("cuda", (dist.get_world_size(),)))
+        logger.info(
+            "[rank %d] FSDP2 replicate applied (pure DDP, reduce_dtype=float32)",
+            rank,
+        )
+        return model
+
+    from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+
     param_dtype = _resolve_dtype(fsdp_config.get("param_dtype"), torch.bfloat16)
     reduce_dtype = _resolve_dtype(fsdp_config.get("reduce_dtype"), torch.float32)
-    if fp8_linear:
-        mp_policy = MixedPrecisionPolicy(
-            param_dtype=param_dtype,
-            reduce_dtype=reduce_dtype,
-        )
-    else:
-        mp_policy = MixedPrecisionPolicy(
-            param_dtype=param_dtype,
-            reduce_dtype=reduce_dtype,
-        )
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=param_dtype,
+        reduce_dtype=reduce_dtype,
+    )
 
     reshard = fsdp_config.get("reshard_after_forward", True)
     offload_policy = None
@@ -223,7 +230,7 @@ def _apply_fsdp2_sharding(
         offload_policy=offload_policy,
     )
 
-    logger.info("[rank %d] FSDP2 fully_shard applied (fp8_reduce=%s, offload=%s)",
+    logger.info("[rank %d] FSDP2 full_shard applied (fp8_reduce=%s, offload=%s)",
                 rank, fp8_linear, fsdp_config.get("param_offload", False))
     return model
 

@@ -29,9 +29,9 @@ LOG_FILE="${OUTPUT_DIR}/${EXP_NAME}.log"
 NUM_GPUS="${NUM_GPUS:-8}"
 
 # ─── Data / model paths ─────────────────────────────────────────────────────
-MODEL_DIR="${MODEL_DIR:-/mnt/raid0/danyzhan/model}"
-DATA_DIR="${DATA_DIR:-/mnt/raid0/danyzhan/data}"
-CKPT_DIR="${CKPT_DIR:-/mnt/raid0/danyzhan/ckpts/lumenrl-dapo/1a-bf16-sync}"
+MODEL_DIR="${MODEL_DIR:-/home/danyzhan/model}"
+DATA_DIR="${DATA_DIR:-/home/danyzhan/data}"
+CKPT_DIR="${CKPT_DIR:-/home/danyzhan/ckpts/lumenrl-dapo/1a-bf16-sync}"
 
 # Preflight
 if [ ! -d "${MODEL_DIR}/qwen3-8b-base" ]; then
@@ -100,13 +100,13 @@ if [ "${SMOKE_TEST}" = true ]; then
     LOG_FILE="${OUTPUT_DIR}/${EXP_NAME}.log"
     mkdir -p "${OUTPUT_DIR}"
     OVERRIDES+=("num_training_steps=2")
-    OVERRIDES+=("policy.train_global_batch_size=64")
+    OVERRIDES+=("policy.train_global_batch_size=16")
     OVERRIDES+=("policy.max_response_length=512")
     OVERRIDES+=("policy.max_total_sequence_length=1024")
-    OVERRIDES+=("policy.max_token_len_per_gpu=8192")
+    OVERRIDES+=("policy.max_token_len_per_gpu=1024")
     OVERRIDES+=("policy.generation.atom_cfg.max_model_len=1024")
     OVERRIDES+=("algorithm.dapo.num_generations=8")
-    echo "*** SMOKE-TEST MODE: 2 steps, batch=64 (8p×8g), max_resp=512 ***"
+    echo "*** SMOKE-TEST MODE: 2 steps, batch=16, max_resp=512 ***"
 fi
 
 # ─── Dry-run: skip ATOM, use mock generation for training-only debugging ─────

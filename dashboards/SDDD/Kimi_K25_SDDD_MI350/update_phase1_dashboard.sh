@@ -8,17 +8,20 @@ container = "kimi_k25_eagle3_v2_phase1"
 dir_path = "/home/danyzhan/Lumen-RL/dashboards/SDDD/Kimi_K25_SDDD_MI350"
 dashboard = os.path.join(dir_path, "phase1.html")
 data_file = os.path.join(dir_path, "phase1_data.json")
-total_steps = 111012
+total_steps = 37005
 
 # --- Load existing ---
 existing = {}
 max_existing_step = -1
+max_existing_eval_step = -1
 if os.path.exists(data_file):
     try:
         with open(data_file) as f:
             existing = json.load(f)
         if existing.get("steps"):
             max_existing_step = max(existing["steps"])
+        if existing.get("eval_steps"):
+            max_existing_eval_step = max(existing["eval_steps"])
     except Exception:
         existing = {}
 
@@ -26,35 +29,58 @@ fields = ["steps","grad_norms","losses","lrs",
           "step_0_acc","step_1_acc","step_2_acc","step_3_acc",
           "step_0_loss","step_1_loss","step_2_loss","step_3_loss",
           "step_times","teacher_times","train_times"]
-for f in fields:
+eval_fields = ["eval_steps","eval_losses","eval_acc_lens",
+               "eval_step_0_acc","eval_step_1_acc","eval_step_2_acc","eval_step_3_acc",
+               "eval_step_0_loss","eval_step_1_loss","eval_step_2_loss","eval_step_3_loss"]
+for f in fields + eval_fields:
     if f not in existing:
         existing[f] = []
 
 # --- Parse docker logs ---
-# Grep the JSON log file directly (much faster than `docker logs` pipe
-# for containers with massive Mooncake C++ log spam — 71GB+ log files).
 container_running = True
 try:
     tmp = os.path.join(dir_path, ".step_logs.tmp")
+    tmp_eval = os.path.join(dir_path, ".eval_logs.tmp")
     log_path_result = subprocess.run(
         ["docker", "inspect", container, "--format", "{{.LogPath}}"],
         capture_output=True, text=True, timeout=10
     )
     log_path = log_path_result.stdout.strip()
-    if log_path and os.path.exists(log_path):
-        os.system(f"sudo grep -F 'callbacks: step=' {log_path} > {tmp} 2>/dev/null")
-    elif max_existing_step > 0:
-        os.system(f"docker logs --since 40m {container} 2>&1 | grep -F 'callbacks: step=' > {tmp}")
+    log_exists = log_path and subprocess.run(["sudo", "test", "-f", log_path], capture_output=True, timeout=5).returncode == 0
+    if log_exists:
+        os.system(f"sudo grep -F 'callbacks: step=' {log_path} > {tmp}.raw 2>/dev/null")
+        os.system(f"sudo grep -F 'callbacks: eval step=' {log_path} > {tmp_eval}.raw 2>/dev/null")
+        for src, dst in [(f"{tmp}.raw", tmp), (f"{tmp_eval}.raw", tmp_eval)]:
+            with open(src) as _rf, open(dst, "w") as _wf:
+                for _line in _rf:
+                    try:
+                        _wf.write(json.loads(_line)["log"])
+                    except Exception:
+                        _wf.write(_line)
+            try:
+                os.remove(src)
+            except Exception:
+                pass
     else:
-        os.system(f"docker logs --tail 200000 {container} 2>&1 | grep -F 'callbacks: step=' > {tmp}")
+        os.system(f"docker logs {container} 2>&1 | grep -F 'callbacks: step=' > {tmp}")
+        os.system(f"docker logs {container} 2>&1 | grep -F 'callbacks: eval step=' > {tmp_eval}")
+    # Also try reading from container's log file if docker logs are empty
+    if os.path.getsize(tmp) == 0:
+        os.system(f"docker exec {container} grep -F 'callbacks: step=' /dev/shm/phase1_bs8_20k.log > {tmp} 2>/dev/null")
+    if os.path.getsize(tmp_eval) == 0:
+        os.system(f"docker exec {container} grep -F 'callbacks: eval step=' /dev/shm/phase1_bs8_20k.log > {tmp_eval} 2>/dev/null")
     with open(tmp) as f:
         raw = f.read()
-    try:
-        os.remove(tmp)
-    except Exception:
-        pass
+    with open(tmp_eval) as f:
+        raw_eval = f.read()
+    for fp in [tmp, tmp_eval]:
+        try:
+            os.remove(fp)
+        except Exception:
+            pass
 except Exception:
     raw = ""
+    raw_eval = ""
 try:
     ps = subprocess.run(["docker","ps","--filter",f"name={container}","--format","{{.Names}}"],
                         capture_output=True, text=True, timeout=10)
@@ -62,6 +88,7 @@ try:
 except Exception:
     container_running = False
 
+# --- Parse training steps ---
 pattern = re.compile(
     r'step=(\d+)\s+grad_norm=([^\s]+)\s+loss=([^\s]+)\s+lr=([^\s]+)\s+'
     r'seq/max_len=([^\s]+)\s+'
@@ -93,6 +120,40 @@ for m in pattern.finditer(raw):
     existing["train_times"].append(float(m.group(16)))
     new_count += 1
 
+# --- Parse eval steps ---
+eval_pattern = re.compile(
+    r'eval step=(\d+)\s+eval/loss=([^\s]+)\s+eval/simulated_acc_len=([^\s]+)\s+'
+    r'eval/step_0_acc=([^\s]+)\s+eval/step_0_loss=([^\s]+)\s+'
+    r'eval/step_1_acc=([^\s]+)\s+eval/step_1_loss=([^\s]+)\s+'
+    r'eval/step_2_acc=([^\s]+)\s+eval/step_2_loss=([^\s]+)\s+'
+    r'eval/step_3_acc=([^\s]+)\s+eval/step_3_loss=([^\s]+)')
+
+eval_new = 0
+for m in eval_pattern.finditer(raw_eval):
+    step = int(m.group(1))
+    if step <= max_existing_eval_step:
+        continue
+    accs = [float(m.group(4)), float(m.group(6)), float(m.group(8)), float(m.group(10))]
+    # Corrected simulated accept length using cumulative product
+    cum_prod = 1.0
+    corrected_acc_len = 1.0
+    for a in accs:
+        cum_prod *= a
+        corrected_acc_len += cum_prod
+
+    existing["eval_steps"].append(step)
+    existing["eval_losses"].append(float(m.group(2)))
+    existing["eval_acc_lens"].append(corrected_acc_len)
+    existing["eval_step_0_acc"].append(accs[0])
+    existing["eval_step_0_loss"].append(float(m.group(5)))
+    existing["eval_step_1_acc"].append(accs[1])
+    existing["eval_step_1_loss"].append(float(m.group(7)))
+    existing["eval_step_2_acc"].append(accs[2])
+    existing["eval_step_2_loss"].append(float(m.group(9)))
+    existing["eval_step_3_acc"].append(accs[3])
+    existing["eval_step_3_loss"].append(float(m.group(11)))
+    eval_new += 1
+
 if not existing["steps"]:
     print("No valid steps found"); sys.exit(0)
 
@@ -106,6 +167,15 @@ s2a=existing["step_2_acc"]; s3a=existing["step_3_acc"]
 s0l=existing["step_0_loss"]; s1l=existing["step_1_loss"]
 s2l=existing["step_2_loss"]; s3l=existing["step_3_loss"]
 n = len(steps)
+
+# Eval data
+e_steps=existing["eval_steps"]; e_losses=existing["eval_losses"]
+e_acc_lens=existing["eval_acc_lens"]
+e0a=existing["eval_step_0_acc"]; e1a=existing["eval_step_1_acc"]
+e2a=existing["eval_step_2_acc"]; e3a=existing["eval_step_3_acc"]
+e0l=existing["eval_step_0_loss"]; e1l=existing["eval_step_1_loss"]
+e2l=existing["eval_step_2_loss"]; e3l=existing["eval_step_3_loss"]
+ne = len(e_steps)
 
 # --- Moving average ---
 def ma(arr, w=200):
@@ -121,6 +191,16 @@ ml=ma(losses); mg=ma(grad_norms); mst=ma(step_times)
 mtt=ma(teacher_times); mtr=ma(train_times)
 ma0=ma(s0a); ma1=ma(s1a); ma2=ma(s2a); ma3=ma(s3a)
 ml0=ma(s0l); ml1=ma(s1l); ml2=ma(s2l); ml3=ma(s3l)
+
+# Train-based accept length from MA'd accuracies
+train_acc_len = []
+for i in range(n):
+    al_val = 1.0
+    cp = 1.0
+    for a_arr in [ma0, ma1, ma2, ma3]:
+        cp *= a_arr[i]
+        al_val += cp
+    train_acc_len.append(al_val)
 
 # --- Subsample (max 2000) ---
 stride = max(1, n // 2000)
@@ -139,17 +219,25 @@ pl=S(ml); pg=S(mg); pt=S(mst); plr=S(lrs)
 ptt=S(mtt); ptr=S(mtr)
 pa0=S(ma0); pa1=S(ma1); pa2=S(ma2); pa3=S(ma3)
 pl0=S(ml0); pl1=S(ml1); pl2=S(ml2); pl3=S(ml3)
+ptal=S(train_acc_len)
 
 # --- Stats ---
 cur = steps[-1]; pct = cur/total_steps*100
 w = min(1000, n)
-al = sum(losses[-w:])/w; ast = sum(step_times[-w:])/w
+al = sum(losses[-w:])/w
+w_eta = min(250, n)
+ast = sum(step_times[-w_eta:])/w_eta
 eta = (total_steps-cur)*ast/3600
 es = cur*ast; eh=int(es//3600); em=int((es%3600)//60)
 aa0=sum(s0a[-w:])/w*100; aa1=sum(s1a[-w:])/w*100
 aa2=sum(s2a[-w:])/w*100; aa3=sum(s3a[-w:])/w*100
 status = "Training" if container_running else ("Completed" if cur>=total_steps-100 else "Stopped")
 now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+# Latest eval accept length
+latest_acc_len = e_acc_lens[-1] if e_acc_lens else 0.0
+latest_eval_loss = e_losses[-1] if e_losses else 0.0
+latest_train_acc_len = train_acc_len[-1] if train_acc_len else 0.0
 
 html = f"""<!DOCTYPE html>
 <html lang="en"><head>
@@ -177,7 +265,7 @@ h1{{color:#58a6ff;margin:0 0 4px 0;font-size:22px;font-weight:600}}
 </head><body>
 <div class="header">
 <h1>Kimi K2.5 Eagle3 SDDD v2 - Phase 1</h1>
-<p class="sub">perfectblend | lr=5e-5 | spec_length=4 | bfloat16 | 8x MI350 (FSDP2 + vLLM)</p>
+<p class="sub">perfectblend | lr=5e-5 | bs=8 | spec_length=4 | 8x MI350 (FSDP2 + ATOM MXFP4)</p>
 <p class="st st-{status.lower()}">{status}</p>
 <div class="stats">
 <div class="s"><div class="sv">{cur:,} / {total_steps:,}</div><div class="sl">Step ({pct:.1f}%)</div></div>
@@ -186,13 +274,18 @@ h1{{color:#58a6ff;margin:0 0 4px 0;font-size:22px;font-weight:600}}
 <div class="s"><div class="sv">{aa0:.1f}% / {aa1:.1f}% / {aa2:.1f}% / {aa3:.1f}%</div><div class="sl">Acc pos 0/1/2/3</div></div>
 <div class="s"><div class="sv">{ast*1000:.0f} ms</div><div class="sl">Step Time</div></div>
 <div class="s"><div class="sv">{eta:.1f} h</div><div class="sl">ETA</div></div>
+<div class="s"><div class="sv">{latest_train_acc_len:.4f} / {latest_acc_len:.4f}</div><div class="sl">Accept Len (Train / Eval)</div></div>
+<div class="s"><div class="sv">{latest_eval_loss:.4f}</div><div class="sl">Eval Loss</div></div>
 </div></div>
 <div class="charts">
 <div class="ch" id="c1"></div>
 <div class="ch" id="c2"></div>
+<div class="ch" id="c7"></div>
+<div class="ch" id="c8"></div>
 <div class="ch" id="c3"></div>
 <div class="ch" id="c4"></div>
 <div class="ch" id="c5"></div>
+<div class="ch" id="c9"></div>
 <div class="ch" id="c6"></div>
 </div>
 <script>
@@ -219,6 +312,17 @@ var teach={json.dumps(ptt)};
 var train={json.dumps(ptr)};
 var a0={json.dumps(pa0)},a1={json.dumps(pa1)},a2={json.dumps(pa2)},a3={json.dumps(pa3)};
 var l0={json.dumps(pl0)},l1={json.dumps(pl1)},l2={json.dumps(pl2)},l3={json.dumps(pl3)};
+
+// Train accept length (from MA'd train accuracy)
+var trainAccLen={json.dumps(ptal)};
+
+// Eval data
+var es={json.dumps(e_steps)};
+var eloss={json.dumps(e_losses)};
+var eacclen={json.dumps(e_acc_lens)};
+var ea0={json.dumps(e0a)},ea1={json.dumps(e1a)},ea2={json.dumps(e2a)},ea3={json.dumps(e3a)};
+var el0={json.dumps(e0l)},el1={json.dumps(e1l)},el2={json.dumps(e2l)},el3={json.dumps(e3l)};
+
 var C=['#58a6ff','#3fb950','#d29922','#f778ba'];
 
 function L(id,traces,title,extra){{
@@ -228,11 +332,13 @@ function L(id,traces,title,extra){{
   Plotly.newPlot(id,traces,layout,{{responsive:true}});
 }}
 function raw(x,y,c){{return {{x:x,y:y,mode:'lines',line:{{color:c,width:1}},opacity:0.35,showlegend:false,hoverinfo:'skip'}};}}
+function evaltr(x,y,name,c){{return {{x:x,y:y,mode:'lines+markers',name:name,line:{{color:c,width:2}},marker:{{size:5,color:c}}}};}}
 
 L('c1',[
   raw(s,rloss,'#f85149'),
-  {{x:s,y:loss,mode:'lines',name:'Loss',line:{{color:'#f85149',width:2}}}},
-],'Training Loss');
+  {{x:s,y:loss,mode:'lines',name:'Train Loss (MA)',line:{{color:'#f85149',width:2}}}},
+  evaltr(es,eloss,'Eval Loss','#58a6ff'),
+],'Training & Eval Loss');
 
 L('c2',[
   raw(s,ra0.map(v=>v*100),C[0]),raw(s,ra1.map(v=>v*100),C[1]),raw(s,ra2.map(v=>v*100),C[2]),raw(s,ra3.map(v=>v*100),C[3]),
@@ -240,7 +346,19 @@ L('c2',[
   {{x:s,y:a1.map(v=>v*100),mode:'lines',name:'Pos 1',line:{{color:C[1],width:2}}}},
   {{x:s,y:a2.map(v=>v*100),mode:'lines',name:'Pos 2',line:{{color:C[2],width:2}}}},
   {{x:s,y:a3.map(v=>v*100),mode:'lines',name:'Pos 3',line:{{color:C[3],width:2}}}},
-],'Accuracy by Position (%)',{{yaxis:{{range:[0,105],title:'%'}},legend:{{x:0.99,y:0.01,xanchor:'right',yanchor:'bottom'}}}});
+],'Train Accuracy by Position (%)',{{yaxis:{{range:[0,105],title:'%'}},legend:{{x:0.01,y:0.99,xanchor:'left',yanchor:'top'}}}});
+
+L('c7',[
+  {{x:s,y:trainAccLen,mode:'lines',name:'Train (MA)',line:{{color:'#d29922',width:2}}}},
+  evaltr(es,eacclen,'Eval','#3fb950'),
+],'Accept Length (Train vs Eval)',{{yaxis:{{title:'Accept Length'}},legend:{{x:0.01,y:0.99,xanchor:'left',yanchor:'top'}}}});
+
+L('c8',[
+  evaltr(es,ea0.map(v=>v*100),'Pos 0',C[0]),
+  evaltr(es,ea1.map(v=>v*100),'Pos 1',C[1]),
+  evaltr(es,ea2.map(v=>v*100),'Pos 2',C[2]),
+  evaltr(es,ea3.map(v=>v*100),'Pos 3',C[3]),
+],'Eval Accuracy by Position (%)',{{yaxis:{{range:[0,105],title:'%'}},legend:{{x:0.01,y:0.99,xanchor:'left',yanchor:'top'}}}});
 
 L('c3',[
   raw(s,rgrad,'#d29922'),
@@ -262,15 +380,22 @@ L('c5',[
   {{x:s,y:l1,mode:'lines',name:'Pos 1',line:{{color:C[1],width:2}}}},
   {{x:s,y:l2,mode:'lines',name:'Pos 2',line:{{color:C[2],width:2}}}},
   {{x:s,y:l3,mode:'lines',name:'Pos 3',line:{{color:C[3],width:2}}}},
-],'Loss by Position',{{legend:{{x:0.99,y:0.99,xanchor:'right',yanchor:'top'}}}});
+],'Train Loss by Position',{{legend:{{x:0.01,y:0.01,xanchor:'left',yanchor:'bottom'}}}});
+
+L('c9',[
+  evaltr(es,el0,'Pos 0',C[0]),
+  evaltr(es,el1,'Pos 1',C[1]),
+  evaltr(es,el2,'Pos 2',C[2]),
+  evaltr(es,el3,'Pos 3',C[3]),
+],'Eval Loss by Position',{{legend:{{x:0.99,y:0.99,xanchor:'right',yanchor:'top'}}}});
 
 L('c6',[{{x:s,y:lr,mode:'lines',name:'LR',line:{{color:'#a5d6ff',width:2}}}}],
   'Learning Rate');
 </script>
-<p class="up">Updated: {now} | {n:,} points</p>
+<p class="up">Updated: {now} | {n:,} train + {ne} eval points</p>
 </body></html>"""
 
 with open(dashboard, 'w') as f:
     f.write(html)
-print(f"Dashboard updated: {n} total ({new_count} new), step {cur}, status: {status}")
+print(f"Dashboard updated: {n} train ({new_count} new) + {ne} eval ({eval_new} new), step {cur}, acc_len={latest_acc_len:.4f}, status: {status}")
 PYEOF

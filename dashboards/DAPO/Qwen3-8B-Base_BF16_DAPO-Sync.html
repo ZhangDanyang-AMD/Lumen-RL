@@ -3,774 +3,296 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>LumenRL 1A BF16 — Training Dashboard</title>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Instrument+Serif&display=swap" rel="stylesheet">
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<title>Qwen3-8B-Base BF16 DAPO Sync Training Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Instrument+Sans:wght@400;600;700&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #0a0c10;
-    --surface: #12151c;
-    --border: #1e2330;
-    --accent: #22d3ee;
-    --accent2: #f472b6;
-    --accent3: #a78bfa;
-    --accent4: #34d399;
-    --accent5: #fb923c;
-    --text: #e2e8f0;
-    --dim: #64748b;
-    --positive: #22d3ee;
-    --negative: #f472b6;
-    --warn: #fbbf24;
+    --bg: #070a0f; --card: #101620; --border: #1a2636;
+    --text: #c8d0dc; --muted: #6b7c92; --accent: #38bdf8;
+    --green: #34d399; --orange: #fbbf24; --red: #fb7185;
+    --purple: #c084fc; --teal: #2dd4bf; --amber: #fcd34d;
+    --glow: rgba(56, 189, 248, 0.12);
   }
-
   * { margin: 0; padding: 0; box-sizing: border-box; }
-
   body {
-    background: var(--bg);
-    color: var(--text);
-    font-family: 'JetBrains Mono', monospace;
-    min-height: 100vh;
-    overflow-x: hidden;
+    background: radial-gradient(1200px 600px at 10% -10%, rgba(56, 189, 248, 0.08), transparent),
+                radial-gradient(900px 500px at 100% 0%, rgba(52, 211, 153, 0.05), transparent),
+                var(--bg);
+    color: var(--text); font-family: 'Instrument Sans', sans-serif;
+    padding: 32px 36px 48px; min-height: 100vh;
   }
-
-  .noise {
-    position: fixed; inset: 0; z-index: 0; opacity: 0.03; pointer-events: none;
-    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
-    background-size: 200px;
-  }
-
-  .header {
-    position: relative; z-index: 1;
-    padding: 32px 40px 24px;
-    display: flex; align-items: baseline; gap: 20px;
-    border-bottom: 1px solid var(--border);
-  }
-
-  .header h1 {
-    font-family: 'Instrument Serif', serif;
-    font-size: 36px; font-weight: 400; letter-spacing: -0.5px;
-    background: linear-gradient(135deg, var(--accent), var(--accent3));
+  h1 {
+    font-size: 1.85rem; font-weight: 700; margin-bottom: 6px; letter-spacing: -0.02em;
+    background: linear-gradient(120deg, #7dd3fc, #34d399, #a5b4fc);
     -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    background-clip: text;
   }
-
-  .header .tag {
-    font-size: 11px; text-transform: uppercase; letter-spacing: 2px;
-    color: var(--dim); padding: 4px 10px;
-    border: 1px solid var(--border); border-radius: 4px;
+  .subtitle { color: var(--muted); font-size: 0.88rem; margin-bottom: 22px; font-family: 'JetBrains Mono', monospace; line-height: 1.5; }
+  .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 18px; margin-bottom: 22px; }
+  @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
+  .card {
+    background: linear-gradient(145deg, rgba(16, 22, 32, 0.95), rgba(10, 14, 22, 0.98));
+    border: 1px solid var(--border); border-radius: 14px; padding: 20px 22px;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.03);
   }
-
-  .header .live-dot {
-    width: 8px; height: 8px; border-radius: 50%;
-    background: var(--accent4);
-    animation: pulse 2s ease-in-out infinite;
-    margin-left: auto;
+  .card h2 {
+    font-size: 0.92rem; font-weight: 600; margin-bottom: 12px; color: var(--accent);
+    letter-spacing: -0.01em; display: flex; align-items: center; gap: 8px;
   }
-
-  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
-
-  .header .status {
-    font-size: 12px; color: var(--accent4); margin-left: 8px;
+  .card h2::before {
+    content: ''; width: 3px; height: 14px; border-radius: 2px;
+    background: linear-gradient(180deg, var(--accent), var(--teal));
   }
-
-  .kpi-row {
-    position: relative; z-index: 1;
-    display: grid; grid-template-columns: repeat(7, 1fr);
-    gap: 1px; background: var(--border);
-    border-bottom: 1px solid var(--border);
+  .chart-wrap { height: 280px; }
+  .ref-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; font-family: 'JetBrains Mono', monospace; }
+  .ref-table th, .ref-table td { padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: top; }
+  .ref-table th {
+    color: var(--muted); font-weight: 600; font-size: 0.68rem; text-transform: uppercase;
+    letter-spacing: 0.55px; background: rgba(0,0,0,0.2);
   }
-
-  .kpi {
-    background: var(--surface); padding: 20px 22px;
-    display: flex; flex-direction: column; gap: 5px;
-    animation: fadeUp 0.5s ease both;
+  .ref-table tr:hover td { background: rgba(56, 189, 248, 0.04); }
+  .ref-table td:first-child { color: var(--accent); font-weight: 600; font-family: 'Instrument Sans', sans-serif; white-space: nowrap; }
+  .status { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; vertical-align: middle; }
+  .status.running { background: var(--green); box-shadow: 0 0 10px var(--green); animation: pulse 1.8s ease-in-out infinite; }
+  .status.snapshot { background: var(--orange); }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+  .badge { display: inline-block; padding: 2px 9px; border-radius: 6px; font-size: 0.68rem; font-weight: 600; font-family: 'JetBrains Mono', monospace; }
+  .badge-sync { background: rgba(45, 212, 191, 0.14); color: var(--teal); border: 1px solid rgba(45, 212, 191, 0.25); }
+  .badge-phase { background: rgba(251, 191, 36, 0.14); color: var(--orange); border: 1px solid rgba(251, 191, 36, 0.25); }
+  .metric-row { display: flex; gap: 12px; margin-bottom: 22px; flex-wrap: wrap; }
+  .metric-box {
+    background: linear-gradient(160deg, rgba(56, 189, 248, 0.06), rgba(16, 22, 32, 0.9));
+    border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; flex: 1;
+    min-width: 118px; max-width: 200px; transition: border-color 0.2s, box-shadow 0.2s;
   }
-
-  .kpi:nth-child(2) { animation-delay: 0.04s; }
-  .kpi:nth-child(3) { animation-delay: 0.08s; }
-  .kpi:nth-child(4) { animation-delay: 0.12s; }
-  .kpi:nth-child(5) { animation-delay: 0.16s; }
-  .kpi:nth-child(6) { animation-delay: 0.20s; }
-  .kpi:nth-child(7) { animation-delay: 0.24s; }
-
-  @keyframes fadeUp {
-    from { opacity: 0; transform: translateY(12px); }
-    to { opacity: 1; transform: translateY(0); }
+  .metric-box:hover { border-color: rgba(56, 189, 248, 0.35); box-shadow: 0 0 0 1px var(--glow); }
+  .metric-box .label {
+    font-size: 0.65rem; color: var(--muted); text-transform: uppercase;
+    letter-spacing: 0.65px; font-family: 'JetBrains Mono', monospace;
   }
-
-  .kpi .label {
-    font-size: 9px; text-transform: uppercase; letter-spacing: 1.5px;
-    color: var(--dim);
+  .metric-box .value { font-size: 1.35rem; font-weight: 700; margin-top: 4px; font-family: 'JetBrains Mono', monospace; line-height: 1.15; }
+  .metric-box .hint { font-size: 0.7rem; margin-top: 4px; color: var(--muted); font-family: 'JetBrains Mono', monospace; }
+  .hint.pos { color: var(--green); } .hint.neg { color: var(--red); } .hint.neu { color: var(--muted); }
+  .full-width { grid-column: 1 / -1; }
+  .note {
+    border-radius: 10px; padding: 14px 18px; margin-bottom: 20px; font-size: 0.82rem;
+    font-family: 'JetBrains Mono', monospace; border: 1px solid var(--border);
+    background: rgba(56, 189, 248, 0.05); color: var(--text);
   }
-
-  .kpi .value {
-    font-size: 24px; font-weight: 700; letter-spacing: -1px;
-  }
-
-  .kpi .delta {
-    font-size: 11px; display: flex; align-items: center; gap: 4px;
-  }
-
-  .kpi .delta.up { color: var(--accent4); }
-  .kpi .delta.down { color: var(--negative); }
-  .kpi .delta.neutral { color: var(--dim); }
-
-  .charts {
-    position: relative; z-index: 1;
-    display: grid; grid-template-columns: 1fr 1fr 1fr;
-    gap: 1px; background: var(--border);
-  }
-
-  .chart-panel {
-    background: var(--surface); padding: 24px;
-    animation: fadeUp 0.6s ease both;
-  }
-
-  .chart-panel:nth-child(2) { animation-delay: 0.06s; }
-  .chart-panel:nth-child(3) { animation-delay: 0.12s; }
-  .chart-panel:nth-child(4) { animation-delay: 0.18s; }
-  .chart-panel:nth-child(5) { animation-delay: 0.24s; }
-  .chart-panel:nth-child(6) { animation-delay: 0.30s; }
-
-  .chart-panel h3 {
-    font-size: 11px; text-transform: uppercase; letter-spacing: 1.5px;
-    color: var(--dim); margin-bottom: 16px;
-  }
-
-  .chart-panel canvas { width: 100% !important; height: 200px !important; }
-
-  .table-section {
-    position: relative; z-index: 1;
-    padding: 24px 40px;
-    animation: fadeUp 0.7s ease both;
-    animation-delay: 0.25s;
-  }
-
-  .table-section h3 {
-    font-size: 12px; text-transform: uppercase; letter-spacing: 1.5px;
-    color: var(--dim); margin-bottom: 14px;
-  }
-
-  table {
-    width: 100%; border-collapse: collapse;
-    font-size: 12px;
-  }
-
-  th {
-    text-align: left; padding: 8px 10px;
-    font-size: 9px; text-transform: uppercase; letter-spacing: 1px;
-    color: var(--dim); border-bottom: 1px solid var(--border);
-    font-weight: 600; white-space: nowrap;
-  }
-
-  td {
-    padding: 8px 10px; border-bottom: 1px solid #161a24;
-    font-variant-numeric: tabular-nums; white-space: nowrap;
-  }
-
-  tr:hover td { background: rgba(34, 211, 238, 0.03); }
-
-  .c-accent { color: var(--accent); }
-  .c-accent2 { color: var(--accent2); }
-  .c-accent3 { color: var(--accent3); }
-  .c-accent4 { color: var(--accent4); }
-  .c-accent5 { color: var(--accent5); }
-  .c-warn { color: var(--warn); }
-
-  .config-bar {
-    position: relative; z-index: 1;
-    padding: 14px 40px;
-    border-top: 1px solid var(--border);
-    display: flex; gap: 28px; flex-wrap: wrap;
-    font-size: 11px; color: var(--dim);
-  }
-
-  .config-bar span { display: flex; align-items: center; gap: 6px; }
-  .config-bar .val { color: var(--text); font-weight: 600; }
-
-  .update-ts {
-    position: relative; z-index: 1;
-    padding: 8px 40px;
-    font-size: 10px; color: var(--dim);
-    border-top: 1px solid var(--border);
-    text-align: right;
-  }
-
-  .phase-note {
-    position: relative; z-index: 1;
-    padding: 12px 40px;
-    font-size: 11px; color: var(--dim);
-    border-top: 1px solid var(--border);
-    line-height: 1.6;
-  }
-  .phase-note b { color: var(--accent); font-weight: 600; }
-  .phase-note .val { color: var(--accent4); font-weight: 600; }
+  .note strong { color: var(--accent); }
+  .config-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; font-family: 'JetBrains Mono', monospace; margin-top: 12px; }
+  .config-table th, .config-table td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border); }
+  .config-table th { color: var(--muted); font-weight: 600; font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.5px; background: rgba(0,0,0,0.2); }
+  .config-table .old { color: var(--red); text-decoration: line-through; opacity: 0.6; }
+  .config-table .new { color: var(--green); font-weight: 600; }
 </style>
 </head>
 <body>
-<div class="noise"></div>
-
-<div class="header">
-  <h1>LumenRL Training</h1>
-  <span class="tag">1A BF16 Sync</span>
-  <span class="tag">Run 14 — LR Warmup + No Dynamic Sampling</span>
-  <span class="tag">8xMI300X</span>
-  <div class="live-dot"></div>
-  <span class="status" id="statusText">Running</span>
+<h1>Qwen3-8B-Base BF16 DAPO Sync Training Dashboard</h1>
+<div class="subtitle">
+  <span class="badge badge-sync">Sync &middot; RLTrainer</span>
+  <span class="badge badge-phase">Phase 1 &middot; Optimized</span>
+  <span class="status running"></span> Training in progress &mdash; Phase 1 optimizations &middot;
+  Last update: <span id="hdr-ts">2026-04-18 14:50</span>
 </div>
 
-<div class="kpi-row" id="kpiRow"></div>
-
-<div class="phase-note">
-  <b>Run 14 Fixes (vs Run 13):</b>
-  LR warmup <span class="val">10 steps linear</span> (1e-7 &rarr; 1e-6) |
-  dynamic_sampling <span class="val">OFF</span> (was ON, filtering ~33% data) |
-  LR configurable from YAML |
+<div class="note">
+  <strong>Phase 1 optimizations applied:</strong>
+  <b>Opt 1</b> batch_size 64&rarr;128 |
+  <b>Opt 2</b> ATOM gpu_mem 0.13&rarr;0.20 |
+  <b>Opt 5</b> seq_len 8192&rarr;4096 |
+  <b>Opt 7</b> checkpoint resume (first save at step 25).
+  <br><br>
+  <strong>vLLM Zero-Risk Opts:</strong> V1 engine, chunked prefill, max_num_seqs=64, disable_log_stats.
   <br>
-  <b>Run 15 (step 131+):</b>
-  max_response_length <span class="val">20480 &rarr; 8192</span> |
-  Resumed from checkpoint_130 |
-  Step time <span class="val c-accent4">56 min &rarr; 22 min (-60%)</span> |
+  <strong>Bugs fixed:</strong> Checkpoint callback deadlock (FSDP2 collective rank-0-only &rarr; all-rank).
   <br>
-  <b>Phase summary:</b>
-  Step 0-9 (warmup): avg acc <span class="val">11.0%</span> |
-  Step 10-19: avg acc <span class="val">12.2%</span> |
-  Step 20-29: avg acc <span class="val">14.6%</span> |
-  Step 30-39: avg acc <span class="val">15.5%</span> |
-  Step 40-49: avg acc <span class="val">15.9%</span> |
-  Step 50-59: avg acc <span class="val">15.2%</span> |
-  Step 60-69: avg acc <span class="val">14.4%</span> |
-  Step 70-79: avg acc <span class="val">16.5%</span> |
-  Step 80-89: avg acc <span class="val">15.5%</span> |
-  Step 90-99: avg acc <span class="val">15.3%</span> |
-  Step 100-113: avg acc <span class="val">16.7%</span> |
-  Step 114-130 (dip): avg acc <span class="val c-accent2">15.8%</span> |
-  <span class="val c-accent5">&#9889; Step 131: config change (8K)</span> |
-  Step 131-140 (8K adapt): avg acc <span class="val">12.7%</span> |
-  Step 141-152 (8K stable): avg acc <span class="val">15.5%</span> |
-  Step 153-162: avg acc <span class="val">15.8%</span> |
-  Step 163-172: avg acc <span class="val">17.0%</span> |
-  Step 173-182: avg acc <span class="val">18.0%</span> |
-  Step 183-187: avg acc <span class="val">17.8%</span> |
-  Peak (8K): step 185 <span class="val c-accent4">23.2%</span>, step 180 <span class="val">22.5%</span>, step 162 <span class="val">21.5%</span> |
-  Peak (20K): step 105 <span class="val">26.4%</span>
+  <strong>Current status:</strong> Run 3 completed 21 steps (0&ndash;20), crashed step 21 (ROCm page fault GPU-2).
+  Run 4 resumed from ckpt_0, completed 11 steps (1&ndash;11), crashed step 12 (ROCm page fault ALL GPUs).
+  Run 5 resuming from ckpt_10. save_steps=10 for crash recovery.
+  <br>
+  Phase 1 chart uses Run 3 data (longest continuous trajectory, 21 steps).
+  Run 4 data shown as &ldquo;Resumed&rdquo; series where available.
 </div>
 
-<div class="charts">
-  <div class="chart-panel">
-    <h3>Accuracy & Reward</h3>
-    <canvas id="chartAccuracy"></canvas>
-  </div>
-  <div class="chart-panel">
-    <h3>Loss & Gradient Norm</h3>
-    <canvas id="chartLoss"></canvas>
-  </div>
-  <div class="chart-panel">
-    <h3>Response Length (mean tokens)</h3>
-    <canvas id="chartRespLen"></canvas>
-  </div>
-  <div class="chart-panel">
-    <h3>Throughput & Timing</h3>
-    <canvas id="chartTiming"></canvas>
-  </div>
-  <div class="chart-panel">
-    <h3>Learning Rate Schedule</h3>
-    <canvas id="chartLR"></canvas>
-  </div>
-  <div class="chart-panel">
-    <h3>Run 14/15 vs Run 13 Accuracy</h3>
-    <canvas id="chartComparison"></canvas>
-  </div>
-</div>
-
-<div class="table-section">
-  <h3>Step History</h3>
-  <table>
-    <thead>
-      <tr>
-        <th>Step</th><th>Accuracy</th><th>Reward</th>
-        <th>Loss</th><th>Grad Norm</th><th>MKL</th>
-        <th>LR</th>
-        <th>Resp Len</th><th>Gen tok/s</th><th>Gen (s)</th><th>Train (s)</th><th>Total (s)</th>
-      </tr>
-    </thead>
-    <tbody id="tableBody"></tbody>
+<div class="card" style="margin-bottom: 22px;">
+  <h2>Phase 1 Config Changes</h2>
+  <table class="config-table">
+    <thead><tr><th>Parameter</th><th>Run v1 (old)</th><th>Phase 1 (new)</th><th>Rationale</th></tr></thead>
+    <tbody>
+      <tr><td>train_global_batch_size</td><td class="old">64 (4x16)</td><td class="new">128 (8x16)</td><td>Match VERL baseline; better gradient quality</td></tr>
+      <tr><td>gpu_memory_utilization</td><td class="old">0.13 (~33 GiB)</td><td class="new">0.20 (~50 GiB)</td><td>More KV cache, higher gen throughput</td></tr>
+      <tr><td>max_total_sequence_length</td><td class="old">8192</td><td class="new">4096</td><td>Math rarely needs &gt;3K; reduces peak memory</td></tr>
+      <tr><td>max_response_length</td><td class="old">7168</td><td class="new">3072</td><td>Aligned with reduced seq length</td></tr>
+      <tr><td>max_model_len (ATOM)</td><td class="old">8192</td><td class="new">4096</td><td>Match sequence length cap</td></tr>
+      <tr><td>checkpoint resume</td><td class="old">metrics only</td><td class="new">full model+optimizer state</td><td>Crash recovery (ROCm page faults)</td></tr>
+      <tr><td>init_process_group timeout</td><td class="old">1800s (default)</td><td class="new">7200s</td><td>Prevent Gloo timeout during long gen</td></tr>
+    </tbody>
   </table>
 </div>
 
-<div class="config-bar">
-  <span>Model: <b class="val">Qwen3-8B-Base</b></span>
-  <span>Algorithm: <b class="val">DAPO</b></span>
-  <span>Batch: <b class="val">1536 (96p x 16g)</b></span>
-  <span>max_response_length: <b class="val c-accent5">8192</b> (was 20480, changed at step 131)</span>
-  <span>dynamic_sampling: <b class="val c-accent2">OFF</b></span>
-  <span>LR warmup: <b class="val c-accent4">10 steps</b></span>
-  <span>LR: <b class="val">1e-6</b></span>
-  <span>Weight Sync: <b class="val c-accent4">ENABLED</b></span>
-  <span>Precision: <b class="val">BF16</b></span>
-  <span>clip_ratio_c: <b class="val c-accent4">3.0</b></span>
-  <span>accum_steps: <b class="val c-accent4">1</b></span>
-  <span>loss_norm: <b class="val c-accent4">batch_num_tokens (all-reduce)</b></span>
+<div class="metric-row" id="summary-cards"></div>
+
+<div class="grid">
+  <div class="card"><h2>Training Loss</h2><div class="chart-wrap"><canvas id="c-loss"></canvas></div></div>
+  <div class="card"><h2>Reward Mean</h2><div class="chart-wrap"><canvas id="c-rmean"></canvas></div></div>
+  <div class="card"><h2>Reward Accuracy</h2><div class="chart-wrap"><canvas id="c-racc"></canvas></div></div>
+  <div class="card"><h2>Step Time</h2><div class="chart-wrap"><canvas id="c-step"></canvas></div></div>
+  <div class="card"><h2>Gen Time &amp; Gen Throughput</h2><div class="chart-wrap"><canvas id="c-gen"></canvas></div></div>
+  <div class="card"><h2>Grad Norm</h2><div class="chart-wrap"><canvas id="c-grad"></canvas></div></div>
+  <div class="card"><h2>Time per Token (Gen) &mdash; ms</h2><div class="chart-wrap"><canvas id="c-tpt"></canvas></div></div>
+  <div class="card"><h2>Mean Response Length</h2><div class="chart-wrap"><canvas id="c-meanlen"></canvas></div></div>
+  <div class="card"><h2>Max Sequence Length</h2><div class="chart-wrap"><canvas id="c-maxlen"></canvas></div></div>
+
+  <div class="card full-width">
+    <h2>Metrics Reference</h2>
+    <table class="ref-table">
+      <thead><tr><th>Metric</th><th>Formula / Computation</th><th>Source</th><th>Granularity</th></tr></thead>
+      <tbody>
+        <tr><td>Training Loss</td><td>Clipped surrogate DAPO asymmetric clip <code>[1-e_low, 1+e_high]</code></td><td>loss_functions.py, dapo.py</td><td>Mean over mini-batches per step</td></tr>
+        <tr><td>Reward Mean</td><td><code>mean(rewards)</code> over all rollout sequences</td><td>rl_trainer.py</td><td>Per step</td></tr>
+        <tr><td>Reward Accuracy</td><td>Fraction of sequences with reward &gt; 0</td><td>rl_trainer.py</td><td>Per step</td></tr>
+        <tr><td>Step Time</td><td>Wall clock: gen + old_logp + ref + train + sync</td><td>rl_trainer.py</td><td>Per step</td></tr>
+        <tr><td>Gen Time</td><td>Wall clock for rollout phase (ATOM vLLM)</td><td>rl_trainer.py</td><td>Per step</td></tr>
+        <tr><td>Gen Throughput</td><td><code>generated_tokens / gen_time</code></td><td>rl_trainer.py</td><td>Per step</td></tr>
+        <tr><td>Time per Token (Gen)</td><td><code>1000 / gen_tok_per_s</code> &mdash; ms per generated token during rollout</td><td>Derived from rl_trainer.py</td><td>Per step</td></tr>
+        <tr><td>Grad Norm</td><td><code>clip_grad_norm_(params, 1.0)</code> global L2</td><td>rl_trainer.py</td><td>Per step</td></tr>
+        <tr><td>NaN Grads</td><td>Params with NaN <code>.grad</code>; zeroed before clip</td><td>rl_trainer.py</td><td>Per step</td></tr>
+        <tr><td>Mean Response Length</td><td>Mean token count from <code>response_mask</code></td><td>rl_trainer.py</td><td>Per step</td></tr>
+        <tr><td>Max Sequence Length</td><td>Max padded sequence length in batch</td><td>rl_trainer.py</td><td>Per step</td></tr>
+      </tbody>
+    </table>
+  </div>
 </div>
 
-<div class="update-ts" id="updateTs"></div>
-
 <script>
-// ── Run 14 (2026-04-30 05:47 UTC): LR warmup + dynamic_sampling=false ──
-// Fixes vs Run 13: lr_warmup_steps=10 (linear), dynamic_sampling=false
-const DATA = [
-  { step: 0,  acc: 0.106771, reward: -0.786458, loss: 0.00655, grad: 0.1792, mkl: 0.000105, lr: 1e-7, genTok: 1013.63, genS: 1533.14, trainS: 259.03, stepS: 1858.20, respLen: 1011.74, syncS: 26.04, time: "Apr30 06:19" },
-  { step: 1,  acc: 0.140625, reward: -0.718750, loss: 0.04786, grad: 0.3273, mkl: -0.000192, lr: 2e-7, genTok: 1124.30, genS: 1430.62, trainS: 252.79, stepS: 1755.96, respLen: 1047.16, syncS: 25.90, time: "Apr30 06:50" },
-  { step: 2,  acc: 0.118490, reward: -0.763021, loss: 0.03963, grad: 0.2118, mkl: -0.000308, lr: 3e-7, genTok: 1171.10, genS: 1675.05, trainS: 291.37, stepS: 2053.10, respLen: 1277.11, syncS: 25.44, time: "Apr30 07:25" },
-  { step: 3,  acc: 0.108724, reward: -0.782552, loss: -0.02578, grad: 0.2196, mkl: 0.000158, lr: 4e-7, genTok: 1136.61, genS: 1515.05, trainS: 270.97, stepS: 1867.81, respLen: 1121.11, syncS: 25.33, time: "Apr30 07:57" },
-  { step: 4,  acc: 0.112630, reward: -0.774740, loss: 0.04426, grad: 0.2224, mkl: 0.000280, lr: 5e-7, genTok: 1113.22, genS: 1610.74, trainS: 300.74, stepS: 2004.81, respLen: 1167.38, syncS: 26.42, time: "Apr30 08:30" },
-  { step: 5,  acc: 0.128255, reward: -0.743490, loss: 0.02034, grad: 0.1847, mkl: -0.000114, lr: 6e-7, genTok: 1133.78, genS: 1494.80, trainS: 215.26, stepS: 1784.69, respLen: 1103.36, syncS: 25.48, time: "Apr30 09:01" },
-  { step: 6,  acc: 0.100260, reward: -0.799479, loss: 0.01770, grad: 0.2102, mkl: 0.000025, lr: 7e-7, genTok: 1121.74, genS: 1562.18, trainS: 269.40, stepS: 1924.48, respLen: 1140.86, syncS: 26.41, time: "Apr30 09:34" },
-  { step: 7,  acc: 0.132812, reward: -0.734375, loss: 0.04063, grad: 0.2714, mkl: 0.000218, lr: 8e-7, genTok: 1102.92, genS: 1499.10, trainS: 273.38, stepS: 1861.08, respLen: 1076.42, syncS: 25.58, time: "Apr30 10:06" },
-  { step: 8,  acc: 0.100260, reward: -0.799479, loss: 0.00426, grad: 1.7471, mkl: -0.000395, lr: 9e-7, genTok: 1244.61, genS: 1473.64, trainS: 264.11, stepS: 1824.33, respLen: 1194.08, syncS: 25.14, time: "Apr30 10:36" },
-  { step: 9,  acc: 0.108073, reward: -0.783854, loss: 0.02863, grad: 0.2058, mkl: -0.000025, lr: 1e-6, genTok: 1094.25, genS: 1618.42, trainS: 269.77, stepS: 1982.07, respLen: 1152.97, syncS: 25.26, time: "Apr30 11:10" },
-  { step: 10, acc: 0.141276, reward: -0.717448, loss: 0.03553, grad: 0.2336, mkl: -0.000214, lr: 1e-6, genTok: 1107.68, genS: 1418.57, trainS: 219.48, stepS: 1714.39, respLen: 1023.00, syncS: 27.24, time: "Apr30 11:39" },
-  { step: 11, acc: 0.074219, reward: -0.851563, loss: 0.00461, grad: 0.3613, mkl: -0.000022, lr: 1e-6, genTok: 1107.38, genS: 1665.12, trainS: 265.95, stepS: 2020.41, respLen: 1200.46, syncS: 27.17, time: "Apr30 12:14" },
-  { step: 12, acc: 0.120443, reward: -0.759115, loss: 0.02379, grad: 0.1837, mkl: -0.000142, lr: 1e-6, genTok: 1068.59, genS: 1759.12, trainS: 325.11, stepS: 2201.09, respLen: 1223.82, syncS: 25.94, time: "Apr30 12:51" },
-  { step: 13, acc: 0.113932, reward: -0.772135, loss: -0.00112, grad: 0.5127, mkl: -0.000061, lr: 1e-6, genTok: 1168.57, genS: 1524.12, trainS: 268.06, stepS: 1890.55, respLen: 1159.53, syncS: 27.91, time: "Apr30 13:23" },
-  { step: 14, acc: 0.103516, reward: -0.792969, loss: -0.02777, grad: 0.1803, mkl: 0.000082, lr: 1e-6, genTok: 1137.75, genS: 1623.40, trainS: 301.00, stepS: 2032.40, respLen: 1202.49, syncS: 26.16, time: "Apr30 13:57" },
-  { step: 15, acc: 0.132161, reward: -0.735677, loss: -0.00387, grad: 0.2239, mkl: 0.000270, lr: 1e-6, genTok: 1127.38, genS: 1780.49, trainS: 322.24, stepS: 2220.56, respLen: 1306.83, syncS: 27.60, time: "Apr30 14:35" },
-  { step: 16, acc: 0.116536, reward: -0.766927, loss: -0.00406, grad: 0.1725, mkl: -0.000031, lr: 1e-6, genTok: 1076.06, genS: 1831.86, trainS: 286.69, stepS: 2224.66, respLen: 1283.32, syncS: 25.55, time: "Apr30 15:13" },
-  { step: 17, acc: 0.121745, reward: -0.756510, loss: -0.00616, grad: 0.2618, mkl: 0.000125, lr: 1e-6, genTok: 1228.15, genS: 1510.19, trainS: 304.65, stepS: 1937.68, respLen: 1207.52, syncS: 27.26, time: "Apr30 15:46" },
-  { step: 18, acc: 0.141276, reward: -0.717448, loss: -0.01351, grad: 0.1884, mkl: -0.000179, lr: 1e-6, genTok: 1259.66, genS: 1339.44, trainS: 270.17, stepS: 1719.66, respLen: 1098.46, syncS: 25.45, time: "Apr30 16:15" },
-  { step: 19, acc: 0.146484, reward: -0.707031, loss: 0.03302, grad: 0.5449, mkl: -0.000057, lr: 1e-6, genTok: 1113.19, genS: 1788.74, trainS: 358.17, stepS: 2279.74, respLen: 1296.36, syncS: 25.73, time: "Apr30 16:54" },
-  { step: 20, acc: 0.138672, reward: -0.722656, loss: 0.02857, grad: 0.2303, mkl: -0.000218, lr: 1e-6, genTok: 1104.43, genS: 1675.32, trainS: 266.85, stepS: 2051.83, respLen: 1204.61, syncS: 26.24, time: "Apr30 17:28" },
-  { step: 21, acc: 0.162109, reward: -0.675781, loss: 0.04876, grad: 0.2299, mkl: -0.000022, lr: 1e-6, genTok: 1159.47, genS: 1604.23, trainS: 319.24, stepS: 2048.02, respLen: 1210.97, syncS: 25.74, time: "Apr30 18:04" },
-  { step: 22, acc: 0.147786, reward: -0.704427, loss: 0.03542, grad: 0.2015, mkl: 0.000529, lr: 1e-6, genTok: 1117.41, genS: 1617.72, trainS: 247.70, stepS: 1966.22, respLen: 1176.85, syncS: 25.34, time: "Apr30 18:37" },
-  { step: 23, acc: 0.143880, reward: -0.712240, loss: 0.06407, grad: 0.2000, mkl: 0.000217, lr: 1e-6, genTok: 1119.69, genS: 1689.61, trainS: 263.23, stepS: 2070.77, respLen: 1231.67, syncS: 26.96, time: "Apr30 19:12" },
-  { step: 24, acc: 0.134115, reward: -0.731771, loss: 0.03779, grad: 0.2216, mkl: -0.000193, lr: 1e-6, genTok: 1111.36, genS: 1658.41, trainS: 283.59, stepS: 2069.32, respLen: 1199.93, syncS: 26.04, time: "Apr30 19:47" },
-  { step: 25, acc: 0.160156, reward: -0.679688, loss: 0.05181, grad: 0.2142, mkl: 0.000365, lr: 1e-6, genTok: 1182.55, genS: 1731.25, trainS: 355.04, stepS: 2220.81, respLen: 1332.87, syncS: 25.56, time: "Apr30 20:25" },
-  { step: 26, acc: 0.152344, reward: -0.695313, loss: 0.05597, grad: 0.2424, mkl: 0.000222, lr: 1e-6, genTok: 1184.78, genS: 1593.66, trainS: 285.01, stepS: 2010.57, respLen: 1229.26, syncS: 25.97, time: "Apr30 21:00" },
-  { step: 27, acc: 0.155599, reward: -0.688802, loss: 0.06516, grad: 0.2761, mkl: 0.000200, lr: 1e-6, genTok: 1130.46, genS: 1927.70, trainS: 317.14, stepS: 2399.04, respLen: 1418.73, syncS: 26.33, time: "Apr30 21:40" },
-  { step: 28, acc: 0.122396, reward: -0.755208, loss: 0.08764, grad: 0.6353, mkl: 0.000031, lr: 1e-6, genTok: 1188.51, genS: 1798.16, trainS: 299.75, stepS: 2246.87, respLen: 1391.36, syncS: 26.84, time: "Apr30 22:18" },
-  { step: 29, acc: 0.162760, reward: -0.674479, loss: -0.00521, grad: 0.3501, mkl: 0.000200, lr: 1e-6, genTok: 1166.56, genS: 1746.33, trainS: 279.34, stepS: 2167.96, respLen: 1326.31, syncS: 26.27, time: "Apr30 22:55" },
-  { step: 30, acc: 0.167969, reward: -0.664063, loss: 0.06177, grad: 0.2192, mkl: 0.000102, lr: 1e-6, genTok: 1107.64, genS: 1666.38, trainS: 304.27, stepS: 2094.81, respLen: 1201.66, syncS: 25.89, time: "Apr30 23:30" },
-  { step: 31, acc: 0.156901, reward: -0.686198, loss: -0.03239, grad: 0.3630, mkl: 0.000039, lr: 1e-6, genTok: 1205.60, genS: 1708.85, trainS: 368.66, stepS: 2240.44, respLen: 1341.27, syncS: 27.67, time: "May01 00:09" },
-  { step: 32, acc: 0.123047, reward: -0.753906, loss: 0.02307, grad: 0.1537, mkl: 0.000096, lr: 1e-6, genTok: 1218.31, genS: 1614.59, trainS: 281.13, stepS: 2051.99, respLen: 1280.65, syncS: 25.68, time: "May01 00:44" },
-  { step: 33, acc: 0.195313, reward: -0.609375, loss: 0.06666, grad: 0.2262, mkl: -0.000205, lr: 1e-6, genTok: 1180.99, genS: 1571.09, trainS: 211.43, stepS: 1901.45, respLen: 1207.97, syncS: 25.94, time: "May01 01:16" },
-  { step: 34, acc: 0.141927, reward: -0.716146, loss: 0.01030, grad: 0.2269, mkl: -0.000126, lr: 1e-6, genTok: 1197.70, genS: 1729.57, trainS: 265.66, stepS: 2144.09, respLen: 1348.63, syncS: 26.57, time: "May01 01:52" },
-  { step: 35, acc: 0.153646, reward: -0.692708, loss: -0.02458, grad: 0.1896, mkl: -0.000184, lr: 1e-6, genTok: 1194.54, genS: 1637.90, trainS: 258.98, stepS: 2031.39, respLen: 1273.79, syncS: 26.04, time: "May01 02:26" },
-  { step: 36, acc: 0.154297, reward: -0.691406, loss: 0.02468, grad: 0.2448, mkl: 0.000116, lr: 1e-6, genTok: 1239.13, genS: 1669.61, trainS: 312.52, stepS: 2127.01, respLen: 1346.91, syncS: 25.86, time: "May01 03:04" },
-  { step: 37, acc: 0.149740, reward: -0.700521, loss: 0.06238, grad: 0.1996, mkl: -0.000162, lr: 1e-6, genTok: 1112.15, genS: 1923.99, trainS: 316.10, stepS: 2388.30, respLen: 1393.07, syncS: 26.22, time: "May01 03:44" },
-  { step: 38, acc: 0.154948, reward: -0.690104, loss: -0.06246, grad: 0.6284, mkl: -0.000098, lr: 1e-6, genTok: 1152.06, genS: 2006.66, trainS: 388.58, stepS: 2545.19, respLen: 1505.08, syncS: 27.75, time: "May01 04:27" },
-  { step: 39, acc: 0.135417, reward: -0.729167, loss: 0.05283, grad: 0.2328, mkl: 0.000034, lr: 1e-6, genTok: 1048.69, genS: 2061.89, trainS: 310.85, stepS: 2526.71, respLen: 1407.74, syncS: 27.24, time: "May01 05:09" },
-  { step: 40, acc: 0.184896, reward: -0.630208, loss: -0.07401, grad: 0.4395, mkl: 0.000329, lr: 1e-6, genTok: 1094.78, genS: 1967.43, trainS: 316.07, stepS: 2452.64, respLen: 1402.29, syncS: 25.43, time: "May01 05:50" },
-  { step: 41, acc: 0.194010, reward: -0.611979, loss: 0.06519, grad: 0.2480, mkl: -0.000197, lr: 1e-6, genTok: 1211.25, genS: 1813.98, trainS: 358.42, stepS: 2333.26, respLen: 1430.46, syncS: 25.75, time: "May01 06:31" },
-  { step: 42, acc: 0.199870, reward: -0.600260, loss: 0.03839, grad: 0.6978, mkl: -0.000115, lr: 1e-6, genTok: 1107.09, genS: 2099.36, trainS: 335.11, stepS: 2614.75, respLen: 1513.13, syncS: 27.54, time: "May01 07:15" },
-  { step: 43, acc: 0.143229, reward: -0.713542, loss: 0.08453, grad: 0.6396, mkl: -0.000039, lr: 1e-6, genTok: 1179.25, genS: 1821.37, trainS: 298.88, stepS: 2295.90, respLen: 1398.34, syncS: 26.42, time: "May01 07:54" },
-  { step: 44, acc: 0.158854, reward: -0.682292, loss: 0.05710, grad: 0.2107, mkl: -0.000006, lr: 1e-6, genTok: 1283.08, genS: 1583.35, trainS: 285.37, stepS: 2014.11, respLen: 1322.64, syncS: 25.48, time: "May01 08:28" },
-  { step: 45, acc: 0.158203, reward: -0.683594, loss: 0.00141, grad: 0.2001, mkl: 0.000071, lr: 1e-6, genTok: 1197.01, genS: 2091.17, trainS: 343.87, stepS: 2632.29, respLen: 1629.65, syncS: 25.42, time: "May01 09:12" },
-  { step: 46, acc: 0.147135, reward: -0.705729, loss: 0.00861, grad: 0.3235, mkl: -0.000259, lr: 1e-6, genTok: 1282.64, genS: 1763.01, trainS: 312.23, stepS: 2240.75, respLen: 1472.20, syncS: 25.14, time: "May01 09:51" },
-  { step: 47, acc: 0.149740, reward: -0.700521, loss: -0.05222, grad: 0.3254, mkl: -0.000033, lr: 1e-6, genTok: 1302.25, genS: 1562.70, trainS: 258.27, stepS: 1999.98, respLen: 1324.89, syncS: 25.94, time: "May01 10:25" },
-  { step: 48, acc: 0.175130, reward: -0.649740, loss: 0.04941, grad: 0.2059, mkl: 0.000163, lr: 1e-6, genTok: 1231.17, genS: 1655.14, trainS: 308.36, stepS: 2133.03, respLen: 1326.66, syncS: 25.34, time: "May01 11:01" },
-  { step: 49, acc: 0.130859, reward: -0.738281, loss: 0.06536, grad: 0.1985, mkl: 0.000091, lr: 1e-6, genTok: 1273.25, genS: 1947.92, trainS: 361.53, stepS: 2496.21, respLen: 1614.70, syncS: 26.82, time: "May01 11:43" },
-  { step: 50, acc: 0.152344, reward: -0.695313, loss: 0.01506, grad: 0.3335, mkl: -0.000058, lr: 1e-6, genTok: 1249.85, genS: 1869.73, trainS: 311.35, stepS: 2391.35, respLen: 1521.41, syncS: 25.44, time: "May01 12:23" },
-  { step: 51, acc: 0.135417, reward: -0.729167, loss: 0.05670, grad: 0.2826, mkl: 0.000027, lr: 1e-6, genTok: 1204.62, genS: 1985.36, trainS: 306.52, stepS: 2473.57, respLen: 1557.04, syncS: 25.56, time: "May01 13:06" },
-  { step: 52, acc: 0.175130, reward: -0.649740, loss: 0.05965, grad: 0.2307, mkl: -0.000019, lr: 1e-6, genTok: 1190.85, genS: 1836.10, trainS: 314.86, stepS: 2328.12, respLen: 1423.52, syncS: 27.39, time: "May01 13:45" },
-  { step: 53, acc: 0.167318, reward: -0.665365, loss: 0.02159, grad: 0.1875, mkl: -0.000159, lr: 1e-6, genTok: 1248.88, genS: 1751.67, trainS: 313.00, stepS: 2244.26, respLen: 1424.23, syncS: 25.88, time: "May01 14:23" },
-  { step: 54, acc: 0.117839, reward: -0.764323, loss: 0.04539, grad: 0.2482, mkl: 0.000199, lr: 1e-6, genTok: 1297.60, genS: 1896.14, trainS: 415.80, stepS: 2511.61, respLen: 1601.84, syncS: 25.79, time: "May01 15:06" },
-  { step: 55, acc: 0.143880, reward: -0.712240, loss: 0.03298, grad: 0.3110, mkl: -0.000146, lr: 1e-6, genTok: 1213.15, genS: 1956.42, trainS: 363.79, stepS: 2531.71, respLen: 1545.21, syncS: 25.61, time: "May01 15:48" },
-  { step: 56, acc: 0.160156, reward: -0.679688, loss: 0.07998, grad: 0.2236, mkl: 0.000121, lr: 1e-6, genTok: 1277.78, genS: 1683.23, trainS: 335.59, stepS: 2249.56, respLen: 1400.26, syncS: 27.71, time: "May01 16:27" },
-  { step: 57, acc: 0.159505, reward: -0.680990, loss: 0.01922, grad: 0.2592, mkl: 0.000074, lr: 1e-6, genTok: 1210.83, genS: 1923.36, trainS: 328.18, stepS: 2445.13, respLen: 1516.18, syncS: 26.28, time: "May01 17:08" },
-  { step: 58, acc: 0.125651, reward: -0.748698, loss: 0.06439, grad: 0.2018, mkl: 0.000226, lr: 1e-6, genTok: 1137.69, genS: 2293.92, trainS: 401.47, stepS: 2936.72, respLen: 1699.07, syncS: 27.57, time: "May01 17:58" },
-  { step: 59, acc: 0.177734, reward: -0.644531, loss: 0.03586, grad: 0.2444, mkl: -0.000038, lr: 1e-6, genTok: 1156.63, genS: 2045.03, trainS: 312.92, stepS: 2579.84, respLen: 1539.94, syncS: 26.90, time: "May01 18:41" },
-  { step: 60, acc: 0.127604, reward: -0.744792, loss: 0.01795, grad: 0.1934, mkl: 0.000057, lr: 1e-6, genTok: 1194.86, genS: 2105.28, trainS: 345.39, stepS: 2641.05, respLen: 1637.70, syncS: 24.78, time: "May01 19:26" },
-  { step: 61, acc: 0.154297, reward: -0.691406, loss: 0.02034, grad: 0.2268, mkl: -0.000172, lr: 1e-6, genTok: 1227.05, genS: 1931.29, trainS: 343.82, stepS: 2517.36, respLen: 1542.83, syncS: 25.95, time: "May01 20:09" },
-  { step: 62, acc: 0.141276, reward: -0.717448, loss: 0.02824, grad: 0.2543, mkl: 0.000144, lr: 1e-6, genTok: 1136.12, genS: 2109.43, trainS: 341.25, stepS: 2688.03, respLen: 1560.26, syncS: 28.21, time: "May01 20:55" },
-  { step: 63, acc: 0.227865, reward: -0.544271, loss: 0.04862, grad: 0.2903, mkl: -0.000155, lr: 1e-6, genTok: 1247.19, genS: 1683.34, trainS: 319.64, stepS: 2232.60, respLen: 1366.83, syncS: 28.27, time: "May01 21:32" },
-  { step: 64, acc: 0.181641, reward: -0.636719, loss: 0.06913, grad: 0.2770, mkl: 0.000046, lr: 1e-6, genTok: 1210.39, genS: 1953.26, trainS: 347.81, stepS: 2509.79, respLen: 1539.19, syncS: 26.19, time: "May01 22:15" },
-  { step: 65, acc: 0.146484, reward: -0.707031, loss: 0.01747, grad: 0.2354, mkl: 0.000085, lr: 1e-6, genTok: 1215.17, genS: 2195.73, trainS: 319.56, stepS: 2722.43, respLen: 1737.11, syncS: 25.84, time: "May01 23:00" },
-  { step: 66, acc: 0.136068, reward: -0.727865, loss: 0.00330, grad: 0.1777, mkl: -0.000110, lr: 1e-6, genTok: 1231.77, genS: 2113.52, trainS: 345.02, stepS: 2670.23, respLen: 1694.90, syncS: 25.93, time: "May01 23:47" },
-  { step: 67, acc: 0.126302, reward: -0.747396, loss: 0.03367, grad: 0.3489, mkl: 0.000092, lr: 1e-6, genTok: 1180.70, genS: 2186.21, trainS: 343.99, stepS: 2742.01, respLen: 1680.50, syncS: 26.39, time: "May02 00:33" },
-  { step: 68, acc: 0.154948, reward: -0.690104, loss: 0.05638, grad: 0.2112, mkl: 0.000057, lr: 1e-6, genTok: 1230.86, genS: 1893.82, trainS: 348.60, stepS: 2493.12, respLen: 1517.60, syncS: 26.56, time: "May02 01:15" },
-  { step: 69, acc: 0.132812, reward: -0.734375, loss: -0.14754, grad: 0.5393, mkl: -0.000092, lr: 1e-6, genTok: 1298.31, genS: 1862.26, trainS: 324.35, stepS: 2435.40, respLen: 1574.08, syncS: 26.29, time: "May02 01:56" },
-  { step: 70, acc: 0.145182, reward: -0.709635, loss: 0.01881, grad: 0.7656, mkl: -0.000012, lr: 1e-6, genTok: 1278.91, genS: 1852.33, trainS: 323.46, stepS: 2436.20, respLen: 1542.30, syncS: 26.20, time: "May02 02:37" },
-  { step: 71, acc: 0.181641, reward: -0.636719, loss: 0.05335, grad: 0.1921, mkl: 0.000018, lr: 1e-6, genTok: 1241.78, genS: 1810.50, trainS: 298.59, stepS: 2321.79, respLen: 1463.71, syncS: 27.75, time: "May02 03:17" },
-  { step: 72, acc: 0.172526, reward: -0.654948, loss: 0.02781, grad: 0.1887, mkl: -0.000116, lr: 1e-6, genTok: 1185.17, genS: 2059.27, trainS: 357.09, stepS: 2640.33, respLen: 1588.93, syncS: 25.56, time: "May02 04:01" },
-  { step: 73, acc: 0.176432, reward: -0.647135, loss: 0.00082, grad: 0.2249, mkl: -0.000097, lr: 1e-6, genTok: 1164.20, genS: 2215.05, trainS: 350.16, stepS: 2830.68, respLen: 1678.88, syncS: 28.51, time: "May02 04:49" },
-  { step: 74, acc: 0.167318, reward: -0.665365, loss: 0.06860, grad: 0.2065, mkl: 0.000082, lr: 1e-6, genTok: 1226.16, genS: 1974.57, trainS: 347.07, stepS: 2558.97, respLen: 1576.26, syncS: 26.49, time: "May02 05:32" },
-  { step: 75, acc: 0.167318, reward: -0.665365, loss: 0.10318, grad: 0.2384, mkl: -0.000107, lr: 1e-6, genTok: 1127.27, genS: 2273.44, trainS: 366.79, stepS: 2914.47, respLen: 1668.47, syncS: 27.67, time: "May02 06:21" },
-  { step: 76, acc: 0.224609, reward: -0.550781, loss: -0.01245, grad: 0.2406, mkl: 0.000211, lr: 1e-6, genTok: 1255.07, genS: 1803.96, trainS: 291.10, stepS: 2318.96, respLen: 1474.02, syncS: 25.97, time: "May02 07:02" },
-  { step: 77, acc: 0.178385, reward: -0.643229, loss: 0.08229, grad: 0.2777, mkl: -0.000211, lr: 1e-6, genTok: 1195.80, genS: 2199.49, trainS: 411.97, stepS: 2862.06, respLen: 1712.34, syncS: 26.31, time: "May02 07:50" },
-  { step: 78, acc: 0.149089, reward: -0.701823, loss: -0.01714, grad: 0.4309, mkl: 0.000054, lr: 1e-6, genTok: 1300.99, genS: 1980.98, trainS: 336.73, stepS: 2599.64, respLen: 1677.89, syncS: 27.22, time: "May02 08:33" },
-  { step: 79, acc: 0.162109, reward: -0.675781, loss: 0.07369, grad: 2.1270, mkl: 0.000032, lr: 1e-6, genTok: 1144.00, genS: 2135.18, trainS: 403.24, stepS: 2785.89, respLen: 1590.27, syncS: 25.93, time: "May02 09:20" },
-  { step: 80, acc: 0.184245, reward: -0.631510, loss: 0.09000, grad: 0.2322, mkl: -0.000062, lr: 1e-6, genTok: 1202.25, genS: 2095.25, trainS: 338.64, stepS: 2673.65, respLen: 1639.99, syncS: 26.13, time: "May02 10:05" },
-  { step: 81, acc: 0.145182, reward: -0.709635, loss: 0.00524, grad: 0.2344, mkl: 0.000026, lr: 1e-6, genTok: 1286.86, genS: 1811.88, trainS: 308.68, stepS: 2356.03, respLen: 1517.98, syncS: 26.67, time: "May02 10:46" },
-  { step: 82, acc: 0.149740, reward: -0.700521, loss: 0.04738, grad: 0.1897, mkl: -0.000130, lr: 1e-6, genTok: 1217.09, genS: 2182.64, trainS: 342.14, stepS: 2815.20, respLen: 1729.47, syncS: 27.24, time: "May02 11:34" },
-  { step: 83, acc: 0.128906, reward: -0.742188, loss: 0.05666, grad: 0.2017, mkl: -0.000027, lr: 1e-6, genTok: 1216.44, genS: 2057.37, trainS: 337.48, stepS: 2688.25, respLen: 1629.34, syncS: 25.77, time: "May02 12:19" },
-  { step: 84, acc: 0.136719, reward: -0.726563, loss: -0.00931, grad: 0.1790, mkl: -0.000236, lr: 1e-6, genTok: 1278.07, genS: 2042.72, trainS: 378.64, stepS: 2682.27, respLen: 1699.70, syncS: 26.38, time: "May02 13:04" },
-  { step: 85, acc: 0.119141, reward: -0.761719, loss: 0.01853, grad: 0.2103, mkl: 0.000461, lr: 1e-6, genTok: 1235.08, genS: 2156.90, trainS: 381.93, stepS: 2837.43, respLen: 1734.33, syncS: 25.57, time: "May02 13:52" },
-  { step: 86, acc: 0.159505, reward: -0.680990, loss: 0.01646, grad: 0.2048, mkl: -0.000060, lr: 1e-6, genTok: 1215.27, genS: 2088.63, trainS: 359.41, stepS: 2758.72, respLen: 1652.51, syncS: 25.25, time: "May02 14:39" },
-  { step: 87, acc: 0.174479, reward: -0.651042, loss: 0.02225, grad: 0.2205, mkl: -0.000109, lr: 1e-6, genTok: 1283.06, genS: 2013.84, trainS: 389.71, stepS: 2725.48, respLen: 1682.22, syncS: 25.21, time: "May02 15:25" },
-  { step: 88, acc: 0.162109, reward: -0.675781, loss: 0.02048, grad: 1.2446, mkl: 0.000249, lr: 1e-6, genTok: 1202.16, genS: 2083.60, trainS: 324.03, stepS: 2713.47, respLen: 1630.73, syncS: 25.25, time: "May02 16:11" },
-  { step: 89, acc: 0.180990, reward: -0.638021, loss: 0.09209, grad: 0.4031, mkl: -0.000101, lr: 1e-6, genTok: 1298.48, genS: 1835.42, trainS: 329.74, stepS: 2475.72, respLen: 1551.60, syncS: 25.70, time: "May02 16:53" },
-  { step: 90, acc: 0.201823, reward: -0.596354, loss: 0.07597, grad: 0.4924, mkl: 0.000135, lr: 1e-6, genTok: 1227.48, genS: 2080.80, trainS: 359.57, stepS: 2760.05, respLen: 1662.85, syncS: 25.57, time: "May02 17:39" },
-  { step: 91, acc: 0.141927, reward: -0.716146, loss: 0.01647, grad: 0.2950, mkl: -0.000084, lr: 1e-6, genTok: 1163.47, genS: 2222.85, trainS: 302.46, stepS: 2788.03, respLen: 1683.73, syncS: 25.21, time: "May02 18:27" },
-  { step: 92, acc: 0.193359, reward: -0.613281, loss: 0.04462, grad: 0.6357, mkl: 0.000188, lr: 1e-6, genTok: 1215.25, genS: 1909.00, trainS: 395.45, stepS: 2626.33, respLen: 1510.37, syncS: 25.35, time: "May02 19:11" },
-  { step: 93, acc: 0.158854, reward: -0.682292, loss: 0.04011, grad: 0.2012, mkl: 0.000120, lr: 1e-6, genTok: 1287.92, genS: 1943.42, trainS: 344.79, stepS: 2551.66, respLen: 1629.54, syncS: 25.13, time: "May02 19:54" },
-  { step: 94, acc: 0.119792, reward: -0.760417, loss: 0.04602, grad: 0.2168, mkl: -0.000154, lr: 1e-6, genTok: 1218.21, genS: 2136.72, trainS: 356.82, stepS: 2771.65, respLen: 1694.64, syncS: 24.55, time: "May02 20:41" },
-  { step: 95, acc: 0.220703, reward: -0.558594, loss: 0.07686, grad: 0.2552, mkl: -0.000081, lr: 1e-6, genTok: 1220.94, genS: 1945.08, trainS: 327.74, stepS: 2592.84, respLen: 1546.12, syncS: 25.14, time: "May02 21:25" },
-  { step: 96, acc: 0.190104, reward: -0.619792, loss: 0.07289, grad: 0.2108, mkl: 0.000137, lr: 1e-6, genTok: 1284.78, genS: 2051.68, trainS: 399.63, stepS: 2758.06, respLen: 1716.12, syncS: 25.68, time: "May02 22:12" },
-  { step: 97, acc: 0.215495, reward: -0.569010, loss: 0.03257, grad: 0.3774, mkl: 0.000019, lr: 1e-6, genTok: 1375.15, genS: 1729.02, trainS: 384.61, stepS: 2403.56, respLen: 1547.95, syncS: 25.59, time: "May02 22:53" },
-  { step: 98, acc: 0.136719, reward: -0.726563, loss: -0.00972, grad: 0.6377, mkl: 0.000161, lr: 1e-6, genTok: 1294.38, genS: 2071.15, trainS: 422.46, stepS: 2840.28, respLen: 1745.34, syncS: 27.91, time: "May02 23:40" },
-  { step: 99, acc: 0.138672, reward: -0.722656, loss: 0.04547, grad: 0.2186, mkl: 0.000107, lr: 1e-6, genTok: 1242.24, genS: 2199.39, trainS: 374.40, stepS: 2921.47, respLen: 1778.76, syncS: 26.70, time: "May03 00:30" },
-  { step: 100, acc: 0.173177, reward: -0.653646, loss: 0.00845, grad: 0.2919, mkl: -0.000123, lr: 1e-6, genTok: 1249.42, genS: 2094.34, trainS: 364.84, stepS: 2748.73, respLen: 1703.59, syncS: 26.65, time: "May03 01:16" },
-  { step: 101, acc: 0.230469, reward: -0.539063, loss: 0.03102, grad: 0.1884, mkl: -0.000314, lr: 1e-6, genTok: 1222.42, genS: 1921.18, trainS: 328.09, stepS: 2589.89, respLen: 1528.96, syncS: 26.55, time: "May03 02:01" },
-  { step: 102, acc: 0.195964, reward: -0.608073, loss: 0.10240, grad: 0.2593, mkl: 0.000111, lr: 1e-6, genTok: 1270.01, genS: 1944.72, trainS: 396.10, stepS: 2635.17, respLen: 1607.95, syncS: 26.66, time: "May03 02:45" },
-  { step: 103, acc: 0.147786, reward: -0.704427, loss: 0.01021, grad: 0.1976, mkl: 0.000088, lr: 1e-6, genTok: 1295.99, genS: 1973.87, trainS: 356.57, stepS: 2624.06, respLen: 1665.44, syncS: 26.02, time: "May03 03:29" },
-  { step: 104, acc: 0.131510, reward: -0.736979, loss: 0.03377, grad: 2.2910, mkl: -0.000062, lr: 1e-6, genTok: 1270.46, genS: 2195.21, trainS: 435.82, stepS: 2934.07, respLen: 1815.70, syncS: 26.20, time: "May03 04:19" },
-  { step: 105, acc: 0.263672, reward: -0.472656, loss: 0.04908, grad: 0.4297, mkl: -0.000229, lr: 1e-6, genTok: 1316.81, genS: 1713.88, trainS: 336.24, stepS: 2396.63, respLen: 1469.30, syncS: 26.39, time: "May03 04:59" },
-  { step: 106, acc: 0.147135, reward: -0.705729, loss: 0.05699, grad: 0.2012, mkl: 0.000137, lr: 1e-6, genTok: 1236.93, genS: 2084.01, trainS: 375.05, stepS: 2817.51, respLen: 1678.24, syncS: 27.31, time: "May03 05:48" },
-  { step: 107, acc: 0.148438, reward: -0.703125, loss: 0.08087, grad: 0.2731, mkl: -0.000182, lr: 1e-6, genTok: 1192.63, genS: 2226.89, trainS: 317.00, stepS: 2847.54, respLen: 1729.08, syncS: 26.48, time: "May03 06:36" },
-  { step: 108, acc: 0.159505, reward: -0.680990, loss: 0.05200, grad: 0.2124, mkl: 0.000005, lr: 1e-6, genTok: 1161.38, genS: 2391.64, trainS: 412.32, stepS: 3190.49, respLen: 1808.32, syncS: 26.63, time: "May03 07:29" },
-  { step: 109, acc: 0.128906, reward: -0.742188, loss: 0.04966, grad: 0.2074, mkl: 0.000054, lr: 1e-6, genTok: 1218.77, genS: 2342.64, trainS: 392.38, stepS: 3120.44, respLen: 1858.82, syncS: 27.59, time: "May03 08:22" },
-  { step: 110, acc: 0.139974, reward: -0.720052, loss: 0.07233, grad: 0.2177, mkl: 0.000110, lr: 1e-6, genTok: 1212.12, genS: 2081.48, trainS: 358.98, stepS: 2816.78, respLen: 1642.58, syncS: 25.69, time: "May03 09:09" },
-  { step: 111, acc: 0.204427, reward: -0.591146, loss: 0.05420, grad: 0.2306, mkl: -0.000156, lr: 1e-6, genTok: 1294.06, genS: 1881.90, trainS: 327.17, stepS: 2510.16, respLen: 1585.48, syncS: 25.28, time: "May03 09:53" },
-  { step: 112, acc: 0.199870, reward: -0.600260, loss: 0.04599, grad: 0.2666, mkl: -0.000049, lr: 1e-6, genTok: 1195.15, genS: 2160.57, trainS: 370.88, stepS: 2917.96, respLen: 1681.12, syncS: 25.49, time: "May03 10:42" },
-  { step: 113, acc: 0.155599, reward: -0.688802, loss: -0.00735, grad: 0.1653, mkl: -0.000061, lr: 1e-6, genTok: 1262.25, genS: 1987.56, trainS: 339.99, stepS: 2642.88, respLen: 1633.33, syncS: 25.39, time: "May03 11:26" },
-  // Run 14 continued (max_response_length=20480)
-  { step: 114, acc: 0.177083, reward: -0.645833, loss: 0.01996, grad: 0.2524, mkl: 0.000030, lr: 1e-6, genTok: 1197.41, genS: 2178.23, trainS: 343.38, stepS: 2901.84, respLen: 1698.08, syncS: 25.80, time: "May03 12:15" },
-  { step: 115, acc: 0.173828, reward: -0.652344, loss: 0.05567, grad: 0.2284, mkl: 0.000199, lr: 1e-6, genTok: 1299.22, genS: 2044.73, trainS: 349.23, stepS: 2778.06, respLen: 1729.52, syncS: 25.72, time: "May03 13:02" },
-  { step: 116, acc: 0.175781, reward: -0.648438, loss: 0.03800, grad: 0.1957, mkl: -0.000265, lr: 1e-6, genTok: 1206.48, genS: 2198.61, trainS: 420.26, stepS: 3033.18, respLen: 1726.94, syncS: 25.24, time: "May03 13:54" },
-  { step: 117, acc: 0.207031, reward: -0.585938, loss: 0.02727, grad: 0.2363, mkl: -0.000135, lr: 1e-6, genTok: 1317.16, genS: 1808.08, trainS: 347.50, stepS: 2539.31, respLen: 1550.48, syncS: 26.86, time: "May03 14:37" },
-  { step: 118, acc: 0.141927, reward: -0.716146, loss: -0.05281, grad: 0.1971, mkl: -0.000165, lr: 1e-6, genTok: 1271.77, genS: 2085.37, trainS: 381.49, stepS: 2863.67, respLen: 1726.63, syncS: 26.16, time: "May03 15:25" },
-  { step: 119, acc: 0.163411, reward: -0.673177, loss: 0.05891, grad: 1.1143, mkl: -0.000096, lr: 1e-6, genTok: 1212.07, genS: 2258.56, trainS: 411.88, stepS: 3071.73, respLen: 1782.26, syncS: 26.13, time: "May03 16:16" },
-  { step: 120, acc: 0.131510, reward: -0.736979, loss: 0.08145, grad: 0.3118, mkl: -0.000029, lr: 1e-6, genTok: 1244.58, genS: 2214.63, trainS: 373.59, stepS: 2931.49, respLen: 1794.46, syncS: 25.41, time: "May03 17:06" },
-  { step: 121, acc: 0.175130, reward: -0.649740, loss: 0.01457, grad: 0.2675, mkl: -0.000206, lr: 1e-6, genTok: 1278.00, genS: 2082.42, trainS: 374.59, stepS: 2867.00, respLen: 1732.64, syncS: 27.50, time: "May03 17:55" },
-  { step: 122, acc: 0.198568, reward: -0.602865, loss: 0.10477, grad: 0.3151, mkl: -0.000100, lr: 1e-6, genTok: 1377.49, genS: 1988.46, trainS: 412.31, stepS: 2743.39, respLen: 1783.26, syncS: 25.47, time: "May03 18:41" },
-  { step: 123, acc: 0.147135, reward: -0.705729, loss: 0.06316, grad: 0.3478, mkl: -0.000206, lr: 1e-6, genTok: 1277.48, genS: 2023.05, trainS: 355.11, stepS: 2788.50, respLen: 1682.55, syncS: 25.96, time: "May03 19:28" },
-  { step: 124, acc: 0.176432, reward: -0.647135, loss: 0.05483, grad: 0.2988, mkl: 0.000000, lr: 1e-6, genTok: 1276.33, genS: 2096.75, trainS: 386.76, stepS: 2828.09, respLen: 1742.28, syncS: 25.90, time: "May03 20:16" },
-  { step: 125, acc: 0.139974, reward: -0.720052, loss: 0.08540, grad: 0.2308, mkl: 0.000060, lr: 1e-6, genTok: 1180.93, genS: 2390.11, trainS: 395.31, stepS: 3146.75, respLen: 1837.61, syncS: 26.05, time: "May03 21:09" },
-  { step: 126, acc: 0.167318, reward: -0.665365, loss: 0.03831, grad: 1.2954, mkl: -0.000073, lr: 1e-6, genTok: 1287.03, genS: 2149.90, trainS: 342.97, stepS: 2846.33, respLen: 1801.43, syncS: 25.27, time: "May03 21:58" },
-  { step: 127, acc: 0.166667, reward: -0.666667, loss: 0.04183, grad: 0.2281, mkl: -0.000017, lr: 1e-6, genTok: 1230.09, genS: 2167.95, trainS: 373.61, stepS: 2896.33, respLen: 1736.17, syncS: 25.57, time: "May03 22:47" },
-  { step: 128, acc: 0.160156, reward: -0.679688, loss: 0.01726, grad: 0.3201, mkl: -0.000013, lr: 1e-6, genTok: 1247.40, genS: 2206.80, trainS: 426.48, stepS: 3002.00, respLen: 1792.17, syncS: 25.63, time: "May03 23:37" },
-  { step: 129, acc: 0.143229, reward: -0.713542, loss: 0.01087, grad: 0.3916, mkl: 0.000073, lr: 1e-6, genTok: 1267.24, genS: 2077.91, trainS: 429.60, stepS: 2871.90, respLen: 1714.33, syncS: 25.68, time: "May04 00:25" },
-  { step: 130, acc: 0.125000, reward: -0.750000, loss: 0.04759, grad: 0.2144, mkl: -0.000119, lr: 1e-6, genTok: 1194.22, genS: 2322.21, trainS: 389.98, stepS: 3153.31, respLen: 1805.50, syncS: 27.11, time: "May04 01:18" },
-  // ── Run 15: max_response_length reduced 20480→8192, resumed from checkpoint_130 ──
-  { step: 131, acc: 0.098958, reward: -0.802083, loss: 0.00690, grad: 0.6250, mkl: 0.000355, lr: 1e-6, genTok: 1505.02, genS: 992.70, trainS: 272.71, stepS: 1347.00, respLen: 972.68, syncS: 28.42, time: "May04 03:27" },
-  { step: 132, acc: 0.113281, reward: -0.773438, loss: 0.03832, grad: 0.3567, mkl: -0.000151, lr: 1e-6, genTok: 1508.39, genS: 984.25, trainS: 241.66, stepS: 1298.18, respLen: 966.56, syncS: 27.68, time: "May04 03:49" },
-  { step: 133, acc: 0.104818, reward: -0.790365, loss: -0.03541, grad: 0.4087, mkl: 0.000065, lr: 1e-6, genTok: 1502.33, genS: 1091.38, trainS: 287.93, stepS: 1459.58, respLen: 1067.45, syncS: 27.58, time: "May04 04:14" },
-  { step: 134, acc: 0.130859, reward: -0.738281, loss: -0.01996, grad: 0.4863, mkl: -0.000295, lr: 1e-6, genTok: 1472.03, genS: 1060.19, trainS: 256.06, stepS: 1392.92, respLen: 1016.04, syncS: 27.99, time: "May04 04:37" },
-  { step: 135, acc: 0.143880, reward: -0.712240, loss: 0.05175, grad: 0.4053, mkl: 0.000072, lr: 1e-6, genTok: 1493.03, genS: 981.74, trainS: 270.06, stepS: 1330.80, respLen: 954.28, syncS: 27.35, time: "May04 05:00" },
-  { step: 136, acc: 0.117839, reward: -0.764323, loss: -0.02199, grad: 0.5120, mkl: 0.000485, lr: 1e-6, genTok: 1533.10, genS: 1115.37, trainS: 297.58, stepS: 1502.69, respLen: 1113.26, syncS: 27.10, time: "May04 05:27" },
-  { step: 137, acc: 0.135417, reward: -0.729167, loss: 0.01427, grad: 0.3970, mkl: 0.000342, lr: 1e-6, genTok: 1488.27, genS: 1017.05, trainS: 256.87, stepS: 1359.53, respLen: 985.45, syncS: 27.70, time: "May04 05:50" },
-  { step: 138, acc: 0.111979, reward: -0.776042, loss: 0.03197, grad: 0.4404, mkl: -0.000340, lr: 1e-6, genTok: 1519.10, genS: 1075.77, trainS: 262.89, stepS: 1421.79, respLen: 1063.94, syncS: 27.64, time: "May04 06:14" },
-  { step: 139, acc: 0.157552, reward: -0.684896, loss: -0.02733, grad: 0.4268, mkl: -0.000242, lr: 1e-6, genTok: 1514.98, genS: 1050.01, trainS: 278.36, stepS: 1415.16, respLen: 1035.64, syncS: 26.97, time: "May04 06:38" },
-  { step: 140, acc: 0.162760, reward: -0.674479, loss: 0.06439, grad: 0.5313, mkl: -0.000193, lr: 1e-6, genTok: 1515.17, genS: 1193.04, trainS: 327.86, stepS: 1628.13, respLen: 1176.85, syncS: 27.15, time: "May04 07:06" },
-  { step: 141, acc: 0.157552, reward: -0.684896, loss: 0.02059, grad: 0.3572, mkl: 0.000580, lr: 1e-6, genTok: 1483.02, genS: 1169.02, trainS: 292.71, stepS: 1554.18, respLen: 1128.69, syncS: 26.41, time: "May04 07:33" },
-  { step: 142, acc: 0.157552, reward: -0.684896, loss: 0.02262, grad: 1.8838, mkl: 0.000301, lr: 1e-6, genTok: 1503.81, genS: 1130.84, trainS: 283.70, stepS: 1515.58, respLen: 1107.15, syncS: 26.83, time: "May04 07:59" },
-  { step: 143, acc: 0.156901, reward: -0.686198, loss: -0.03854, grad: 0.7319, mkl: -0.000736, lr: 1e-6, genTok: 1560.94, genS: 1080.71, trainS: 284.25, stepS: 1461.84, respLen: 1098.26, syncS: 26.50, time: "May04 08:24" },
-  { step: 144, acc: 0.171224, reward: -0.657552, loss: 0.08275, grad: 1.9297, mkl: -0.000071, lr: 1e-6, genTok: 1535.22, genS: 1134.91, trainS: 302.91, stepS: 1539.00, respLen: 1134.33, syncS: 27.22, time: "May04 08:50" },
-  { step: 145, acc: 0.124349, reward: -0.751302, loss: 0.00137, grad: 0.2905, mkl: -0.000159, lr: 1e-6, genTok: 1540.16, genS: 1172.38, trainS: 286.07, stepS: 1557.83, respLen: 1175.56, syncS: 27.35, time: "May04 09:16" },
-  { step: 146, acc: 0.180339, reward: -0.639323, loss: 0.02905, grad: 0.5659, mkl: 0.000200, lr: 1e-6, genTok: 1510.83, genS: 1222.55, trainS: 305.86, stepS: 1638.17, respLen: 1202.52, syncS: 26.77, time: "May04 09:45" },
-  { step: 147, acc: 0.143880, reward: -0.712240, loss: 0.00192, grad: 0.5757, mkl: -0.000262, lr: 1e-6, genTok: 1513.63, genS: 1230.49, trainS: 313.50, stepS: 1659.32, respLen: 1212.57, syncS: 26.55, time: "May04 10:13" },
-  { step: 148, acc: 0.180990, reward: -0.638021, loss: 0.00454, grad: 1.0913, mkl: 0.000052, lr: 1e-6, genTok: 1539.51, genS: 1193.30, trainS: 311.32, stepS: 1617.68, respLen: 1196.03, syncS: 26.32, time: "May04 10:41" },
-  { step: 149, acc: 0.133464, reward: -0.733073, loss: 0.03680, grad: 0.3291, mkl: 0.000276, lr: 1e-6, genTok: 1493.91, genS: 1282.85, trainS: 326.89, stepS: 1732.70, respLen: 1247.70, syncS: 26.18, time: "May04 11:10" },
-  { step: 150, acc: 0.126302, reward: -0.747396, loss: -0.00607, grad: 0.3297, mkl: -0.000153, lr: 1e-6, genTok: 1568.57, genS: 1321.54, trainS: 317.60, stepS: 1760.08, respLen: 1349.56, syncS: 26.98, time: "May04 11:40" },
-  { step: 151, acc: 0.170573, reward: -0.658854, loss: 0.05695, grad: 0.4229, mkl: 0.000010, lr: 1e-6, genTok: 1537.97, genS: 1268.67, trainS: 341.22, stepS: 1726.88, respLen: 1270.30, syncS: 26.67, time: "May04 12:10" },
-  { step: 152, acc: 0.172526, reward: -0.654948, loss: 0.03280, grad: 0.9028, mkl: -0.000263, lr: 1e-6, genTok: 1552.66, genS: 1248.43, trainS: 298.23, stepS: 1662.35, respLen: 1261.98, syncS: 26.20, time: "May04 12:38" },
-  { step: 153, acc: 0.142578, reward: -0.714844, loss: 0.03274, grad: 0.7710, mkl: -0.000255, lr: 1e-6, genTok: 1546.03, genS: 1340.80, trainS: 351.95, stepS: 1829.04, respLen: 1349.56, syncS: 26.50, time: "May04 13:09" },
-  { step: 154, acc: 0.171875, reward: -0.656250, loss: 0.04175, grad: 0.4663, mkl: 0.000094, lr: 1e-6, genTok: 1584.61, genS: 1279.97, trainS: 347.94, stepS: 1767.01, respLen: 1320.47, syncS: 26.46, time: "May04 13:39" },
-  { step: 155, acc: 0.126302, reward: -0.747396, loss: -0.01061, grad: 0.9551, mkl: -0.000124, lr: 1e-6, genTok: 1575.55, genS: 1238.40, trainS: 318.22, stepS: 1678.78, respLen: 1270.29, syncS: 26.53, time: "May04 14:08" },
-  { step: 156, acc: 0.159505, reward: -0.680990, loss: 0.02984, grad: 6.6758, mkl: -0.000335, lr: 1e-6, genTok: 1550.49, genS: 1234.33, trainS: 332.03, stepS: 1706.29, respLen: 1245.97, syncS: 27.04, time: "May04 14:38" },
-  { step: 157, acc: 0.160807, reward: -0.678385, loss: 0.01722, grad: 0.4209, mkl: -0.000211, lr: 1e-6, genTok: 1537.58, genS: 1356.36, trainS: 325.60, stepS: 1829.60, respLen: 1357.76, syncS: 26.97, time: "May04 15:09" },
-  { step: 158, acc: 0.136068, reward: -0.727865, loss: 0.03301, grad: 0.4409, mkl: 0.000121, lr: 1e-6, genTok: 1534.21, genS: 1352.55, trainS: 354.34, stepS: 1858.00, respLen: 1350.98, syncS: 26.55, time: "May04 15:40" },
-  { step: 159, acc: 0.149089, reward: -0.701823, loss: -0.00206, grad: 0.3870, mkl: 0.000431, lr: 1e-6, genTok: 1545.66, genS: 1349.77, trainS: 319.10, stepS: 1810.60, respLen: 1358.26, syncS: 26.68, time: "May04 16:11" },
-  { step: 160, acc: 0.162109, reward: -0.675781, loss: 0.04729, grad: 1.4531, mkl: -0.000384, lr: 1e-6, genTok: 1605.79, genS: 1345.61, trainS: 321.42, stepS: 1800.99, respLen: 1406.74, syncS: 25.51, time: "May04 16:41" },
-  { step: 161, acc: 0.173828, reward: -0.652344, loss: 0.03077, grad: 0.7827, mkl: 0.000072, lr: 1e-6, genTok: 1572.10, genS: 1351.99, trainS: 342.77, stepS: 1852.47, respLen: 1383.77, syncS: 25.54, time: "May04 17:14" },
-  { step: 162, acc: 0.215495, reward: -0.569010, loss: 0.01711, grad: 0.4817, mkl: 0.000025, lr: 1e-6, genTok: 1500.35, genS: 1273.49, trainS: 351.75, stepS: 1771.32, respLen: 1243.93, syncS: 25.58, time: "May04 17:44" },
-  { step: 163, acc: 0.182943, reward: -0.634115, loss: -0.04233, grad: 0.5039, mkl: -0.000331, lr: 1e-6, genTok: 1572.54, genS: 1339.05, trainS: 341.30, stepS: 1838.99, respLen: 1370.90, syncS: 25.28, time: "May04 18:15" },
-  { step: 164, acc: 0.140625, reward: -0.718750, loss: 0.04087, grad: 1.7744, mkl: 0.000120, lr: 1e-6, genTok: 1580.93, genS: 1199.39, trainS: 297.87, stepS: 1629.57, respLen: 1234.48, syncS: 25.67, time: "May04 18:42" },
-  { step: 165, acc: 0.156250, reward: -0.687500, loss: 0.00283, grad: 3.5781, mkl: -0.000292, lr: 1e-6, genTok: 1535.63, genS: 1320.14, trainS: 355.25, stepS: 1818.21, respLen: 1319.83, syncS: 25.33, time: "May04 19:13" },
-  { step: 166, acc: 0.149089, reward: -0.701823, loss: -0.01215, grad: 0.6167, mkl: -0.000680, lr: 1e-6, genTok: 1585.71, genS: 1453.54, trainS: 359.40, stepS: 1969.79, respLen: 1500.58, syncS: 25.05, time: "May04 19:48" },
-  { step: 167, acc: 0.168620, reward: -0.662760, loss: 0.00370, grad: 0.4690, mkl: 0.000411, lr: 1e-6, genTok: 1560.35, genS: 1406.76, trainS: 343.44, stepS: 1895.16, respLen: 1429.06, syncS: 24.58, time: "May04 20:20" },
-  { step: 168, acc: 0.108073, reward: -0.783854, loss: 0.02067, grad: 0.5664, mkl: -0.000116, lr: 1e-6, genTok: 1601.08, genS: 1412.52, trainS: 333.32, stepS: 1918.79, respLen: 1472.36, syncS: 24.90, time: "May04 20:52" },
-  { step: 169, acc: 0.198568, reward: -0.602865, loss: 0.04577, grad: 0.4258, mkl: 0.000206, lr: 1e-6, genTok: 1549.93, genS: 1373.08, trainS: 326.38, stepS: 1854.80, respLen: 1385.53, syncS: 24.68, time: "May04 21:23" },
-  { step: 170, acc: 0.193359, reward: -0.613281, loss: -0.01984, grad: 0.3889, mkl: 0.000367, lr: 1e-6, genTok: 1639.06, genS: 1290.19, trainS: 332.32, stepS: 1798.87, respLen: 1376.76, syncS: 24.16, time: "May04 21:54" },
-  { step: 171, acc: 0.187500, reward: -0.625000, loss: -0.00477, grad: 0.4080, mkl: 0.000217, lr: 1e-6, genTok: 1599.29, genS: 1355.24, trainS: 326.82, stepS: 1834.59, respLen: 1411.08, syncS: 25.18, time: "May04 22:26" },
-  { step: 172, acc: 0.177734, reward: -0.644531, loss: 0.03748, grad: 2.8398, mkl: 0.000385, lr: 1e-6, genTok: 1537.46, genS: 1443.35, trainS: 434.10, stepS: 2056.00, respLen: 1444.72, syncS: 24.26, time: "May04 23:01" },
-  { step: 173, acc: 0.177083, reward: -0.645833, loss: 0.02128, grad: 0.3950, mkl: 0.000080, lr: 1e-6, genTok: 1582.28, genS: 1459.81, trainS: 354.07, stepS: 2001.70, respLen: 1503.79, syncS: 24.54, time: "May04 23:34" },
-  { step: 174, acc: 0.179036, reward: -0.641927, loss: 0.05834, grad: 0.4702, mkl: 0.000397, lr: 1e-6, genTok: 1591.60, genS: 1406.47, trainS: 362.65, stepS: 1939.60, respLen: 1457.38, syncS: 24.55, time: "May05 00:07" },
-  { step: 175, acc: 0.161458, reward: -0.677083, loss: 0.04140, grad: 1.7471, mkl: -0.000131, lr: 1e-6, genTok: 1580.04, genS: 1356.05, trainS: 341.50, stepS: 1858.31, respLen: 1394.94, syncS: 24.18, time: "May05 00:38" },
-  { step: 176, acc: 0.207682, reward: -0.584635, loss: 0.06293, grad: 1.5161, mkl: 0.000003, lr: 1e-6, genTok: 1586.18, genS: 1289.00, trainS: 325.61, stepS: 1798.51, respLen: 1331.11, syncS: 24.73, time: "May05 01:10" },
-  { step: 177, acc: 0.155599, reward: -0.688802, loss: 0.02486, grad: 0.6409, mkl: -0.000023, lr: 1e-6, genTok: 1593.41, genS: 1452.90, trainS: 361.14, stepS: 1985.16, respLen: 1507.21, syncS: 24.97, time: "May05 01:44" },
-  { step: 178, acc: 0.197266, reward: -0.605469, loss: 0.05320, grad: 0.3975, mkl: 0.000320, lr: 1e-6, genTok: 1612.20, genS: 1315.98, trainS: 348.40, stepS: 1832.49, respLen: 1381.27, syncS: 24.28, time: "May05 02:15" },
-  { step: 179, acc: 0.180339, reward: -0.639323, loss: -0.01150, grad: 0.4106, mkl: 0.000028, lr: 1e-6, genTok: 1589.92, genS: 1372.99, trainS: 310.98, stepS: 1846.82, respLen: 1421.19, syncS: 24.38, time: "May05 02:46" },
-  { step: 180, acc: 0.225260, reward: -0.549479, loss: 0.04256, grad: 0.3613, mkl: 0.000088, lr: 1e-6, genTok: 1553.22, genS: 1291.78, trainS: 332.49, stepS: 1789.96, respLen: 1306.27, syncS: 24.33, time: "May05 03:16" },
-  { step: 181, acc: 0.171224, reward: -0.657552, loss: 0.02111, grad: 0.4541, mkl: 0.000115, lr: 1e-6, genTok: 1589.51, genS: 1374.21, trainS: 344.61, stepS: 1920.54, respLen: 1422.09, syncS: 25.48, time: "May05 03:50" },
-  { step: 182, acc: 0.141276, reward: -0.717448, loss: 0.03838, grad: 0.4597, mkl: -0.000931, lr: 1e-6, genTok: 1585.10, genS: 1421.73, trainS: 370.70, stepS: 1973.14, respLen: 1467.18, syncS: 25.26, time: "May05 04:23" },
-  { step: 183, acc: 0.156901, reward: -0.686198, loss: -0.00136, grad: 0.4678, mkl: -0.000018, lr: 1e-6, genTok: 1608.34, genS: 1581.57, trainS: 391.58, stepS: 2168.11, respLen: 1656.05, syncS: 27.19, time: "May05 05:00" },
-  { step: 184, acc: 0.197917, reward: -0.604167, loss: 0.02633, grad: 0.4539, mkl: -0.000089, lr: 1e-6, genTok: 1570.93, genS: 1355.71, trainS: 330.87, stepS: 1892.88, respLen: 1386.54, syncS: 27.48, time: "May05 05:32" },
-  { step: 185, acc: 0.232422, reward: -0.535156, loss: 0.02289, grad: 0.5977, mkl: 0.000035, lr: 1e-6, genTok: 1555.15, genS: 1378.22, trainS: 386.67, stepS: 1993.91, respLen: 1395.40, syncS: 26.71, time: "May05 06:05" },
-  { step: 186, acc: 0.171875, reward: -0.656250, loss: 0.01087, grad: 0.7920, mkl: -0.000338, lr: 1e-6, genTok: 1582.61, genS: 1473.81, trainS: 380.59, stepS: 2076.76, respLen: 1518.52, syncS: 26.31, time: "May05 06:41" },
-  { step: 187, acc: 0.182292, reward: -0.635417, loss: 0.05111, grad: 0.3933, mkl: 0.000126, lr: 1e-6, genTok: 1550.52, genS: 1398.38, trainS: 382.87, stepS: 1979.94, respLen: 1411.59, syncS: 25.63, time: "May05 07:15" },
-];
+var V1_STEPS=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17];
+var V1_LOSS=[-0.0914343,0.0493069,0.0950321,0.0488714,-0.0373262,-0.0514216,0.0374856,0,0.0579588,0.0130063,0.101164,0.0542512,0.0922696,-0.116074,0.062252,0.00902419,-0.0846051,0.134629];
+var V1_REWARD_MEAN=[-0.90625,-0.65625,-0.875,-0.84375,-0.875,-0.6875,-0.90625,-1,-0.90625,-0.9375,-0.8125,-0.96875,-0.78125,-0.59375,-0.71875,-0.78125,-0.71875,-0.78125];
+var V1_REWARD_ACC=[0.046875,0.171875,0.0625,0.078125,0.0625,0.15625,0.046875,0,0.046875,0.03125,0.09375,0.015625,0.109375,0.203125,0.140625,0.109375,0.140625,0.109375];
+var V1_STEP_S=[86.2233,67.5819,54.6486,85.5501,72.6152,82.657,59.5421,70.9706,60.3779,64.8084,76.8484,64.9383,64.7454,89.6192,82.9879,57.2422,82.9475,100.251];
+var V1_GEN_S=[40.3178,27.3849,22.5275,35.1995,30.2927,33.9176,24.0526,29.7012,25.1362,27.5957,32.4175,26.6691,27.0047,36.7578,33.3738,23.5548,34.0202,40.6965];
+var V1_GEN_TOK_S=[1228.56,2283.03,1986.47,1399.34,2165.51,1390.28,1867.74,1763.13,1814.8,1405.33,1511.5,1830.33,1841.24,1630.43,1378.33,1988.82,1406.58,1502.68];
+var V1_GRAD_NORM=[0.297607,0.431641,0.343018,0.294922,0.254028,0.737793,0.222534,0,0.457275,0.201172,0.370605,0.175293,0.469727,0.396484,0.378418,0.371094,0.333008,0.424072];
+var V1_MEAN_RESP_LEN=[944.062,1092.59,827.125,920.75,1143.12,897.828,853.547,973.516,831.156,729.734,888.875,907.047,917.109,1065.44,866.828,851.812,862.625,1078.05];
+var V1_MAX_SEQ_LEN=[2366,2612,2253,3562,2961,3415,2558,2932,2513,2686,3078,2699,2642,3628,3501,2332,3445,4062];
 
-// ── Run 13 comparison data (for overlay chart) ──
-const RUN13 = [
-  { step: 0,  acc: 0.110026 },
-  { step: 1,  acc: 0.148438 },
-  { step: 2,  acc: 0.124349 },
-  { step: 3,  acc: 0.100260 },
-  { step: 4,  acc: 0.097656 },
-  { step: 5,  acc: 0.140625 },
-  { step: 6,  acc: 0.118490 },
-  { step: 7,  acc: 0.129557 },
-  { step: 8,  acc: 0.115234 },
-  { step: 9,  acc: 0.102865 },
-  { step: 10, acc: 0.115234 },
-  { step: 11, acc: 0.118490 },
-  { step: 12, acc: 0.143880 },
-  { step: 13, acc: 0.136068 },
-  { step: 14, acc: 0.126953 },
-  { step: 15, acc: 0.152995 },
-  { step: 16, acc: 0.124349 },
-  { step: 17, acc: 0.144531 },
-  { step: 18, acc: 0.172526 },
-  { step: 19, acc: 0.177734 },
-  { step: 20, acc: 0.167318 },
-  { step: 21, acc: 0.171224 },
-  { step: 22, acc: 0.142578 },
-  { step: 23, acc: 0.114583 },
-  { step: 24, acc: 0.158854 },
-  { step: 25, acc: 0.117839 },
-  { step: 26, acc: 0.135417 },
-  { step: 27, acc: 0.153646 },
-  { step: 28, acc: 0.140625 },
-  { step: 29, acc: 0.143229 },
-  { step: 30, acc: 0.197266 },
-  { step: 31, acc: 0.155599 },
-  { step: 32, acc: 0.145833 },
-  { step: 33, acc: 0.188151 },
-  { step: 34, acc: 0.156250 },
-  { step: 35, acc: 0.181641 },
-];
+var P1_STEPS=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20];
+var P1_LOSS=[0.000476,0.0304,0.3134,-0.0298,0.0238,-0.00370,-0.00164,-0.1089,0.0133,-0.0129,0.0675,0.0852,0.0376,0.0195,-0.0630,-0.00453,0.00762,0.0162,-0.0796,0.0193,-0.0437];
+var P1_REWARD_MEAN=[-0.6875,-0.84375,-0.8125,-0.796875,-0.703125,-0.703125,-0.625,-0.703125,-0.734375,-0.84375,-0.734375,-0.765625,-0.875,-0.78125,-0.75,-0.546875,-0.578125,-0.90625,-0.65625,-0.78125,-0.6875];
+var P1_REWARD_ACC=[0.15625,0.078125,0.09375,0.101562,0.148438,0.148438,0.1875,0.148438,0.132812,0.078125,0.132812,0.117188,0.0625,0.109375,0.125,0.226562,0.210938,0.046875,0.171875,0.109375,0.15625];
+var P1_STEP_S=[160.09,139.94,120.70,137.12,101.23,130.90,152.09,109.45,133.59,127.45,144.27,131.22,131.42,130.80,110.95,128.37,125.99,103.04,98.13,129.50,130.60];
+var P1_GEN_S=[51.50,38.47,31.43,37.26,26.52,37.06,43.00,30.12,34.34,37.00,41.44,35.88,33.54,32.37,29.79,36.52,32.43,30.33,34.74,35.85,36.20];
+var P1_GEN_TOK_S=[1970.16,3003.06,3321.05,2919.89,2895.02,3044.85,3160.40,3025.29,3263.30,2776.87,3112.03,2317.22,3054.46,2459.13,2949.79,2807.01,2815.87,2825.72,2106.06,2680.68,2629.74];
+var P1_GRAD_NORM=[0.2286,0.1931,183.688,0.2866,0.4944,0.3599,0.3989,0.2694,0.2499,0.2467,0.2549,0.3726,0.1952,0.6162,0.00243,0.3643,0.3025,0.2341,0.4514,0.2506,0.3911];
+var P1_MEAN_RESP_LEN=[939.73,1041.04,956.75,1004.23,721.76,1013.82,1193.26,846.70,994.09,937.48,1143.85,801.84,955.49,791.41,822.37,962.66,829.91,833.76,702.90,858.27,875.09];
+var P1_MAX_SEQ_LEN=[3177,3216,2945,3209,2550,3065,3244,2593,3208,3016,3260,3227,3242,3321,2727,2790,3133,2423,2104,3116,3168];
+var P1_NAN_PARAMS=[0,0,309,0,0,0,0,0,0,0,0,0,0,0,399,0,0,0,0,0,0];
 
-DATA.forEach(d => {
-  d.msTok = d.genTok > 0 ? (1000 / d.genTok) : 0;
-});
+var TOTAL_TRAINING_STEPS=275;
 
-const latest = DATA[DATA.length - 1];
-const prev = DATA.length > 1 ? DATA[DATA.length - 2] : null;
+var V1_TPT=V1_GEN_TOK_S.map(function(t){return t>0?1000/t:0;});
+var P1_TPT=P1_GEN_TOK_S.map(function(t){return t>0?1000/t:0;});
 
-function fmt(v, d=4) { return v.toFixed(d); }
-function pct(v) { return (v * 100).toFixed(1) + '%'; }
-function delta(curr, prev, fmt_fn, invert=false) {
-  if (!prev && prev !== 0) return { text: '\u2014', cls: 'neutral' };
-  const d = curr - prev;
-  const sign = d > 0 ? '+' : '';
-  const cls = d === 0 ? 'neutral' : (invert ? (d > 0 ? 'down' : 'up') : (d > 0 ? 'up' : 'down'));
-  return { text: sign + fmt_fn(d), cls };
+var avgStep=P1_STEP_S.reduce(function(a,b){return a+b;},0)/P1_STEP_S.length;
+var remaining=Math.max(0,TOTAL_TRAINING_STEPS-P1_STEPS.length);
+var etaH=(remaining*avgStep)/3600;
+var latestTput=P1_GEN_TOK_S[P1_GEN_TOK_S.length-1];
+var latestTPT=latestTput>0?(1000/latestTput).toFixed(2):'---';
+
+function fmtNum(x){
+  var ax=Math.abs(x);
+  if(ax>=1000)return x.toFixed(1);
+  if(ax>=100)return x.toFixed(2);
+  if(ax>=10)return x.toFixed(3);
+  if(ax>=1)return x.toFixed(4);
+  return x.toFixed(5);
 }
 
-// 5-step moving average for accuracy
-function movingAvg(data, key, window) {
-  return data.map((d, i) => {
-    const start = Math.max(0, i - window + 1);
-    const slice = data.slice(start, i + 1);
-    return slice.reduce((s, x) => s + x[key], 0) / slice.length;
-  });
-}
-
-const kpis = [
-  { label: 'Latest Step', value: latest.step, delta: null },
-  { label: 'Accuracy', value: pct(latest.acc), delta: delta(latest.acc, prev?.acc, v => pct(v)) },
-  { label: 'Mean Reward', value: fmt(latest.reward, 3), delta: delta(latest.reward, prev?.reward, v => fmt(v, 3)) },
-  { label: 'Grad Norm', value: fmt(latest.grad, 3), delta: delta(latest.grad, prev?.grad, v => fmt(v, 3)) },
-  { label: 'Learning Rate', value: latest.lr.toExponential(0), delta: null },
-  { label: 'Resp Len (mean)', value: fmt(latest.respLen, 0), delta: delta(latest.respLen, prev?.respLen, v => fmt(v, 0)) },
-  { label: 'Gen Throughput', value: fmt(latest.genTok, 0) + ' t/s', delta: delta(latest.genTok, prev?.genTok, v => fmt(v, 0)) },
+var cards=[
+  {label:'Phase 1 step',value:String(P1_STEPS[P1_STEPS.length-1]),hint:P1_STEPS.length+' / '+TOTAL_TRAINING_STEPS,hClass:'neu'},
+  {label:'Run v1 steps',value:String(V1_STEPS.length),hint:'bs=64, completed',hClass:'neu'},
+  {label:'Training loss',value:fmtNum(P1_LOSS[P1_LOSS.length-1]),hint:'Phase 1 latest',hClass:'neu'},
+  {label:'Reward accuracy',value:(P1_REWARD_ACC[P1_REWARD_ACC.length-1]*100).toFixed(1)+'%',hint:'fraction r>0',hClass:'pos'},
+  {label:'Reward mean',value:fmtNum(P1_REWARD_MEAN[P1_REWARD_MEAN.length-1]),hint:'batch mean',hClass:'neu'},
+  {label:'Gen throughput',value:latestTput.toFixed(0)+' tok/s',hint:'Phase 1',hClass:'pos'},
+  {label:'ms/token (gen)',value:latestTPT,hint:'1000 / tok_per_s',hClass:'neu'},
+  {label:'Step time',value:avgStep.toFixed(0)+'s',hint:'Phase 1 avg',hClass:'neu'},
+  {label:'Grad norm',value:fmtNum(P1_GRAD_NORM[P1_GRAD_NORM.length-1]),hint:'global L2',hClass:'neu'},
+  {label:'NaN grad steps',value:P1_NAN_PARAMS.filter(function(x){return x>0;}).length+'/'+P1_STEPS.length,hint:'steps 2,14 spiked',hClass:P1_NAN_PARAMS[P1_NAN_PARAMS.length-1]>0?'neg':'pos'},
+  {label:'ETA (est.)',value:etaH<200?etaH.toFixed(1)+' h':'---',hint:remaining+' steps x '+avgStep.toFixed(0)+'s',hClass:'neu'},
 ];
+document.getElementById('summary-cards').innerHTML=cards.map(function(c){
+  return '<div class="metric-box"><div class="label">'+c.label+'</div><div class="value" style="color:var(--text)">'+c.value+'</div><div class="hint '+c.hClass+'">'+c.hint+'</div></div>';
+}).join('');
 
-const kpiRow = document.getElementById('kpiRow');
-kpis.forEach(k => {
-  const div = document.createElement('div');
-  div.className = 'kpi';
-  let dHtml = '';
-  if (k.delta) {
-    dHtml = '<div class="delta ' + k.delta.cls + '">' + (k.delta.cls === 'up' ? '\u25B2' : k.delta.cls === 'down' ? '\u25BC' : '\u25CF') + ' ' + k.delta.text + '</div>';
-  }
-  div.innerHTML = '<span class="label">' + k.label + '</span><span class="value">' + k.value + '</span>' + dHtml;
-  kpiRow.appendChild(div);
-});
-
-const tbody = document.getElementById('tableBody');
-DATA.forEach(d => {
-  const tr = document.createElement('tr');
-  tr.innerHTML =
-    '<td class="c-accent">' + d.step + '</td>' +
-    '<td class="c-accent4">' + pct(d.acc) + '</td>' +
-    '<td>' + fmt(d.reward, 3) + '</td>' +
-    '<td>' + fmt(d.loss, 4) + '</td>' +
-    '<td>' + fmt(d.grad, 3) + '</td>' +
-    '<td>' + (d.mkl != null ? fmt(d.mkl, 4) : '\u2014') + '</td>' +
-    '<td class="c-warn">' + d.lr.toExponential(0) + '</td>' +
-    '<td class="c-accent5">' + fmt(d.respLen, 0) + '</td>' +
-    '<td>' + fmt(d.genTok, 0) + '</td>' +
-    '<td>' + fmt(d.genS, 1) + '</td>' +
-    '<td>' + fmt(d.trainS, 1) + '</td>' +
-    '<td>' + fmt(d.stepS, 1) + '</td>';
-  tbody.appendChild(tr);
-});
-
-document.getElementById('updateTs').textContent = 'Last updated: 2026-05-05 07:15 UTC | Run 14 started: 2026-04-30 05:47 UTC | Run 15 (8K) started: step 131 | Step 187/275 (68.0%) | Step time: ~30 min';
-
-const chartDefaults = {
-  responsive: true,
-  maintainAspectRatio: false,
-  plugins: { legend: { labels: { color: '#64748b', font: { family: 'JetBrains Mono', size: 10 } } } },
-  scales: {
-    x: { ticks: { color: '#64748b', font: { family: 'JetBrains Mono', size: 10 } }, grid: { color: '#1e2330' } },
-    y: { ticks: { color: '#64748b', font: { family: 'JetBrains Mono', size: 10 } }, grid: { color: '#1e2330' } },
+var cF={family:"'JetBrains Mono', monospace",size:11};
+var gridColor='#1a2434';
+var tickColor='#7a8ca3';
+var baseOpts={
+  responsive:true,maintainAspectRatio:false,
+  interaction:{mode:'index',intersect:false},
+  plugins:{
+    legend:{display:true,labels:{color:tickColor,font:cF,boxWidth:14}},
+    tooltip:{backgroundColor:'rgba(10,14,22,0.94)',titleFont:cF,bodyFont:cF,borderColor:'#2a3a50',borderWidth:1,padding:10},
+  },
+  scales:{
+    x:{type:'linear',ticks:{color:tickColor,font:cF,maxTicksLimit:12},grid:{color:gridColor},title:{display:true,text:'Training step',color:tickColor,font:cF}},
+    y:{ticks:{color:tickColor,font:cF},grid:{color:gridColor}},
   },
 };
 
-const steps = DATA.map(d => d.step);
-const ma5 = movingAvg(DATA, 'acc', 5);
+function dualChart(canvasId,label1,steps1,data1,color1,label2,steps2,data2,color2,yTitle,opts){
+  opts=opts||{};
+  var ds1={
+    label:label1,data:steps1.map(function(s,i){return{x:s,y:data1[i]};}),
+    borderColor:color1,backgroundColor:color1+'22',borderWidth:1.5,tension:0.3,
+    pointRadius:2,pointHoverRadius:4,borderDash:[4,3],fill:false,spanGaps:true,
+  };
+  var ds2={
+    label:label2,data:steps2.map(function(s,i){return{x:s,y:data2[i]};}),
+    borderColor:color2,backgroundColor:color2+'22',borderWidth:2.5,tension:0.3,
+    pointRadius:3,pointHoverRadius:6,fill:opts.fill||false,spanGaps:true,
+  };
+  var datasets=steps2.length>0?[ds1,ds2]:[ds1];
+  var yAxis={ticks:{color:tickColor,font:cF},grid:{color:gridColor},title:{display:true,text:yTitle,color:tickColor,font:cF}};
+  if(opts.yMin!==undefined)yAxis.min=opts.yMin;
+  if(opts.yMax!==undefined)yAxis.max=opts.yMax;
+  return new Chart(document.getElementById(canvasId),{
+    type:'line',data:{datasets:datasets},
+    options:{responsive:true,maintainAspectRatio:false,interaction:baseOpts.interaction,plugins:baseOpts.plugins,scales:{x:baseOpts.scales.x,y:yAxis}},
+  });
+}
 
-// Chart 1: Accuracy & Reward
-new Chart(document.getElementById('chartAccuracy'), {
-  type: 'line',
-  data: {
-    labels: steps,
-    datasets: [
-      { label: 'Accuracy %', data: DATA.map(d => d.acc * 100), borderColor: '#22d3ee', backgroundColor: 'rgba(34,211,238,0.1)', tension: 0.3, fill: true, pointRadius: 3, pointBackgroundColor: '#22d3ee', borderWidth: 1.5 },
-      { label: 'Accuracy (5-MA)', data: ma5.map(v => v * 100), borderColor: '#fbbf24', tension: 0.4, pointRadius: 0, borderWidth: 2.5, borderDash: [] },
-      { label: 'Reward', data: DATA.map(d => d.reward * 50 + 50), borderColor: '#f472b6', tension: 0.3, fill: false, pointRadius: 2, pointBackgroundColor: '#f472b6', borderWidth: 1, yAxisID: 'y1' },
-    ]
-  },
-  options: {
-    ...chartDefaults,
-    scales: {
-      ...chartDefaults.scales,
-      y: { ...chartDefaults.scales.y, title: { display: true, text: 'Accuracy %', color: '#64748b' }, min: 0, max: 30 },
-      y1: { position: 'right', ticks: { color: '#f472b6', font: { family: 'JetBrains Mono', size: 10 }, callback: v => ((v - 50) / 50).toFixed(2) }, grid: { display: false }, title: { display: true, text: 'Reward', color: '#f472b6' } },
-    }
-  }
-});
+dualChart('c-loss','Run v1 (bs=64)',V1_STEPS,V1_LOSS,'#6b7c92','Phase 1 (bs=128)',P1_STEPS,P1_LOSS,'#38bdf8','loss');
+dualChart('c-rmean','Run v1',V1_STEPS,V1_REWARD_MEAN,'#6b7c92','Phase 1',P1_STEPS,P1_REWARD_MEAN,'#fbbf24','reward/mean');
+dualChart('c-racc','Run v1',V1_STEPS,V1_REWARD_ACC.map(function(v){return v*100;}),'#6b7c92','Phase 1',P1_STEPS,P1_REWARD_ACC.map(function(v){return v*100;}),'#34d399','reward/accuracy (%)',{yMin:0,yMax:50});
+dualChart('c-step','Run v1',V1_STEPS,V1_STEP_S,'#6b7c92','Phase 1',P1_STEPS,P1_STEP_S,'#a78bfa','timing/step_s');
 
-// Chart 2: Loss & Grad Norm
-new Chart(document.getElementById('chartLoss'), {
-  type: 'line',
-  data: {
-    labels: steps,
-    datasets: [
-      { label: 'Loss', data: DATA.map(d => d.loss), borderColor: '#a78bfa', tension: 0.3, pointRadius: 3, pointBackgroundColor: '#a78bfa', borderWidth: 1.5 },
-      { label: 'Grad Norm', data: DATA.map(d => d.grad), borderColor: '#fbbf24', tension: 0.3, pointRadius: 3, pointBackgroundColor: '#fbbf24', yAxisID: 'y1', borderWidth: 1.5 },
-    ]
-  },
-  options: {
-    ...chartDefaults,
-    scales: {
-      ...chartDefaults.scales,
-      y: { ...chartDefaults.scales.y, title: { display: true, text: 'Loss', color: '#a78bfa' } },
-      y1: { position: 'right', ticks: { color: '#fbbf24', font: { family: 'JetBrains Mono', size: 10 } }, grid: { display: false }, title: { display: true, text: 'Grad Norm', color: '#fbbf24' } },
-    }
-  }
-});
-
-// Chart 3: Response Length
-new Chart(document.getElementById('chartRespLen'), {
-  type: 'line',
-  data: {
-    labels: steps,
-    datasets: [
-      { label: 'Mean Response Len', data: DATA.map(d => d.respLen), borderColor: '#fb923c', backgroundColor: 'rgba(251,146,60,0.1)', tension: 0.3, fill: true, pointRadius: 3, pointBackgroundColor: '#fb923c', borderWidth: 1.5 },
-    ]
-  },
-  options: {
-    ...chartDefaults,
-    plugins: { ...chartDefaults.plugins, legend: { display: false } },
-    scales: {
-      ...chartDefaults.scales,
-      y: { ...chartDefaults.scales.y, title: { display: true, text: 'Tokens', color: '#fb923c' }, min: 500 },
-    }
-  }
-});
-
-// Chart 4: Timing
-new Chart(document.getElementById('chartTiming'), {
-  type: 'bar',
-  data: {
-    labels: steps,
-    datasets: [
-      { label: 'Generation (s)', data: DATA.map(d => d.genS), backgroundColor: 'rgba(34,211,238,0.6)', borderRadius: 2 },
-      { label: 'Training (s)', data: DATA.map(d => d.trainS), backgroundColor: 'rgba(167,139,250,0.6)', borderRadius: 2 },
-      { label: 'Weight Sync (s)', data: DATA.map(d => d.syncS), backgroundColor: 'rgba(251,146,60,0.6)', borderRadius: 2 },
-    ]
-  },
-  options: {
-    ...chartDefaults,
-    scales: {
-      ...chartDefaults.scales,
-      x: { ...chartDefaults.scales.x, stacked: true },
-      y: { ...chartDefaults.scales.y, stacked: true, title: { display: true, text: 'Seconds', color: '#64748b' } },
-    }
-  }
-});
-
-// Chart 5: LR Schedule
-new Chart(document.getElementById('chartLR'), {
-  type: 'line',
-  data: {
-    labels: steps,
-    datasets: [
-      { label: 'Learning Rate', data: DATA.map(d => d.lr * 1e6), borderColor: '#34d399', backgroundColor: 'rgba(52,211,153,0.1)', tension: 0.1, fill: true, pointRadius: 4, pointBackgroundColor: '#34d399', borderWidth: 2, stepped: false },
-    ]
-  },
-  options: {
-    ...chartDefaults,
-    plugins: { ...chartDefaults.plugins, legend: { display: false } },
-    scales: {
-      ...chartDefaults.scales,
-      y: { ...chartDefaults.scales.y, title: { display: true, text: 'LR (x1e-6)', color: '#34d399' }, min: 0, max: 1.2 },
+(function(){
+  var ctx=document.getElementById('c-gen');
+  new Chart(ctx,{
+    type:'line',
+    data:{datasets:[
+      {label:'Gen time v1',data:V1_STEPS.map(function(s,i){return{x:s,y:V1_GEN_S[i]};}),borderColor:'#6b7c92',borderWidth:1.5,borderDash:[4,3],tension:0.3,pointRadius:2,fill:false,yAxisID:'y'},
+      {label:'Gen time P1',data:P1_STEPS.map(function(s,i){return{x:s,y:P1_GEN_S[i]};}),borderColor:'#2dd4bf',borderWidth:2.5,tension:0.3,pointRadius:3,fill:false,yAxisID:'y'},
+      {label:'Throughput v1',data:V1_STEPS.map(function(s,i){return{x:s,y:V1_GEN_TOK_S[i]};}),borderColor:'#4a5568',borderWidth:1,borderDash:[2,2],tension:0.3,pointRadius:1,fill:false,yAxisID:'y1'},
+      {label:'Throughput P1',data:P1_STEPS.map(function(s,i){return{x:s,y:P1_GEN_TOK_S[i]};}),borderColor:'#f472b6',borderWidth:2.5,tension:0.3,pointRadius:3,fill:false,yAxisID:'y1'},
+    ]},
+    options:{responsive:true,maintainAspectRatio:false,interaction:baseOpts.interaction,plugins:baseOpts.plugins,
+      scales:{x:baseOpts.scales.x,
+        y:{ticks:{color:'#2dd4bf',font:cF},grid:{color:gridColor},title:{display:true,text:'gen_time (s)',color:'#2dd4bf',font:cF},position:'left'},
+        y1:{ticks:{color:'#f472b6',font:cF},grid:{drawOnChartArea:false},title:{display:true,text:'tok/s',color:'#f472b6',font:cF},position:'right'},
+      },
     },
-    elements: {
-      point: {
-        backgroundColor: function(ctx) {
-          return ctx.dataIndex < 10 ? '#fbbf24' : '#34d399';
-        }
-      }
-    }
-  }
-});
+  });
+})();
 
-// Chart 6: Run 14/15 vs Run 13 comparison
-const ma5_14 = movingAvg(DATA, 'acc', 5);
-const ma5_13 = movingAvg(RUN13, 'acc', 5);
-// Find index of step 131 (config change) for vertical line
-const configChangeIdx = DATA.findIndex(d => d.step === 131);
-new Chart(document.getElementById('chartComparison'), {
-  type: 'line',
-  data: {
-    labels: steps,
-    datasets: [
-      { label: 'Run 14/15 (5-MA)', data: ma5_14.map(v => v * 100), borderColor: '#22d3ee', tension: 0.4, pointRadius: 0, borderWidth: 2.5 },
-      { label: 'Run 13 (5-MA)', data: ma5_13.map(v => v * 100), borderColor: '#f472b6', tension: 0.4, pointRadius: 0, borderWidth: 2.5, borderDash: [6, 3] },
-      { label: 'Run 14/15 raw', data: DATA.map(d => d.acc * 100), borderColor: 'rgba(34,211,238,0.3)', tension: 0.3, pointRadius: 2, borderWidth: 1 },
-      { label: 'Run 13 raw', data: RUN13.map(d => d.acc * 100), borderColor: 'rgba(244,114,182,0.3)', tension: 0.3, pointRadius: 2, borderWidth: 1, borderDash: [3, 3] },
-    ]
-  },
-  options: {
-    ...chartDefaults,
-    scales: {
-      ...chartDefaults.scales,
-      y: { ...chartDefaults.scales.y, title: { display: true, text: 'Accuracy %', color: '#64748b' }, min: 5, max: 30 },
-    },
-    plugins: {
-      ...chartDefaults.plugins,
-      annotation: configChangeIdx >= 0 ? {
-        annotations: {
-          configChange: { type: 'line', xMin: configChangeIdx, xMax: configChangeIdx, borderColor: '#fb923c', borderWidth: 2, borderDash: [4, 4], label: { display: true, content: '8K config', color: '#fb923c', position: 'start' } }
-        }
-      } : undefined,
-    }
-  }
-});
+dualChart('c-grad','Run v1',V1_STEPS,V1_GRAD_NORM,'#6b7c92','Phase 1',P1_STEPS,P1_GRAD_NORM,'#c084fc','grad_norm');
+dualChart('c-tpt','Run v1',V1_STEPS,V1_TPT,'#6b7c92','Phase 1',P1_STEPS,P1_TPT,'#fb923c','ms/token',{yMin:0});
+dualChart('c-meanlen','Run v1',V1_STEPS,V1_MEAN_RESP_LEN,'#6b7c92','Phase 1',P1_STEPS,P1_MEAN_RESP_LEN,'#7dd3fc','seq/mean_response_len');
+dualChart('c-maxlen','Run v1',V1_STEPS,V1_MAX_SEQ_LEN,'#6b7c92','Phase 1',P1_STEPS,P1_MAX_SEQ_LEN,'#fcd34d','seq/max_len');
 </script>
 </body>
 </html>

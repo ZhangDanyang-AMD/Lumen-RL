@@ -15,62 +15,54 @@ cluster:
   gpus_per_node: 8
 
 policy:
-  model_name: /mnt/raid0/danyzhan/model/qwen3-8b-base
+  model_name: /home/danyzhan/model/qwen3-8b-base
   training_backend: fsdp2
   generation_backend: atom
-  max_total_sequence_length: 3072
-  max_response_length: 2048
+  max_total_sequence_length: 20480
+  max_response_length: 20480
   train_global_batch_size: 1536       # 96 prompts × 16 gens (matches verl 32×3×16)
   train_micro_batch_size: 1
-  max_token_len_per_gpu: 3072
-  ppo_mini_batch_size: 32             # matches verl; yields ~48 optimizer steps
-  learning_rate: 5e-7
-  lr_warmup_steps: 10
+  max_token_len_per_gpu: 20480
   training:
-    optimizer_dtype: fp32           # FP32 optimizer + FP32 forward/backward (this run)
     fsdp_cfg:
       param_offload: true
   generation:
     atom_cfg:
       gpu_memory_utilization: 0.25
-      max_model_len: 3072
+      max_model_len: 20480
 
 algorithm:
   name: dapo
   dapo:
     num_generations: 16
-    kl_coeff: 0.02
+    kl_coeff: 0.0
     clip_ratio_low: 0.2
     clip_ratio_high: 0.28
-    clip_ratio_c: 3.0
-    dynamic_sampling: false
+    clip_ratio_c: 10.0
+    dynamic_sampling: true
     token_level_pg: true
     overlong_reward_shaping: true
-    loss_mode: token_level
 
 reward:
   type: function
   function: lumenrl.rewards.math_reward.dapo_math_reward
-  dataset: /mnt/raid0/danyzhan/data/dapo-math-17k.parquet
+  dataset: /home/danyzhan/data/dapo-math-17k.parquet
 
 quantization:
   rollout:
     precision: bf16
   training:
     fp8: null
-    lumen_norm: true
-    fused_mlp: true
-    fused_rope: true
 
 checkpointing:
-  checkpoint_dir: /mnt/raid0/danyzhan/ckpts/lumenrl-dapo/1a-bf16-sync
+  checkpoint_dir: /home/danyzhan/ckpts/lumenrl-dapo/1a-bf16-sync
   save_steps: 5
   save_total_limit: 3
-  resume: true
+  resume: false
 
 logger:
   wandb_enabled: false
   log_interval: 1
 
-num_training_steps: 500
+num_training_steps: 275
 seed: 42

@@ -63,6 +63,7 @@ def main() -> None:
     from lumenrl.trainer.callbacks import (
         LoggingCallback,
         CheckpointCallback,
+        EvalCallback,
         WandbCallback,
     )
 
@@ -110,6 +111,9 @@ def main() -> None:
             save_interval=config.checkpointing.save_steps,
             save_total_limit=config.checkpointing.save_total_limit,
         ))
+
+    if config.eval.enabled:
+        cbs.append(EvalCallback(interval=config.eval.interval))
 
     if config.logger.wandb_enabled:
         cbs.append(WandbCallback(

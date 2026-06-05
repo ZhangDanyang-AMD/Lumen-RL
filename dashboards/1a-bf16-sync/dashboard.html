@@ -194,16 +194,6 @@
     border-top: 1px solid var(--border);
     text-align: right;
   }
-
-  .phase-note {
-    position: relative; z-index: 1;
-    padding: 12px 40px;
-    font-size: 11px; color: var(--dim);
-    border-top: 1px solid var(--border);
-    line-height: 1.6;
-  }
-  .phase-note b { color: var(--accent); font-weight: 600; }
-  .phase-note .val { color: var(--accent4); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -211,33 +201,14 @@
 
 <div class="header">
   <h1>LumenRL Training</h1>
-  <span class="tag">1A FP32 Optimizer</span>
-  <span class="tag">FP32 Master Weights + BF16 Compute</span>
-  <span class="tag">8xMI300X</span>
+  <span class="tag">1A BF16 Sync</span>
+  <span class="tag">Qwen3-8B-Base</span>
+  <span class="tag">8×MI300X</span>
   <div class="live-dot"></div>
   <span class="status" id="statusText">Running</span>
 </div>
 
 <div class="kpi-row" id="kpiRow"></div>
-
-<div class="phase-note">
-  <b>FP32 Optimizer Run (2026-05-19, fresh from scratch):</b>
-  optimizer_dtype <span class="val c-accent4">fp32</span> (FP32 master weights + BF16 fwd/bwd) |
-  <span class="val c-accent4">clip_ratio 0.4/0.4</span> |
-  loss_mode <span class="val">token_level</span> |
-  max_response_length <span class="val c-accent5">20480</span> |
-  param_offload <span class="val c-accent4">ON</span> |
-  LR warmup <span class="val">9 steps</span> (1e-7 &rarr; 1e-6) |
-  dynamic_sampling <span class="val">OFF</span> |
-  clip_ratio_c <span class="val">3.0</span> |
-  <br>
-  <b>Key change:</b> Model loaded in <span class="val c-accent4">FP32</span>, FSDP2 MixedPrecisionPolicy casts to BF16 for compute.
-  AdamW maintains FP32 momentum/variance and master weights. AITER kernels operate in BF16. |
-  <br>
-  <b>Progress:</b> Step 1: acc <span class="val">11.7%</span> |
-  Step 2: acc <span class="val">12.7%</span> |
-  Training in progress...
-</div>
 
 <div class="charts">
   <div class="chart-panel">
@@ -257,8 +228,12 @@
     <canvas id="chartTiming"></canvas>
   </div>
   <div class="chart-panel">
-    <h3>Learning Rate Schedule</h3>
-    <canvas id="chartLR"></canvas>
+    <h3>Time per Token (ms) — Generation</h3>
+    <canvas id="chartTpT"></canvas>
+  </div>
+  <div class="chart-panel">
+    <h3>Reward Breakdown per Step</h3>
+    <canvas id="chartBreakdown"></canvas>
   </div>
 </div>
 
@@ -268,9 +243,10 @@
     <thead>
       <tr>
         <th>Step</th><th>Accuracy</th><th>Reward</th>
-        <th>Loss</th><th>Grad Norm</th><th>MKL</th>
-        <th>LR</th>
-        <th>Resp Len</th><th>Gen tok/s</th><th>Gen (s)</th><th>Train (s)</th><th>Total (s)</th>
+        <th>Loss</th><th>Grad Norm</th>
+        <th>+1</th><th>-1</th>
+        <th>Resp Len</th><th>ms/tok</th>
+        <th>Gen tok/s</th><th>Gen (s)</th><th>Train (s)</th><th>Total (s)</th>
       </tr>
     </thead>
     <tbody id="tableBody"></tbody>
@@ -280,101 +256,47 @@
 <div class="config-bar">
   <span>Model: <b class="val">Qwen3-8B-Base</b></span>
   <span>Algorithm: <b class="val">DAPO</b></span>
-  <span>Batch: <b class="val">1536 (96p x 16g)</b></span>
-  <span>max_response_length: <b class="val c-accent4">20480</b></span>
-  <span>dynamic_sampling: <b class="val c-accent2">OFF</b></span>
-  <span>LR warmup: <b class="val c-accent4">10 steps</b></span>
-  <span>LR: <b class="val">1e-6</b></span>
+  <span>Batch: <b class="val">1536 (96p × 16g)</b></span>
+  <span>max_response_length: <b class="val">20480</b></span>
+  <span>dynamic_sampling: <b class="val c-accent4">ON</b></span>
   <span>Weight Sync: <b class="val c-accent4">ENABLED</b></span>
-  <span>Optimizer: <b class="val c-accent4">FP32</b> (master weights + momentum)</span>
-  <span>Compute: <b class="val">BF16</b> (fwd/bwd via AITER)</span>
-  <span>clip_ratio: <b class="val c-accent4">0.4/0.4</b></span>
-  <span>clip_ratio_c: <b class="val c-accent4">3.0</b></span>
-  <span>loss_mode: <b class="val c-accent4">token_level</b></span>
-  <span>accum_steps: <b class="val c-accent4">1</b></span>
-  <span>Data: <b class="val">/tmp/model + /tmp/data</b></span>
+  <span>Precision: <b class="val">BF16</b></span>
+  <span>Attn: <b class="val">AITER FA (Lumen patch)</b></span>
+  <span>ATOM Sleep: <b class="val c-accent4">POST-GEN</b></span>
+  <span>param_offload: <b class="val c-accent4">ON</b></span>
+  <span>clip_ratio_c: <b class="val c-accent4">10.0</b></span>
+  <span>weight_decay: <b class="val">0.1</b></span>
+  <span>overlong_penalty: <b class="val">1.0</b></span>
+  <span>optimizer: <b class="val c-accent4">per-mini-batch step</b></span>
 </div>
 
 <div class="update-ts" id="updateTs"></div>
 
 <script>
-// ── v3 Run (2026-05-21): LR=5e-7, warmup=10, clip=0.2/0.28, kl=0.02, maxResp=2048 ──
+// ── RUN 2 (2026-04-23, steps 0-8): DAPO fixes only — gradient accumulation, loss≈0, accuracy flat ──
+// ── ROOT CAUSE: optimizer.step() called ONCE after all mini-batches → ratio=1 → no learning ──
+// const OLD_DATA = [
+//   { step: 0, acc: 0.107422, reward: -0.785156, loss: 1.649e-09 },
+//   { step: 1, acc: 0.125, reward: -0.75, loss: -1.921e-09 },
+//   { step: 2, acc: 0.104818, reward: -0.790365, loss: 3.900e-09 },
+//   { step: 3, acc: 0.100911, reward: -0.798177, loss: 2.134e-10 },
+//   { step: 4, acc: 0.0976562, reward: -0.804688, loss: -1.94e-10 },
+//   { step: 5, acc: 0.121745, reward: -0.75651, loss: -1.397e-09 },
+//   { step: 6, acc: 0.110026, reward: -0.779948, loss: 2.522e-09 },
+//   { step: 7, acc: 0.136068, reward: -0.727865, loss: -2.716e-10 },
+//   { step: 8, acc: 0.0859375, reward: -0.828125, loss: -5.239e-10 },
+// ];
+
+// ── RUN 3 (2026-04-24): Per-mini-batch optimizer stepping — matching verl architecture ──
+// Fix: optimizer.step() now called after EACH mini-batch (not accumulated).
+// This makes ratio ≠ 1.0 from mini-batch 2 onward → meaningful PPO clipping → actual learning.
 const DATA = [
-  { step: 0, acc: 0.092448, reward: -0.815104, loss: -0.00128, grad: 1.4883, mkl: -0.000781, kl: -0.000003, lr: 5.00e-08, genTok: 1860.71, genS: 677.50, trainS: 996.02, stepS: 1769.34, respLen: 820.73, syncS: 44.59, refS: 35.93 },
-  { step: 1, acc: 0.120443, reward: -0.759115, loss: 0.01571, grad: 1.0686, mkl: 0.000941, kl: 0.000053, lr: 1.00e-07, genTok: 1939.04, genS: 626.56, trainS: 1114.09, stepS: 1834.33, respLen: 790.97, syncS: 46.43, refS: 32.77 },
-  { step: 2, acc: 0.134115, reward: -0.731771, loss: 0.01337, grad: 0.9754, mkl: -0.000718, kl: 0.000152, lr: 1.50e-07, genTok: 1941.20, genS: 612.41, trainS: 965.47, stepS: 1665.79, respLen: 773.97, syncS: 46.72, refS: 30.63 },
-  { step: 3, acc: 0.106771, reward: -0.786458, loss: 0.00010, grad: 1.0561, mkl: 0.000384, kl: 0.000326, lr: 2.00e-07, genTok: 1908.56, genS: 656.05, trainS: 1077.08, stepS: 1830.65, respLen: 815.17, syncS: 48.66, refS: 32.77 },
-  { step: 4, acc: 0.105469, reward: -0.789063, loss: -0.00397, grad: 0.9984, mkl: 0.000301, kl: 0.000544, lr: 2.50e-07, genTok: 1944.06, genS: 667.45, trainS: 987.06, stepS: 1748.96, respLen: 844.76, syncS: 48.58, refS: 32.04 },
-  { step: 5, acc: 0.149089, reward: -0.701823, loss: -0.00775, grad: 0.8976, mkl: -0.000295, kl: 0.000408, lr: 3.00e-07, genTok: 1949.27, genS: 690.37, trainS: 1012.30, stepS: 1797.42, respLen: 876.12, syncS: 47.39, refS: 31.30 },
-  { step: 6, acc: 0.157552, reward: -0.684896, loss: 0.01342, grad: 4.2262, mkl: 0.000605, kl: -0.000044, lr: 3.50e-07, genTok: 2035.06, genS: 749.11, trainS: 1272.71, stepS: 2139.26, respLen: 992.51, syncS: 47.35, refS: 37.62 },
-  { step: 7, acc: 0.194010, reward: -0.611979, loss: 0.00022, grad: 2.0407, mkl: -0.000072, kl: -0.000565, lr: 4.00e-07, genTok: 1996.23, genS: 778.67, trainS: 1273.38, stepS: 2167.85, respLen: 1011.97, syncS: 47.80, refS: 37.60 },
-  { step: 8, acc: 0.190755, reward: -0.618490, loss: 0.02645, grad: 0.7808, mkl: -0.000175, kl: -0.001772, lr: 4.50e-07, genTok: 1969.91, genS: 775.48, trainS: 1245.53, stepS: 2135.69, respLen: 994.54, syncS: 47.72, refS: 36.52 },
-  { step: 9, acc: 0.220052, reward: -0.559896, loss: 0.05797, grad: 1.2407, mkl: 0.000374, kl: -0.002516, lr: 5.00e-07, genTok: 1987.94, genS: 835.06, trainS: 1367.65, stepS: 2329.27, respLen: 1080.76, syncS: 46.90, refS: 39.45 },
-  { step: 10, acc: 0.178385, reward: -0.643229, loss: 0.05148, grad: 1.1895, mkl: -0.000126, kl: -0.003729, lr: 5.00e-07, genTok: 2020.34, genS: 853.83, trainS: 1379.75, stepS: 2363.00, respLen: 1123.06, syncS: 48.79, refS: 39.77 },
-  { step: 11, acc: 0.226562, reward: -0.546875, loss: 0.08130, grad: 1.4017, mkl: -0.000011, kl: -0.008596, lr: 5.00e-07, genTok: 2039.68, genS: 926.99, trainS: 1639.81, stepS: 2722.93, respLen: 1230.96, syncS: 47.47, refS: 47.04 },
-  { step: 12, acc: 0.121094, reward: -0.757813, loss: 0.05657, grad: 0.8400, mkl: 0.000729, kl: -0.014948, lr: 5.00e-07, genTok: 2078.57, genS: 1057.72, trainS: 1813.65, stepS: 3037.60, respLen: 1431.34, syncS: 47.46, refS: 49.86 },
-  { step: 13, acc: 0.134115, reward: -0.731771, loss: 0.06440, grad: 0.7232, mkl: 0.000167, kl: -0.048004, lr: 5.00e-07, genTok: 2086.41, genS: 1074.79, trainS: 1778.15, stepS: 3017.97, respLen: 1459.93, syncS: 48.11, refS: 48.89 },
-  { step: 14, acc: 0.154948, reward: -0.690104, loss: 0.06427, grad: 1.0598, mkl: 0.000029, kl: -0.069013, lr: 5.00e-07, genTok: 2068.94, genS: 1111.06, trainS: 1922.62, stepS: 3209.50, respLen: 1496.56, syncS: 46.78, refS: 53.11 },
-  { step: 15, acc: 0.051432, reward: -0.897135, loss: 0.04938, grad: 1.0147, mkl: 0.000328, kl: -0.154639, lr: 5.00e-07, genTok: 2095.76, genS: 1215.22, trainS: 1927.57, stepS: 3327.03, respLen: 1658.08, syncS: 47.82, refS: 53.82 },
-  { step: 16, acc: 0.039714, reward: -0.920573, loss: 0.02307, grad: 1.0269, mkl: -0.000328, kl: -0.171417, lr: 5.00e-07, genTok: 2123.44, genS: 1230.77, trainS: 1967.42, stepS: 3388.42, respLen: 1701.48, syncS: 47.36, refS: 55.27 },
-  { step: 17, acc: 0.048828, reward: -0.902344, loss: 0.03666, grad: 0.8007, mkl: -0.000106, kl: -0.140163, lr: 5.00e-07, genTok: 2128.70, genS: 1158.49, trainS: 1800.45, stepS: 3139.47, respLen: 1605.52, syncS: 47.49, refS: 51.09 },
-  { step: 18, acc: 0.045573, reward: -0.908854, loss: 0.02581, grad: 3.2046, mkl: -0.000286, kl: 0.421579, lr: 5.00e-07, genTok: 1968.93, genS: 1217.00, trainS: 1866.68, stepS: 3270.19, respLen: 1560.01, syncS: 56.57, refS: 52.01 },
-  { step: 19, acc: 0.038412, reward: -0.923177, loss: 0.02276, grad: 3.7318, mkl: 0.000017, kl: 0.339034, lr: 5.00e-07, genTok: 1992.72, genS: 1212.49, trainS: 1842.75, stepS: 3239.34, respLen: 1573.01, syncS: 47.16, refS: 50.83 },
-  { step: 20, acc: 0.072266, reward: -0.855469, loss: -0.00334, grad: 2.4899, mkl: -0.000339, kl: 0.561456, lr: 5.00e-07, genTok: 1519.03, genS: 1296.12, trainS: 1715.40, stepS: 3183.13, respLen: 1281.80, syncS: 46.99, refS: 45.39 },
-  { step: 21, acc: 0.044922, reward: -0.910156, loss: -0.00657, grad: 2.7900, mkl: 0.000120, kl: 0.562454, lr: 5.00e-07, genTok: 1486.60, genS: 1359.54, trainS: 1647.06, stepS: 3180.12, respLen: 1315.82, syncS: 49.48, refS: 44.87 },
-  { step: 22, acc: 0.057943, reward: -0.884115, loss: -0.01554, grad: 4.1489, mkl: -0.000134, kl: 0.504958, lr: 5.00e-07, genTok: 1486.19, genS: 1318.46, trainS: 1654.85, stepS: 3150.85, respLen: 1275.71, syncS: 47.77, refS: 45.49 },
-  { step: 23, acc: 0.083333, reward: -0.833333, loss: 0.00662, grad: 10.3211, mkl: 0.000638, kl: 0.461877, lr: 5.00e-07, genTok: 1373.72, genS: 1307.79, trainS: 1511.45, stepS: 2986.21, respLen: 1169.62, syncS: 47.40, refS: 41.67 },
-  { step: 24, acc: 0.129557, reward: -0.740885, loss: -0.02876, grad: 31.4834, mkl: -0.000072, kl: 0.410011, lr: 5.00e-07, genTok: 1283.88, genS: 1276.35, trainS: 1309.13, stepS: 2744.31, respLen: 1066.85, syncS: 48.32, refS: 38.18 },
-  { step: 25, acc: 0.076172, reward: -0.847656, loss: -0.05046, grad: 11.2569, mkl: 0.001585, kl: 0.480102, lr: 5.00e-07, genTok: 1013.78, genS: 1298.89, trainS: 1051.38, stepS: 2491.00, respLen: 857.29, syncS: 46.86, refS: 32.02 },
-  { step: 26, acc: 0.180990, reward: -0.638021, loss: -0.01694, grad: 21.8723, mkl: -0.000519, kl: 0.213877, lr: 5.00e-07, genTok: 1517.89, genS: 1047.03, trainS: 1245.26, stepS: 2455.18, respLen: 1034.69, syncS: 51.83, refS: 37.46 },
-  { step: 27, acc: 0.253906, reward: -0.492188, loss: -0.05426, grad: 30.5159, mkl: -0.003727, kl: 0.311815, lr: 5.00e-07, genTok: 1265.75, genS: 1067.63, trainS: 1052.52, stepS: 2269.16, respLen: 879.79, syncS: 47.85, refS: 32.54 },
-  { step: 28, acc: 0.201172, reward: -0.597656, loss: 0.00256, grad: 12.7322, mkl: 0.002063, kl: 0.097347, lr: 5.00e-07, genTok: 1478.26, genS: 1034.12, trainS: 1263.77, stepS: 2464.57, respLen: 995.24, syncS: 46.89, refS: 37.29 },
-  { step: 29, acc: 0.008464, reward: -0.983073, loss: -0.01490, grad: 3.5030, mkl: 0.000070, kl: 0.233387, lr: 5.00e-07, genTok: 765.48, genS: 1383.90, trainS: 816.94, stepS: 2336.37, respLen: 689.68, syncS: 47.25, refS: 27.57 },
-  { step: 30, acc: 0.238281, reward: -0.523438, loss: 0.01118, grad: 7.9117, mkl: -0.001218, kl: 0.027956, lr: 5.00e-07, genTok: 1919.97, genS: 920.55, trainS: 1454.95, stepS: 2556.86, respLen: 1150.67, syncS: 51.16, refS: 41.15 },
-  { step: 31, acc: 0.195312, reward: -0.609375, loss: -0.05636, grad: 25.1165, mkl: -0.002918, kl: 0.109594, lr: 5.00e-07, genTok: 1166.36, genS: 1135.79, trainS: 1127.86, stepS: 2421.87, respLen: 862.46, syncS: 53.93, refS: 32.95 },
-  { step: 32, acc: 0.236328, reward: -0.527344, loss: -0.05216, grad: 34.1785, mkl: 0.004541, kl: 0.115125, lr: 5.00e-07, genTok: 1376.50, genS: 1051.49, trainS: 1265.12, stepS: 2484.71, respLen: 942.30, syncS: 48.39, refS: 35.62 },
-  { step: 33, acc: 0.220052, reward: -0.559896, loss: 0.01432, grad: 25.2581, mkl: 0.001694, kl: 0.155304, lr: 5.00e-07, genTok: 1450.78, genS: 1033.80, trainS: 1273.91, stepS: 2479.71, respLen: 976.44, syncS: 48.16, refS: 35.56 },
-  { step: 34, acc: 0.076172, reward: -0.847656, loss: 0.00473, grad: 40.4313, mkl: -0.000787, kl: 0.659997, lr: 5.00e-07, genTok: 939.20, genS: 1333.59, trainS: 1031.48, stepS: 2525.40, respLen: 815.43, syncS: 48.71, refS: 31.45 },
-  { step: 35, acc: 0.191406, reward: -0.617188, loss: -0.05729, grad: 18.9170, mkl: -0.000255, kl: 0.322419, lr: 5.00e-07, genTok: 1228.26, genS: 1160.05, trainS: 1130.49, stepS: 2459.07, respLen: 927.64, syncS: 47.69, refS: 33.92 },
-  { step: 36, acc: 0.143229, reward: -0.713542, loss: -0.00124, grad: 17.0337, mkl: -0.001794, kl: 0.574150, lr: 5.00e-07, genTok: 1174.70, genS: 1166.97, trainS: 1089.80, stepS: 2428.64, respLen: 892.47, syncS: 46.82, refS: 33.17 },
-  { step: 37, acc: 0.138021, reward: -0.723958, loss: -0.00827, grad: 27.9313, mkl: 0.000178, kl: 0.482215, lr: 5.00e-07, genTok: 1127.44, genS: 1176.88, trainS: 1075.98, stepS: 2427.00, respLen: 863.84, syncS: 48.05, refS: 32.49 },
-  { step: 38, acc: 0.062500, reward: -0.875000, loss: 0.00240, grad: 9.0406, mkl: 0.000316, kl: 0.856955, lr: 5.00e-07, genTok: 850.60, genS: 1348.65, trainS: 873.19, stepS: 2383.83, respLen: 746.85, syncS: 50.18, refS: 28.62 },
-  { step: 39, acc: 0.067057, reward: -0.865885, loss: -0.01608, grad: 9.7597, mkl: -0.000954, kl: 0.543411, lr: 5.00e-07, genTok: 859.74, genS: 1360.25, trainS: 992.80, stepS: 2519.70, respLen: 761.37, syncS: 48.64, refS: 29.58 },
-  { step: 40, acc: 0.130208, reward: -0.739584, loss: -0.03916, grad: 28.3552, mkl: -0.002466, kl: 0.408257, lr: 5.00e-07, genTok: 1038.23, genS: 1193.41, trainS: 978.95, stepS: 2343.55, respLen: 806.66, syncS: 49.48, refS: 30.43 },
-  { step: 41, acc: 0.150391, reward: -0.699218, loss: -0.06016, grad: 12.7165, mkl: -0.005030, kl: 0.207751, lr: 5.00e-07, genTok: 1015.44, genS: 1224.82, trainS: 1012.13, stepS: 2415.14, respLen: 809.72, syncS: 46.23, refS: 31.29 },
-  { step: 42, acc: 0.153646, reward: -0.692708, loss: -0.10956, grad: 21.5305, mkl: 0.001844, kl: 0.266302, lr: 5.00e-07, genTok: 1036.26, genS: 1190.56, trainS: 1056.46, stepS: 2428.73, respLen: 803.21, syncS: 48.40, refS: 31.71 },
-  { step: 43, acc: 0.134115, reward: -0.731770, loss: -0.03814, grad: 43.1228, mkl: 0.000917, kl: 0.374314, lr: 5.00e-07, genTok: 1090.03, genS: 1152.25, trainS: 1056.41, stepS: 2394.75, respLen: 817.70, syncS: 46.28, refS: 32.11 },
-  { step: 44, acc: 0.166667, reward: -0.666666, loss: -0.03338, grad: 100.1880, mkl: 0.006142, kl: 0.309201, lr: 5.00e-07, genTok: 1167.10, genS: 1122.79, trainS: 1128.82, stepS: 2442.19, respLen: 853.13, syncS: 46.49, refS: 32.99 },
-  { step: 45, acc: 0.158203, reward: -0.683594, loss: -0.00895, grad: 42.8934, mkl: 0.002100, kl: 0.415009, lr: 5.00e-07, genTok: 1261.88, genS: 1078.97, trainS: 1135.94, stepS: 2407.10, respLen: 886.41, syncS: 46.74, refS: 32.94 },
-  { step: 46, acc: 0.222656, reward: -0.554688, loss: -0.00666, grad: 21.3328, mkl: 0.001626, kl: 0.601985, lr: 5.00e-07, genTok: 1242.01, genS: 1073.14, trainS: 1098.28, stepS: 2361.97, respLen: 867.74, syncS: 49.20, refS: 31.80 },
-  { step: 47, acc: 0.130208, reward: -0.739584, loss: -0.04879, grad: 17.5434, mkl: -0.002328, kl: 0.687527, lr: 5.00e-07, genTok: 1103.21, genS: 1193.59, trainS: 1130.50, stepS: 2519.21, respLen: 857.28, syncS: 48.06, refS: 33.18 },
-  { step: 48, acc: 0.140625, reward: -0.718750, loss: -0.01218, grad: 21.3540, mkl: 0.001732, kl: 0.702277, lr: 5.00e-07, genTok: 1074.39, genS: 1192.90, trainS: 1133.39, stepS: 2518.57, respLen: 834.40, syncS: 47.67, refS: 31.57 },
-  { step: 49, acc: 0.152344, reward: -0.695312, loss: -0.05627, grad: 32.6822, mkl: 0.003252, kl: 0.107303, lr: 5.00e-07, genTok: 1179.77, genS: 1120.48, trainS: 1048.02, stepS: 2363.50, respLen: 860.62, syncS: 49.18, refS: 31.55 },
-  { step: 50, acc: 0.138672, reward: -0.722656, loss: -0.02507, grad: 21.3471, mkl: 0.001514, kl: 0.119934, lr: 5.00e-07, genTok: 1191.57, genS: 1128.51, trainS: 1115.46, stepS: 2451.12, respLen: 875.45, syncS: 48.39, refS: 33.68 },
-  { step: 51, acc: 0.132812, reward: -0.734376, loss: -0.02889, grad: 16.2003, mkl: 0.006281, kl: 0.122644, lr: 5.00e-07, genTok: 1149.53, genS: 1133.80, trainS: 1108.35, stepS: 2447.92, respLen: 848.53, syncS: 46.57, refS: 32.68 },
-  { step: 52, acc: 0.103516, reward: -0.792968, loss: -0.03486, grad: 15.0455, mkl: 0.000434, kl: 0.346274, lr: 5.00e-07, genTok: 1066.62, genS: 1170.45, trainS: 1033.53, stepS: 2407.56, respLen: 812.78, syncS: 47.91, refS: 31.95 },
-  { step: 53, acc: 0.128255, reward: -0.743490, loss: -0.01737, grad: 20.3546, mkl: 0.000156, kl: 0.616689, lr: 5.00e-07, genTok: 1105.60, genS: 1142.80, trainS: 984.40, stepS: 2331.85, respLen: 822.58, syncS: 48.32, refS: 31.05 },
-  { step: 54, acc: 0.147135, reward: -0.705730, loss: -0.03230, grad: 147.0040, mkl: 0.003429, kl: 0.536818, lr: 5.00e-07, genTok: 1062.26, genS: 1116.74, trainS: 1040.16, stepS: 2365.55, respLen: 772.31, syncS: 51.35, refS: 30.32 },
-  { step: 55, acc: 0.088542, reward: -0.822917, loss: -0.00722, grad: 72.3304, mkl: 0.004814, kl: 1.001770, lr: 5.00e-07, genTok: 948.70, genS: 1237.89, trainS: 931.49, stepS: 2375.05, respLen: 764.58, syncS: 47.99, refS: 29.71 },
-  { step: 56, acc: 0.125651, reward: -0.748698, loss: -0.04990, grad: 19.5678, mkl: 0.001588, kl: 1.076700, lr: 5.00e-07, genTok: 982.81, genS: 1211.01, trainS: 995.10, stepS: 2417.90, respLen: 774.87, syncS: 47.86, refS: 31.36 },
-  { step: 57, acc: 0.083333, reward: -0.833333, loss: 0.01959, grad: 14.4501, mkl: -0.000584, kl: 1.414220, lr: 5.00e-07, genTok: 955.82, genS: 1225.94, trainS: 940.21, stepS: 2376.67, respLen: 762.87, syncS: 48.10, refS: 29.51 },
-  { step: 58, acc: 0.152995, reward: -0.694010, loss: 0.00377, grad: 72.8186, mkl: -0.000437, kl: 0.609062, lr: 5.00e-07, genTok: 1130.91, genS: 1187.36, trainS: 1278.71, stepS: 2696.74, respLen: 874.22, syncS: 48.04, refS: 35.71 },
-  { step: 59, acc: 0.102214, reward: -0.795572, loss: -0.00942, grad: 17.6074, mkl: -0.006032, kl: 1.111420, lr: 5.00e-07, genTok: 1139.12, genS: 1184.14, trainS: 1110.57, stepS: 2520.74, respLen: 878.18, syncS: 47.61, refS: 32.88 },
-  { step: 60, acc: 0.127604, reward: -0.744792, loss: -0.03360, grad: 44.9936, mkl: -0.005388, kl: 0.085762, lr: 5.00e-07, genTok: 1236.44, genS: 1147.05, trainS: 1193.81, stepS: 2573.42, respLen: 923.34, syncS: 48.85, refS: 34.05 },
-  { step: 61, acc: 0.125000, reward: -0.750000, loss: -0.06209, grad: 20.2997, mkl: -0.001998, kl: 0.002825, lr: 5.00e-07, genTok: 1270.95, genS: 1153.51, trainS: 1311.42, stepS: 2707.32, respLen: 954.46, syncS: 47.93, refS: 36.84 },
-  { step: 62, acc: 0.119141, reward: -0.761718, loss: -0.01731, grad: 9.5110, mkl: 0.000984, kl: 0.053576, lr: 5.00e-07, genTok: 1316.21, genS: 1104.01, trainS: 1242.48, stepS: 2587.03, respLen: 946.04, syncS: 47.33, refS: 35.36 },
-  { step: 63, acc: 0.143229, reward: -0.713542, loss: -0.02777, grad: 31.4958, mkl: 0.005205, kl: 0.024540, lr: 5.00e-07, genTok: 1362.95, genS: 1135.38, trainS: 1352.11, stepS: 2734.60, respLen: 1007.46, syncS: 47.84, refS: 36.41 },
-  { step: 64, acc: 0.092448, reward: -0.815104, loss: -0.01439, grad: 12.1203, mkl: -0.002284, kl: 0.109293, lr: 5.00e-07, genTok: 1372.33, genS: 1115.83, trainS: 1266.67, stepS: 2630.11, respLen: 996.93, syncS: 48.55, refS: 35.56 },
-  { step: 65, acc: 0.064453, reward: -0.871094, loss: -0.02423, grad: 10.1399, mkl: 0.000497, kl: 0.054657, lr: 5.00e-07, genTok: 1420.90, genS: 1104.89, trainS: 1252.16, stepS: 2605.73, respLen: 1022.10, syncS: 48.45, refS: 36.69 },
-  { step: 66, acc: 0.191406, reward: -0.617188, loss: -0.07286, grad: 15.2508, mkl: -0.001090, kl: 0.033442, lr: 5.00e-07, genTok: 1364.58, genS: 1028.52, trainS: 1342.47, stepS: 2628.63, respLen: 913.74, syncS: 48.13, refS: 37.07 },
-  { step: 67, acc: 0.380208, reward: -0.239583, loss: -0.02570, grad: 14.0959, mkl: -0.000345, kl: 0.094288, lr: 5.00e-07, genTok: 1374.88, genS: 1020.45, trainS: 1296.41, stepS: 2572.04, respLen: 913.41, syncS: 46.95, refS: 36.93 },
-  { step: 68, acc: 0.459635, reward: -0.080729, loss: -0.04762, grad: 17.8121, mkl: 0.000701, kl: 0.129754, lr: 5.00e-07, genTok: 1523.78, genS: 920.78, trainS: 1248.00, stepS: 2420.86, respLen: 913.46, syncS: 47.02, refS: 35.27 },
-  { step: 69, acc: 0.380859, reward: -0.238281, loss: -0.03813, grad: 16.0541, mkl: 0.000020, kl: 0.197861, lr: 5.00e-07, genTok: 1500.15, genS: 1040.94, trainS: 1370.30, stepS: 2671.02, respLen: 1016.64, syncS: 47.56, refS: 37.46 },
-  { step: 70, acc: 0.291016, reward: -0.417969, loss: -0.01486, grad: 21.3860, mkl: -0.000024, kl: 0.474450, lr: 5.00e-07, genTok: 1231.56, genS: 1179.25, trainS: 1293.44, stepS: 2733.21, respLen: 945.52, syncS: 50.74, refS: 36.13 },
-  { step: 71, acc: 0.257812, reward: -0.484375, loss: 0.01496, grad: 19.9927, mkl: 0.000630, kl: 0.674424, lr: 5.00e-07, genTok: 1179.69, genS: 1173.24, trainS: 1198.15, stepS: 2625.83, respLen: 901.08, syncS: 49.20, refS: 34.65 },
+  { step: 0, acc: 0.10612, reward: -0.78776, loss: 0.00336109, grad: 1.48633, pos: 163, neg: 1373, genTok: 585.214, genS: 2795.88, trainS: 3989.7, stepS: 11476.1, respLen: 1214.68, maxLen: 20480, time: "05:38", syncS: 62.48 },
+  { step: 1, acc: 0.13737, reward: -0.72526, loss: -0.00159607, grad: 3.88672, pos: 211, neg: 1325, genTok: 1122.11, genS: 1363.13, trainS: 3941.6, stepS: 5958.92, respLen: 1146.62, maxLen: 20480, time: "07:19", syncS: 61.16 },
+  { step: 2, acc: 0.111979, reward: -0.776042, loss: 0.00348772, grad: 32.7656, pos: 172, neg: 1364, genTok: 1179.67, genS: 1667.99, trainS: 4293.22, stepS: 6619.26, respLen: 1427.81, maxLen: 20480, time: "09:11", syncS: 61.68 },
+  { step: 3, acc: 0.111328, reward: -0.777344, loss: -0.0016283, grad: 6.62891, pos: 171, neg: 1365, genTok: 1272.62, genS: 1362.14, trainS: 3942.26, stepS: 5964.29, respLen: 1281.79, maxLen: 20480, time: "10:51", syncS: 61.22 },
+  { step: 4, acc: 0.106771, reward: -0.786458, loss: 0.00197054, grad: 8.875, pos: 164, neg: 1372, genTok: 1159.58, genS: 1576.5, trainS: 3946.48, stepS: 6184.56, respLen: 1332.68, maxLen: 20480, time: "12:35", syncS: 62.09 },
 ];
-
-
 
 DATA.forEach(d => {
   d.msTok = d.genTok > 0 ? (1000 / d.genTok) : 0;
@@ -386,20 +308,11 @@ const prev = DATA.length > 1 ? DATA[DATA.length - 2] : null;
 function fmt(v, d=4) { return v.toFixed(d); }
 function pct(v) { return (v * 100).toFixed(1) + '%'; }
 function delta(curr, prev, fmt_fn, invert=false) {
-  if (!prev && prev !== 0) return { text: '\u2014', cls: 'neutral' };
+  if (!prev && prev !== 0) return { text: '—', cls: 'neutral' };
   const d = curr - prev;
   const sign = d > 0 ? '+' : '';
   const cls = d === 0 ? 'neutral' : (invert ? (d > 0 ? 'down' : 'up') : (d > 0 ? 'up' : 'down'));
   return { text: sign + fmt_fn(d), cls };
-}
-
-// 5-step moving average for accuracy
-function movingAvg(data, key, window) {
-  return data.map((d, i) => {
-    const start = Math.max(0, i - window + 1);
-    const slice = data.slice(start, i + 1);
-    return slice.reduce((s, x) => s + x[key], 0) / slice.length;
-  });
 }
 
 const kpis = [
@@ -407,8 +320,8 @@ const kpis = [
   { label: 'Accuracy', value: pct(latest.acc), delta: delta(latest.acc, prev?.acc, v => pct(v)) },
   { label: 'Mean Reward', value: fmt(latest.reward, 3), delta: delta(latest.reward, prev?.reward, v => fmt(v, 3)) },
   { label: 'Grad Norm', value: fmt(latest.grad, 3), delta: delta(latest.grad, prev?.grad, v => fmt(v, 3)) },
-  { label: 'Learning Rate', value: latest.lr.toExponential(0), delta: null },
   { label: 'Resp Len (mean)', value: fmt(latest.respLen, 0), delta: delta(latest.respLen, prev?.respLen, v => fmt(v, 0)) },
+  { label: 'ms / token', value: fmt(latest.msTok, 2), delta: delta(latest.msTok, prev?.msTok, v => fmt(v, 2), true) },
   { label: 'Gen Throughput', value: fmt(latest.genTok, 0) + ' t/s', delta: delta(latest.genTok, prev?.genTok, v => fmt(v, 0)) },
 ];
 
@@ -418,32 +331,34 @@ kpis.forEach(k => {
   div.className = 'kpi';
   let dHtml = '';
   if (k.delta) {
-    dHtml = '<div class="delta ' + k.delta.cls + '">' + (k.delta.cls === 'up' ? '\u25B2' : k.delta.cls === 'down' ? '\u25BC' : '\u25CF') + ' ' + k.delta.text + '</div>';
+    dHtml = `<div class="delta ${k.delta.cls}">${k.delta.cls === 'up' ? '▲' : k.delta.cls === 'down' ? '▼' : '●'} ${k.delta.text}</div>`;
   }
-  div.innerHTML = '<span class="label">' + k.label + '</span><span class="value">' + k.value + '</span>' + dHtml;
+  div.innerHTML = `<span class="label">${k.label}</span><span class="value">${k.value}</span>${dHtml}`;
   kpiRow.appendChild(div);
 });
 
 const tbody = document.getElementById('tableBody');
 DATA.forEach(d => {
   const tr = document.createElement('tr');
-  tr.innerHTML =
-    '<td class="c-accent">' + d.step + '</td>' +
-    '<td class="c-accent4">' + pct(d.acc) + '</td>' +
-    '<td>' + fmt(d.reward, 3) + '</td>' +
-    '<td>' + fmt(d.loss, 4) + '</td>' +
-    '<td>' + fmt(d.grad, 3) + '</td>' +
-    '<td>' + (d.mkl != null ? fmt(d.mkl, 4) : '\u2014') + '</td>' +
-    '<td class="c-warn">' + d.lr.toExponential(0) + '</td>' +
-    '<td class="c-accent5">' + fmt(d.respLen, 0) + '</td>' +
-    '<td>' + fmt(d.genTok, 0) + '</td>' +
-    '<td>' + fmt(d.genS, 1) + '</td>' +
-    '<td>' + fmt(d.trainS, 1) + '</td>' +
-    '<td>' + fmt(d.stepS, 1) + '</td>';
+  tr.innerHTML = `
+    <td class="c-accent">${d.step}</td>
+    <td class="c-accent4">${pct(d.acc)}</td>
+    <td>${fmt(d.reward, 3)}</td>
+    <td>${fmt(d.loss, 4)}</td>
+    <td>${fmt(d.grad, 3)}</td>
+    <td class="c-accent4">${d.pos}</td>
+    <td class="c-accent2">${d.neg}</td>
+    <td class="c-accent5">${fmt(d.respLen, 0)}</td>
+    <td class="c-warn">${fmt(d.msTok, 2)}</td>
+    <td>${fmt(d.genTok, 0)}</td>
+    <td>${fmt(d.genS, 1)}</td>
+    <td>${fmt(d.trainS, 1)}</td>
+    <td>${fmt(d.stepS, 1)}</td>
+  `;
   tbody.appendChild(tr);
 });
 
-document.getElementById('updateTs').textContent = 'Last updated: 2026-05-23 06:10 UTC | v3 Run (kl=0.02, maxResp=2048, warmup=10) | Step 71/500 (14.2%) | acc fading: 46%→29%→26% (steps 68-71), grad ~20, KL rising 0.47→0.67 | Recovery weakening';
+document.getElementById('updateTs').textContent = 'Last updated: ' + new Date().toLocaleString();
 
 const chartDefaults = {
   responsive: true,
@@ -455,38 +370,34 @@ const chartDefaults = {
   },
 };
 
-const steps = DATA.map(d => d.step);
-const ma5 = movingAvg(DATA, 'acc', 5);
+const steps = DATA.map(d => 'Step ' + d.step);
 
-// Chart 1: Accuracy & Reward
 new Chart(document.getElementById('chartAccuracy'), {
   type: 'line',
   data: {
     labels: steps,
     datasets: [
-      { label: 'Accuracy %', data: DATA.map(d => d.acc * 100), borderColor: '#22d3ee', backgroundColor: 'rgba(34,211,238,0.1)', tension: 0.3, fill: true, pointRadius: 3, pointBackgroundColor: '#22d3ee', borderWidth: 1.5 },
-      { label: 'Accuracy (5-MA)', data: ma5.map(v => v * 100), borderColor: '#fbbf24', tension: 0.4, pointRadius: 0, borderWidth: 2.5, borderDash: [] },
-      { label: 'Reward', data: DATA.map(d => d.reward * 50 + 50), borderColor: '#f472b6', tension: 0.3, fill: false, pointRadius: 2, pointBackgroundColor: '#f472b6', borderWidth: 1, yAxisID: 'y1' },
+      { label: 'Accuracy %', data: DATA.map(d => d.acc * 100), borderColor: '#22d3ee', backgroundColor: 'rgba(34,211,238,0.1)', tension: 0.3, fill: true, pointRadius: 5, pointBackgroundColor: '#22d3ee' },
+      { label: 'Reward', data: DATA.map(d => d.reward * 50 + 50), borderColor: '#f472b6', tension: 0.3, fill: false, pointRadius: 5, pointBackgroundColor: '#f472b6', yAxisID: 'y1' },
     ]
   },
   options: {
     ...chartDefaults,
     scales: {
       ...chartDefaults.scales,
-      y: { ...chartDefaults.scales.y, title: { display: true, text: 'Accuracy %', color: '#64748b' }, min: 0 },
+      y: { ...chartDefaults.scales.y, title: { display: true, text: 'Accuracy %', color: '#64748b' }, min: 0, max: 80 },
       y1: { position: 'right', ticks: { color: '#f472b6', font: { family: 'JetBrains Mono', size: 10 }, callback: v => ((v - 50) / 50).toFixed(2) }, grid: { display: false }, title: { display: true, text: 'Reward', color: '#f472b6' } },
     }
   }
 });
 
-// Chart 2: Loss & Grad Norm
 new Chart(document.getElementById('chartLoss'), {
   type: 'line',
   data: {
     labels: steps,
     datasets: [
-      { label: 'Loss', data: DATA.map(d => d.loss), borderColor: '#a78bfa', tension: 0.3, pointRadius: 3, pointBackgroundColor: '#a78bfa', borderWidth: 1.5 },
-      { label: 'Grad Norm', data: DATA.map(d => Math.min(d.grad, 10)), borderColor: '#fbbf24', tension: 0.3, pointRadius: 3, pointBackgroundColor: (ctx) => DATA[ctx.dataIndex]?.grad > 10 ? '#ef4444' : '#fbbf24', yAxisID: 'y1', borderWidth: 1.5 },
+      { label: 'Loss', data: DATA.map(d => d.loss), borderColor: '#a78bfa', tension: 0.3, pointRadius: 5, pointBackgroundColor: '#a78bfa' },
+      { label: 'Grad Norm', data: DATA.map(d => d.grad), borderColor: '#fbbf24', tension: 0.3, pointRadius: 5, pointBackgroundColor: '#fbbf24', yAxisID: 'y1' },
     ]
   },
   options: {
@@ -494,18 +405,17 @@ new Chart(document.getElementById('chartLoss'), {
     scales: {
       ...chartDefaults.scales,
       y: { ...chartDefaults.scales.y, title: { display: true, text: 'Loss', color: '#a78bfa' } },
-      y1: { position: 'right', ticks: { color: '#fbbf24', font: { family: 'JetBrains Mono', size: 10 } }, grid: { display: false }, title: { display: true, text: 'Grad Norm (clamped 10)', color: '#fbbf24' }, max: 10 },
+      y1: { position: 'right', ticks: { color: '#fbbf24', font: { family: 'JetBrains Mono', size: 10 } }, grid: { display: false }, title: { display: true, text: 'Grad Norm', color: '#fbbf24' } },
     }
   }
 });
 
-// Chart 3: Response Length
 new Chart(document.getElementById('chartRespLen'), {
   type: 'line',
   data: {
     labels: steps,
     datasets: [
-      { label: 'Mean Response Len', data: DATA.map(d => d.respLen), borderColor: '#fb923c', backgroundColor: 'rgba(251,146,60,0.1)', tension: 0.3, fill: true, pointRadius: 3, pointBackgroundColor: '#fb923c', borderWidth: 1.5 },
+      { label: 'Mean Response Len', data: DATA.map(d => d.respLen), borderColor: '#fb923c', backgroundColor: 'rgba(251,146,60,0.1)', tension: 0.3, fill: true, pointRadius: 5, pointBackgroundColor: '#fb923c' },
     ]
   },
   options: {
@@ -518,15 +428,13 @@ new Chart(document.getElementById('chartRespLen'), {
   }
 });
 
-// Chart 4: Timing
 new Chart(document.getElementById('chartTiming'), {
   type: 'bar',
   data: {
     labels: steps,
     datasets: [
-      { label: 'Generation (s)', data: DATA.map(d => d.genS), backgroundColor: 'rgba(34,211,238,0.6)', borderRadius: 2 },
-      { label: 'Training (s)', data: DATA.map(d => d.trainS), backgroundColor: 'rgba(167,139,250,0.6)', borderRadius: 2 },
-      { label: 'Weight Sync (s)', data: DATA.map(d => d.syncS), backgroundColor: 'rgba(251,146,60,0.6)', borderRadius: 2 },
+      { label: 'Generation (s)', data: DATA.map(d => d.genS), backgroundColor: 'rgba(34,211,238,0.6)', borderRadius: 4 },
+      { label: 'Training (s)', data: DATA.map(d => d.trainS), backgroundColor: 'rgba(167,139,250,0.6)', borderRadius: 4 },
     ]
   },
   options: {
@@ -539,13 +447,12 @@ new Chart(document.getElementById('chartTiming'), {
   }
 });
 
-// Chart 5: LR Schedule
-new Chart(document.getElementById('chartLR'), {
+new Chart(document.getElementById('chartTpT'), {
   type: 'line',
   data: {
     labels: steps,
     datasets: [
-      { label: 'Learning Rate', data: DATA.map(d => d.lr * 1e6), borderColor: '#34d399', backgroundColor: 'rgba(52,211,153,0.1)', tension: 0.1, fill: true, pointRadius: 4, pointBackgroundColor: '#34d399', borderWidth: 2, stepped: false },
+      { label: 'ms/token (gen)', data: DATA.map(d => d.msTok), borderColor: '#fbbf24', backgroundColor: 'rgba(251,191,36,0.1)', tension: 0.3, fill: true, pointRadius: 6, pointBackgroundColor: '#fbbf24', borderWidth: 2 },
     ]
   },
   options: {
@@ -553,18 +460,29 @@ new Chart(document.getElementById('chartLR'), {
     plugins: { ...chartDefaults.plugins, legend: { display: false } },
     scales: {
       ...chartDefaults.scales,
-      y: { ...chartDefaults.scales.y, title: { display: true, text: 'LR (x1e-6)', color: '#34d399' }, min: 0, max: 1.2 },
-    },
-    elements: {
-      point: {
-        backgroundColor: function(ctx) {
-          return ctx.dataIndex < 10 ? '#fbbf24' : '#34d399';
-        }
-      }
+      y: { ...chartDefaults.scales.y, title: { display: true, text: 'ms / token', color: '#fbbf24' }, min: 0 },
     }
   }
 });
 
+new Chart(document.getElementById('chartBreakdown'), {
+  type: 'bar',
+  data: {
+    labels: steps,
+    datasets: [
+      { label: 'Correct (+1)', data: DATA.map(d => d.pos), backgroundColor: 'rgba(34,211,158,0.7)', borderRadius: 4 },
+      { label: 'Wrong (-1)', data: DATA.map(d => d.neg), backgroundColor: 'rgba(244,114,182,0.4)', borderRadius: 4 },
+    ]
+  },
+  options: {
+    ...chartDefaults,
+    scales: {
+      ...chartDefaults.scales,
+      x: { ...chartDefaults.scales.x, stacked: true },
+      y: { ...chartDefaults.scales.y, stacked: true, title: { display: true, text: 'Count (of 1536)', color: '#64748b' }, max: 1536 },
+    }
+  }
+});
 </script>
 </body>
 </html>

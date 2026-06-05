@@ -1,0 +1,262 @@
+{
+  "backend": "atom",
+  "target_model": "/dev/shm/Kimi-K2.5-MXFP4",
+  "draft_model": "/dev/shm/Kimi_K25_eagle3_v2_phase2_HF",
+  "phase": "phase2",
+  "checkpoint_step": "22000",
+  "num_speculative_tokens": 3,
+  "benchmarks": {
+    "mtbench": {
+      "benchmark": "mtbench",
+      "num_samples": 80,
+      "accept_length": 2.238,
+      "acceptance_rate": 41.3,
+      "total_output_tokens": 101038,
+      "throughput_tps": 555.1,
+      "latency_s": 182.0,
+      "num_draft_tokens": 135348,
+      "num_accepted": 55842,
+      "distribution": {
+        "0": 15807,
+        "1": 12338,
+        "2": 7409,
+        "3": 9562
+      },
+      "errors": 0
+    },
+    "ceval": {
+      "benchmark": "ceval",
+      "num_samples": 212,
+      "accept_length": 2.121,
+      "acceptance_rate": 37.4,
+      "total_output_tokens": 102262,
+      "throughput_tps": 543.7,
+      "latency_s": 188.1,
+      "num_draft_tokens": 144330,
+      "num_accepted": 53940,
+      "distribution": {
+        "0": 18663,
+        "1": 13180,
+        "2": 8041,
+        "3": 8226
+      },
+      "errors": 0
+    },
+    "gsm8k": {
+      "benchmark": "gsm8k",
+      "num_samples": 500,
+      "accept_length": 3.105,
+      "acceptance_rate": 70.2,
+      "total_output_tokens": 197832,
+      "throughput_tps": 750.5,
+      "latency_s": 263.6,
+      "num_draft_tokens": 190668,
+      "num_accepted": 133776,
+      "distribution": {
+        "0": 8428,
+        "1": 10150,
+        "2": 11308,
+        "3": 33670
+      },
+      "errors": 0
+    },
+    "humaneval": {
+      "benchmark": "humaneval",
+      "num_samples": 164,
+      "accept_length": 2.728,
+      "acceptance_rate": 57.6,
+      "total_output_tokens": 158265,
+      "throughput_tps": 706.2,
+      "latency_s": 224.1,
+      "num_draft_tokens": 173889,
+      "num_accepted": 100138,
+      "distribution": {
+        "0": 12137,
+        "1": 13150,
+        "2": 11040,
+        "3": 21636
+      },
+      "errors": 0
+    },
+    "math500": {
+      "benchmark": "math500",
+      "num_samples": 500,
+      "accept_length": 2.886,
+      "acceptance_rate": 62.9,
+      "total_output_tokens": 716986,
+      "throughput_tps": 746.7,
+      "latency_s": 960.3,
+      "num_draft_tokens": 744813,
+      "num_accepted": 468215,
+      "distribution": {
+        "0": 44767,
+        "1": 48632,
+        "2": 45033,
+        "3": 109839
+      },
+      "errors": 0
+    },
+    "aime": {
+      "benchmark": "aime",
+      "num_samples": 30,
+      "accept_length": 2.448,
+      "acceptance_rate": 48.3,
+      "total_output_tokens": 122575,
+      "throughput_tps": 601.5,
+      "latency_s": 203.8,
+      "num_draft_tokens": 150183,
+      "num_accepted": 72484,
+      "distribution": {
+        "0": 13957,
+        "1": 13138,
+        "2": 9552,
+        "3": 13414
+      },
+      "errors": 0
+    },
+    "bfcl_v3_simple": {
+      "benchmark": "bfcl_v3_simple",
+      "num_samples": 400,
+      "accept_length": 2.714,
+      "acceptance_rate": 57.1,
+      "total_output_tokens": 86059,
+      "throughput_tps": 604.4,
+      "latency_s": 142.4,
+      "num_draft_tokens": 94680,
+      "num_accepted": 54099,
+      "distribution": {
+        "0": 6856,
+        "1": 7001,
+        "2": 6011,
+        "3": 11692
+      },
+      "errors": 0
+    },
+    "bfcl_v3_multiple": {
+      "benchmark": "bfcl_v3_multiple",
+      "num_samples": 200,
+      "accept_length": 2.714,
+      "acceptance_rate": 57.1,
+      "total_output_tokens": 49898,
+      "throughput_tps": 612.2,
+      "latency_s": 81.5,
+      "num_draft_tokens": 54930,
+      "num_accepted": 31388,
+      "distribution": {
+        "0": 3926,
+        "1": 4098,
+        "2": 3568,
+        "3": 6718
+      },
+      "errors": 0
+    },
+    "bfcl_v3_parallel": {
+      "benchmark": "bfcl_v3_parallel",
+      "num_samples": 200,
+      "accept_length": 2.79,
+      "acceptance_rate": 59.7,
+      "total_output_tokens": 79984,
+      "throughput_tps": 669.4,
+      "latency_s": 119.5,
+      "num_draft_tokens": 85788,
+      "num_accepted": 51188,
+      "distribution": {
+        "0": 5658,
+        "1": 6117,
+        "2": 5392,
+        "3": 11429
+      },
+      "errors": 0
+    },
+    "bfcl_v3_parallel_multiple": {
+      "benchmark": "bfcl_v3_parallel_multiple",
+      "num_samples": 200,
+      "accept_length": 2.76,
+      "acceptance_rate": 58.7,
+      "total_output_tokens": 90102,
+      "throughput_tps": 669.8,
+      "latency_s": 134.5,
+      "num_draft_tokens": 97728,
+      "num_accepted": 57326,
+      "distribution": {
+        "0": 6468,
+        "1": 7194,
+        "2": 6610,
+        "3": 12304
+      },
+      "errors": 0
+    },
+    "bfcl_v3_live_simple": {
+      "benchmark": "bfcl_v3_live_simple",
+      "num_samples": 258,
+      "accept_length": 2.513,
+      "acceptance_rate": 50.4,
+      "total_output_tokens": 82478,
+      "throughput_tps": 591.2,
+      "latency_s": 139.5,
+      "num_draft_tokens": 98136,
+      "num_accepted": 49508,
+      "distribution": {
+        "0": 8698,
+        "1": 8174,
+        "2": 6186,
+        "3": 9654
+      },
+      "errors": 0
+    },
+    "bfcl_v3_live_multiple": {
+      "benchmark": "bfcl_v3_live_multiple",
+      "num_samples": 1030,
+      "accept_length": 2.533,
+      "acceptance_rate": 51.1,
+      "total_output_tokens": 354531,
+      "throughput_tps": 599.8,
+      "latency_s": 591.0,
+      "num_draft_tokens": 418671,
+      "num_accepted": 213944,
+      "distribution": {
+        "0": 35800,
+        "1": 35080,
+        "2": 27167,
+        "3": 41510
+      },
+      "errors": 0
+    },
+    "bfcl_v3_live_parallel": {
+      "benchmark": "bfcl_v3_live_parallel",
+      "num_samples": 16,
+      "accept_length": 2.428,
+      "acceptance_rate": 47.6,
+      "total_output_tokens": 7720,
+      "throughput_tps": 522.9,
+      "latency_s": 14.8,
+      "num_draft_tokens": 9519,
+      "num_accepted": 4531,
+      "distribution": {
+        "0": 919,
+        "1": 824,
+        "2": 583,
+        "3": 847
+      },
+      "errors": 0
+    },
+    "bfcl_v3_live_parallel_multiple": {
+      "benchmark": "bfcl_v3_live_parallel_multiple",
+      "num_samples": 24,
+      "accept_length": 2.539,
+      "acceptance_rate": 51.3,
+      "total_output_tokens": 10225,
+      "throughput_tps": 574.5,
+      "latency_s": 17.8,
+      "num_draft_tokens": 12051,
+      "num_accepted": 6184,
+      "distribution": {
+        "0": 1034,
+        "1": 1007,
+        "2": 751,
+        "3": 1225
+      },
+      "errors": 0
+    }
+  }
+}

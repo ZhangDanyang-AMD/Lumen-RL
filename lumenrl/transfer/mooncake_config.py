@@ -49,7 +49,7 @@ class MooncakeConfig:
             )
 
         if self.async_put_pool_size is None:
-            self.async_put_pool_size = 1
+            self.async_put_pool_size = 2
 
         if self.gpu_buffer_size is None and self.enable_gpu_direct:
             from lumenrl.transfer.eagle_mooncake_store import calculate_eagle3_buffer_size
@@ -140,6 +140,6 @@ class MooncakeConfig:
                 os.getenv("MOONCAKE_GET_RETRY_LOG_INTERVAL_SECONDS", "5.0")
             ),
             get_retry_max_wait_seconds=float(
-                os.getenv("MOONCAKE_GET_RETRY_MAX_WAIT_SECONDS", "5.0")
+                os.getenv("MOONCAKE_GET_RETRY_MAX_WAIT_SECONDS", "90.0")
             ),
         )

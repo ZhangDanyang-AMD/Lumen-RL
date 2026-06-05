@@ -176,6 +176,7 @@ def query_vllm(base_url, model_name, messages, max_tokens=2048):
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": 0,
+            "chat_template_kwargs": {"thinking": False},
         },
         timeout=300,
     )
@@ -200,9 +201,9 @@ def get_prometheus_metrics(base_url):
         return {}
 
 
-def run_benchmark(base_url, model_name, name, prompts, max_tokens=2048):
+def run_benchmark(base_url, model_name, name, prompts, max_tokens=2048, concurrency=1):
     print(f"\n{'='*60}")
-    print(f"Running: {name} ({len(prompts)} samples)")
+    print(f"Running: {name} ({len(prompts)} samples, concurrency={concurrency})")
     print(f"{'='*60}")
 
     # Get metrics before
@@ -215,18 +216,37 @@ def run_benchmark(base_url, model_name, name, prompts, max_tokens=2048):
     errors = 0
     start = time.time()
 
-    for i, msgs in enumerate(prompts):
-        try:
-            result = query_vllm(base_url, model_name, msgs, max_tokens=max_tokens)
-            usage = result.get("usage", {})
-            total_output_tokens += usage.get("completion_tokens", 0)
-            if (i + 1) % 50 == 0:
-                elapsed = time.time() - start
-                print(f"  Progress: {i+1}/{len(prompts)} ({elapsed:.1f}s)")
-        except Exception as e:
-            errors += 1
-            if errors <= 3:
-                print(f"  ERROR on sample {i}: {e}")
+    if concurrency <= 1:
+        for i, msgs in enumerate(prompts):
+            try:
+                result = query_vllm(base_url, model_name, msgs, max_tokens=max_tokens)
+                usage = result.get("usage", {})
+                total_output_tokens += usage.get("completion_tokens", 0)
+                if (i + 1) % 50 == 0:
+                    elapsed = time.time() - start
+                    print(f"  Progress: {i+1}/{len(prompts)} ({elapsed:.1f}s)")
+            except Exception as e:
+                errors += 1
+                if errors <= 3:
+                    print(f"  ERROR on sample {i}: {e}")
+    else:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        done = 0
+        with ThreadPoolExecutor(max_workers=concurrency) as ex:
+            futs = {ex.submit(query_vllm, base_url, model_name, m, max_tokens): i
+                    for i, m in enumerate(prompts)}
+            for fut in as_completed(futs):
+                try:
+                    r = fut.result()
+                    total_output_tokens += r.get("usage", {}).get("completion_tokens", 0)
+                except Exception as e:
+                    errors += 1
+                    if errors <= 3:
+                        print(f"  ERROR on sample {futs[fut]}: {e}")
+                done += 1
+                if done % 50 == 0 or done == len(prompts):
+                    elapsed = time.time() - start
+                    print(f"  Progress: {done}/{len(prompts)} ({elapsed:.1f}s)")
 
     elapsed = time.time() - start
     if errors > 3:
@@ -276,6 +296,8 @@ def main():
     parser.add_argument("--output-dir", default="./benchmark_results")
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--benchmarks", nargs="+", default=["all"])
+    parser.add_argument("--concurrency", type=int, default=1,
+                        help="Number of in-flight requests per benchmark (1 = sequential, backward-compatible).")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -314,7 +336,8 @@ def main():
         loader, n, max_tok = benchmark_configs[name]
         try:
             prompts = loader(n)
-            result = run_benchmark(args.base_url, model_name, name, prompts, max_tokens=max_tok)
+            result = run_benchmark(args.base_url, model_name, name, prompts,
+                                   max_tokens=max_tok, concurrency=args.concurrency)
             all_results[name] = result
         except Exception as e:
             print(f"ERROR running {name}: {e}")

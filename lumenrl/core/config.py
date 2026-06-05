@@ -202,6 +202,10 @@ class PolicyConfig:
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
     warmup_ratio: float = 0.0
+    min_lr: float = 0.0
+    lr_decay_style: str = "cosine"       # constant, linear, cosine, WSD
+    wsd_decay_ratio: float = 0.2
+    wsd_decay_style: str = "cosine"
     balance_batch: bool = False         # seqlen-balanced partitioning across DP ranks
 
 
@@ -276,6 +280,8 @@ class TeacherConfig:
     quantization: str = ""                  # "" | "fp8" | "fp4" | "mxfp4"
     tensor_parallel_size: int = 1           # ATOM tensor parallelism
     gpu_ids: Optional[list[int]] = None     # GPUs for ATOM inference
+    transport: str = "mooncake"             # "mooncake" | "mori"
+    atom: Any = None                        # ATOM config extra args
     # MORI-IO P2P RDMA for GPU-direct hidden state transfer
     mori_io_host: str = "127.0.0.1"         # OOB communication address
     mori_io_port: int = 0                   # 0 = auto-assign
@@ -302,6 +308,17 @@ class DraftModelConfig:
     rope_beta_slow: float = 1.0
     rope_mscale: float = 1.0
     rope_mscale_all_dim: float = 1.0
+    # Llama3-specific RoPE (nvidia/gpt-oss-120b-Eagle3 layout)
+    rope_low_freq_factor: float = 1.0
+    rope_high_freq_factor: float = 4.0
+    # HF eagle_config toggles
+    use_aux_hidden_state: bool = True
+    use_input_layernorm_in_first_layer: bool = True
+    use_last_layernorm: bool = True
+    use_mtp_layernorm: bool = False
+    attention_bias: bool = False
+    mlp_bias: bool = False
+    max_window_layers: Optional[int] = None
     dtype: str = "float16"
     resume_from: Optional[str] = None
 
@@ -405,7 +422,27 @@ class RewardConfig:
     type: str = "function"
     function: str = "math_reward"
     dataset: str = ""
+    dataset_split: str = "train"
     model_name: Optional[str] = None
+
+
+@dataclass
+class DatasetConfig:
+    """Dataset preprocessing configuration for speculative distillation."""
+    chat_template: str = ""
+    last_turn_loss_only: str = "false"    # "true", "false", or "auto"
+    min_loss_tokens: int = 0
+    num_preprocess_workers: int = 16
+    cache_dir: str = "/dev/shm/lumenrl_cache"
+
+
+@dataclass
+class EvalConfig:
+    """Validation / evaluation configuration."""
+    enabled: bool = False
+    interval: int = 1000
+    num_samples: int = 256
+    micro_batch_size: int = 8
 
 
 @dataclass
@@ -459,7 +496,9 @@ class MooncakeTransferConfig:
     async_put_pool_size: int = 4
     enable_gpu_direct: bool = False
     enable_hard_pin: bool = False
-    kv_lease_ttl_s: float = 5.0
+    kv_lease_ttl_s: float = 120.0
+    get_retry_wait_seconds: float = 1.0
+    get_retry_max_wait_seconds: float = 90.0
 
 
 @dataclass
@@ -569,6 +608,8 @@ class LumenRLConfig:
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
     controller: ControllerConfig = field(default_factory=ControllerConfig)
     assembly: RuntimeAssemblyConfig = field(default_factory=RuntimeAssemblyConfig)
+    dataset: DatasetConfig = field(default_factory=DatasetConfig)
+    eval: EvalConfig = field(default_factory=EvalConfig)
     num_training_steps: int = 1000
     seed: int = 42
     val_dataset: str = ""

@@ -87,35 +87,73 @@ class CheckpointCallback(Callback):
 
         model = getattr(trainer, "_actor_model", None) or getattr(trainer, "_draft_model", None)
 
-        if trainer._is_distributed:
-            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            try:
-                from torch.distributed.checkpoint.state_dict import (
-                    get_model_state_dict,
-                    get_optimizer_state_dict,
-                    StateDictOptions,
-                )
-                opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
-                state["model_state_dict"] = get_model_state_dict(
-                    model, options=opts,
-                )
-                state["optimizer_state_dict"] = get_optimizer_state_dict(
-                    model, trainer._optimizer, options=opts,
-                )
-            except Exception as exc:
-                logger.warning("FSDP2 state_dict extraction failed (%s); saving metrics only.", exc)
-        else:
-            if model is not None:
-                state["model_state_dict"] = model.state_dict()
-            if trainer._optimizer is not None:
-                state["optimizer_state_dict"] = trainer._optimizer.state_dict()
+        if model is not None:
+            state["model_state_dict"] = {
+                k: v.cpu() for k, v in model.state_dict().items()
+            }
+
+        opt = trainer._optimizer
+        if opt is not None:
+            state["optimizer_state_dict"] = opt.state_dict()
+            if hasattr(opt, "fp32_params"):
+                state["fp32_params"] = [p.data.cpu().clone() for p in opt.fp32_params]
+            if hasattr(opt, "scheduler"):
+                state["scheduler_last_epoch"] = opt.scheduler.last_epoch
 
         if rank == 0:
+            n_model = len(state.get("model_state_dict", {}))
+            n_fp32 = len(state.get("fp32_params", []))
+            logger.info(
+                "Saving checkpoint step=%d: %d model keys, %d fp32 params, opt=%s, sched_epoch=%s",
+                step, n_model, n_fp32,
+                "yes" if "optimizer_state_dict" in state else "no",
+                state.get("scheduler_last_epoch", "N/A"),
+            )
             self._manager.save(state, path, step)
             self._prune_old_checkpoints(ckpt_dir)
 
         if trainer._is_distributed:
             torch.distributed.barrier()
+
+    @staticmethod
+    def _verify_checkpoint(path: Path, model, opt, step: int) -> None:
+        """Load saved checkpoint back and compare against live model weights."""
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+            saved = payload.get("state_dict", payload)
+            saved_sd = saved.get("model_state_dict", {})
+
+            live_sd = {k: v.cpu() for k, v in model.state_dict().items()}
+
+            if len(saved_sd) != len(live_sd):
+                logger.error("CKPT VERIFY FAIL step=%d: saved %d keys vs live %d keys",
+                             step, len(saved_sd), len(live_sd))
+                return
+
+            max_diff = 0.0
+            for k in live_sd:
+                if k not in saved_sd:
+                    logger.error("CKPT VERIFY FAIL step=%d: key %s missing from checkpoint", step, k)
+                    return
+                diff = (saved_sd[k].float() - live_sd[k].float()).abs().max().item()
+                max_diff = max(max_diff, diff)
+
+            if max_diff > 1e-6:
+                logger.error("CKPT VERIFY FAIL step=%d: max diff=%.6g (should be 0)", step, max_diff)
+            else:
+                logger.info("CKPT VERIFY OK step=%d: %d keys, max_diff=%.2e", step, len(saved_sd), max_diff)
+
+            saved_fp32 = saved.get("fp32_params", [])
+            if saved_fp32 and opt is not None and hasattr(opt, "fp32_params"):
+                fp32_max_diff = 0.0
+                for sp, lp in zip(saved_fp32, opt.fp32_params):
+                    diff = (sp.cpu().float() - lp.data.cpu().float()).abs().max().item()
+                    fp32_max_diff = max(fp32_max_diff, diff)
+                logger.info("CKPT VERIFY FP32 step=%d: %d params, max_diff=%.2e",
+                            step, len(saved_fp32), fp32_max_diff)
+
+        except Exception as exc:
+            logger.warning("CKPT VERIFY ERROR step=%d: %s", step, exc)
 
     def _prune_old_checkpoints(self, ckpt_dir: Path) -> None:
         pattern = re.compile(r"checkpoint_(\d+)\.pt$")
@@ -135,7 +173,11 @@ class CheckpointCallback(Callback):
 
 
 class EvalCallback(Callback):
-    """Run periodic validation using the trainer hook."""
+    """Run periodic validation using the trainer hook.
+
+    Must run on **all ranks** because teacher forward + FSDP require
+    collective operations.  Only rank 0 logs the results.
+    """
 
     def __init__(self, interval: int) -> None:
         self.interval = max(1, int(interval))
@@ -143,10 +185,11 @@ class EvalCallback(Callback):
     def on_step_end(self, trainer: "RLTrainer", step: int, metrics: dict[str, float]) -> None:
         if step % self.interval != 0:
             return
-        if trainer._rank != 0:
-            return
         val_metrics = trainer.run_validation()
-        logger.info("validation step=%d %s", step, val_metrics)
+        if trainer._rank == 0:
+            parts = [f"{k}={v:.6g}" for k, v in sorted(val_metrics.items())]
+            logger.info("eval step=%d %s", step, " ".join(parts))
+        metrics.update(val_metrics)
 
 
 class WandbCallback(Callback):
