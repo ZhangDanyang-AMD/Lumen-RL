@@ -1,0 +1,191 @@
+{
+  "backend": "atom",
+  "benchmark": "SPEED-Bench",
+  "target_model": "/dev/shm/Kimi-K2.5-MXFP4",
+  "draft_model": "/dev/shm/Kimi_K25_eagle3_v2_phase2_HF",
+  "phase": "phase2",
+  "checkpoint_step": "22000",
+  "num_speculative_tokens": 3,
+  "batch_size": 2,
+  "categories": {
+    "coding": {
+      "category": "coding",
+      "num_samples": 80,
+      "batch_size": 2,
+      "accept_length": 2.477,
+      "acceptance_rate": 49.2,
+      "total_output_tokens": 160811,
+      "throughput_tps": 362.3,
+      "latency_s": 443.8,
+      "num_draft_tokens": 194673,
+      "num_accepted": 95831,
+      "distribution": {
+        "0": 17596,
+        "1": 16957,
+        "2": 12140,
+        "3": 18198
+      },
+      "errors": 0
+    },
+    "humanities": {
+      "category": "humanities",
+      "num_samples": 8,
+      "batch_size": 2,
+      "accept_length": 1.897,
+      "acceptance_rate": 29.9,
+      "total_output_tokens": 29803,
+      "throughput_tps": 275.2,
+      "latency_s": 108.3,
+      "num_draft_tokens": 47103,
+      "num_accepted": 14086,
+      "distribution": {
+        "0": 7197,
+        "1": 4571,
+        "2": 2284,
+        "3": 1649
+      },
+      "errors": 0
+    },
+    "math": {
+      "category": "math",
+      "num_samples": 18,
+      "batch_size": 2,
+      "accept_length": 3.066,
+      "acceptance_rate": 68.9,
+      "total_output_tokens": 21317,
+      "throughput_tps": 430.3,
+      "latency_s": 49.5,
+      "num_draft_tokens": 20823,
+      "num_accepted": 14340,
+      "distribution": {
+        "0": 943,
+        "1": 1216,
+        "2": 1222,
+        "3": 3560
+      },
+      "errors": 0
+    },
+    "multilingual": {
+      "category": "multilingual",
+      "num_samples": 80,
+      "batch_size": 2,
+      "accept_length": 2.208,
+      "acceptance_rate": 40.3,
+      "total_output_tokens": 123669,
+      "throughput_tps": 212.4,
+      "latency_s": 582.3,
+      "num_draft_tokens": 1010547,
+      "num_accepted": 407052,
+      "distribution": {
+        "0": 126210,
+        "1": 85286,
+        "2": 54293,
+        "3": 71060
+      },
+      "errors": 0
+    },
+    "qa": {
+      "category": "qa",
+      "num_samples": 80,
+      "batch_size": 2,
+      "accept_length": 2.031,
+      "acceptance_rate": 34.4,
+      "total_output_tokens": 61373,
+      "throughput_tps": 189.0,
+      "latency_s": 324.7,
+      "num_draft_tokens": 789486,
+      "num_accepted": 271307,
+      "distribution": {
+        "0": 107387,
+        "1": 76999,
+        "2": 42020,
+        "3": 36756
+      },
+      "errors": 0
+    },
+    "rag": {
+      "category": "rag",
+      "num_samples": 80,
+      "batch_size": 2,
+      "accept_length": 1.0,
+      "acceptance_rate": 0,
+      "total_output_tokens": 60307,
+      "throughput_tps": 18.9,
+      "latency_s": 3186.0,
+      "num_draft_tokens": -3545865,
+      "num_accepted": -1371430,
+      "distribution": {},
+      "errors": 10
+    },
+    "reasoning": {
+      "category": "reasoning",
+      "num_samples": 80,
+      "batch_size": 2,
+      "accept_length": 1.0,
+      "acceptance_rate": 0,
+      "total_output_tokens": 0,
+      "throughput_tps": 0.0,
+      "latency_s": 2573.9,
+      "num_draft_tokens": 0,
+      "num_accepted": 0,
+      "distribution": {},
+      "errors": 80
+    },
+    "roleplay": {
+      "category": "roleplay",
+      "num_samples": 80,
+      "batch_size": 2,
+      "accept_length": 1.0,
+      "acceptance_rate": 0,
+      "total_output_tokens": 0,
+      "throughput_tps": 0.0,
+      "latency_s": 0.0,
+      "num_draft_tokens": 0,
+      "num_accepted": 0,
+      "distribution": {},
+      "errors": 80
+    },
+    "stem": {
+      "category": "stem",
+      "num_samples": 6,
+      "batch_size": 2,
+      "accept_length": 1.0,
+      "acceptance_rate": 0,
+      "total_output_tokens": 0,
+      "throughput_tps": 0.0,
+      "latency_s": 0.0,
+      "num_draft_tokens": 0,
+      "num_accepted": 0,
+      "distribution": {},
+      "errors": 6
+    },
+    "summarization": {
+      "category": "summarization",
+      "num_samples": 80,
+      "batch_size": 2,
+      "accept_length": 1.0,
+      "acceptance_rate": 0,
+      "total_output_tokens": 0,
+      "throughput_tps": 0.0,
+      "latency_s": 0.0,
+      "num_draft_tokens": 0,
+      "num_accepted": 0,
+      "distribution": {},
+      "errors": 80
+    },
+    "writing": {
+      "category": "writing",
+      "num_samples": 80,
+      "batch_size": 2,
+      "accept_length": 1.0,
+      "acceptance_rate": 0,
+      "total_output_tokens": 0,
+      "throughput_tps": 0.0,
+      "latency_s": 0.1,
+      "num_draft_tokens": 0,
+      "num_accepted": 0,
+      "distribution": {},
+      "errors": 80
+    }
+  }
+}

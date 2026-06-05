@@ -452,12 +452,33 @@ class SpecDistillTrainer:
         if resume_from and not getattr(draft_cfg, "from_scratch", False):
             import glob as _glob
             ckpt_files = sorted(_glob.glob(os.path.join(resume_from, "checkpoint_*.pt")))
+            safetensor_files = sorted(_glob.glob(os.path.join(resume_from, "*.safetensors")))
             if ckpt_files:
                 ckpt_path = ckpt_files[-1]
                 logger.info("[rank %d] Loading draft weights from %s", self._rank, ckpt_path)
                 payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
                 sd = payload.get("model_state_dict", payload)
                 self._draft_model.load_state_dict(sd, strict=False)
+            elif safetensor_files:
+                from safetensors.torch import load_file as _load_safetensors
+                logger.info("[rank %d] Loading draft weights from HF safetensors: %s", self._rank, resume_from)
+                sd = {}
+                for sf in safetensor_files:
+                    sd.update(_load_safetensors(sf, device="cpu"))
+                # HF key mapping: midlayer.* -> layers.0.*, norm.* -> out_norm.*
+                mapped = {}
+                for k, v in sd.items():
+                    if k in ("embed_tokens.weight", "lm_head.weight"):
+                        continue
+                    nk = k.replace("midlayer.", "layers.0.")
+                    if nk == "norm.weight":
+                        nk = "out_norm.weight"
+                    mapped[nk] = v
+                missing, unexpected = self._draft_model.load_state_dict(mapped, strict=False)
+                if missing:
+                    logger.info("[rank %d] HF resume missing keys: %s", self._rank, missing)
+                if unexpected:
+                    logger.info("[rank %d] HF resume unexpected keys: %s", self._rank, unexpected)
             else:
                 logger.warning("[rank %d] resume_from=%s but no checkpoints found", self._rank, resume_from)
 

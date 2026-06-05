@@ -1,0 +1,225 @@
+Using model: /dev/shm/Kimi-K2.5-MXFP4
+Backend: ATOM
+Batch size: 4
+Detected num_speculative_tokens: 3
+
+============================================================
+Running: mtbench (80 samples, BS=4)
+============================================================
+  Progress: 50/80 (97.3s)
+  Accept length: 2.238
+  Acceptance rate: 41.3%
+  Throughput: 555.1 tok/s
+  Total time: 182.0s
+  Distribution: {'0': 15807, '1': 12338, '2': 7409, '3': 9562}
+
+============================================================
+Running: ceval (212 samples, BS=4)
+============================================================
+  Progress: 50/212 (46.4s)
+  Progress: 100/212 (90.8s)
+  Progress: 150/212 (134.2s)
+  Progress: 200/212 (177.4s)
+  Accept length: 2.121
+  Acceptance rate: 37.4%
+  Throughput: 543.7 tok/s
+  Total time: 188.1s
+  Distribution: {'0': 18663, '1': 13180, '2': 8041, '3': 8226}
+
+============================================================
+Running: gsm8k (500 samples, BS=4)
+============================================================
+  Progress: 50/500 (26.8s)
+  Progress: 100/500 (54.0s)
+  Progress: 150/500 (79.6s)
+  Progress: 200/500 (106.6s)
+  Progress: 250/500 (132.6s)
+  Progress: 300/500 (158.1s)
+  Progress: 350/500 (185.5s)
+  Progress: 400/500 (211.9s)
+  Progress: 450/500 (239.9s)
+  Progress: 500/500 (263.6s)
+  Accept length: 3.105
+  Acceptance rate: 70.2%
+  Throughput: 750.5 tok/s
+  Total time: 263.6s
+  Distribution: {'0': 8428, '1': 10150, '2': 11308, '3': 33670}
+
+============================================================
+Running: humaneval (164 samples, BS=4)
+============================================================
+  Progress: 50/164 (66.1s)
+  Progress: 100/164 (134.2s)
+  Progress: 150/164 (205.7s)
+  Accept length: 2.728
+  Acceptance rate: 57.6%
+  Throughput: 706.2 tok/s
+  Total time: 224.1s
+  Distribution: {'0': 12137, '1': 13150, '2': 11040, '3': 21636}
+
+============================================================
+Running: math500 (500 samples, BS=4)
+============================================================
+  Progress: 50/500 (88.2s)
+  Progress: 100/500 (170.1s)
+  Progress: 150/500 (271.5s)
+  Progress: 200/500 (363.2s)
+  Progress: 250/500 (468.1s)
+  Progress: 300/500 (567.4s)
+  Progress: 350/500 (668.5s)
+  Progress: 400/500 (765.6s)
+  Progress: 450/500 (859.2s)
+  Progress: 500/500 (960.3s)
+  Accept length: 2.886
+  Acceptance rate: 62.9%
+  Throughput: 746.7 tok/s
+  Total time: 960.3s
+  Distribution: {'0': 44767, '1': 48632, '2': 45033, '3': 109839}
+
+============================================================
+Running: aime (30 samples, BS=4)
+============================================================
+  Accept length: 2.448
+  Acceptance rate: 48.3%
+  Throughput: 601.5 tok/s
+  Total time: 203.8s
+  Distribution: {'0': 13957, '1': 13138, '2': 9552, '3': 13414}
+
+============================================================
+Running: bfcl_v3_simple (400 samples, BS=4)
+============================================================
+  Progress: 50/400 (17.2s)
+  Progress: 100/400 (36.6s)
+  Progress: 150/400 (52.7s)
+  Progress: 200/400 (71.6s)
+  Progress: 250/400 (88.9s)
+  Progress: 300/400 (105.3s)
+  Progress: 350/400 (122.8s)
+  Progress: 400/400 (142.4s)
+  Accept length: 2.714
+  Acceptance rate: 57.1%
+  Throughput: 604.4 tok/s
+  Total time: 142.4s
+  Distribution: {'0': 6856, '1': 7001, '2': 6011, '3': 11692}
+
+============================================================
+Running: bfcl_v3_multiple (200 samples, BS=4)
+============================================================
+  Progress: 50/200 (22.3s)
+  Progress: 100/200 (43.5s)
+  Progress: 150/200 (62.3s)
+  Progress: 200/200 (81.5s)
+  Accept length: 2.714
+  Acceptance rate: 57.1%
+  Throughput: 612.2 tok/s
+  Total time: 81.5s
+  Distribution: {'0': 3926, '1': 4098, '2': 3568, '3': 6718}
+
+============================================================
+Running: bfcl_v3_parallel (200 samples, BS=4)
+============================================================
+  Progress: 50/200 (27.4s)
+  Progress: 100/200 (59.3s)
+  Progress: 150/200 (89.9s)
+  Progress: 200/200 (119.5s)
+  Accept length: 2.790
+  Acceptance rate: 59.7%
+  Throughput: 669.4 tok/s
+  Total time: 119.5s
+  Distribution: {'0': 5658, '1': 6117, '2': 5392, '3': 11429}
+
+============================================================
+Running: bfcl_v3_parallel_multiple (200 samples, BS=4)
+============================================================
+  Progress: 50/200 (30.1s)
+  Progress: 100/200 (64.4s)
+  Progress: 150/200 (97.6s)
+  Progress: 200/200 (134.5s)
+  Accept length: 2.760
+  Acceptance rate: 58.7%
+  Throughput: 669.8 tok/s
+  Total time: 134.5s
+  Distribution: {'0': 6468, '1': 7194, '2': 6610, '3': 12304}
+
+============================================================
+Running: bfcl_v3_live_simple (258 samples, BS=4)
+============================================================
+  Progress: 50/258 (31.0s)
+  Progress: 100/258 (53.8s)
+  Progress: 150/258 (85.3s)
+  Progress: 200/258 (111.5s)
+  Progress: 250/258 (133.3s)
+  Accept length: 2.513
+  Acceptance rate: 50.4%
+  Throughput: 591.2 tok/s
+  Total time: 139.5s
+  Distribution: {'0': 8698, '1': 8174, '2': 6186, '3': 9654}
+
+============================================================
+Running: bfcl_v3_live_multiple (1030 samples, BS=4)
+============================================================
+  Progress: 50/1030 (30.3s)
+  Progress: 100/1030 (55.1s)
+  Progress: 150/1030 (80.2s)
+  Progress: 200/1030 (114.3s)
+  Progress: 250/1030 (138.2s)
+  Progress: 300/1030 (165.9s)
+  Progress: 350/1030 (188.4s)
+  Progress: 400/1030 (213.1s)
+  Progress: 450/1030 (245.2s)
+  Progress: 500/1030 (270.1s)
+  Progress: 550/1030 (298.5s)
+  Progress: 600/1030 (325.7s)
+  Progress: 650/1030 (360.9s)
+  Progress: 700/1030 (390.6s)
+  Progress: 750/1030 (415.0s)
+  Progress: 800/1030 (446.7s)
+  Progress: 850/1030 (476.4s)
+  Progress: 900/1030 (506.6s)
+  Progress: 950/1030 (537.1s)
+  Progress: 1000/1030 (569.7s)
+  Accept length: 2.533
+  Acceptance rate: 51.1%
+  Throughput: 599.8 tok/s
+  Total time: 591.0s
+  Distribution: {'0': 35800, '1': 35080, '2': 27167, '3': 41510}
+
+============================================================
+Running: bfcl_v3_live_parallel (16 samples, BS=4)
+============================================================
+  Accept length: 2.428
+  Acceptance rate: 47.6%
+  Throughput: 522.9 tok/s
+  Total time: 14.8s
+  Distribution: {'0': 919, '1': 824, '2': 583, '3': 847}
+
+============================================================
+Running: bfcl_v3_live_parallel_multiple (24 samples, BS=4)
+============================================================
+  Accept length: 2.539
+  Acceptance rate: 51.3%
+  Throughput: 574.5 tok/s
+  Total time: 17.8s
+  Distribution: {'0': 1034, '1': 1007, '2': 751, '3': 1225}
+
+Results saved to ./benchmark_results/phase2_atom_eagle3_step22000_20260605_053712.json
+
+======================================================================
+Benchmark                               n   Accept Len   Acc Rate    Tok/s
+======================================================================
+mtbench                                80        2.238      41.3%    555.1
+ceval                                 212        2.121      37.4%    543.7
+gsm8k                                 500        3.105      70.2%    750.5
+humaneval                             164        2.728      57.6%    706.2
+math500                               500        2.886      62.9%    746.7
+aime                                   30        2.448      48.3%    601.5
+bfcl_v3_simple                        400        2.714      57.1%    604.4
+bfcl_v3_multiple                      200        2.714      57.1%    612.2
+bfcl_v3_parallel                      200        2.790      59.7%    669.4
+bfcl_v3_parallel_multiple             200        2.760      58.7%    669.8
+bfcl_v3_live_simple                   258        2.513      50.4%    591.2
+bfcl_v3_live_multiple                1030        2.533      51.1%    599.8
+bfcl_v3_live_parallel                  16        2.428      47.6%    522.9
+bfcl_v3_live_parallel_multiple         24        2.539      51.3%    574.5
+======================================================================
+AVERAGE                                          2.608      53.6%

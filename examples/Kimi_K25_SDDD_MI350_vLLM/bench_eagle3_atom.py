@@ -11,6 +11,8 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 import requests
 
@@ -54,20 +56,20 @@ def load_mtbench(n):
 
 
 def load_ceval(n):
-    url = "https://huggingface.co/datasets/ceval/ceval-exam/resolve/main/test/computer_network_test.csv"
-    path = download_file(url, "ceval_cn_test.csv")
-    import csv
+    url = "https://huggingface.co/datasets/ceval/ceval-exam/resolve/main/computer_network/test-00000-of-00001.parquet"
+    path = download_file(url, "ceval_cn_test.parquet")
+    import pyarrow.parquet as pq
+    table = pq.read_table(path)
+    data = table.to_pydict()
     prompts = []
-    with open(path) as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            q = row.get("question", row.get("Question", ""))
-            choices = []
-            for c in ["A", "B", "C", "D"]:
-                if c in row:
-                    choices.append(f"{c}. {row[c]}")
-            prompt = q + "\n" + "\n".join(choices) + "\nAnswer:"
-            prompts.append([{"role": "user", "content": prompt}])
+    for i in range(len(data["question"])):
+        q = data["question"][i]
+        choices = []
+        for c in ["A", "B", "C", "D"]:
+            if c in data:
+                choices.append(f"{c}. {data[c][i]}")
+        prompt = q + "\n" + "\n".join(choices) + "\nAnswer:"
+        prompts.append([{"role": "user", "content": prompt}])
     if len(prompts) < n:
         prompts = prompts * (n // len(prompts) + 1)
     return prompts[:n]
@@ -101,13 +103,15 @@ def load_humaneval(n):
 
 
 def load_math500(n):
-    url = "https://huggingface.co/datasets/HuggingFaceH4/MATH-500/resolve/main/test/data-00000-of-00001.parquet"
-    path = download_file(url, "math500_test.parquet")
-    import pyarrow.parquet as pq
-    table = pq.read_table(path)
+    url = "https://huggingface.co/datasets/HuggingFaceH4/MATH-500/resolve/main/test.jsonl"
+    path = download_file(url, "math500_test.jsonl")
     prompts = []
-    for row in table.to_pydict()["problem"][:n]:
-        prompts.append([{"role": "user", "content": row}])
+    with open(path) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            q = json.loads(line)
+            prompts.append([{"role": "user", "content": q["problem"]}])
     return prompts[:n]
 
 
@@ -189,9 +193,9 @@ def get_atom_mtp_stats(base_url):
         return {}
 
 
-def run_benchmark(base_url, model_name, name, prompts, max_tokens=2048):
+def run_benchmark(base_url, model_name, name, prompts, max_tokens=2048, batch_size=1):
     print(f"\n{'='*60}")
-    print(f"Running: {name} ({len(prompts)} samples)")
+    print(f"Running: {name} ({len(prompts)} samples, BS={batch_size})")
     print(f"{'='*60}")
 
     stats_before = get_atom_mtp_stats(base_url)
@@ -200,20 +204,31 @@ def run_benchmark(base_url, model_name, name, prompts, max_tokens=2048):
 
     total_output_tokens = 0
     errors = 0
+    done_count = 0
+    lock = Lock()
     start = time.time()
 
-    for i, msgs in enumerate(prompts):
-        try:
-            result = query_server(base_url, model_name, msgs, max_tokens=max_tokens)
-            usage = result.get("usage", {})
-            total_output_tokens += usage.get("completion_tokens", 0)
-            if (i + 1) % 50 == 0:
-                elapsed = time.time() - start
-                print(f"  Progress: {i+1}/{len(prompts)} ({elapsed:.1f}s)")
-        except Exception as e:
-            errors += 1
-            if errors <= 3:
-                print(f"  ERROR on sample {i}: {e}")
+    def _worker(msgs):
+        return query_server(base_url, model_name, msgs, max_tokens=max_tokens)
+
+    with ThreadPoolExecutor(max_workers=batch_size) as pool:
+        futures = {pool.submit(_worker, msgs): i for i, msgs in enumerate(prompts)}
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                usage = result.get("usage", {})
+                with lock:
+                    total_output_tokens += usage.get("completion_tokens", 0)
+                    done_count += 1
+                    if done_count % 50 == 0:
+                        elapsed = time.time() - start
+                        print(f"  Progress: {done_count}/{len(prompts)} ({elapsed:.1f}s)")
+            except Exception as e:
+                with lock:
+                    errors += 1
+                    done_count += 1
+                    if errors <= 3:
+                        print(f"  ERROR on sample {futures[future]}: {e}")
 
     elapsed = time.time() - start
     if errors > 3:
@@ -226,7 +241,7 @@ def run_benchmark(base_url, model_name, name, prompts, max_tokens=2048):
     num_draft_tokens = draft_after - draft_before
     num_accepted = accepted_after - accepted_before
 
-    mtp_k = 4
+    mtp_k = 3
     num_steps = num_draft_tokens // mtp_k if mtp_k > 0 else 0
     accept_length = 1.0 + (num_accepted / num_steps) if num_steps > 0 else 1.0
     acceptance_rate = (num_accepted / num_draft_tokens * 100) if num_draft_tokens > 0 else 0
@@ -270,6 +285,10 @@ def main():
     parser.add_argument("--output-dir", default="./benchmark_results")
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--benchmarks", nargs="+", default=["all"])
+    parser.add_argument("--phase", default="phase2", help="Training phase (phase1 or phase2)")
+    parser.add_argument("--step", default="auto", help="Checkpoint step number")
+    parser.add_argument("--draft-model", default=None, help="Draft model path for metadata")
+    parser.add_argument("--batch-size", type=int, default=1, help="Concurrent requests")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -277,10 +296,16 @@ def main():
     model_name = get_model_name(args.base_url)
     print(f"Using model: {model_name}")
     print(f"Backend: ATOM")
+    print(f"Batch size: {args.batch_size}")
 
     initial_stats = get_atom_mtp_stats(args.base_url)
     if not initial_stats.get("enabled", False):
         print("WARNING: MTP/Eagle3 stats not enabled — acceptance metrics will be unavailable")
+
+    mtp_k = len(initial_stats.get("distribution", {})) - 1
+    if mtp_k <= 0:
+        mtp_k = 3
+    print(f"Detected num_speculative_tokens: {mtp_k}")
 
     benchmark_configs = {
         "mtbench": (load_mtbench, 80, 2048),
@@ -312,7 +337,7 @@ def main():
         loader, n, max_tok = benchmark_configs[name]
         try:
             prompts = loader(n)
-            result = run_benchmark(args.base_url, model_name, name, prompts, max_tokens=max_tok)
+            result = run_benchmark(args.base_url, model_name, name, prompts, max_tokens=max_tok, batch_size=args.batch_size)
             all_results[name] = result
         except Exception as e:
             print(f"ERROR running {name}: {e}")
@@ -320,14 +345,17 @@ def main():
             traceback.print_exc()
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    result_file = os.path.join(args.output_dir, f"phase1_atom_eagle3_step37000_{timestamp}.json")
+    step_str = args.step if args.step != "auto" else "latest"
+    result_file = os.path.join(args.output_dir, f"{args.phase}_atom_eagle3_step{step_str}_{timestamp}.json")
+    draft_model = args.draft_model or f"/dev/shm/Kimi_K25_eagle3_v2_{args.phase}_HF"
     with open(result_file, "w") as f:
         json.dump({
             "backend": "atom",
             "target_model": "/dev/shm/Kimi-K2.5-MXFP4",
-            "draft_model": "/dev/shm/Kimi_K25_eagle3_v2_phase1_HF",
-            "checkpoint_step": 37000,
-            "num_speculative_tokens": 4,
+            "draft_model": draft_model,
+            "phase": args.phase,
+            "checkpoint_step": step_str,
+            "num_speculative_tokens": mtp_k,
             "benchmarks": all_results,
         }, f, indent=2)
     print(f"\nResults saved to {result_file}")

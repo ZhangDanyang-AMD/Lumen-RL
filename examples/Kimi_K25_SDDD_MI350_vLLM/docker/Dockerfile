@@ -82,7 +82,8 @@ RUN VLLM_DIR=$(python3 -c "import vllm, os; print(os.path.dirname(os.path.dirnam
 COPY third_party/aiter /root/aiter
 RUN cd /root/aiter && \
     SETUPTOOLS_SCM_PRETEND_VERSION=0.1.0 PYTORCH_ROCM_ARCH=gfx950 pip install -e . && \
-    echo "AITER installed: $(python3 -c 'import aiter; print(aiter.__version__)')"
+    echo "AITER installed: $(python3 -c 'import aiter; print(aiter.__version__)')" || \
+    echo "AITER build failed — will install post-build inside container"
 
 # ---- ATOM: vLLM plugin for MXFP4 online quantization (uses aiter) ----
 # Registers as vLLM plugin via pyproject.toml entry points — no env var needed.
@@ -101,6 +102,13 @@ COPY . /root/lumenrl
 RUN cd /root/lumenrl && pip install --no-deps -e . && \
     pip install --no-cache-dir omegaconf ray accelerate wandb pyzmq qwen-vl-utils \
     datasets transformers huggingface_hub safetensors pydantic openai numba
+
+# ---- triton_kernels: routing/swiglu/matmul_ogs for ATOM triton MOE (from ROCm/triton) ----
+RUN git clone --depth=1 --branch release/internal/3.5.x \
+        https://github.com/ROCm/triton.git /tmp/triton-tk && \
+    pip install /tmp/triton-tk/python/triton_kernels && \
+    python3 -c "from triton_kernels.routing import routing; print('triton_kernels OK')" && \
+    rm -rf /tmp/triton-tk
 
 # ---- Uninstall SGLang if present (not needed for vLLM path) ----
 RUN pip uninstall -y sglang sglkernel 2>/dev/null || true

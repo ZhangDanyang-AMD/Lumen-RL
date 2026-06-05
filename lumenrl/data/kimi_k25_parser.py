@@ -4,6 +4,7 @@ Ported from TorchSpec's data processing pipeline to ensure identical
 tokenization and assistant-only loss masking for speculative distillation.
 """
 
+import json
 import re
 from typing import Dict, List, Tuple, Union
 
@@ -94,6 +95,33 @@ class KimiK25Parser:
             return content.replace(self.IMAGE_PLACEHOLDER, self.MEDIA_TOKEN + "\n")
         return content
 
+    def _flatten_multimodal_list(self, content: list) -> str:
+        text_parts = []
+        for item in content:
+            if item.get("type") == "text":
+                text_parts.append(item.get("text", ""))
+            elif item.get("type") in ("image", "image_url"):
+                text_parts.append(self.MEDIA_TOKEN + "\n")
+        return "".join(text_parts)
+
+    def _try_parse_multimodal_string(self, content: str):
+        """Parse stringified JSON multimodal content (e.g. llava_instruct).
+
+        Returns flattened text with MEDIA_TOKEN placeholders, or None if
+        the string is not parseable multimodal content.
+        """
+        if not content.startswith("["):
+            return None
+        try:
+            parsed = json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(parsed, list) or not parsed:
+            return None
+        if not isinstance(parsed[0], dict) or "type" not in parsed[0]:
+            return None
+        return self._flatten_multimodal_list(parsed)
+
     def _strip_thinking(self, content: str) -> str:
         return self.THINK_PATTERN.sub("", content)
 
@@ -128,17 +156,15 @@ class KimiK25Parser:
 
             if not isinstance(content, str):
                 if isinstance(content, list):
-                    text_parts = []
-                    for item in content:
-                        if item.get("type") == "text":
-                            text_parts.append(item.get("text", ""))
-                        elif item.get("type") in ("image", "image_url"):
-                            text_parts.append(self.MEDIA_TOKEN + "\n")
-                    content = "".join(text_parts)
+                    content = self._flatten_multimodal_list(content)
                 else:
                     content = str(content)
             else:
-                content = self._format_content(content, role)
+                parsed = self._try_parse_multimodal_string(content)
+                if parsed is not None:
+                    content = parsed
+                else:
+                    content = self._format_content(content, role)
 
             if role == "assistant" and idx != last_assistant_idx:
                 content = self._strip_thinking(content)

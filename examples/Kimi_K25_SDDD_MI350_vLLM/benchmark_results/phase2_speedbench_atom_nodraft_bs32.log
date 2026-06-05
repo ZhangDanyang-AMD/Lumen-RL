@@ -1,0 +1,146 @@
+Using model: /dev/shm/Kimi-K2.5-MXFP4
+Backend: ATOM
+Batch size: 32
+Thinking mode: DISABLED
+WARNING: MTP/Eagle3 stats not enabled — acceptance metrics will be unavailable
+Detected num_speculative_tokens: 3
+Loaded 672 resolved samples
+
+============================================================
+Running: coding (80 samples, BS=32)
+============================================================
+  Progress: 20/80 (130.8s)
+  Progress: 40/80 (157.5s)
+  Progress: 60/80 (173.5s)
+  Progress: 80/80 (212.4s)
+  Accept length: 1.000
+  Acceptance rate: 0.0%
+  Throughput: 767.5 tok/s
+  Total time: 212.4s
+
+============================================================
+Running: humanities (8 samples, BS=32)
+============================================================
+  Accept length: 1.000
+  Acceptance rate: 0.0%
+  Throughput: 590.6 tok/s
+  Total time: 49.7s
+
+============================================================
+Running: math (18 samples, BS=32)
+============================================================
+  Accept length: 1.000
+  Acceptance rate: 0.0%
+  Throughput: 457.7 tok/s
+  Total time: 48.5s
+
+============================================================
+Running: multilingual (80 samples, BS=32)
+============================================================
+  Progress: 20/80 (28.5s)
+  Progress: 40/80 (44.2s)
+  Progress: 60/80 (59.1s)
+  Progress: 80/80 (78.6s)
+  Accept length: 1.000
+  Acceptance rate: 0.0%
+  Throughput: 1579.7 tok/s
+  Total time: 78.6s
+
+============================================================
+Running: qa (80 samples, BS=32)
+============================================================
+  Progress: 20/80 (10.7s)
+  Progress: 40/80 (20.4s)
+  Progress: 60/80 (30.3s)
+  Progress: 80/80 (49.7s)
+  Accept length: 1.000
+  Acceptance rate: 0.0%
+  Throughput: 1324.7 tok/s
+  Total time: 49.7s
+
+============================================================
+Running: rag (80 samples, BS=32)
+============================================================
+  Progress: 20/80 (12.6s)
+  Progress: 40/80 (22.5s)
+  Progress: 60/80 (40.1s)
+  Progress: 80/80 (78.5s)
+  Accept length: 1.000
+  Acceptance rate: 0.0%
+  Throughput: 1101.3 tok/s
+  Total time: 78.5s
+
+============================================================
+Running: reasoning (80 samples, BS=32)
+============================================================
+  Progress: 20/80 (46.1s)
+  Progress: 40/80 (67.7s)
+  Progress: 60/80 (90.2s)
+  Progress: 80/80 (134.2s)
+  Accept length: 1.000
+  Acceptance rate: 0.0%
+  Throughput: 1422.0 tok/s
+  Total time: 134.2s
+
+============================================================
+Running: roleplay (80 samples, BS=32)
+============================================================
+  Progress: 20/80 (35.4s)
+  Progress: 40/80 (56.9s)
+  Progress: 60/80 (75.5s)
+  Progress: 80/80 (129.4s)
+  Accept length: 1.000
+  Acceptance rate: 0.0%
+  Throughput: 1278.7 tok/s
+  Total time: 129.4s
+
+============================================================
+Running: stem (6 samples, BS=32)
+============================================================
+  Accept length: 1.000
+  Acceptance rate: 0.0%
+  Throughput: 387.2 tok/s
+  Total time: 46.2s
+
+============================================================
+Running: summarization (80 samples, BS=32)
+============================================================
+  Progress: 20/80 (10.9s)
+  Progress: 40/80 (18.4s)
+  Progress: 60/80 (25.5s)
+  Progress: 80/80 (34.0s)
+  Accept length: 1.000
+  Acceptance rate: 0.0%
+  Throughput: 1484.9 tok/s
+  Total time: 34.0s
+
+============================================================
+Running: writing (80 samples, BS=32)
+============================================================
+  Progress: 20/80 (36.8s)
+  Progress: 40/80 (68.0s)
+  Progress: 60/80 (73.4s)
+  Progress: 80/80 (108.0s)
+  Accept length: 1.000
+  Acceptance rate: 0.0%
+  Throughput: 1505.0 tok/s
+  Total time: 108.0s
+
+Results saved to ./benchmark_results/phase2_speedbench_atom_eagle3_bs32_nothink_stepnodraft_20260605_061955.json
+
+======================================================================
+Category                 n   Accept Len   Acc Rate    Tok/s
+======================================================================
+coding                  80        1.000       0.0%    767.5
+humanities               8        1.000       0.0%    590.6
+math                    18        1.000       0.0%    457.7
+multilingual            80        1.000       0.0%   1579.7
+qa                      80        1.000       0.0%   1324.7
+rag                     80        1.000       0.0%   1101.3
+reasoning               80        1.000       0.0%   1422.0
+roleplay                80        1.000       0.0%   1278.7
+stem                     6        1.000       0.0%    387.2
+summarization           80        1.000       0.0%   1484.9
+writing                 80        1.000       0.0%   1505.0
+======================================================================
+MEAN                              1.000       0.0%
