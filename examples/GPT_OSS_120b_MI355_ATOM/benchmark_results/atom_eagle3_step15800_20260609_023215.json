@@ -1,0 +1,113 @@
+{
+  "backend": "atom",
+  "target_model": "/dev/shm/gpt-oss-120b",
+  "draft_model": "/home/danyzhan/gpt_oss_120b_eagle3_HF",
+  "checkpoint_step": "15800",
+  "spec_length": 3,
+  "benchmarks": {
+    "mtbench_coding": {
+      "benchmark": "mtbench_coding",
+      "num_samples": 10,
+      "accept_length": 1.0,
+      "acceptance_rate": 0,
+      "total_output_tokens": 16941,
+      "throughput_tps": 1234.4,
+      "latency_s": 13.7,
+      "num_draft_tokens": 0,
+      "num_accepted": 0,
+      "distribution": {},
+      "errors": 0
+    },
+    "mtbench_extraction": {
+      "benchmark": "mtbench_extraction",
+      "num_samples": 10,
+      "accept_length": 1.0,
+      "acceptance_rate": 0,
+      "total_output_tokens": 3847,
+      "throughput_tps": 606.5,
+      "latency_s": 6.3,
+      "num_draft_tokens": 0,
+      "num_accepted": 0,
+      "distribution": {},
+      "errors": 0
+    },
+    "mtbench_humanities": {
+      "benchmark": "mtbench_humanities",
+      "num_samples": 10,
+      "accept_length": 1.0,
+      "acceptance_rate": 0,
+      "total_output_tokens": 16250,
+      "throughput_tps": 1466.8,
+      "latency_s": 11.1,
+      "num_draft_tokens": 0,
+      "num_accepted": 0,
+      "distribution": {},
+      "errors": 0
+    },
+    "mtbench_math": {
+      "benchmark": "mtbench_math",
+      "num_samples": 10,
+      "accept_length": 1.0,
+      "acceptance_rate": 0,
+      "total_output_tokens": 3242,
+      "throughput_tps": 1101.3,
+      "latency_s": 2.9,
+      "num_draft_tokens": 0,
+      "num_accepted": 0,
+      "distribution": {},
+      "errors": 0
+    },
+    "mtbench_reasoning": {
+      "benchmark": "mtbench_reasoning",
+      "num_samples": 10,
+      "accept_length": 1.0,
+      "acceptance_rate": 0,
+      "total_output_tokens": 5188,
+      "throughput_tps": 678.2,
+      "latency_s": 7.6,
+      "num_draft_tokens": 0,
+      "num_accepted": 0,
+      "distribution": {},
+      "errors": 0
+    },
+    "mtbench_roleplay": {
+      "benchmark": "mtbench_roleplay",
+      "num_samples": 10,
+      "accept_length": 1.0,
+      "acceptance_rate": 0,
+      "total_output_tokens": 10054,
+      "throughput_tps": 1142.9,
+      "latency_s": 8.8,
+      "num_draft_tokens": 0,
+      "num_accepted": 0,
+      "distribution": {},
+      "errors": 0
+    },
+    "mtbench_stem": {
+      "benchmark": "mtbench_stem",
+      "num_samples": 10,
+      "accept_length": 1.0,
+      "acceptance_rate": 0,
+      "total_output_tokens": 13779,
+      "throughput_tps": 1255.6,
+      "latency_s": 11.0,
+      "num_draft_tokens": 0,
+      "num_accepted": 0,
+      "distribution": {},
+      "errors": 0
+    },
+    "mtbench_writing": {
+      "benchmark": "mtbench_writing",
+      "num_samples": 10,
+      "accept_length": 1.0,
+      "acceptance_rate": 0,
+      "total_output_tokens": 5531,
+      "throughput_tps": 648.0,
+      "latency_s": 8.5,
+      "num_draft_tokens": 0,
+      "num_accepted": 0,
+      "distribution": {},
+      "errors": 0
+    }
+  }
+}

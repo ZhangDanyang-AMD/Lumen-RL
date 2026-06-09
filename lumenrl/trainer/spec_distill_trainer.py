@@ -1056,6 +1056,7 @@ class SpecDistillTrainer:
                 teacher_path = self.config.algorithm.teacher.model_name
                 if os.path.isdir(teacher_path):
                     tokenizer_path = teacher_path
+            dataset_split = getattr(self.config.reward, "dataset_split", "train")
             self._preprocessed = load_and_preprocess_dataset(
                 dataset_path=dataset_path,
                 tokenizer_path=tokenizer_path,
@@ -1066,6 +1067,7 @@ class SpecDistillTrainer:
                 min_loss_tokens=ds_cfg.min_loss_tokens,
                 num_workers=ds_cfg.num_preprocess_workers,
                 cache_dir=ds_cfg.cache_dir,
+                dataset_split=dataset_split,
             )
             self._dataset = None
             logger.info(

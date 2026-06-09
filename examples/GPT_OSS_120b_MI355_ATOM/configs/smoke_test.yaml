@@ -1,0 +1,110 @@
+# GPT-OSS-120B SDDD Smoke Test — MI350 (vLLM 0.11 + Mooncake TCP)
+#
+# Full-pipeline 5-step validation using gpt-oss-120b as both teacher and policy.
+# Tests the complete vLLM + Mooncake TCP path on MI350 with synthetic prompts.
+#
+# GPU split (8x MI350 — 4+4 layout):
+#   GPUs 0-3: torchrun FSDP2 draft model training (BF16, LumenRL + aiter)
+#   GPUs 4-7: vLLM teacher inference (TP=4, native MXFP4 MoE)
+#
+# Usage:
+#   bash examples/GPT_OSS_120b_MI355_ATOM/run_gpt_oss_120b.sh --smoke-test
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1
+
+policy:
+  model_name: /dev/shm/gpt-oss-120b
+  training_backend: fsdp2
+  generation_backend: hf
+  max_total_sequence_length: 2048
+  train_global_batch_size: 8
+  train_micro_batch_size: 1
+  learning_rate: 1e-4
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  warmup_ratio: 0.0
+
+algorithm:
+  name: spec_distill
+  spec_distill:
+    draft_type: eagle3
+    loss_type: forward_kl
+    position_decay: 0.9
+    num_target_layers: 1
+    spec_length: 3
+    # Same teacher-layer indices as train.yaml so smoke test
+    # exercises the production data path.
+    aux_hidden_state_layer_ids: [1, 17, 32]
+  teacher:
+    model_name: /dev/shm/gpt-oss-120b
+    inference_backend: atom
+    tensor_parallel_size: 4
+    gpu_ids: [4, 5, 6, 7]
+    quantization: ""
+    transport: mooncake
+    atom:
+      enforce_eager: true
+      trust_remote_code: true
+      extra_args:
+        kv_cache_dtype: fp8
+        max_num_batched_tokens: 40000
+        max_model_len: 2048
+        gpu_memory_utilization: 0.9
+        level: 0
+  draft:
+    from_scratch: true
+    # ---- Aligned with nvidia/gpt-oss-120b-Eagle3-long-context/config.json ----
+    # Mirrors examples/.../configs/train.yaml so the smoke test
+    # builds the SAME draft architecture as the production run.
+    num_layers: 1                  # num_hidden_layers
+    num_heads: 64                  # num_attention_heads
+    num_kv_heads: 8                # num_key_value_heads  (GQA 8:1)
+    head_dim: 64                   # head_dim
+    ffn_dim: 17280                 # intermediate_size
+    rms_norm_eps: 1.0e-5           # rms_norm_eps
+    rope_theta: 500000.0           # rope_theta
+    # Llama3 RoPE scaling (nvidia config).
+    rope_scaling_type: llama3      # rope_scaling.rope_type
+    rope_scaling_factor: 8.0       # rope_scaling.factor
+    rope_original_max_pos: 8192    # rope_scaling.original_max_position_embeddings
+    rope_low_freq_factor: 1.0      # rope_scaling.low_freq_factor   (llama3-only)
+    rope_high_freq_factor: 4.0     # rope_scaling.high_freq_factor  (llama3-only)
+    # eagle_config knobs (HF nvidia layout).
+    use_aux_hidden_state: true
+    use_input_layernorm_in_first_layer: true
+    use_last_layernorm: true
+    use_mtp_layernorm: false
+    attention_bias: false
+    mlp_bias: false
+    dtype: bfloat16
+
+mooncake:
+  protocol: tcp
+  device_name: ""
+  global_segment_size: 16GB
+  local_buffer_size: 4GB
+
+quantization:
+  training:
+    fp8: null
+  rollout_correction:
+    enabled: false
+
+reward:
+  type: function
+  function: math_reward
+
+checkpointing:
+  checkpoint_dir: /dev/shm/checkpoints/gpt_oss_120b_smoke_test
+  save_steps: 9999
+  save_total_limit: 1
+  resume: false
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 5
+seed: 42

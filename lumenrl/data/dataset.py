@@ -25,14 +25,23 @@ logger = logging.getLogger(__name__)
 _worker_state = {}
 
 
-def _init_worker(tokenizer_path, max_length, last_turn_loss_only, min_loss_tokens):
+def _init_worker(tokenizer_path, max_length, last_turn_loss_only, min_loss_tokens, chat_template="kimi-k25"):
     """Per-worker initializer — loads tokenizer once."""
     from transformers import AutoTokenizer
 
     _worker_state["tokenizer"] = AutoTokenizer.from_pretrained(
         tokenizer_path, trust_remote_code=True
     )
-    _worker_state["parser"] = KimiK25Parser(_worker_state["tokenizer"])
+
+    if chat_template == "kimi-k25":
+        _worker_state["parser"] = KimiK25Parser(_worker_state["tokenizer"])
+    else:
+        from lumenrl.data.hf_generation_parser import HFGenerationParser
+        override = None if chat_template == "hf-generation" else chat_template
+        _worker_state["parser"] = HFGenerationParser(
+            _worker_state["tokenizer"], chat_template_override=override
+        )
+
     _worker_state["max_length"] = max_length
     _worker_state["last_turn_loss_only"] = last_turn_loss_only
     _worker_state["min_loss_tokens"] = min_loss_tokens
@@ -81,6 +90,7 @@ def load_and_preprocess_dataset(
     min_loss_tokens: int = 0,
     num_workers: int = 16,
     cache_dir: str = "/dev/shm/lumenrl_cache",
+    dataset_split: str = "train",
 ) -> list:
     """Load, tokenize, and cache a conversation dataset.
 
@@ -103,6 +113,7 @@ def load_and_preprocess_dataset(
         f"{os.path.basename(dataset_path)}-{dataset_path}{file_stat}"
         f"-{tokenizer_path}-{max_length}-{chat_template}"
         f"-ltlo={last_turn_loss_only}-mlt={min_loss_tokens}"
+        f"-split={dataset_split}"
     )
     cache_key = hashlib.md5(cache_params.encode()).hexdigest()
     cache_subdir = os.path.join(cache_dir, "tokenized_dataset")
@@ -124,30 +135,30 @@ def load_and_preprocess_dataset(
         elif dataset_path.endswith(".parquet"):
             ds = _load_dataset("parquet", data_files=dataset_path, split="train")
         else:
-            ds = _load_dataset(dataset_path, split="train")
+            ds = _load_dataset(dataset_path, split=dataset_split)
     elif os.path.isdir(dataset_path):
-        ds = _load_dataset(dataset_path, split="train")
+        ds = _load_dataset(dataset_path, split=dataset_split)
     else:
-        ds = _load_dataset(dataset_path, split="train")
+        ds = _load_dataset(dataset_path, split=dataset_split)
 
     ds = ds.shuffle(seed=seed)
 
     raw_conversations = []
     for sample in tqdm(ds, desc="Loading samples"):
-        convs = sample.get("conversations")
+        convs = sample.get("conversations") or sample.get("messages")
         if convs and isinstance(convs, list):
             raw_conversations.append(convs)
 
     logger.info("Loaded %d samples, tokenizing with %d workers...", len(raw_conversations), num_workers)
 
     if num_workers <= 1:
-        _init_worker(tokenizer_path, max_length, last_turn_loss_only, min_loss_tokens)
+        _init_worker(tokenizer_path, max_length, last_turn_loss_only, min_loss_tokens, chat_template)
         results = [_tokenize_single(c) for c in tqdm(raw_conversations, desc="Tokenizing")]
     else:
         with mp.Pool(
             num_workers,
             initializer=_init_worker,
-            initargs=(tokenizer_path, max_length, last_turn_loss_only, min_loss_tokens),
+            initargs=(tokenizer_path, max_length, last_turn_loss_only, min_loss_tokens, chat_template),
         ) as pool:
             results = list(
                 tqdm(

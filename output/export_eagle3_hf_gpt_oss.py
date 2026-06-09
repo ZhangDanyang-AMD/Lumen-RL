@@ -178,7 +178,13 @@ def main() -> None:
         "use_cache": True,
         "vocab_size": base_cfg["vocab_size"],            # 201088
         "draft_vocab_size": base_cfg["vocab_size"],      # no draft-vocab compression
-        "eagle_aux_hidden_state_layer_ids": [1, 17, 32],
+        "eagle_config": {
+            "eagle_aux_hidden_state_layer_ids": [1, 17, 32],
+            "use_aux_hidden_state": True,
+            "use_input_layernorm_in_first_layer": True,
+            "use_last_layernorm": True,
+            "use_mtp_layernorm": False,
+        },
         "dtype": args.draft_dtype,
     }
     with open(os.path.join(args.out, "config.json"), "w") as f:

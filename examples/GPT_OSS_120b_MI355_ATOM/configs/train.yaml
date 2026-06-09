@@ -1,0 +1,142 @@
+# GPT-OSS-120B Eagle3 Speculative Decoding Draft Distillation — MI350
+#
+# Single-pass training on combined UltraChat-200K + Magpie-300K prompts,
+# aligned with NVIDIA's gpt-oss-120b-Eagle3-long-context recipe.
+#
+# Key parameters aligned with Model-Optimizer eagle3.yaml defaults:
+#   eagle_ttt_steps: 3          → spec_length: 3
+#   eagle_loss_decay_factor: 0.9 → position_decay: 0.9
+#   learning_rate: 1e-4         → learning_rate: 1e-4
+#   warmup_steps: 1000          → warmup_ratio: 0.064  (1000/15719)
+#   lr_scheduler_type: linear   → lr_decay_style: linear
+#   num_train_epochs: 1         → num_training_steps: 15719
+#   answer_only_loss: false     → last_turn_loss_only: false
+#   eagle_self_logit_distillation: true → loss_type: forward_kl
+#
+# Data preparation (prompt-only, matching NVIDIA model card):
+#   python3 examples/GPT_OSS_120b_MI355_ATOM/make_dataset.py
+#   → /dev/shm/gpt_oss_120b_dataset/train.jsonl (~503K prompts)
+#
+# Disaggregated architecture (ATOM + Mooncake TCP):
+#   GPUs 0-3: FSDP2 Eagle3 draft model training (BF16, Lumen + aiter)
+#   GPUs 4-7: ATOM teacher inference (TP=4, MXFP4 MoE, aiter)
+#
+# Model: openai/gpt-oss-120b — 117B MoE (5.1B active),
+#        36 layers, hidden=2880, vocab=201088 (o200k_harmony tokenizer),
+#        128 experts, 4 experts per token.
+# Draft: Eagle3 — 1-layer Transformer, predicts from teacher hidden states.
+#        Config mirrors nvidia/gpt-oss-120b-Eagle3-long-context/config.json.
+#
+# Usage:
+#   bash examples/GPT_OSS_120b_MI355_ATOM/run_gpt_oss_120b.sh
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1
+
+policy:
+  model_name: /dev/shm/gpt-oss-120b
+  training_backend: fsdp2
+  generation_backend: hf
+  max_total_sequence_length: 2048
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  # Aligned with Model-Optimizer eagle3.yaml: learning_rate=1e-4
+  learning_rate: 1e-4
+  weight_decay: 0.0
+  max_grad_norm: 0.5
+  # warmup_steps=1000 / total_steps=15870 ≈ 0.063
+  warmup_ratio: 0.063
+  # Model-Optimizer default: lr_scheduler_type=linear
+  lr_decay_style: linear
+
+algorithm:
+  name: spec_distill
+  spec_distill:
+    draft_type: eagle3
+    loss_type: forward_kl
+    # eagle_loss_decay_factor=0.9 in Model-Optimizer
+    position_decay: 0.9
+    num_target_layers: 1
+    # eagle_ttt_steps=3 in Model-Optimizer
+    spec_length: 3
+    aux_hidden_state_layer_ids: [1, 17, 32]
+  teacher:
+    model_name: /dev/shm/gpt-oss-120b
+    inference_backend: atom
+    tensor_parallel_size: 4
+    gpu_ids: [4, 5, 6, 7]
+    quantization: ""
+    transport: mooncake
+    atom:
+      enforce_eager: true
+      trust_remote_code: true
+      extra_args:
+        kv_cache_dtype: fp8
+        max_num_batched_tokens: 40000
+        max_model_len: 2048
+        gpu_memory_utilization: 0.9
+        level: 0
+  draft:
+    from_scratch: true
+    # ---- Aligned with nvidia/gpt-oss-120b-Eagle3-long-context/config.json ----
+    num_layers: 1                  # num_hidden_layers
+    num_heads: 64                  # num_attention_heads
+    num_kv_heads: 8                # num_key_value_heads  (GQA 8:1)
+    head_dim: 64                   # head_dim
+    ffn_dim: 17280                 # intermediate_size
+    rms_norm_eps: 1.0e-5           # rms_norm_eps
+    rope_theta: 500000.0           # rope_theta
+    rope_scaling_type: llama3      # rope_scaling.rope_type
+    rope_scaling_factor: 8.0       # rope_scaling.factor
+    rope_original_max_pos: 8192    # rope_scaling.original_max_position_embeddings
+    rope_low_freq_factor: 1.0      # rope_scaling.low_freq_factor   (llama3-only)
+    rope_high_freq_factor: 4.0     # rope_scaling.high_freq_factor  (llama3-only)
+    use_aux_hidden_state: true
+    use_input_layernorm_in_first_layer: true
+    use_last_layernorm: true
+    use_mtp_layernorm: false
+    attention_bias: false
+    mlp_bias: false
+    dtype: bfloat16
+
+mooncake:
+  protocol: tcp
+  device_name: ""
+  global_segment_size: 16GB
+  local_buffer_size: 4GB
+
+quantization:
+  training:
+    fp8: null
+  rollout_correction:
+    enabled: false
+
+dataset:
+  chat_template: hf-generation
+  last_turn_loss_only: false
+  min_loss_tokens: 0
+  num_preprocess_workers: 16
+  cache_dir: /dev/shm/lumenrl_cache
+
+# Combined prompts from make_dataset.py (~503K prompts in a single JSONL).
+reward:
+  type: function
+  function: math_reward
+  dataset: /dev/shm/gpt_oss_120b_dataset/train.jsonl
+  dataset_split: train
+
+checkpointing:
+  checkpoint_dir: /dev/shm/checkpoints/gpt_oss_120b_eagle3
+  save_steps: 100
+  save_total_limit: 3
+  resume: true
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+# ~508K prompts / global_bs=32 = 15,870 steps/epoch.
+# Model-Optimizer default: num_train_epochs=1.
+num_training_steps: 15870
+seed: 42

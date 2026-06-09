@@ -1,0 +1,140 @@
+# GPT-OSS-120B Eagle3 Speculative Decoding Draft Distillation
+#
+# Disaggregated architecture (vLLM 0.11 + Mooncake TCP):
+#   GPUs 0-3: FSDP2 Eagle3 draft model training (BF16, LumenRL + aiter)
+#   GPUs 4-7: vLLM teacher inference (TP=4, native MXFP4 MoE)
+#   Mooncake TCP for hidden state transfer
+#
+# Model: openai/gpt-oss-120b -- 117B MoE (5.1B active),
+#        36 layers, hidden=2880, vocab=201088 (o200k_harmony tokenizer),
+#        128 experts, 4 experts per token, rope_theta=150000 + YaRN(factor=32).
+# Draft: Eagle3 -- 1-layer Transformer, predicts from teacher hidden states.
+#        Config below mirrors nvidia/gpt-oss-120b-Eagle3-long-context:
+#          hidden=2880 (from teacher), num_heads=64, num_kv_heads=8 (GQA 8:1),
+#          head_dim=64, ffn=17280, rms_norm_eps=1e-5,
+#          rope_theta=500000 + Llama3 RoPE scaling (factor=8, ctx 8192→131072),
+#          aux_hidden_state_layer_ids=[1, 17, 32].
+#
+# Usage:
+#   bash examples/GPT_OSS_120b_MI308_ATOM/run_gpt_oss_120b.sh
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1
+
+policy:
+  model_name: /dev/shm/gpt-oss-120b
+  training_backend: fsdp2
+  generation_backend: hf
+  # NVIDIA recipe trains at 8192 ctx; YaRN factor 8 still gives 131K inference.
+  # 20K wastes mooncake host buffer + draft activations for no benefit and
+  # bloats the first-step torch.compile.
+  max_total_sequence_length: 8192
+  # Global=32 over 4 ranks with micro=1 → num_accum=8, every rank gets 8 mb.
+  # The previous (B=8, micro=auto) collapsed to num_accum=1 so only rank 0
+  # did real work (see spec_distill_trainer.py:1791 round-robin slicing).
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  learning_rate: 5e-5
+  weight_decay: 0.0
+  max_grad_norm: 0.5
+  warmup_ratio: 0.015
+
+algorithm:
+  name: spec_distill
+  spec_distill:
+    draft_type: eagle3
+    loss_type: forward_kl
+    position_decay: 0.8
+    num_target_layers: 1
+    spec_length: 4
+    # Indices of teacher hidden layers (0-indexed) to concat into Eagle3 fc input.
+    # nvidia/gpt-oss-120b-Eagle3 uses [1, 17, 32]; if null trainer auto-picks
+    # [2, N//2, N-3] = [2, 18, 33] for the 36-layer teacher.
+    aux_hidden_state_layer_ids: [1, 17, 32]
+  teacher:
+    model_name: /dev/shm/gpt-oss-120b
+    inference_backend: vllm
+    tensor_parallel_size: 4
+    gpu_ids: [4, 5, 6, 7]
+    quantization: ""
+  draft:
+    from_scratch: true
+    # ---- Aligned with nvidia/gpt-oss-120b-Eagle3-long-context/config.json ----
+    num_layers: 1                  # num_hidden_layers
+    num_heads: 64                  # num_attention_heads
+    num_kv_heads: 8                # num_key_value_heads  (GQA 8:1)
+    head_dim: 64                   # head_dim
+    ffn_dim: 17280                 # intermediate_size
+    rms_norm_eps: 1.0e-5           # rms_norm_eps
+    rope_theta: 500000.0           # rope_theta
+    # Llama3 RoPE scaling (nvidia config).
+    rope_scaling_type: llama3      # rope_scaling.rope_type
+    rope_scaling_factor: 8.0       # rope_scaling.factor
+    rope_original_max_pos: 8192    # rope_scaling.original_max_position_embeddings
+    rope_low_freq_factor: 1.0      # rope_scaling.low_freq_factor   (llama3-only)
+    rope_high_freq_factor: 4.0     # rope_scaling.high_freq_factor  (llama3-only)
+    # eagle_config knobs (HF nvidia layout).
+    use_aux_hidden_state: true
+    use_input_layernorm_in_first_layer: true
+    use_last_layernorm: true
+    use_mtp_layernorm: false
+    attention_bias: false
+    mlp_bias: false
+    dtype: bfloat16
+
+mooncake:
+  protocol: tcp
+  device_name: ""
+  global_segment_size: 16GB
+  local_buffer_size: 4GB
+
+quantization:
+  training:
+    fp8: null
+  rollout_correction:
+    enabled: false
+
+dataset:
+  chat_template: hf-generation
+  last_turn_loss_only: false
+  min_loss_tokens: 0
+  num_preprocess_workers: 16
+  cache_dir: /dev/shm/lumenrl_cache
+
+# SDDD doesn't use rewards; the `reward` block carries the dataset pointer
+# only because the trainer reads `reward.dataset` / `reward.dataset_split` as
+# its prompt source. `type` / `function` are inert here.
+#
+# NVIDIA recipe trains on ultrachat_200k + Magpie-Llama-3.1-Pro-300K-Filtered
+# using ONLY prompts (responses synthesised by the teacher at training time).
+# spec_distill_trainer's loader already ignores the `messages` field on
+# ultrachat samples and reads only `s["prompt"]` (see
+# spec_distill_trainer.py:1089), so train_sft is effectively prompt-only here.
+# Adding Magpie would require multi-dataset concat support in _load_dataset.
+reward:
+  type: function
+  function: math_reward
+  dataset: HuggingFaceH4/ultrachat_200k
+  dataset_split: train_sft
+
+checkpointing:
+  checkpoint_dir: /dev/shm/checkpoints/gpt_oss_120b_eagle3_vllm
+  # 19488 steps / 100 = ~195 saves, capped to last 3 by save_total_limit (~9 GB).
+  # MI308 ROCm hits HSA aperture faults on long runs (~once per 500-700 steps
+  # with vLLM+aiter teacher); auto-restart wrapper resumes from the latest
+  # ckpt — so per-crash redo cost ≈ 0-100 steps.
+  save_steps: 100
+  save_total_limit: 3
+  resume: true
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+# ultrachat_200k train_sft = 207,865 effective samples (1 empty prompt dropped).
+# With global_bs=32: 1 epoch = ceil(207865/32) = 6,496 steps; 3 epochs = 19,488.
+# NVIDIA recipe is 3 epochs over ~503K prompts (ultrachat + Magpie); we use
+# ultrachat only, so this is the equivalent epoch budget on the smaller set.
+num_training_steps: 19488 
+seed: 42
