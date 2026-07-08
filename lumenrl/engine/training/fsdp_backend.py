@@ -137,27 +137,56 @@ def _apply_lumen_fp8(model: nn.Module, quant_config: dict[str, Any]) -> nn.Modul
     if not (fp8_enabled or fp8_pm or lumen_norm or fused_mlp or fused_rope or lumen_rollout):
         return model
 
+    # Alignment mode: delegate the exact FP8 model modification to verl's
+    # ``_maybe_apply_lumen`` (same LumenConfig.enable + lm_head BF16 restore),
+    # so the native actor's FP8 training path is byte-identical to verl's
+    # validated recipe. Enabled with LUMENRL_FP8_VIA_VERL=1 (needs verl importable
+    # + MODEL_NAME env set). Keeps the native verl-free default for BF16/rollout.
+    if os.environ.get("LUMENRL_FP8_VIA_VERL", "0") == "1":
+        try:
+            from verl.utils.fsdp_utils import _maybe_apply_lumen
+
+            _maybe_apply_lumen(model, forward_only=False)
+            logger.info("FP8 applied via verl _maybe_apply_lumen (aligned recipe).")
+            return model
+        except Exception as exc:
+            logger.error("verl _maybe_apply_lumen delegation failed: %s", exc, exc_info=True)
+            return model
+
     try:
         from lumen.config import LumenConfig
 
+        # Respect LUMEN_DISABLE_HF_ATTN_PATCH: the native Ray path runs a validated
+        # packed single-sequence pure-SDPA forward and installs its own packing
+        # attention wrapper. Letting Lumen re-patch SDPA on top corrupts the
+        # padded/packed attention layout (garbage logits -> exploding grad_norm /
+        # rollout_corr/kl). Keep FP8 *linear* + norm while leaving attention to
+        # the native forward unless the user explicitly opts into Lumen attention.
+        hf_attn_patch = os.environ.get("LUMEN_DISABLE_HF_ATTN_PATCH", "0") != "1"
         kwargs = dict(
             fp8_param_manager=bool(fp8_pm),
             lumen_norm=bool(lumen_norm),
             fused_mlp=bool(fused_mlp),
             fused_rope=bool(fused_rope),
-            hf_attn_patch=True,
+            hf_attn_patch=hf_attn_patch,
             fp8_weight_cache=quant_config.get("fp8_weight_cache", False),
         )
         if lumen_rollout:
             kwargs["rollout"] = lumen_rollout
         if fp8_enabled:
-            # FP8 mode: enable quantized linear and related features
+            # FP8 mode: enable quantized linear and related features. Attention
+            # FP8 knobs (fp8_attn/attn_quant_type/attn_backend) are forwarded so
+            # that ``LUMEN_FP8_ATTN=mha`` etc. take effect — matching verl's
+            # ``_maybe_apply_lumen`` (per_block_fp8 recipe uses mha/blockwise).
             kwargs.update(
                 scaling=os.environ.get("LUMEN_FP8_SCALING", "delayed"),
                 format=os.environ.get("LUMEN_FP8_FORMAT", "fp8_e4m3"),
                 block_size=int(os.environ.get("LUMEN_FP8_BLOCK_SIZE", "128")),
                 fp8_activation_store=os.environ.get("LUMEN_FP8_ACTIVATION_STORE", "0") == "1",
                 fp8_param_gather=os.environ.get("LUMEN_FP8_PARAM_GATHER", "0") == "1",
+                fp8_attn=os.environ.get("LUMEN_FP8_ATTN", "none"),
+                attn_quant_type=os.environ.get("LUMEN_FP8_QUANT_TYPE", "blockwise"),
+                attn_backend=os.environ.get("LUMEN_ATTN_BACKEND", "auto"),
             )
         else:
             # BF16 mode: no FP8 quantized linear (scaling="none"); ATOM/norm/attn
@@ -169,6 +198,25 @@ def _apply_lumen_fp8(model: nn.Module, quant_config: dict[str, Any]) -> nn.Modul
             )
         cfg = LumenConfig(**kwargs)
         _manager, model = cfg.enable(model)
+
+        # verl-aligned (fsdp_utils._maybe_apply_lumen): restore lm_head to BF16.
+        # The lm_head FP8 blockscale GEMM overflows INT32 on the huge vocab GEMM
+        # (vocab ~152k x hidden 4096) -> garbage logits -> exploding grad_norm /
+        # near-zero entropy / policy collapse. Keep every other Linear in FP8 but
+        # run lm_head in BF16. Only relevant when FP8 quantized linear is active.
+        if fp8_enabled:
+            import torch.nn as nn
+
+            restored = 0
+            for name, mod in model.named_modules():
+                if isinstance(mod, nn.Linear) and "lm_head" in name:
+                    if getattr(mod, "_quant_enabled", False):
+                        mod._quant_enabled = False
+                    mod.forward = nn.Linear.forward.__get__(mod, nn.Linear)
+                    restored += 1
+            if restored:
+                logger.info("Restored %d lm_head Linear(s) to BF16 (CK blockscale INT32 overflow)", restored)
+
         logger.info(
             "Lumen optimizations applied (fp8=%s, fp8pm=%s, norm=%s, fused_mlp=%s, "
             "fused_rope=%s, rollout=%s)",

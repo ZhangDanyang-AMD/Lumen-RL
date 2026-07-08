@@ -279,6 +279,14 @@ class FSDP2Engine(BaseEngine):
 
             output_lst.append(meta)
 
+            # verl-aligned (VERL_EMPTY_CACHE_PER_MICRO_BATCH): free the allocator's
+            # cached blocks after every micro-batch so variable-length sequences do
+            # not accumulate fragmentation across the ~batch/micro-bsz iterations.
+            # Default-on (matches verl); the small sync cost is worth the lower peak.
+            del loss, meta
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
         return self._postprocess_batch(output_lst)
 
     def _device_or_cuda(self) -> torch.device:

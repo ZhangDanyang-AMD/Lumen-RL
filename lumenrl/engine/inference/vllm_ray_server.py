@@ -74,6 +74,22 @@ class VLLMRayServer:
         self.engine = AsyncLLM.from_engine_args(args)
         logger.info("VLLMRayServer[%d]: AsyncLLM ready.", self.replica_rank)
 
+        # verl-aligned: mask OOV/padded logits at engine init (critical for online
+        # FP8 rollout where the requantized lm_head can otherwise emit garbage after
+        # a weight update). Best-effort; tokenizer length = true vocab size.
+        try:
+            from transformers import AutoTokenizer
+
+            vocab_size = len(AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True))
+            await self.engine.collective_rpc(
+                "monkey_patch_model", kwargs={"vocab_size": vocab_size}
+            )
+            logger.info("VLLMRayServer[%d]: monkey_patch_model applied (vocab=%d).",
+                        self.replica_rank, vocab_size)
+        except Exception as exc:  # pragma: no cover - best effort
+            logger.warning("VLLMRayServer[%d]: monkey_patch_model failed: %s",
+                           self.replica_rank, exc)
+
         if self.start_http:
             try:
                 await self._start_http()
