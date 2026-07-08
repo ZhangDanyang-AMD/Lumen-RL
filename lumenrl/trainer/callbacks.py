@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 from abc import ABC
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -42,7 +43,7 @@ class LoggingCallback(Callback):
         self.interval = max(1, int(interval))
 
     def on_step_end(self, trainer: "RLTrainer", step: int, metrics: dict[str, float]) -> None:
-        if step % self.interval != 0:
+        if (step + 1) % self.interval != 0:
             return
         if trainer._rank != 0:
             return
@@ -72,16 +73,25 @@ class CheckpointCallback(Callback):
         self._manager = CheckpointManager()
 
     def on_step_end(self, trainer: "RLTrainer", step: int, metrics: dict[str, float]) -> None:
-        if step % self.save_interval != 0:
+        # Checkpoint names follow verl's 1-based global_step convention. Never
+        # expose or persist the trainer's internal 0-based step as checkpoint_0.
+        global_step = int(step) + 1
+        if global_step <= 0:
+            return
+        if global_step % self.save_interval != 0:
+            return
+
+        if getattr(trainer, "_use_ray_controller", False) and getattr(trainer, "_actor_wg", None) is not None:
+            self._save_ray_controller_checkpoint(trainer, global_step, metrics)
             return
 
         rank = trainer._rank
         ckpt_dir = Path(self.checkpoint_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
-        path = ckpt_dir / f"checkpoint_{step}.pt"
+        path = ckpt_dir / f"checkpoint_{global_step}.pt"
 
         state: dict[str, Any] = {
-            "step": step,
+            "step": global_step,
             "metrics": metrics,
             "algo": trainer.config.algorithm.name,
         }
@@ -126,15 +136,32 @@ class CheckpointCallback(Callback):
             n_fp32 = len(state.get("fp32_params", []))
             logger.info(
                 "Saving checkpoint step=%d: %d model keys, %d fp32 params, opt=%s, sched_epoch=%s",
-                step, n_model, n_fp32,
+                global_step, n_model, n_fp32,
                 "yes" if "optimizer_state_dict" in state else "no",
                 state.get("scheduler_last_epoch", "N/A"),
             )
-            self._manager.save(state, path, step)
+            self._manager.save(state, path, global_step)
             self._prune_old_checkpoints(ckpt_dir)
 
         if trainer._is_distributed:
             torch.distributed.barrier()
+
+    def _save_ray_controller_checkpoint(self, trainer: "RLTrainer", global_step: int, metrics: dict[str, float]) -> None:
+        ckpt_root = Path(self.checkpoint_dir)
+        step_dir = ckpt_root / f"global_step_{global_step}"
+        actor_dir = step_dir / "actor"
+        actor_dir.mkdir(parents=True, exist_ok=True)
+        trainer._actor_wg.execute_all_sync("save_checkpoint", str(actor_dir), global_step=global_step)
+        meta = {
+            "step": global_step,
+            "metrics": metrics,
+            "algo": trainer.config.algorithm.name,
+            "format": "verl_ray_sharded",
+        }
+        self._manager.save(meta, step_dir / f"checkpoint_{global_step}.pt", global_step)
+        (ckpt_root / "latest_checkpointed_iteration.txt").write_text(str(global_step), encoding="utf-8")
+        logger.info("Saved Ray checkpoint to %s (global_step=%d)", step_dir, global_step)
+        self._prune_old_ray_checkpoints(ckpt_root)
 
     @staticmethod
     def _verify_checkpoint(path: Path, model, opt, step: int) -> None:
@@ -192,6 +219,21 @@ class CheckpointCallback(Callback):
             except OSError:
                 pass
 
+    def _prune_old_ray_checkpoints(self, ckpt_root: Path) -> None:
+        pattern = re.compile(r"global_step_(\d+)$")
+        ckpts: list[tuple[int, Path]] = []
+        for p in ckpt_root.iterdir():
+            if not p.is_dir():
+                continue
+            m = pattern.match(p.name)
+            if m:
+                ckpts.append((int(m.group(1)), p))
+        ckpts.sort(key=lambda x: x[0])
+        while len(ckpts) > self.save_total_limit:
+            _, old = ckpts.pop(0)
+            shutil.rmtree(old, ignore_errors=True)
+            logger.info("Pruned old Ray checkpoint: %s", old)
+
 
 class EvalCallback(Callback):
     """Run periodic validation using the trainer hook.
@@ -209,7 +251,7 @@ class EvalCallback(Callback):
         val_metrics = trainer.run_validation()
         if trainer._rank == 0:
             parts = [f"{k}={v:.6g}" for k, v in sorted(val_metrics.items())]
-            logger.info("eval step=%d %s", step, " ".join(parts))
+            logger.info("eval step=%d %s", step + 1, " ".join(parts))
         metrics.update(val_metrics)
 
 
@@ -245,7 +287,6 @@ class WandbCallback(Callback):
     # dedicated wandb `core/` panel group.
     _CORE_MAP = {
         "reward/mean": "core/reward_mean",
-        "reward/accuracy": "core/train_accuracy",
         "seq/mean_response_len": "core/response_len_mean",
         "response_length/mean": "core/response_len_mean",
         "timing/step_s": "core/step_time_s",
@@ -253,15 +294,12 @@ class WandbCallback(Callback):
         "timing/train_s": "core/train_time_s",
         "rollout_correction/kl": "core/kl",
         "rollout_corr/kl": "core/kl",
-        "ppo_kl": "core/ppo_kl",
         "mismatch_kl": "core/mismatch_kl",
         "entropy": "core/entropy",
-        "val-core/acc/mean@1": "core/val_accuracy",
-        "val/response_length_mean": "core/val_response_len",
         "grad_norm": "core/grad_norm",
         "loss": "core/loss",
+        "mem/actor_max_reserved_gb": "core/max_reserved_mem_gb",
     }
-    _EVAL_KEYS = ("val-core/acc/mean@1", "val/accuracy", "eval/accuracy", "val/acc", "val_accuracy")
 
     def on_step_end(self, trainer: "RLTrainer", step: int, metrics: dict[str, float]) -> None:
         if not self._enabled or self._wandb is None:
@@ -273,13 +311,8 @@ class WandbCallback(Callback):
         for src, dst in self._CORE_MAP.items():
             if src in metrics and dst not in payload:
                 payload[dst] = metrics[src]
-        for ek in self._EVAL_KEYS:
-            if ek in metrics:
-                payload["core/eval_score"] = metrics[ek]
-                break
         # 1-based step to align the wandb x-axis with verl (global_steps).
         wstep = step + 1
-        payload["core/step"] = wstep
         payload["train/global_step"] = wstep
         self._wandb.log(payload, step=wstep)
 

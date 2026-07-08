@@ -407,7 +407,7 @@ class RLTrainer:
         )
 
     def _rollout_with_ray_vllm(
-        self, prompts: list[str], num_generations: int,
+        self, prompts: list[str], num_generations: int, sampling_params: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, list[int], torch.Tensor | None]:
         """Token-in/token-out DP rollout across colocated vLLM replicas.
 
@@ -433,7 +433,7 @@ class RLTrainer:
             ids = self._tokenizer(p, add_special_tokens=False)["input_ids"]
             expanded.extend([list(ids)] * num_generations)
 
-        sp = self._ray_sampling_params(want_lp)
+        sp = dict(sampling_params) if sampling_params is not None else self._ray_sampling_params(want_lp)
         results = self._ray_vllm_engine.generate_tokens(expanded, sp)
 
         # Assemble left-padded prompt + response into a single tensor block.
@@ -499,6 +499,21 @@ class RLTrainer:
         if want_logprobs:
             sp["logprobs"] = 0
         return sp
+
+    def _ray_eval_sampling_params(self) -> dict[str, Any]:
+        """verl-aligned validation sampling params.
+
+        Matches verl rollout.val_kwargs defaults: do_sample=false,
+        temperature=0, top_p=1.0, top_k=-1, n=1.
+        """
+        max_resp = int(getattr(self.config.policy, "max_response_length", 0) or 0)
+        max_total = int(getattr(self.config.policy, "max_total_sequence_length", 0) or 0)
+        return {
+            "max_tokens": max_resp if max_resp > 0 else max(128, max_total // 2),
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": -1,
+        }
 
     def _sync_weights_ipc(self) -> None:
         """verl-aligned weight sync: wake weights -> ZMQ IPC -> wake KV cache.
@@ -613,6 +628,8 @@ class RLTrainer:
             self._rendezvous_ray_group(self._actor_wg)
             self._actor_wg.call_all("init_model")
 
+        self._try_resume_ray_checkpoint()
+
         if use_ref and self._ref_wg is None:
             ref_pool = self._ray_cluster.create_pool(
                 ref_pool_name,
@@ -660,13 +677,13 @@ class RLTrainer:
 
         if not self.callbacks:
             self.callbacks.append(LoggingCallback(interval=max(1, self.config.logger.log_interval)))
-        self._resume_step = 0
         logger.info(
-            "RLTrainer.setup (ray-controller) complete: algo=%s, model=%s, actor_workers=%d, ref=%s",
+            "RLTrainer.setup (ray-controller) complete: algo=%s, model=%s, actor_workers=%d, ref=%s, resume_step=%d",
             self.config.algorithm.name,
             model_name,
             actor_workers,
             self._ref_wg is not None,
+            self._resume_step,
         )
         self._init_profiler()
 
@@ -795,7 +812,9 @@ class RLTrainer:
 
         logger.info("[rank %d] Resuming from checkpoint: %s", self._rank, latest)
         payload = CheckpointManager.load(latest)
-        self._resume_step = int(payload.get("step", 0)) + 1
+        # Checkpoints store verl-style 1-based global steps. The internal
+        # training loop is 0-based, so global_step_N resumes at internal step N.
+        self._resume_step = int(payload.get("step", 0))
 
         # Unwrap nested structure: CheckpointManager.save wraps state in
         # {"step": N, "state_dict": {actual_data}}, so model_state_dict and
@@ -873,6 +892,56 @@ class RLTrainer:
         del payload
         gc.collect()
         logger.info("[rank %d] Resume complete. Will start from step %d.", self._rank, self._resume_step)
+
+    def _find_latest_ray_checkpoint(self) -> tuple[int, str] | None:
+        ckpt_dir = Path(self.config.checkpointing.checkpoint_dir)
+        if not ckpt_dir.is_dir():
+            return None
+        tracker = ckpt_dir / "latest_checkpointed_iteration.txt"
+        if tracker.exists():
+            try:
+                step = int(tracker.read_text(encoding="utf-8").strip())
+                actor_dir = ckpt_dir / f"global_step_{step}" / "actor"
+                if actor_dir.is_dir():
+                    return step, str(actor_dir)
+            except Exception:
+                pass
+        best: tuple[int, Path] | None = None
+        for child in ckpt_dir.iterdir():
+            if not child.is_dir() or not child.name.startswith("global_step_"):
+                continue
+            try:
+                step = int(child.name[len("global_step_"):])
+            except ValueError:
+                continue
+            actor_dir = child / "actor"
+            if actor_dir.is_dir() and (best is None or step > best[0]):
+                best = (step, actor_dir)
+        return (best[0], str(best[1])) if best else None
+
+    def _try_resume_ray_checkpoint(self) -> None:
+        if self._actor_wg is None:
+            return
+        if not getattr(self.config.checkpointing, "resume", True):
+            self._resume_step = 0
+            return
+        latest = self._find_latest_ray_checkpoint()
+        if latest is None:
+            self._resume_step = 0
+            logger.info("No Ray checkpoint found in %s; training from scratch.",
+                        self.config.checkpointing.checkpoint_dir)
+            return
+        step, actor_dir = latest
+        logger.info("Resuming Ray actor checkpoint from %s (step=%d).", actor_dir, step)
+        loaded = self._actor_wg.execute_all_sync("load_checkpoint", actor_dir)
+        # Checkpoint directories use verl-style 1-based global steps. The
+        # internal loop is 0-based, so global_step_N resumes at internal step N
+        # and the next emitted callback line is step=N+1.
+        self._resume_step = int(max([step] + [int(x) for x in loaded]))
+        logger.info(
+            "Ray resume complete. Next training log will be global_step=%d.",
+            self._resume_step + 1,
+        )
 
     def _get_batch_prompts(self, step: int) -> tuple[list[str], list[str]]:
         """Get a batch of (prompts, ground_truths) for the current step."""
@@ -3044,6 +3113,41 @@ class RLTrainer:
             merged[key] = float(sum(vals) / max(1, len(vals)))
         return merged
 
+    def _reset_actor_memory_stats(self) -> None:
+        if self._actor_wg is None:
+            return
+        try:
+            self._actor_wg.execute_all_sync("reset_memory_stats")
+        except Exception as exc:
+            logger.warning("reset actor memory stats failed: %s", exc)
+
+    def _collect_actor_memory_metrics(self) -> dict[str, float]:
+        if self._actor_wg is None:
+            return {}
+        try:
+            stats = self._actor_wg.execute_all_sync("get_memory_stats")
+        except Exception as exc:
+            logger.warning("collect actor memory stats failed: %s", exc)
+            return {}
+        if not stats:
+            return {}
+        max_reserved = max(float(s.get("max_reserved_bytes", 0.0)) for s in stats)
+        max_allocated = max(float(s.get("max_allocated_bytes", 0.0)) for s in stats)
+        cur_reserved = max(float(s.get("reserved_bytes", 0.0)) for s in stats)
+        cur_allocated = max(float(s.get("allocated_bytes", 0.0)) for s in stats)
+        gb = 1024.0 ** 3
+        return {
+            "mem/actor_max_reserved_gb": max_reserved / gb,
+            "mem/actor_max_allocated_gb": max_allocated / gb,
+            "mem/actor_reserved_gb": cur_reserved / gb,
+            "mem/actor_allocated_gb": cur_allocated / gb,
+        }
+
+    @staticmethod
+    def _display_step(step: int) -> int:
+        """verl-style 1-based global step for logs/checkpoints/W&B."""
+        return int(step) + 1
+
     def _train_with_ray_controller(self) -> None:
         """Ray worker orchestration path (no torch.distributed collectives)."""
         if self._algorithm is None or self._actor_wg is None:
@@ -3058,6 +3162,11 @@ class RLTrainer:
         total_steps = int(self.config.num_training_steps)
         start_step = self._resume_step
         use_ray_vllm = bool(getattr(self, "_ray_use_vllm", False) and self._ray_vllm_engine is not None)
+        if start_step > 0:
+            logger.info("Skipping global steps 1..%d (resuming from checkpoint).", start_step)
+            if use_ray_vllm:
+                logger.info("Resume: syncing restored actor weights to Ray vLLM before first rollout.")
+                self._sync_weights_ipc()
 
         for step in range(start_step, total_steps):
             step_start = time.time()
@@ -3065,6 +3174,7 @@ class RLTrainer:
             self._maybe_start_profile(step)
             for cb in self.callbacks:
                 cb.on_step_begin(self, step)
+            self._reset_actor_memory_stats()
 
             # ---- rollout ----
             gen_t0 = time.time()
@@ -3207,6 +3317,7 @@ class RLTrainer:
             sync_time = time.time() - t_sync
             if sync_time > 1.0:
                 metrics["timing/weight_sync_s"] = sync_time
+            metrics.update(self._collect_actor_memory_metrics())
 
             for cb in self.callbacks:
                 cb.on_step_end(self, step, metrics)
@@ -3234,19 +3345,20 @@ class RLTrainer:
         Reports verl-style ``val-core/acc/mean@1`` (fraction correct) plus mean
         reward and response length. Generation is colocated (rank 0 generates via
         the inference engine, broadcast to all ranks) so every rank computes
-        identical metrics. Capped at ``eval.num_samples`` to keep frequent eval
-        cheap.
+        identical metrics. ``eval.num_samples <= 0`` evaluates the full val set,
+        matching verl's val dataloader behavior.
         """
         if self._val_dataset is None or len(self._val_dataset) == 0:
             return {}
 
         from lumenrl.rewards.math_reward import compute_math_reward
 
-        val_bs = max(1, int(getattr(self.config, "val_batch_size", 16)))
         cap = int(getattr(self.config.eval, "num_samples", 0) or 0)
         num_samples = len(self._val_dataset)
         if cap > 0:
             num_samples = min(num_samples, cap)
+        val_bs_cfg = int(getattr(self.config, "val_batch_size", 16) or 0)
+        val_bs = num_samples if val_bs_cfg <= 0 else max(1, val_bs_cfg)
 
         all_scores: list[float] = []
         all_acc: list[float] = []
@@ -3254,7 +3366,14 @@ class RLTrainer:
         all_responses: list[str] = []
 
         if self._rank == 0:
-            logger.info("[eval] step=%d: evaluating %d val samples (greedy)", self.global_step + 1, num_samples)
+            logger.info(
+                "[eval] step=%d: evaluating %d val samples (greedy, batch_size=%d)",
+                self.global_step + 1, num_samples, val_bs,
+            )
+
+        size_divisor = 1
+        if getattr(self, "_ray_vllm_engine", None) is not None and self._actor_wg is not None:
+            size_divisor = max(1, int(self._actor_wg.num_workers))
 
         for start in range(0, num_samples, val_bs):
             end = min(start + val_bs, num_samples)
@@ -3264,13 +3383,26 @@ class RLTrainer:
                 p, gt = self._extract_prompt_gt(s)
                 prompts.append(p)
                 ground_truths.append(gt)
+            real_batch = len(prompts)
+
+            # verl pads validation batches to rollout DP size and unpads after
+            # generation. Mirror that behavior for Ray vLLM routing.
+            pad_size = 0
+            if size_divisor > 1 and real_batch > 0:
+                remainder = real_batch % size_divisor
+                if remainder:
+                    pad_size = size_divisor - remainder
+                    for i in range(pad_size):
+                        src = i % real_batch
+                        prompts.append(prompts[src])
+                        ground_truths.append(ground_truths[src])
 
             # Eval generation (colocated). Ray-controller path generates via the
             # colocated vLLM replicas (self._actor_model is None on the driver, so
             # the torchrun _rollout_phase fallback would crash).
             if getattr(self, "_ray_vllm_engine", None) is not None:
                 sequences, seq_mask, prompt_lengths, _ = self._rollout_with_ray_vllm(
-                    prompts, num_generations=1,
+                    prompts, num_generations=1, sampling_params=self._ray_eval_sampling_params(),
                 )
             elif self._use_vllm and self._atom_engine is not None:
                 sequences, seq_mask, prompt_lengths, _ = self._rollout_with_vllm(
@@ -3285,6 +3417,11 @@ class RLTrainer:
             # Decode + score (identical on every rank — sequences are broadcast).
             seq_cpu = sequences.cpu()
             responses = []
+            keep = max(0, seq_cpu.shape[0] - pad_size)
+            seq_cpu = seq_cpu[:keep]
+            prompt_lengths = prompt_lengths[:keep]
+            seq_mask = seq_mask[:keep]
+            ground_truths = ground_truths[:keep]
             for i in range(seq_cpu.shape[0]):
                 plen = int(prompt_lengths[i]) if i < len(prompt_lengths) else 0
                 responses.append(self._tokenizer.decode(seq_cpu[i, plen:], skip_special_tokens=True))

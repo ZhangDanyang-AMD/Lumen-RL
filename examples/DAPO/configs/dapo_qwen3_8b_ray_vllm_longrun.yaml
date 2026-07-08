@@ -114,10 +114,10 @@ reward:
 # verl uses val_kwargs.temperature=0.6 — diagnostic only, does not affect training.
 val_dataset: /home/shengnxu/xysheng/data/data_cached/qwen3-8b-maxprompt1024/aime-2024.filtered.parquet
 val_steps: 10                           # in-loop validation every 10 steps (Ray-aware)
-val_batch_size: 16
+val_batch_size: 0                        # 0 = full validation set in one dataloader batch, matching verl
 eval:
   enabled: false                        # disable EvalCallback (it fires at step 0);
-  num_samples: 30                       # run_validation still reads num_samples
+  num_samples: 0                        # 0 = full validation set, matching verl
 
 checkpointing:
   checkpoint_dir: /home/shengnxu/xysheng/data/ckpts/lumenrl-dapo/longrun-ray-vllm-8b

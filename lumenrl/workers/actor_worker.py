@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -440,6 +441,29 @@ class LumenActorWorker(BaseWorker):
         metrics["lr"] = self._engine.lr_scheduler_step()
         return metrics
 
+    def reset_memory_stats(self) -> bool:
+        """Reset per-step CUDA/HIP peak memory counters for this actor rank."""
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.empty_cache()
+        return True
+
+    def get_memory_stats(self) -> dict[str, float]:
+        """Return current-step peak memory counters for this actor rank."""
+        if not torch.cuda.is_available():
+            return {
+                "max_reserved_bytes": 0.0,
+                "max_allocated_bytes": 0.0,
+                "reserved_bytes": 0.0,
+                "allocated_bytes": 0.0,
+            }
+        return {
+            "max_reserved_bytes": float(torch.cuda.max_memory_reserved()),
+            "max_allocated_bytes": float(torch.cuda.max_memory_allocated()),
+            "reserved_bytes": float(torch.cuda.memory_reserved()),
+            "allocated_bytes": float(torch.cuda.memory_allocated()),
+        }
+
     def _policy_loss_fn(self, model_output, data):
         """DAPO/GRPO surrogate on ONE micro, using the micro's own tensors.
 
@@ -551,6 +575,78 @@ class LumenActorWorker(BaseWorker):
             full = param.full_tensor() if isinstance(param, DTensor) else param
             out[name] = full.detach().cpu()
         return out
+
+    def save_checkpoint(self, local_path: str, global_step: int = 0) -> bool:
+        """Save this actor rank's sharded training state.
+
+        This mirrors verl's Ray worker checkpoint contract: every actor writes
+        its own model/optimizer/scheduler shard under the same step directory.
+        """
+        if self._engine is None:
+            raise RuntimeError("init_model() must be called before save_checkpoint().")
+        path = Path(local_path)
+        path.mkdir(parents=True, exist_ok=True)
+        rank = int(self.rank)
+        world = int(self.world_size)
+        module = getattr(self._engine, "module", None)
+        optimizer = getattr(self._engine, "optimizer", None)
+        scheduler = getattr(self._engine, "lr_scheduler", None)
+        if module is None:
+            raise RuntimeError("Engine has no module to checkpoint.")
+
+        torch.save(module.state_dict(), path / f"model_world_size_{world}_rank_{rank}.pt")
+        if optimizer is not None:
+            torch.save(optimizer.state_dict(), path / f"optim_world_size_{world}_rank_{rank}.pt")
+        extra = {
+            "global_step": int(global_step),
+            "lr_scheduler": scheduler.state_dict() if scheduler is not None else None,
+            "rng": {
+                "cpu": torch.get_rng_state(),
+                "cuda": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+            },
+        }
+        torch.save(extra, path / f"extra_state_world_size_{world}_rank_{rank}.pt")
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        return True
+
+    def load_checkpoint(self, local_path: str) -> int:
+        """Load this actor rank's sharded training state and return global_step."""
+        if self._engine is None:
+            raise RuntimeError("init_model() must be called before load_checkpoint().")
+        path = Path(local_path)
+        rank = int(self.rank)
+        world = int(self.world_size)
+        module = getattr(self._engine, "module", None)
+        optimizer = getattr(self._engine, "optimizer", None)
+        scheduler = getattr(self._engine, "lr_scheduler", None)
+        if module is None:
+            raise RuntimeError("Engine has no module to restore.")
+
+        model_path = path / f"model_world_size_{world}_rank_{rank}.pt"
+        optim_path = path / f"optim_world_size_{world}_rank_{rank}.pt"
+        extra_path = path / f"extra_state_world_size_{world}_rank_{rank}.pt"
+        if not model_path.exists():
+            raise FileNotFoundError(f"Missing actor checkpoint shard: {model_path}")
+
+        module.load_state_dict(torch.load(model_path, map_location="cpu", weights_only=False))
+        if optimizer is not None and optim_path.exists():
+            optimizer.load_state_dict(torch.load(optim_path, map_location="cpu", weights_only=False))
+        global_step = 0
+        if extra_path.exists():
+            extra = torch.load(extra_path, map_location="cpu", weights_only=False)
+            global_step = int(extra.get("global_step", 0))
+            sched_state = extra.get("lr_scheduler")
+            if scheduler is not None and sched_state is not None:
+                scheduler.load_state_dict(sched_state)
+            rng = extra.get("rng") or {}
+            if rng.get("cpu") is not None:
+                torch.set_rng_state(rng["cpu"])
+            if torch.cuda.is_available() and rng.get("cuda") is not None:
+                torch.cuda.set_rng_state(rng["cuda"])
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        return global_step
 
     def update_weights_ipc_send(
         self, bucket_size_mb: int = 512, use_shm: bool = False,
