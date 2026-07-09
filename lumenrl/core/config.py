@@ -166,6 +166,15 @@ class AtomConfig:
     max_model_len: Optional[int] = None
     gpu_memory_utilization: float = 0.6
     gpu_id: Optional[int] = None
+    # Ray-controller online rollout path. The common rollout knobs (sampling,
+    # sequence limits, IPC bucket size, sleep) are still read from vllm_cfg so the
+    # DAPO vLLM/ATOM configs stay comparable.
+    transport: str = "fifo"
+    data_parallel_size: int = 1
+    expert_parallel_size: int = 1
+    enable_prefix_caching: bool = False
+    online_quant_config: Optional[dict] = None
+    engine_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

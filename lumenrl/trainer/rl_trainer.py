@@ -104,6 +104,7 @@ class RLTrainer:
         self._prompt_perm: Any = None
         # verl-aligned Ray rollout (ray_http transport); populated in setup.
         self._ray_use_vllm: bool = False
+        self._ray_use_atom: bool = False
         self._ray_vllm_engine: Any = None
         self._ray_rollout_mgr: Any = None
         self._is_distributed: bool = torch.distributed.is_initialized()
@@ -406,6 +407,62 @@ class RLTrainer:
             mgr.num_replicas,
         )
 
+    def _setup_ray_atom_rollout(self, model_name: str, vcfg: Any, atom_cfg: Any) -> None:
+        """Build colocated ATOM rollout replicas + client on the Ray controller path."""
+        from lumenrl.engine.inference.atom_ray_server import ATOMReplicaManager
+        from lumenrl.engine.inference.vllm_http_engine import VLLMHttpEngine
+
+        seed = self.config.seed if getattr(vcfg, "seed", None) is None else vcfg.seed
+        max_model_len = getattr(atom_cfg, "max_model_len", None) or getattr(vcfg, "max_model_len", None)
+        quant_cfg = getattr(atom_cfg, "online_quant_config", None)
+        vllm_quant = str(getattr(vcfg, "quantization", "") or "")
+        if quant_cfg is None and vllm_quant in {"fp8_per_block", "per_block_fp8"}:
+            quant_cfg = {"global_quant_config": "per_block_fp8"}
+
+        engine_kwargs: dict[str, Any] = dict(
+            model=model_name,
+            tensor_parallel_size=int(getattr(atom_cfg, "tensor_parallel_size", 1) or 1),
+            data_parallel_size=int(getattr(atom_cfg, "data_parallel_size", 1) or 1),
+            enable_expert_parallel=int(getattr(atom_cfg, "expert_parallel_size", 1) or 1) > 1,
+            gpu_memory_utilization=float(getattr(atom_cfg, "gpu_memory_utilization", None) or vcfg.gpu_memory_utilization),
+            max_num_batched_tokens=int(vcfg.max_num_batched_tokens),
+            max_num_seqs=int(vcfg.max_num_seqs),
+            enforce_eager=bool(vcfg.enforce_eager),
+            trust_remote_code=bool(vcfg.trust_remote_code),
+            enable_chunked_prefill=bool(vcfg.enable_chunked_prefill),
+            enable_prefix_caching=bool(getattr(atom_cfg, "enable_prefix_caching", False)),
+        )
+        kv_cache_dtype = str(getattr(atom_cfg, "kv_cache_dtype", "auto") or "auto")
+        if kv_cache_dtype != "auto":
+            engine_kwargs["kv_cache_dtype"] = kv_cache_dtype
+        if max_model_len:
+            engine_kwargs["max_model_len"] = int(max_model_len)
+        if quant_cfg:
+            engine_kwargs["online_quant_config"] = quant_cfg
+
+        extra = getattr(atom_cfg, "engine_kwargs", {}) or {}
+        if extra:
+            engine_kwargs.update(dict(extra))
+
+        mgr = ATOMReplicaManager(
+            self._actor_wg,
+            model_name,
+            engine_kwargs,
+            max_concurrency=max(8, int(vcfg.max_num_seqs)),
+            base_seed=(int(seed) if seed is not None else None),
+        )
+        mgr.create()
+        self._ray_rollout_mgr = mgr
+        self._ray_vllm_engine = VLLMHttpEngine(
+            mgr, sleep_level=int(vcfg.sleep_level), enable_sleep=bool(vcfg.enable_sleep_mode),
+        )
+        logger.info(
+            "Ray ATOM rollout ready: %d colocated replicas (TP=%d, online_quant=%s, ZMQ IPC weight sync).",
+            mgr.num_replicas,
+            int(engine_kwargs["tensor_parallel_size"]),
+            engine_kwargs.get("online_quant_config"),
+        )
+
     def _rollout_with_ray_vllm(
         self, prompts: list[str], num_generations: int, sampling_params: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, list[int], torch.Tensor | None]:
@@ -658,15 +715,19 @@ class RLTrainer:
         self._tokenizer.padding_side = "left"
 
         vcfg = self.config.policy.generation.vllm_cfg
+        atom_cfg = self.config.policy.generation.atom_cfg
         self._ray_use_vllm = self._use_vllm and str(getattr(vcfg, "transport", "fifo")) == "ray_http"
+        self._ray_use_atom = self._gen_backend == "atom" and str(getattr(atom_cfg, "transport", "fifo")) == "ray_http"
         self._ray_rollout_mgr = None
         self._ray_vllm_engine = None
         if self._ray_use_vllm:
             self._setup_ray_vllm_rollout(model_name, vcfg)
             self._atom_engine = None
+        elif self._ray_use_atom:
+            self._setup_ray_atom_rollout(model_name, vcfg, atom_cfg)
+            self._atom_engine = None
         else:
             from lumenrl.engine.inference.atom_engine import AtomEngine
-            atom_cfg = self.config.policy.generation.atom_cfg
             self._atom_engine = AtomEngine(config=atom_cfg, model_name=model_name)
         self._load_dataset()
 
@@ -1630,7 +1691,10 @@ class RLTrainer:
             gen_prompts = train_prompts
 
         def _one_round(prompts: list[str]):
-            if getattr(self, "_ray_use_vllm", False) and self._ray_vllm_engine is not None:
+            if (
+                (getattr(self, "_ray_use_vllm", False) or getattr(self, "_ray_use_atom", False))
+                and self._ray_vllm_engine is not None
+            ):
                 seqs, mask, plen, lp = self._rollout_with_ray_vllm(prompts, g)
             elif self._use_vllm:
                 seqs, mask, plen, lp = self._rollout_with_vllm(prompts, g)
@@ -1662,7 +1726,10 @@ class RLTrainer:
         kept_prompts = 0
         rounds = 0
         max_rounds = fg.max_num_gen_batches if fg.max_num_gen_batches > 0 else 10_000
-        want_lp = self._use_vllm and self.config.policy.generation.vllm_cfg.calculate_log_probs
+        want_lp = (
+            (self._use_vllm or getattr(self, "_ray_use_atom", False))
+            and self.config.policy.generation.vllm_cfg.calculate_log_probs
+        )
 
         while kept_prompts < train_prompts and rounds < max_rounds:
             rounds += 1
@@ -3153,7 +3220,7 @@ class RLTrainer:
         if self._algorithm is None or self._actor_wg is None:
             raise RuntimeError("Call setup() before train().")
         if self._atom_engine is None and self._ray_vllm_engine is None:
-            raise RuntimeError("Ray controller path requires an ATOM or ray_http vLLM rollout engine.")
+            raise RuntimeError("Ray controller path requires an ATOM or ray_http rollout engine.")
 
         for cb in self.callbacks:
             cb.on_train_begin(self)
@@ -3161,11 +3228,14 @@ class RLTrainer:
         num_generations = _algo_num_generations(self.config)
         total_steps = int(self.config.num_training_steps)
         start_step = self._resume_step
-        use_ray_vllm = bool(getattr(self, "_ray_use_vllm", False) and self._ray_vllm_engine is not None)
+        use_ray_rollout = bool(
+            (getattr(self, "_ray_use_vllm", False) or getattr(self, "_ray_use_atom", False))
+            and self._ray_vllm_engine is not None
+        )
         if start_step > 0:
             logger.info("Skipping global steps 1..%d (resuming from checkpoint).", start_step)
-            if use_ray_vllm:
-                logger.info("Resume: syncing restored actor weights to Ray vLLM before first rollout.")
+            if use_ray_rollout:
+                logger.info("Resume: syncing restored actor weights to Ray rollout before first rollout.")
                 self._sync_weights_ipc()
 
         for step in range(start_step, total_steps):
@@ -3179,7 +3249,7 @@ class RLTrainer:
             # ---- rollout ----
             gen_t0 = time.time()
             rollout_lp = None
-            if use_ray_vllm:
+            if use_ray_rollout:
                 # verl-aligned online rollout across colocated replicas, with
                 # DAPO filter_groups dynamic sampling handled in the collector.
                 (sequences, seq_mask, prompt_lengths, rewards, responses,
@@ -3242,7 +3312,7 @@ class RLTrainer:
             batch = self._algorithm.compute_advantages(batch)
             batch = apply_rollout_correction(batch, self.config)
 
-            if use_ray_vllm:
+            if use_ray_rollout:
                 # verl-aligned loss normalization: GLOBAL response-token count
                 # (full batch) + dp_size so each actor's shard normalizes by the
                 # global denominator and FSDP grad averaging yields token-mean.
@@ -3310,7 +3380,7 @@ class RLTrainer:
 
             # ---- weight sync to rollout engine ----
             t_sync = time.time()
-            if use_ray_vllm:
+            if use_ray_rollout:
                 self._sync_weights_ipc()   # wake weights -> ZMQ IPC -> wake KV
             else:
                 self._sync_rollout_weights()
