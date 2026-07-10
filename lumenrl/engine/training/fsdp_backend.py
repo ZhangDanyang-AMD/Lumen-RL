@@ -187,6 +187,10 @@ def _apply_lumen_fp8(model: nn.Module, quant_config: dict[str, Any]) -> nn.Modul
                 fp8_attn=os.environ.get("LUMEN_FP8_ATTN", "none"),
                 attn_quant_type=os.environ.get("LUMEN_FP8_QUANT_TYPE", "blockwise"),
                 attn_backend=os.environ.get("LUMEN_ATTN_BACKEND", "auto"),
+                fp8_wgrad=os.environ.get(
+                    "LUMEN_FP8_WGRAD",
+                    os.environ.get("FP8_WGRAD", "1"),
+                ) != "0",
             )
         else:
             # BF16 mode: no FP8 quantized linear (scaling="none"); ATOM/norm/attn

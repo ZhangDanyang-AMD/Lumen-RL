@@ -71,6 +71,15 @@ class _AiterTopkPatchLoader(importlib.abc.Loader):
                 )
 
             module.topk_gating = _topk_gating_unavailable
+        if self.fullname == "aiter" and hasattr(module, "init_dist_env"):
+            original = module.init_dist_env
+            if not getattr(original, "_lumen_atom_compat", False):
+                def _init_dist_env_compat(*args, **kwargs):  # noqa: ANN002, ANN003
+                    kwargs.pop("prefill_context_model_parallel_size", None)
+                    return original(*args, **kwargs)
+
+                _init_dist_env_compat._lumen_atom_compat = True  # type: ignore[attr-defined]
+                module.init_dist_env = _init_dist_env_compat
         elif self.fullname == "aiter.ops.shuffle":
             fallback = getattr(module, "shuffle_scale", None)
             if fallback is None:
@@ -96,4 +105,4 @@ class _AiterTopkPatchFinder(importlib.abc.MetaPathFinder):
 _SRC = os.environ.get("LUMENRL_ATOM_AITER_SRC")
 if _SRC and os.path.isdir(_SRC):
     sys.meta_path.insert(0, _AiterAtomModuleFinder(_SRC))
-    sys.meta_path.insert(0, _AiterTopkPatchFinder())
+sys.meta_path.insert(0, _AiterTopkPatchFinder())

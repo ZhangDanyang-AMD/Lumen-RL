@@ -57,16 +57,19 @@ if [ "$MODE" = "atomfp8" ] || [ "$MODE" = "atom_fp8" ]; then
   ATOM_ONLINE_QUANT="${ATOM_ONLINE_QUANT:-per_block_fp8}"
   unset ATOM_DISABLE_VLLM_PLUGIN
   export LUMENRL_ATOM_AITER_SRC="${LUMENRL_ATOM_AITER_SRC:-$RL_ROOT/../rl_base/aiter}"
-  export PYTHONPATH="$RL_ROOT/Lumen-RL/examples/DAPO/atom_aiter_shim:$RL_ROOT/Lumen-RL:$LUMEN_DIR:$ATOM_DIR:$USER_PYTHONPATH"
+  export PYTHONPATH="$RL_ROOT/Lumen-RL/examples/DAPO/atom_aiter_shim:$RL_ROOT/Lumen-RL:$AITER_DIR:$LUMEN_DIR:$ATOM_DIR:$USER_PYTHONPATH"
   export ATOM_ISOLATE_TORCH_COMPILE_CACHE=1
   export VLLM_ROCM_USE_AITER=0 VLLM_ROCM_USE_AITER_MHA=0 VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=0 VLLM_ROCM_USE_AITER_LINEAR=0
-  # Native LumenRL uses its own packed varlen forward. As in the vLLM fp8 path,
-  # do not stack Lumen's HF attention patch on top; keep FP8 linear/norm only.
-  export LUMEN_DISABLE_HF_ATTN_PATCH=1 LUMEN_ROLLOUT=ATOM LUMEN_NORM=1
+  # Match the vLLM fp8 training-side configuration exactly: standard Lumen FP8
+  # blockwise2d linear + norm, no HF attention patch and no rollout-specific
+  # early-return path. Rollout is ATOM; actor training stays on the vLLM fp8 path.
+  unset LUMEN_ROLLOUT
+  export LUMEN_DISABLE_HF_ATTN_PATCH=1 LUMEN_NORM=1
   if [ "$TRAIN_FP8" = "1" ]; then
     export LUMEN_FP8=1 FP8_PARAM_MANAGER=0
     export LUMEN_FP8_SCALING=blockwise2d LUMEN_FP8_FORMAT=fp8_e4m3 LUMEN_FP8_BLOCK_SIZE=128
     export LUMEN_FP8_ATTN=none LUMEN_FP8_QUANT_TYPE=blockwise LUMEN_ATTN_BACKEND=auto
+    export LUMEN_FP8_WGRAD="${LUMEN_FP8_WGRAD:-0}"
   fi
   EXTRA_ARGS+=(policy.generation.atom_cfg.online_quant_config.global_quant_config="$ATOM_ONLINE_QUANT")
 elif [ "$MODE" = "fp8" ]; then
@@ -82,6 +85,7 @@ else
   CONFIG=examples/DAPO/configs/dapo_qwen3_8b_ray_vllm_longrun.yaml
   export VLLM_ROCM_USE_AITER=0 VLLM_ROCM_USE_AITER_MHA=0 VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=0 VLLM_ROCM_USE_AITER_LINEAR=0
 fi
+CONFIG="${CONFIG_OVERRIDE:-$CONFIG}"
 
 echo "$LOG" > /tmp/run_dapo_log.txt
 echo "=== MODE=$MODE TRAIN_FP8=$TRAIN_FP8 STEPS=$STEPS  CONFIG=$CONFIG  LOG=$LOG ==="

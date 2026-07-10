@@ -107,22 +107,32 @@ class ATOMRayServer:
             params["top_k"] = -1
             params["top_p"] = 1.0
 
+        temperature = float(params.pop("temperature", 1.0))
+        top_p = float(params.pop("top_p", 1.0))
+        top_k = int(params.pop("top_k", -1))
+        ignore_eos = bool(params.pop("ignore_eos", False))
+        stop_strings = params.pop("stop_strings", params.pop("stop", None))
+
         for key in ("repetition_penalty", "stop_token_ids", "min_tokens"):
             if key in params:
                 logger.debug("ATOM rollout dropping unsupported sampling param %s=%r", key, params.pop(key))
         if params:
             logger.debug("ATOM rollout dropping unsupported sampling params: %s", sorted(params))
 
-        return SamplingParams(
-            max_tokens=max(1, int(max_tokens)),
-            temperature=float(params.pop("temperature", 1.0)),
-            top_p=float(params.pop("top_p", 1.0)),
-            top_k=int(params.pop("top_k", -1)),
-            logprobs=logprobs,
-            seed=seed,
-            ignore_eos=bool(params.pop("ignore_eos", False)),
-            stop_strings=params.pop("stop_strings", params.pop("stop", None)),
-        )
+        sp_kwargs = {
+            "max_tokens": max(1, int(max_tokens)),
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "logprobs": logprobs,
+            "seed": seed,
+            "ignore_eos": ignore_eos,
+            "stop_strings": stop_strings,
+        }
+        fields = getattr(SamplingParams, "__dataclass_fields__", None)
+        if fields:
+            sp_kwargs = {k: v for k, v in sp_kwargs.items() if k in fields}
+        return SamplingParams(**sp_kwargs)
 
     async def generate(
         self,
@@ -159,18 +169,30 @@ class ATOMRayServer:
             raise RuntimeError("ATOMRayServer.launch() must be called before generate_batch().")
 
         prompt_ids_list = [list(p) for p in prompts]
-        request_ids = [uuid4().hex for _ in prompt_ids_list]
-        params = [
-            self._build_sampling_params(sampling_params, prompt_length=len(p))
-            for p in prompt_ids_list
-        ]
+        grouped_prompts: list[list[int]] = []
+        grouped_counts: list[int] = []
+        for prompt_ids in prompt_ids_list:
+            if grouped_prompts and prompt_ids == grouped_prompts[-1]:
+                grouped_counts[-1] += 1
+            else:
+                grouped_prompts.append(prompt_ids)
+                grouped_counts.append(1)
+
+        request_ids = [uuid4().hex for _ in grouped_prompts]
+        params = []
+        for prompt_ids, n in zip(grouped_prompts, grouped_counts):
+            sp = self._build_sampling_params(sampling_params, prompt_length=len(prompt_ids))
+            if n > 1 and hasattr(sp, "n"):
+                sp.n = n
+            params.append(sp)
 
         def _generate_blocking():
-            return self.engine.generate(prompt_ids_list, params, request_ids=request_ids)
+            return self.engine.generate(grouped_prompts, params, request_ids=request_ids)
 
         outs = await asyncio.get_event_loop().run_in_executor(None, _generate_blocking)
         results: list[dict[str, Any]] = []
-        for p_ids, out in zip(prompt_ids_list, outs):
+        expanded_prompts = [p for p, n in zip(grouped_prompts, grouped_counts) for _ in range(n)]
+        for p_ids, out in zip(expanded_prompts, outs):
             token_ids = list(out.get("token_ids", [])) if isinstance(out, dict) else []
             logprobs = out.get("logprobs") if isinstance(out, dict) else None
             results.append({
@@ -223,13 +245,22 @@ class ATOMRayServer:
         socket.setsockopt(zmq.LINGER, 0)
         socket.connect(self._get_zmq_handle())
 
-        staging_buffer = None
-        staging_handle = None
+        per_gpu_buffers = None
+        per_gpu_ipc_handles = None
+        ipc_buffer = None
         try:
             comm_metadata = socket.recv_pyobj()
             socket.send(b"")
             ipc_buffer = rebuild_ipc_handle(comm_metadata, device_id=0)
-            staging_size = int(ipc_buffer.numel())
+            bucket_size = int(ipc_buffer.numel())
+            num_gpus = int(self.engine_kwargs.get("tensor_parallel_size", 1) or 1) * int(
+                self.engine_kwargs.get("data_parallel_size", 1) or 1
+            )
+            per_gpu_buffers = {
+                gpu_idx: torch.empty(bucket_size, dtype=torch.uint8, device=f"cuda:{gpu_idx}")
+                for gpu_idx in range(num_gpus)
+            }
+            per_gpu_ipc_handles = {gpu_idx: reduce_tensor(buf) for gpu_idx, buf in per_gpu_buffers.items()}
             stats = {"buckets": 0, "weights": 0}
 
             while True:
@@ -240,34 +271,43 @@ class ATOMRayServer:
 
                 # Large direct-send tensors carry their own IPC handles. Materialize
                 # those into a receiver-owned staging buffer so ATOM's runner sees a
-                # single contiguous bucket, just like its native load_weights_via_ipc.
+                # single stable buffer handle for the whole update cycle, just like
+                # verl/ATOM's native load_weights_via_ipc. ModelRunner caches the
+                # first IPC mapping until is_last; passing a different handle for
+                # direct-send buckets and normal buckets makes later buckets read
+                # stale bytes from the first large tensor.
                 direct_tensors = {
                     name: rebuild_ipc_handle(meta["handle"], device_id=0)
                     for name, meta in raw_bucket_meta.items()
                     if meta.get("handle") is not None
                 }
-                ipc_handle = comm_metadata
-                ipc_handles = None
-                if direct_tensors:
-                    if staging_buffer is None or used_bytes > staging_size:
-                        staging_size = max(used_bytes, staging_size)
-                        staging_buffer = torch.empty(staging_size, dtype=torch.uint8, device="cuda:0")
-                        staging_handle = reduce_tensor(staging_buffer)
+                if used_bytes > bucket_size:
+                    del per_gpu_buffers
+                    del per_gpu_ipc_handles
+                    bucket_size = used_bytes
+                    per_gpu_buffers = {
+                        gpu_idx: torch.empty(bucket_size, dtype=torch.uint8, device=f"cuda:{gpu_idx}")
+                        for gpu_idx in range(num_gpus)
+                    }
+                    per_gpu_ipc_handles = {gpu_idx: reduce_tensor(buf) for gpu_idx, buf in per_gpu_buffers.items()}
+
+                for gpu_idx, dst in per_gpu_buffers.items():
                     for name, tensor in direct_tensors.items():
                         meta = raw_bucket_meta[name]
                         nbytes = meta["dtype"].itemsize * torch.Size(meta["shape"]).numel()
                         offset = int(meta["offset"])
-                        staging_buffer[offset : offset + nbytes].copy_(
+                        dst[offset : offset + nbytes].copy_(
                             tensor.contiguous().view(-1).view(torch.uint8),
                             non_blocking=True,
                         )
-                    torch.cuda.synchronize(0)
-                    ipc_handle = staging_handle
+                    if not direct_tensors:
+                        dst[:used_bytes].copy_(ipc_buffer[:used_bytes], non_blocking=True)
+                    torch.cuda.synchronize(gpu_idx)
 
                 self.engine.core_mgr.broadcast_utility_command_sync(
                     "update_weights_ipc",
-                    ipc_handle=ipc_handle,
-                    ipc_handles=ipc_handles,
+                    ipc_handle=None,
+                    ipc_handles=per_gpu_ipc_handles,
                     bucket_meta=bucket_meta,
                     is_last=is_last,
                 )
@@ -280,7 +320,9 @@ class ATOMRayServer:
         finally:
             socket.close()
             ctx.term()
-            del staging_buffer
+            del per_gpu_buffers
+            del per_gpu_ipc_handles
+            del ipc_buffer
             gc.collect()
             torch.cuda.ipc_collect()
             torch.cuda.empty_cache()
@@ -373,6 +415,7 @@ class ATOMReplicaManager:
         infos = self.actor_wg.execute_all_sync("get_colocation_info")
         logger.info("ATOMReplicaManager: colocation infos = %s", infos)
 
+        true_vocab_size = self._get_true_vocab_size()
         remote_cls = ray.remote(ATOMRayServer)
         for i, info in enumerate(infos):
             node_id = info["node_id"]
@@ -387,6 +430,8 @@ class ATOMReplicaManager:
                 "LUMEN_REPLICA_RANK": str(i),
                 "LUMEN_RAY_JOB_ID": str(job_id),
             }
+            if true_vocab_size is not None:
+                env_vars["LUMENRL_ATOM_TRUE_VOCAB_SIZE"] = str(true_vocab_size)
             for key in (
                 "ATOM_ISOLATE_TORCH_COMPILE_CACHE",
                 "ATOM_USE_TORCH_RMSNORM",
@@ -413,6 +458,17 @@ class ATOMReplicaManager:
 
         ray.get([s.launch.remote() for s in self.servers])
         logger.info("ATOMReplicaManager: launched %d colocated rollout replicas.", len(self.servers))
+
+    def _get_true_vocab_size(self) -> Optional[int]:
+        try:
+            from transformers import AutoTokenizer
+
+            vocab_size = len(AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True))
+            logger.info("ATOMReplicaManager: true tokenizer vocab size = %d", vocab_size)
+            return int(vocab_size)
+        except Exception as exc:
+            logger.warning("ATOMReplicaManager: failed to resolve tokenizer vocab size: %s", exc)
+            return None
 
     def sleep_all(self, level: int = 2) -> None:
         import ray
