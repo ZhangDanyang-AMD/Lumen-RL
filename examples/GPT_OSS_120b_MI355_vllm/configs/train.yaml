@@ -58,7 +58,7 @@ algorithm:
     num_target_layers: 1
     # eagle_ttt_steps=3 in Model-Optimizer
     spec_length: 3
-    aux_hidden_state_layer_ids: [1, 17, 32, 36]
+    aux_hidden_state_layer_ids: [2, 18, 33, 36]
     separate_last_hidden: true
     shift_input_embeds: true
   teacher:
