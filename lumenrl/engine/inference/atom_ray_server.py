@@ -441,6 +441,8 @@ class ATOMReplicaManager:
                 if key in os.environ:
                     env_vars[key] = os.environ[key]
 
+            engine_kwargs = self._engine_kwargs_for_replica(i, job_id)
+
             server = remote_cls.options(
                 num_gpus=0,
                 num_cpus=1,
@@ -450,7 +452,7 @@ class ATOMReplicaManager:
                 runtime_env={"env_vars": env_vars},
             ).remote(
                 model_name=self.model_name,
-                engine_kwargs=self.engine_kwargs,
+                engine_kwargs=engine_kwargs,
                 replica_rank=i,
                 base_seed=self.base_seed,
             )
@@ -469,6 +471,26 @@ class ATOMReplicaManager:
         except Exception as exc:
             logger.warning("ATOMReplicaManager: failed to resolve tokenizer vocab size: %s", exc)
             return None
+
+    def _engine_kwargs_for_replica(self, replica_rank: int, job_id: str) -> dict[str, Any]:
+        kwargs = dict(self.engine_kwargs)
+        if os.getenv("ATOM_ISOLATE_TORCH_COMPILE_CACHE", "0") not in {"1", "true", "TRUE", "yes", "YES"}:
+            return kwargs
+
+        comp_cfg = dict(kwargs.get("compilation_config") or {})
+        if int(comp_cfg.get("level", 0) or 0) <= 0 and bool(kwargs.get("enforce_eager", True)):
+            return kwargs
+
+        cache_root = os.getenv("ATOM_TORCH_COMPILE_CACHE_ROOT", "/tmp/atom_torch_compile_cache")
+        safe_job_id = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in str(job_id))
+        comp_cfg["cache_dir"] = os.path.join(cache_root, safe_job_id, f"replica_{replica_rank}")
+        kwargs["compilation_config"] = comp_cfg
+        logger.info(
+            "ATOMReplicaManager: replica %d torch compile cache_dir=%s",
+            replica_rank,
+            comp_cfg["cache_dir"],
+        )
+        return kwargs
 
     def sleep_all(self, level: int = 2) -> None:
         import ray
