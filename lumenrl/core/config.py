@@ -483,6 +483,8 @@ class AlgorithmConfig:
     clip_ratio_low: Optional[float] = None
     clip_ratio_high: Optional[float] = None
     clip_ratio_c: float = 3.0
+    # Rollout correction (also available via quantization.rollout_correction)
+    rollout_correction: Optional[RolloutCorrectionConfig] = None
 
 
 @dataclass
@@ -510,12 +512,16 @@ class RolloutCorrectionConfig:
     enabled: bool = False
     method: str = "tis"
     clip: float = 1.5
-    # Extended rollout correction (verl/trainer/ppo/rollout_corr_helper.py)
-    rollout_is: str = ""                # "token" | "sequence" | "" (importance sampling level)
-    rollout_is_threshold: float = 2.0   # upper truncation for IS weights
+    # IS weights (verl rollout_corr_helper.py)
+    rollout_is: str = ""                # "token" | "sequence" | ""
+    rollout_is_threshold: str = "2.0"   # float or "lower_upper" (IcePop)
     rollout_is_batch_normalize: bool = False
-    rollout_rs: str = ""                # rejection sampling mode
-    rollout_rs_threshold: float = 0.0
+    # Rejection sampling (11 criteria: token_k1/k2/k3, seq_sum/mean/max_k1/k2/k3)
+    rollout_rs: str = ""                # comma-separated: "seq_mean_k1", "seq_mean_k3", etc.
+    rollout_rs_threshold: str = ""      # comma-separated thresholds; K1 uses "lower_upper"
+    # Bypass mode: set pi_old = pi_rollout, skip old_log_prob computation
+    bypass_mode: bool = False
+    loss_type: str = "ppo_clip"         # "ppo_clip" | "reinforce" (bypass mode only)
 
 
 @dataclass

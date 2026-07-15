@@ -2657,10 +2657,23 @@ class RLTrainer:
                 if responses_full:
                     responses_full = responses_full[_s:_e]
 
-            self._actor_model.eval()
-            old_log_probs = self._compute_log_probs_for_model(
-                self._actor_model, sequences, seq_mask,
-            )
+            _rc_cfg = self.config.quantization.rollout_correction
+            _bypass_mode = getattr(_rc_cfg, "bypass_mode", False)
+
+            if _bypass_mode and rollout_lp_full is not None:
+                old_log_probs = rollout_lp_full.to(self._device) if rollout_lp_full is not None else None
+                if old_log_probs is None:
+                    raise ValueError(
+                        "bypass_mode=True requires rollout_log_probs. "
+                        "Set calculate_log_probs=true in vllm_cfg."
+                    )
+                if self._rank == 0:
+                    logger.info("[step=%d] bypass_mode: using rollout_log_probs as old_log_probs", step)
+            else:
+                self._actor_model.eval()
+                old_log_probs = self._compute_log_probs_for_model(
+                    self._actor_model, sequences, seq_mask,
+                )
 
             if step < 3 and self._rank == 0:
                 logger.info(
@@ -2773,24 +2786,12 @@ class RLTrainer:
                     logger.warning("[LUMEN_DUMP] failed: %s", _e)
 
             # --- Extended rollout correction: IS weights + rejection sampling ---
-            # (verl/trainer/ppo/ray_trainer.py L1481-1567)
-            _rc_cfg = self.config.quantization.rollout_correction
             _rc_metrics = {}
-            if _rc_cfg.rollout_is and "old_log_probs" in batch.tensors:
-                _rollout_lp = batch.tensors.get("rollout_log_probs", batch.tensors.get("fp8_logprobs"))
-                if _rollout_lp is not None:
-                    from lumenrl.quantization.rollout_correction import compute_rollout_is_weights, apply_rejection_sampling
-                    _rmask = batch.tensors.get("response_mask", batch.tensors.get("attention_mask"))
-                    _is_w, _rc_metrics = compute_rollout_is_weights(
-                        batch.tensors["old_log_probs"], _rollout_lp, _rmask,
-                        rollout_is=_rc_cfg.rollout_is,
-                        rollout_is_threshold=_rc_cfg.rollout_is_threshold,
-                        rollout_is_batch_normalize=_rc_cfg.rollout_is_batch_normalize,
-                    )
-                    batch.tensors["rollout_is_weights"] = _is_w
-                    if _rc_cfg.rollout_rs and _rc_cfg.rollout_rs_threshold > 0:
-                        _rmask = apply_rejection_sampling(_rmask, _is_w, _rc_cfg.rollout_rs_threshold)
-                        batch.tensors["response_mask"] = _rmask
+            _rollout_lp = batch.tensors.get("rollout_log_probs", batch.tensors.get("fp8_logprobs"))
+            _rc_want = (_rc_cfg.rollout_is or _rc_cfg.rollout_rs or _bypass_mode) and "old_log_probs" in batch.tensors and _rollout_lp is not None
+            if _rc_want:
+                from lumenrl.algorithms.rollout_correction import compute_rollout_correction_and_add_to_batch
+                batch, _rc_metrics = compute_rollout_correction_and_add_to_batch(batch, _rc_cfg)
 
             # --- Seqlen balanced partitioning ---
             # (verl/utils/seqlen_balancing.py, verl/trainer/ppo/ray_trainer.py L1098-1165)
@@ -3263,10 +3264,19 @@ class RLTrainer:
                 ground_truths_expanded = ground_truths * num_generations
             gen_time = time.time() - gen_t0
 
-            old_log_probs, entropy_full = self._compute_log_probs_with_worker_group(
-                self._actor_wg, sequences, role="actor", want_entropy=True,
-                attention_mask=seq_mask,
-            )
+            _rc_cfg_ray = self.config.quantization.rollout_correction
+            _bypass_ray = getattr(_rc_cfg_ray, "bypass_mode", False)
+
+            if _bypass_ray and rollout_lp is not None:
+                old_log_probs = rollout_lp
+                entropy_full = None
+                if self._rank == 0:
+                    logger.info("[step=%d] bypass_mode (ray): using rollout_log_probs as old_log_probs", step)
+            else:
+                old_log_probs, entropy_full = self._compute_log_probs_with_worker_group(
+                    self._actor_wg, sequences, role="actor", want_entropy=True,
+                    attention_mask=seq_mask,
+                )
             if self._ref_wg is not None:
                 ref_log_probs = self._compute_log_probs_with_worker_group(
                     self._ref_wg, sequences, role="ref", attention_mask=seq_mask,
@@ -3312,6 +3322,14 @@ class RLTrainer:
             batch = self._algorithm.compute_advantages(batch)
             batch = apply_rollout_correction(batch, self.config)
 
+            # --- Extended rollout correction: IS weights + RS (Ray path) ---
+            _rc_metrics_ray = {}
+            _rlp_ray = batch.tensors.get("rollout_log_probs", batch.tensors.get("fp8_logprobs"))
+            _rc_want_ray = (_rc_cfg_ray.rollout_is or _rc_cfg_ray.rollout_rs or _bypass_ray) and "old_log_probs" in batch.tensors and _rlp_ray is not None
+            if _rc_want_ray:
+                from lumenrl.algorithms.rollout_correction import compute_rollout_correction_and_add_to_batch
+                batch, _rc_metrics_ray = compute_rollout_correction_and_add_to_batch(batch, _rc_cfg_ray)
+
             if use_ray_rollout:
                 # verl-aligned loss normalization: GLOBAL response-token count
                 # (full batch) + dp_size so each actor's shard normalizes by the
@@ -3337,6 +3355,9 @@ class RLTrainer:
             _pt = metrics.pop("ppo_kl_tok", None)
             if _ps is not None and _pt:
                 metrics["ppo_kl"] = _ps / max(_pt, 1e-6)
+
+            if _rc_metrics_ray:
+                metrics.update(_rc_metrics_ray)
 
             total_tok = int(seq_mask.sum().item())
             prompt_tok = int(sum(prompt_lengths))

@@ -540,6 +540,27 @@ def compute_policy_loss_cispo(
     }
 
 
+@register_policy_loss("reinforce")
+def compute_policy_loss_reinforce(
+    old_log_prob: Tensor, log_prob: Tensor, advantages: Tensor,
+    response_mask: Tensor, loss_agg_mode: str = "token-mean",
+    config: dict[str, Any] | None = None,
+    rollout_is_weights: Tensor | None = None,
+) -> tuple[Tensor, dict[str, Any]]:
+    """REINFORCE: policy gradient with explicit IS weights, no PPO clipping."""
+    assert config is not None
+    pg_losses = -advantages * log_prob
+    if rollout_is_weights is not None:
+        pg_losses = pg_losses * rollout_is_weights
+    loss = agg_loss(pg_losses, response_mask, loss_agg_mode,
+                    dp_size=config.get("dp_size", 1),
+                    batch_num_tokens=config.get("batch_num_tokens"),
+                    global_batch_size=config.get("global_batch_size"))
+    neg_kl = log_prob - old_log_prob
+    kl = masked_mean(-neg_kl, response_mask)
+    return loss, {"actor/ppo_kl": kl.detach().item()}
+
+
 @register_policy_loss("bypass_mode")
 def compute_policy_loss_bypass_mode(
     old_log_prob: Tensor, log_prob: Tensor, advantages: Tensor,
@@ -547,26 +568,60 @@ def compute_policy_loss_bypass_mode(
     config: dict[str, Any] | None = None,
     rollout_is_weights: Tensor | None = None,
 ) -> tuple[Tensor, dict[str, Any]]:
-    """Bypass mode: old_log_prob = rollout_log_prob, dispatches to REINFORCE or PPO-clip.
-    (verl/trainer/ppo/core_algos.py L2351-2487)
+    """Bypass mode: old_log_prob = rollout_log_prob, computes IS/RS on-the-fly.
+
+    In bypass mode, pi_old = pi_rollout. The loss function computes IS weights
+    and rejection mask using current log_prob vs rollout_log_prob (= old_log_prob),
+    then dispatches to PPO-clip (no explicit IS — ratio handles it) or REINFORCE
+    (explicit IS weights).
     """
     assert config is not None
+    rc_cfg = config.get("rollout_correction")
     loss_type = config.get("bypass_loss_type", "ppo_clip")
+    metrics: dict[str, Any] = {}
+
+    # Compute IS weights and RS on-the-fly using current vs rollout policy
+    effective_mask = response_mask
+    effective_is_weights = rollout_is_weights
+    if rc_cfg is not None:
+        from lumenrl.algorithms.rollout_correction import (
+            compute_rollout_correction_and_rejection_mask,
+        )
+        r_is = rc_cfg.get("rollout_is") if hasattr(rc_cfg, "get") else getattr(rc_cfg, "rollout_is", None)
+        r_is = r_is or None
+        r_is_th = rc_cfg.get("rollout_is_threshold", "2.0") if hasattr(rc_cfg, "get") else getattr(rc_cfg, "rollout_is_threshold", "2.0")
+        r_is_bn = rc_cfg.get("rollout_is_batch_normalize", False) if hasattr(rc_cfg, "get") else getattr(rc_cfg, "rollout_is_batch_normalize", False)
+        r_rs = rc_cfg.get("rollout_rs") if hasattr(rc_cfg, "get") else getattr(rc_cfg, "rollout_rs", None)
+        r_rs = r_rs or None
+        r_rs_th = rc_cfg.get("rollout_rs_threshold") if hasattr(rc_cfg, "get") else getattr(rc_cfg, "rollout_rs_threshold", None)
+        r_rs_th = r_rs_th or None
+
+        with torch.no_grad():
+            is_w, mod_mask, rc_metrics = compute_rollout_correction_and_rejection_mask(
+                old_log_prob=log_prob,
+                rollout_log_prob=old_log_prob,  # old_log_prob = rollout_log_prob in bypass
+                response_mask=response_mask,
+                rollout_is=r_is,
+                rollout_is_threshold=r_is_th,
+                rollout_is_batch_normalize=r_is_bn,
+                rollout_rs=r_rs,
+                rollout_rs_threshold=r_rs_th,
+            )
+        effective_mask = mod_mask
+        metrics.update(rc_metrics)
+        if loss_type == "reinforce" and is_w is not None:
+            effective_is_weights = is_w
 
     if loss_type == "reinforce":
-        pg_losses = -advantages * log_prob
-        if rollout_is_weights is not None:
-            pg_losses = pg_losses * rollout_is_weights
-        loss = agg_loss(pg_losses, response_mask, loss_agg_mode,
-                        dp_size=config.get("dp_size", 1),
-                        batch_num_tokens=config.get("batch_num_tokens"),
-                        global_batch_size=config.get("global_batch_size"))
-        neg_kl = log_prob - old_log_prob
-        kl = masked_mean(-neg_kl, response_mask)
-        return loss, {"actor/ppo_kl": kl.detach().item()}
-
-    # Default: PPO-clip with old_log_prob = rollout_log_prob
-    return compute_policy_loss_vanilla(
-        old_log_prob, log_prob, advantages, response_mask,
-        loss_agg_mode, config, rollout_is_weights=None,
-    )
+        loss, loss_m = compute_policy_loss_reinforce(
+            old_log_prob, log_prob, advantages, effective_mask,
+            loss_agg_mode, config, rollout_is_weights=effective_is_weights,
+        )
+    else:
+        # PPO-clip: ratio = pi_theta / pi_rollout already handles IS
+        loss, loss_m = compute_policy_loss_vanilla(
+            old_log_prob, log_prob, advantages, effective_mask,
+            loss_agg_mode, config, rollout_is_weights=None,
+        )
+    metrics.update(loss_m)
+    return loss, metrics
