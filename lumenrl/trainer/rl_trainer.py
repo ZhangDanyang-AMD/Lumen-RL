@@ -491,6 +491,9 @@ class RLTrainer:
             expanded.extend([list(ids)] * num_generations)
 
         sp = dict(sampling_params) if sampling_params is not None else self._ray_sampling_params(want_lp)
+        if getattr(self._ray_vllm_engine, "_sleeping", False):
+            logger.info("Ray rollout engine sleeping before generation; refreshing weights before wake.")
+            self._sync_weights_ipc()
         results = self._ray_vllm_engine.generate_tokens(expanded, sp)
 
         # Assemble left-padded prompt + response into a single tensor block.
@@ -3505,6 +3508,16 @@ class RLTrainer:
             all_responses.extend(responses)
             response_mask = self._build_response_mask(sequences, seq_mask, prompt_lengths)
             all_response_lengths.extend([int(x) for x in response_mask.sum(dim=-1).tolist()])
+
+        # Keep the Ray rollout lifecycle consistent across training and
+        # validation: after any generation phase, release rollout-side KV/graphs
+        # before the next training phase. The next weight sync will wake weights
+        # and KV cache in the same order used for normal training rollout.
+        if getattr(self, "_ray_vllm_engine", None) is not None:
+            try:
+                self._ray_vllm_engine.sleep()
+            except Exception:
+                logger.exception("Ray rollout sleep after validation failed")
 
         # Non-persistent path frees the eval vLLM (kill subprocess: reliable GPU
         # release on ROCm). Persistent path keeps the resident engine(s) alive.
