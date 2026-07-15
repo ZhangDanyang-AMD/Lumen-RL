@@ -589,9 +589,11 @@ class RLTrainer:
         use_shm = bool(vcfg.use_shm)
         sleeping = bool(getattr(self._ray_vllm_engine, "enable_sleep", False))
 
+        rollout_engine = self._ray_vllm_engine
+
         # 1) wake weight memory before loading (only when sleep is in use).
         if sleeping:
-            mgr.wake_all(tags=["weights"])
+            rollout_engine.wake(tags=["weights"])
         # 2) start receivers + senders concurrently, then join both.
         recv = [s.update_weights_from_ipc.remote(use_shm) for s in mgr.servers]
         send = self._actor_wg.execute_all_async(
@@ -601,7 +603,7 @@ class RLTrainer:
         ray.get(recv)
         # 3) wake KV cache so the next rollout can run.
         if sleeping:
-            mgr.wake_all(tags=["kv_cache"])
+            rollout_engine.wake(tags=["kv_cache"])
 
     def _setup_ray_controller(self) -> None:
         """Initialize Ray cluster + worker groups for actor/ref orchestration."""
@@ -3368,16 +3370,6 @@ class RLTrainer:
                             _neglp, int(_denom), float(entropy_full.max().item()),
                         )
 
-            # Validation
-            val_steps = getattr(self.config, 'val_steps', 0)
-            if val_steps > 0 and (step + 1) % val_steps == 0:
-                val_metrics = self.run_validation()
-                metrics.update(val_metrics)
-
-            self.last_metrics = metrics
-            for k, v in metrics.items():
-                self._metrics.update(k, v)
-
             # ---- weight sync to rollout engine ----
             t_sync = time.time()
             if use_ray_rollout:
@@ -3388,6 +3380,17 @@ class RLTrainer:
             if sync_time > 1.0:
                 metrics["timing/weight_sync_s"] = sync_time
             metrics.update(self._collect_actor_memory_metrics())
+
+            # Validation uses the rollout engine too, so run it after the fresh
+            # actor weights have been synced and sleep/wake has restored KV cache.
+            val_steps = getattr(self.config, 'val_steps', 0)
+            if val_steps > 0 and (step + 1) % val_steps == 0:
+                val_metrics = self.run_validation()
+                metrics.update(val_metrics)
+
+            self.last_metrics = metrics
+            for k, v in metrics.items():
+                self._metrics.update(k, v)
 
             for cb in self.callbacks:
                 cb.on_step_end(self, step, metrics)
