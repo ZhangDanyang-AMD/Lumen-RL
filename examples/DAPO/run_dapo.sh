@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 统一 DAPO 启动：MODE=bf16|fp8, TRAIN_FP8=0|1, STEPS=N。路径取容器内 $RL_ROOT/$DATA_ROOT。
+# 统一 DAPO 启动：MODE=bf16|fp8|atomfp8, TRAIN_FP8=0|1, STEPS=N。路径取容器内 $RL_ROOT/$DATA_ROOT。
 set -uo pipefail
 : "${RL_ROOT:?}"; : "${DATA_ROOT:?}"
 MODE="${MODE:-bf16}"; TRAIN_FP8="${TRAIN_FP8:-0}"; STEPS="${STEPS:-1000}"
@@ -56,9 +56,12 @@ if [ "$MODE" = "atomfp8" ] || [ "$MODE" = "atom_fp8" ]; then
   fi
   ATOM_ONLINE_QUANT="${ATOM_ONLINE_QUANT:-per_block_fp8}"
   unset ATOM_DISABLE_VLLM_PLUGIN
-  export LUMENRL_ATOM_AITER_SRC="${LUMENRL_ATOM_AITER_SRC:-$RL_ROOT/../rl_base/aiter}"
+  export LUMENRL_ATOM_AITER_SRC="${LUMENRL_ATOM_AITER_SRC:-$AITER_DIR}"
   export PYTHONPATH="$RL_ROOT/Lumen-RL/examples/DAPO/atom_aiter_shim:$RL_ROOT/Lumen-RL:$AITER_DIR:$LUMEN_DIR:$ATOM_DIR:$USER_PYTHONPATH"
-  export ATOM_ISOLATE_TORCH_COMPILE_CACHE=1
+  # ATOM FP8 正式方案：no-eager + compilation level=3，需开启 dynamo，且每个 colocated
+  # replica 用独立 torch compile cache，避免 8 个 rank0 并发写同一路径触发 Inductor rename race。
+  export TORCHDYNAMO_DISABLE=0 ATOM_ISOLATE_TORCH_COMPILE_CACHE=1
+  export ATOM_TORCH_COMPILE_CACHE_ROOT="${ATOM_TORCH_COMPILE_CACHE_ROOT:-/tmp/atom_torch_compile_cache}"
   export VLLM_ROCM_USE_AITER=0 VLLM_ROCM_USE_AITER_MHA=0 VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=0 VLLM_ROCM_USE_AITER_LINEAR=0
   # Match the vLLM fp8 training-side configuration exactly: standard Lumen FP8
   # blockwise2d linear + norm, no HF attention patch and no rollout-specific
@@ -71,7 +74,16 @@ if [ "$MODE" = "atomfp8" ] || [ "$MODE" = "atom_fp8" ]; then
     export LUMEN_FP8_ATTN=none LUMEN_FP8_QUANT_TYPE=blockwise LUMEN_ATTN_BACKEND=auto
     export LUMEN_FP8_WGRAD="${LUMEN_FP8_WGRAD:-0}"
   fi
-  EXTRA_ARGS+=(policy.generation.atom_cfg.online_quant_config.global_quant_config="$ATOM_ONLINE_QUANT")
+  # no-eager level=3 正式方案：enforce_eager=false + compilation_config.level=3 + sleep2
+  # （sleep_mode 训练前释放 rollout KV/weights/CUDA graph，避免 backward OOM）。
+  EXTRA_ARGS+=(
+    policy.generation.atom_cfg.online_quant_config.global_quant_config="$ATOM_ONLINE_QUANT"
+    policy.generation.vllm_cfg.enforce_eager=false
+    policy.generation.atom_cfg.engine_kwargs.enforce_eager=false
+    policy.generation.atom_cfg.engine_kwargs.compilation_config.level=3
+    policy.generation.vllm_cfg.enable_sleep_mode=true
+    policy.generation.vllm_cfg.sleep_level=2
+  )
 elif [ "$MODE" = "fp8" ]; then
   CONFIG=examples/DAPO/configs/dapo_qwen3_8b_ray_vllm_fp8_longrun.yaml
   # rollout per_block_fp8 + AITER unified attention

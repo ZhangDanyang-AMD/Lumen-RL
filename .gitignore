@@ -18,6 +18,7 @@ checkpoints/
 docs/build/
 _site/
 results/
+online_quant_info_*.json
 
 # Keep output/ directory structure but ignore run artifacts
 output/DAPO/metrics/*.csv
