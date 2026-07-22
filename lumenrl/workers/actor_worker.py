@@ -153,6 +153,14 @@ class LumenActorWorker(BaseWorker):
                 "seed": int(policy.get("seed", 42)),
                 "dtype": meg_cfg.get("dtype", "bf16"),
                 "use_distributed_optimizer": meg_cfg.get("use_distributed_optimizer", False),
+                # Activation recomputation (needed for long sequences: Megatron
+                # local-spec attention is O(seq^2) in memory without TE flash).
+                "recompute_granularity": meg_cfg.get("recompute_granularity", None),
+                "recompute_method": meg_cfg.get("recompute_method", None),
+                "recompute_num_layers": meg_cfg.get("recompute_num_layers", None),
+                # Long-sequence memory: flash attn (O(L)) + chunked/fused log-prob.
+                "attention_backend": meg_cfg.get("attention_backend", "unfused"),
+                "log_probs_chunk_size": meg_cfg.get("log_probs_chunk_size", 0),
             }
         return {}
 

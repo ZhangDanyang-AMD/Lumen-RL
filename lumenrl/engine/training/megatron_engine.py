@@ -45,6 +45,88 @@ from lumenrl.engine.training.qwen3_megatron_bridge import (
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LUMENRL_LOGGING_LEVEL", "INFO"))
 
+import math  # noqa: E402
+
+try:
+    from flash_attn import flash_attn_func as _flash_attn_func
+except Exception:  # pragma: no cover - flash_attn optional
+    _flash_attn_func = None
+
+
+class FlashSelfAttentionCore(torch.nn.Module):
+    """Flash-attention drop-in for Megatron's local-spec ``DotProductAttention``.
+
+    The local (non-TE) core attention materializes the full ``[b, np, sq, sk]``
+    score matrix -> **O(L^2)** memory, which OOMs at long RL response lengths
+    (resp=20480). This replacement calls ``flash_attn_func`` (O(L) memory) and is
+    swapped into the GPT layer spec's ``self_attention.submodules.core_attention``
+    when ``megatron_cfg.attention_backend == "flash"``.
+
+    Assumes causal self-attention on a single unpadded sequence (LumenRL's
+    per-sequence forward). GQA (num_query_groups < num_heads) is handled natively
+    by flash-attn, so we skip the KV ``repeat_interleave`` the local path does.
+    """
+
+    def __init__(self, config, layer_number: int = 1, attn_mask_type=None,
+                 attention_type=None, cp_comm_type=None, softmax_scale=None, **kwargs):
+        super().__init__()
+        if _flash_attn_func is None:
+            raise ImportError(
+                "megatron_cfg.attention_backend='flash' requires the flash_attn "
+                "package (import failed). Install flash-attn or set attention_backend='unfused'."
+            )
+        self.config = config
+        self.layer_number = max(1, layer_number or 1)
+        head_dim = getattr(config, "kv_channels", None) or (
+            config.hidden_size // config.num_attention_heads
+        )
+        self.softmax_scale = (
+            softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(head_dim)
+        )
+
+    def forward(self, query, key, value, attention_mask=None, attn_mask_type=None,
+                attention_bias=None, packed_seq_params=None):
+        # Megatron layout [s, b, h, d] -> flash layout [b, s, h, d]
+        q = query.transpose(0, 1)
+        k = key.transpose(0, 1)
+        v = value.transpose(0, 1)
+        out = _flash_attn_func(q, k, v, causal=True, softmax_scale=self.softmax_scale)
+        # [b, sq, np, hn] -> [sq, b, np*hn]
+        out = out.transpose(0, 1).contiguous()
+        return out.reshape(out.shape[0], out.shape[1], -1)
+
+
+class _FusedTokenLogProb(torch.autograd.Function):
+    """Memory-efficient per-token log-prob: ``log p(target) = logit_target - logsumexp``.
+
+    Retains a single ``[L, V]`` softmax buffer for backward instead of the
+    several ``[L, V]`` tensors that ``log_softmax(logits).gather(...)`` keeps
+    alive (the full log_softmax output plus its gradient). Values/gradients are
+    exact. Backward uses ``grad_logits = (onehot(target) - softmax) * grad_lp``.
+    """
+
+    @staticmethod
+    def forward(ctx, logits, target):
+        logits = logits.float()
+        m = logits.max(dim=-1, keepdim=True).values          # [L,1]
+        shifted = logits.sub(m)                               # new [L,V]
+        exp = shifted.exp_()                                  # in-place -> exp
+        Z = exp.sum(dim=-1, keepdim=True)                     # [L,1]
+        softmax = exp.div_(Z)                                 # in-place -> softmax
+        logZ = Z.log_().add_(m)                               # logsumexp [L,1]
+        tgt_logit = logits.gather(-1, target.unsqueeze(-1))   # [L,1]
+        log_prob = (tgt_logit - logZ).squeeze(-1)             # [L]
+        ctx.save_for_backward(softmax, target)
+        return log_prob
+
+    @staticmethod
+    def backward(ctx, grad_lp):
+        softmax, target = ctx.saved_tensors                   # softmax [L,V]
+        grad = softmax.neg_()                                 # -softmax (reuse buffer)
+        grad.scatter_add_(-1, target.unsqueeze(-1), torch.ones_like(grad[:, :1]))
+        grad.mul_(grad_lp.unsqueeze(-1))
+        return grad, None
+
 
 class MegatronEngine(BaseEngine):
     """Megatron-Core GPTModel engine (Qwen3, BF16, TP=PP=1, DP=world)."""
@@ -96,6 +178,11 @@ class MegatronEngine(BaseEngine):
         cp = int(ec.get("context_parallel_size", 1))
         ep = int(ec.get("expert_model_parallel_size", 1))
         seed = int(ec.get("seed", 42))
+        # Long-sequence memory knobs (default off -> unchanged smoke behavior):
+        #   attention_backend="flash"  -> O(L) flash attn instead of O(L^2) local core
+        #   log_probs_chunk_size>0     -> memory-efficient fused/chunked token log-prob
+        self._attention_backend = str(ec.get("attention_backend") or "unfused").lower()
+        self._logprob_chunk_size = int(ec.get("log_probs_chunk_size") or 0)
 
         if not mpu.is_initialized():
             mpu.initialize_model_parallel(
@@ -117,6 +204,15 @@ class MegatronEngine(BaseEngine):
             head_dim=head_dim, ffn=hf["intermediate_size"], vocab=hf["vocab_size"],
         )
         tb.LayerNormImpl = WTN  # force torch RMSNorm (apex FusedLayerNorm lacks RMSNorm)
+        # Activation recomputation: Megatron local-spec attention (no TE flash) keeps
+        # the full O(seq^2) score matrix, so long-sequence training (resp=20480) OOMs
+        # without recompute. Off by default (smoke, short seq); enable via megatron_cfg.
+        recompute_kwargs: dict = {}
+        rc_gran = ec.get("recompute_granularity") or None
+        if rc_gran:
+            recompute_kwargs["recompute_granularity"] = rc_gran
+            recompute_kwargs["recompute_method"] = ec.get("recompute_method") or "uniform"
+            recompute_kwargs["recompute_num_layers"] = int(ec.get("recompute_num_layers") or 1)
         tfcfg = TransformerConfig(
             num_layers=hf["num_hidden_layers"], hidden_size=hf["hidden_size"],
             num_attention_heads=hf["num_attention_heads"],
@@ -129,12 +225,17 @@ class MegatronEngine(BaseEngine):
             bf16=True, params_dtype=torch.bfloat16, pipeline_dtype=torch.bfloat16,
             tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp,
             use_cpu_initialization=True,
+            **recompute_kwargs,
         )
         spec = get_gpt_layer_local_spec(qk_layernorm=True)
         spec.submodules.input_layernorm = WTN
         spec.submodules.pre_mlp_layernorm = WTN
         spec.submodules.self_attention.submodules.q_layernorm = WTN
         spec.submodules.self_attention.submodules.k_layernorm = WTN
+        if self._attention_backend == "flash":
+            # Swap the O(L^2) local core attention for flash-attn (O(L) memory).
+            spec.submodules.self_attention.submodules.core_attention = FlashSelfAttentionCore
+            logger.info("MegatronEngine[%d]: using flash-attention core (O(L) memory)", self._rank())
 
         model = GPTModel(
             config=tfcfg, transformer_layer_spec=spec, vocab_size=hf["vocab_size"],
@@ -252,6 +353,38 @@ class MegatronEngine(BaseEngine):
             return 0, 0
         return int(idx[0].item()), int(idx.numel())
 
+    # ---- memory-efficient log-prob helpers (see FlashSelfAttentionCore/#2) ----
+    def _token_logprob_train(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Per-token log-prob with grad. Uses the fused single-buffer CE (optionally
+        chunked over the sequence) when ``log_probs_chunk_size>0``; otherwise the
+        original ``log_softmax(...).gather(...)`` path (kept for the smoke config)."""
+        cs = self._logprob_chunk_size
+        if cs and cs > 0:
+            outs = []
+            for s in range(0, logits.shape[0], cs):
+                outs.append(_FusedTokenLogProb.apply(logits[s:s + cs], targets[s:s + cs]))
+            return torch.cat(outs, dim=0)
+        lp = torch.log_softmax(logits, dim=-1)
+        return lp.gather(-1, targets.view(-1, 1)).squeeze(-1)
+
+    def _logprob_entropy_nograd(
+        self, logits: torch.Tensor, targets: torch.Tensor, want_entropy: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """No-grad per-token log-prob (+ optional entropy), chunked over the
+        sequence to bound the ``[chunk, V]`` softmax memory."""
+        cs = self._logprob_chunk_size if (self._logprob_chunk_size and self._logprob_chunk_size > 0) else logits.shape[0]
+        cs = max(1, cs)
+        lps, ents = [], []
+        for s in range(0, logits.shape[0], cs):
+            lg = logits[s:s + cs]
+            lsm = torch.log_softmax(lg, dim=-1)
+            lps.append(lsm.gather(-1, targets[s:s + cs].view(-1, 1)).squeeze(-1))
+            if want_entropy:
+                ents.append(-(lsm.exp() * lsm).sum(-1))
+        lp = torch.cat(lps, dim=0)
+        ent = torch.cat(ents, dim=0) if want_entropy else None
+        return lp, ent
+
     # ---- engine-level compute_log_probs (actor delegates here) ----
     def engine_compute_log_probs(self, batch: DataProto) -> DataProto:
         seqs = batch["input_ids"]
@@ -272,12 +405,9 @@ class MegatronEngine(BaseEngine):
                     continue
                 ids = seqs[r, start:start + L].to("cuda")
                 logits = self._forward_logits(ids) / temperature  # [L,V]
-                lp = torch.log_softmax(logits[:-1], dim=-1)
-                tok_lp = lp.gather(-1, ids[1:].view(-1, 1)).squeeze(-1)  # [L-1]
+                tok_lp, ent = self._logprob_entropy_nograd(logits[:-1], ids[1:], want_ent)  # [L-1]
                 lp_out[r, start:start + L - 1] = tok_lp.cpu()
-                if want_ent:
-                    p = torch.softmax(logits[:-1], dim=-1)
-                    ent = -(p * torch.log_softmax(logits[:-1], dim=-1)).sum(-1)
+                if want_ent and ent is not None:
                     ent_out[r, start:start + L - 1] = ent.cpu()
         tensors = {"log_probs": lp_out, "input_ids": batch["input_ids"]}
         if want_ent:
@@ -325,8 +455,7 @@ class MegatronEngine(BaseEngine):
                 continue
             ids = seqs[r, start:start + L].to("cuda")
             logits = self._forward_logits(ids, model=self._ddp) / temperature  # [L,V] (grad)
-            lp = torch.log_softmax(logits[:-1], dim=-1)
-            token_lp = lp.gather(-1, ids[1:].view(-1, 1)).squeeze(-1).view(1, -1)  # [1,L-1]
+            token_lp = self._token_logprob_train(logits[:-1], ids[1:]).view(1, -1)  # [1,L-1]
             Lm = token_lp.shape[-1]
             dev = token_lp.device
 

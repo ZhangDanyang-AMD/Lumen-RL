@@ -157,6 +157,18 @@ class MegatronConfig:
     num_experts: Optional[int] = None
     moe_grouped_gemm: bool = False
     moe_use_legacy_grouped_gemm: bool = False
+    # Distributed optimizer: shard FP32 master + Adam state across DP ranks.
+    use_distributed_optimizer: bool = True
+    # Activation recomputation (gradient checkpointing). Needed for long-sequence
+    # training: the Megatron local-spec attention (no TE flash) keeps the full
+    # O(seq^2) score matrix, so resp=20480 OOMs without recompute. Defaults off.
+    recompute_granularity: Optional[str] = None  # None | "full" | "selective"
+    recompute_method: Optional[str] = None       # "uniform" | "block"
+    recompute_num_layers: Optional[int] = None
+    # Long-sequence memory: flash attention (O(L) vs local O(L^2)) + memory-efficient
+    # chunked/fused token log-prob. Both default off (unchanged smoke behavior).
+    attention_backend: str = "unfused"           # "flash" | "unfused"
+    log_probs_chunk_size: int = 0                # >0 enables fused/chunked log-prob
 
 
 @dataclass
