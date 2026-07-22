@@ -1,786 +1,452 @@
-# Copyright 2024 Bytedance Ltd. and/or its affiliates
 # Copyright 2025 LumenRL Contributors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
-# This file contains code adapted from the verl project
-# (https://github.com/verl-project/verl).
-# Original: verl/workers/engine/megatron/transformer_impl.py
 
-"""Megatron-Core training engine implementation.
+"""VIME-style Megatron-Core training engine for LumenRL (BF16, TP=1/PP=1/DP=N).
 
-Provides full Megatron-Core integration with tensor parallelism (TP),
-pipeline parallelism (PP/VPP), context parallelism (CP), expert
-parallelism (EP), and distributed optimizer support.
+Builds a real Megatron-Core ``GPTModel`` (Qwen3), loads HF weights, and runs
+the DAPO/GRPO RL step through Megatron modules -- the same training stack VIME
+uses (GPTModel + Megatron forward) -- while plugging into LumenRL's Ray
+controller via the ``BaseEngine`` interface.
+
+Scope: tensor/pipeline parallel = 1, data parallel = world size (the LumenRL
+BF16 smoke). Mixed precision uses BF16 compute with FP32 master weights; data
+parallel gradient sync is a manual mean all-reduce over the world group.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
-import random
 from contextlib import nullcontext
-from typing import Any, Callable, ContextManager, Optional
+from typing import Any
 
-import numpy as np
 import torch
 import torch.distributed as dist
-import torch.nn as nn
+import torch.nn.functional as F
 
-from lumenrl.core.config import McoreEngineConfig, OptimizerConfig
-from lumenrl.engine.training.base_engine import BaseEngine, BaseEngineCtx, EngineRegistry
+from lumenrl.algorithms.loss_functions import (
+    asymmetric_clip_loss,
+    kl_penalty,
+    policy_gradient_loss,
+)
+from lumenrl.core.protocol import DataProto
+from lumenrl.core.types import AlgorithmName
+from lumenrl.engine.training.base_engine import BaseEngine, EngineRegistry
+from lumenrl.engine.training.qwen3_megatron_bridge import (
+    Qwen3Dims,
+    hf_to_megatron,
+    load_hf_safetensors,
+    megatron_to_hf,
+)
 
 logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("LUMENRL_LOGGING_LEVEL", "WARN"))
-
-
-def _set_random_seed(seed: int) -> None:
-    """Set random seed for reproducibility across all backends."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+logger.setLevel(os.getenv("LUMENRL_LOGGING_LEVEL", "INFO"))
 
 
 class MegatronEngine(BaseEngine):
-    """Training engine backed by Megatron-Core.
+    """Megatron-Core GPTModel engine (Qwen3, BF16, TP=PP=1, DP=world)."""
 
-    Supports TP, PP (1F1B and interleaved VPP), CP, EP, sequence
-    parallelism, and distributed optimizer via Megatron's native APIs.
-
-    Requires ``megatron-core`` and ``megatron-bridge`` packages.
-    """
-
-    def __init__(
-        self,
-        model_config: Any,
-        engine_config: McoreEngineConfig | dict[str, Any],
-        optimizer_config: OptimizerConfig | dict[str, Any],
-        model_name: str = "",
-    ) -> None:
+    def __init__(self, model_config, engine_config, optimizer_config, model_name: str = ""):
         super().__init__()
-
-        self.model_config = model_config
-        self.engine_config = (
-            engine_config
-            if isinstance(engine_config, McoreEngineConfig)
-            else McoreEngineConfig(**engine_config)
-        )
+        self.model_config = model_config if isinstance(model_config, dict) else vars(model_config)
+        self.engine_config = engine_config if isinstance(engine_config, dict) else vars(engine_config)
         self.optimizer_config = (
-            optimizer_config
-            if isinstance(optimizer_config, OptimizerConfig)
-            else OptimizerConfig(**optimizer_config)
+            optimizer_config if isinstance(optimizer_config, dict) else vars(optimizer_config)
         )
-        self.model_name = model_name
-
-        self._is_offload_param = self.engine_config.param_offload
-        self._is_offload_optimizer = self.engine_config.optimizer_offload
-        self._is_offload_grad = self.engine_config.grad_offload
-
+        self.model_name = model_name or self.model_config.get("local_path", "")
+        self.module: torch.nn.Module | None = None   # unwrapped GPTModel (eval fwd, save/load)
+        self._ddp: Any = None                          # Megatron DistributedDataParallel wrapper
+        self.optimizer: Any = None                     # Megatron distributed optimizer
+        self.lr_scheduler: Any = None                  # Megatron OptimizerParamScheduler
+        self._dims: Qwen3Dims | None = None
+        self._step = 0
         self.mode: str | None = None
-        self.module: list[nn.Module] | None = None
-        self.optimizer: Any = None
-        self.lr_scheduler: Any = None
 
-        self.bridge: Any = None
-        self.tf_config: Any = None
-        self.is_value_model: bool = False
-
-        _set_random_seed(self.engine_config.seed)
-
+    # -- offload (Ray path: never offload) --
     @property
     def is_param_offload_enabled(self) -> bool:
-        return self._is_offload_param
+        return False
 
     @property
     def is_optimizer_offload_enabled(self) -> bool:
-        return self._is_offload_optimizer
+        return False
+
+    def train_mode(self, **kwargs):
+        return nullcontext()
+
+    def eval_mode(self, **kwargs):
+        return nullcontext()
 
     # ------------------------------------------------------------------
-    # Initialization
-    # ------------------------------------------------------------------
-
     def initialize(self) -> None:
-        """Build Megatron model, set up parallelism, create optimizer."""
-        self._init_device_mesh()
-        self._build_tf_config()
-        self._build_megatron_module()
-
-        if not self.engine_config.forward_only:
-            self.optimizer = self._build_optimizer()
-            self.lr_scheduler = self._build_lr_scheduler()
-
-        self.to(
-            device="cpu",
-            model=self._is_offload_param,
-            optimizer=self._is_offload_optimizer,
-            grad=self._is_offload_param,
-        )
-
-    # Adapted from verl (https://github.com/verl-project/verl)
-    # Original: verl/workers/engine/megatron/transformer_impl.py::_init_device_mesh
-    def _init_device_mesh(self) -> None:
-        """Initialize Megatron-Core parallel state with TP/PP/CP/EP."""
-        try:
-            from megatron.core import parallel_state as mpu
-        except ImportError as e:
-            raise ImportError(
-                "megatron-core is required for MegatronEngine. "
-                "Install it with: pip install megatron-core"
-            ) from e
-
-        if mpu.is_initialized():
-            return
-
-        mpu.initialize_model_parallel(
-            tensor_model_parallel_size=self.engine_config.tensor_model_parallel_size,
-            pipeline_model_parallel_size=self.engine_config.pipeline_model_parallel_size,
-            virtual_pipeline_model_parallel_size=(
-                self.engine_config.virtual_pipeline_model_parallel_size
-            ),
-            use_sharp=False,
-            context_parallel_size=self.engine_config.context_parallel_size,
-            expert_model_parallel_size=self.engine_config.expert_model_parallel_size,
-            nccl_communicator_config_path=None,
-        )
-
-    # Adapted from verl (https://github.com/verl-project/verl)
-    # Original: verl/workers/engine/megatron/transformer_impl.py::_build_tf_config
-    def _build_tf_config(self) -> None:
-        """Build Megatron TransformerConfig from HF config via megatron-bridge."""
-        try:
-            from megatron.bridge.models import AutoBridge
-        except ImportError:
-            try:
-                from megatron.core.models.bridge import AutoBridge
-            except ImportError:
-                logger.warning(
-                    "megatron-bridge not available; using stub transformer config."
-                )
-                self.tf_config = None
-                self.bridge = None
-                return
-
-        hf_model_path = self.model_name or getattr(self.model_config, "local_path", "")
-        trust_remote = getattr(self.model_config, "trust_remote_code", True)
-
-        dtype_str = self.engine_config.dtype
-        dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
-        param_dtype = dtype_map.get(dtype_str, torch.bfloat16)
-
-        bridge = AutoBridge.from_hf_pretrained(hf_model_path, trust_remote_code=trust_remote)
-        provider = bridge.to_megatron_provider(load_weights=False)
-
-        from megatron.core.transformer.enums import AttnBackend
-
-        provider_overrides = {
-            "tensor_model_parallel_size": self.engine_config.tensor_model_parallel_size,
-            "pipeline_model_parallel_size": self.engine_config.pipeline_model_parallel_size,
-            "expert_model_parallel_size": self.engine_config.expert_model_parallel_size,
-            "virtual_pipeline_model_parallel_size": (
-                self.engine_config.virtual_pipeline_model_parallel_size
-            ),
-            "context_parallel_size": self.engine_config.context_parallel_size,
-            "sequence_parallel": self.engine_config.sequence_parallel,
-            "variable_seq_lengths": True,
-            "attention_backend": AttnBackend.flash,
-            "moe_token_dispatcher_type": "alltoall",
-            "moe_router_load_balancing_type": "none",
-        }
-
-        provider.apply_overrides_and_finalize(
-            dtype=param_dtype,
-            overrides=provider_overrides,
-        )
-        self.bridge = bridge
-        self.provider = provider
-        self.tf_config = None
-        self.param_dtype = param_dtype
-
-    # Adapted from verl (https://github.com/verl-project/verl)
-    # Original: verl/workers/engine/megatron/transformer_impl.py::_build_megatron_module
-    def _build_megatron_module(self) -> None:
-        """Build and load the Megatron GPTModel, then wrap with DDP."""
+        import megatron.core.transformer.transformer_block as tb
         from megatron.core import parallel_state as mpu
+        from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+        from megatron.core.models.gpt.gpt_model import GPTModel
+        from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+        from megatron.core.transformer.torch_norm import WrappedTorchNorm as WTN
+        from megatron.core.transformer.transformer_config import TransformerConfig
 
-        if self.bridge is None:
-            from lumenrl.engine.training.megatron_backend import _MegatronStubLM
-            self.module = [_MegatronStubLM()]
-            logger.warning("MegatronEngine: using stub model (megatron-bridge not available)")
-            return
+        ec = self.engine_config
+        tp = int(ec.get("tensor_model_parallel_size", 1))
+        pp = int(ec.get("pipeline_model_parallel_size", 1))
+        cp = int(ec.get("context_parallel_size", 1))
+        ep = int(ec.get("expert_model_parallel_size", 1))
+        seed = int(ec.get("seed", 42))
 
-        hf_model_path = self.model_name or getattr(self.model_config, "local_path", "")
-        model_type = getattr(self.model_config, "model_type", "language_model")
-        self.is_value_model = model_type == "value_model"
-
-        wrap_with_ddp = not self.engine_config.forward_only
-
-        try:
-            from verl.utils.megatron_utils import McoreModuleWrapperConfig, make_megatron_module
-        except ImportError:
-            raise ImportError(
-                "verl.utils.megatron_utils is required for Megatron model construction. "
-                "Ensure verl is installed or megatron_utils is available."
+        if not mpu.is_initialized():
+            mpu.initialize_model_parallel(
+                tensor_model_parallel_size=tp,
+                pipeline_model_parallel_size=pp,
+                context_parallel_size=cp,
+                expert_model_parallel_size=ep,
             )
+        model_parallel_cuda_manual_seed(seed)
 
-        wrap_config = McoreModuleWrapperConfig(
-            is_value_model=self.is_value_model,
-            wrap_with_ddp=wrap_with_ddp,
-            use_distributed_optimizer=self.engine_config.use_distributed_optimizer,
+        # ---- HF config -> Qwen3 dims / TransformerConfig ----
+        cfg_path = os.path.join(self.model_name, "config.json")
+        with open(cfg_path) as fh:
+            hf = json.load(fh)
+        head_dim = hf.get("head_dim", hf["hidden_size"] // hf["num_attention_heads"])
+        self._dims = Qwen3Dims(
+            num_layers=hf["num_hidden_layers"], hidden=hf["hidden_size"],
+            num_heads=hf["num_attention_heads"], num_kv_groups=hf["num_key_value_heads"],
+            head_dim=head_dim, ffn=hf["intermediate_size"], vocab=hf["vocab_size"],
+        )
+        tb.LayerNormImpl = WTN  # force torch RMSNorm (apex FusedLayerNorm lacks RMSNorm)
+        tfcfg = TransformerConfig(
+            num_layers=hf["num_hidden_layers"], hidden_size=hf["hidden_size"],
+            num_attention_heads=hf["num_attention_heads"],
+            num_query_groups=hf["num_key_value_heads"], kv_channels=head_dim,
+            ffn_hidden_size=hf["intermediate_size"], gated_linear_unit=True,
+            activation_func=F.silu, add_bias_linear=False,
+            add_qkv_bias=bool(hf.get("attention_bias", False)),
+            normalization="RMSNorm", layernorm_epsilon=hf.get("rms_norm_eps", 1e-6),
+            qk_layernorm=True, hidden_dropout=0.0, attention_dropout=0.0,
+            bf16=True, params_dtype=torch.bfloat16, pipeline_dtype=torch.bfloat16,
+            tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp,
+            use_cpu_initialization=True,
+        )
+        spec = get_gpt_layer_local_spec(qk_layernorm=True)
+        spec.submodules.input_layernorm = WTN
+        spec.submodules.pre_mlp_layernorm = WTN
+        spec.submodules.self_attention.submodules.q_layernorm = WTN
+        spec.submodules.self_attention.submodules.k_layernorm = WTN
+
+        model = GPTModel(
+            config=tfcfg, transformer_layer_spec=spec, vocab_size=hf["vocab_size"],
+            max_sequence_length=hf.get("max_position_embeddings", 32768),
+            pre_process=True, post_process=True, position_embedding_type="rope",
+            rotary_base=hf.get("rope_theta", 1000000.0),
+            share_embeddings_and_output_weights=bool(hf.get("tie_word_embeddings", False)),
         )
 
-        module, updated_tf_config = make_megatron_module(
-            wrap_config=wrap_config,
-            tf_config=self.tf_config,
-            hf_config=getattr(self.model_config, "hf_config", None),
-            bridge=self.bridge,
-            provider=self.provider,
-        )
-        self.tf_config = updated_tf_config
+        # ---- load HF weights ----
+        logger.info("MegatronEngine[%d]: loading HF weights from %s", self._rank(), self.model_name)
+        hf_state = load_hf_safetensors(self.model_name)
+        meg_state = hf_to_megatron(hf_state, self._dims)
+        del hf_state
+        missing = model.load_state_dict(meg_state, strict=False)
+        real_missing = [k for k in missing.missing_keys if "_extra_state" not in k]
+        if real_missing:
+            raise RuntimeError(f"Megatron load missing keys: {real_missing[:6]} ...")
+        del meg_state
+        self.module = model.cuda().bfloat16()
+        self._tfcfg = tfcfg
 
-        allowed_mismatched = ["output_layer.weight"] if self.is_value_model else []
-        self.bridge.load_hf_weights(
-            module,
-            hf_model_path,
-            allowed_mismatched_params=allowed_mismatched,
-        )
+        # ---- Megatron DistributedDataParallel: shards optimizer state across DP ----
+        from megatron.core.distributed import DistributedDataParallel as DDP
+        from megatron.core.distributed import DistributedDataParallelConfig
+        from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+        from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 
-        self.module = module
-        if dist.get_rank() == 0:
-            total_params = sum(
-                p.numel() for m in (module if isinstance(module, list) else [module]) for p in m.parameters()
-            )
+        oc = self.optimizer_config
+        self._clip = float(oc.get("clip_grad", 1.0))
+        ddp_cfg = DistributedDataParallelConfig(
+            grad_reduce_in_fp32=True,
+            overlap_grad_reduce=False,
+            use_distributed_optimizer=True,
+            average_in_collective=True,
+            bucket_size=None,
+        )
+        self._ddp = DDP(config=tfcfg, ddp_config=ddp_cfg, module=self.module)
+
+        opt_cfg = OptimizerConfig(
+            optimizer="adam", lr=float(oc.get("lr", 1e-6)),
+            weight_decay=float(oc.get("weight_decay", 0.1)),
+            adam_beta1=0.9, adam_beta2=0.95, adam_eps=1e-8,
+            clip_grad=self._clip, bf16=True, fp16=False,
+            params_dtype=torch.bfloat16, use_distributed_optimizer=True,
+        )
+        self.optimizer = get_megatron_optimizer(opt_cfg, model_chunks=[self._ddp])
+
+        warmup = int(oc.get("lr_warmup_steps", 10))
+        base_lr = float(oc.get("lr", 1e-6))
+        wd = float(oc.get("weight_decay", 0.1))
+        self.lr_scheduler = OptimizerParamScheduler(
+            self.optimizer, init_lr=0.0, max_lr=base_lr, min_lr=base_lr,
+            lr_warmup_steps=warmup, lr_decay_steps=max(warmup + 1, 1000),
+            lr_decay_style="constant", start_wd=wd, end_wd=wd,
+            wd_incr_steps=0, wd_incr_style="constant",
+        )
+        if self._rank() == 0:
+            n = sum(p.numel() for p in self.module.parameters() if p.requires_grad)
             logger.info(
-                "MegatronEngine: built model with %d params (TP=%d PP=%d CP=%d EP=%d)",
-                total_params,
-                mpu.get_tensor_model_parallel_world_size(),
-                mpu.get_pipeline_model_parallel_world_size(),
-                getattr(mpu, "get_context_parallel_world_size", lambda: 1)(),
-                getattr(mpu, "get_expert_model_parallel_world_size", lambda: 1)(),
+                "MegatronEngine: model+distributed-optimizer ready, %d params, dp_size=%d",
+                n, self.get_data_parallel_size(),
             )
 
-    def _build_optimizer(self) -> Any:
-        """Create optimizer for Megatron module."""
-        cfg = self.optimizer_config
-        if self.module is None:
-            return None
-
-        params = []
-        modules = self.module if isinstance(self.module, list) else [self.module]
-        for m in modules:
-            params.extend(p for p in m.parameters() if p.requires_grad)
-
-        if cfg.optimizer_type == "adamw":
-            return torch.optim.AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
-        raise NotImplementedError(f"Unsupported optimizer: {cfg.optimizer_type}")
-
-    def _build_lr_scheduler(self) -> Any:
-        if self.optimizer is None:
-            return None
-        from lumenrl.utils.lr_scheduler import (
-            get_constant_schedule_with_warmup,
-            get_cosine_schedule_with_warmup,
-        )
-        cfg = self.optimizer_config
-        num_warmup = cfg.lr_warmup_steps
-        if num_warmup <= 0:
-            num_warmup = int(cfg.lr_warmup_steps_ratio * cfg.total_training_steps)
-        if cfg.lr_scheduler_type == "constant":
-            return get_constant_schedule_with_warmup(self.optimizer, num_warmup)
-        elif cfg.lr_scheduler_type == "cosine":
-            return get_cosine_schedule_with_warmup(
-                self.optimizer,
-                num_warmup,
-                cfg.total_training_steps,
-                min_lr_ratio=cfg.min_lr_ratio,
-                num_cycles=cfg.num_cycles,
-            )
-        raise NotImplementedError(f"LR scheduler type {cfg.lr_scheduler_type} not supported")
-
     # ------------------------------------------------------------------
-    # Mode context managers
-    # ------------------------------------------------------------------
-
-    def train_mode(self, **kwargs) -> ContextManager:
-        return _MegatronTrainModeCtx(self, **kwargs)
-
-    def eval_mode(self, **kwargs) -> ContextManager:
-        return _MegatronEvalModeCtx(self, **kwargs)
-
-    # ------------------------------------------------------------------
-    # Data-parallel helpers
-    # ------------------------------------------------------------------
-
-    def get_data_parallel_rank(self) -> int:
-        try:
-            from megatron.core import parallel_state as mpu
-            return mpu.get_data_parallel_rank()
-        except (ImportError, AssertionError):
-            return dist.get_rank() if dist.is_initialized() else 0
+    def _rank(self) -> int:
+        return dist.get_rank() if dist.is_initialized() else 0
 
     def get_data_parallel_size(self) -> int:
         try:
             from megatron.core import parallel_state as mpu
             return mpu.get_data_parallel_world_size()
-        except (ImportError, AssertionError):
+        except Exception:
             return dist.get_world_size() if dist.is_initialized() else 1
+
+    def get_data_parallel_rank(self) -> int:
+        try:
+            from megatron.core import parallel_state as mpu
+            return mpu.get_data_parallel_rank()
+        except Exception:
+            return self._rank()
 
     def get_data_parallel_group(self):
         try:
             from megatron.core import parallel_state as mpu
             return mpu.get_data_parallel_group()
-        except (ImportError, AssertionError):
+        except Exception:
             return dist.group.WORLD if dist.is_initialized() else None
 
     def is_mp_src_rank_with_outputs(self) -> bool:
-        """True only on the last PP stage's TP rank 0."""
-        try:
-            from megatron.core import parallel_state as mpu
-            is_last_pp = mpu.is_pipeline_last_stage()
-            tp_rank = mpu.get_tensor_model_parallel_rank()
-            return is_last_pp and tp_rank == 0
-        except (ImportError, AssertionError):
-            return True
+        return True
+
+    def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True) -> None:
+        return
 
     # ------------------------------------------------------------------
-    # Forward / backward (with Pipeline Parallelism)
-    # ------------------------------------------------------------------
+    def _forward_logits(self, ids: torch.Tensor, model=None) -> torch.Tensor:
+        """Run the model on a single unpadded sequence -> logits [L, V] (float).
 
-    # Adapted from verl (https://github.com/verl-project/verl)
-    # Original: verl/workers/engine/megatron/transformer_impl.py::forward_backward_batch
-    def forward_backward_batch(
-        self,
-        data: dict[str, Any],
-        loss_function: Callable,
-        forward_only: bool = False,
-    ) -> dict[str, Any]:
-        """Run forward/backward across micro-batches using Megatron's PP scheduler.
-
-        Uses ``get_forward_backward_func()`` which handles 1F1B scheduling
-        for PP>1 and interleaved scheduling for VPP.
+        ``model`` defaults to the unwrapped GPTModel (eval); pass ``self._ddp``
+        during training so DDP grad hooks fire and grads land in the buffer.
         """
-        from megatron.core import parallel_state as mpu
-        from megatron.core.pipeline_parallel import get_forward_backward_func
+        m = model if model is not None else self.module
+        L = ids.numel()
+        inp = ids.view(1, L)
+        pos = torch.arange(L, device=ids.device).view(1, L)
+        out = m(input_ids=inp, position_ids=pos, attention_mask=None)
+        logits = out.logits if hasattr(out, "logits") else out
+        return logits.view(L, -1).float()
 
-        micro_batches = self._prepare_micro_batches(data)
-        num_microbatches = len(micro_batches)
+    @staticmethod
+    def _real_block(mask_row: torch.Tensor) -> tuple[int, int]:
+        idx = mask_row.nonzero(as_tuple=False).squeeze(-1)
+        if idx.numel() == 0:
+            return 0, 0
+        return int(idx[0].item()), int(idx.numel())
 
-        pp_size = mpu.get_pipeline_model_parallel_world_size()
+    # ---- engine-level compute_log_probs (actor delegates here) ----
+    def engine_compute_log_probs(self, batch: DataProto) -> DataProto:
+        seqs = batch["input_ids"]
+        B, S = seqs.shape
+        am = batch.tensors.get("attention_mask")
+        if am is None:
+            am = torch.ones_like(seqs)
+        want_ent = bool(batch.meta.get("calculate_entropy", False))
+        temperature = float(batch.meta.get("temperature", 1.0) or 1.0)
 
-        if pp_size <= 1:
-            return self._forward_backward_no_pp(
-                micro_batches, loss_function, forward_only,
-            )
+        lp_out = torch.zeros(B, S, dtype=torch.float32)
+        ent_out = torch.zeros(B, S, dtype=torch.float32) if want_ent else None
+        self.module.eval()
+        with torch.no_grad():
+            for r in range(B):
+                start, L = self._real_block(am[r])
+                if L < 2:
+                    continue
+                ids = seqs[r, start:start + L].to("cuda")
+                logits = self._forward_logits(ids) / temperature  # [L,V]
+                lp = torch.log_softmax(logits[:-1], dim=-1)
+                tok_lp = lp.gather(-1, ids[1:].view(-1, 1)).squeeze(-1)  # [L-1]
+                lp_out[r, start:start + L - 1] = tok_lp.cpu()
+                if want_ent:
+                    p = torch.softmax(logits[:-1], dim=-1)
+                    ent = -(p * torch.log_softmax(logits[:-1], dim=-1)).sum(-1)
+                    ent_out[r, start:start + L - 1] = ent.cpu()
+        tensors = {"log_probs": lp_out, "input_ids": batch["input_ids"]}
+        if want_ent:
+            tensors["entropy"] = ent_out
+        return DataProto(tensors=tensors, meta=dict(batch.meta))
 
-        vpp_size = self.engine_config.virtual_pipeline_model_parallel_size or 1
-        batch_gen = _make_batch_generator(micro_batches, vpp_size)
+    # ---- engine-level DAPO/GRPO update (actor delegates here) ----
+    def engine_update_policy(self, batch: DataProto) -> dict[str, float]:
+        if batch.batch_size == 0:
+            return {"loss": 0.0, "lr": self._cur_lr(), "grad_norm": 0.0}
+        meta = dict(batch.meta)
+        algo_name = str(meta.get("algorithm", "dapo")).lower()
+        temperature = float(meta.get("temperature", 1.0) or 1.0)
+        bnt = meta.get("batch_num_tokens")
+        dp = int(meta.get("dp_size", self.get_data_parallel_size()) or 1)
+        algo_cfg_full = meta.get("algo_config", {}) or {}
+        _sub = algo_cfg_full.get(algo_name)
+        _sub = _sub if isinstance(_sub, dict) else {}
 
-        forward_backward_func = get_forward_backward_func()
+        def _cfg(key, default):
+            v = _sub.get(key, algo_cfg_full.get(key, default))
+            return default if v is None else v
 
-        def forward_step_func(data_iterator, model):
-            mb = next(data_iterator)
-            return self.forward_step(mb, loss_function, forward_only)
+        t = batch.tensors
+        seqs = t["input_ids"]
+        am = t.get("attention_mask")
+        if am is None:
+            am = torch.ones_like(seqs)
+        B, S = seqs.shape
 
-        losses = forward_backward_func(
-            forward_step_func=forward_step_func,
-            data_iterator=batch_gen,
-            model=self.module,
-            num_microbatches=num_microbatches,
-            forward_only=forward_only,
-            seq_length=data.get("seq_length", 1),
-            micro_batch_size=micro_batches[0]["input_ids"].shape[0] if micro_batches else 1,
-        )
+        self.module.train()
+        self._ddp.zero_grad_buffer()
+        self.optimizer.zero_grad()
 
-        return self._postprocess_pp_outputs(losses)
+        loss_accum = 0.0
+        ppo_kl_sum = 0.0
+        ppo_kl_tok = 0.0
+        rc_kl_sum = 0.0
+        rc_kl_tok = 0.0
+        n_rows = 0
 
-    def _forward_backward_no_pp(
-        self,
-        micro_batches: list[dict[str, Any]],
-        loss_function: Callable,
-        forward_only: bool,
-    ) -> dict[str, Any]:
-        """Simple forward/backward without pipeline parallelism."""
-        output_lst: list[dict] = []
-        ctx = torch.no_grad() if forward_only else nullcontext()
+        for r in range(B):
+            start, L = self._real_block(am[r])
+            if L < 2:
+                continue
+            ids = seqs[r, start:start + L].to("cuda")
+            logits = self._forward_logits(ids, model=self._ddp) / temperature  # [L,V] (grad)
+            lp = torch.log_softmax(logits[:-1], dim=-1)
+            token_lp = lp.gather(-1, ids[1:].view(-1, 1)).squeeze(-1).view(1, -1)  # [1,L-1]
+            Lm = token_lp.shape[-1]
+            dev = token_lp.device
 
-        for mb in micro_batches:
-            with ctx:
-                loss, meta = self.forward_step(mb, loss_function, forward_only)
-                if not forward_only:
-                    loss.backward()
-            output_lst.append(meta)
+            def _col(name, shift):
+                x = t.get(name)
+                if x is None:
+                    return None
+                x = x[r].to(dev)
+                s0 = start + (1 if shift else 0)
+                return x[s0:].reshape(1, -1)
 
-        return self._postprocess_batch(output_lst)
-
-    def forward_step(
-        self,
-        micro_batch: dict[str, Any],
-        loss_function: Callable,
-        forward_only: bool,
-    ) -> tuple[torch.Tensor, dict]:
-        """Single micro-batch forward pass."""
-        modules = self.module if isinstance(self.module, list) else [self.module]
-        model = modules[0] if len(modules) == 1 else modules[-1]
-
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        input_ids = micro_batch["input_ids"].to(device)
-        attention_mask = micro_batch.get("attention_mask")
-        position_ids = micro_batch.get("position_ids")
-
-        model_kwargs: dict[str, Any] = {"input_ids": input_ids}
-        if attention_mask is not None:
-            model_kwargs["attention_mask"] = attention_mask.to(device)
-        if position_ids is not None:
-            model_kwargs["position_ids"] = position_ids.to(device)
-
-        raw_output = model(**model_kwargs)
-        logits = raw_output.logits if hasattr(raw_output, "logits") else raw_output
-
-        model_output = self._prepare_model_outputs(logits, input_ids, micro_batch)
-
-        if loss_function is not None:
-            loss, metrics = loss_function(model_output=model_output, data=micro_batch)
-        else:
-            assert forward_only
-            loss = torch.tensor(0.0, device=device)
-            metrics = {}
-
-        meta = {
-            "model_output": model_output,
-            "loss": loss.detach().item(),
-            "metrics": metrics,
-        }
-        return loss, meta
-
-    def _prepare_model_outputs(
-        self,
-        logits: torch.Tensor,
-        input_ids: torch.Tensor,
-        micro_batch: dict[str, Any],
-    ) -> dict[str, torch.Tensor]:
-        from lumenrl.utils.torch_functional import (
-            calculate_sum_pi_squared_from_logits,
-            entropy_from_logits,
-            logprobs_from_logits,
-        )
-
-        shift_logits = logits[:, :-1].contiguous()
-        shift_labels = input_ids[:, 1:].contiguous()
-
-        log_probs = logprobs_from_logits(shift_logits, shift_labels)
-        result: dict[str, torch.Tensor] = {"log_probs": log_probs}
-
-        meta = micro_batch.get("meta", {}) if isinstance(micro_batch, dict) else {}
-        if meta.get("calculate_entropy", False):
-            result["entropy"] = entropy_from_logits(shift_logits)
-        if meta.get("calculate_sum_pi_squared", False):
-            result["sum_pi_squared"] = calculate_sum_pi_squared_from_logits(shift_logits)
-
-        return result
-
-    def _prepare_micro_batches(self, data: dict[str, Any]) -> list[dict[str, Any]]:
-        micro_batch_size = data.get("micro_batch_size")
-        if micro_batch_size is not None and micro_batch_size > 0:
-            input_ids = data["input_ids"]
-            total = input_ids.shape[0]
-            batches = []
-            for start in range(0, total, micro_batch_size):
-                end = min(start + micro_batch_size, total)
-                mb = {
-                    k: v[start:end] if isinstance(v, torch.Tensor) else v
-                    for k, v in data.items()
-                }
-                batches.append(mb)
-            return batches
-        return [data]
-
-    def _postprocess_batch(self, output_lst: list[dict]) -> dict[str, Any]:
-        model_output: dict[str, list] = {}
-        losses: list[float] = []
-        aggregated_metrics: dict[str, list] = {}
-
-        for o in output_lst:
-            if "model_output" in o:
-                for key, val in o["model_output"].items():
-                    model_output.setdefault(key, []).append(val)
-            if "loss" in o:
-                losses.append(o["loss"])
-            if "metrics" in o:
-                for key, val in o["metrics"].items():
-                    aggregated_metrics.setdefault(key, []).append(val)
-
-        concat_output: dict[str, torch.Tensor] = {}
-        for key, vals in model_output.items():
-            if all(isinstance(v, torch.Tensor) for v in vals):
-                concat_output[key] = torch.cat(vals, dim=0)
+            old_lp = _col("old_log_probs", shift=False)
+            if old_lp is None:
+                continue
+            resp_mask = _col("response_mask", shift=True)
+            adv_t = t.get("advantages")
+            if adv_t is None:
+                continue
+            if adv_t.dim() == 1:
+                adv = adv_t[r].to(dev).view(1, 1).expand(1, Lm).float()
             else:
-                concat_output[key] = vals
+                adv = adv_t[r].to(dev)[start + 1:].reshape(1, -1).float()
+            ris = _col("rollout_is_weights", shift=False)
+            ref_lp0 = _col("ref_log_probs", shift=False)
+            rlp0 = _col("rollout_log_probs", shift=False)
 
-        return {
-            "model_output": concat_output,
-            "loss": losses,
-            "metrics": aggregated_metrics,
+            # Align every per-token tensor + token_lp to their common min length
+            # (rollout tensors can differ by one at the sequence boundary).
+            cand = [token_lp, old_lp, adv]
+            for v in (resp_mask, ris, ref_lp0, rlp0):
+                if v is not None:
+                    cand.append(v)
+            Le = min(v.shape[-1] for v in cand)
+            token_lp = token_lp[..., :Le]
+            old_lp = old_lp[..., :Le]
+            adv = adv[..., :Le]
+            mask = resp_mask[..., :Le].float() if resp_mask is not None else None
+            ris = ris[..., :Le] if ris is not None else None
+            ref_lp = ref_lp0[..., :Le] if ref_lp0 is not None else None
+            rlp = rlp0[..., :Le] if rlp0 is not None else None
+
+            if algo_name == AlgorithmName.DAPO.value:
+                loss = asymmetric_clip_loss(
+                    token_lp, old_lp, adv,
+                    float(_cfg("clip_ratio_low", 0.2)), float(_cfg("clip_ratio_high", 0.28)),
+                    mask=mask, clip_ratio_c=float(_cfg("clip_ratio_c", 0.0)),
+                    batch_num_tokens=bnt, dp_size=dp, rollout_is_weights=ris,
+                )
+            else:
+                loss = policy_gradient_loss(
+                    token_lp, old_lp, adv, float(_cfg("clip_ratio", 0.2)), mask=mask,
+                )
+            kl_c = float(_cfg("kl_coeff", 0.0))
+            if kl_c > 0.0 and ref_lp is not None:
+                loss = loss + kl_c * kl_penalty(token_lp, ref_lp, mask=mask)
+
+            loss.backward()
+            loss_accum += float(loss.detach())
+            n_rows += 1
+            if mask is not None:
+                with torch.no_grad():
+                    tok = float(mask.sum())
+                    ppo_kl_sum += float(((old_lp - token_lp) * mask).sum())
+                    ppo_kl_tok += tok
+                    if rlp is not None:
+                        rc_kl_sum += float(((rlp - token_lp) * mask).sum())
+                        rc_kl_tok += tok
+
+        grad_norm = self._optimizer_step()
+        lr = self._sched_step()
+        metrics = {
+            "loss": loss_accum / max(1, n_rows),
+            "lr": lr,
+            "grad_norm": grad_norm,
         }
+        if ppo_kl_tok > 0:
+            metrics["ppo_kl_sum"] = ppo_kl_sum
+            metrics["ppo_kl_tok"] = ppo_kl_tok
+        if rc_kl_tok > 0:
+            metrics["rollout_corr_kl_sum"] = rc_kl_sum
+            metrics["rollout_corr_kl_tok"] = rc_kl_tok
+        return metrics
 
-    def _postprocess_pp_outputs(self, losses: Any) -> dict[str, Any]:
-        """Postprocess outputs from Megatron's PP forward_backward_func."""
-        if self.is_mp_src_rank_with_outputs() and losses:
-            avg_loss = sum(float(l) for l in losses) / len(losses) if losses else 0.0
-        else:
-            avg_loss = 0.0
-        return {
-            "model_output": {},
-            "loss": [avg_loss],
-            "metrics": {},
-        }
+    def _optimizer_step(self) -> float:
+        """Reduce grads across DP (+reduce-scatter for the distributed optimizer),
+        then step the Megatron distributed optimizer."""
+        from megatron.core.distributed import finalize_model_grads
+        finalize_model_grads([self._ddp])
+        update_successful, grad_norm, _num_zeros = self.optimizer.step()
+        if not update_successful:
+            logger.warning("optimizer.step reported update_successful=False")
+        return float(grad_norm) if grad_norm is not None else 0.0
 
-    # ------------------------------------------------------------------
-    # Optimizer / LR
-    # ------------------------------------------------------------------
+    def _cur_lr(self) -> float:
+        try:
+            return float(self.optimizer.param_groups[0]["lr"])
+        except Exception:
+            return 0.0
 
-    def optimizer_zero_grad(self) -> None:
-        if self.optimizer is not None:
-            self.optimizer.zero_grad(set_to_none=True)
-
-    def optimizer_step(self) -> float:
-        assert self.optimizer is not None
-        clip = self.optimizer_config.clip_grad
-
-        modules = self.module if isinstance(self.module, list) else [self.module]
-        params = [p for m in modules for p in m.parameters() if p.grad is not None]
-        grad_norm = torch.nn.utils.clip_grad_norm_(params, max_norm=clip)
-
-        if not torch.isfinite(grad_norm):
-            logger.warning("grad_norm is not finite: %s — skipping update", grad_norm)
-            self.optimizer.zero_grad(set_to_none=True)
-        else:
-            self.optimizer.step()
-
-        return float(grad_norm)
+    def _sched_step(self) -> float:
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step(increment=1)
+        return self._cur_lr()
 
     def lr_scheduler_step(self) -> float:
-        if self.lr_scheduler is not None:
-            self.lr_scheduler.step()
-            return self.lr_scheduler.get_last_lr()[0]
-        return 0.0
+        return self._cur_lr()
 
-    # ------------------------------------------------------------------
-    # Offload / device movement
-    # ------------------------------------------------------------------
-
-    def to(
-        self,
-        device: str,
-        model: bool = True,
-        optimizer: bool = True,
-        grad: bool = True,
-    ) -> None:
-        super().to(device=device, model=model, optimizer=optimizer, grad=grad)
-        if self.module is None:
-            return
-
-        modules = self.module if isinstance(self.module, list) else [self.module]
-
-        if device in ("cuda", "gpu"):
-            if model:
-                for m in modules:
-                    m.cuda()
-            if optimizer and self.optimizer is not None:
-                for state in self.optimizer.state.values():
-                    for k, v in state.items():
-                        if isinstance(v, torch.Tensor):
-                            state[k] = v.cuda()
-        elif device == "cpu":
-            if model:
-                for m in modules:
-                    m.cpu()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            if optimizer and self.optimizer is not None:
-                for state in self.optimizer.state.values():
-                    for k, v in state.items():
-                        if isinstance(v, torch.Tensor):
-                            state[k] = v.to("cpu", non_blocking=True)
-
-    # ------------------------------------------------------------------
-    # Checkpoint
-    # ------------------------------------------------------------------
-
-    def save_checkpoint(
-        self,
-        local_path: str,
-        global_step: int = 0,
-        max_ckpt_to_keep: Optional[int] = None,
-        **kwargs: Any,
-    ) -> None:
-        assert self.module is not None
-        if self._is_offload_param:
-            self.to("cuda", model=True, optimizer=False, grad=False)
-
-        modules = self.module if isinstance(self.module, list) else [self.module]
-        state: dict[str, Any] = {
-            "global_step": global_step,
-        }
-        for i, m in enumerate(modules):
-            state[f"model_{i}"] = m.state_dict()
-        if self.optimizer is not None:
-            state["optimizer"] = self.optimizer.state_dict()
-        if self.lr_scheduler is not None:
-            state["lr_scheduler"] = self.lr_scheduler.state_dict()
-
-        save_path = os.path.join(local_path, f"step_{global_step}")
-        os.makedirs(save_path, exist_ok=True)
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        torch.save(state, os.path.join(save_path, f"rank_{rank}.pt"))
-
-        if dist.is_initialized():
-            dist.barrier()
-
-        if self._is_offload_param:
-            self.to("cpu", model=True, optimizer=False, grad=False)
-
-    def load_checkpoint(self, local_path: str, **kwargs: Any) -> None:
-        assert self.module is not None
-        if self._is_offload_param:
-            self.to("cuda", model=True, optimizer=False, grad=False)
-
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        ckpt_path = os.path.join(local_path, f"rank_{rank}.pt")
-        if not os.path.exists(ckpt_path):
-            logger.warning("Checkpoint not found: %s", ckpt_path)
-            return
-
-        state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        modules = self.module if isinstance(self.module, list) else [self.module]
-        for i, m in enumerate(modules):
-            key = f"model_{i}"
-            if key in state:
-                m.load_state_dict(state[key])
-        if self.optimizer is not None and "optimizer" in state:
-            self.optimizer.load_state_dict(state["optimizer"])
-        if self.lr_scheduler is not None and "lr_scheduler" in state:
-            self.lr_scheduler.load_state_dict(state["lr_scheduler"])
-
-        if dist.is_initialized():
-            dist.barrier()
-
-        if self._is_offload_param:
-            self.to("cpu", model=True, optimizer=False, grad=False)
-
-    # ------------------------------------------------------------------
-    # Weight sync
-    # ------------------------------------------------------------------
-
+    # ---- weight sync: Megatron -> HF named tensors ----
     def get_per_tensor_param(self, **kwargs):
-        """Export model weights, optionally converting to HF format via bridge."""
         assert self.module is not None
-
-        if self._is_offload_param:
-            self.to("cuda", model=True, optimizer=False, grad=False)
-
-        modules = self.module if isinstance(self.module, list) else [self.module]
-
-        if self.bridge is not None and hasattr(self.bridge, "export_hf_weights"):
-            hf_state = self.bridge.export_hf_weights(modules)
-            if self._is_offload_param:
-                self.to("cpu", model=True, optimizer=False, grad=False)
-            return hf_state.items(), None
-
-        combined = {}
-        for i, m in enumerate(modules):
-            for name, param in m.state_dict().items():
-                combined[f"module_{i}.{name}"] = param
-        if self._is_offload_param:
-            self.to("cpu", model=True, optimizer=False, grad=False)
-        return combined.items(), None
-
-    def disable_adapter(self) -> ContextManager:
-        modules = self.module if isinstance(self.module, list) else [self.module]
-        if hasattr(modules[0], "disable_adapter"):
-            return modules[0].disable_adapter()
-        return nullcontext()
-
-
-# ------------------------------------------------------------------
-# Registered engine variants
-# ------------------------------------------------------------------
+        named = [(n, p.detach()) for n, p in self.module.named_parameters()]
+        gen = megatron_to_hf(named, self._dims)
+        return gen, None
 
 
 @EngineRegistry.register(model_type="language_model", backend="megatron")
 class MegatronEngineWithLMHead(MegatronEngine):
-    """Language-model variant for Megatron backend."""
     pass
 
 
 @EngineRegistry.register(model_type="value_model", backend="megatron")
 class MegatronEngineWithValueHead(MegatronEngine):
-    """Value-model variant for Megatron backend."""
     pass
-
-
-# ------------------------------------------------------------------
-# Mode context managers
-# ------------------------------------------------------------------
-
-
-class _MegatronTrainModeCtx(BaseEngineCtx):
-    def __init__(self, engine: MegatronEngine, **kwargs):
-        super().__init__(engine=engine, mode="train", **kwargs)
-
-    def __enter__(self):
-        super().__enter__()
-        modules = self.engine.module
-        if modules is not None:
-            for m in (modules if isinstance(modules, list) else [modules]):
-                m.train()
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.engine.optimizer_zero_grad()
-        super().__exit__(exc_type, exc_val, exc_tb)
-
-
-class _MegatronEvalModeCtx(BaseEngineCtx):
-    def __init__(self, engine: MegatronEngine, **kwargs):
-        super().__init__(engine=engine, mode="eval", **kwargs)
-
-    def __enter__(self):
-        super().__enter__()
-        modules = self.engine.module
-        if modules is not None:
-            for m in (modules if isinstance(modules, list) else [modules]):
-                m.eval()
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        super().__exit__(exc_type, exc_val, exc_tb)
-
-
-# ------------------------------------------------------------------
-# PP utilities
-# ------------------------------------------------------------------
-
-
-def _make_batch_generator(
-    micro_batches: list[dict[str, Any]],
-    vpp_size: int = 1,
-):
-    """Create a data iterator compatible with Megatron's PP scheduler."""
-    idx = 0
-
-    def gen():
-        nonlocal idx
-        while idx < len(micro_batches):
-            yield micro_batches[idx]
-            idx += 1
-
-    return iter(gen())

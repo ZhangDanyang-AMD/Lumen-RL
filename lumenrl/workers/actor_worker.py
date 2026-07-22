@@ -190,6 +190,10 @@ class LumenActorWorker(BaseWorker):
         if "input_ids" not in batch.tensors:
             raise KeyError("batch must contain 'input_ids'")
 
+        # Megatron backend owns its own (GPTModel) forward + logprob path.
+        if hasattr(self._engine, "engine_compute_log_probs"):
+            return self._engine.engine_compute_log_probs(batch)
+
         from lumenrl.engine.training.packing import (
             PackingContext,
             pack_sequences,
@@ -408,6 +412,10 @@ class LumenActorWorker(BaseWorker):
             raise RuntimeError("init_model() must be called before update_policy().")
         if batch.batch_size == 0:
             return {"loss": 0.0}
+
+        # Megatron backend owns its own (GPTModel) forward-backward + DAPO loss.
+        if hasattr(self._engine, "engine_update_policy"):
+            return self._engine.engine_update_policy(batch)
 
         data: dict[str, Any] = {k: v for k, v in batch.tensors.items()}
         # verl-aligned packed (remove-padding + varlen) training forward: the
