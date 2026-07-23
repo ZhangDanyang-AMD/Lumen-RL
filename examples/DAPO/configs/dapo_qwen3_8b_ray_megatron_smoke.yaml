@@ -46,6 +46,9 @@ policy:
       #   flash attention (O(L) vs local O(L^2)) + memory-efficient chunked log-prob.
       attention_backend: flash
       log_probs_chunk_size: 1024
+      # Dynamic-batch packing (concat sequences into one flash_attn_varlen forward).
+      enable_dynamic_batch: true
+      max_tokens_per_gpu: 2048
     fsdp_cfg:
       # 256GB MI300X: keep params/optimizer resident (offload has an FSDP2
       # CPU-offload validation edge case under the Ray path; not needed at 8B).

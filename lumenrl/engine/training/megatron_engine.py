@@ -49,8 +49,10 @@ import math  # noqa: E402
 
 try:
     from flash_attn import flash_attn_func as _flash_attn_func
+    from flash_attn import flash_attn_varlen_func as _flash_attn_varlen_func
 except Exception:  # pragma: no cover - flash_attn optional
     _flash_attn_func = None
+    _flash_attn_varlen_func = None
 
 
 class FlashSelfAttentionCore(torch.nn.Module):
@@ -86,7 +88,21 @@ class FlashSelfAttentionCore(torch.nn.Module):
 
     def forward(self, query, key, value, attention_mask=None, attn_mask_type=None,
                 attention_bias=None, packed_seq_params=None):
-        # Megatron layout [s, b, h, d] -> flash layout [b, s, h, d]
+        # ---- packed varlen (thd): multiple concatenated sequences, one forward ----
+        if packed_seq_params is not None and getattr(packed_seq_params, "qkv_format", None) == "thd":
+            if _flash_attn_varlen_func is None:
+                raise ImportError("dynamic-batch packing needs flash_attn.flash_attn_varlen_func")
+            cu = packed_seq_params.cu_seqlens_q
+            mx = int(packed_seq_params.max_seqlen_q)
+            # Megatron sbhd with b=1: [T, 1, h, d] -> thd [T, h, d]
+            q = query.squeeze(1)
+            k = key.squeeze(1)
+            v = value.squeeze(1)
+            out = _flash_attn_varlen_func(
+                q, k, v, cu, cu, mx, mx, causal=True, softmax_scale=self.softmax_scale,
+            )  # [T, np, hn]
+            return out.reshape(out.shape[0], 1, -1)  # [T, 1, np*hn]
+        # ---- single unpadded sequence: Megatron layout [s,b,h,d] -> flash [b,s,h,d] ----
         q = query.transpose(0, 1)
         k = key.transpose(0, 1)
         v = value.transpose(0, 1)
@@ -183,6 +199,13 @@ class MegatronEngine(BaseEngine):
         #   log_probs_chunk_size>0     -> memory-efficient fused/chunked token log-prob
         self._attention_backend = str(ec.get("attention_backend") or "unfused").lower()
         self._logprob_chunk_size = int(ec.get("log_probs_chunk_size") or 0)
+        # Dynamic-batch packing: concat multiple sequences into one varlen forward
+        # (flash_attn_varlen + cu_seqlens) to keep GEMMs full on short sequences.
+        self._dynamic_batch = bool(ec.get("enable_dynamic_batch") or False)
+        self._max_tokens_per_gpu = int(ec.get("max_tokens_per_gpu") or 0)
+        if self._dynamic_batch and self._attention_backend != "flash":
+            # varlen packing requires the flash core; auto-enable it.
+            self._attention_backend = "flash"
 
         if not mpu.is_initialized():
             mpu.initialize_model_parallel(
@@ -346,6 +369,57 @@ class MegatronEngine(BaseEngine):
         logits = out.logits if hasattr(out, "logits") else out
         return logits.view(L, -1).float()
 
+    def _forward_logits_packed(self, ids_list, model=None) -> tuple[torch.Tensor, list[int]]:
+        """Packed varlen forward: concat ``ids_list`` (per-sequence 1D token tensors)
+        into one [1,T] stream and run a single GPTModel forward with thd
+        ``PackedSeqParams``. Returns ``(logits [T,V] float, offsets)`` where
+        ``offsets[i]:offsets[i+1]`` slices sequence ``i``'s logits.
+
+        Rotary is applied per-segment by Megatron's thd path (via cu_seqlens);
+        attention is isolated per-segment by flash_attn_varlen. So each sequence's
+        logits are identical to a standalone forward (up to bf16 nondeterminism)."""
+        from megatron.core.packed_seq_params import PackedSeqParams
+        m = model if model is not None else self.module
+        lens = [int(t.numel()) for t in ids_list]
+        offsets = [0]
+        for L in lens:
+            offsets.append(offsets[-1] + L)
+        T = offsets[-1]
+        tokens = torch.cat([t.view(-1) for t in ids_list], dim=0).view(1, T)
+        # per-segment position ids (0..L_i-1); ignored by thd rotary but kept correct.
+        pos = torch.cat([torch.arange(L, device=tokens.device) for L in lens], dim=0).view(1, T)
+        cu = torch.tensor(offsets, dtype=torch.int32, device=tokens.device)
+        max_seqlen = max(lens) if lens else 0
+        pp = PackedSeqParams(
+            cu_seqlens_q=cu, cu_seqlens_kv=cu,
+            max_seqlen_q=max_seqlen, max_seqlen_kv=max_seqlen, qkv_format="thd",
+        )
+        out = m(input_ids=tokens, position_ids=pos, attention_mask=None, packed_seq_params=pp)
+        logits = out.logits if hasattr(out, "logits") else out
+        return logits.view(T, -1).float(), offsets
+
+    def _build_bins(self, lengths: list[int], budget: int) -> list[list[int]]:
+        """Greedy bin-packing of row indices into groups whose summed token length
+        stays <= ``budget`` (a row longer than budget forms its own bin)."""
+        if budget <= 0:
+            budget = max(lengths) if lengths else 1
+        order = sorted(range(len(lengths)), key=lambda i: -lengths[i])
+        bins: list[list[int]] = []
+        bin_tokens: list[int] = []
+        for i in order:
+            Li = lengths[i]
+            placed = False
+            for b in range(len(bins)):
+                if bin_tokens[b] + Li <= budget:
+                    bins[b].append(i)
+                    bin_tokens[b] += Li
+                    placed = True
+                    break
+            if not placed:
+                bins.append([i])
+                bin_tokens.append(Li)
+        return bins
+
     @staticmethod
     def _real_block(mask_row: torch.Tensor) -> tuple[int, int]:
         idx = mask_row.nonzero(as_tuple=False).squeeze(-1)
@@ -385,6 +459,76 @@ class MegatronEngine(BaseEngine):
         ent = torch.cat(ents, dim=0) if want_entropy else None
         return lp, ent
 
+    def _row_policy_loss(self, t, r, start, token_lp, algo_name, cfg_fn, bnt, dp):
+        """DAPO/PG loss + PPO-KL metrics for one sequence, given its (grad-carrying)
+        per-token log-prob ``token_lp`` [1, Lm]. Returns ``(loss_tensor|None, stats|None)``.
+        Shared by the packed and per-row training paths."""
+        Lm = token_lp.shape[-1]
+        dev = token_lp.device
+
+        def _col(name, shift):
+            x = t.get(name)
+            if x is None:
+                return None
+            x = x[r].to(dev)
+            s0 = start + (1 if shift else 0)
+            return x[s0:].reshape(1, -1)
+
+        old_lp = _col("old_log_probs", shift=False)
+        if old_lp is None:
+            return None, None
+        resp_mask = _col("response_mask", shift=True)
+        adv_t = t.get("advantages")
+        if adv_t is None:
+            return None, None
+        if adv_t.dim() == 1:
+            adv = adv_t[r].to(dev).view(1, 1).expand(1, Lm).float()
+        else:
+            adv = adv_t[r].to(dev)[start + 1:].reshape(1, -1).float()
+        ris = _col("rollout_is_weights", shift=False)
+        ref_lp0 = _col("ref_log_probs", shift=False)
+        rlp0 = _col("rollout_log_probs", shift=False)
+
+        cand = [token_lp, old_lp, adv]
+        for v in (resp_mask, ris, ref_lp0, rlp0):
+            if v is not None:
+                cand.append(v)
+        Le = min(v.shape[-1] for v in cand)
+        token_lp = token_lp[..., :Le]
+        old_lp = old_lp[..., :Le]
+        adv = adv[..., :Le]
+        mask = resp_mask[..., :Le].float() if resp_mask is not None else None
+        ris = ris[..., :Le] if ris is not None else None
+        ref_lp = ref_lp0[..., :Le] if ref_lp0 is not None else None
+        rlp = rlp0[..., :Le] if rlp0 is not None else None
+
+        if algo_name == AlgorithmName.DAPO.value:
+            loss = asymmetric_clip_loss(
+                token_lp, old_lp, adv,
+                float(cfg_fn("clip_ratio_low", 0.2)), float(cfg_fn("clip_ratio_high", 0.28)),
+                mask=mask, clip_ratio_c=float(cfg_fn("clip_ratio_c", 0.0)),
+                batch_num_tokens=bnt, dp_size=dp, rollout_is_weights=ris,
+            )
+        else:
+            loss = policy_gradient_loss(
+                token_lp, old_lp, adv, float(cfg_fn("clip_ratio", 0.2)), mask=mask,
+            )
+        kl_c = float(cfg_fn("kl_coeff", 0.0))
+        if kl_c > 0.0 and ref_lp is not None:
+            loss = loss + kl_c * kl_penalty(token_lp, ref_lp, mask=mask)
+
+        stats = {"loss": float(loss.detach()), "ppo_kl_sum": 0.0, "ppo_kl_tok": 0.0,
+                 "rc_kl_sum": 0.0, "rc_kl_tok": 0.0}
+        if mask is not None:
+            with torch.no_grad():
+                tok = float(mask.sum())
+                stats["ppo_kl_sum"] = float(((old_lp - token_lp) * mask).sum())
+                stats["ppo_kl_tok"] = tok
+                if rlp is not None:
+                    stats["rc_kl_sum"] = float(((rlp - token_lp) * mask).sum())
+                    stats["rc_kl_tok"] = tok
+        return loss, stats
+
     # ---- engine-level compute_log_probs (actor delegates here) ----
     def engine_compute_log_probs(self, batch: DataProto) -> DataProto:
         seqs = batch["input_ids"]
@@ -398,17 +542,34 @@ class MegatronEngine(BaseEngine):
         lp_out = torch.zeros(B, S, dtype=torch.float32)
         ent_out = torch.zeros(B, S, dtype=torch.float32) if want_ent else None
         self.module.eval()
+
+        def _emit(r, start, L, seg_logits, ids_row):
+            tok_lp, ent = self._logprob_entropy_nograd(seg_logits[:-1], ids_row[1:], want_ent)  # [L-1]
+            lp_out[r, start:start + L - 1] = tok_lp.cpu()
+            if want_ent and ent is not None:
+                ent_out[r, start:start + L - 1] = ent.cpu()
+
         with torch.no_grad():
+            rows = []
             for r in range(B):
                 start, L = self._real_block(am[r])
-                if L < 2:
-                    continue
-                ids = seqs[r, start:start + L].to("cuda")
-                logits = self._forward_logits(ids) / temperature  # [L,V]
-                tok_lp, ent = self._logprob_entropy_nograd(logits[:-1], ids[1:], want_ent)  # [L-1]
-                lp_out[r, start:start + L - 1] = tok_lp.cpu()
-                if want_ent and ent is not None:
-                    ent_out[r, start:start + L - 1] = ent.cpu()
+                if L >= 2:
+                    rows.append((r, start, L))
+            if self._dynamic_batch:
+                budget = self._max_tokens_per_gpu if self._max_tokens_per_gpu > 0 else 21504
+                lengths = [L for (_, _, L) in rows]
+                for bin_rows in self._build_bins(lengths, budget):
+                    ids_list = [seqs[rows[j][0], rows[j][1]:rows[j][1] + rows[j][2]].to("cuda") for j in bin_rows]
+                    logits_packed, offsets = self._forward_logits_packed(ids_list, model=self.module)
+                    logits_packed = logits_packed / temperature
+                    for k, j in enumerate(bin_rows):
+                        r, start, L = rows[j]
+                        _emit(r, start, L, logits_packed[offsets[k]:offsets[k + 1]], ids_list[k])
+            else:
+                for (r, start, L) in rows:
+                    ids = seqs[r, start:start + L].to("cuda")
+                    logits = self._forward_logits(ids) / temperature  # [L,V]
+                    _emit(r, start, L, logits, ids)
         tensors = {"log_probs": lp_out, "input_ids": batch["input_ids"]}
         if want_ent:
             tensors["entropy"] = ent_out
@@ -449,80 +610,53 @@ class MegatronEngine(BaseEngine):
         rc_kl_tok = 0.0
         n_rows = 0
 
+        def _accum(stats):
+            nonlocal loss_accum, ppo_kl_sum, ppo_kl_tok, rc_kl_sum, rc_kl_tok, n_rows
+            loss_accum += stats["loss"]
+            n_rows += 1
+            ppo_kl_sum += stats["ppo_kl_sum"]
+            ppo_kl_tok += stats["ppo_kl_tok"]
+            rc_kl_sum += stats["rc_kl_sum"]
+            rc_kl_tok += stats["rc_kl_tok"]
+
+        # Collect valid (non-empty) rows.
+        rows = []
         for r in range(B):
             start, L = self._real_block(am[r])
-            if L < 2:
-                continue
-            ids = seqs[r, start:start + L].to("cuda")
-            logits = self._forward_logits(ids, model=self._ddp) / temperature  # [L,V] (grad)
-            token_lp = self._token_logprob_train(logits[:-1], ids[1:]).view(1, -1)  # [1,L-1]
-            Lm = token_lp.shape[-1]
-            dev = token_lp.device
+            if L >= 2:
+                rows.append((r, start, L))
 
-            def _col(name, shift):
-                x = t.get(name)
-                if x is None:
-                    return None
-                x = x[r].to(dev)
-                s0 = start + (1 if shift else 0)
-                return x[s0:].reshape(1, -1)
-
-            old_lp = _col("old_log_probs", shift=False)
-            if old_lp is None:
-                continue
-            resp_mask = _col("response_mask", shift=True)
-            adv_t = t.get("advantages")
-            if adv_t is None:
-                continue
-            if adv_t.dim() == 1:
-                adv = adv_t[r].to(dev).view(1, 1).expand(1, Lm).float()
-            else:
-                adv = adv_t[r].to(dev)[start + 1:].reshape(1, -1).float()
-            ris = _col("rollout_is_weights", shift=False)
-            ref_lp0 = _col("ref_log_probs", shift=False)
-            rlp0 = _col("rollout_log_probs", shift=False)
-
-            # Align every per-token tensor + token_lp to their common min length
-            # (rollout tensors can differ by one at the sequence boundary).
-            cand = [token_lp, old_lp, adv]
-            for v in (resp_mask, ris, ref_lp0, rlp0):
-                if v is not None:
-                    cand.append(v)
-            Le = min(v.shape[-1] for v in cand)
-            token_lp = token_lp[..., :Le]
-            old_lp = old_lp[..., :Le]
-            adv = adv[..., :Le]
-            mask = resp_mask[..., :Le].float() if resp_mask is not None else None
-            ris = ris[..., :Le] if ris is not None else None
-            ref_lp = ref_lp0[..., :Le] if ref_lp0 is not None else None
-            rlp = rlp0[..., :Le] if rlp0 is not None else None
-
-            if algo_name == AlgorithmName.DAPO.value:
-                loss = asymmetric_clip_loss(
-                    token_lp, old_lp, adv,
-                    float(_cfg("clip_ratio_low", 0.2)), float(_cfg("clip_ratio_high", 0.28)),
-                    mask=mask, clip_ratio_c=float(_cfg("clip_ratio_c", 0.0)),
-                    batch_num_tokens=bnt, dp_size=dp, rollout_is_weights=ris,
-                )
-            else:
-                loss = policy_gradient_loss(
-                    token_lp, old_lp, adv, float(_cfg("clip_ratio", 0.2)), mask=mask,
-                )
-            kl_c = float(_cfg("kl_coeff", 0.0))
-            if kl_c > 0.0 and ref_lp is not None:
-                loss = loss + kl_c * kl_penalty(token_lp, ref_lp, mask=mask)
-
-            loss.backward()
-            loss_accum += float(loss.detach())
-            n_rows += 1
-            if mask is not None:
-                with torch.no_grad():
-                    tok = float(mask.sum())
-                    ppo_kl_sum += float(((old_lp - token_lp) * mask).sum())
-                    ppo_kl_tok += tok
-                    if rlp is not None:
-                        rc_kl_sum += float(((rlp - token_lp) * mask).sum())
-                        rc_kl_tok += tok
+        if self._dynamic_batch:
+            # ---- dynamic-batch packing: concat rows into varlen forwards ----
+            budget = self._max_tokens_per_gpu if self._max_tokens_per_gpu > 0 else 21504
+            lengths = [L for (_, _, L) in rows]
+            for bin_rows in self._build_bins(lengths, budget):
+                ids_list = [seqs[rows[j][0], rows[j][1]:rows[j][1] + rows[j][2]].to("cuda") for j in bin_rows]
+                logits_packed, offsets = self._forward_logits_packed(ids_list, model=self._ddp)
+                logits_packed = logits_packed / temperature  # [T,V] (grad)
+                bin_loss = None
+                for k, j in enumerate(bin_rows):
+                    r, start, _L = rows[j]
+                    seg = logits_packed[offsets[k]:offsets[k + 1]]           # [L,V]
+                    token_lp = self._token_logprob_train(seg[:-1], ids_list[k][1:]).view(1, -1)
+                    loss, stats = self._row_policy_loss(t, r, start, token_lp, algo_name, _cfg, bnt, dp)
+                    if loss is None:
+                        continue
+                    bin_loss = loss if bin_loss is None else bin_loss + loss
+                    _accum(stats)
+                if bin_loss is not None:
+                    bin_loss.backward()
+        else:
+            # ---- per-sequence forward (original path) ----
+            for (r, start, L) in rows:
+                ids = seqs[r, start:start + L].to("cuda")
+                logits = self._forward_logits(ids, model=self._ddp) / temperature  # [L,V] (grad)
+                token_lp = self._token_logprob_train(logits[:-1], ids[1:]).view(1, -1)  # [1,L-1]
+                loss, stats = self._row_policy_loss(t, r, start, token_lp, algo_name, _cfg, bnt, dp)
+                if loss is None:
+                    continue
+                loss.backward()
+                _accum(stats)
 
         grad_norm = self._optimizer_step()
         lr = self._sched_step()

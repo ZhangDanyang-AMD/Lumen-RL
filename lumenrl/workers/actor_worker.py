@@ -161,6 +161,9 @@ class LumenActorWorker(BaseWorker):
                 # Long-sequence memory: flash attn (O(L)) + chunked/fused log-prob.
                 "attention_backend": meg_cfg.get("attention_backend", "unfused"),
                 "log_probs_chunk_size": meg_cfg.get("log_probs_chunk_size", 0),
+                # Dynamic-batch packing (flash_attn_varlen) for GEMM efficiency.
+                "enable_dynamic_batch": meg_cfg.get("enable_dynamic_batch", False),
+                "max_tokens_per_gpu": meg_cfg.get("max_tokens_per_gpu", 0),
             }
         return {}
 

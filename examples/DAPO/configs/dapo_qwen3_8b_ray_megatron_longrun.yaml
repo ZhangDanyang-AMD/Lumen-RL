@@ -55,6 +55,11 @@ policy:
       # Memory-efficient chunked/fused token log-prob (single [chunk,V] softmax
       # buffer instead of full log_softmax + grad). Matches vime --log-probs-chunk-size.
       log_probs_chunk_size: 1024
+      # Dynamic-batch packing: concat sequences into one flash_attn_varlen forward
+      # (cu_seqlens) so short responses keep GEMMs full -> faster train step.
+      # Matches vime --use-dynamic-batch-size --max-tokens-per-gpu.
+      enable_dynamic_batch: true
+      max_tokens_per_gpu: 21504
     fsdp_cfg:
       param_offload: false
       optimizer_offload: false

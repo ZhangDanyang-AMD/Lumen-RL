@@ -169,6 +169,10 @@ class MegatronConfig:
     # chunked/fused token log-prob. Both default off (unchanged smoke behavior).
     attention_backend: str = "unfused"           # "flash" | "unfused"
     log_probs_chunk_size: int = 0                # >0 enables fused/chunked log-prob
+    # Dynamic-batch packing: concat multiple sequences into one flash_attn_varlen
+    # forward (keeps GEMMs full on short sequences). Requires attention_backend=flash.
+    enable_dynamic_batch: bool = False
+    max_tokens_per_gpu: int = 0                  # per-forward token budget (0 -> 21504)
 
 
 @dataclass
