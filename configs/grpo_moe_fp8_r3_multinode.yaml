@@ -12,8 +12,8 @@ policy:
 
   training:
     megatron_cfg:
-      tensor_parallel_size: 8
-      expert_parallel_size: 2
+      tensor_model_parallel_size: 8
+      expert_model_parallel_size: 2
       num_experts: 128
       moe_grouped_gemm: true
 

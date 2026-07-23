@@ -11,6 +11,7 @@ from typing_extensions import NotRequired
 class TrainingBackend(str, Enum):
     FSDP2 = "fsdp2"
     MEGATRON = "megatron"
+    MEGATRON_NATIVE = "megatron_native"
     NONE = "none"
 
 
@@ -84,9 +85,11 @@ class ClusterConfigDict(TypedDict):
 
 
 class MegatronConfigDict(TypedDict):
-    tensor_parallel_size: int
-    expert_parallel_size: NotRequired[int]
-    pipeline_parallel_size: NotRequired[int]
+    tensor_model_parallel_size: int
+    pipeline_model_parallel_size: NotRequired[int]
+    context_parallel_size: NotRequired[int]
+    expert_model_parallel_size: NotRequired[int]
+    sequence_parallel: NotRequired[bool]
     num_experts: NotRequired[int]
     moe_grouped_gemm: NotRequired[bool]
 

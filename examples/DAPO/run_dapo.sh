@@ -139,5 +139,5 @@ sleep 8
 
 python3 -u -m lumenrl.trainer.main --config "$CONFIG" \
   policy.model_name="$MODEL_PATH" reward.dataset="$TRAIN_FILE" val_dataset="$VAL_FILE" \
-  num_training_steps="$STEPS" seed=10086 "${EXTRA_ARGS[@]}" > "$LOG" 2>&1
+  num_training_steps="$STEPS" seed=10086 "${EXTRA_ARGS[@]}" ${EXTRA_OVERRIDE:-} > "$LOG" 2>&1
 echo "=== exit=$? ==="

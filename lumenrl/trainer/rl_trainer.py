@@ -93,6 +93,8 @@ class RLTrainer:
         self._ray_cluster: RayCluster | None = None
         self._actor_wg: RayWorkerGroup | None = None
         self._ref_wg: RayWorkerGroup | None = None
+        self._actor_mp: int = 1  # Megatron model-parallel size (TP*PP*CP)
+        self._actor_dp_size: int = 0  # data-parallel size (0 => not queried; fallback below)
         self._ray_dispatch_state: dict[str, Any] = {}
         self._profiler: DistProfiler | None = None
         self._prev_step_profile: bool = False
@@ -359,6 +361,26 @@ class RLTrainer:
             "Ray rendezvous complete: %d actors on %s:%s (FSDP2 sharded).",
             n, master_addr, master_port,
         )
+
+    def _compute_actor_mp(self) -> int:
+        """Total model-parallel size (TP x PP x CP) of the actor engine (Megatron
+        native path only).
+
+        FSDP and the legacy megatron backend are pure DP (mp=1). Only the native
+        Megatron-Core engine consumes ``megatron_cfg.tensor_model_parallel_size``
+        / ``pipeline_model_parallel_size`` / ``context_parallel_size``.
+        """
+        backend = str(getattr(self.config.policy, "training_backend", "")).lower()
+        if backend not in ("megatron_native", "megatron-native"):
+            return 1
+        try:
+            meg = self.config.policy.training.megatron_cfg
+            tp = int(getattr(meg, "tensor_model_parallel_size", 1) or 1)
+            pp = int(getattr(meg, "pipeline_model_parallel_size", 1) or 1)
+            cp = int(getattr(meg, "context_parallel_size", 1) or 1)
+        except Exception:
+            tp = pp = cp = 1
+        return max(1, tp * pp * cp)
 
     def _setup_ray_vllm_rollout(self, model_name: str, vcfg: Any) -> None:
         """Build verl-style colocated vLLM rollout replicas + client (ray_http)."""
@@ -689,6 +711,22 @@ class RLTrainer:
             self._actor_wg.start()
             self._rendezvous_ray_group(self._actor_wg)
             self._actor_wg.call_all("init_model")
+
+        # Megatron model-parallel (TP/PP/CP): the actor world is a
+        # DP x (TP,PP,CP) mesh. All model-parallel members of one DP shard must
+        # receive the SAME data shard, so we build ``mesh_mapping`` from each
+        # actor's real DP rank (robust to Megatron's rank ordering) and normalize
+        # the loss by pure DP size (num_workers // (tp*pp*cp)), not num_workers.
+        self._actor_mp = self._compute_actor_mp()
+        if self._actor_mp > 1 and self._actor_wg is not None:
+            infos = self._actor_wg.execute_all_sync("get_mp_info")
+            mesh = [int(info["dp_rank"]) for info in infos]
+            self._actor_dp_size = int(infos[0]["dp_size"])
+            actor_role.mesh_mapping = mesh
+            logger.info(
+                "Megatron model-parallel=%d: actor DP=%d, mesh_mapping=%s",
+                self._actor_mp, self._actor_dp_size, mesh,
+            )
 
         self._try_resume_ray_checkpoint()
 
@@ -3324,7 +3362,12 @@ class RLTrainer:
                 _rmask = batch.tensors.get("response_mask")
                 if _rmask is not None:
                     batch.meta["batch_num_tokens"] = int(_rmask.sum().item())
-                batch.meta["dp_size"] = int(self._actor_wg.num_workers)
+                # Loss normalization divides by the number of DP shards (grad is
+                # averaged across DP×CP, while the differentiable CP gather's
+                # backward SUM cancels the CP average) = pure DP width.
+                batch.meta["dp_size"] = int(
+                    self._actor_dp_size or (self._actor_wg.num_workers // max(1, self._actor_mp))
+                )
 
             # ---- train (worker-side PPO mini-batch loop; FSDP grad sync) ----
             train_t0 = time.time()

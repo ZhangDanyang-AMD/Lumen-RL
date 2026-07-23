@@ -11,7 +11,7 @@
 # Delta vs FSDP long run:
 #   - policy.training_backend: fsdp2 -> megatron  (MegatronEngine, TP1/PP1/CP1/DP8,
 #     use_distributed_optimizer=True forced by engine; FP32 master + Adam sharded to DP)
-#   - vllm enable_sleep_mode: true / sleep_level: 2  (free vLLM memory during training)
+#   - vllm enable_sleep_mode: false（ROCm 7.2.3 cumem sleep broken；保持常驻）
 
 cluster:
   num_nodes: 1
@@ -26,7 +26,7 @@ controller:
       dispatch_mode: dp_compute_proto
 
 policy:
-  model_name: /home/shengnxu/xysheng/data/models/Qwen3-8B-Base
+  model_name: "${oc.env:DATA_ROOT}/models/Qwen3-8B-Base"
   training_backend: megatron
   generation_backend: vllm
   max_total_sequence_length: 21504      # 1024 prompt + 20480 response
@@ -128,13 +128,13 @@ quantization:
 reward:
   type: function
   function: lumenrl.rewards.math_reward.dapo_math_reward
-  dataset: /home/shengnxu/xysheng/data/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet
+  dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet"
   shuffle: true
   shuffle_seed: 10086
 
 # periodic validation on AIME (verl test_freq=10). NOTE: LumenRL val is greedy;
 # verl uses val_kwargs.temperature=0.6 — diagnostic only, does not affect training.
-val_dataset: /home/shengnxu/xysheng/data/data_cached/qwen3-8b-maxprompt1024/aime-2024.filtered.parquet
+val_dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/aime-2024.filtered.parquet"
 val_steps: 10                           # in-loop validation every 10 steps (Ray-aware)
 val_batch_size: 0                        # 0 = full validation set in one dataloader batch, matching verl
 eval:
@@ -142,7 +142,7 @@ eval:
   num_samples: 0                        # 0 = full validation set, matching verl
 
 checkpointing:
-  checkpoint_dir: /mnt/m2m_nobackup/xysheng/data/ckpts/lumenrl-dapo/longrun-ray-megatron-8b
+  checkpoint_dir: "${oc.env:DATA_ROOT}/ckpts/lumenrl-dapo/longrun-ray-megatron-8b"
   save_steps: 50
   save_total_limit: 5
   resume: true

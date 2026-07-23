@@ -15,9 +15,9 @@ policy:
 
   training:
     megatron_cfg:
-      tensor_parallel_size: 8
-      expert_parallel_size: 4
-      pipeline_parallel_size: 1
+      tensor_model_parallel_size: 8
+      expert_model_parallel_size: 4
+      pipeline_model_parallel_size: 1
       num_experts: 256
       moe_grouped_gemm: true
 

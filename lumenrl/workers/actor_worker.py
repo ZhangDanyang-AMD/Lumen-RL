@@ -46,6 +46,8 @@ class LumenActorWorker(BaseWorker):
             backend_key = "fsdp2"
         elif backend_raw == "megatron":
             backend_key = "megatron"
+        elif backend_raw in ("megatron_native", "megatron-native"):
+            backend_key = "megatron_native"
         else:
             raise ValueError(f"Unknown policy.training_backend: {backend_raw}")
 
@@ -110,6 +112,35 @@ class LumenActorWorker(BaseWorker):
         except Exception as exc:
             self._log.warning("PROBE_FWD failed: %s", exc)
 
+    def get_mp_info(self) -> dict[str, Any]:
+        """Report this actor's Megatron model-parallel coordinates.
+
+        Used by the controller to build the DP x (TP,PP,CP) data ``mesh_mapping`` and
+        the loss-normalizing DP size. Falls back to pure-DP (rank/world) when
+        Megatron model-parallel state is not initialized (FSDP / legacy backends).
+        """
+        try:
+            from megatron.core import parallel_state as mpu
+            if mpu.is_initialized():
+                return {
+                    # Exclude CP: all CP ranks holding different token chunks of
+                    # one sequence must receive the same controller data shard.
+                    "dp_rank": int(mpu.get_data_parallel_rank(with_context_parallel=False)),
+                    "dp_size": int(mpu.get_data_parallel_world_size(with_context_parallel=False)),
+                    "tp_rank": int(mpu.get_tensor_model_parallel_rank()),
+                    "pp_rank": int(mpu.get_pipeline_model_parallel_rank()),
+                    "cp_rank": int(mpu.get_context_parallel_rank()),
+                    "cp_size": int(mpu.get_context_parallel_world_size()),
+                    "is_last_stage": bool(mpu.is_pipeline_last_stage()),
+                }
+        except Exception:
+            pass
+        return {
+            "dp_rank": int(self.rank), "dp_size": int(self.world_size),
+            "tp_rank": 0, "pp_rank": 0, "cp_rank": 0, "cp_size": 1,
+            "is_last_stage": True,
+        }
+
     def _build_engine_config(
         self, backend: str, training_cfg: dict, policy: dict,
     ) -> dict[str, Any]:
@@ -136,7 +167,7 @@ class LumenActorWorker(BaseWorker):
                 },
                 "seed": int(policy.get("seed", 42)),
             }
-        elif backend == "megatron":
+        elif backend in ("megatron", "megatron_native"):
             meg_cfg = training_cfg.get("megatron_cfg") or policy.get("megatron_cfg") or {}
             if not isinstance(meg_cfg, dict):
                 from dataclasses import asdict, is_dataclass
@@ -203,7 +234,14 @@ class LumenActorWorker(BaseWorker):
 
         # Megatron backend owns its own (GPTModel) forward + logprob path.
         if hasattr(self._engine, "engine_compute_log_probs"):
-            return self._engine.engine_compute_log_probs(batch)
+            out = self._engine.engine_compute_log_probs(batch)
+            # Every TP/PP/CP member ran the collective forward on the same data.
+            # The engine designates one rank after CP reconstruction so the
+            # controller's DP merge does not duplicate this group's rows.
+            src = getattr(self._engine, "is_mp_src_rank_with_outputs", None)
+            if src is not None and not src():
+                return DataProto(meta=dict(batch.meta))
+            return out
 
         from lumenrl.engine.training.packing import (
             PackingContext,
@@ -605,6 +643,11 @@ class LumenActorWorker(BaseWorker):
             raise RuntimeError("init_model() must be called before save_checkpoint().")
         path = Path(local_path)
         path.mkdir(parents=True, exist_ok=True)
+        # Native Megatron engine: use sharded dist-checkpoint (no DP duplication,
+        # resharding-capable) instead of per-rank torch.save of full weights.
+        if hasattr(self._engine, "save_dist_checkpoint"):
+            self._engine.save_dist_checkpoint(str(path), global_step=global_step)
+            return True
         rank = int(self.rank)
         world = int(self.world_size)
         module = getattr(self._engine, "module", None)
@@ -634,6 +677,8 @@ class LumenActorWorker(BaseWorker):
         if self._engine is None:
             raise RuntimeError("init_model() must be called before load_checkpoint().")
         path = Path(local_path)
+        if hasattr(self._engine, "load_dist_checkpoint"):
+            return self._engine.load_dist_checkpoint(str(path))
         rank = int(self.rank)
         world = int(self.world_size)
         module = getattr(self._engine, "module", None)

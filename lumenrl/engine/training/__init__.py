@@ -11,6 +11,11 @@ from lumenrl.engine.training.megatron_engine import (
     MegatronEngineWithLMHead,
     MegatronEngineWithValueHead,
 )
+from lumenrl.engine.training.megatron_native_engine import (
+    MegatronNativeEngine,
+    MegatronNativeEngineWithLMHead,
+    MegatronNativeEngineWithValueHead,
+)
 
 try:
     from lumenrl.engine.training.weight_sync import WeightSyncManager
@@ -28,5 +33,8 @@ __all__ = [
     "MegatronEngine",
     "MegatronEngineWithLMHead",
     "MegatronEngineWithValueHead",
+    "MegatronNativeEngine",
+    "MegatronNativeEngineWithLMHead",
+    "MegatronNativeEngineWithValueHead",
     "WeightSyncManager",
 ]

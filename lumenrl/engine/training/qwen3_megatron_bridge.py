@@ -45,8 +45,16 @@ def _megatron_qkv_to_hf(qkv, d: Qwen3Dims):
     return q, k, v
 
 
-def hf_to_megatron(hf: dict[str, torch.Tensor], d: Qwen3Dims) -> dict[str, torch.Tensor]:
-    """Return a Megatron GPTModel state_dict (bf16 tensors on CPU)."""
+def hf_to_megatron(hf: dict[str, torch.Tensor], d: Qwen3Dims, te: bool = False) -> dict[str, torch.Tensor]:
+    """Return a Megatron GPTModel state_dict (bf16 tensors on CPU).
+
+    ``te=True`` targets the TransformerEngine layer spec, where the input/pre-mlp
+    RMSNorms are fused into the following linear (``linear_qkv.layer_norm_weight``
+    / ``linear_fc1.layer_norm_weight``); ``te=False`` targets the local spec
+    (standalone ``input_layernorm`` / ``pre_mlp_layernorm``). All other keys match.
+    """
+    in_ln = "self_attention.linear_qkv.layer_norm_weight" if te else "input_layernorm.weight"
+    mlp_ln = "mlp.linear_fc1.layer_norm_weight" if te else "pre_mlp_layernorm.weight"
     m: dict[str, torch.Tensor] = {}
     m["embedding.word_embeddings.weight"] = hf["model.embed_tokens.weight"]
     m["decoder.final_layernorm.weight"] = hf["model.norm.weight"]
@@ -54,7 +62,7 @@ def hf_to_megatron(hf: dict[str, torch.Tensor], d: Qwen3Dims) -> dict[str, torch
     for i in range(d.num_layers):
         hp = f"model.layers.{i}."
         mp = f"decoder.layers.{i}."
-        m[mp + "input_layernorm.weight"] = hf[hp + "input_layernorm.weight"]
+        m[mp + in_ln] = hf[hp + "input_layernorm.weight"]
         m[mp + "self_attention.linear_qkv.weight"] = _hf_qkv_to_megatron(
             hf[hp + "self_attn.q_proj.weight"],
             hf[hp + "self_attn.k_proj.weight"],
@@ -63,7 +71,7 @@ def hf_to_megatron(hf: dict[str, torch.Tensor], d: Qwen3Dims) -> dict[str, torch
         m[mp + "self_attention.q_layernorm.weight"] = hf[hp + "self_attn.q_norm.weight"]
         m[mp + "self_attention.k_layernorm.weight"] = hf[hp + "self_attn.k_norm.weight"]
         m[mp + "self_attention.linear_proj.weight"] = hf[hp + "self_attn.o_proj.weight"]
-        m[mp + "pre_mlp_layernorm.weight"] = hf[hp + "post_attention_layernorm.weight"]
+        m[mp + mlp_ln] = hf[hp + "post_attention_layernorm.weight"]
         m[mp + "mlp.linear_fc1.weight"] = torch.cat(
             [hf[hp + "mlp.gate_proj.weight"], hf[hp + "mlp.up_proj.weight"]], dim=0
         ).contiguous()
@@ -71,12 +79,15 @@ def hf_to_megatron(hf: dict[str, torch.Tensor], d: Qwen3Dims) -> dict[str, torch
     return m
 
 
-def megatron_to_hf(named_params, d: Qwen3Dims):
+def megatron_to_hf(named_params, d: Qwen3Dims, te: bool = False):
     """Yield (hf_name, tensor) from Megatron GPTModel named params (TP=1).
 
     ``named_params`` is an iterable of ``(megatron_name, tensor)``. Names may be
-    prefixed (e.g. ``module.``); the prefix is stripped.
+    prefixed (e.g. ``module.``); the prefix is stripped. ``te=True`` reads the
+    fused TE layernorm names (see ``hf_to_megatron``).
     """
+    in_ln = "self_attention.linear_qkv.layer_norm_weight" if te else "input_layernorm.weight"
+    mlp_ln = "mlp.linear_fc1.layer_norm_weight" if te else "pre_mlp_layernorm.weight"
     md = {}
     for name, t in named_params:
         # strip DDP/Float16Module wrappers
@@ -95,7 +106,7 @@ def megatron_to_hf(named_params, d: Qwen3Dims):
     for i in range(d.num_layers):
         mp = f"decoder.layers.{i}."
         hp = f"model.layers.{i}."
-        yield hp + "input_layernorm.weight", get(mp + "input_layernorm.weight")
+        yield hp + "input_layernorm.weight", get(mp + in_ln)
         q, k, v = _megatron_qkv_to_hf(get(mp + "self_attention.linear_qkv.weight"), d)
         yield hp + "self_attn.q_proj.weight", q
         yield hp + "self_attn.k_proj.weight", k
@@ -103,7 +114,7 @@ def megatron_to_hf(named_params, d: Qwen3Dims):
         yield hp + "self_attn.q_norm.weight", get(mp + "self_attention.q_layernorm.weight")
         yield hp + "self_attn.k_norm.weight", get(mp + "self_attention.k_layernorm.weight")
         yield hp + "self_attn.o_proj.weight", get(mp + "self_attention.linear_proj.weight")
-        yield hp + "post_attention_layernorm.weight", get(mp + "pre_mlp_layernorm.weight")
+        yield hp + "post_attention_layernorm.weight", get(mp + mlp_ln)
         fc1 = get(mp + "mlp.linear_fc1.weight")
         gate, up = fc1[: d.ffn], fc1[d.ffn:]
         yield hp + "mlp.gate_proj.weight", gate.contiguous()

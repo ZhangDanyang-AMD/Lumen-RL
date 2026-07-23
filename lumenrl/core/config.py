@@ -151,9 +151,19 @@ class ControllerConfig:
 
 @dataclass
 class MegatronConfig:
-    tensor_parallel_size: int = 1
-    expert_parallel_size: int = 1
-    pipeline_parallel_size: int = 1
+    # Parallelism sizes. NOTE: field names match what ``actor_worker`` and the
+    # Megatron engines read (``*_model_parallel_size`` + ``context_parallel_size``).
+    # (Previously named ``tensor_parallel_size`` / ``pipeline_parallel_size`` /
+    # ``expert_parallel_size``, which silently never reached the engine -> TP/PP
+    # config was ignored. See megatron-native-refactor handoff §2.)
+    tensor_model_parallel_size: int = 1
+    pipeline_model_parallel_size: int = 1
+    context_parallel_size: int = 1
+    expert_model_parallel_size: int = 1
+    # Sequence parallelism (TP-only): shards activations along the sequence dim.
+    # Requires seq length divisible by TP, so it is OFF by default for RL's
+    # variable-length forwards (per-sequence / packed thd).
+    sequence_parallel: bool = False
     num_experts: Optional[int] = None
     moe_grouped_gemm: bool = False
     moe_use_legacy_grouped_gemm: bool = False
