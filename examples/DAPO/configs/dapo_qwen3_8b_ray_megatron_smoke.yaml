@@ -24,7 +24,7 @@ controller:
       dispatch_mode: dp_compute_proto
 
 policy:
-  model_name: /home/shengnxu/xysheng/data/models/Qwen3-8B-Base
+  model_name: /mnt/m2m_nobackup/xysheng/lumenrl-data/models/Qwen3-8B-Base
   training_backend: megatron
   generation_backend: vllm
   max_total_sequence_length: 2048
@@ -71,7 +71,7 @@ policy:
       # corrupts weights) and the old KV-only patch is incompatible with vLLM
       # 0.23. With 256GB MI300X the engine (gpu_mem_util=0.30 => ~76GB) stays
       # resident alongside FSDP training, so sleep is disabled.
-      enable_sleep_mode: true
+      enable_sleep_mode: false          # cumem sleep broken on ROCm 7.2.3 (wake_up OOMs); vLLM stays resident
       sleep_level: 2
       update_weights_bucket_megabytes: 512
       temperature: 1.0
@@ -106,7 +106,7 @@ algorithm:
 reward:
   type: function
   function: lumenrl.rewards.math_reward.dapo_math_reward
-  dataset: /home/shengnxu/xysheng/data/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet
+  dataset: /mnt/m2m_nobackup/xysheng/lumenrl-data/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet
 
 quantization:
   rollout:
@@ -119,10 +119,10 @@ quantization:
     rollout_is_batch_normalize: false
 
 checkpointing:
-  checkpoint_dir: /home/shengnxu/xysheng/data/ckpts/lumenrl-dapo/ray-vllm-smoke
-  save_steps: 1000
-  save_total_limit: 1
-  resume: false
+  checkpoint_dir: /mnt/m2m_nobackup/xysheng/lumenrl-data/ckpts/lumenrl-dapo/megatron-smoke
+  save_steps: 5
+  save_total_limit: 5
+  resume: true
 
 logger:
   wandb_enabled: false

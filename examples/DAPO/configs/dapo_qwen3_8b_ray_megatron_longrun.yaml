@@ -79,7 +79,11 @@ policy:
       max_num_seqs: 64
       quantization: ""
       calculate_log_probs: true
-      enable_sleep_mode: true           # Megatron: sleep vLLM during training to free VRAM
+      # sleep DISABLED: vLLM cumem sleep is broken on this ROCm 7.2.3 image
+      # (discard is a no-op -> frees nothing; wake_up then re-maps and OOMs,
+      # cumem_allocator.cpp:151). We don't need sleep: training peak (~120GB) +
+      # resident vLLM (0.30 => ~86GB) < 288GB. Keeping vLLM resident is fine.
+      enable_sleep_mode: false
       sleep_level: 2
       update_weights_bucket_megabytes: 512
       temperature: 1.0
@@ -138,7 +142,7 @@ eval:
   num_samples: 0                        # 0 = full validation set, matching verl
 
 checkpointing:
-  checkpoint_dir: /home/shengnxu/xysheng/data/ckpts/lumenrl-dapo/longrun-ray-megatron-8b
+  checkpoint_dir: /mnt/m2m_nobackup/xysheng/data/ckpts/lumenrl-dapo/longrun-ray-megatron-8b
   save_steps: 50
   save_total_limit: 5
   resume: true
