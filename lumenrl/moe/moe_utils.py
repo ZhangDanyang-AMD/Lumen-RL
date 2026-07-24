@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import re
+from contextlib import contextmanager
 from typing import Any, Iterator
 
 import torch
@@ -11,6 +13,8 @@ import torch.nn.functional as F
 from torch import Tensor
 
 logger = logging.getLogger(__name__)
+
+_LAYER_IDX_RE = re.compile(r"layers\.(\d+)\.")
 
 
 def _extract_router_logits(output: Any) -> Tensor | None:
@@ -25,17 +29,102 @@ def _extract_router_logits(output: Any) -> Tensor | None:
 
 
 def iter_moe_modules(model: nn.Module) -> Iterator[tuple[int, str, nn.Module]]:
-    """Yield ``(layer_index, qualified_name, module)`` for likely MoE blocks."""
-    idx = 0
+    """Yield ``(layer_index, qualified_name, module)`` for likely MoE blocks.
+
+    Handles HF-style blocks (``experts`` + ``gate``/``w_gate``) and Megatron-Core
+    ``MoELayer`` (``experts`` + ``router``). The layer index is parsed from the
+    module path (``decoder.layers.{i}.mlp``) when available, else a running count.
+    """
+    running = 0
     for name, module in model.named_modules():
         cls = type(module).__name__
-        if "MoE" in cls or "MoeBlock" in cls or "SparseMoe" in cls:
-            yield idx, name, module
-            idx += 1
+        is_moe = (
+            "MoE" in cls or "MoeBlock" in cls or "SparseMoe" in cls
+            or (hasattr(module, "experts") and hasattr(module, "router"))       # Megatron MoELayer
+            or (hasattr(module, "experts") and (hasattr(module, "gate") or hasattr(module, "w_gate")))
+        )
+        if not is_moe:
             continue
-        if hasattr(module, "experts") and (hasattr(module, "gate") or hasattr(module, "w_gate")):
-            yield idx, name, module
-            idx += 1
+        m = _LAYER_IDX_RE.search(name)
+        layer_idx = int(m.group(1)) if m else running
+        yield layer_idx, name, module
+        running += 1
+
+
+def iter_megatron_routers(model: nn.Module) -> Iterator[tuple[int, nn.Module]]:
+    """Yield ``(layer_index, router_module)`` for Megatron-Core MoE routers.
+
+    A router is detected by the presence of ``routing`` + ``gating`` callables
+    (``megatron.core.transformer.moe.router.TopKRouter``). The layer index is
+    parsed from the module path (local per-PP-stage numbering)."""
+    for name, module in model.named_modules():
+        if callable(getattr(module, "routing", None)) and callable(getattr(module, "gating", None)):
+            m = _LAYER_IDX_RE.search(name)
+            if m:
+                yield int(m.group(1)), module
+
+
+@contextmanager
+def megatron_record_router_logits(model: nn.Module, store: dict[int, Tensor]):
+    """Record each Megatron MoE layer's router logits into ``store`` (by layer idx).
+
+    Wraps every router's ``routing(logits, ...)`` so the pre-routing gating logits
+    are captured (detached) as they flow through the forward. Works under EP/CP/TP
+    (each rank records its LOCAL token logits). Restores the methods on exit.
+    """
+    saved: list[tuple[nn.Module, Any]] = []
+
+    def make_wrap(layer_idx: int, orig):
+        def wrapped(logits, *args, **kwargs):
+            store[layer_idx] = logits.detach()
+            return orig(logits, *args, **kwargs)
+        return wrapped
+
+    try:
+        for layer_idx, router in iter_megatron_routers(model):
+            orig = router.routing
+            saved.append((router, orig))
+            router.routing = make_wrap(layer_idx, orig)
+        if not saved:
+            logger.warning("megatron_record_router_logits: no Megatron routers found.")
+        yield store
+    finally:
+        for router, orig in saved:
+            router.routing = orig
+
+
+@contextmanager
+def megatron_replay_router_logits(model: nn.Module, recorded: dict[int, Tensor]):
+    """Replay recorded router logits into each Megatron MoE layer's ``routing``.
+
+    Substitutes the passed ``logits`` with ``recorded[layer_idx]`` (shape/dtype/
+    device matched) so training reuses the recorded routing decisions. Restores
+    the methods on exit. Requires the current forward's per-rank token layout to
+    match the recording forward (same microbatch construction)."""
+    saved: list[tuple[nn.Module, Any]] = []
+
+    def make_wrap(layer_idx: int, orig):
+        def wrapped(logits, *args, **kwargs):
+            rec = recorded.get(layer_idx)
+            if rec is not None and rec.numel() == logits.numel():
+                logits = rec.to(device=logits.device, dtype=logits.dtype).reshape(logits.shape)
+            elif rec is not None:
+                logger.warning(
+                    "megatron_replay_router_logits: layer %d shape mismatch rec=%s cur=%s; using current.",
+                    layer_idx, tuple(rec.shape), tuple(logits.shape),
+                )
+            return orig(logits, *args, **kwargs)
+        return wrapped
+
+    try:
+        for layer_idx, router in iter_megatron_routers(model):
+            orig = router.routing
+            saved.append((router, orig))
+            router.routing = make_wrap(layer_idx, orig)
+        yield
+    finally:
+        for router, orig in saved:
+            router.routing = orig
 
 
 def compute_load_balance_loss(router_logits: Tensor, num_experts: int, top_k: int) -> Tensor:

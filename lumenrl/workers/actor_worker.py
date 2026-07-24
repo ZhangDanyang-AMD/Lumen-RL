@@ -176,6 +176,24 @@ class LumenActorWorker(BaseWorker):
                 "context_parallel_size": meg_cfg.get("context_parallel_size", 1),
                 "expert_model_parallel_size": meg_cfg.get("expert_model_parallel_size", 1),
                 "sequence_parallel": meg_cfg.get("sequence_parallel", False),
+                # MoE / Expert Parallel: forwarded to the native engine, which only
+                # consumes them when the HF config is detected as MoE (dense path
+                # ignores every ``moe_*``/``num_experts`` field). ``None`` means
+                # "auto-derive from the HF config".
+                "num_experts": meg_cfg.get("num_experts", None),
+                "moe_grouped_gemm": meg_cfg.get("moe_grouped_gemm", True),
+                "expert_tensor_parallel_size": meg_cfg.get("expert_tensor_parallel_size", None),
+                "moe_router_topk": meg_cfg.get("moe_router_topk", None),
+                "moe_router_load_balancing_type": meg_cfg.get("moe_router_load_balancing_type", "aux_loss"),
+                "moe_router_pre_softmax": meg_cfg.get("moe_router_pre_softmax", None),
+                "moe_router_score_function": meg_cfg.get("moe_router_score_function", None),
+                "moe_router_dtype": meg_cfg.get("moe_router_dtype", "fp32"),
+                "moe_router_topk_scaling_factor": meg_cfg.get("moe_router_topk_scaling_factor", None),
+                "moe_shared_expert_intermediate_size": meg_cfg.get("moe_shared_expert_intermediate_size", None),
+                "moe_aux_loss_coeff": meg_cfg.get("moe_aux_loss_coeff", 0.0),
+                "moe_router_bias_update_rate": meg_cfg.get("moe_router_bias_update_rate", None),
+                "moe_token_dispatcher_type": meg_cfg.get("moe_token_dispatcher_type", "alltoall"),
+                "moe_permute_fusion": meg_cfg.get("moe_permute_fusion", False),
                 "param_offload": meg_cfg.get("param_offload", False),
                 "optimizer_offload": meg_cfg.get("optimizer_offload", False),
                 "grad_offload": meg_cfg.get("grad_offload", False),

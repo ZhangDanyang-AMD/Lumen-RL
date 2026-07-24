@@ -7,6 +7,9 @@ from lumenrl.moe.moe_utils import (
     check_expert_utilization,
     compute_load_balance_loss,
     compute_router_entropy,
+    iter_megatron_routers,
+    megatron_record_router_logits,
+    megatron_replay_router_logits,
 )
 from lumenrl.moe.r3_manager import R3Manager
 from lumenrl.moe.router_recorder import RouterRecorder
@@ -20,4 +23,7 @@ __all__ = [
     "check_expert_utilization",
     "compute_load_balance_loss",
     "compute_router_entropy",
+    "iter_megatron_routers",
+    "megatron_record_router_logits",
+    "megatron_replay_router_logits",
 ]

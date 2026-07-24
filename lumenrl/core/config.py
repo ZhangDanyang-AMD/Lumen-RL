@@ -146,8 +146,29 @@ class MegatronConfig:
     # Requires seq length divisible by TP, so it is OFF by default for RL's
     # variable-length forwards (per-sequence / packed thd).
     sequence_parallel: bool = False
+    # ---- MoE / Expert Parallel ----
+    # ``num_experts`` (a.k.a. num_moe_experts) is auto-detected from the HF config
+    # when None; set it explicitly only to override. All the ``moe_*`` knobs below
+    # are likewise auto-derived from the HF config when left None, and forwarded to
+    # Megatron's TransformerConfig only when the model is MoE (dense path ignores
+    # them). ``expert_model_parallel_size`` shards experts across EP ranks;
+    # ``expert_tensor_parallel_size`` (ETP) additionally TP-shards each expert.
     num_experts: Optional[int] = None
-    moe_grouped_gemm: bool = False
+    moe_grouped_gemm: bool = True
+    expert_tensor_parallel_size: Optional[int] = None
+    moe_router_topk: Optional[int] = None
+    moe_router_load_balancing_type: str = "aux_loss"     # "aux_loss" | "none" | "seq_aux_loss"
+    moe_router_pre_softmax: Optional[bool] = None
+    moe_router_score_function: Optional[str] = None       # "softmax" | "sigmoid"
+    # fp32 router improves expert-selection stability (bf16 top-k flips experts ->
+    # large train/rollout log-prob mismatch). Defaults to fp32 for MoE.
+    moe_router_dtype: Optional[str] = "fp32"              # None | "fp32" | "fp64"
+    moe_router_topk_scaling_factor: Optional[float] = None
+    moe_shared_expert_intermediate_size: Optional[int] = None
+    moe_aux_loss_coeff: float = 0.0                       # 0 keeps RL loss unchanged
+    moe_router_bias_update_rate: Optional[float] = None
+    moe_token_dispatcher_type: str = "alltoall"
+    moe_permute_fusion: bool = False
     # Distributed optimizer: shard FP32 master + Adam state across DP ranks.
     use_distributed_optimizer: bool = True
     # Activation recomputation (gradient checkpointing) for long sequences.

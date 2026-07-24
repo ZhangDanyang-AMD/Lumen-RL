@@ -32,6 +32,14 @@ from lumenrl.engine.training.qwen3_megatron_bridge import (
     load_hf_safetensors,
     megatron_to_hf,
 )
+from lumenrl.engine.training.qwen3moe_megatron_bridge import (
+    _expert_local_index,
+    _non_expert_hf_to_megatron,
+    build_moe_dims,
+    hf_expert_fc1,
+    hf_expert_fc2,
+    megatron_to_hf_moe,
+)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LUMENRL_LOGGING_LEVEL", "INFO"))
@@ -77,6 +85,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
     def initialize(self) -> None:
         from megatron.core import parallel_state as mpu
         from megatron.core.models.gpt.gpt_layer_specs import (
+            get_gpt_decoder_block_spec,
             get_gpt_layer_with_transformer_engine_spec,
         )
         from megatron.core.models.gpt.gpt_model import GPTModel
@@ -88,6 +97,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
         pp = int(ec.get("pipeline_model_parallel_size", 1))
         cp = int(ec.get("context_parallel_size", 1))
         ep = int(ec.get("expert_model_parallel_size", 1))
+        etp = int(ec.get("expert_tensor_parallel_size") or tp)
         seed = int(ec.get("seed", 42))
         # Sequence parallelism shards activations along the sequence dim, which
         # requires seq_len % tp == 0. RL forwards are variable-length (per-seq or
@@ -98,6 +108,9 @@ class MegatronNativeEngine(MegatronBaseEngine):
         self._tp = tp
         self._pp = pp
         self._cp = cp
+        self._ep = ep
+        self._etp = etp
+        self._sp = sp
         # Forward-side knobs shared with the base log-prob helpers.
         self._logprob_chunk_size = int(ec.get("log_probs_chunk_size") or 0)
         self._dynamic_batch = bool(ec.get("enable_dynamic_batch") or False)
@@ -109,6 +122,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 pipeline_model_parallel_size=pp,
                 context_parallel_size=cp,
                 expert_model_parallel_size=ep,
+                expert_tensor_parallel_size=etp,
             )
         model_parallel_cuda_manual_seed(seed)
 
@@ -122,11 +136,77 @@ class MegatronNativeEngine(MegatronBaseEngine):
         with open(cfg_path) as fh:
             hf = json.load(fh)
         head_dim = hf.get("head_dim", hf["hidden_size"] // hf["num_attention_heads"])
-        self._dims = Qwen3Dims(
-            num_layers=hf["num_hidden_layers"], hidden=hf["hidden_size"],
-            num_heads=hf["num_attention_heads"], num_kv_groups=hf["num_key_value_heads"],
-            head_dim=head_dim, ffn=hf["intermediate_size"], vocab=hf["vocab_size"],
+
+        # ---- MoE detection: HF config declares routed experts (Qwen3-MoE etc.) ----
+        # Any of these HF keys marks a MoE model; an explicit engine_config
+        # ``num_experts`` overrides. dense models keep every ``moe_*`` off.
+        hf_num_experts = (
+            hf.get("num_experts") or hf.get("n_routed_experts") or hf.get("num_local_experts")
         )
+        cfg_num_experts = ec.get("num_experts")
+        num_experts = int(cfg_num_experts or hf_num_experts or 0)
+        self._is_moe = num_experts > 1
+        self._num_experts = num_experts
+
+        # Megatron hard-requires sequence parallelism when MoE and TP are both on
+        # (the MoE token dispatcher assumes SP-scattered activations under TP).
+        # RL forwards are variable-length, so the packed thd stream is padded to a
+        # multiple of TP in ``_pp_forward_model`` to satisfy the SP sequence split.
+        if self._is_moe and tp > 1 and not sp:
+            sp = True
+            self._sp = True
+            logger.info(
+                "MegatronNativeEngine: MoE+TP(%d) -> forcing sequence_parallel=True "
+                "(packed thd padded to multiple of TP).", tp,
+            )
+
+        moe_kwargs: dict = {}
+        if self._is_moe:
+            self._dims = build_moe_dims(hf)
+            moe_ffn = self._dims.moe_ffn
+            topk = int(ec.get("moe_router_topk") or hf.get("num_experts_per_tok") or 2)
+            shared_ffn = int(
+                ec.get("moe_shared_expert_intermediate_size")
+                or hf.get("shared_expert_intermediate_size", 0) or 0
+            )
+            moe_kwargs = dict(
+                num_moe_experts=num_experts,
+                moe_ffn_hidden_size=moe_ffn,
+                moe_router_topk=topk,
+                moe_grouped_gemm=bool(ec.get("moe_grouped_gemm", True)),
+                moe_router_load_balancing_type=str(ec.get("moe_router_load_balancing_type", "aux_loss")),
+                moe_aux_loss_coeff=float(ec.get("moe_aux_loss_coeff", 0.0) or 0.0),
+                expert_model_parallel_size=ep,
+                expert_tensor_parallel_size=etp,
+                moe_permute_fusion=bool(ec.get("moe_permute_fusion", False)),
+            )
+            # Qwen3-MoE routing = softmax(all) -> top-k -> renormalize top-k
+            # (HF ``norm_topk_prob=True``). That is mathematically identical to
+            # Megatron's ``moe_router_pre_softmax=False`` (top-k of logits, then a
+            # softmax over ONLY the top-k logits -> already sums to 1), because the
+            # full-softmax denominator cancels under renormalization. Using
+            # ``pre_softmax=True`` instead would leave the gate weights un-renormalized
+            # (sum<1) and diverge from vLLM -> large rollout/train log-prob mismatch.
+            pre_softmax = ec.get("moe_router_pre_softmax")
+            moe_kwargs["moe_router_pre_softmax"] = (
+                False if pre_softmax is None else bool(pre_softmax)
+            )
+            if ec.get("moe_router_score_function"):
+                moe_kwargs["moe_router_score_function"] = str(ec.get("moe_router_score_function"))
+            if ec.get("moe_router_dtype"):
+                moe_kwargs["moe_router_dtype"] = str(ec.get("moe_router_dtype"))
+            if ec.get("moe_router_topk_scaling_factor") is not None:
+                moe_kwargs["moe_router_topk_scaling_factor"] = float(ec.get("moe_router_topk_scaling_factor"))
+            if ec.get("moe_router_bias_update_rate") is not None:
+                moe_kwargs["moe_router_bias_update_rate"] = float(ec.get("moe_router_bias_update_rate"))
+            if shared_ffn > 0:
+                moe_kwargs["moe_shared_expert_intermediate_size"] = shared_ffn
+        else:
+            self._dims = Qwen3Dims(
+                num_layers=hf["num_hidden_layers"], hidden=hf["hidden_size"],
+                num_heads=hf["num_attention_heads"], num_kv_groups=hf["num_key_value_heads"],
+                head_dim=head_dim, ffn=hf["intermediate_size"], vocab=hf["vocab_size"],
+            )
 
         recompute_kwargs: dict = {}
         rc_gran = ec.get("recompute_granularity") or None
@@ -155,12 +235,20 @@ class MegatronNativeEngine(MegatronBaseEngine):
             # allgather dispatcher under variable_seq_lengths.)
             variable_seq_lengths=(pp > 1),
             moe_token_dispatcher_type="alltoall",
+            **moe_kwargs,
             **recompute_kwargs,
         )
 
-        # TransformerEngine spec: fused TELayerNormColumnParallelLinear +
-        # TEDotProductAttention (CK/aotriton fused attn), TE RMSNorm.
-        spec = get_gpt_layer_with_transformer_engine_spec(qk_layernorm=True)
+        if self._is_moe:
+            # MoE: get_gpt_decoder_block_spec builds per-layer specs with the routed
+            # expert MLP (grouped-GEMM TEGroupedLinear or sequential local experts)
+            # and standalone pre-MLP RMSNorm, driven by the TransformerConfig MoE
+            # fields above. Attention keeps the fused TE qkv layer-norm-linear.
+            spec = get_gpt_decoder_block_spec(tfcfg, use_transformer_engine=True)
+        else:
+            # TransformerEngine spec: fused TELayerNormColumnParallelLinear +
+            # TEDotProductAttention (CK/aotriton fused attn), TE RMSNorm.
+            spec = get_gpt_layer_with_transformer_engine_spec(qk_layernorm=True)
 
         model = GPTModel(
             config=tfcfg, transformer_layer_spec=spec, vocab_size=hf["vocab_size"],
@@ -179,11 +267,14 @@ class MegatronNativeEngine(MegatronBaseEngine):
 
         # ---- load HF weights via the TE-named bridge ----
         logger.info(
-            "MegatronNativeEngine[%d]: loading HF weights (TE spec, tp=%d pp=%d cp=%d) from %s",
-            self._rank(), tp, pp, cp, self.model_name,
+            "MegatronNativeEngine[%d]: loading HF weights (TE spec, moe=%s experts=%d "
+            "tp=%d pp=%d cp=%d ep=%d etp=%d) from %s",
+            self._rank(), self._is_moe, num_experts, tp, pp, cp, ep, etp, self.model_name,
         )
         hf_state = load_hf_safetensors(self.model_name)
-        if tp == 1 and pp == 1:
+        if self._is_moe:
+            meg_state = self._shard_hf_for_moe(model, hf_state)
+        elif tp == 1 and pp == 1:
             meg_state = hf_to_megatron(hf_state, self._dims, te=True)
         else:
             # TP/PP>1: each rank keeps only its model-parallel shard. For TP the
@@ -199,6 +290,21 @@ class MegatronNativeEngine(MegatronBaseEngine):
         del meg_state
         self.module = model.cuda()
         self._tfcfg = tfcfg
+
+        if self._is_moe and self._rank() == 0:
+            # Surface MoE + Expert-Parallel topology to the run log (stdout is
+            # forwarded by Ray). Evidence of expert sharding / EP group width.
+            print(
+                f"[MegatronNativeEngine] MoE+EP spec: num_experts={num_experts} "
+                f"topk={moe_kwargs.get('moe_router_topk')} moe_ffn={self._dims.moe_ffn} | "
+                f"tp={tp} pp={pp} cp={cp} EP={ep} etp={etp} -> "
+                f"local_experts/rank={num_experts // ep} | "
+                f"grouped_gemm={moe_kwargs.get('moe_grouped_gemm')} "
+                f"router_dtype={moe_kwargs.get('moe_router_dtype')} "
+                f"pre_softmax={moe_kwargs.get('moe_router_pre_softmax')} "
+                f"aux_loss_coeff={moe_kwargs.get('moe_aux_loss_coeff')}",
+                flush=True,
+            )
 
         # ---- distributed optimizer + scheduler ----
         from megatron.core.distributed import DistributedDataParallel as DDP
@@ -299,6 +405,79 @@ class MegatronNativeEngine(MegatronBaseEngine):
         del meg_full
         return local_sd
 
+    # ---- MoE weight loading: HF -> this (TP+PP+EP+ETP) rank's shard ----
+    def _shard_hf_for_moe(self, model, hf_state: dict) -> dict:
+        """Build this rank's MoE Megatron state dict from full HF weights.
+
+        Non-expert params (embedding, attention, norms, router, output) are TP/PP
+        sharded exactly like the dense path (plain ShardedTensor ``global_slice``;
+        MoE has no dense-MLP fused ``fc1`` factory). Expert params are selected by
+        Expert-Parallel rank -- each EP rank owns ``E / ep`` consecutive global
+        experts -- and, when Expert-Tensor-Parallel (ETP) > 1, additionally sliced:
+        ``linear_fc1`` (fused gate;up) column-parallel, ``linear_fc2`` row-parallel.
+        Handles both grouped-GEMM (``experts.linear_fc{1,2}.weight{e}``) and
+        sequential (``experts.local_experts.{e}.linear_fc{1,2}.weight``) naming.
+        """
+        from megatron.core import parallel_state as mpu
+        from megatron.core.dist_checkpointing.mapping import ShardedTensor
+
+        d = self._dims
+        ep = mpu.get_expert_model_parallel_world_size()
+        ep_rank = mpu.get_expert_model_parallel_rank()
+        etp = mpu.get_expert_tensor_parallel_world_size()
+        etp_rank = mpu.get_expert_tensor_parallel_rank()
+        tp = mpu.get_tensor_model_parallel_world_size()
+        num_local = d.num_experts // ep
+        if num_local * ep != d.num_experts:
+            raise RuntimeError(
+                f"num_experts={d.num_experts} not divisible by expert_model_parallel_size={ep}"
+            )
+        moe_ffn = d.moe_ffn
+
+        non_expert_full = _non_expert_hf_to_megatron(hf_state, d)
+        ssd = model.sharded_state_dict()
+        offset = _pp_layer_offset_from_ssd(ssd)
+
+        local_sd: dict = {}
+        for name, p in model.named_parameters():
+            exp = _expert_local_index(name)
+            if exp is not None:
+                local_e, which_fc = exp
+                m = _LAYER_RE.search(name)
+                global_layer = int(m.group(2)) + offset
+                global_e = ep_rank * num_local + local_e
+                if which_fc == "1":
+                    full = hf_expert_fc1(hf_state, d, global_layer, global_e)  # [2*moe_ffn, hidden]
+                    if etp > 1:
+                        shard = moe_ffn // etp
+                        gate = full[:moe_ffn]
+                        up = full[moe_ffn:]
+                        full = torch.cat(
+                            [gate[etp_rank * shard:(etp_rank + 1) * shard],
+                             up[etp_rank * shard:(etp_rank + 1) * shard]], dim=0,
+                        ).contiguous()
+                else:
+                    full = hf_expert_fc2(hf_state, d, global_layer, global_e)  # [hidden, moe_ffn]
+                    if etp > 1:
+                        shard = moe_ffn // etp
+                        full = full[:, etp_rank * shard:(etp_rank + 1) * shard].contiguous()
+                local_sd[name] = full.to(torch.bfloat16)
+                continue
+
+            # non-expert param: TP/PP slice via the ShardedTensor metadata.
+            gkey = _to_global_key(name, offset)
+            if gkey not in non_expert_full:
+                continue
+            full = non_expert_full[gkey]
+            if tp > 1:
+                st = ssd.get(name)
+                if isinstance(st, ShardedTensor):
+                    sl = st.global_slice()[st.prepend_axis_num:]
+                    full = full[sl]
+            local_sd[name] = full.contiguous().to(torch.bfloat16)
+        del non_expert_full
+        return local_sd
+
     # ---- weight sync: Megatron(TE) -> full (TP+PP gathered) named tensors ----
     def _tp_gather_named_params(self) -> dict:
         """All-gather this stage's params across the TP group -> full (unsharded-TP)
@@ -380,8 +559,110 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 out[k] = t
         return list(out.items())
 
+    def _full_megatron_named_params_moe(self):
+        """Reconstruct the COMPLETE MoE model as (global_name, tensor) on every rank.
+
+        Non-expert params: TP all-gather (attention shards) + PP broadcast. Expert
+        params: ETP-gather each local expert (fc1 gate/up column shards, fc2 row
+        shards), all-gather across the EP group with local->global expert relabel,
+        then PP broadcast. Expert names carry GLOBAL indices so ``megatron_to_hf_moe``
+        maps them back to HF ``mlp.experts.{e}.*``. Collective on all actors."""
+        from megatron.core import parallel_state as mpu
+        from megatron.core.dist_checkpointing.mapping import ShardedTensor
+        from lumenrl.engine.training.qwen3moe_megatron_bridge import _relabel_expert_index
+
+        d = self._dims
+        ep = mpu.get_expert_model_parallel_world_size()
+        etp = mpu.get_expert_tensor_parallel_world_size()
+        tp = mpu.get_tensor_model_parallel_world_size()
+        num_local = d.num_experts // ep
+
+        ssd = self.module.sharded_state_dict()
+        offset = _pp_layer_offset_from_ssd(ssd)
+        tp_group = mpu.get_tensor_model_parallel_group() if tp > 1 else None
+        etp_group = mpu.get_expert_tensor_parallel_group() if etp > 1 else None
+        ep_group = mpu.get_expert_model_parallel_group() if ep > 1 else None
+
+        stage: dict = {}
+        for name, param in self.module.named_parameters():
+            p = param.detach().contiguous()
+            exp = _expert_local_index(name)
+            if exp is None:
+                # ---- non-expert: TP all-gather ----
+                gkey = _to_global_key(name, offset)
+                if tp == 1:
+                    stage[gkey] = p
+                    continue
+                gathered = [torch.empty_like(p) for _ in range(tp)]
+                dist.all_gather(gathered, p, group=tp_group)
+                st = ssd.get(name)
+                if isinstance(st, ShardedTensor):
+                    gshape = tuple(st.global_shape[st.prepend_axis_num:])
+                    lshape = tuple(st.local_shape)
+                    split_dim = next(
+                        (dd for dd in range(len(lshape)) if lshape[dd] != gshape[dd]), None
+                    )
+                    stage[gkey] = gathered[0] if split_dim is None else torch.cat(gathered, dim=split_dim)
+                else:
+                    stage[gkey] = gathered[0]
+                continue
+
+            # ---- expert: ETP gather -> full local expert tensor ----
+            local_e, which_fc = exp
+            if etp > 1:
+                g = [torch.empty_like(p) for _ in range(etp)]
+                dist.all_gather(g, p, group=etp_group)
+                if which_fc == "1":
+                    sh = p.shape[0] // 2
+                    gate = torch.cat([x[:sh] for x in g], dim=0)
+                    up = torch.cat([x[sh:] for x in g], dim=0)
+                    p = torch.cat([gate, up], dim=0)
+                else:
+                    p = torch.cat(g, dim=1)
+            # ---- EP all-gather -> relabel local->global expert index ----
+            if ep == 1:
+                gname = _to_global_key(_relabel_expert_index(name, local_e), offset)
+                stage[gname] = p
+                continue
+            g = [torch.empty_like(p) for _ in range(ep)]
+            dist.all_gather(g, p, group=ep_group)
+            for j in range(ep):
+                global_e = j * num_local + local_e
+                gname = _to_global_key(_relabel_expert_index(name, global_e), offset)
+                stage[gname] = g[j]
+
+        # ---- PP broadcast: every rank ends up with all stages' params ----
+        pp = mpu.get_pipeline_model_parallel_world_size()
+        if pp == 1:
+            return list(stage.items())
+        pp_group = mpu.get_pipeline_model_parallel_group()
+        pp_rank = mpu.get_pipeline_model_parallel_rank()
+        meta_local = [(k, tuple(v.shape), str(v.dtype)) for k, v in stage.items()]
+        gathered_meta: list = [None] * pp
+        dist.all_gather_object(gathered_meta, meta_local, group=pp_group)
+        dtype_map = {
+            "torch.bfloat16": torch.bfloat16,
+            "torch.float32": torch.float32,
+            "torch.float16": torch.float16,
+        }
+        out: dict = {}
+        for src in range(pp):
+            src_global = dist.get_global_rank(pp_group, src)
+            for (k, shape, dtype_s) in gathered_meta[src]:
+                if src == pp_rank:
+                    t = stage[k].contiguous()
+                else:
+                    t = torch.empty(shape, dtype=dtype_map[dtype_s], device="cuda")
+                dist.broadcast(t, src=src_global, group=pp_group)
+                out[k] = t
+        return list(out.items())
+
     def get_per_tensor_param(self, **kwargs):
         assert self.module is not None
+        if getattr(self, "_is_moe", False):
+            named = self._full_megatron_named_params_moe()
+            gen = megatron_to_hf_moe(named, self._dims)
+            return gen, None
         named = self._full_megatron_named_params()
         gen = megatron_to_hf(named, self._dims, te=True)
         return gen, None
@@ -496,6 +777,28 @@ class MegatronNativeEngine(MegatronBaseEngine):
             local_offsets.append(end)
 
         local_total = local_offsets[-1]
+        # Sequence parallelism (required for MoE+TP) scatters the packed sequence
+        # across TP ranks, so the local token count must be a multiple of TP. Pad
+        # with a trailing dummy segment (its own cu_seqlens bin -> attention stays
+        # isolated; no layout entry -> its logits are never read for loss).
+        if self._sp and self._tp > 1:
+            pad = (-local_total) % self._tp
+            if pad:
+                local_ids.append(torch.zeros(pad, dtype=torch.long, device=ids_list[0].device))
+                local_offsets.append(local_total + pad)
+                local_total = local_offsets[-1]
+            # SP variable-length efficiency: padding is bounded by TP-1 tokens per
+            # microbatch, i.e. <= (TP-1)/tokens. Log the ratio once (rank 0) so a
+            # longrun can confirm it stays negligible.
+            if not getattr(self, "_sp_pad_logged", False) and self._rank() == 0:
+                real = local_total - pad
+                logger.info(
+                    "MegatronNativeEngine SP pad: +%d/%d tokens (%.3f%%) per microbatch "
+                    "(bound=(TP-1)/tokens=%.3f%%)",
+                    pad, local_total, 100.0 * pad / max(1, local_total),
+                    100.0 * (self._tp - 1) / max(1, real),
+                )
+                self._sp_pad_logged = True
         tokens = torch.cat(local_ids, dim=0).view(1, local_total)
         # For RoPE + packed thd, Megatron derives positions from cu_seqlens and
         # CP rank; explicit position_ids are neither needed nor consumed.
@@ -620,15 +923,34 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 dist.all_reduce(full_ent, group=cp_group)
         return full_lp, full_ent
 
+    def _pad_mbs_for_ep(self, mbs: list) -> list:
+        """Lockstep the microbatch COUNT across the Expert-Parallel group.
+
+        MoE's all-to-all token dispatch is a collective over the EP group, so every
+        EP rank must run the same NUMBER of forward passes or the collective hangs.
+        RL microbatch counts are data-dependent and differ per DP/EP rank, so we
+        all-reduce the max count over the EP group and pad short ranks with dummy
+        2-token microbatches (empty ``rows`` -> zero loss / zero grad, but they
+        still participate in the expert all-to-all)."""
+        if not getattr(self, "_is_moe", False) or self._ep <= 1:
+            return mbs
+        from megatron.core import parallel_state as mpu
+        cnt = torch.tensor([len(mbs)], device="cuda", dtype=torch.long)
+        dist.all_reduce(cnt, op=dist.ReduceOp.MAX, group=mpu.get_expert_model_parallel_group())
+        target = int(cnt.item())
+        while len(mbs) < target:
+            mbs.append({"rows": [], "ids_list": [torch.zeros(2, dtype=torch.long, device="cuda")]})
+        return mbs
+
     def engine_update_policy(self, batch):
-        if self._pp == 1 and self._cp == 1:
+        if self._pp == 1 and self._cp == 1 and not getattr(self, "_is_moe", False):
             return super().engine_update_policy(batch)
         return self._pp_update_policy(batch)
 
     def _pp_update_policy(self, batch) -> dict[str, float]:
         from megatron.core.pipeline_parallel import get_forward_backward_func
 
-        if batch.batch_size == 0:
+        if batch.batch_size == 0 and not getattr(self, "_is_moe", False):
             return {"loss": 0.0, "lr": self._cur_lr(), "grad_norm": 0.0}
         self._pp_setup_config()
         meta = dict(batch.meta)
@@ -651,6 +973,8 @@ class MegatronNativeEngine(MegatronBaseEngine):
             am = torch.ones_like(seqs)
         rows = self._collect_rows(seqs, am)
         mbs = self._build_microbatches(seqs, rows)
+        # MoE: lockstep the microbatch count across the EP group (all-to-all).
+        mbs = self._pad_mbs_for_ep(mbs)
         num_mb = len(mbs)
 
         self.module.train()
@@ -668,9 +992,11 @@ class MegatronNativeEngine(MegatronBaseEngine):
             out, layouts = self._pp_forward_model(model, mb["ids_list"])
 
             def loss_func(output_tensor):
-                local_total = layouts[-1]["local_end"]
-                logits = (output_tensor.logits if hasattr(output_tensor, "logits")
-                          else output_tensor).view(local_total, -1).float() / temperature
+                # reshape by ACTUAL length: under SP the packed stream is padded to
+                # a TP multiple, so the output can be longer than the real token
+                # total. Real sequences index via their (unpadded) layouts.
+                lt = output_tensor.logits if hasattr(output_tensor, "logits") else output_tensor
+                logits = lt.reshape(-1, lt.shape[-1]).float() / temperature
                 bin_loss = None
                 agg = {"loss": 0.0, "n": 0, "ppo_kl_sum": 0.0, "ppo_kl_tok": 0.0,
                        "rc_kl_sum": 0.0, "rc_kl_tok": 0.0}
@@ -740,7 +1066,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
         return metrics
 
     def engine_compute_log_probs(self, batch):
-        if self._pp == 1 and self._cp == 1:
+        if self._pp == 1 and self._cp == 1 and not getattr(self, "_is_moe", False):
             return super().engine_compute_log_probs(batch)
         return self._pp_compute_log_probs(batch)
 
@@ -758,6 +1084,8 @@ class MegatronNativeEngine(MegatronBaseEngine):
 
         rows = self._collect_rows(seqs, am)
         mbs = self._build_microbatches(seqs, rows)
+        # MoE: lockstep the microbatch count across the EP group (all-to-all).
+        mbs = self._pad_mbs_for_ep(mbs)
         num_mb = len(mbs)
         self.module.eval()
 
@@ -772,9 +1100,8 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 out, layouts = self._pp_forward_model(model, mb["ids_list"])
 
                 def collect(output_tensor, non_loss_data=True):
-                    local_total = layouts[-1]["local_end"]
-                    logits = (output_tensor.logits if hasattr(output_tensor, "logits")
-                              else output_tensor).view(local_total, -1).float() / temperature
+                    lt = output_tensor.logits if hasattr(output_tensor, "logits") else output_tensor
+                    logits = lt.reshape(-1, lt.shape[-1]).float() / temperature
                     res = []
                     for k, (r, start, L) in enumerate(mb["rows"]):
                         tok_lp, ent = self._cp_row_logprob_entropy(
