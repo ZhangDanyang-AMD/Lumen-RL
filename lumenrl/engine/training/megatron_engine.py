@@ -549,7 +549,9 @@ class MegatronEngine(BaseEngine):
         opt_cfg = OptimizerConfig(
             optimizer="adam", lr=float(oc.get("lr", 1e-6)),
             weight_decay=float(oc.get("weight_decay", 0.1)),
-            adam_beta1=0.9, adam_beta2=0.95, adam_eps=1e-8,
+            adam_beta1=float(oc.get("adam_beta1", 0.9)),
+            adam_beta2=float(oc.get("adam_beta2", 0.95)),
+            adam_eps=float(oc.get("adam_eps", 1e-8)),
             clip_grad=self._clip, bf16=True, fp16=False,
             params_dtype=torch.bfloat16,
             use_distributed_optimizer=bool(ec.get("use_distributed_optimizer", True)),
@@ -1527,12 +1529,16 @@ class MegatronEngine(BaseEngine):
                     )
             local_full[name] = p
 
-        # --- Phase 2: EP all-gather expert fused tensors ---
+        # --- Phase 2: EP all-gather expert tensors ---
         if ep_size > 1 and ep_group is not None:
             expert_keys = [
                 k for k in local_full
                 if ".experts." in k and ".shared_experts." not in k
             ]
+            # For SequentialMLP expert layout, each EP rank exposes
+            # local_experts.{0..num_local-1}. We need to rebuild full
+            # local_experts.{0..num_experts-1} before megatron_to_hf(ep_size=1).
+            num_local_experts = max(1, self._dims.num_experts // ep_size)
             for key in expert_keys:
                 local_t = local_full[key].contiguous()
                 if not local_t.is_cuda:
@@ -1543,6 +1549,18 @@ class MegatronEngine(BaseEngine):
                     local_full[key] = torch.cat(gathered, dim=1).contiguous()
                 elif "weight2" in key:
                     local_full[key] = torch.cat(gathered, dim=0).contiguous()
+                elif ".local_experts." in key:
+                    head, rest = key.split("local_experts.", 1)
+                    local_idx_s, tail = rest.split(".", 1)
+                    local_idx = int(local_idx_s)
+                    # Remove the rank-local entry before rebuilding global
+                    # expert keys.  For src_ep_rank=0 the rebuilt key equals
+                    # ``key``; deleting afterwards would discard expert 0.
+                    del local_full[key]
+                    for src_ep_rank, part in enumerate(gathered):
+                        global_idx = src_ep_rank * num_local_experts + local_idx
+                        gkey = f"{head}local_experts.{global_idx}.{tail}"
+                        local_full[gkey] = part.contiguous()
                 else:
                     local_full[key] = gathered[0]
 

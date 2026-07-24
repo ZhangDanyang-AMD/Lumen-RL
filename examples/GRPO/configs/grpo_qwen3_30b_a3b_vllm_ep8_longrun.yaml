@@ -1,4 +1,4 @@
-# Qwen3-30B-A3B GRPO long run — Megatron TP4/EP8 + ATOM BF16 rollout (MI308X)
+# Qwen3-30B-A3B GRPO long run — Megatron TP4/EP8 + vLLM BF16 rollout (MI308X)
 #
 # Aligned with LMSYS MILES RL:
 #   GRPO 32x8 sampling, 8k response cap, global batch 256, no KL, TP4/EP8
@@ -8,8 +8,8 @@
 #   distributed optimizer, flash attention, chunked log-prob,
 #   torch RMSNorm — no apex/TE)
 #
-# Rollout: ATOM AsyncLLMEngine (BF16 weights + FP8 KV cache, TP=2 x 4 replicas,
-#   enforce_eager=false + compilation_config.level=3 + sleep_level=2)
+# Rollout: vLLM AsyncLLM (BF16 weights + FP8 KV cache, TP=2 x 4 replicas,
+#   sleep_level=2)
 #
 # FP8 per_block_fp8 is NOT used (Qwen3-30B-A3B MoE intermediate=768 causes
 # garbled output with 128x128 block quantization). BF16 weights + FP8 KV cache.
@@ -32,7 +32,7 @@ controller:
 policy:
   model_name: /mnt/raid0/models/Qwen3-30B-A3B
   training_backend: megatron
-  generation_backend: atom
+  generation_backend: vllm
   max_total_sequence_length: 9216        # 1024 prompt + 8192 response
   max_response_length: 8192             # MILES: 8k response cap
   train_global_batch_size: 256          # MILES: 32 prompts x 8 generations = 256
@@ -66,18 +66,11 @@ policy:
       optimizer_offload: false
       reshard_after_forward: true
   generation:
-    atom_cfg:
-      tensor_parallel_size: 2
-      kv_cache_dtype: fp8
-      transport: ray_http
-      expert_parallel_size: 1
-      engine_kwargs:
-        enforce_eager: false
-        compilation_config:
-          level: 3
     vllm_cfg:
       transport: ray_http
       ray_http_start_server: false
+      tensor_parallel_size: 2            # TP=2: 8 GPUs / 2 = 4 replicas
+      kv_cache_dtype: fp8                # FP8 KV cache (not weight quantization)
       gpu_memory_utilization: 0.60
       max_model_len: 9216
       dtype: bfloat16

@@ -1,25 +1,28 @@
-# Qwen3-30B-A3B GRPO long run — Megatron TP4/EP8 + ATOM BF16 rollout (MI308X)
+# Qwen3-30B-A3B GRPO smoke — Megatron TP4/EP8 + vLLM BF16 rollout (MI308X)
 #
-# Aligned with LMSYS MILES RL:
-#   GRPO 32x8 sampling, 8k response cap, global batch 256, no KL, TP4/EP8
-#   https://www.lmsys.org/blog/2026-03-17-rocm-miles-rl-amd/#performance
+# 2-node training/inference separation (训推分离):
+#   Node 0: vLLM inference (4 replicas × TP=2, 8 GPUs)
+#   Node 1: Megatron training (8 workers, TP=4, EP=8)
+#
+# MILES-aligned hyperparams, reduced scale for fast validation:
+#   3 steps, batch=8 (1 prompt x 8 gen), response=64
 #
 # Training: Megatron-Core GPTModel (TP=4, EP=8, sequence-parallel,
 #   distributed optimizer, flash attention, chunked log-prob,
-#   torch RMSNorm — no apex/TE)
+#   torch RMSNorm — no apex/TE, optimizer_cpu_offload)
 #
-# Rollout: ATOM AsyncLLMEngine (BF16 weights + FP8 KV cache, TP=2 x 4 replicas,
-#   enforce_eager=false + compilation_config.level=3 + sleep_level=2)
+# Rollout: vLLM AsyncLLM (BF16 weights + FP8 KV cache, TP=2 x 4 replicas,
+#   no sleep needed)
+#
+# Weight sync: safetensors on shared filesystem (LUMENRL_WEIGHT_SYNC_DIR)
 #
 # FP8 per_block_fp8 is NOT used (Qwen3-30B-A3B MoE intermediate=768 causes
 # garbled output with 128x128 block quantization). BF16 weights + FP8 KV cache.
-#
-# MILES reference performance (8xMI300X):
-#   Mean step 388.50s, AIME accuracy 0.665 -> 0.729
 
 cluster:
-  num_nodes: 1
+  num_nodes: 2
   gpus_per_node: 8
+  ray_address: "auto"                    # connect to existing Ray cluster
 
 controller:
   ray:
@@ -28,29 +31,31 @@ controller:
     actor:
       num_workers: 8
       dispatch_mode: dp_compute_proto
+      process_on_nodes: [8]           # all 8 training workers on one node
+    rollout:
+      num_workers: 8                  # 8 GPUs for vLLM placement on separate node
+      process_on_nodes: [8]
 
 policy:
   model_name: /mnt/raid0/models/Qwen3-30B-A3B
   training_backend: megatron
-  generation_backend: atom
-  max_total_sequence_length: 9216        # 1024 prompt + 8192 response
-  max_response_length: 8192             # MILES: 8k response cap
-  train_global_batch_size: 256          # MILES: 32 prompts x 8 generations = 256
-  gen_batch_size: 64                    # over-sample prompts per round
+  generation_backend: vllm
+  max_total_sequence_length: 128           # fast-debug: 64 prompt + 64 response
+  max_response_length: 64
+  train_global_batch_size: 8              # fast-debug: 1 prompt x 8 generations
+  gen_batch_size: 8
   train_micro_batch_size: 1
-  max_token_len_per_gpu: 32768           # MILES: --max-tokens-per-gpu 32768
+  max_token_len_per_gpu: 512
   learning_rate: 1.0e-6
   lr_warmup_steps: 10
   weight_decay: 0.1
   max_grad_norm: 1.0
   lr_decay_style: constant
-  adam_beta1: 0.9
-  adam_beta2: 0.98                        # MILES: --adam-beta2 0.98
   training:
-    optimizer_dtype: bf16
+    optimizer_dtype: bf16                 # compute dtype (master weights stay FP32)
     megatron_cfg:
-      tensor_parallel_size: 4
-      expert_parallel_size: 8            # 128 experts / 8 = 16 experts per GPU
+      tensor_parallel_size: 4            # MILES: TP=4
+      expert_parallel_size: 8            # MILES: EP=8 (128/8=16 experts/GPU)
       expert_tensor_parallel_size: 1    # MILES: ETP=1 (MoE layers no TP, dense layers TP=4)
       num_experts: 128
       moe_grouped_gemm: true
@@ -61,34 +66,28 @@ policy:
       recompute_num_layers: 1
       attention_backend: flash
       log_probs_chunk_size: 1024
+      optimizer_cpu_offload: true
     fsdp_cfg:
       param_offload: false
       optimizer_offload: false
       reshard_after_forward: true
   generation:
-    atom_cfg:
-      tensor_parallel_size: 2
-      kv_cache_dtype: fp8
-      transport: ray_http
-      expert_parallel_size: 1
-      engine_kwargs:
-        enforce_eager: false
-        compilation_config:
-          level: 3
     vllm_cfg:
       transport: ray_http
       ray_http_start_server: false
-      gpu_memory_utilization: 0.60
-      max_model_len: 9216
+      tensor_parallel_size: 2            # TP=2: 8 GPUs / 2 = 4 replicas
+      kv_cache_dtype: fp8                # FP8 KV cache (not weight quantization)
+      gpu_memory_utilization: 0.85       # more VRAM since no GPU sharing
+      max_model_len: 128
       dtype: bfloat16
       enforce_eager: false
       enable_chunked_prefill: true
-      max_num_batched_tokens: 16384
-      max_num_seqs: 64
-      quantization: ""
+      max_num_batched_tokens: 8192
+      max_num_seqs: 32
+      quantization: ""                   # BF16 weights (no fp8_per_block)
       calculate_log_probs: true
-      enable_sleep_mode: true
-      sleep_level: 2
+      enable_sleep_mode: false           # no sleep needed (separate nodes)
+      sleep_level: 0
       update_weights_bucket_megabytes: 2048
       temperature: 1.0
       top_p: 1.0
@@ -99,10 +98,9 @@ algorithm:
   adv_estimator: grpo
   use_kl_in_reward: false
   loss_agg_mode: token-mean
-  clip_ratio_high: 0.28                   # MILES: --eps-clip-high 0.28 (asymmetric clip)
   grpo:
-    num_generations: 8
-    kl_coeff: 0.0
+    num_generations: 8                   # keep 8 (= num_workers for EP sync test)
+    kl_coeff: 0.0                        # MILES: no KL loss
     clip_ratio: 0.2
 
 quantization:
@@ -129,24 +127,21 @@ reward:
   shuffle_seed: 10086
 
 val_dataset: /mnt/raid0/data_cached/qwen3-30b-a3b-maxprompt1024/aime-2024.filtered.parquet
-val_steps: 10
+val_steps: 0
 val_batch_size: 0
 eval:
   enabled: false
   num_samples: 0
 
 checkpointing:
-  checkpoint_dir: /mnt/raid0/ckpts/qwen3-30b-a3b-ep8/longrun
-  save_steps: 50
-  save_total_limit: 5
-  resume: true
+  checkpoint_dir: /mnt/raid0/ckpts/qwen3-30b-a3b-ep8/smoke
+  save_steps: 9999
+  save_total_limit: 1
+  resume: false
 
 logger:
-  wandb_enabled: true
+  wandb_enabled: false
   log_interval: 1
-  wandb:
-    project: LumenRL
-    name: qwen3-30b-a3b-grpo-ep8-miles-aligned
 
-num_training_steps: 1000
+num_training_steps: 3
 seed: 10086

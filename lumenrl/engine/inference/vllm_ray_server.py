@@ -198,6 +198,14 @@ class VLLMRayServer:
         await self.engine.reset_prefix_cache()
         return True
 
+    async def reload_weights_from_path(self, weight_dir: str) -> bool:
+        """Reload weights from a safetensors directory (for separation mode / TP>1)."""
+        await self.engine.collective_rpc(
+            "reload_weights_from_safetensors", kwargs={"weight_dir": weight_dir}
+        )
+        await self.engine.reset_prefix_cache()
+        return True
+
     async def sleep(self, level: int = 2) -> bool:
         await self.engine.sleep(level=level)
         return True
@@ -270,33 +278,60 @@ class VLLMReplicaManager:
         self.servers: list = []
 
     def create(self) -> None:
-        """Create + launch one server actor colocated with each training actor."""
+        """Create + launch server actors colocated with training/rollout workers.
+
+        Supports TP>1: when ``engine_kwargs["tensor_parallel_size"] > 1``,
+        groups consecutive workers (by their GPU IDs) into multi-GPU replicas,
+        mirroring ATOMReplicaManager's grouping logic.
+        """
         import ray
         from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
         job_id = ray.get_runtime_context().get_job_id()
-        # Ask each training actor where it lives + which physical GPU it owns.
         infos = self.actor_wg.execute_all_sync("get_colocation_info")
         logger.info("VLLMReplicaManager: colocation infos = %s", infos)
 
+        tp = int(self.engine_kwargs.get("tensor_parallel_size", 1) or 1)
+        num_workers = len(infos)
+        if num_workers % tp != 0:
+            raise ValueError(
+                f"num_workers ({num_workers}) must be divisible by "
+                f"tensor_parallel_size ({tp})"
+            )
+        num_replicas = max(1, num_workers // tp)
+        self.num_replicas = num_replicas
+
         remote_cls = ray.remote(VLLMRayServer)
-        for i, info in enumerate(infos):
-            node_id = info["node_id"]
-            gpu_ids = ",".join(str(g) for g in info["gpu_ids"])
+        for r in range(num_replicas):
+            group = infos[r * tp : (r + 1) * tp]
+            node_id = group[0]["node_id"]
+            all_gpu_ids: list[str] = []
+            for info in group:
+                all_gpu_ids.extend(str(g) for g in info["gpu_ids"])
+            gpu_ids_str = ",".join(all_gpu_ids)
+
             env_vars = {
-                "CUDA_VISIBLE_DEVICES": gpu_ids,
-                "HIP_VISIBLE_DEVICES": gpu_ids,
+                "CUDA_VISIBLE_DEVICES": gpu_ids_str,
+                "HIP_VISIBLE_DEVICES": gpu_ids_str,
                 "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
                 "RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES": "1",
                 "RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES": "1",
                 "NCCL_CUMEM_ENABLE": "0",
-                "LUMEN_REPLICA_RANK": str(i),
+                # This is the native vLLM backend.  ATOM's out-of-tree
+                # platform plugin can otherwise override ROCm platform
+                # detection, and a plugin import failure leaves device_type
+                # empty (AsyncLLM then fails while constructing DeviceConfig).
+                "ATOM_DISABLE_VLLM_PLUGIN": "1",
+                "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": os.getenv(
+                    "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "300"
+                ),
+                "LUMEN_REPLICA_RANK": str(r),
                 "LUMEN_RAY_JOB_ID": str(job_id),
             }
             server = remote_cls.options(
-                num_gpus=0,  # pinned manually via CUDA_VISIBLE_DEVICES; no Ray GPU slot
+                num_gpus=0,
                 num_cpus=1,
-                name=f"lumen-vllm-replica-{i}",
+                name=f"lumen-vllm-replica-{r}",
                 max_concurrency=self.max_concurrency,
                 scheduling_strategy=NodeAffinitySchedulingStrategy(
                     node_id=node_id, soft=False
@@ -304,18 +339,48 @@ class VLLMReplicaManager:
                 runtime_env={"env_vars": env_vars},
             ).remote(
                 model_name=self.model_name,
-                engine_kwargs=self.engine_kwargs,
-                replica_rank=i,
-                http_port=self.base_port + i,
+                engine_kwargs=self._engine_kwargs_for_replica(r, str(job_id)),
+                replica_rank=r,
+                http_port=self.base_port + r,
                 start_http=self.start_http,
                 base_seed=self.base_seed,
             )
             self.servers.append(server)
 
-        import ray as _ray
-        _ray.get([s.launch.remote() for s in self.servers])
-        logger.info("VLLMReplicaManager: launched %d colocated rollout replicas.",
-                    len(self.servers))
+        ray.get([s.launch.remote() for s in self.servers])
+        logger.info(
+            "VLLMReplicaManager: launched %d colocated rollout replicas (tp=%d, workers=%d).",
+            num_replicas, tp, num_workers,
+        )
+
+    def _engine_kwargs_for_replica(
+        self, replica_rank: int, job_id: str
+    ) -> dict[str, Any]:
+        """Give each replica an isolated torch compile cache."""
+        kwargs = dict(self.engine_kwargs)
+        if os.getenv("ATOM_ISOLATE_TORCH_COMPILE_CACHE", "1") not in {
+            "1", "true", "TRUE", "yes", "YES",
+        }:
+            return kwargs
+
+        comp_cfg = dict(kwargs.get("compilation_config") or {})
+        cache_root = os.getenv(
+            "ATOM_TORCH_COMPILE_CACHE_ROOT",
+            "/tmp/atom_torch_compile_cache",
+        )
+        safe_job_id = "".join(
+            ch if ch.isalnum() or ch in "-_." else "_" for ch in job_id
+        )
+        comp_cfg["cache_dir"] = os.path.join(
+            cache_root, safe_job_id, f"vllm_replica_{replica_rank}"
+        )
+        kwargs["compilation_config"] = comp_cfg
+        logger.info(
+            "VLLMReplicaManager: replica %d torch compile cache_dir=%s",
+            replica_rank,
+            comp_cfg["cache_dir"],
+        )
+        return kwargs
 
     # -- fan-out helpers -------------------------------------------------
     def sleep_all(self, level: int = 2) -> None:
@@ -329,6 +394,17 @@ class VLLMReplicaManager:
     def drain_all(self) -> None:
         import ray
         ray.get([s.wait_for_requests_to_drain.remote() for s in self.servers])
+
+    def reload_weights_from_path(self, weight_dir: str) -> None:
+        """Reload weights one replica at a time.
+
+        Each TP=2 replica reads the full checkpoint on both workers.  Loading
+        all replicas concurrently creates eight competing 61GB reads and can
+        leave vLLM workers busy beyond the sample RPC timeout.
+        """
+        import ray
+        for server in self.servers:
+            ray.get(server.reload_weights_from_path.remote(weight_dir))
 
     def shutdown(self) -> None:
         import ray

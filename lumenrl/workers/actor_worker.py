@@ -187,13 +187,17 @@ class LumenActorWorker(BaseWorker):
 
     def _build_optimizer_config(self, policy: dict) -> dict[str, Any]:
         lr = float(policy.get("learning_rate", policy.get("lr", 1e-6)))
-        return {
+        cfg = {
             "lr": lr,
             "weight_decay": float(policy.get("weight_decay", 0.01)),
             "clip_grad": float(policy.get("max_grad_norm", 1.0)),
             "lr_warmup_steps": int(policy.get("lr_warmup_steps", 10)),
             "lr_warmup_steps_ratio": float(policy.get("warmup_ratio", 0.0)),
         }
+        for key in ("adam_beta1", "adam_beta2", "adam_eps"):
+            if key in policy:
+                cfg[key] = float(policy[key])
+        return cfg
 
     def _build_model_config(self, policy: dict) -> dict[str, Any]:
         return {
@@ -613,9 +617,98 @@ class LumenActorWorker(BaseWorker):
         params, _ = self._engine.get_per_tensor_param()
         out: dict[str, torch.Tensor] = {}
         for name, param in params:
+            # Megatron collectives inside get_per_tensor_param() must run on
+            # every rank, but returning a complete CPU state from every Ray
+            # actor multiplies host/object-store usage by world size.  The
+            # controller only consumes states[0], so nonzero ranks participate
+            # in the generator collectives and discard the resulting tensors.
+            if self.rank != 0:
+                continue
             full = param.full_tensor() if isinstance(param, DTensor) else param
             out[name] = full.detach().cpu()
         return out
+
+    def export_state_dict_safetensors(
+        self,
+        sync_dir: str,
+        max_shard_bytes: int = 4 * 1024 * 1024 * 1024,
+    ) -> dict[str, Any]:
+        """Collectively export HF weights without returning them through Ray.
+
+        Every rank consumes the parameter generator so Megatron TP/EP
+        collectives make progress.  Rank 0 streams bounded CPU shards directly
+        to the shared filesystem; other ranks discard each gathered tensor.
+        """
+        if self._engine is None:
+            raise RuntimeError("init_model() must be called before exporting weights.")
+
+        import json
+
+        from safetensors.torch import save_file
+
+        output_dir = Path(sync_dir)
+        is_writer = self.rank == 0
+        if is_writer:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            for old in output_dir.glob("model-*.safetensors"):
+                old.unlink()
+
+        params, _ = self._engine.get_per_tensor_param()
+        shard: dict[str, torch.Tensor] = {}
+        shard_keys: list[list[str]] = []
+        temp_paths: list[Path] = []
+        current_bytes = 0
+        total_bytes = 0
+        num_params = 0
+
+        def flush_shard() -> None:
+            nonlocal shard, current_bytes
+            if not shard:
+                return
+            idx = len(temp_paths) + 1
+            path = output_dir / f"model-{idx:05d}.safetensors.tmp"
+            save_file(shard, str(path))
+            temp_paths.append(path)
+            shard_keys.append(list(shard))
+            shard = {}
+            current_bytes = 0
+
+        for name, param in params:
+            if not is_writer:
+                continue
+            tensor = param.detach().to("cpu").contiguous()
+            tensor_bytes = tensor.numel() * tensor.element_size()
+            if shard and current_bytes + tensor_bytes > max_shard_bytes:
+                flush_shard()
+            shard[name] = tensor
+            current_bytes += tensor_bytes
+            total_bytes += tensor_bytes
+            num_params += 1
+        if is_writer:
+            flush_shard()
+
+            weight_map: dict[str, str] = {}
+            shard_count = len(temp_paths)
+            for idx, (temp_path, keys) in enumerate(zip(temp_paths, shard_keys), 1):
+                filename = f"model-{idx:05d}-of-{shard_count:05d}.safetensors"
+                temp_path.replace(output_dir / filename)
+                for key in keys:
+                    weight_map[key] = filename
+
+            index = {
+                "metadata": {"total_size": total_bytes},
+                "weight_map": weight_map,
+            }
+            (output_dir / "model.safetensors.index.json").write_text(
+                json.dumps(index, indent=2)
+            )
+
+        return {
+            "writer": is_writer,
+            "num_params": num_params,
+            "total_bytes": total_bytes,
+            "num_shards": len(temp_paths),
+        }
 
     def save_checkpoint(self, local_path: str, global_step: int = 0) -> bool:
         """Save this actor rank's sharded training state.

@@ -367,8 +367,9 @@ class RLTrainer:
         from lumenrl.engine.inference.vllm_ray_server import VLLMReplicaManager
 
         seed = self.config.seed if getattr(vcfg, "seed", None) is None else vcfg.seed
+        tp = int(getattr(vcfg, "tensor_parallel_size", 1) or 1)
         engine_kwargs: dict[str, Any] = dict(
-            tensor_parallel_size=1,
+            tensor_parallel_size=tp,
             gpu_memory_utilization=float(vcfg.gpu_memory_utilization),
             dtype=str(vcfg.dtype),
             enforce_eager=bool(vcfg.enforce_eager),
@@ -379,9 +380,6 @@ class RLTrainer:
             enable_sleep_mode=bool(vcfg.enable_sleep_mode),
             disable_log_stats=True,
         )
-        # NOTE: seed is set PER REPLICA in the server (base_seed + replica_rank),
-        # matching verl (``seed = replica_rank + data.seed``). Setting one shared
-        # engine seed here would make all replicas sample from the same RNG.
         if vcfg.max_model_len:
             engine_kwargs["max_model_len"] = int(vcfg.max_model_len)
         if vcfg.kv_cache_dtype and vcfg.kv_cache_dtype != "auto":
@@ -389,8 +387,11 @@ class RLTrainer:
         if vcfg.quantization:
             engine_kwargs["quantization"] = str(vcfg.quantization)
 
+        colocation_wg = getattr(self, "_rollout_wg", None) or self._actor_wg
+        if colocation_wg is not self._actor_wg:
+            logger.info("vLLM replicas will be placed on rollout workers (separation mode).")
         mgr = VLLMReplicaManager(
-            self._actor_wg,
+            colocation_wg,
             model_name,
             engine_kwargs,
             base_port=int(vcfg.ray_http_base_port),
@@ -404,8 +405,9 @@ class RLTrainer:
             mgr, sleep_level=int(vcfg.sleep_level), enable_sleep=bool(vcfg.enable_sleep_mode),
         )
         logger.info(
-            "Ray vLLM rollout ready: %d colocated replicas (TP=1, ZMQ IPC weight sync).",
-            mgr.num_replicas,
+            "Ray vLLM rollout ready: %d replicas (TP=%d, separation=%s).",
+            mgr.num_replicas, tp,
+            colocation_wg is not self._actor_wg,
         )
 
     def _setup_ray_atom_rollout(self, model_name: str, vcfg: Any, atom_cfg: Any) -> None:
@@ -490,8 +492,17 @@ class RLTrainer:
         # HF-tokenized ids (add_special_tokens=False, matching verl's
         # apply_chat_template(tokenize=True)) makes response length match verl.
         expanded: list[list[int]] = []
+        max_prompt_len = min(
+            int(self.config.policy.max_total_sequence_length) // 2,
+            1024,
+        )
         for p in prompts:
-            ids = self._tokenizer(p, add_special_tokens=False)["input_ids"]
+            ids = self._tokenizer(
+                p,
+                add_special_tokens=False,
+                truncation=True,
+                max_length=max_prompt_len,
+            )["input_ids"]
             expanded.extend([list(ids)] * num_generations)
 
         sp = dict(sampling_params) if sampling_params is not None else self._ray_sampling_params(want_lp)
@@ -630,46 +641,21 @@ class RLTrainer:
         rollout_engine = self._ray_vllm_engine
         sleeping = bool(getattr(rollout_engine, "enable_sleep", False))
 
-        cpu_state = self._fetch_actor_cpu_state()
-        if cpu_state is None:
+        if self._actor_wg is None:
             return
 
         sync_dir = Path(os.environ.get(
             "LUMENRL_WEIGHT_SYNC_DIR", "/dev/shm/lumenrl_weight_sync",
         ))
         sync_dir.mkdir(parents=True, exist_ok=True)
-        for old in sync_dir.glob("model-*.safetensors"):
-            old.unlink()
-
-        from safetensors.torch import save_file
-
-        max_shard_bytes = 4 * 1024 * 1024 * 1024
-        shards: list[dict[str, torch.Tensor]] = [{}]
-        current_bytes = 0
-        total_bytes = 0
-        for name, tensor in cpu_state.items():
-            t_bytes = tensor.numel() * tensor.element_size()
-            if current_bytes + t_bytes > max_shard_bytes and shards[-1]:
-                shards.append({})
-                current_bytes = 0
-            shards[-1][name] = tensor
-            current_bytes += t_bytes
-            total_bytes += t_bytes
-
-        weight_map: dict[str, str] = {}
-        for i, shard in enumerate(shards, 1):
-            fname = f"model-{i:05d}-of-{len(shards):05d}.safetensors"
-            save_file(shard, str(sync_dir / fname))
-            for k in shard:
-                weight_map[k] = fname
-
-        index = {
-            "metadata": {"total_size": total_bytes},
-            "weight_map": weight_map,
-        }
-        (sync_dir / "model.safetensors.index.json").write_text(
-            json.dumps(index, indent=2)
+        # Run TP/EP gathers on every actor, but have rank 0 stream bounded
+        # shards directly to the shared filesystem.  Returning a 57GB state
+        # through Ray causes cross-node object transfer and plasma spilling.
+        export_results = self._actor_wg.execute_all_sync(
+            "export_state_dict_safetensors",
+            sync_dir=str(sync_dir),
         )
+        export_meta = export_results[0]
 
         orig = Path(self.config.policy.model_name)
         for fname in ["config.json", "tokenizer_config.json", "tokenizer.json",
@@ -681,11 +667,11 @@ class RLTrainer:
         save_time = time.time() - t0
         logger.info(
             "Weight sync (safetensors): saved %d params to %s in %.1fs (%.1f GB)",
-            len(cpu_state), sync_dir, save_time, total_bytes / 1e9,
+            int(export_meta["num_params"]),
+            sync_dir,
+            save_time,
+            int(export_meta["total_bytes"]) / 1e9,
         )
-
-        del cpu_state
-        gc.collect()
 
         if sleeping:
             rollout_engine.wake(tags=["weights"])

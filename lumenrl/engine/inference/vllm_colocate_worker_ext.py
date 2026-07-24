@@ -174,3 +174,38 @@ class vLLMColocateWorkerExtension:
             process_weights_after_loading(model, model_config, self.device)
         except Exception as exc:  # pragma: no cover - best effort parity with verl
             logger.warning("process_weights_after_loading skipped: %s", exc)
+
+    def reload_weights_from_safetensors(self, weight_dir: str) -> None:
+        """Load weights from safetensors on shared storage (separation mode)."""
+        import json
+        import os
+
+        from safetensors.torch import load_file
+        from vllm.platforms import current_platform
+
+        if getattr(self, "device", None) is None:
+            dev_type = current_platform.device_type
+            self.device = torch.device(f"{dev_type}:{self.local_rank}")
+
+        index_path = os.path.join(weight_dir, "model.safetensors.index.json")
+        if os.path.exists(index_path):
+            with open(index_path) as f:
+                index = json.load(f)
+            files = sorted(set(index["weight_map"].values()))
+        else:
+            files = sorted(
+                f for f in os.listdir(weight_dir) if f.endswith(".safetensors")
+            )
+
+        model = self.model_runner.model
+        for fname in files:
+            sd = load_file(os.path.join(weight_dir, fname))
+            model.load_weights(list(sd.items()))
+
+        # The model was already transformed/compiled during engine startup.
+        # process_weights_after_loading() is not idempotent for all vLLM model
+        # implementations; running it after every reload can re-wrap modules
+        # and trigger a second multi-worker torch.compile.  Reload only replaces
+        # parameter data, then wait for all H2D copies before acknowledging RPC.
+        torch.cuda.synchronize(self.device)
+        logger.info("reload_weights_from_safetensors: loaded from %s", weight_dir)

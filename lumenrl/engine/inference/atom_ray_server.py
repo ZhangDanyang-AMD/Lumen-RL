@@ -465,6 +465,7 @@ class ATOMReplicaManager:
                 all_gpu_ids.extend(str(g) for g in info["gpu_ids"])
             gpu_ids_str = ",".join(all_gpu_ids)
 
+            nccl_port = 29500 + r
             disable_custom_ar = os.environ.get("LUMENRL_DISABLE_CUSTOM_AR", "1" if atom_tp > 1 else "0")
             env_vars = {
                 "CUDA_VISIBLE_DEVICES": gpu_ids_str,
@@ -473,6 +474,7 @@ class ATOMReplicaManager:
                 "RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES": "1",
                 "RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES": "1",
                 "NCCL_CUMEM_ENABLE": "0",
+                "MASTER_PORT": str(nccl_port),
                 "LUMENRL_DISABLE_CUSTOM_AR": disable_custom_ar,
                 **({"ATOM_USE_CUSTOM_ALL_GATHER": "0"} if disable_custom_ar in ("1", "true", "True") else {}),
                 "LUMEN_REPLICA_RANK": str(r),
@@ -518,7 +520,9 @@ class ATOMReplicaManager:
             )
             self.servers.append(server)
 
-        ray.get([s.launch.remote() for s in self.servers])
+        for i, s in enumerate(self.servers):
+            ray.get(s.launch.remote())
+            logger.info("ATOMReplicaManager: replica %d/%d launched.", i + 1, num_replicas)
         logger.info(
             "ATOMReplicaManager: launched %d colocated rollout replicas (atom_tp=%d, workers=%d).",
             num_replicas, atom_tp, num_workers,

@@ -94,10 +94,11 @@ done
 # ═══════════════════════════════════════════════════════════════════════
 # Config selection
 # ═══════════════════════════════════════════════════════════════════════
+BACKEND="${BACKEND:-atom}"  # atom or vllm
 if [ "$MODE" = "longrun" ]; then
-  CONFIG=examples/GRPO/configs/grpo_qwen3_30b_a3b_atom_ep8_longrun.yaml
+  CONFIG=examples/GRPO/configs/grpo_qwen3_30b_a3b_${BACKEND}_ep8_longrun.yaml
 else
-  CONFIG=examples/GRPO/configs/grpo_qwen3_30b_a3b_atom_ep8_smoke.yaml
+  CONFIG=examples/GRPO/configs/grpo_qwen3_30b_a3b_${BACKEND}_ep8_smoke.yaml
 fi
 CONFIG="${CONFIG_OVERRIDE:-$CONFIG}"
 
