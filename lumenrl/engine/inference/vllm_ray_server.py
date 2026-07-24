@@ -283,11 +283,6 @@ class VLLMReplicaManager:
         for i, info in enumerate(infos):
             node_id = info["node_id"]
             gpu_ids = ",".join(str(g) for g in info["gpu_ids"])
-            # ROCm device pinning: select the physical GPU via CUDA/HIP visible
-            # devices ONLY. Do NOT also set ROCR_VISIBLE_DEVICES to the physical
-            # index -- ROCR filters at a lower level, so ROCR=<phys>+HIP=<phys>
-            # double-filters ("No HIP GPUs available"). We still set the NOSET
-            # flags (incl. ROCR) so Ray (num_gpus=0) doesn't clear visibility.
             env_vars = {
                 "CUDA_VISIBLE_DEVICES": gpu_ids,
                 "HIP_VISIBLE_DEVICES": gpu_ids,

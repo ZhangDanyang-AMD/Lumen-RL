@@ -140,6 +140,7 @@ class RayControllerConfig:
     fuse_actor_ref: bool = False
     actor: RayWorkerRoleConfig = field(default_factory=RayWorkerRoleConfig)
     ref: RayWorkerRoleConfig = field(default_factory=RayWorkerRoleConfig)
+    rollout: RayWorkerRoleConfig = field(default_factory=RayWorkerRoleConfig)
     # Optional role->pool name mapping for complex topology routing.
     topology_map: dict[str, str] = field(default_factory=dict)
 
@@ -169,6 +170,12 @@ class MegatronConfig:
     # chunked/fused token log-prob. Both default off (unchanged smoke behavior).
     attention_backend: str = "unfused"           # "flash" | "unfused"
     log_probs_chunk_size: int = 0                # >0 enables fused/chunked log-prob
+    sequence_parallel: bool = False              # TP>1: split LayerNorm/Dropout along seq dim
+    expert_tensor_parallel_size: Optional[int] = None  # ETP for MoE layers (None=same as TP)
+    # Optimizer CPU offload: move Adam states (exp_avg/exp_avg_sq) to CPU memory.
+    # Frees ~2x model-size GPU memory at the cost of slower optimizer steps.
+    optimizer_cpu_offload: bool = False
+    optimizer_offload_fraction: float = 1.0      # fraction of states to offload (0.0-1.0)
 
 
 @dataclass

@@ -8,7 +8,12 @@ from typing import Any, Type
 
 import ray
 
-from lumenrl.controller.dispatch import DispatchMode, collect_proto, dispatch_proto
+from lumenrl.controller.dispatch import (
+    DispatchMode,
+    collect_proto,
+    collect_with_mask,
+    dispatch_proto,
+)
 from lumenrl.controller.ray_cluster import ResourcePool
 from lumenrl.controller.worker_group_factory import resolve_worker_class
 from lumenrl.core.protocol import DataProto
@@ -59,6 +64,8 @@ class RayWorkerGroup:
         self._worker_names: list[str] = worker_names[:] if worker_names is not None else []
         self._lazy_dispatch_state: dict[str, Any] = {}
         self._spawned_groups: dict[str, _SpawnSpec] = {}
+        self._dp_rank_mapping: list[int] | None = None
+        self._collect_mask: list[bool] | None = None
 
     def start(self) -> None:
         """Create and start all workers in this group."""
@@ -75,6 +82,22 @@ class RayWorkerGroup:
             base = self.pool.num_gpus / max(1, self.num_workers)
             gpus_per_worker = min(1.0, max(base, 1.0 / max(1, self.pool.max_colocate_count)))
 
+        use_pg = getattr(self.pool, "use_placement_groups", False)
+        if use_pg:
+            self._start_with_placement_groups(gpus_per_worker)
+        else:
+            self._start_simple(gpus_per_worker)
+
+        logger.info(
+            "Started %d workers of type %s (%s GPUs each, placement_groups=%s)",
+            self.num_workers,
+            self.worker_cls.__name__,
+            gpus_per_worker,
+            use_pg,
+        )
+
+    def _start_simple(self, gpus_per_worker: float) -> None:
+        """Original start path — no placement groups."""
         RemoteWorker = ray.remote(
             num_gpus=gpus_per_worker,
             num_cpus=1,
@@ -96,12 +119,55 @@ class RayWorkerGroup:
             if self.detached:
                 self._worker_names.append(actor_name)
 
+    def _start_with_placement_groups(self, gpus_per_worker: float) -> None:
+        """verl-style start: create per-node placement groups with STRICT_PACK."""
+        from ray.util.placement_group import placement_group
+        from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+        pgs = []
+        for node_idx, count in enumerate(self.pool.process_on_nodes):
+            if count <= 0:
+                continue
+            bundles = [{"GPU": 1, "CPU": 1} for _ in range(count)]
+            pg = placement_group(
+                bundles,
+                strategy="STRICT_PACK",
+                name=f"{self.pool.name}_pg_{node_idx}",
+            )
+            pgs.append((pg, count))
+
+        ray.get([pg.ready() for pg, _ in pgs])
         logger.info(
-            "Started %d workers of type %s (%s GPUs each)",
-            self.num_workers,
-            self.worker_cls.__name__,
-            gpus_per_worker,
+            "Created %d placement groups for pool '%s': %s",
+            len(pgs), self.pool.name,
+            [(pg.bundle_count, count) for pg, count in pgs],
         )
+
+        RemoteWorker = ray.remote(self.worker_cls)
+        rank = 0
+        for pg, count in pgs:
+            for local_rank in range(count):
+                actor_name = f"{self.pool.name}:{self.worker_cls.__name__}:{rank}"
+                options_kwargs: dict[str, Any] = {
+                    "num_gpus": gpus_per_worker,
+                    "num_cpus": 1,
+                    "scheduling_strategy": PlacementGroupSchedulingStrategy(
+                        placement_group=pg,
+                        placement_group_bundle_index=local_rank,
+                    ),
+                }
+                if self.detached:
+                    options_kwargs["name"] = actor_name
+                    options_kwargs["lifetime"] = "detached"
+                actor = RemoteWorker.options(**options_kwargs).remote(
+                    rank=rank,
+                    world_size=self.num_workers,
+                    **self.worker_kwargs,
+                )
+                self._actors.append(actor)
+                if self.detached:
+                    self._worker_names.append(actor_name)
+                rank += 1
 
     def stop(self) -> None:
         """Stop all workers."""
@@ -120,6 +186,21 @@ class RayWorkerGroup:
         refs = [actor.__ray_ready__.remote() for actor in self._actors]
         ready, _ = ray.wait(refs, num_returns=len(refs), timeout=2.0)
         return len(ready) == len(refs)
+
+    def setup_dispatch_collect_info(self) -> None:
+        """Query workers for dp_rank and is_collect, store for auto dispatch/collect.
+
+        Uses method_prefix so fused workers route correctly (e.g. prefix="actor"
+        queries ``actor_get_dp_rank`` / ``actor_get_is_collect``).
+        """
+        dp_ranks = self.execute_all_sync("get_dp_rank")
+        collect_mask = self.execute_all_sync("get_is_collect")
+        self._dp_rank_mapping = [int(r) for r in dp_ranks]
+        self._collect_mask = [bool(c) for c in collect_mask]
+        logger.info(
+            "Auto dispatch info (prefix=%r): dp_rank_mapping=%s, collect_mask=%s",
+            self.method_prefix, self._dp_rank_mapping, self._collect_mask,
+        )
 
     def execute_all_async(self, method: str, *args: Any, **kwargs: Any) -> list[ray.ObjectRef]:
         target_method = _prefixed_method(self.method_prefix, method)
@@ -169,8 +250,38 @@ class RayWorkerGroup:
         lazy_key: str | None = None,
         **kwargs: Any,
     ) -> DataProto:
-        """Split data across workers, call method, and merge results."""
+        """Split data across workers, call method, and merge results.
+
+        Priority for dispatch routing:
+          1. Explicit ``mesh_mapping`` argument
+          2. Auto ``_dp_rank_mapping`` (set by ``setup_dispatch_collect_info``)
+          3. Plain split via ``dispatch_proto``
+        """
         dispatch_mode = self.dispatch_mode if mode is None else DispatchMode(mode)
+        use_auto = (
+            mesh_mapping is None
+            and self._dp_rank_mapping is not None
+            and dispatch_mode in (DispatchMode.DP_COMPUTE_PROTO, DispatchMode.DP_COMPUTE)
+        )
+
+        if use_auto:
+            dp_size = len(set(self._dp_rank_mapping))
+            unique_chunks = data.split(dp_size)
+            # ray.put each unique DP chunk once; TP peers share the ObjectRef.
+            chunk_refs = [ray.put(c) for c in unique_chunks]
+            obj_refs = [chunk_refs[self._dp_rank_mapping[i]] for i in range(self.num_workers)]
+
+            target_method = _prefixed_method(self.method_prefix, method)
+            call_refs = [
+                getattr(self._actors[i], target_method).remote(obj_refs[i], **kwargs)
+                for i in range(self.num_workers)
+            ]
+            results = ray.get(call_refs)
+
+            if self._collect_mask is not None:
+                return collect_with_mask(results, self._collect_mask)
+            return DataProto.merge(results)
+
         chunks = dispatch_proto(
             data,
             self.num_workers,
@@ -184,9 +295,9 @@ class RayWorkerGroup:
             return DataProto()
 
         if len(chunks) == 1:
-            refs = [getattr(self._actors[0], target_method).remote(chunks[0], **kwargs)]
+            call_refs = [getattr(self._actors[0], target_method).remote(chunks[0], **kwargs)]
         elif len(chunks) == self.num_workers:
-            refs = [
+            call_refs = [
                 getattr(self._actors[i], target_method).remote(chunks[i], **kwargs)
                 for i in range(self.num_workers)
             ]
@@ -195,7 +306,7 @@ class RayWorkerGroup:
                 f"dispatch produced {len(chunks)} chunks for {self.num_workers} workers; "
                 "expected 1 (rank-zero) or num_workers."
             )
-        results = ray.get(refs)
+        results = ray.get(call_refs)
         return collect_proto(results, mode=dispatch_mode)
 
     def spawn(self, prefixes: list[str]) -> dict[str, "RayWorkerGroup"]:

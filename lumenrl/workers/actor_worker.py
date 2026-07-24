@@ -7,6 +7,10 @@ import os
 from pathlib import Path
 from typing import Any
 
+# base_worker must be imported before torch so that HIP_VISIBLE_DEVICES
+# is set before HIP initialization (see base_worker.py module-level code).
+from lumenrl.workers.base_worker import BaseWorker, get_nested_config
+
 import torch
 import torch.nn.functional as F
 
@@ -18,7 +22,6 @@ from lumenrl.algorithms.loss_functions import (
 from lumenrl.core.protocol import DataProto
 from lumenrl.core.types import AlgorithmName, TrainingBackend
 from lumenrl.engine.training.base_engine import BaseEngine, EngineRegistry
-from lumenrl.workers.base_worker import BaseWorker, get_nested_config
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +82,19 @@ class LumenActorWorker(BaseWorker):
             )
 
         self._engine.initialize()
-        self._log.info("LumenActorWorker: initialized %s engine.", backend_key)
+
+        self._dispatch_dp_rank = self._engine.get_data_parallel_rank()
+        self._is_collect = self._engine.is_mp_src_rank_with_outputs()
+        self._log.info(
+            "LumenActorWorker: initialized %s engine (dp_rank=%d, is_collect=%s).",
+            backend_key, self._dispatch_dp_rank, self._is_collect,
+        )
+
+    def get_dp_rank(self) -> int:
+        return getattr(self, "_dispatch_dp_rank", self.rank)
+
+    def get_is_collect(self) -> bool:
+        return getattr(self, "_is_collect", True)
 
     def _probe_forward_entropy(self, model_name: str) -> None:
         """One-time sanity probe: entropy of the FSDP forward on a fixed clean
@@ -142,11 +157,12 @@ class LumenActorWorker(BaseWorker):
                 from dataclasses import asdict, is_dataclass
                 meg_cfg = asdict(meg_cfg) if is_dataclass(meg_cfg) else dict(vars(meg_cfg))
             return {
-                "tensor_model_parallel_size": meg_cfg.get("tensor_model_parallel_size", 1),
-                "pipeline_model_parallel_size": meg_cfg.get("pipeline_model_parallel_size", 1),
+                "tensor_model_parallel_size": meg_cfg.get("tensor_model_parallel_size") or meg_cfg.get("tensor_parallel_size", 1),
+                "pipeline_model_parallel_size": meg_cfg.get("pipeline_model_parallel_size") or meg_cfg.get("pipeline_parallel_size", 1),
                 "context_parallel_size": meg_cfg.get("context_parallel_size", 1),
-                "expert_model_parallel_size": meg_cfg.get("expert_model_parallel_size", 1),
+                "expert_model_parallel_size": meg_cfg.get("expert_model_parallel_size") or meg_cfg.get("expert_parallel_size", 1),
                 "sequence_parallel": meg_cfg.get("sequence_parallel", False),
+                "expert_tensor_parallel_size": meg_cfg.get("expert_tensor_parallel_size", None),
                 "param_offload": meg_cfg.get("param_offload", False),
                 "optimizer_offload": meg_cfg.get("optimizer_offload", False),
                 "grad_offload": meg_cfg.get("grad_offload", False),
@@ -161,6 +177,11 @@ class LumenActorWorker(BaseWorker):
                 # Long-sequence memory: flash attn (O(L)) + chunked/fused log-prob.
                 "attention_backend": meg_cfg.get("attention_backend", "unfused"),
                 "log_probs_chunk_size": meg_cfg.get("log_probs_chunk_size", 0),
+                "num_experts": meg_cfg.get("num_experts", 0),
+                "moe_grouped_gemm": meg_cfg.get("moe_grouped_gemm", False),
+                "pipeline_model_parallel_size": meg_cfg.get("pipeline_model_parallel_size") or meg_cfg.get("pipeline_parallel_size", 1),
+                "num_layers_in_first_pipeline_stage": meg_cfg.get("num_layers_in_first_pipeline_stage"),
+                "num_layers_in_last_pipeline_stage": meg_cfg.get("num_layers_in_last_pipeline_stage"),
             }
         return {}
 
@@ -200,7 +221,10 @@ class LumenActorWorker(BaseWorker):
 
         # Megatron backend owns its own (GPTModel) forward + logprob path.
         if hasattr(self._engine, "engine_compute_log_probs"):
-            return self._engine.engine_compute_log_probs(batch)
+            print(f"[TRACE] actor_worker.compute_log_probs: dispatching to engine, B={batch['input_ids'].shape}", flush=True)
+            result = self._engine.engine_compute_log_probs(batch)
+            print(f"[TRACE] actor_worker.compute_log_probs: engine returned", flush=True)
+            return result
 
         from lumenrl.engine.training.packing import (
             PackingContext,
@@ -252,7 +276,8 @@ class LumenActorWorker(BaseWorker):
                     row = min(i, B - 1)  # dummy rows reuse the last real row
                     ids_row = sequences[row:row + 1]
                     mask_row = am[row:row + 1]
-                    packed = pack_sequences(ids_row, mask_row)
+                    _tp = getattr(self._engine, "_tp_size", 1) if self._engine is not None else 1
+                    packed = pack_sequences(ids_row, mask_row, tp_align=_tp)
                     with PackingContext(packed.cu_seqlens, packed.max_seqlen):
                         outputs = module(
                             input_ids=packed.input_ids,

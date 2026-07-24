@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from lumenrl.workers.base_worker import BaseWorker, get_nested_config
+
 import torch
 
 from lumenrl.core.config import AtomConfig, R3Config
@@ -12,7 +14,6 @@ from lumenrl.core.protocol import DataProto
 from lumenrl.engine.inference.atom_engine import AtomEngine
 from lumenrl.engine.inference.kv_cache import FP8KVCacheManager
 from lumenrl.moe.r3_manager import R3Manager
-from lumenrl.workers.base_worker import BaseWorker, get_nested_config
 
 logger = logging.getLogger(__name__)
 

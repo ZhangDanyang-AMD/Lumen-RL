@@ -2,6 +2,83 @@
 
 from __future__ import annotations
 
+# ---------------------------------------------------------------------------
+# GPU visibility setup (verl-aligned) — must run before ``import torch``.
+#
+# 1. Normalise HIP/ROCR → CUDA_VISIBLE_DEVICES (verl worker.py L231-271).
+# 2. If NOSET is active (rollout co-location), discover the assigned GPU via
+#    ``ray.get_runtime_context().get_accelerator_ids()`` (verl worker.py L273-281).
+# 3. ``import torch`` + ``torch.cuda.set_device(0)`` so that downstream
+#    module-level code (e.g. ``lumen/__init__.py`` → ``torch.cuda.current_device()``)
+#    finds an initialised CUDA context.
+# ---------------------------------------------------------------------------
+import os as _os
+import sys as _sys
+
+def _setup_gpu_visibility_early() -> None:
+    """Normalise GPU visibility to CUDA_VISIBLE_DEVICES only (verl-aligned).
+
+    On ROCm, ROCR_VISIBLE_DEVICES and HIP_VISIBLE_DEVICES form a two-layer
+    filter: ROCR narrows first, then HIP selects within that subset.  Setting
+    both to the same physical ID (e.g. "3") causes double-filtering — HIP
+    looks for device 3 inside a set that only contains device 0 → crash.
+
+    verl's solution (worker.py L240-271): pop HIP and ROCR, keep only
+    CUDA_VISIBLE_DEVICES.  PyTorch ROCm maps it internally.
+    """
+    cuda_val = _os.environ.get("CUDA_VISIBLE_DEVICES")
+    hip_val = _os.environ.get("HIP_VISIBLE_DEVICES")
+    rocr_val = _os.environ.get("ROCR_VISIBLE_DEVICES")
+
+    # Normalise HIP → CUDA, remove HIP (verl L240-254)
+    if hip_val:
+        _os.environ.pop("HIP_VISIBLE_DEVICES", None)
+        if not cuda_val:
+            cuda_val = hip_val
+            _os.environ["CUDA_VISIBLE_DEVICES"] = cuda_val
+
+    # Normalise ROCR → CUDA, remove ROCR (verl L256-271)
+    if rocr_val:
+        _os.environ.pop("ROCR_VISIBLE_DEVICES", None)
+        if not cuda_val:
+            cuda_val = rocr_val
+            _os.environ["CUDA_VISIBLE_DEVICES"] = cuda_val
+
+    # NOSET fallback via Ray API (verl L273-281)
+    _NOSET_VARS = (
+        "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
+        "RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES",
+        "RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES",
+    )
+    is_noset = any(_os.environ.get(v) for v in _NOSET_VARS)
+    if is_noset and not cuda_val:
+        try:
+            import ray  # noqa: E402 — ray does not import torch
+            gpu_ids = ray.get_runtime_context().get_accelerator_ids().get("GPU", [])
+            if gpu_ids:
+                cuda_val = str(gpu_ids[0])
+                _os.environ["CUDA_VISIBLE_DEVICES"] = cuda_val
+        except Exception:
+            pass
+
+    print(
+        f"[base_worker] GPU visibility: CUDA_VIS={_os.environ.get('CUDA_VISIBLE_DEVICES', 'unset')} "
+        f"HIP_VIS={_os.environ.get('HIP_VISIBLE_DEVICES', 'unset')} "
+        f"ROCR_VIS={_os.environ.get('ROCR_VISIBLE_DEVICES', 'unset')} "
+        f"NOSET={is_noset}",
+        file=_sys.stderr, flush=True,
+    )
+
+_setup_gpu_visibility_early()
+
+# Now import torch and initialise the CUDA context so that downstream
+# module-level code (lumen/__init__.py → torch.cuda.current_device()) works.
+import torch as _torch
+if _torch.cuda.is_available():
+    _torch.cuda.set_device(0)
+
+del _setup_gpu_visibility_early
+
 import logging
 from abc import ABC, abstractmethod
 from typing import Any
@@ -26,12 +103,48 @@ class BaseWorker(ABC):
     class, owns local devices, and exchanges batches via :class:`DataProto`.
     """
 
+    _NOSET_ENV_VARS = (
+        "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
+        "RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES",
+        "RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES",
+    )
+
     def __init__(self, rank: int, world_size: int, config: dict[str, Any] | None = None) -> None:
+        self._setup_gpu_visibility()
         self.rank = rank
         self.world_size = world_size
         self.config: dict[str, Any] = dict(config or {})
         self._log = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
         self._configure_logging()
+
+    def _setup_gpu_visibility(self) -> None:
+        """Ensure CUDA/HIP/ROCR_VISIBLE_DEVICES are consistent (verl-aligned).
+
+        When ``RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES=1`` is active (e.g.
+        for ATOM rollout), Ray does not set ``HIP_VISIBLE_DEVICES``.  In that
+        case we fall back to ``ray.get_runtime_context().get_accelerator_ids()``
+        to discover the assigned GPU — same approach verl uses.
+        """
+        import os
+
+        is_noset = any(os.environ.get(v) for v in self._NOSET_ENV_VARS)
+        if not is_noset:
+            return
+
+        cuda_vis = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if cuda_vis:
+            return
+
+        try:
+            import ray
+            gpu_ids = ray.get_runtime_context().get_accelerator_ids().get("GPU", [])
+            if gpu_ids:
+                gpu_str = ",".join(str(g) for g in gpu_ids)
+                os.environ["CUDA_VISIBLE_DEVICES"] = gpu_str
+                os.environ["HIP_VISIBLE_DEVICES"] = gpu_str
+                os.environ["ROCR_VISIBLE_DEVICES"] = gpu_str
+        except Exception:
+            pass
 
     def _configure_logging(self) -> None:
         """Ensure worker logs include rank for multi-actor debugging."""
@@ -47,6 +160,14 @@ class BaseWorker(ABC):
     @abstractmethod
     def init_model(self) -> None:
         """Allocate models, optimizers, and device state."""
+
+    def get_dp_rank(self) -> int:
+        """Return this worker's data-parallel rank for dispatch routing."""
+        return self.rank
+
+    def get_is_collect(self) -> bool:
+        """Whether this worker's results should be collected (vs. duplicates from TP/PP peers)."""
+        return True
 
     # ------------------------------------------------------------------
     # Distributed rendezvous (Ray controller path, verl-aligned)
@@ -116,8 +237,27 @@ class BaseWorker(ABC):
         self.rank = int(rank)
         self.world_size = int(world_size)
 
+        import sys
+        def _mem_snap(label):
+            if not torch.cuda.is_available():
+                return
+            free, total = torch.cuda.mem_get_info()
+            alloc = torch.cuda.memory_allocated()
+            print(
+                f"[MEM_DIAG rank={rank}] {label}: "
+                f"total={total/2**30:.2f} GiB, free={free/2**30:.2f} GiB, "
+                f"alloc={alloc/2**30:.2f} GiB, "
+                f"non_torch={max(0, total - free - alloc)/2**30:.2f} GiB  "
+                f"CUDA_VIS={os.environ.get('CUDA_VISIBLE_DEVICES', 'unset')} "
+                f"HIP_VIS={os.environ.get('HIP_VISIBLE_DEVICES', 'unset')} "
+                f"dev_count={torch.cuda.device_count()} "
+                f"NCCL_CUMEM={os.environ.get('NCCL_CUMEM_ENABLE', 'unset')}",
+                file=sys.stderr, flush=True,
+            )
+
         if torch.cuda.is_available():
             torch.cuda.set_device(local_rank)
+            _mem_snap("BEFORE init_process_group")
 
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(
@@ -126,6 +266,10 @@ class BaseWorker(ABC):
                 rank=rank,
                 timeout=timedelta(seconds=int(timeout_s)),
             )
+
+        if torch.cuda.is_available():
+            _mem_snap("AFTER init_process_group")
+
         self._log.info(
             "setup_distributed: rank=%d world_size=%d master=%s:%s local_rank=%d",
             rank, world_size, master_addr, master_port, local_rank,
@@ -141,3 +285,27 @@ class BaseWorker(ABC):
         except Exception:
             pass
         self._log.info("%s.cleanup: default no-op complete.", self.__class__.__name__)
+
+
+class RolloutPlacementWorker:
+    """Lightweight Ray actor for ATOM replica placement on separate nodes.
+
+    Provides ``get_colocation_info()`` so ``ATOMReplicaManager`` can pin
+    replicas to this worker's node/GPU, without loading any model.
+    """
+
+    def __init__(self, rank: int, world_size: int, **kwargs: Any) -> None:
+        self.rank = rank
+
+    def get_colocation_info(self) -> dict[str, Any]:
+        import ray
+        ctx = ray.get_runtime_context()
+        try:
+            gpu_ids = ray.get_gpu_ids()
+        except Exception:
+            gpu_ids = []
+        return {
+            "rank": self.rank,
+            "node_id": ctx.get_node_id(),
+            "gpu_ids": [str(g) for g in gpu_ids],
+        }

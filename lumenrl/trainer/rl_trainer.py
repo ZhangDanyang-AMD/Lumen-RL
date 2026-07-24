@@ -36,6 +36,7 @@ from lumenrl.utils.profiler import DistProfiler
 from lumenrl.workers import LumenActorWorker, RefPolicyWorker
 
 logger = logging.getLogger(__name__)
+LUMENRL_DEBUG = os.environ.get("LUMENRL_DEBUG", "0") in ("1", "true", "True")
 
 
 def _algo_num_generations(config: LumenRLConfig) -> int:
@@ -444,8 +445,11 @@ class RLTrainer:
         if extra:
             engine_kwargs.update(dict(extra))
 
+        colocation_wg = getattr(self, "_rollout_wg", None) or self._actor_wg
+        if colocation_wg is not self._actor_wg:
+            logger.info("ATOM replicas will be placed on rollout workers (separation mode).")
         mgr = ATOMReplicaManager(
-            self._actor_wg,
+            colocation_wg,
             model_name,
             engine_kwargs,
             max_concurrency=max(8, int(vcfg.max_num_seqs)),
@@ -581,12 +585,24 @@ class RLTrainer:
         The training actors (senders) and colocated vLLM workers (receivers) run
         concurrently: each actor all-gathers its full BF16 weights and streams
         them over CUDA IPC to its own replica's socket.
+
+        When ATOM TP > 1 (fewer replicas than actors), falls back to a
+        safetensors-on-disk path: actors export HF weights, ATOM reloads.
         """
         import ray
 
         mgr = self._ray_rollout_mgr
         if mgr is None or self._actor_wg is None:
             return
+
+        separated = getattr(self, "_rollout_wg", None) is not None
+        if separated or mgr.num_replicas < self._actor_wg.num_workers:
+            if LUMENRL_DEBUG:
+                logger.info("[DBG] _sync_weights_ipc: separated=%s replicas=%d workers=%d, using safetensors",
+                            separated, mgr.num_replicas, self._actor_wg.num_workers)
+            self._sync_weights_safetensors(mgr)
+            return
+
         vcfg = self.config.policy.generation.vllm_cfg
         bmb = int(vcfg.update_weights_bucket_megabytes)
         use_shm = bool(vcfg.use_shm)
@@ -605,6 +621,75 @@ class RLTrainer:
         ray.get(send)
         ray.get(recv)
         # 3) wake KV cache so the next rollout can run.
+        if sleeping:
+            rollout_engine.wake(tags=["kv_cache"])
+
+    def _sync_weights_safetensors(self, mgr) -> None:
+        """Weight sync for TP>1 ATOM: export HF weights to /dev/shm, ATOM reloads."""
+        t0 = time.time()
+        rollout_engine = self._ray_vllm_engine
+        sleeping = bool(getattr(rollout_engine, "enable_sleep", False))
+
+        cpu_state = self._fetch_actor_cpu_state()
+        if cpu_state is None:
+            return
+
+        sync_dir = Path(os.environ.get(
+            "LUMENRL_WEIGHT_SYNC_DIR", "/dev/shm/lumenrl_weight_sync",
+        ))
+        sync_dir.mkdir(parents=True, exist_ok=True)
+        for old in sync_dir.glob("model-*.safetensors"):
+            old.unlink()
+
+        from safetensors.torch import save_file
+
+        max_shard_bytes = 4 * 1024 * 1024 * 1024
+        shards: list[dict[str, torch.Tensor]] = [{}]
+        current_bytes = 0
+        total_bytes = 0
+        for name, tensor in cpu_state.items():
+            t_bytes = tensor.numel() * tensor.element_size()
+            if current_bytes + t_bytes > max_shard_bytes and shards[-1]:
+                shards.append({})
+                current_bytes = 0
+            shards[-1][name] = tensor
+            current_bytes += t_bytes
+            total_bytes += t_bytes
+
+        weight_map: dict[str, str] = {}
+        for i, shard in enumerate(shards, 1):
+            fname = f"model-{i:05d}-of-{len(shards):05d}.safetensors"
+            save_file(shard, str(sync_dir / fname))
+            for k in shard:
+                weight_map[k] = fname
+
+        index = {
+            "metadata": {"total_size": total_bytes},
+            "weight_map": weight_map,
+        }
+        (sync_dir / "model.safetensors.index.json").write_text(
+            json.dumps(index, indent=2)
+        )
+
+        orig = Path(self.config.policy.model_name)
+        for fname in ["config.json", "tokenizer_config.json", "tokenizer.json",
+                      "special_tokens_map.json", "generation_config.json"]:
+            src = orig / fname
+            if src.exists():
+                shutil.copy2(str(src), str(sync_dir / fname))
+
+        save_time = time.time() - t0
+        logger.info(
+            "Weight sync (safetensors): saved %d params to %s in %.1fs (%.1f GB)",
+            len(cpu_state), sync_dir, save_time, total_bytes / 1e9,
+        )
+
+        del cpu_state
+        gc.collect()
+
+        if sleeping:
+            rollout_engine.wake(tags=["weights"])
+        mgr.reload_weights_from_path(str(sync_dir))
         if sleeping:
             rollout_engine.wake(tags=["kv_cache"])
 
@@ -654,6 +739,30 @@ class RLTrainer:
             topology_tags=actor_role.topology_tags,
         )
 
+        rollout_role = ray_cfg.rollout
+        self._rollout_wg = None
+        if rollout_role.num_workers > 0:
+            from lumenrl.workers.base_worker import RolloutPlacementWorker
+            rollout_pool = self._ray_cluster.create_pool(
+                "rollout",
+                num_gpus=rollout_role.num_workers,
+                process_on_nodes=rollout_role.process_on_nodes,
+                max_colocate_count=max(1, rollout_role.max_colocate_count),
+                detached=rollout_role.detached,
+                topology_tags=rollout_role.topology_tags,
+            )
+            self._rollout_wg = RayWorkerGroup(
+                worker_cls=RolloutPlacementWorker,
+                pool=rollout_pool,
+                num_workers=rollout_role.num_workers,
+                worker_kwargs={},
+            )
+            self._rollout_wg.start()
+            logger.info(
+                "Rollout placement workers started: %d workers (separation mode)",
+                rollout_role.num_workers,
+            )
+
         use_ref = kl_coeff > 0.0
         if ray_cfg.fuse_actor_ref and use_ref:
             if ref_workers != actor_workers:
@@ -677,6 +786,8 @@ class RLTrainer:
             self._ref_wg = spawned["ref"]
             self._actor_wg.call_all("init_model")
             self._ref_wg.call_all("init_model")
+            self._actor_wg.setup_dispatch_collect_info()
+            self._ref_wg.setup_dispatch_collect_info()
         else:
             self._actor_wg = RayWorkerGroup(
                 worker_cls=LumenActorWorker,
@@ -689,6 +800,7 @@ class RLTrainer:
             self._actor_wg.start()
             self._rendezvous_ray_group(self._actor_wg)
             self._actor_wg.call_all("init_model")
+            self._actor_wg.setup_dispatch_collect_info()
 
         self._try_resume_ray_checkpoint()
 
@@ -712,6 +824,7 @@ class RLTrainer:
             self._ref_wg.start()
             self._rendezvous_ray_group(self._ref_wg)
             self._ref_wg.call_all("init_model")
+            self._ref_wg.setup_dispatch_collect_info()
 
         from transformers import AutoTokenizer
         self._tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -1716,9 +1829,20 @@ class RLTrainer:
         if not use_filter:
             prompts, gts = self._get_prompts_range(self._prompt_cursor, gen_prompts)
             self._prompt_cursor += gen_prompts
+            if LUMENRL_DEBUG:
+                logger.info("[DBG] _collect_rollout: no-filter path, %d prompts × %d gen", gen_prompts, g)
             seqs, mask, plen, lp = _one_round(prompts)
+            if LUMENRL_DEBUG:
+                logger.info("[DBG] _collect_rollout: seqs=%s mask=%s plen=%s lp=%s",
+                            list(seqs.shape), list(mask.shape), list(plen.shape) if hasattr(plen, 'shape') else len(plen),
+                            list(lp.shape) if lp is not None else None)
             gts_exp = [gt for gt in gts for _ in range(g)]
             rewards, responses, _accs = self._compute_rewards_full(seqs, plen, gts_exp)
+            if LUMENRL_DEBUG:
+                _acc_mean = float(torch.tensor(_accs).float().mean()) if _accs is not None and len(_accs) > 0 else -1.0
+                logger.info("[DBG] _collect_rollout: rewards=%s  acc_mean=%.4f  nonzero_reward=%d/%d",
+                            list(rewards.shape), _acc_mean,
+                            int((rewards.abs() > 1e-8).sum()), rewards.numel())
             return seqs, mask, plen, rewards, responses, gts_exp, lp
 
         # Dynamic-sampling regeneration loop (verl filter_groups).
@@ -2066,7 +2190,8 @@ class RLTrainer:
                 ids_chunk = sequences[cs:ce]
                 mask_chunk = attention_mask[cs:ce]
 
-                packed = pack_sequences(ids_chunk, mask_chunk)
+                _tp = getattr(self._engine, "_tp_size", 1) if self._engine is not None else 1
+                packed = pack_sequences(ids_chunk, mask_chunk, tp_align=_tp)
                 with PackingContext(packed.cu_seqlens, packed.max_seqlen):
                     outputs = model(
                         input_ids=packed.input_ids,
@@ -2198,7 +2323,8 @@ class RLTrainer:
                 chunks.append(chunks[-1])
         outs = []
         for ci, (cs, ce) in enumerate(chunks):
-            packed = pack_sequences(sequences[cs:ce], attention_mask[cs:ce])
+            _tp = getattr(self._engine, "_tp_size", 1) if self._engine is not None else 1
+            packed = pack_sequences(sequences[cs:ce], attention_mask[cs:ce], tp_align=_tp)
             with PackingContext(packed.cu_seqlens, packed.max_seqlen):
                 o = self._actor_model(
                     input_ids=packed.input_ids, position_ids=packed.position_ids,
@@ -2466,7 +2592,8 @@ class RLTrainer:
             mb_batch_num_tokens = _local_mb_tokens
 
         # Pack multiple sequences into a single flat tensor for the forward pass
-        packed = pack_sequences(sequences, attention_mask)
+        _tp = getattr(self._engine, "_tp_size", 1) if self._engine is not None else 1
+        packed = pack_sequences(sequences, attention_mask, tp_align=_tp)
 
         # PackingContext stays alive through backward (gradient checkpointing)
         with PackingContext(packed.cu_seqlens, packed.max_seqlen):
@@ -2609,6 +2736,8 @@ class RLTrainer:
             step_start = time.time()
             self.global_step = step
             self._maybe_start_profile(step)
+            if LUMENRL_DEBUG and self._rank == 0:
+                logger.info("[DBG] ===== step %d/%d START =====", step, total_steps)
             if self._rank == 0:
                 for cb in self.callbacks:
                     cb.on_step_begin(self, step)
@@ -2626,6 +2755,9 @@ class RLTrainer:
                 step, num_generations,
             )
             gen_time = time.time() - t0
+            if LUMENRL_DEBUG and self._rank == 0:
+                logger.info("[DBG] step %d rollout done: seqs=%s gen_time=%.1fs",
+                            step, list(sequences.shape), gen_time)
             self._log_gpu_mem("post_gen", step)
 
             # Persistent vLLM stays resident across steps (memory coexists with
@@ -3127,7 +3259,6 @@ class RLTrainer:
             "compute_log_probs",
             req,
             mode=role_cfg.dispatch_mode,
-            mesh_mapping=role_cfg.mesh_mapping,
             lazy_key=role_cfg.lazy_dispatch_key,
         )
         if "log_probs" in out.tensors:
@@ -3145,38 +3276,51 @@ class RLTrainer:
         if self._actor_wg is None:
             raise RuntimeError("Ray actor worker group is not initialized.")
         actor_role_cfg = self.config.controller.ray.actor
-        chunks = dispatch_proto(
-            batch,
-            self._actor_wg.num_workers,
-            mode=actor_role_cfg.dispatch_mode,
-            mesh_mapping=actor_role_cfg.mesh_mapping,
-            lazy_state=self._ray_dispatch_state,
-            lazy_key=actor_role_cfg.lazy_dispatch_key,
-        )
-        if not chunks:
-            return {"loss": 0.0}
+        n = self._actor_wg.num_workers
 
         import ray
 
-        n = self._actor_wg.num_workers
-        # FSDP2 shards params + reduce-scatters grads ACROSS the actor process
-        # group, so train_step must run on ALL actors concurrently (lockstep).
-        # Calling a subset (or sequentially) would deadlock the collectives.
-        if len(chunks) == 1 and n == 1:
-            refs = [self._actor_wg.call_single_async(0, "update_policy", chunks[0])]
-        elif len(chunks) == n:
+        dp_rank_mapping = self._actor_wg._dp_rank_mapping
+        if dp_rank_mapping is not None:
+            dp_size = len(set(dp_rank_mapping))
+            unique_chunks = batch.split(dp_size)
+            chunk_refs = [ray.put(c) for c in unique_chunks]
+            obj_refs = [chunk_refs[dp_rank_mapping[i]] for i in range(n)]
             refs = [
-                self._actor_wg.call_single_async(i, "update_policy", chunks[i])
+                self._actor_wg.call_single_async(i, "update_policy", obj_refs[i])
                 for i in range(n)
             ]
         else:
-            raise ValueError(
-                f"actor dispatch produced {len(chunks)} chunks for "
-                f"{n} workers; expected 1 (single-actor) or num_workers "
-                "(FSDP requires every actor to participate)."
+            chunks = dispatch_proto(
+                batch,
+                n,
+                mode=actor_role_cfg.dispatch_mode,
+                lazy_state=self._ray_dispatch_state,
+                lazy_key=actor_role_cfg.lazy_dispatch_key,
             )
+            if not chunks:
+                return {"loss": 0.0}
+            if len(chunks) == 1 and n == 1:
+                refs = [self._actor_wg.call_single_async(0, "update_policy", chunks[0])]
+            elif len(chunks) == n:
+                refs = [
+                    self._actor_wg.call_single_async(i, "update_policy", chunks[i])
+                    for i in range(n)
+                ]
+            else:
+                raise ValueError(
+                    f"actor dispatch produced {len(chunks)} chunks for "
+                    f"{n} workers; expected 1 (single-actor) or num_workers "
+                    "(FSDP requires every actor to participate)."
+                )
 
         outputs: list[dict[str, float]] = ray.get(refs)
+        if not outputs:
+            return {"loss": 0.0}
+
+        collect_mask = self._actor_wg._collect_mask
+        if collect_mask is not None:
+            outputs = [o for o, keep in zip(outputs, collect_mask) if keep]
         if not outputs:
             return {"loss": 0.0}
         merged: dict[str, float] = {}

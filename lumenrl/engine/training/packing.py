@@ -136,12 +136,15 @@ def pack_from_nested(
 def pack_sequences(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
+    tp_align: int = 1,
 ) -> PackedBatch:
     """Pack left-padded sequences into a contiguous flat tensor.
 
     Args:
         input_ids: ``(B, S)`` left-padded token IDs.
         attention_mask: ``(B, S)`` where 1 = real token, 0 = pad.
+        tp_align: Pad total_tokens to a multiple of this value (TP size)
+            so that sequence-parallel reduce_scatter doesn't assert.
 
     Returns:
         A :class:`PackedBatch` with concatenated tokens, cumulative sequence
@@ -154,8 +157,11 @@ def pack_sequences(
     total_tokens = int(seq_lens.sum().item())
     max_seqlen = int(seq_lens.max().item())
 
-    packed_ids = torch.empty(total_tokens, dtype=input_ids.dtype, device=device)
-    position_ids = torch.empty(total_tokens, dtype=torch.long, device=device)
+    pad_len = (tp_align - total_tokens % tp_align) % tp_align
+    total_padded = total_tokens + pad_len
+
+    packed_ids = torch.zeros(total_padded, dtype=input_ids.dtype, device=device)
+    position_ids = torch.zeros(total_padded, dtype=torch.long, device=device)
 
     cu_seqlens = torch.zeros(B + 1, dtype=torch.int32, device=device)
     cu_seqlens[1:] = torch.cumsum(seq_lens.int(), dim=0)
@@ -169,8 +175,8 @@ def pack_sequences(
         offset += sl
 
     return PackedBatch(
-        input_ids=packed_ids.unsqueeze(0),       # (1, total_tokens)
-        position_ids=position_ids.unsqueeze(0),  # (1, total_tokens)
+        input_ids=packed_ids.unsqueeze(0),       # (1, total_padded)
+        position_ids=position_ids.unsqueeze(0),  # (1, total_padded)
         cu_seqlens=cu_seqlens,
         seq_lens=seq_lens,
         max_seqlen=max_seqlen,
@@ -188,8 +194,9 @@ def packed_token_log_probs(
     Performs the shifted log_softmax + gather per sequence, vectorized.
 
     Args:
-        logits: ``(total_tokens, V)`` model output (squeezed from batch dim).
-        packed_ids: ``(total_tokens,)`` packed token IDs.
+        logits: ``(total_padded, V)`` model output (may include TP-alignment
+            padding beyond ``cu_seqlens[-1]``).
+        packed_ids: ``(total_padded,)`` packed token IDs.
         cu_seqlens: ``(B+1,)`` cumulative sequence lengths.
         temperature: logits are divided by this before ``log_softmax``, matching
             verl's ``logits.div_(temperature)`` in ``_forward_micro_batch`` (so the
@@ -197,10 +204,13 @@ def packed_token_log_probs(
             consistently to old/train/ref log-probs or the importance ratio drifts.
 
     Returns:
-        Flat ``(total_tokens - B,)`` float32 tensor of shifted log-probs.
+        Flat ``(total_real_tokens - B,)`` float32 tensor of shifted log-probs.
         Each sequence *i* contributes ``sl_i - 1`` values.
     """
-    total_tokens = logits.shape[0]
+    total_real = int(cu_seqlens[-1].item())
+    logits = logits[:total_real]
+    packed_ids = packed_ids[:total_real]
+    total_tokens = total_real
     B = cu_seqlens.shape[0] - 1
     device = logits.device
 
@@ -258,7 +268,9 @@ def packed_token_entropy(
     Returns a flat ``(total_tokens - B,)`` tensor aligned with
     :func:`packed_token_log_probs` output.
     """
-    total_tokens = logits.shape[0]
+    total_real = int(cu_seqlens[-1].item())
+    logits = logits[:total_real]
+    total_tokens = total_real
     device = logits.device
     not_last = torch.ones(total_tokens, dtype=torch.bool, device=device)
     not_last[cu_seqlens[1:].long() - 1] = False
