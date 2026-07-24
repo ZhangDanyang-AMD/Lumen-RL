@@ -22,6 +22,29 @@ def test_compute_advantages_with_dynamic_sampling() -> None:
     assert torch.allclose(mask, expected)
 
 
+def test_dapo_uses_dapo_estimator_even_when_recipe_says_grpo() -> None:
+    cfg = LumenRLConfig()
+    cfg.algorithm.name = "dapo"
+    cfg.algorithm.adv_estimator = "grpo"
+    cfg.algorithm.dapo.num_generations = 2
+    cfg.algorithm.dapo.dynamic_sampling = False
+    cfg.algorithm.dapo.overlong_buffer.enable = True
+    cfg.algorithm.dapo.overlong_buffer.len = 20
+    cfg.algorithm.dapo.overlong_buffer.penalty_factor = 1.0
+    cfg.algorithm.dapo.max_resp_len = 100
+
+    batch = DataProto(
+        tensors={"rewards": torch.zeros(2)},
+        meta={"response_lengths": [80, 100]},
+    )
+    out = DAPOAlgorithm(cfg).compute_advantages(batch)
+
+    assert "dapo_sample_mask" in out.tensors
+    assert torch.all(out.tensors["dapo_sample_mask"] == 1)
+    assert out.tensors["advantages"][0] > 0
+    assert out.tensors["advantages"][1] < 0
+
+
 def test_asymmetric_clip() -> None:
     cfg = LumenRLConfig()
     algo = DAPOAlgorithm(cfg)

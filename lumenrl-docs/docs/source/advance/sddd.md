@@ -56,7 +56,7 @@ Following the [lightseekorg recipe](https://huggingface.co/lightseekorg/kimi-k2.
 
 See the runnable examples:
 
-- `examples/Kimi_K25_SDDD/` — Kimi K2.5 with SGLang + ATOM + MXFP4
+- `examples/Kimi_K25_SDDD_MI350_ATOM/` — Kimi K2.5 with ATOM + MXFP4
 - `examples/Kimi_K25_SDDD_MI350/` — Kimi K2.5 on MI350
 - `examples/Kimi_K25_SDDD_MI350_ATOM/` — Kimi K2.5 with ATOM backend
 - `examples/Qwen3_8B_SDDD_MI350_vLLM/` — Qwen3-8B with vLLM on MI350

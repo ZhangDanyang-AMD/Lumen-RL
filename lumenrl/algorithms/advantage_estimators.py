@@ -29,6 +29,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from lumenrl.algorithms.dapo_sampling import overlong_buffer_penalty
 from lumenrl.core.config import LumenRLConfig
 from lumenrl.core.protocol import DataProto
 
@@ -191,7 +192,22 @@ def compute_dapo_advantage(batch: DataProto, config: LumenRLConfig) -> DataProto
             f"Batch size {rewards.shape[0]} not divisible by num_generations={g}."
         )
 
-    if cfg.overlong_reward_shaping:
+    ob = getattr(cfg, "overlong_buffer", None)
+    if ob is not None and getattr(ob, "enable", False):
+        lengths = batch.meta.get("response_lengths")
+        if lengths is not None:
+            max_resp = int(getattr(cfg, "max_resp_len", 0)) or int(
+                config.policy.max_response_length
+            )
+            penalty = overlong_buffer_penalty(
+                lengths,
+                max_resp_len=max_resp,
+                buffer_len=int(ob.len),
+                penalty_factor=float(ob.penalty_factor),
+            ).to(device=rewards.device)
+            if penalty.shape[0] == rewards.shape[0]:
+                rewards = rewards.to(dtype=torch.float32) + penalty
+    elif cfg.overlong_reward_shaping:
         rewards = _apply_overlong_shaping(
             rewards,
             batch,
@@ -200,7 +216,7 @@ def compute_dapo_advantage(batch: DataProto, config: LumenRLConfig) -> DataProto
         )
 
     grouped = rewards.view(-1, g)
-    std = grouped.std(dim=1)
+    std = grouped.std(dim=1, unbiased=False)
 
     if cfg.dynamic_sampling:
         keep = std > 1e-6
@@ -489,8 +505,6 @@ def compute_grpo_passk_advantage(batch: DataProto, config: LumenRLConfig) -> Dat
     rewards = batch.tensors["rewards"]
     if rewards.dim() > 1:
         rewards = rewards.squeeze(-1)
-    cfg = config.algorithm.grpo
-    g = cfg.num_generations
     index = _get_group_index(batch, config)
 
     scores = rewards.clone()

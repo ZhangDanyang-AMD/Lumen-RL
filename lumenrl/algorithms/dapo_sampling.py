@@ -8,8 +8,6 @@ native DAPO path was missing:
 - :func:`filter_groups_keep_mask` — verl's dynamic-sampling group filter that
   drops prompt groups with zero metric variance
   (``recipe/dapo/dapo_ray_trainer.py``).
-- :func:`grpo_advantage_by_uid` — group-relative GRPO advantages keyed by prompt
-  uid (``verl/trainer/ppo/core_algos.py::compute_grpo_outcome_advantage``).
 
 They operate on plain tensors / python lists so they can be unit tested without
 a GPU or any distributed setup.
@@ -26,7 +24,6 @@ from torch import Tensor
 __all__ = [
     "overlong_buffer_penalty",
     "filter_groups_keep_mask",
-    "grpo_advantage_by_uid",
 ]
 
 
@@ -107,49 +104,3 @@ def filter_groups_keep_mask(
     kept_set = set(kept_uids)
     keep_mask = torch.tensor([u in kept_set for u in uids], dtype=torch.bool)
     return keep_mask, kept_uids
-
-
-def grpo_advantage_by_uid(
-    rewards: Tensor,
-    uids: Sequence,
-    *,
-    norm_by_std: bool = True,
-    eps: float = 1e-6,
-) -> Tensor:
-    """Group-relative GRPO advantages keyed by prompt uid (verl).
-
-    ``A_i = (r_i - mean_group) / (std_group + eps)`` when ``norm_by_std`` else
-    ``A_i = r_i - mean_group`` (Dr.GRPO). Singleton groups get ``mean=0, std=1``.
-
-    Args:
-        rewards: Per-sample sequence reward, shape ``[N]``.
-        uids: Per-sample prompt id (length ``N``).
-        norm_by_std: Divide by group std (original GRPO) or not (Dr.GRPO).
-        eps: Numerical floor on group std.
-
-    Returns:
-        Advantages ``[N]`` (float32) in the original sample order.
-    """
-    r = rewards.reshape(-1).to(dtype=torch.float32)
-    if len(uids) != r.shape[0]:
-        raise ValueError(f"len(uids)={len(uids)} != rewards={r.shape[0]}")
-
-    uid2idx: dict = defaultdict(list)
-    for i, u in enumerate(uids):
-        uid2idx[u].append(i)
-
-    adv = torch.zeros_like(r)
-    for u, idxs in uid2idx.items():
-        group = r[idxs]
-        if group.numel() == 1:
-            mean = torch.tensor(0.0)
-            std = torch.tensor(1.0)
-        else:
-            mean = group.mean()
-            # verl uses torch.std (unbiased / Bessel-corrected) for GRPO norm.
-            std = group.std(unbiased=True)
-        if norm_by_std:
-            adv[idxs] = (group - mean) / (std + eps)
-        else:
-            adv[idxs] = group - mean
-    return adv

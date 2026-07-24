@@ -383,16 +383,15 @@ python examples/run_grpo.py \
     clip: <span class="n">1.5</span></pre>
       </div>
       <div class="cblock">
-        <div class="ch"><i style="background:var(--violet)"></i> moe r3 config</div>
-<pre><span class="k">moe</span>:
-  <span class="v">r3</span>:
-    enabled: <span class="n">true</span>
-    record_router_logits: <span class="n">true</span>
-    replay_mode: <span class="s">distribution</span>
+        <div class="ch"><i style="background:var(--violet)"></i> dapo launcher</div>
+<pre><span class="c"># BF16</span>
+MODE=bf16 STEPS=1000 bash examples/DAPO/run_dapo.sh
 
-<span class="c"># DAPO example</span>
-bash examples/DAPO/run_1a_bf16_baseline.sh
-bash examples/DAPO/run_1d_fp8_e2e_blockwise.sh</pre>
+<span class="c"># FP8 rollout</span>
+MODE=fp8 STEPS=1000 bash examples/DAPO/run_dapo.sh
+
+<span class="c"># ATOM FP8 rollout</span>
+MODE=atomfp8 STEPS=1000 bash examples/DAPO/run_dapo.sh</pre>
       </div>
     </div>
   </div>
@@ -923,24 +922,25 @@ python examples/run_grpo.py --config configs/grpo_dense_fp8.yaml \
 <h1>SDDD Training Example</h1>
 <p>Train Eagle3 speculative decoding draft models using LumenRL's SDDD pipeline powered by <a href="https://github.com/lightseekorg/TorchSpec">TorchSpec</a>.</p>
 
-<h2>Kimi K2.5 Eagle3 (SGLang + Mooncake)</h2>
-<p>Train an Eagle3 draft model for Kimi K2.5 on 8 GPUs with SGLang + ATOM inference and Mooncake RDMA transfer.</p>
+<h2>Kimi K2.5 Eagle3 (ATOM + Mooncake)</h2>
+<p>Train an Eagle3 draft model for Kimi K2.5 on 8 GPUs with ATOM inference and Mooncake transfer.</p>
 
 <h3>GPU Layout</h3>
 <ul>
 <li><strong>GPUs 0&ndash;3</strong>: FSDP2 Eagle3 draft model training (BF16)</li>
-<li><strong>GPUs 4&ndash;7</strong>: SGLang + ATOM plugin &mdash; Kimi K2.5 teacher (TP=4, BF16 to MXFP4)</li>
+<li><strong>GPUs 4&ndash;7</strong>: ATOM plugin &mdash; Kimi K2.5 teacher (TP=4, BF16 to MXFP4)</li>
 </ul>
 
 <h3>Quick Start</h3>
 <pre><span class="c"># Smoke test</span>
-bash examples/Kimi_K25_SDDD/run_kimi_k25.sh --smoke-test
+CUDA_VISIBLE_DEVICES=0 python -m lumenrl.trainer.main \
+  --config examples/Kimi_K25_SDDD_MI350_ATOM/configs/smoke_test_hf.yaml
 
 <span class="c"># Full two-phase training (Docker)</span>
-bash examples/Kimi_K25_SDDD/run_full_training_docker.sh
+bash examples/Kimi_K25_SDDD_MI350_ATOM/run_full_training_docker.sh
 
-<span class="c"># Custom model path</span>
-MODEL_PATH=/path/to/kimi-k2.5 bash examples/Kimi_K25_SDDD/run_kimi_k25.sh</pre>
+<span class="c"># Phase 2 only</span>
+bash examples/Kimi_K25_SDDD_MI350_ATOM/run_full_training_docker.sh --phase2-only</pre>
 
 <h3>Models</h3>
 <table class="dtbl"><thead><tr><th>Role</th><th>Model</th><th>Notes</th></tr></thead><tbody>
@@ -1205,7 +1205,7 @@ FSDP2 Eagle3/DFlash draft model  &lt;---  Teacher model (ATOM / SGLang / vLLM)
 
 <h2>Quick Start</h2>
 <pre>torchrun --nproc_per_node=8 -m lumenrl.trainer.main \
-  --config configs/1a_bf16_async.yaml</pre>
+  --config /absolute/path/to/async_config.yaml</pre>
 
 <h2>Tuning Recommendations</h2>
 <ul>

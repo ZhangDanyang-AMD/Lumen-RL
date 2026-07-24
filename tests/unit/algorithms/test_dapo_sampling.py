@@ -1,5 +1,4 @@
-"""Tests for verl-faithful DAPO helpers (overlong buffer, filter_groups, GRPO,
-and TIS rollout correction applied in the DAPO loss)."""
+"""Tests for verl-faithful DAPO sampling and rollout correction helpers."""
 
 from __future__ import annotations
 
@@ -8,7 +7,6 @@ import torch
 from lumenrl.algorithms.dapo import DAPOAlgorithm
 from lumenrl.algorithms.dapo_sampling import (
     filter_groups_keep_mask,
-    grpo_advantage_by_uid,
     overlong_buffer_penalty,
 )
 from lumenrl.algorithms.loss_functions import asymmetric_clip_loss
@@ -56,27 +54,6 @@ def test_filter_groups_keeps_singletons() -> None:
     keep, kept_uids = filter_groups_keep_mask(acc, uids)
     assert keep.tolist() == [True, True]
     assert kept_uids == ["a", "b"]
-
-
-# --------------------------------------------------------------------------- #
-# GRPO advantage by uid (verl core_algos)
-# --------------------------------------------------------------------------- #
-def test_grpo_advantage_by_uid_group_norm() -> None:
-    rewards = torch.tensor([1.0, -1.0, 1.0, 1.0])
-    uids = ["p0", "p0", "p1", "p1"]
-    adv = grpo_advantage_by_uid(rewards, uids, norm_by_std=True)
-    # p0: mean=0, std(unbiased)=sqrt(2); adv = +/- 1/sqrt2.
-    assert adv[0] > 0 and adv[1] < 0
-    assert abs(adv[0].item() - 1.0 / (2.0 ** 0.5)) < 1e-3
-    # p1: identical rewards -> zero advantage.
-    assert torch.allclose(adv[2:], torch.zeros(2), atol=1e-5)
-
-
-def test_grpo_advantage_singleton() -> None:
-    rewards = torch.tensor([3.0])
-    adv = grpo_advantage_by_uid(rewards, ["solo"], norm_by_std=True)
-    # singleton: mean=0, std=1 -> adv == reward.
-    assert torch.allclose(adv, torch.tensor([3.0]))
 
 
 # --------------------------------------------------------------------------- #

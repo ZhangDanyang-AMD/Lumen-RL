@@ -74,7 +74,7 @@ trigger_parameter_sync_step = train_batch_size / (require_batches × ppo_mini_ba
 ## Quick Start
 
 ```yaml
-# configs/1a_bf16_async.yaml
+# Save as a project-specific async config.
 policy:
   model_name: Qwen/Qwen3-8B
   generation_backend: atom
@@ -100,7 +100,7 @@ Launch:
 
 ```bash
 torchrun --nproc_per_node=8 -m lumenrl.trainer.main \
-  --config configs/1a_bf16_async.yaml
+  --config /absolute/path/to/async_config.yaml
 ```
 
 ## Key Metrics

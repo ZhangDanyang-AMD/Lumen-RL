@@ -67,8 +67,9 @@ override `cluster.num_nodes` and `cluster.gpus_per_node` as needed.
 Train an Eagle3 draft model for speculative decoding using teacher hidden-state distillation:
 
 ```bash
-# Kimi K2.5 SDDD smoke test (8 GPUs)
-bash examples/Kimi_K25_SDDD/run_kimi_k25.sh --smoke-test
+# Kimi K2.5 SDDD smoke test
+CUDA_VISIBLE_DEVICES=0 python -m lumenrl.trainer.main \
+  --config examples/Kimi_K25_SDDD_MI350_ATOM/configs/smoke_test_hf.yaml
 
 # Qwen3-8B SDDD on MI350 with vLLM
 bash examples/Qwen3_8B_SDDD_MI350_vLLM/run_vllm_mi350.sh

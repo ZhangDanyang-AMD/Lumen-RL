@@ -9,8 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-# agg_loss: verl/trainer/ppo/core_algos.py L1138-1199
-from lumenrl.algorithms.policy_losses import agg_loss  # re-export
+from lumenrl.utils.torch_functional import masked_sum
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +24,47 @@ __all__ = [
     "hidden_state_loss",
     "entropy_bonus",
 ]
+
+
+def agg_loss(
+    loss_mat: Tensor,
+    loss_mask: Tensor,
+    loss_agg_mode: str,
+    dp_size: int = 1,
+    batch_num_tokens: Optional[int] = None,
+    global_batch_size: Optional[int] = None,
+) -> Tensor:
+    """Aggregate token losses using verl-compatible reduction modes."""
+    if loss_agg_mode == "token-mean":
+        if batch_num_tokens is None:
+            if dp_size > 1:
+                raise ValueError("batch_num_tokens is required when dp_size > 1")
+            batch_num_tokens = int(loss_mask.sum().item())
+        return masked_sum(loss_mat, loss_mask) / max(batch_num_tokens, 1) * dp_size
+
+    if loss_agg_mode in ("seq-mean-token-sum", "seq-mean-token-sum-norm"):
+        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)
+        seq_mask = (torch.sum(loss_mask, dim=-1) > 0).float()
+        if global_batch_size is None:
+            if dp_size > 1:
+                raise ValueError("global_batch_size is required when dp_size > 1")
+            global_batch_size = int(seq_mask.sum().item())
+        loss = masked_sum(seq_losses, seq_mask) / max(global_batch_size, 1) * dp_size
+        if loss_agg_mode == "seq-mean-token-sum-norm":
+            loss = loss / loss_mask.shape[-1]
+        return loss
+
+    if loss_agg_mode == "seq-mean-token-mean":
+        seq_count = torch.sum(loss_mask, dim=-1)
+        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / (seq_count + 1e-8)
+        seq_mask = (seq_count > 0).float()
+        if global_batch_size is None:
+            if dp_size > 1:
+                raise ValueError("global_batch_size is required when dp_size > 1")
+            global_batch_size = int(seq_mask.sum().item())
+        return masked_sum(seq_losses, seq_mask) / max(global_batch_size, 1) * dp_size
+
+    raise ValueError(f"Invalid loss_agg_mode: {loss_agg_mode!r}")
 
 
 def policy_gradient_loss(
