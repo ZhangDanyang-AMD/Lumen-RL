@@ -25,7 +25,6 @@ def register_default_bindings() -> None:
     """
     from lumenrl.engine.inference.atom_engine import AtomEngine
     from lumenrl.engine.training.fsdp_backend import FSDP2Backend
-    from lumenrl.engine.training.megatron_backend import MegatronBackend
     from lumenrl.trainer.async_trainer import AsyncRLTrainer
     from lumenrl.trainer.opd_trainer import OPDTrainer
     from lumenrl.trainer.rl_trainer import RLTrainer
@@ -46,7 +45,6 @@ def register_default_bindings() -> None:
 
     _ensure(training_backend_registry, "fsdp", FSDP2Backend)
     _ensure(training_backend_registry, "fsdp2", FSDP2Backend)
-    _ensure(training_backend_registry, "megatron", MegatronBackend)
     _ensure(inference_backend_registry, "atom", AtomEngine)
 
     _ensure(trainer_registry, "trainer.rl", RLTrainer)

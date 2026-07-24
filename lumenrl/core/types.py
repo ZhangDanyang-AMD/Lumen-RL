@@ -3,14 +3,10 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import TypedDict
-
-from typing_extensions import NotRequired
 
 
 class TrainingBackend(str, Enum):
     FSDP2 = "fsdp2"
-    MEGATRON = "megatron"
     MEGATRON_NATIVE = "megatron_native"
     NONE = "none"
 
@@ -26,100 +22,3 @@ class AlgorithmName(str, Enum):
     PPO = "ppo"
     OPD = "opd"
     SPEC_DISTILL = "spec_distill"
-
-
-class AdvantageEstimator(str, Enum):
-    GAE = "gae"
-    GRPO = "grpo"
-    REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
-    RLOO = "rloo"
-    DAPO = "dapo"
-    # New estimators (verl/trainer/ppo/core_algos.py L334-865)
-    GRPO_VECTORIZED = "grpo_vectorized"
-    GDPO = "gdpo"
-    GRPO_PASSK = "grpo_passk"
-    REINFORCE_PLUS_PLUS_BASELINE = "reinforce_plus_plus_baseline"
-    REMAX = "remax"
-    OPO = "opo"
-    GPG = "gpg"
-    RLOO_VECTORIZED = "rloo_vectorized"
-
-
-class FP8Precision(str, Enum):
-    FP8 = "fp8"
-    BF16 = "bf16"
-
-
-class FP8Recipe(str, Enum):
-    BLOCKWISE = "blockwise"
-    TENSORWISE = "tensorwise"
-
-
-class RolloutCorrectionMethod(str, Enum):
-    TIS = "tis"
-    MIS = "mis"
-
-
-class R3ReplayMode(str, Enum):
-    DISTRIBUTION = "distribution"
-    HARD_ASSIGNMENT = "hard_assignment"
-
-
-class DispatchMode(str, Enum):
-    """How DataProto is dispatched across DP workers."""
-    RANK_ZERO = "rank_zero"
-    DP_COMPUTE = "dp_compute"
-    DP_COMPUTE_PROTO = "dp_compute_proto"
-    DP_COMPUTE_PROTO_WITH_FUNC = "dp_compute_proto_with_func"
-    DP_COMPUTE_METRIC = "dp_compute_metric"
-    ONE_TO_ALL = "one_to_all"
-    ALL_TO_ALL = "all_to_all"
-    DIRECT_ROLLOUT_METHOD = "direct_rollout_method"
-    BROADCAST = "broadcast"
-
-
-class ClusterConfigDict(TypedDict):
-    num_nodes: int
-    gpus_per_node: int
-    ray_address: NotRequired[str]
-
-
-class MegatronConfigDict(TypedDict):
-    tensor_model_parallel_size: int
-    pipeline_model_parallel_size: NotRequired[int]
-    context_parallel_size: NotRequired[int]
-    expert_model_parallel_size: NotRequired[int]
-    sequence_parallel: NotRequired[bool]
-    num_experts: NotRequired[int]
-    moe_grouped_gemm: NotRequired[bool]
-
-
-class AtomConfigDict(TypedDict):
-    tensor_parallel_size: int
-    kv_cache_dtype: NotRequired[str]
-    max_model_len: NotRequired[int]
-
-
-class RolloutQuantConfigDict(TypedDict):
-    precision: str
-    use_deep_gemm: NotRequired[bool]
-    num_first_layers_in_bf16: NotRequired[int]
-    num_last_layers_in_bf16: NotRequired[int]
-
-
-class TrainingQuantConfigDict(TypedDict):
-    fp8: NotRequired[str]
-    fp8_recipe: NotRequired[str]
-    fp8_weight_cache: NotRequired[bool]
-
-
-class RolloutCorrectionConfigDict(TypedDict):
-    enabled: bool
-    method: NotRequired[str]
-    clip: NotRequired[float]
-
-
-class R3ConfigDict(TypedDict):
-    enabled: bool
-    record_router_logits: NotRequired[bool]
-    replay_mode: NotRequired[str]

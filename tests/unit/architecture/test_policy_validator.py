@@ -22,3 +22,12 @@ def test_rejects_training_backend_outside_allowlist() -> None:
     )
     with pytest.raises(ValueError, match="Training backend"):
         validate_backend_policy(cfg)
+
+
+def test_rejects_removed_legacy_megatron_backend() -> None:
+    cfg = RuntimeAssemblyConfig(
+        training_backend="megatron",
+        inference_backend="atom",
+    )
+    with pytest.raises(ValueError, match="Training backend"):
+        validate_backend_policy(cfg)

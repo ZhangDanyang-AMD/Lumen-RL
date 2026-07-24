@@ -32,8 +32,6 @@ class CriticWorker(BaseWorker):
 
         if backend_raw in ("fsdp", "fsdp2"):
             backend_key = "fsdp2"
-        elif backend_raw == "megatron":
-            backend_key = "megatron"
         else:
             raise ValueError(f"Unknown critic training_backend: {backend_raw}")
 

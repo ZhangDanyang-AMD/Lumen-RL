@@ -44,8 +44,6 @@ class LumenActorWorker(BaseWorker):
 
         if backend_raw in ("fsdp", "fsdp2"):
             backend_key = "fsdp2"
-        elif backend_raw == "megatron":
-            backend_key = "megatron"
         elif backend_raw in ("megatron_native", "megatron-native"):
             backend_key = "megatron_native"
         else:
@@ -117,7 +115,7 @@ class LumenActorWorker(BaseWorker):
 
         Used by the controller to build the DP x (TP,PP,CP) data ``mesh_mapping`` and
         the loss-normalizing DP size. Falls back to pure-DP (rank/world) when
-        Megatron model-parallel state is not initialized (FSDP / legacy backends).
+        Megatron model-parallel state is not initialized (for example FSDP2).
         """
         try:
             from megatron.core import parallel_state as mpu
@@ -167,7 +165,7 @@ class LumenActorWorker(BaseWorker):
                 },
                 "seed": int(policy.get("seed", 42)),
             }
-        elif backend in ("megatron", "megatron_native"):
+        elif backend in ("megatron_native", "megatron-native"):
             meg_cfg = training_cfg.get("megatron_cfg") or policy.get("megatron_cfg") or {}
             if not isinstance(meg_cfg, dict):
                 from dataclasses import asdict, is_dataclass
@@ -184,15 +182,13 @@ class LumenActorWorker(BaseWorker):
                 "seed": int(policy.get("seed", 42)),
                 "dtype": meg_cfg.get("dtype", "bf16"),
                 "use_distributed_optimizer": meg_cfg.get("use_distributed_optimizer", False),
-                # Activation recomputation (needed for long sequences: Megatron
-                # local-spec attention is O(seq^2) in memory without TE flash).
+                # Activation recomputation for long sequences.
                 "recompute_granularity": meg_cfg.get("recompute_granularity", None),
                 "recompute_method": meg_cfg.get("recompute_method", None),
                 "recompute_num_layers": meg_cfg.get("recompute_num_layers", None),
-                # Long-sequence memory: flash attn (O(L)) + chunked/fused log-prob.
-                "attention_backend": meg_cfg.get("attention_backend", "unfused"),
+                # Memory-efficient chunked/fused log-prob.
                 "log_probs_chunk_size": meg_cfg.get("log_probs_chunk_size", 0),
-                # Dynamic-batch packing (flash_attn_varlen) for GEMM efficiency.
+                # Dynamic-batch packing through TE packed-sequence attention.
                 "enable_dynamic_batch": meg_cfg.get("enable_dynamic_batch", False),
                 "max_tokens_per_gpu": meg_cfg.get("max_tokens_per_gpu", 0),
             }

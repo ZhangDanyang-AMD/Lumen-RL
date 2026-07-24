@@ -127,9 +127,6 @@ python examples/run_grpo.py --config configs/grpo_dense_fp8.yaml
 # 8 GPUs
 python examples/run_grpo.py --config configs/grpo_dense_fp8_8gpu.yaml
 
-# MoE model with R3 + FP8
-python examples/run_grpo.py --config configs/grpo_moe_fp8_r3.yaml
-
 # Ray-controller recipe with extended dispatch modes
 python examples/run_grpo.py --config configs/recipes/ray_controller_dispatch_modes_1n8g.yaml
 ```
@@ -152,18 +149,9 @@ Legacy alias: `broadcast` is accepted and normalized to `one_to_all`.
 ### Multi-Node with SLURM
 
 ```bash
-NUM_NODES=2
-
-COMMAND="python examples/run_grpo_moe.py \
-    --config configs/grpo_moe_fp8_r3_multinode.yaml \
-    cluster.num_nodes=$NUM_NODES \
-    cluster.gpus_per_node=8 \
-    policy.model_name=Qwen/Qwen3-30B-A3B \
-    quantization.rollout.precision=fp8 \
-    moe.r3.enabled=true \
-    logger.wandb_enabled=true"
-
-sbatch --nodes=$NUM_NODES --gres=gpu:8 scripts/ray.sub
+bash scripts/launch_slurm.sh 2 configs/grpo_dense_fp8.yaml \
+    policy.model_name=Qwen/Qwen3-8B \
+    logger.wandb_enabled=true
 ```
 
 ## Fully Async Training

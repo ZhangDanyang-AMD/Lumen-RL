@@ -5,8 +5,8 @@
 #   bash scripts/launch_single_node.sh configs/grpo_dense_fp8.yaml [overrides...]
 #
 # Example:
-#   bash scripts/launch_single_node.sh configs/grpo_moe_fp8_r3.yaml \
-#       policy.model_name=Qwen/Qwen3-30B-A3B logger.wandb_enabled=true
+#   bash scripts/launch_single_node.sh configs/grpo_dense_fp8.yaml \
+#       policy.model_name=Qwen/Qwen3-8B logger.wandb_enabled=true
 
 set -euo pipefail
 

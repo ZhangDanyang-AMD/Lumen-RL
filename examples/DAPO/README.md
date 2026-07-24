@@ -522,8 +522,7 @@ examples/DAPO/
 ├── configs/
 │   ├── 1a_bf16_sync.yaml              # Sync on-policy (recommended)
 │   ├── 1a_bf16_async.yaml             # Async off-policy
-│   ├── 1a_bf16_baseline.yaml          # Legacy VERL baseline
-│   └── smoke_test_native.yaml         # Quick smoke test
+│   └── 1a_bf16_baseline.yaml          # Legacy VERL baseline
 ├── run_1a_bf16_sync.sh                # Launch sync training (auto-restart)
 ├── run_1a_bf16_async.sh               # Launch async training
 ├── run_1a_bf16_baseline.sh            # Legacy VERL baseline

@@ -49,8 +49,8 @@ same = load_config("configs/grpo_dense_bf16.yaml", overrides=["seed=123"])
 | Field | Default | Description |
 | --- | --- | --- |
 | `model_name` | `""` | Hugging Face hub id or local path |
-| `training_backend` | `"fsdp2"` | `TrainingBackend` string (`fsdp2`, `megatron`) |
-| `generation_backend` | `"atom"` | `GenerationBackend` string (`atom`) |
+| `training_backend` | `"fsdp2"` | `TrainingBackend` string (`fsdp2`, `megatron_native`) |
+| `generation_backend` | `"atom"` | `GenerationBackend` string (`atom`, `vllm`) |
 | `training` | `TrainingConfig` | Nested Megatron / FSDP knobs |
 | `generation` | `GenerationConfig` | Nested ATOM generation knobs |
 | `max_total_sequence_length` | `4096` | Token cap for prompts + responses |
@@ -65,12 +65,16 @@ same = load_config("configs/grpo_dense_bf16.yaml", overrides=["seed=123"])
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `tensor_parallel_size` | `1` | TP degree |
-| `expert_parallel_size` | `1` | EP degree for MoE |
-| `pipeline_parallel_size` | `1` | PP degree |
+| `tensor_model_parallel_size` | `1` | TP degree |
+| `pipeline_model_parallel_size` | `1` | PP degree |
+| `context_parallel_size` | `1` | CP degree |
+| `expert_model_parallel_size` | `1` | EP degree |
+| `sequence_parallel` | `False` | Sequence parallelism toggle |
 | `num_experts` | `None` | Expert count hint for MoE recipes |
 | `moe_grouped_gemm` | `False` | Prefer grouped GEMM kernels |
-| `moe_use_legacy_grouped_gemm` | `False` | Legacy grouped GEMM toggle |
+| `use_distributed_optimizer` | `True` | Shard FP32 master weights and optimizer state |
+| `log_probs_chunk_size` | `0` | Chunk size for memory-efficient token log-prob |
+| `enable_dynamic_batch` | `False` | Pack variable-length sequences into TE forwards |
 
 ### `AtomConfig`
 

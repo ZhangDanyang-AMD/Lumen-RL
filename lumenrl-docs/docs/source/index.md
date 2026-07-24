@@ -63,7 +63,6 @@ examples/grpo_training
 examples/dapo_training
 examples/ppo_training
 examples/fp8_training
-examples/moe_r3_training
 examples/sddd_training
 ```
 

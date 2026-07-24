@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from lumenrl.architecture.config.assembly_config import RuntimeAssemblyConfig
 
-ALLOWED_TRAINING = {"fsdp", "fsdp2", "megatron"}
+ALLOWED_TRAINING = {"fsdp", "fsdp2"}
 ALLOWED_INFERENCE = {"atom"}
 
 

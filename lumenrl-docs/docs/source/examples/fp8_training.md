@@ -75,4 +75,3 @@ If you disable `rollout_correction` while keeping FP8 rollouts on, monitor KL to
 
 - Conceptual deep dive: {doc}`/advance/fp8_quantization`
 - Python APIs: {doc}`/api/quantization`, {doc}`/api/config`
-- MoE + FP8 + R3 joint recipe: {doc}`/examples/moe_r3_training`

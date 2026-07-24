@@ -1,8 +1,8 @@
 """Qwen3 <-> Megatron-Core GPTModel weight conversion (TP=1).
 
-Maps Hugging Face ``Qwen3ForCausalLM`` weights to a Megatron-Core ``GPTModel``
-built with a local (non-TE) or TE layer spec, and back (for rollout weight
-sync). Only TP=1/PP=1 is supported (the LumenRL Megatron smoke uses DP=8).
+Maps Hugging Face ``Qwen3ForCausalLM`` weights to the full Megatron-Core tensor
+layout used by the TransformerEngine spec, and back for rollout weight sync.
+The native engine applies TP/PP sharding around these full-tensor conversions.
 
 Megatron GQA ``linear_qkv`` layout is interleaved per KV group:
 ``[g0: q0..q_{r-1}, k0, v0, g1: ...]`` with ``r = num_heads / num_kv_groups``.

@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import OmegaConf
 
 from lumenrl.architecture.config.assembly_config import RuntimeAssemblyConfig
 from lumenrl.core.types import (
@@ -38,24 +38,6 @@ class FSDPEngineConfig:
     forward_prefetch: bool = False
     use_orig_params: bool = True
     use_torch_compile: bool = False
-
-
-@dataclass
-class McoreEngineConfig:
-    """Configuration for the Megatron-Core training engine."""
-    tensor_model_parallel_size: int = 1
-    pipeline_model_parallel_size: int = 1
-    virtual_pipeline_model_parallel_size: Optional[int] = None
-    context_parallel_size: int = 1
-    expert_model_parallel_size: int = 1
-    sequence_parallel: bool = False
-    param_offload: bool = False
-    optimizer_offload: bool = False
-    grad_offload: bool = False
-    forward_only: bool = False
-    seed: int = 42
-    dtype: str = "bf16"
-    use_distributed_optimizer: bool = False
 
 
 @dataclass
@@ -166,21 +148,15 @@ class MegatronConfig:
     sequence_parallel: bool = False
     num_experts: Optional[int] = None
     moe_grouped_gemm: bool = False
-    moe_use_legacy_grouped_gemm: bool = False
     # Distributed optimizer: shard FP32 master + Adam state across DP ranks.
     use_distributed_optimizer: bool = True
-    # Activation recomputation (gradient checkpointing). Needed for long-sequence
-    # training: the Megatron local-spec attention (no TE flash) keeps the full
-    # O(seq^2) score matrix, so resp=20480 OOMs without recompute. Defaults off.
+    # Activation recomputation (gradient checkpointing) for long sequences.
     recompute_granularity: Optional[str] = None  # None | "full" | "selective"
     recompute_method: Optional[str] = None       # "uniform" | "block"
     recompute_num_layers: Optional[int] = None
-    # Long-sequence memory: flash attention (O(L) vs local O(L^2)) + memory-efficient
-    # chunked/fused token log-prob. Both default off (unchanged smoke behavior).
-    attention_backend: str = "unfused"           # "flash" | "unfused"
+    # Memory-efficient chunked/fused token log-prob.
     log_probs_chunk_size: int = 0                # >0 enables fused/chunked log-prob
-    # Dynamic-batch packing: concat multiple sequences into one flash_attn_varlen
-    # forward (keeps GEMMs full on short sequences). Requires attention_backend=flash.
+    # Dynamic-batch packing: concat multiple sequences into one packed TE forward.
     enable_dynamic_batch: bool = False
     max_tokens_per_gpu: int = 0                  # per-forward token budget (0 -> 21504)
 

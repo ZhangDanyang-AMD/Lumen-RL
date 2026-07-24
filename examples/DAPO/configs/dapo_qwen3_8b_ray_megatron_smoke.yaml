@@ -42,11 +42,9 @@ policy:
     optimizer_dtype: bf16
     megatron_cfg:
       use_distributed_optimizer: true
-      # Same long-sequence memory path as the longrun (harmless at smoke scale):
-      #   flash attention (O(L) vs local O(L^2)) + memory-efficient chunked log-prob.
-      attention_backend: flash
+      # TE spec provides fused attention; bound log-prob memory by chunking.
       log_probs_chunk_size: 1024
-      # Dynamic-batch packing (concat sequences into one flash_attn_varlen forward).
+      # Dynamic-batch packing through TE packed-sequence attention.
       enable_dynamic_batch: true
       max_tokens_per_gpu: 2048
     fsdp_cfg:

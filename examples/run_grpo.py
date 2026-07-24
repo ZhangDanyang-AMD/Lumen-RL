@@ -3,8 +3,6 @@
 Usage:
     python examples/run_grpo.py --config configs/grpo_dense_bf16.yaml
     python examples/run_grpo.py --config configs/grpo_dense_fp8.yaml
-    python examples/run_grpo.py --config configs/grpo_moe_fp8_r3.yaml \\
-        cluster.num_nodes=2 logger.wandb_enabled=true
 """
 
 from __future__ import annotations

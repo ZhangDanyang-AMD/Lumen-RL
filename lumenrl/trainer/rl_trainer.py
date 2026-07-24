@@ -31,7 +31,7 @@ from lumenrl.controller.dispatch import dispatch_proto
 from lumenrl.engine.training.base_engine import BaseEngine, EngineRegistry
 from lumenrl.quantization.rollout_correction import apply_rollout_correction
 from lumenrl.trainer.callbacks import Callback, LoggingCallback
-from lumenrl.utils.metrics import MetricsTracker, compute_kl_divergence
+from lumenrl.utils.metrics import MetricsTracker
 from lumenrl.utils.profiler import DistProfiler
 from lumenrl.workers import LumenActorWorker, RefPolicyWorker
 
@@ -153,10 +153,11 @@ class RLTrainer:
         backend_str = getattr(self.config.policy, "training_backend", "fsdp2").lower()
         if backend_str in ("fsdp", "fsdp2"):
             backend_key = "fsdp2"
-        elif backend_str == "megatron":
-            backend_key = "megatron"
         else:
-            backend_key = "fsdp2"
+            raise ValueError(
+                "The non-Ray trainer supports only policy.training_backend=fsdp2; "
+                f"got {backend_str!r}."
+            )
 
         logger.info("[rank %d] Building actor model via Engine layer: %s (backend=%s, optimizer_dtype=%s)",
                     self._rank, model_name, backend_key, optimizer_dtype_str)
@@ -358,7 +359,7 @@ class RLTrainer:
         ]
         ray.get(refs)
         logger.info(
-            "Ray rendezvous complete: %d actors on %s:%s (FSDP2 sharded).",
+            "Ray rendezvous complete: %d distributed actors on %s:%s.",
             n, master_addr, master_port,
         )
 
@@ -366,9 +367,9 @@ class RLTrainer:
         """Total model-parallel size (TP x PP x CP) of the actor engine (Megatron
         native path only).
 
-        FSDP and the legacy megatron backend are pure DP (mp=1). Only the native
-        Megatron-Core engine consumes ``megatron_cfg.tensor_model_parallel_size``
-        / ``pipeline_model_parallel_size`` / ``context_parallel_size``.
+        FSDP is pure DP (mp=1). The Megatron-Native engine consumes
+        ``megatron_cfg.tensor_model_parallel_size`` /
+        ``pipeline_model_parallel_size`` / ``context_parallel_size``.
         """
         backend = str(getattr(self.config.policy, "training_backend", "")).lower()
         if backend not in ("megatron_native", "megatron-native"):
@@ -1060,8 +1061,6 @@ class RLTrainer:
         Wraps around the dataset. Used by both the fixed-batch path and the DAPO
         dynamic-sampling regeneration loop (which advances a running cursor).
         """
-        import json as _json
-
         if self._dataset is None:
             prompts = [f"What is {start + i} + {start + i + 1}?" for i in range(count)]
             gts = [str(2 * (start + i) + 1) for i in range(count)]
@@ -1960,7 +1959,6 @@ class RLTrainer:
         Pads to the global max sequence length, gathers, then trims.
         """
         local_max = torch.tensor([local_seqs.shape[1]], device=self._device)
-        global_max = torch.zeros_like(local_max)
         torch.distributed.all_reduce(local_max, op=torch.distributed.ReduceOp.MAX)
         global_max_len = int(local_max.item())
 
@@ -2937,8 +2935,6 @@ class RLTrainer:
                             self._engine.optimizer_zero_grad()
                         else:
                             self._optimizer.zero_grad(set_to_none=True)
-                    group_start = (i // accum_steps) * accum_steps
-                    group_size = min(accum_steps, len(mini_batches) - group_start)
                     cur_loss_scale = 1.0  # full-batch token-mean handles averaging
                     is_last_in_group = (i + 1) % accum_steps == 0 or i == len(mini_batches) - 1
                     if _fsdp_grad_sync:

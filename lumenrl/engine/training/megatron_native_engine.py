@@ -25,7 +25,7 @@ import torch.nn.functional as F
 
 from lumenrl.core.protocol import DataProto
 from lumenrl.engine.training.base_engine import EngineRegistry
-from lumenrl.engine.training.megatron_engine import MegatronEngine
+from lumenrl.engine.training.megatron_base_engine import MegatronBaseEngine
 from lumenrl.engine.training.qwen3_megatron_bridge import (
     Qwen3Dims,
     hf_to_megatron,
@@ -66,11 +66,11 @@ def _to_global_key(key: str, offset: int) -> str:
     return f"{key[:m.start(2)]}{int(m.group(2)) + offset}{key[m.end(2):]}"
 
 
-class MegatronNativeEngine(MegatronEngine):
+class MegatronNativeEngine(MegatronBaseEngine):
     """Megatron-Core GPTModel engine using the TransformerEngine layer spec.
 
-    Inherits forward / log-prob / packing / optimizer-step / save-load from
-    ``MegatronEngine``; only the model construction (TE spec, pipeline-stage
+    Inherits forward / log-prob / packing / optimizer-step helpers from
+    ``MegatronBaseEngine``; only the model construction (TE spec, pipeline-stage
     aware) and HF weight I/O (TE-named bridge) differ.
     """
 
@@ -98,8 +98,7 @@ class MegatronNativeEngine(MegatronEngine):
         self._tp = tp
         self._pp = pp
         self._cp = cp
-        # forward-side knobs shared with the parent forward/log-prob helpers
-        self._attention_backend = "te"  # TE spec provides fused attention
+        # Forward-side knobs shared with the base log-prob helpers.
         self._logprob_chunk_size = int(ec.get("log_probs_chunk_size") or 0)
         self._dynamic_batch = bool(ec.get("enable_dynamic_batch") or False)
         self._max_tokens_per_gpu = int(ec.get("max_tokens_per_gpu") or 0)
@@ -201,7 +200,7 @@ class MegatronNativeEngine(MegatronEngine):
         self.module = model.cuda()
         self._tfcfg = tfcfg
 
-        # ---- distributed optimizer + scheduler (same as MegatronEngine) ----
+        # ---- distributed optimizer + scheduler ----
         from megatron.core.distributed import DistributedDataParallel as DDP
         from megatron.core.distributed import DistributedDataParallelConfig
         from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer

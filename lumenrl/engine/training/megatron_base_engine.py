@@ -3,21 +3,15 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
-"""VIME-style Megatron-Core training engine for LumenRL (BF16, TP=1/PP=1/DP=N).
+"""Shared training logic for Megatron-Core engines.
 
-Builds a real Megatron-Core ``GPTModel`` (Qwen3), loads HF weights, and runs
-the DAPO/GRPO RL step through Megatron modules -- the same training stack VIME
-uses (GPTModel + Megatron forward) -- while plugging into LumenRL's Ray
-controller via the ``BaseEngine`` interface.
-
-Scope: tensor/pipeline parallel = 1, data parallel = world size (the LumenRL
-BF16 smoke). Mixed precision uses BF16 compute with FP32 master weights; data
-parallel gradient sync is a manual mean all-reduce over the world group.
+The concrete native engine owns model construction, topology, and checkpoint
+format. This base provides common forward, packed batching, log-prob, policy
+loss, optimizer, scheduler, and data-parallel helpers.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from contextlib import nullcontext
@@ -25,7 +19,6 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 
 from lumenrl.algorithms.loss_functions import (
     asymmetric_clip_loss,
@@ -34,82 +27,11 @@ from lumenrl.algorithms.loss_functions import (
 )
 from lumenrl.core.protocol import DataProto
 from lumenrl.core.types import AlgorithmName
-from lumenrl.engine.training.base_engine import BaseEngine, EngineRegistry
-from lumenrl.engine.training.qwen3_megatron_bridge import (
-    Qwen3Dims,
-    hf_to_megatron,
-    load_hf_safetensors,
-    megatron_to_hf,
-)
+from lumenrl.engine.training.base_engine import BaseEngine
+from lumenrl.engine.training.qwen3_megatron_bridge import Qwen3Dims
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LUMENRL_LOGGING_LEVEL", "INFO"))
-
-import math  # noqa: E402
-
-try:
-    from flash_attn import flash_attn_func as _flash_attn_func
-    from flash_attn import flash_attn_varlen_func as _flash_attn_varlen_func
-except Exception:  # pragma: no cover - flash_attn optional
-    _flash_attn_func = None
-    _flash_attn_varlen_func = None
-
-
-class FlashSelfAttentionCore(torch.nn.Module):
-    """Flash-attention drop-in for Megatron's local-spec ``DotProductAttention``.
-
-    The local (non-TE) core attention materializes the full ``[b, np, sq, sk]``
-    score matrix -> **O(L^2)** memory, which OOMs at long RL response lengths
-    (resp=20480). This replacement calls ``flash_attn_func`` (O(L) memory) and is
-    swapped into the GPT layer spec's ``self_attention.submodules.core_attention``
-    when ``megatron_cfg.attention_backend == "flash"``.
-
-    Assumes causal self-attention on a single unpadded sequence (LumenRL's
-    per-sequence forward). GQA (num_query_groups < num_heads) is handled natively
-    by flash-attn, so we skip the KV ``repeat_interleave`` the local path does.
-    """
-
-    def __init__(self, config, layer_number: int = 1, attn_mask_type=None,
-                 attention_type=None, cp_comm_type=None, softmax_scale=None, **kwargs):
-        super().__init__()
-        if _flash_attn_func is None:
-            raise ImportError(
-                "megatron_cfg.attention_backend='flash' requires the flash_attn "
-                "package (import failed). Install flash-attn or set attention_backend='unfused'."
-            )
-        self.config = config
-        self.layer_number = max(1, layer_number or 1)
-        head_dim = getattr(config, "kv_channels", None) or (
-            config.hidden_size // config.num_attention_heads
-        )
-        self.softmax_scale = (
-            softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(head_dim)
-        )
-
-    def forward(self, query, key, value, attention_mask=None, attn_mask_type=None,
-                attention_bias=None, packed_seq_params=None):
-        # ---- packed varlen (thd): multiple concatenated sequences, one forward ----
-        if packed_seq_params is not None and getattr(packed_seq_params, "qkv_format", None) == "thd":
-            if _flash_attn_varlen_func is None:
-                raise ImportError("dynamic-batch packing needs flash_attn.flash_attn_varlen_func")
-            cu = packed_seq_params.cu_seqlens_q
-            mx = int(packed_seq_params.max_seqlen_q)
-            # Megatron sbhd with b=1: [T, 1, h, d] -> thd [T, h, d]
-            q = query.squeeze(1)
-            k = key.squeeze(1)
-            v = value.squeeze(1)
-            out = _flash_attn_varlen_func(
-                q, k, v, cu, cu, mx, mx, causal=True, softmax_scale=self.softmax_scale,
-            )  # [T, np, hn]
-            return out.reshape(out.shape[0], 1, -1)  # [T, 1, np*hn]
-        # ---- single unpadded sequence: Megatron layout [s,b,h,d] -> flash [b,s,h,d] ----
-        q = query.transpose(0, 1)
-        k = key.transpose(0, 1)
-        v = value.transpose(0, 1)
-        out = _flash_attn_func(q, k, v, causal=True, softmax_scale=self.softmax_scale)
-        # [b, sq, np, hn] -> [sq, b, np*hn]
-        out = out.transpose(0, 1).contiguous()
-        return out.reshape(out.shape[0], out.shape[1], -1)
 
 
 class _FusedTokenLogProb(torch.autograd.Function):
@@ -144,8 +66,8 @@ class _FusedTokenLogProb(torch.autograd.Function):
         return grad, None
 
 
-class MegatronEngine(BaseEngine):
-    """Megatron-Core GPTModel engine (Qwen3, BF16, TP=PP=1, DP=world)."""
+class MegatronBaseEngine(BaseEngine):
+    """Shared implementation for concrete Megatron-Core engines."""
 
     def __init__(self, model_config, engine_config, optimizer_config, model_name: str = ""):
         super().__init__()
@@ -160,7 +82,6 @@ class MegatronEngine(BaseEngine):
         self.optimizer: Any = None                     # Megatron distributed optimizer
         self.lr_scheduler: Any = None                  # Megatron OptimizerParamScheduler
         self._dims: Qwen3Dims | None = None
-        self._step = 0
         self.mode: str | None = None
 
     # -- offload (Ray path: never offload) --
@@ -177,151 +98,6 @@ class MegatronEngine(BaseEngine):
 
     def eval_mode(self, **kwargs):
         return nullcontext()
-
-    # ------------------------------------------------------------------
-    def initialize(self) -> None:
-        import megatron.core.transformer.transformer_block as tb
-        from megatron.core import parallel_state as mpu
-        from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
-        from megatron.core.models.gpt.gpt_model import GPTModel
-        from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-        from megatron.core.transformer.torch_norm import WrappedTorchNorm as WTN
-        from megatron.core.transformer.transformer_config import TransformerConfig
-
-        ec = self.engine_config
-        tp = int(ec.get("tensor_model_parallel_size", 1))
-        pp = int(ec.get("pipeline_model_parallel_size", 1))
-        cp = int(ec.get("context_parallel_size", 1))
-        ep = int(ec.get("expert_model_parallel_size", 1))
-        seed = int(ec.get("seed", 42))
-        # Long-sequence memory knobs (default off -> unchanged smoke behavior):
-        #   attention_backend="flash"  -> O(L) flash attn instead of O(L^2) local core
-        #   log_probs_chunk_size>0     -> memory-efficient fused/chunked token log-prob
-        self._attention_backend = str(ec.get("attention_backend") or "unfused").lower()
-        self._logprob_chunk_size = int(ec.get("log_probs_chunk_size") or 0)
-        # Dynamic-batch packing: concat multiple sequences into one varlen forward
-        # (flash_attn_varlen + cu_seqlens) to keep GEMMs full on short sequences.
-        self._dynamic_batch = bool(ec.get("enable_dynamic_batch") or False)
-        self._max_tokens_per_gpu = int(ec.get("max_tokens_per_gpu") or 0)
-        if self._dynamic_batch and self._attention_backend != "flash":
-            # varlen packing requires the flash core; auto-enable it.
-            self._attention_backend = "flash"
-
-        if not mpu.is_initialized():
-            mpu.initialize_model_parallel(
-                tensor_model_parallel_size=tp,
-                pipeline_model_parallel_size=pp,
-                context_parallel_size=cp,
-                expert_model_parallel_size=ep,
-            )
-        model_parallel_cuda_manual_seed(seed)
-
-        # ---- HF config -> Qwen3 dims / TransformerConfig ----
-        cfg_path = os.path.join(self.model_name, "config.json")
-        with open(cfg_path) as fh:
-            hf = json.load(fh)
-        head_dim = hf.get("head_dim", hf["hidden_size"] // hf["num_attention_heads"])
-        self._dims = Qwen3Dims(
-            num_layers=hf["num_hidden_layers"], hidden=hf["hidden_size"],
-            num_heads=hf["num_attention_heads"], num_kv_groups=hf["num_key_value_heads"],
-            head_dim=head_dim, ffn=hf["intermediate_size"], vocab=hf["vocab_size"],
-        )
-        tb.LayerNormImpl = WTN  # force torch RMSNorm (apex FusedLayerNorm lacks RMSNorm)
-        # Activation recomputation: Megatron local-spec attention (no TE flash) keeps
-        # the full O(seq^2) score matrix, so long-sequence training (resp=20480) OOMs
-        # without recompute. Off by default (smoke, short seq); enable via megatron_cfg.
-        recompute_kwargs: dict = {}
-        rc_gran = ec.get("recompute_granularity") or None
-        if rc_gran:
-            recompute_kwargs["recompute_granularity"] = rc_gran
-            recompute_kwargs["recompute_method"] = ec.get("recompute_method") or "uniform"
-            recompute_kwargs["recompute_num_layers"] = int(ec.get("recompute_num_layers") or 1)
-        tfcfg = TransformerConfig(
-            num_layers=hf["num_hidden_layers"], hidden_size=hf["hidden_size"],
-            num_attention_heads=hf["num_attention_heads"],
-            num_query_groups=hf["num_key_value_heads"], kv_channels=head_dim,
-            ffn_hidden_size=hf["intermediate_size"], gated_linear_unit=True,
-            activation_func=F.silu, add_bias_linear=False,
-            add_qkv_bias=bool(hf.get("attention_bias", False)),
-            normalization="RMSNorm", layernorm_epsilon=hf.get("rms_norm_eps", 1e-6),
-            qk_layernorm=True, hidden_dropout=0.0, attention_dropout=0.0,
-            bf16=True, params_dtype=torch.bfloat16, pipeline_dtype=torch.bfloat16,
-            tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp,
-            use_cpu_initialization=True,
-            **recompute_kwargs,
-        )
-        spec = get_gpt_layer_local_spec(qk_layernorm=True)
-        spec.submodules.input_layernorm = WTN
-        spec.submodules.pre_mlp_layernorm = WTN
-        spec.submodules.self_attention.submodules.q_layernorm = WTN
-        spec.submodules.self_attention.submodules.k_layernorm = WTN
-        if self._attention_backend == "flash":
-            # Swap the O(L^2) local core attention for flash-attn (O(L) memory).
-            spec.submodules.self_attention.submodules.core_attention = FlashSelfAttentionCore
-            logger.info("MegatronEngine[%d]: using flash-attention core (O(L) memory)", self._rank())
-
-        model = GPTModel(
-            config=tfcfg, transformer_layer_spec=spec, vocab_size=hf["vocab_size"],
-            max_sequence_length=hf.get("max_position_embeddings", 32768),
-            pre_process=True, post_process=True, position_embedding_type="rope",
-            rotary_base=hf.get("rope_theta", 1000000.0),
-            share_embeddings_and_output_weights=bool(hf.get("tie_word_embeddings", False)),
-        )
-
-        # ---- load HF weights ----
-        logger.info("MegatronEngine[%d]: loading HF weights from %s", self._rank(), self.model_name)
-        hf_state = load_hf_safetensors(self.model_name)
-        meg_state = hf_to_megatron(hf_state, self._dims)
-        del hf_state
-        missing = model.load_state_dict(meg_state, strict=False)
-        real_missing = [k for k in missing.missing_keys if "_extra_state" not in k]
-        if real_missing:
-            raise RuntimeError(f"Megatron load missing keys: {real_missing[:6]} ...")
-        del meg_state
-        self.module = model.cuda().bfloat16()
-        self._tfcfg = tfcfg
-
-        # ---- Megatron DistributedDataParallel: shards optimizer state across DP ----
-        from megatron.core.distributed import DistributedDataParallel as DDP
-        from megatron.core.distributed import DistributedDataParallelConfig
-        from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
-        from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
-
-        oc = self.optimizer_config
-        self._clip = float(oc.get("clip_grad", 1.0))
-        ddp_cfg = DistributedDataParallelConfig(
-            grad_reduce_in_fp32=True,
-            overlap_grad_reduce=False,
-            use_distributed_optimizer=True,
-            average_in_collective=True,
-            bucket_size=None,
-        )
-        self._ddp = DDP(config=tfcfg, ddp_config=ddp_cfg, module=self.module)
-
-        opt_cfg = OptimizerConfig(
-            optimizer="adam", lr=float(oc.get("lr", 1e-6)),
-            weight_decay=float(oc.get("weight_decay", 0.1)),
-            adam_beta1=0.9, adam_beta2=0.95, adam_eps=1e-8,
-            clip_grad=self._clip, bf16=True, fp16=False,
-            params_dtype=torch.bfloat16, use_distributed_optimizer=True,
-        )
-        self.optimizer = get_megatron_optimizer(opt_cfg, model_chunks=[self._ddp])
-
-        warmup = int(oc.get("lr_warmup_steps", 10))
-        base_lr = float(oc.get("lr", 1e-6))
-        wd = float(oc.get("weight_decay", 0.1))
-        self.lr_scheduler = OptimizerParamScheduler(
-            self.optimizer, init_lr=0.0, max_lr=base_lr, min_lr=base_lr,
-            lr_warmup_steps=warmup, lr_decay_steps=max(warmup + 1, 1000),
-            lr_decay_style="constant", start_wd=wd, end_wd=wd,
-            wd_incr_steps=0, wd_incr_style="constant",
-        )
-        if self._rank() == 0:
-            n = sum(p.numel() for p in self.module.parameters() if p.requires_grad)
-            logger.info(
-                "MegatronEngine: model+distributed-optimizer ready, %d params, dp_size=%d",
-                n, self.get_data_parallel_size(),
-            )
 
     # ------------------------------------------------------------------
     def _rank(self) -> int:
@@ -347,9 +123,6 @@ class MegatronEngine(BaseEngine):
             return mpu.get_data_parallel_group()
         except Exception:
             return dist.group.WORLD if dist.is_initialized() else None
-
-    def is_mp_src_rank_with_outputs(self) -> bool:
-        return True
 
     def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True) -> None:
         return
@@ -427,7 +200,7 @@ class MegatronEngine(BaseEngine):
             return 0, 0
         return int(idx[0].item()), int(idx.numel())
 
-    # ---- memory-efficient log-prob helpers (see FlashSelfAttentionCore/#2) ----
+    # ---- memory-efficient log-prob helpers ----
     def _token_logprob_train(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """Per-token log-prob with grad. Uses the fused single-buffer CE (optionally
         chunked over the sequence) when ``log_probs_chunk_size>0``; otherwise the
@@ -696,20 +469,3 @@ class MegatronEngine(BaseEngine):
 
     def lr_scheduler_step(self) -> float:
         return self._cur_lr()
-
-    # ---- weight sync: Megatron -> HF named tensors ----
-    def get_per_tensor_param(self, **kwargs):
-        assert self.module is not None
-        named = [(n, p.detach()) for n, p in self.module.named_parameters()]
-        gen = megatron_to_hf(named, self._dims)
-        return gen, None
-
-
-@EngineRegistry.register(model_type="language_model", backend="megatron")
-class MegatronEngineWithLMHead(MegatronEngine):
-    pass
-
-
-@EngineRegistry.register(model_type="value_model", backend="megatron")
-class MegatronEngineWithValueHead(MegatronEngine):
-    pass

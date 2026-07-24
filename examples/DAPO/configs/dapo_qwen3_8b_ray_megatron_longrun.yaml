@@ -49,14 +49,12 @@ policy:
       recompute_granularity: full
       recompute_method: uniform
       recompute_num_layers: 1
-      # Flash attention (O(L) memory vs local-spec O(L^2)) — the key fix for
-      # resp=20480 (matches vime's --attention-backend flash). Uses flash_attn.
-      attention_backend: flash
+      # TE spec provides fused O(L) attention for resp=20480.
       # Memory-efficient chunked/fused token log-prob (single [chunk,V] softmax
       # buffer instead of full log_softmax + grad). Matches vime --log-probs-chunk-size.
       log_probs_chunk_size: 1024
-      # Dynamic-batch packing: concat sequences into one flash_attn_varlen forward
-      # (cu_seqlens) so short responses keep GEMMs full -> faster train step.
+      # Dynamic-batch packing: concat sequences into one TE packed-sequence forward
+      # so short responses keep GEMMs full -> faster train step.
       # Matches vime --use-dynamic-batch-size --max-tokens-per-gpu.
       enable_dynamic_batch: true
       max_tokens_per_gpu: 21504
@@ -68,7 +66,7 @@ policy:
     vllm_cfg:
       transport: ray_http
       ray_http_start_server: false
-      # With flash attention + chunked log-prob the Megatron training peak is small
+      # With TE fused attention + chunked log-prob the Megatron training peak is small
       # enough to keep the full 0.30 vLLM footprint (matches vime/FSDP longrun).
       gpu_memory_utilization: 0.30
       max_model_len: 21504

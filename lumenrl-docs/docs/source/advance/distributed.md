@@ -4,7 +4,8 @@ LumenRL scales along two axes: **training backend parallelism** (FSDP2 vs Megatr
 
 ## FSDP2 backend
 
-`policy.training_backend: fsdp2` selects the PyTorch FSDP2 integration under `lumenrl/engine/training/fsdp_backend.py`. It is the default for dense models and smaller MoE runs where expert parallel is not required.
+`policy.training_backend: fsdp2` selects the PyTorch FSDP2 integration under
+`lumenrl/engine/training/fsdp_backend.py`. It is the default dense-model backend.
 
 Strengths:
 
@@ -12,27 +13,26 @@ Strengths:
 - Works well for single-node and moderate multi-node jobs
 - Compatible with Lumen FP8 hooks via `FP8TrainingManager`
 
-## Megatron-Core backend
+## Megatron-Native backend
 
-`policy.training_backend: megatron` enables the Megatron path for large sharded models. Configure tensor, pipeline, and expert parallel sizes via `policy.training.megatron_cfg` (`MegatronConfig` in {doc}`/api/config`).
-
-MoE RL recipes typically need Megatron for **MORI-backed expert parallel** and grouped GEMM flags (`moe_grouped_gemm`).
+`policy.training_backend: megatron_native` selects the TransformerEngine-based
+Megatron-Core engine. Configure tensor, pipeline, and context parallel sizes via
+`policy.training.megatron_cfg` (`MegatronConfig` in {doc}`/api/config`).
 
 ## Backend support matrix
 
-| Capability | FSDP2 | Megatron-Core |
+| Capability | FSDP2 | Megatron-Native |
 | --- | --- | --- |
-| Dense FP8 training | Yes | Yes |
-| MoE training | Limited | Yes (EP via MORI) |
+| Dense BF16 training | Yes | Yes |
+| Dense FP8 training | Yes | Not validated |
 | FP8 rollout (ATOM) | Yes | Yes |
-| R3 router replay | Yes | Yes |
-| LoRA / adapters | Yes | Yes |
-| Multi-node | Yes | Yes |
-| Expert parallel | No | Yes |
-| Sequence parallelism | Yes | Yes |
+| FSDP parameter sharding | Yes | No |
+| Tensor / pipeline / context parallelism | No | Yes |
+| Megatron dist-checkpoint | No | Yes |
 
 ```{note}
-If your model requires expert parallel (`expert_parallel_size > 1`), start from a Megatron-based recipe such as `configs/grpo_moe_fp8_r3.yaml` rather than forcing FSDP2.
+The repository currently ships validated dense recipes. Add new expert-parallel
+recipes only after validating them against `megatron_native`.
 ```
 
 ## Multi-node launch
@@ -49,12 +49,8 @@ cluster:
 For SLURM, keep the driver command in a single variable so `sbatch` can reuse it:
 
 ```bash
-NUM_NODES=4
-COMMAND="python examples/run_grpo_moe.py \
-  --config configs/grpo_moe_fp8_r3_multinode.yaml \
-  cluster.num_nodes=$NUM_NODES"
-
-sbatch --nodes=$NUM_NODES --gres=gpu:8 scripts/ray.sub
+bash scripts/launch_slurm.sh 4 configs/grpo_dense_fp8.yaml \
+  policy.model_name=Qwen/Qwen3-8B
 ```
 
 Adapt `scripts/ray.sub` to export `RAY_ADDRESS`, NCCL/MORI environment variables, and conda/module initialization for your site.

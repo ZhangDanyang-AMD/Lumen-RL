@@ -82,7 +82,7 @@ A single `RuntimeAssembler` constructs runtime objects from config + registries,
 
 The assembler must enforce:
 
-- `training_backend in {"fsdp", "megatron"}`
+- `training_backend in {"fsdp", "fsdp2"}`
 - `inference_backend == "atom"`
 
 Violations fail at startup with clear error messages.
@@ -143,7 +143,8 @@ Initial bindings keep behavior unchanged:
 - Ref role -> `RefPolicyWorker`
 - Hybrid topology -> `HybridWorker`
 - Training backend `fsdp` -> existing `FSDP2Backend` wrapper path
-- Training backend `megatron` -> existing `MegatronBackend` wrapper path
+- `megatron_native` is selected by policy workers through `EngineRegistry`;
+  the unused assembler-level Megatron binding has been removed
 - Inference backend `atom` -> existing `AtomEngine` path
 
 ## Error Handling and Observability
