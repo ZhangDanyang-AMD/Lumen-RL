@@ -194,6 +194,13 @@ class LumenActorWorker(BaseWorker):
                 "moe_router_bias_update_rate": meg_cfg.get("moe_router_bias_update_rate", None),
                 "moe_token_dispatcher_type": meg_cfg.get("moe_token_dispatcher_type", "alltoall"),
                 "moe_permute_fusion": meg_cfg.get("moe_permute_fusion", False),
+                # R3 routing replay: record router logits during the old-logprob
+                # forward and replay them during the update so the importance ratio
+                # is not polluted by router drift (opt-in via moe.r3.enabled).
+                "r3_enabled": bool(
+                    get_nested_config(self.config, "moe", "r3", "enabled", default=False)
+                    or meg_cfg.get("r3_enabled", False)
+                ),
                 "param_offload": meg_cfg.get("param_offload", False),
                 "optimizer_offload": meg_cfg.get("optimizer_offload", False),
                 "grad_offload": meg_cfg.get("grad_offload", False),

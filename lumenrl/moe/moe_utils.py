@@ -65,18 +65,23 @@ def iter_megatron_routers(model: nn.Module) -> Iterator[tuple[int, nn.Module]]:
 
 
 @contextmanager
-def megatron_record_router_logits(model: nn.Module, store: dict[int, Tensor]):
+def megatron_record_router_logits(model: nn.Module, store: dict[int, list[Tensor]]):
     """Record each Megatron MoE layer's router logits into ``store`` (by layer idx).
 
     Wraps every router's ``routing(logits, ...)`` so the pre-routing gating logits
-    are captured (detached) as they flow through the forward. Works under EP/CP/TP
-    (each rank records its LOCAL token logits). Restores the methods on exit.
+    are captured (detached) as they flow through the forward. ``store[layer]`` is a
+    LIST that grows by one entry per routing call, i.e. one per microbatch in call
+    order -- this keeps multi-microbatch (dynamic-batch / pipeline) forwards aligned
+    for replay. Works under EP/CP/TP (each rank records its LOCAL token logits).
+    Restores the methods on exit.
     """
     saved: list[tuple[nn.Module, Any]] = []
 
     def make_wrap(layer_idx: int, orig):
         def wrapped(logits, *args, **kwargs):
-            store[layer_idx] = logits.detach()
+            # store on CPU: over many microbatches x layers the fp32 router logits
+            # (~[tokens, num_experts]) can add up to GBs; keep them off the GPU.
+            store.setdefault(layer_idx, []).append(logits.detach().to("cpu"))
             return orig(logits, *args, **kwargs)
         return wrapped
 
@@ -94,25 +99,33 @@ def megatron_record_router_logits(model: nn.Module, store: dict[int, Tensor]):
 
 
 @contextmanager
-def megatron_replay_router_logits(model: nn.Module, recorded: dict[int, Tensor]):
+def megatron_replay_router_logits(model: nn.Module, recorded: dict[int, list[Tensor]]):
     """Replay recorded router logits into each Megatron MoE layer's ``routing``.
 
-    Substitutes the passed ``logits`` with ``recorded[layer_idx]`` (shape/dtype/
-    device matched) so training reuses the recorded routing decisions. Restores
-    the methods on exit. Requires the current forward's per-rank token layout to
-    match the recording forward (same microbatch construction)."""
+    Substitutes the passed ``logits`` with the next ``recorded[layer_idx]`` entry
+    (consumed in call order, matching the recording forward's microbatch order) so
+    training reuses the recorded routing decisions. Falls back to the natural
+    logits (with a one-time warning) when the recording is missing/exhausted or the
+    shape does not match. Restores the methods on exit.
+    """
     saved: list[tuple[nn.Module, Any]] = []
+    call_idx: dict[int, int] = {}
+    warned: dict[int, bool] = {}
 
     def make_wrap(layer_idx: int, orig):
         def wrapped(logits, *args, **kwargs):
-            rec = recorded.get(layer_idx)
-            if rec is not None and rec.numel() == logits.numel():
-                logits = rec.to(device=logits.device, dtype=logits.dtype).reshape(logits.shape)
-            elif rec is not None:
+            seq = recorded.get(layer_idx)
+            i = call_idx.get(layer_idx, 0)
+            if seq is not None and i < len(seq) and seq[i].numel() == logits.numel():
+                logits = seq[i].to(device=logits.device, dtype=logits.dtype).reshape(logits.shape)
+            elif not warned.get(layer_idx):
                 logger.warning(
-                    "megatron_replay_router_logits: layer %d shape mismatch rec=%s cur=%s; using current.",
-                    layer_idx, tuple(rec.shape), tuple(logits.shape),
+                    "megatron_replay_router_logits: layer %d no aligned recording "
+                    "(have=%s call=%d); using natural routing.",
+                    layer_idx, (len(seq) if seq is not None else None), i,
                 )
+                warned[layer_idx] = True
+            call_idx[layer_idx] = i + 1
             return orig(logits, *args, **kwargs)
         return wrapped
 

@@ -147,6 +147,10 @@ class MegatronNativeEngine(MegatronBaseEngine):
         num_experts = int(cfg_num_experts or hf_num_experts or 0)
         self._is_moe = num_experts > 1
         self._num_experts = num_experts
+        # R3 routing replay (opt-in): record router logits in the old-logprob
+        # forward, replay in the update. Only meaningful for MoE.
+        self._r3_enabled = bool(ec.get("r3_enabled", False)) and self._is_moe
+        self._r3_store: dict[int, list] = {}
 
         # Megatron hard-requires sequence parallelism when MoE and TP are both on
         # (the MoE token dispatcher assumes SP-scattered activations under TP).
@@ -1028,10 +1032,19 @@ class MegatronNativeEngine(MegatronBaseEngine):
             return out, loss_func
 
         fwd_bwd = get_forward_backward_func()
-        losses = fwd_bwd(
-            forward_step_func=forward_step, data_iterator=[data_iter], model=[self._ddp],
-            num_microbatches=num_mb, seq_length=1, micro_batch_size=1, forward_only=False,
-        )
+        # R3: replay the router logits recorded during the old-logprob forward so
+        # the importance ratio reflects only weight changes, not router drift.
+        from contextlib import nullcontext
+        if self._r3_enabled and self._r3_store:
+            from lumenrl.moe.moe_utils import megatron_replay_router_logits
+            r3_ctx = megatron_replay_router_logits(self.module, self._r3_store)
+        else:
+            r3_ctx = nullcontext()
+        with r3_ctx:
+            losses = fwd_bwd(
+                forward_step_func=forward_step, data_iterator=[data_iter], model=[self._ddp],
+                num_microbatches=num_mb, seq_length=1, micro_batch_size=1, forward_only=False,
+            )
 
         update_successful, grad_norm, _ = self.optimizer.step()
         if not update_successful:
@@ -1117,7 +1130,16 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 return out, collect
 
             fwd_bwd = get_forward_backward_func()
-            with torch.no_grad():
+            # R3: record this (old-logprob) forward's router logits so the update
+            # can replay the identical routing. Reset the per-step store first.
+            from contextlib import nullcontext
+            if self._r3_enabled:
+                from lumenrl.moe.moe_utils import megatron_record_router_logits
+                self._r3_store = {}
+                r3_ctx = megatron_record_router_logits(self.module, self._r3_store)
+            else:
+                r3_ctx = nullcontext()
+            with torch.no_grad(), r3_ctx:
                 data_store = fwd_bwd(
                     forward_step_func=forward_step, data_iterator=[data_iter], model=[self.module],
                     num_microbatches=num_mb, seq_length=1, micro_batch_size=1,

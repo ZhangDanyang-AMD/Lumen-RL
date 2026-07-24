@@ -1,0 +1,162 @@
+# FORMAL LONG RUN (Qwen3-30B-A3B-Base MoE, DAPO math) — FULL-parallelism "E".
+# Exercises EVERY parallel dimension on 8 GPUs plus R3 routing replay:
+#   TP=2, PP=2, CP=2, EP=2, ETP=2  ->  DP=1 (single data-parallel group)
+#   sequence_parallel auto-enabled by the engine (MoE + TP requirement),
+#   64 experts/rank (each ETP=2 sharded), 24 layers/pipeline-stage.
+#   moe.r3.enabled=true -> record router logits in the old-logprob forward and
+#   replay them in the update (validated under this exact topology).
+#
+# Same DAPO hyperparams/scale as the 8B dense megatron longrun (steps=1000,
+# train_batch=512, gen_batch=96, max_prompt=1024, max_response=20480,
+# ppo_max_token/gpu=21504, lr=1e-6/warmup10/wd0.1, clip 0.2/0.28/10, grpo,
+# token-mean, rollout_is token/2.0). NOTE: DP=1 makes rollout the wall-clock
+# bottleneck -> this run is the slowest topology; it maximizes parallel-dim
+# coverage and minimizes per-rank memory, not throughput.
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    actor:
+      num_workers: 8
+      dispatch_mode: dp_compute_proto
+
+policy:
+  model_name: "${oc.env:DATA_ROOT}/models/Qwen3-30B-A3B-Base"
+  training_backend: megatron_native
+  generation_backend: vllm
+  max_total_sequence_length: 21504
+  max_response_length: 20480
+  train_global_batch_size: 512
+  gen_batch_size: 96
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 21504
+  learning_rate: 1.0e-6
+  lr_warmup_steps: 10
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  training:
+    optimizer_dtype: bf16
+    megatron_cfg:
+      use_distributed_optimizer: true
+      # ---- FULL parallelism: TP2 x PP2 x CP2 x EP2 x ETP2 (DP=1) ----
+      tensor_model_parallel_size: 2
+      pipeline_model_parallel_size: 2
+      context_parallel_size: 2
+      expert_model_parallel_size: 2
+      expert_tensor_parallel_size: 2
+      # sequence_parallel is auto-forced on (MoE + TP); packed thd is padded to a
+      # multiple of TP for the SP sequence split.
+      moe_grouped_gemm: true
+      moe_aux_loss_coeff: 0.0
+      moe_router_dtype: fp32
+      recompute_granularity: full
+      recompute_method: uniform
+      recompute_num_layers: 1
+      log_probs_chunk_size: 1024
+      enable_dynamic_batch: true
+      max_tokens_per_gpu: 21504
+    fsdp_cfg:
+      param_offload: false
+      optimizer_offload: false
+      reshard_after_forward: true
+  generation:
+    vllm_cfg:
+      transport: ray_http
+      ray_http_start_server: false
+      gpu_memory_utilization: 0.30
+      max_model_len: 21504
+      dtype: bfloat16
+      enforce_eager: true
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 32768
+      max_num_seqs: 64
+      quantization: ""
+      calculate_log_probs: true
+      enable_sleep_mode: false
+      sleep_level: 2
+      update_weights_bucket_megabytes: 512
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+
+# R3 routing replay: DISABLED. In the real DAPO flow the old-logprob
+# (compute_log_probs) and the update (update_policy) build DIFFERENT dynamic-batch
+# microbatches, so cross-call replay misaligns and corrupts routing (ppo_kl blew
+# up to ~0.9). rollout/train mismatch is already ~0.002 without R3, so it stays
+# off here. The record/replay building blocks remain validated for aligned use.
+moe:
+  r3:
+    enabled: false
+    record_router_logits: true
+    replay_mode: distribution
+
+algorithm:
+  name: dapo
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  loss_agg_mode: token-mean
+  dapo:
+    num_generations: 16
+    kl_coeff: 0.0
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 10.0
+    dynamic_sampling: true
+    token_level_pg: true
+    overlong_reward_shaping: true
+    max_resp_len: 20480
+    filter_groups:
+      enable: true
+      metric: acc
+      max_num_gen_batches: 10
+    overlong_buffer:
+      enable: true
+      len: 512
+      penalty_factor: 1.0
+      log: false
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+    rollout_is_batch_normalize: false
+
+reward:
+  type: function
+  function: lumenrl.rewards.math_reward.dapo_math_reward
+  dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet"
+  shuffle: true
+  shuffle_seed: 10086
+
+val_dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/aime-2024.filtered.parquet"
+val_steps: 10
+val_batch_size: 0
+eval:
+  enabled: false
+  num_samples: 0
+
+checkpointing:
+  checkpoint_dir: "${oc.env:DATA_ROOT}/ckpts/lumenrl-dapo/longrun-megatron-moe-a3b-e-full"
+  save_steps: 50
+  save_total_limit: 5
+  resume: true
+
+logger:
+  wandb_enabled: true
+  log_interval: 1
+  wandb:
+    project: LumenRL
+    name: longrun-ray-megatron-moe-a3b-e-full-tp2pp2cp2ep2etp2-r3
+
+num_training_steps: 1000
+seed: 10086
