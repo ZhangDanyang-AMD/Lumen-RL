@@ -1,0 +1,89 @@
+{
+  "checkpoint": "checkpoint_15800",
+  "step": 15800,
+  "draft_length": 3,
+  "results": {
+    "coding": {
+      "accept_length": 2.05,
+      "acceptance_rate": 34.9,
+      "num_drafts": 8508,
+      "num_accepted": 8902,
+      "total_output_tokens": 17408,
+      "throughput_tps": 343.0,
+      "latency_s": 50.7
+    },
+    "extraction": {
+      "accept_length": 1.83,
+      "acceptance_rate": 27.7,
+      "num_drafts": 2016,
+      "num_accepted": 1677,
+      "total_output_tokens": 3688,
+      "throughput_tps": 293.0,
+      "latency_s": 12.6
+    },
+    "humanities": {
+      "accept_length": 1.78,
+      "acceptance_rate": 25.9,
+      "num_drafts": 9598,
+      "num_accepted": 7457,
+      "total_output_tokens": 17055,
+      "throughput_tps": 298.4,
+      "latency_s": 57.1
+    },
+    "math": {
+      "accept_length": 2.21,
+      "acceptance_rate": 40.4,
+      "num_drafts": 1591,
+      "num_accepted": 1926,
+      "total_output_tokens": 3506,
+      "throughput_tps": 367.8,
+      "latency_s": 9.5
+    },
+    "reasoning": {
+      "accept_length": 1.79,
+      "acceptance_rate": 26.4,
+      "num_drafts": 3383,
+      "num_accepted": 2683,
+      "total_output_tokens": 6069,
+      "throughput_tps": 300.5,
+      "latency_s": 20.2
+    },
+    "roleplay": {
+      "accept_length": 1.8,
+      "acceptance_rate": 26.8,
+      "num_drafts": 4686,
+      "num_accepted": 3768,
+      "total_output_tokens": 8453,
+      "throughput_tps": 302.8,
+      "latency_s": 27.9
+    },
+    "stem": {
+      "accept_length": 1.9,
+      "acceptance_rate": 29.9,
+      "num_drafts": 8947,
+      "num_accepted": 8019,
+      "total_output_tokens": 16968,
+      "throughput_tps": 318.1,
+      "latency_s": 53.3
+    },
+    "writing": {
+      "accept_length": 1.74,
+      "acceptance_rate": 24.6,
+      "num_drafts": 3725,
+      "num_accepted": 2754,
+      "total_output_tokens": 6478,
+      "throughput_tps": 293.2,
+      "latency_s": 22.1
+    }
+  },
+  "nvidia_ref": {
+    "writing": 2.24,
+    "roleplay": 2.25,
+    "reasoning": 2.47,
+    "math": 2.83,
+    "coding": 2.51,
+    "extraction": 2.53,
+    "stem": 2.17,
+    "humanities": 1.95
+  }
+}

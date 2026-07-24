@@ -1,0 +1,119 @@
+# GPT-OSS-120B Eagle3 SDDD — Phase 2: Long Context
+#
+# Continues from Phase 1 checkpoint with long-context prompts (>4096 tokens).
+# Aligned with NVIDIA Eagle3-v3 two-phase approach.
+#
+# Key differences from Phase 1:
+#   - max_total_sequence_length: 8192 (was 4096)
+#   - generate_max_tokens: 8192 (was 4096)
+#   - Dataset: phase2_long.jsonl (~200K long prompts)
+#   - Resumes from Phase 1 final checkpoint (draft.from_scratch: false)
+#   - Shorter training: ~6250 steps (200K / 32)
+#   - Lower warmup: 200 steps (shorter training)
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1
+
+policy:
+  model_name: /dev/shm/gpt-oss-120b
+  training_backend: fsdp2
+  generation_backend: hf
+  max_total_sequence_length: 8192
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  learning_rate: 1e-4
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  # warmup_steps=200 for shorter Phase 2. 200/6250 ≈ 0.032
+  warmup_ratio: 0.032
+  lr_decay_style: linear
+
+algorithm:
+  name: spec_distill
+  spec_distill:
+    draft_type: eagle3
+    loss_type: forward_kl
+    position_decay: 0.9
+    num_target_layers: 1
+    spec_length: 3
+    aux_hidden_state_layer_ids: [2, 18, 33, 36]
+    separate_last_hidden: true
+    shift_input_embeds: true
+  teacher:
+    model_name: /dev/shm/gpt-oss-120b
+    inference_backend: vllm
+    tensor_parallel_size: 4
+    gpu_ids: [4, 5, 6, 7]
+    quantization: ""
+    generate_mode: generate
+    generate_max_tokens: 8192
+    generate_temperature: 0.0
+  draft:
+    from_scratch: false
+    resume_from: /dev/shm/checkpoints/gpt_oss_120b_eagle3_v3_phase1
+    num_layers: 1
+    num_heads: 64
+    num_kv_heads: 8
+    head_dim: 64
+    ffn_dim: 17280
+    rms_norm_eps: 1.0e-5
+    rope_theta: 500000.0
+    rope_scaling_type: llama3
+    rope_scaling_factor: 8.0
+    rope_original_max_pos: 8192
+    rope_low_freq_factor: 1.0
+    rope_high_freq_factor: 4.0
+    use_aux_hidden_state: true
+    use_input_layernorm_in_first_layer: true
+    use_last_layernorm: true
+    use_mtp_layernorm: false
+    attention_bias: false
+    mlp_bias: false
+    dtype: bfloat16
+
+mooncake:
+  protocol: tcp
+  device_name: ""
+  global_segment_size: 16GB
+  local_buffer_size: 4GB
+
+quantization:
+  training:
+    fp8: null
+  rollout_correction:
+    enabled: false
+
+dataset:
+  chat_template: hf-generation
+  last_turn_loss_only: false
+  min_loss_tokens: -1
+  num_preprocess_workers: 16
+  cache_dir: /dev/shm/lumenrl_cache
+
+reward:
+  type: function
+  function: math_reward
+  dataset: /dev/shm/gpt_oss_120b_dataset_v3/phase2_long.jsonl
+  dataset_split: train
+
+eval:
+  enabled: false
+  interval: 1000
+  num_samples: 256
+  micro_batch_size: 8
+
+checkpointing:
+  checkpoint_dir: /dev/shm/checkpoints/gpt_oss_120b_eagle3_v3_phase2
+  save_steps: 200
+  save_total_limit: 3
+  resume: true
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+# ~200K prompts / global_bs=32 ≈ 6,250 steps.
+# Actual step count depends on Phase 2 dataset size.
+num_training_steps: 6250
+seed: 42

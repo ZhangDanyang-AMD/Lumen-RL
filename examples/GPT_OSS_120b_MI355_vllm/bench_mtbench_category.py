@@ -161,7 +161,7 @@ def main():
     # Summary table
     print()
     print(f"{'='*70}")
-    print(f"  MT-Bench Results by Category (checkpoint_5500, step 5500)")
+    print(f"  MT-Bench Results by Category (checkpoint_15800, step 15800)")
     print(f"{'='*70}")
     print(f"{'Category':<20} {'Accept Length':>14} {'NVIDIA Ref':>12} {'Gap':>8}")
     print(f"{'-'*70}")
@@ -193,7 +193,7 @@ def main():
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     result_file = os.path.join(args.output_dir, f"mtbench_category_{timestamp}.json")
     with open(result_file, "w") as f:
-        json.dump({"checkpoint": "checkpoint_5500", "step": 5500,
+        json.dump({"checkpoint": "checkpoint_15800", "step": 15800,
                     "draft_length": 3, "results": results,
                     "nvidia_ref": nvidia_ref}, f, indent=2)
     print(f"\nResults saved to {result_file}")
