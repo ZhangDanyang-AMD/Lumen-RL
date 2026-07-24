@@ -9,8 +9,8 @@
 #   max_num_batched_tokens=32768.
 #
 # Delta vs FSDP long run:
-#   - policy.training_backend: fsdp2 -> megatron  (MegatronEngine, TP1/PP1/CP1/DP8,
-#     use_distributed_optimizer=True forced by engine; FP32 master + Adam sharded to DP)
+#   - policy.training_backend: fsdp2 -> megatron_native (MegatronNativeEngine TE spec;
+#     TP/PP/CP default to 1 unless launch overrides them; distributed FP32 master + Adam)
 #   - vllm enable_sleep_mode: false（ROCm 7.2.3 cumem sleep broken；保持常驻）
 
 cluster:
@@ -27,7 +27,7 @@ controller:
 
 policy:
   model_name: "${oc.env:DATA_ROOT}/models/Qwen3-8B-Base"
-  training_backend: megatron
+  training_backend: megatron_native
   generation_backend: vllm
   max_total_sequence_length: 21504      # 1024 prompt + 20480 response
   max_response_length: 20480

@@ -13,7 +13,7 @@ controller:
       dispatch_mode: dp_compute_proto
 
 policy:
-  model_name: /home/shengnxu/xysheng/data/models/Qwen3-8B-Base
+  model_name: "${oc.env:DATA_ROOT}/models/Qwen3-8B-Base"
   training_backend: fsdp2
   generation_backend: atom
   max_total_sequence_length: 5120
@@ -99,7 +99,7 @@ quantization:
 reward:
   type: function
   function: lumenrl.rewards.math_reward.dapo_math_reward
-  dataset: /home/shengnxu/xysheng/data/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet
+  dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet"
   shuffle: true
   shuffle_seed: 10086
 

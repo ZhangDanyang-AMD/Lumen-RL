@@ -1,8 +1,8 @@
 # verl-aligned online rollout SMOKE: Ray driver + colocated vLLM replicas.
 #
 # Exercises the full verl-aligned stack inside LumenRL's Ray controller path:
-#   - training on 8 Ray actors with cross-actor torch.distributed rendezvous +
-#     FSDP2 sharding + grad sync (verl RayWorkerGroup style)
+#   - training on 8 Ray actors with Megatron-Native TE spec, distributed
+#     optimizer, pipeline schedule, and dist-checkpoint support
 #   - 8 colocated vLLM AsyncLLM rollout replicas (TP=1, one per training GPU)
 #   - ZMQ CUDA-IPC bucketed weight sync (BucketedWeightSender/Receiver)
 #   - cumem / ROCm KV-only sleep-wake between rollout and training
@@ -25,7 +25,7 @@ controller:
 
 policy:
   model_name: "${oc.env:DATA_ROOT}/models/Qwen3-8B-Base"
-  training_backend: megatron
+  training_backend: megatron_native
   generation_backend: vllm
   max_total_sequence_length: 2048
   max_response_length: 512
