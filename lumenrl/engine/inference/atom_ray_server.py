@@ -434,6 +434,7 @@ class ATOMReplicaManager:
                 env_vars["LUMENRL_ATOM_TRUE_VOCAB_SIZE"] = str(true_vocab_size)
             for key in (
                 "ATOM_ISOLATE_TORCH_COMPILE_CACHE",
+                "ATOM_LOG_LEVEL",
                 "ATOM_USE_TORCH_RMSNORM",
                 "VERL_ATOM_AGENT_LOG",
                 "VERL_MEMORY_AGENT_LOG",

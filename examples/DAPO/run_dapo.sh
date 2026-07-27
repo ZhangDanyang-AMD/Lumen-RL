@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 统一 DAPO 启动：MODE=bf16|fp8|atomfp8, TRAIN_FP8=0|1, STEPS=N。路径取容器内 $RL_ROOT/$DATA_ROOT。
+# 统一 DAPO 启动：MODE=bf16|fp8|atomfp8|atombf16, TRAIN_FP8=0|1, STEPS=N。路径取容器内 $RL_ROOT/$DATA_ROOT。
 set -uo pipefail
 : "${RL_ROOT:?}"; : "${DATA_ROOT:?}"
 MODE="${MODE:-bf16}"; TRAIN_FP8="${TRAIN_FP8:-0}"; STEPS="${STEPS:-1000}"
@@ -48,13 +48,17 @@ for _wandb_key in "$RL_ROOT/wandb.key" "$RL_ROOT/../wandb.key"; do
 done
 
 EXTRA_ARGS=()
-if [ "$MODE" = "atomfp8" ] || [ "$MODE" = "atom_fp8" ]; then
-  if [ "${ATOM_DEBUG:-0}" = "1" ]; then
+if [ "$MODE" = "atomfp8" ] || [ "$MODE" = "atom_fp8" ] || \
+   [ "$MODE" = "atombf16" ] || [ "$MODE" = "atom_bf16" ]; then
+  ATOM_BF16=0
+  if [ "$MODE" = "atombf16" ] || [ "$MODE" = "atom_bf16" ]; then
+    ATOM_BF16=1
+    CONFIG=examples/DAPO/configs/dapo_qwen3_8b_ray_atom_bf16_longrun.yaml
+  elif [ "${ATOM_DEBUG:-0}" = "1" ]; then
     CONFIG=examples/DAPO/configs/dapo_qwen3_8b_ray_atom_fp8_debug.yaml
   else
     CONFIG=examples/DAPO/configs/dapo_qwen3_8b_ray_atom_fp8_longrun.yaml
   fi
-  ATOM_ONLINE_QUANT="${ATOM_ONLINE_QUANT:-per_block_fp8}"
   unset ATOM_DISABLE_VLLM_PLUGIN
   export LUMENRL_ATOM_AITER_SRC="${LUMENRL_ATOM_AITER_SRC:-$AITER_DIR}"
   export PYTHONPATH="$RL_ROOT/Lumen-RL/examples/DAPO/atom_aiter_shim:$RL_ROOT/Lumen-RL:$AITER_DIR:$LUMEN_DIR:$ATOM_DIR:$USER_PYTHONPATH"
@@ -67,8 +71,19 @@ if [ "$MODE" = "atomfp8" ] || [ "$MODE" = "atom_fp8" ]; then
   # blockwise2d linear + norm, no HF attention patch and no rollout-specific
   # early-return path. Rollout is ATOM; actor training stays on the vLLM fp8 path.
   unset LUMEN_ROLLOUT
-  export LUMEN_DISABLE_HF_ATTN_PATCH=1 LUMEN_NORM=1
-  if [ "$TRAIN_FP8" = "1" ]; then
+  export LUMEN_DISABLE_HF_ATTN_PATCH=1
+  if [ "$ATOM_BF16" = "1" ]; then
+    # Pure BF16 baseline: keep both actor and ATOM rollout unquantized. Avoid
+    # importing the Lumen/AITER norm patch in actor initialization; the HF
+    # Qwen3 RMSNorm is already model-sensitive and this keeps BF16 comparable
+    # with MODE=bf16 while retaining the ATOM rollout backend.
+    unset LUMEN_NORM LUMEN_FP8 FP8_PARAM_MANAGER LUMEN_FP8_SCALING
+    unset LUMEN_FP8_FORMAT LUMEN_FP8_BLOCK_SIZE LUMEN_FP8_ATTN
+    unset LUMEN_FP8_QUANT_TYPE LUMEN_ATTN_BACKEND LUMEN_FP8_WGRAD
+  else
+    export LUMEN_NORM=1
+  fi
+  if [ "$ATOM_BF16" = "0" ] && [ "$TRAIN_FP8" = "1" ]; then
     export LUMEN_FP8=1 FP8_PARAM_MANAGER=0
     export LUMEN_FP8_SCALING=blockwise2d LUMEN_FP8_FORMAT=fp8_e4m3 LUMEN_FP8_BLOCK_SIZE=128
     export LUMEN_FP8_ATTN=none LUMEN_FP8_QUANT_TYPE=blockwise LUMEN_ATTN_BACKEND=auto
@@ -77,13 +92,18 @@ if [ "$MODE" = "atomfp8" ] || [ "$MODE" = "atom_fp8" ]; then
   # no-eager level=3 正式方案：enforce_eager=false + compilation_config.level=3 + sleep2
   # （sleep_mode 训练前释放 rollout KV/weights/CUDA graph，避免 backward OOM）。
   EXTRA_ARGS+=(
-    policy.generation.atom_cfg.online_quant_config.global_quant_config="$ATOM_ONLINE_QUANT"
     policy.generation.vllm_cfg.enforce_eager=false
     policy.generation.atom_cfg.engine_kwargs.enforce_eager=false
     policy.generation.atom_cfg.engine_kwargs.compilation_config.level=3
     policy.generation.vllm_cfg.enable_sleep_mode=true
     policy.generation.vllm_cfg.sleep_level=2
   )
+  if [ "$ATOM_BF16" = "0" ]; then
+    ATOM_ONLINE_QUANT="${ATOM_ONLINE_QUANT:-per_block_fp8}"
+    EXTRA_ARGS+=(
+      policy.generation.atom_cfg.online_quant_config.global_quant_config="$ATOM_ONLINE_QUANT"
+    )
+  fi
 elif [ "$MODE" = "fp8" ]; then
   CONFIG=examples/DAPO/configs/dapo_qwen3_8b_ray_vllm_fp8_longrun.yaml
   # rollout per_block_fp8 + AITER unified attention
