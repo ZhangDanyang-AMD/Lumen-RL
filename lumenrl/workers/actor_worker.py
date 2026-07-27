@@ -287,17 +287,35 @@ class LumenActorWorker(BaseWorker):
         # (logits.div_(temperature)); apply the same so old/train/ref stay unbiased.
         temperature = float(batch.meta.get("temperature", 1.0) or 1.0)
 
-        # Pack ONE sequence per forward: dropping the left-pad and running plain
-        # causal attention on a single segment is correct regardless of whether
-        # the varlen (packing) attention patch is installed. Packing multiple
-        # sequences here would require that patch for cross-sequence isolation
-        # (which is disabled under LUMEN_DISABLE_HF_ATTN_PATCH=1 / pure SDPA).
+        # Pack as many sequences per forward as the token budget allows. This
+        # relies on the varlen packing attention wrapper for cross-sequence
+        # isolation, which is now installed unconditionally (see
+        # fsdp_backend._install_packing_attention); one row per forward was the
+        # fallback for when that wrapper was missing.
         import torch.distributed as dist
 
-        n_rows = B
+        max_tok = self._max_token_len_per_gpu()
+        row_lens = am.sum(dim=1).long().tolist()
+        chunks: list[tuple[int, int]] = []
+        if max_tok > 0:
+            start = 0
+            while start < B:
+                tok, end = 0, start
+                while end < B:
+                    sl = int(row_lens[end])
+                    if tok + sl > max_tok and end > start:
+                        break
+                    tok += sl
+                    end += 1
+                chunks.append((start, end))
+                start = end
+        else:
+            chunks = [(r, r + 1) for r in range(B)]
+
+        n_rows = len(chunks)
         if dist.is_initialized() and dist.get_world_size() > 1:
             # FSDP2 all-gathers per forward must run in lockstep across ranks;
-            # equalize the number of forwards (pad with a dummy last row).
+            # equalize the number of forwards (pad by repeating the last chunk).
             cnt = torch.tensor([n_rows], device=self._device)
             dist.all_reduce(cnt, op=dist.ReduceOp.MAX)
             n_iters = int(cnt.item())
@@ -311,9 +329,9 @@ class LumenActorWorker(BaseWorker):
         with self._engine.eval_mode():
             with torch.no_grad():
                 for i in range(n_iters):
-                    row = min(i, B - 1)  # dummy rows reuse the last real row
-                    ids_row = sequences[row:row + 1]
-                    mask_row = am[row:row + 1]
+                    lo, hi = chunks[min(i, n_rows - 1)]  # padding reuses the last chunk
+                    ids_row = sequences[lo:hi]
+                    mask_row = am[lo:hi]
                     packed = pack_sequences(ids_row, mask_row)
                     with PackingContext(packed.cu_seqlens, packed.max_seqlen):
                         outputs = module(
@@ -466,6 +484,14 @@ class LumenActorWorker(BaseWorker):
         self._log.debug("train_step loss=%f (algo=%s)", metrics.get("loss", 0.0), algo_name)
         return metrics
 
+    def _max_token_len_per_gpu(self) -> int:
+        """Per-micro-batch token budget for the packed forward (0 if unset)."""
+        policy = get_nested_config(self.config, "policy", default={}) or {}
+        try:
+            return int(policy.get("max_token_len_per_gpu", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
     def update_policy(self, batch: DataProto) -> dict[str, float]:
         """verl-aligned worker-side PPO update over this actor's DP shard.
 
@@ -496,8 +522,14 @@ class LumenActorWorker(BaseWorker):
         # inflating entropy ~7x.
         data["use_packed_forward"] = True
         data["temperature"] = float(batch.meta.get("temperature", 1.0) or 1.0)
-        # 1 sequence per micro (memory); grads accumulate across micros.
-        data["micro_batch_size"] = 1
+        # Pack micros to the same token budget verl uses for
+        # ppo_max_token_len_per_gpu. Falls back to one row per micro only if the
+        # budget is unset.
+        max_tok = self._max_token_len_per_gpu()
+        if max_tok > 0:
+            data["max_token_len_per_gpu"] = max_tok
+        else:
+            data["micro_batch_size"] = 1
         self._pol_meta = dict(batch.meta)
         if not getattr(self, "_logged_norm", False):
             self._logged_norm = True

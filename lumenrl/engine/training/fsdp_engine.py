@@ -38,10 +38,7 @@ from lumenrl.core.config import (
     OptimizerConfig,
 )
 from lumenrl.engine.training.base_engine import BaseEngine, BaseEngineCtx, EngineRegistry
-from lumenrl.engine.training.fsdp_backend import (
-    FSDP2Backend,
-    set_requires_gradient_sync,
-)
+from lumenrl.engine.training.fsdp_backend import FSDP2Backend
 from lumenrl.utils.fsdp_utils import (
     fsdp2_clip_grad_norm_,
     load_fsdp_model_to_gpu,
@@ -248,10 +245,13 @@ class FSDP2Engine(BaseEngine):
         output_lst: list[dict] = []
         ctx = torch.no_grad() if forward_only else nullcontext()
 
-        for i, mb in enumerate(micro_batches):
-            if not forward_only and len(micro_batches) > 1 and self.module is not None:
-                is_last = i == len(micro_batches) - 1
-                set_requires_gradient_sync(self.module, is_last)
+        # Gradient sync stays on for every micro-batch. Disabling it (the classic
+        # no_sync accumulation pattern) makes FSDP2 skip the reduce-scatter and
+        # hold the FULL UNSHARDED gradient until the last micro-batch: ~30 GB for
+        # an 8B model, measured as the dominant term in this actor's peak. Syncing
+        # per micro-batch keeps gradients sharded (~3.7 GB at DP=8) and is
+        # mathematically identical, since averaging across ranks is linear.
+        for mb in micro_batches:
 
             if use_packing:
                 from lumenrl.engine.training.packing import (
@@ -412,18 +412,72 @@ class FSDP2Engine(BaseEngine):
         return result
 
     def _prepare_micro_batches(self, data: dict[str, Any]) -> list[dict[str, Any]]:
-        """Split *data* into micro-batches according to ``micro_batch_size`` or ``max_token_len_per_gpu``."""
+        """Split *data* into micro-batches by token budget, else by row count.
+
+        ``max_token_len_per_gpu`` packs as many sequences as fit the budget,
+        matching verl's ``use_dynamic_bsz`` + ``ppo_max_token_len_per_gpu``. Row
+        splitting (``micro_batch_size``) is the fallback; one row per micro-batch
+        leaves the GPU far below saturation and multiplies the FSDP2 all-gather
+        cycles by the row count.
+        """
+        max_token_len = data.get("max_token_len_per_gpu")
         micro_batch_size = data.get("micro_batch_size")
-        if micro_batch_size is not None and micro_batch_size > 0:
-            input_ids = data["input_ids"]
-            total = input_ids.shape[0]
-            batches = []
-            for start in range(0, total, micro_batch_size):
-                end = min(start + micro_batch_size, total)
-                mb = {k: v[start:end] if isinstance(v, torch.Tensor) else v for k, v in data.items()}
-                batches.append(mb)
-            return batches
-        return [data]
+        input_ids = data.get("input_ids")
+        if input_ids is None:
+            return [data]
+
+        def slice_rows(start: int, end: int) -> dict[str, Any]:
+            return {k: v[start:end] if isinstance(v, torch.Tensor) else v for k, v in data.items()}
+
+        bounds: list[tuple[int, int]] = []
+        total = input_ids.shape[0]
+        if max_token_len is not None and max_token_len > 0:
+            am = data.get("attention_mask")
+            seq_lens = (
+                am.sum(dim=1).long().tolist()
+                if am is not None
+                else [int(input_ids.shape[1])] * total
+            )
+            start = 0
+            while start < total:
+                tok, end = 0, start
+                while end < total:
+                    sl = int(seq_lens[end])
+                    if tok + sl > max_token_len and end > start:
+                        break
+                    tok += sl
+                    end += 1
+                bounds.append((start, end))
+                start = end
+        elif micro_batch_size is not None and micro_batch_size > 0:
+            bounds = [
+                (s, min(s + micro_batch_size, total))
+                for s in range(0, total, micro_batch_size)
+            ]
+        else:
+            return [data]
+
+        batches = [slice_rows(s, e) for s, e in bounds]
+
+        # FSDP2 all-gathers are collective, so every rank must run the same
+        # number of forward/backward passes. Token-budget splitting can yield
+        # different counts per rank; pad with a zero-response-mask copy of the
+        # last micro-batch, which contributes no loss and no gradient.
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            world = torch.distributed.get_world_size()
+            if world > 1:
+                count = torch.tensor([len(batches)], device=self._device_or_cuda())
+                torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.MAX)
+                target = int(count.item())
+                while len(batches) < target:
+                    dummy = {
+                        k: (v.clone() if isinstance(v, torch.Tensor) else v)
+                        for k, v in batches[-1].items()
+                    }
+                    if isinstance(dummy.get("response_mask"), torch.Tensor):
+                        dummy["response_mask"] = torch.zeros_like(dummy["response_mask"])
+                    batches.append(dummy)
+        return batches
 
     def _postprocess_batch(self, output_lst: list[dict]) -> dict[str, Any]:
         model_output: dict[str, list] = {}

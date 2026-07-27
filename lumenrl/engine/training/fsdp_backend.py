@@ -36,8 +36,6 @@ def _patch_hf_attention_with_lumen() -> None:
     Uses ``lumen.ops.attention.hf_patch`` which replaces the ``sdpa``
     entry in HF's ``ALL_ATTENTION_FUNCTIONS`` with an AITER-backed
     implementation that supports both forward and backward.
-
-    Then installs a varlen wrapper on top for sequence packing support.
     """
     try:
         from lumen.ops.attention.hf_patch import patch_hf_sdpa
@@ -47,7 +45,18 @@ def _patch_hf_attention_with_lumen() -> None:
     except Exception as exc:
         logger.error("Lumen HF attention patch failed: %s", exc, exc_info=True)
 
-    # Install varlen-aware wrapper for sequence packing (must come AFTER patch_hf_sdpa)
+
+def _install_packing_attention() -> None:
+    """Install the varlen-aware wrapper used by the packed forward.
+
+    Independent of the Lumen AITER patch: it wraps whatever is registered as
+    HF ``sdpa`` at call time and only diverges inside a ``PackingContext``,
+    where it dispatches to ``aiter.flash_attn_varlen_func`` with ``cu_seqlens``.
+    Without it a packed micro-batch degrades to one causal block over the whole
+    buffer, so sequences attend across each other's boundaries and multi-sequence
+    packing is unusable. Must run after ``patch_hf_sdpa`` when that is enabled,
+    so the Lumen kernel becomes the non-packed fallback.
+    """
     try:
         from lumenrl.engine.training.packing import patch_attention_for_packing
         patch_attention_for_packing()
@@ -100,6 +109,10 @@ def _load_hf_model(model_name: str, torch_dtype: torch.dtype = torch.bfloat16) -
         logger.info("[rank %d] HF attention patch disabled; using pure torch SDPA.", rank)
     else:
         _patch_hf_attention_with_lumen()
+
+    # Always installed: the packed forward needs varlen isolation regardless of
+    # whether the Lumen AITER kernel is in play.
+    _install_packing_attention()
 
     logger.info("[rank %d] Loading HF model: %s (dtype=%s)", rank, model_name, torch_dtype)
     model = AutoModelForCausalLM.from_pretrained(

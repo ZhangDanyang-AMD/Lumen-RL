@@ -3174,10 +3174,47 @@ class RLTrainer:
             return logp, (ent.to(self._device) if ent is not None else None)
         return logp
 
+    @staticmethod
+    def _balance_rows_across_workers(batch: DataProto, num_workers: int) -> None:
+        """Reorder rows so each worker's contiguous shard holds similar tokens.
+
+        Dispatch splits by row count, so an unlucky split gives one rank more
+        tokens than the rest. That rank forms an extra micro-batch, and because
+        FSDP2 collectives must run in lockstep every other rank then runs a
+        padding micro-batch too -- paying a full round of all-gather and
+        reduce-scatter for zero gradient. Longest-first assignment into
+        equal-cardinality bins removes the straggler. Loss normalization uses the
+        global token count, so it is invariant to this permutation.
+        """
+        am = batch.tensors.get("attention_mask")
+        n = batch.batch_size
+        if am is None or num_workers <= 1 or n < num_workers or n % num_workers:
+            return
+        per_worker = n // num_workers
+        lens = am.sum(dim=1).long().tolist()
+        order = sorted(range(n), key=lambda i: -lens[i])
+        bins: list[list[int]] = [[] for _ in range(num_workers)]
+        loads = [0] * num_workers
+        for idx in order:
+            b = min(
+                (j for j in range(num_workers) if len(bins[j]) < per_worker),
+                key=lambda j: loads[j],
+            )
+            bins[b].append(idx)
+            loads[b] += lens[idx]
+        perm = [i for b in bins for i in b]
+        if perm == list(range(n)):
+            return
+        batch.reorder(perm)
+        for key, val in list(batch.meta.items()):
+            if isinstance(val, list) and len(val) == n:
+                batch.meta[key] = [val[i] for i in perm]
+
     def _update_actor_with_ray(self, batch: DataProto) -> dict[str, float]:
         if self._actor_wg is None:
             raise RuntimeError("Ray actor worker group is not initialized.")
         actor_role_cfg = self.config.controller.ray.actor
+        self._balance_rows_across_workers(batch, self._actor_wg.num_workers)
         chunks = dispatch_proto(
             batch,
             self._actor_wg.num_workers,

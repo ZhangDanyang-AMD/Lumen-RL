@@ -28,6 +28,14 @@ import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
+# Flash-Attention's Triton cross-entropy, the same kernel verl reaches through
+# `logprobs_from_logits`. It fuses log_softmax + gather and supports an in-place
+# backward, so per-token log-probs cost no extra vocab-sized allocation.
+try:
+    from flash_attn.ops.triton.cross_entropy import cross_entropy_loss as _FUSED_CROSS_ENTROPY
+except ImportError:  # fall back to chunked log_softmax + gather
+    _FUSED_CROSS_ENTROPY = None
+
 # ---------------------------------------------------------------------------
 # Packing context (module-global, survives gradient checkpointing recompute)
 # ---------------------------------------------------------------------------
@@ -201,24 +209,35 @@ def packed_token_log_probs(
         Each sequence *i* contributes ``sl_i - 1`` values.
     """
     total_tokens = logits.shape[0]
-    B = cu_seqlens.shape[0] - 1
     device = logits.device
 
-    # Build masks to exclude boundary tokens for shifted prediction
     # not_last[j] = True if j is NOT the last token of any sequence
     not_last = torch.ones(total_tokens, dtype=torch.bool, device=device)
     not_last[cu_seqlens[1:].long() - 1] = False
 
-    # not_first[j] = True if j is NOT the first token of any sequence
+    if _FUSED_CROSS_ENTROPY is not None:
+        # Fused path: one Triton kernel over the full (total_tokens, V) buffer,
+        # with the backward writing dlogits in place. Never materializes a
+        # log_softmax tensor, and the boundary rows are dropped *after* the
+        # kernel so no second vocab-sized copy is made either. Their gradient is
+        # zero because the selection below routes no upstream grad to them.
+        targets = torch.empty_like(packed_ids)
+        targets[:-1] = packed_ids[1:]
+        targets[-1] = 0  # position is dropped by not_last
+        losses, _ = _FUSED_CROSS_ENTROPY(
+            logits if logits.is_contiguous() else logits.contiguous(),
+            targets,
+            logit_scale=(1.0 / temperature) if temperature != 1.0 else 1.0,
+            inplace_backward=True,
+        )
+        return (-losses)[not_last].float()  # (total - B,)
+
+    # Fallback: chunked log_softmax + gather. Needs the shifted copies.
     not_first = torch.ones(total_tokens, dtype=torch.bool, device=device)
     not_first[cu_seqlens[:-1].long()] = False
-
-    # Shifted logits: all positions except the last token of each sequence
     shifted_logits = logits[not_last]                          # (total - B, V)
     shifted_targets = packed_ids[not_first].unsqueeze(-1)      # (total - B, 1)
 
-    # Per-row log_softmax (bf16-safe, matches _fused_token_log_probs pattern)
-    # Process in chunks to bound peak memory from float32 promotion
     chunk_size = 4096
     lp_parts = []
     for start in range(0, shifted_logits.shape[0], chunk_size):
@@ -262,12 +281,13 @@ def packed_token_entropy(
     device = logits.device
     not_last = torch.ones(total_tokens, dtype=torch.bool, device=device)
     not_last[cu_seqlens[1:].long() - 1] = False
-    shifted = logits[not_last]  # (total - B, V)
 
+    # Chunk over row slices (views) and drop the boundary rows afterwards, so no
+    # vocab-sized copy of the logits is ever materialized.
     parts = []
-    for start in range(0, shifted.shape[0], chunk_size):
-        end = min(start + chunk_size, shifted.shape[0])
-        z = shifted[start:end]
+    for start in range(0, total_tokens, chunk_size):
+        end = min(start + chunk_size, total_tokens)
+        z = logits[start:end]
         if upcast:
             z = z.float()
         if temperature != 1.0:
@@ -278,7 +298,7 @@ def packed_token_entropy(
         parts.append(ent.float())
     if not parts:
         return torch.zeros(0, dtype=torch.float32, device=device)
-    return torch.cat(parts, dim=0)
+    return torch.cat(parts, dim=0)[not_last]
 
 
 def unpack_log_probs(
