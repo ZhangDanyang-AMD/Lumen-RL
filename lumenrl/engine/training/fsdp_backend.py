@@ -9,6 +9,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from lumenrl.moe.router_precision import enable_fp32_moe_router
+
 logger = logging.getLogger(__name__)
 
 
@@ -125,6 +127,13 @@ def _load_hf_model(model_name: str, torch_dtype: torch.dtype = torch.bfloat16) -
     model.gradient_checkpointing_enable(
         gradient_checkpointing_kwargs={"use_reentrant": False},
     )
+
+    # MoE only: a BF16 router makes top-k expert selection disagree with the
+    # rollout engine on ~6% of (token, layer) decisions, which shows up as a
+    # large rollout_corr/kl. Must stay in sync with the rollout-side patch in
+    # lumenrl/engine/inference/vllm_colocate_worker_ext.py.
+    enable_fp32_moe_router(model)
+
     logger.info("[rank %d] Model ready: %s (%d params)", rank, model_name, sum(p.numel() for p in model.parameters()))
     return model
 

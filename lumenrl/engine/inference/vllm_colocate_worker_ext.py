@@ -90,8 +90,16 @@ class vLLMColocateWorkerExtension:
 
     def monkey_patch_model(self, vocab_size: int) -> None:
         """verl-aligned engine-init patch: mask OOV/padded logits to -inf."""
-        _monkey_patch_compute_logits(self.model_runner.model, vocab_size)
+        model = self.model_runner.model
+        _monkey_patch_compute_logits(model, vocab_size)
         logger.info("monkey_patch_model: compute_logits OOV mask (vocab=%d)", vocab_size)
+
+        # MoE only: match the training side's fp32 router so top-k expert
+        # selection agrees. Must stay in sync with the trainer-side patch in
+        # lumenrl/engine/training/fsdp_backend.py.
+        from lumenrl.moe.router_precision import enable_fp32_moe_router
+
+        enable_fp32_moe_router(model)
 
     def update_weights_from_ipc(self, use_shm: bool = False) -> None:
         """Receive bucketed weights over ZMQ IPC and load them into the model."""
