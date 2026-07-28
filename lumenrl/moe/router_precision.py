@@ -34,6 +34,8 @@ import os
 import torch
 import torch.nn.functional as F
 
+from lumenrl.moe.rollout_routing import apply_replay, layer_index_of
+
 logger = logging.getLogger(__name__)
 
 _MARKER = "_lumen_fp32_router"
@@ -57,21 +59,33 @@ def _is_hf_topk_router(mod: torch.nn.Module) -> bool:
     return all(hasattr(mod, a) for a in ("top_k", "num_experts", "norm_topk_prob"))
 
 
-def _patch_hf_topk_router(mod: torch.nn.Module) -> None:
-    """Reimplement Qwen3MoeTopKRouter.forward with the matmul promoted to fp32.
+def _patch_hf_topk_router(mod: torch.nn.Module, layer_idx: int | None, fp32: bool) -> None:
+    """Reimplement Qwen3MoeTopKRouter.forward with fp32 logits and an R3 hook.
 
     Upstream computes ``router_logits`` in BF16 and only upcasts at the softmax,
     which is too late — the ranking has already been decided by the rounded
     logits. Everything the block consumes downstream (logits and scores) is cast
     back to the original dtype, so only the *selection* changes.
+
+    When Rollout Routing Replay has installed routing for the current
+    micro-batch, the selection is replaced by the rollout's and the weights are
+    regathered from the live probabilities, which keeps the router differentiable.
     """
 
-    def forward(hidden_states, _m=mod):
+    def forward(hidden_states, _m=mod, _layer=layer_idx, _fp32=fp32):
         out_dtype = _m.weight.dtype
         hidden_states = hidden_states.reshape(-1, _m.hidden_dim)
-        router_logits = F.linear(hidden_states.float(), _m.weight.float())
+        if _fp32:
+            router_logits = F.linear(hidden_states.float(), _m.weight.float())
+        else:
+            router_logits = F.linear(hidden_states, _m.weight)
         router_probs = F.softmax(router_logits, dtype=torch.float, dim=-1)
         router_top_value, router_indices = torch.topk(router_probs, _m.top_k, dim=-1)
+
+        replayed = apply_replay(router_probs, router_indices, _layer)
+        if replayed is not None:
+            router_top_value, router_indices = replayed
+
         if _m.norm_topk_prob:
             router_top_value = router_top_value / router_top_value.sum(dim=-1, keepdim=True)
         return router_logits.to(out_dtype), router_top_value.to(out_dtype), router_indices
@@ -100,15 +114,18 @@ def _patch_linear_router(mod: torch.nn.Module, returns_tuple: bool) -> None:
 
 
 def enable_fp32_moe_router(model: torch.nn.Module) -> int:
-    """Promote every MoE router matmul in ``model`` to fp32. Returns #patched.
+    """Patch every MoE router in ``model``. Returns #patched.
 
     Idempotent, and a no-op on dense models. Handles the HF ``Qwen3MoeTopKRouter``
     (top-k inside the router, 3-tuple return), vLLM's ``ReplicatedLinear`` gate
     (``(output, bias)`` return, top-k done by FusedMoE), and a plain
     ``nn.Linear`` gate.
+
+    The HF patch is installed even when fp32 is switched off, because it is also
+    where Rollout Routing Replay intercepts the top-k. fp32 then only controls
+    the precision of the matmul inside it.
     """
-    if not fp32_router_enabled():
-        return 0
+    fp32 = fp32_router_enabled()
 
     patched = 0
     for name, mod in model.named_modules():
@@ -116,9 +133,11 @@ def enable_fp32_moe_router(model: torch.nn.Module) -> int:
             continue
 
         if _is_hf_topk_router(mod):
-            _patch_hf_topk_router(mod)
-        else:
+            _patch_hf_topk_router(mod, layer_index_of(name), fp32)
+        elif fp32:
             _patch_linear_router(mod, returns_tuple=not isinstance(mod, torch.nn.Linear))
+        else:
+            continue
 
         setattr(mod, _MARKER, True)
         patched += 1
@@ -127,5 +146,5 @@ def enable_fp32_moe_router(model: torch.nn.Module) -> int:
         # print, not logger: this module runs inside Ray actors and vLLM workers
         # whose logging config swallows library-level records, and a long run
         # needs positive confirmation that the patch actually took effect.
-        print(f"[lumenrl] fp32 MoE router enabled on {patched} gate modules", flush=True)
+        print(f"[lumenrl] MoE router patched on {patched} gates (fp32={fp32})", flush=True)
     return patched

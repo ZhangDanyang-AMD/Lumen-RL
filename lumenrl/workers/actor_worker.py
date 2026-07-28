@@ -235,6 +235,19 @@ class LumenActorWorker(BaseWorker):
             "trust_remote_code": True,
         }
 
+    def _pack_routing_chunk(self, rows, packed):
+        """Lay one chunk's R3 rollout routing out in packed token order."""
+        if not rows:
+            return None, None
+        from lumenrl.moe.rollout_routing import pack_rollout_routing
+
+        sample = next((r for r in rows if r is not None), None)
+        if sample is None:
+            return None, None
+        return pack_rollout_routing(
+            rows, packed.seq_lens, int(sample.shape[1]), int(sample.shape[2]), self._device,
+        )
+
     def compute_log_probs(self, batch: DataProto) -> DataProto:
         """Return per-token log-probs (and optionally entropy) for the policy.
 
@@ -271,6 +284,7 @@ class LumenActorWorker(BaseWorker):
             packed_token_log_probs,
             unpack_log_probs,
         )
+        from lumenrl.moe.rollout_routing import RoutingReplayContext
 
         sequences = batch["input_ids"].to(self._device)
         B, S = sequences.shape
@@ -325,6 +339,10 @@ class LumenActorWorker(BaseWorker):
         lp_parts: list[torch.Tensor] = []
         ent_parts: list[torch.Tensor] = []
         module = self._engine.module
+        # R3: old_log_probs must be produced under the SAME routing as the
+        # training forward, or the PPO ratio compares two different policies and
+        # ppo_kl picks up routing noise instead of the optimizer step.
+        routing_rows = batch.ragged.get("rollout_routing")
 
         with self._engine.eval_mode():
             with torch.no_grad():
@@ -333,7 +351,11 @@ class LumenActorWorker(BaseWorker):
                     ids_row = sequences[lo:hi]
                     mask_row = am[lo:hi]
                     packed = pack_sequences(ids_row, mask_row)
-                    with PackingContext(packed.cu_seqlens, packed.max_seqlen):
+                    r3_idx, r3_valid = self._pack_routing_chunk(
+                        routing_rows[lo:hi] if routing_rows else None, packed,
+                    )
+                    with PackingContext(packed.cu_seqlens, packed.max_seqlen), \
+                            RoutingReplayContext(r3_idx, r3_valid):
                         outputs = module(
                             input_ids=packed.input_ids,
                             position_ids=packed.position_ids,
@@ -514,6 +536,9 @@ class LumenActorWorker(BaseWorker):
             return self._engine.engine_update_policy(batch)
 
         data: dict[str, Any] = {k: v for k, v in batch.tensors.items()}
+        # per-row ragged payloads (R3 rollout routing); the engine slices these
+        # with the rows when it forms micro-batches.
+        data.update(batch.ragged)
         # verl-aligned packed (remove-padding + varlen) training forward: the
         # engine packs each micro, dropping all pad tokens. This is the forward
         # that matches verl (use_remove_padding=True) and keeps old_log_probs

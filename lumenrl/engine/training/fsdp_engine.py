@@ -257,6 +257,7 @@ class FSDP2Engine(BaseEngine):
                 from lumenrl.engine.training.packing import (
                     PackingContext, pack_sequences,
                 )
+                from lumenrl.moe.rollout_routing import RoutingReplayContext
                 ids = mb["input_ids"]
                 am = mb.get("attention_mask")
                 if am is None:
@@ -264,10 +265,13 @@ class FSDP2Engine(BaseEngine):
                 packed = pack_sequences(ids.to(self._device_or_cuda()), am.to(self._device_or_cuda()))
                 mb["_packed"] = packed
                 mb["_padded_seq_len"] = int(ids.shape[1])
-                # PackingContext must stay alive through backward so gradient
-                # checkpointing recompute still sees the varlen metadata.
+                r3_idx, r3_valid = self._packed_rollout_routing(mb, packed)
+                # Both contexts must stay alive through backward so gradient
+                # checkpointing recompute sees the same varlen metadata and the
+                # same routing the forward used.
                 with ctx:
-                    with PackingContext(packed.cu_seqlens, packed.max_seqlen):
+                    with PackingContext(packed.cu_seqlens, packed.max_seqlen), \
+                            RoutingReplayContext(r3_idx, r3_valid):
                         loss, meta = self.forward_step(mb, loss_function, forward_only)
                         if not forward_only:
                             loss.backward()
@@ -411,6 +415,21 @@ class FSDP2Engine(BaseEngine):
             )
         return result
 
+    def _packed_rollout_routing(self, mb: dict[str, Any], packed: Any):
+        """Lay this micro-batch's R3 routing out in packed token order."""
+        rows = mb.get("rollout_routing")
+        if not rows:
+            return None, None
+        from lumenrl.moe.rollout_routing import pack_rollout_routing
+
+        sample = next((r for r in rows if r is not None), None)
+        if sample is None:
+            return None, None
+        n_layers, top_k = int(sample.shape[1]), int(sample.shape[2])
+        return pack_rollout_routing(
+            rows, packed.seq_lens, n_layers, top_k, self._device_or_cuda(),
+        )
+
     def _prepare_micro_batches(self, data: dict[str, Any]) -> list[dict[str, Any]]:
         """Split *data* into micro-batches by token budget, else by row count.
 
@@ -426,8 +445,19 @@ class FSDP2Engine(BaseEngine):
         if input_ids is None:
             return [data]
 
+        total_rows = int(input_ids.shape[0])
+
         def slice_rows(start: int, end: int) -> dict[str, Any]:
-            return {k: v[start:end] if isinstance(v, torch.Tensor) else v for k, v in data.items()}
+            out: dict[str, Any] = {}
+            for k, v in data.items():
+                if isinstance(v, torch.Tensor):
+                    out[k] = v[start:end]
+                elif isinstance(v, list) and len(v) == total_rows:
+                    # per-row payloads (e.g. R3 rollout routing) must follow rows
+                    out[k] = v[start:end]
+                else:
+                    out[k] = v
+            return out
 
         bounds: list[tuple[int, int]] = []
         total = input_ids.shape[0]
