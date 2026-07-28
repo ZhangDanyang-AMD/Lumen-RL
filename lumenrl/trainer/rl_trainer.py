@@ -3210,6 +3210,29 @@ class RLTrainer:
             if isinstance(val, list) and len(val) == n:
                 batch.meta[key] = [val[i] for i in perm]
 
+    @staticmethod
+    def _finalize_mismatch_metrics(metrics: dict[str, float]) -> None:
+        """Turn the workers' mismatch sums into means, in place.
+
+        Companion to ``LumenActorWorker._mismatch_metrics``; see there for why the
+        signed ``rollout_corr/kl`` alone is not enough to see a train/rollout gap.
+        """
+        tok = metrics.pop("mismatch_tok", None)
+        n_seq = metrics.pop("mismatch_seq_n", None)
+        per_token = {
+            "mismatch_abs_sum": "mismatch/abs_diff",
+            "mismatch_k3_sum": "mismatch/k3_kl",
+            "mismatch_chi2_tok_sum": "mismatch/chi2_token",
+            "mismatch_tail_sum": "mismatch/frac_abs_gt_0.1",
+        }
+        for src, dst in per_token.items():
+            val = metrics.pop(src, None)
+            if val is not None and tok:
+                metrics[dst] = val / max(tok, 1e-6)
+        seq_sum = metrics.pop("mismatch_chi2_seq_sum", None)
+        if seq_sum is not None and n_seq:
+            metrics["mismatch/chi2_seq"] = seq_sum / max(n_seq, 1e-6)
+
     def _update_actor_with_ray(self, batch: DataProto) -> dict[str, float]:
         if self._actor_wg is None:
             raise RuntimeError("Ray actor worker group is not initialized.")
@@ -3418,6 +3441,7 @@ class RLTrainer:
             _pt = metrics.pop("ppo_kl_tok", None)
             if _ps is not None and _pt:
                 metrics["ppo_kl"] = _ps / max(_pt, 1e-6)
+            self._finalize_mismatch_metrics(metrics)
 
             total_tok = int(seq_mask.sum().item())
             prompt_tok = int(sum(prompt_lengths))

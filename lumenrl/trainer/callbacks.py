@@ -295,6 +295,10 @@ class WandbCallback(Callback):
         "rollout_correction/kl": "core/kl",
         "rollout_corr/kl": "core/kl",
         "mismatch_kl": "core/mismatch_kl",
+        # core/kl is SIGNED, so symmetric train/rollout disagreement cancels in it.
+        # These two do not cancel and are what actually track the gap.
+        "mismatch/abs_diff": "core/mismatch_abs_diff",
+        "mismatch/k3_kl": "core/mismatch_k3_kl",
         "entropy": "core/entropy",
         "grad_norm": "core/grad_norm",
         "loss": "core/loss",

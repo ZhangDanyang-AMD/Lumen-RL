@@ -663,9 +663,46 @@ class LumenActorWorker(BaseWorker):
                 rlp = data.get("rollout_log_probs")
                 if rlp is not None:
                     rlp = rlp.to(dev)[..., :L]
-                    out_metrics["rollout_corr_kl_sum"] = float(((rlp - token_log_probs) * mask).sum())
+                    delta = (rlp - token_log_probs) * mask
+                    out_metrics["rollout_corr_kl_sum"] = float(delta.sum())
                     out_metrics["rollout_corr_kl_tok"] = tok
+                    out_metrics.update(self._mismatch_metrics(delta, mask, tok))
         return loss, out_metrics
+
+    @staticmethod
+    def _mismatch_metrics(delta, mask, tok: float) -> dict[str, float]:
+        """Train/rollout mismatch diagnostics beyond the signed mean.
+
+        ``rollout_corr/kl`` is a SIGNED mean, so symmetric per-token disagreement
+        cancels inside it. On a routed-expert model it hid an order of magnitude:
+        measured mean |delta| 0.0226 behind a signed mean of 0.0019, because
+        train/rollout expert-selection flips are large but unbiased. These are the
+        quantities that do not cancel.
+
+        Everything is returned as a SUM plus its denominator so the controller can
+        form a global token-weighted (or sequence-weighted) mean; per-micro and
+        per-worker averaging of both parts leaves the ratio exact.
+        """
+        # exp() of a log-ratio: clamp so a pathological sequence cannot turn the
+        # whole metric into inf and hide the rest.
+        w = torch.exp(delta.clamp(-10.0, 10.0))
+        seq_delta = delta.sum(dim=-1).clamp(-10.0, 10.0)
+        w_seq = torch.exp(seq_delta)
+        n_seq = float(delta.shape[0])
+        return {
+            # mean |delta|: the magnitude that the signed mean cancels away
+            "mismatch_abs_sum": float(delta.abs().sum()),
+            # k3 estimator E[e^r - r - 1] >= 0, unbiased and low-variance for small KL
+            "mismatch_k3_sum": float((((w - 1.0) - delta) * mask).sum()),
+            # second moment of the token-level IS weight: predicts gradient variance
+            "mismatch_chi2_tok_sum": float((((w - 1.0) ** 2) * mask).sum()),
+            # same at sequence level, where TIS actually clips
+            "mismatch_chi2_seq_sum": float(((w_seq - 1.0) ** 2).sum()),
+            "mismatch_seq_n": n_seq,
+            # tail mass: the population driving the divergence (expert flips)
+            "mismatch_tail_sum": float(((delta.abs() > 0.1).float() * mask).sum()),
+            "mismatch_tok": tok,
+        }
 
     def get_state_dict(self) -> dict[str, torch.Tensor]:
         """CPU full state dict for weight sync to rollout engines.
