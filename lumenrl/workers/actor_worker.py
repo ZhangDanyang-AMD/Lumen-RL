@@ -176,6 +176,13 @@ class LumenActorWorker(BaseWorker):
                 "seed": int(policy.get("seed", 42)),
                 "dtype": meg_cfg.get("dtype", "bf16"),
                 "use_distributed_optimizer": meg_cfg.get("use_distributed_optimizer", False),
+                "grad_reduce_in_fp32": meg_cfg.get("grad_reduce_in_fp32", False),
+                "attention_softmax_in_fp32": meg_cfg.get(
+                    "attention_softmax_in_fp32", False
+                ),
+                "moe_token_dispatcher_type": meg_cfg.get(
+                    "moe_token_dispatcher_type", "alltoall"
+                ),
                 # Activation recomputation (needed for long sequences: Megatron
                 # local-spec attention is O(seq^2) in memory without TE flash).
                 "recompute_granularity": meg_cfg.get("recompute_granularity", None),
@@ -952,9 +959,9 @@ class LumenActorWorker(BaseWorker):
             raise FileNotFoundError(f"Missing actor checkpoint shard: {model_path}")
 
         module.load_state_dict(torch.load(model_path, map_location="cpu", weights_only=False))
-        if optimizer is not None and optim_path.exists():
-            optimizer.load_state_dict(torch.load(optim_path, map_location="cpu", weights_only=False))
         has_parameter_state = any(path.glob("optim_parameter_state_world_size_*.pt"))
+        if optimizer is not None and optim_path.exists() and has_parameter_state:
+            optimizer.load_state_dict(torch.load(optim_path, map_location="cpu", weights_only=False))
         if optimizer is not None and has_parameter_state and hasattr(
             optimizer, "load_parameter_state"
         ):
