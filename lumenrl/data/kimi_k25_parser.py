@@ -1,7 +1,11 @@
-"""Kimi-K2.5 chat template parser and loss mask utilities.
+"""Kimi-K2.5 / Kimi-K3 chat template parser and loss mask utilities.
 
-Ported from TorchSpec's data processing pipeline to ensure identical
-tokenization and assistant-only loss masking for speculative distillation.
+Ported from TorchSpec (torchspec/data/parse.py, KimiK25Parser) to ensure
+identical tokenization and assistant-only loss masking for speculative
+distillation training.
+
+Reference: https://github.com/LightSeek-Foundation/TorchSpec
+License: MIT
 """
 
 import json
@@ -10,6 +14,10 @@ from typing import Dict, List, Tuple, Union
 
 import torch
 from transformers import PreTrainedTokenizer
+
+# ---------------------------------------------------------------------------
+# Conversation normalization (ported from torchspec/data/preprocessing.py)
+# ---------------------------------------------------------------------------
 
 ROLE_MAPPING = {
     "human": "user",
@@ -20,18 +28,33 @@ ROLE_MAPPING = {
 _HAS_THINKING_RE = re.compile(r"<think>(?!\s*</think>)")
 
 
+def _has_dropped_think_opener(content: str) -> bool:
+    """Check if content has </think> but no leading <think> — opener was dropped.
+
+    Ported from torchspec/data/parse.py::_has_dropped_think_opener.
+    """
+    return "</think>" in content and not content.lstrip().startswith("<think>")
+
+
 def has_thinking_content(conversation: List[Dict]) -> bool:
     """Detect whether any assistant message contains real thinking content.
 
-    Checks for non-empty <think> blocks and for separate thinking/reasoning
-    fields. Must be called BEFORE formatting, since format() injects empty
-    <think></think> tags.
+    Checks for non-empty <think> blocks in message content (including the
+    dropped-opener ``{reasoning}</think>{answer}`` shape that recovery restores)
+    and for separate thinking/reasoning fields on the message dict.
+
+    Must be called on the raw conversation BEFORE formatting, since
+    formatters inject empty <think></think> tags.
+
+    Ported from torchspec/data/parse.py::has_thinking_content.
     """
     for msg in conversation:
         if not isinstance(msg, dict) or msg.get("role") != "assistant":
             continue
         content = msg.get("content", "")
-        if isinstance(content, str) and _HAS_THINKING_RE.search(content):
+        if isinstance(content, str) and (
+            _HAS_THINKING_RE.search(content) or _has_dropped_think_opener(content)
+        ):
             return True
         for field in ("thinking", "thinking_content", "reasoning_content", "reasoning"):
             if msg.get(field):
@@ -39,10 +62,20 @@ def has_thinking_content(conversation: List[Dict]) -> bool:
     return False
 
 
+def has_unbalanced_thinking_tags(formatted_text: str) -> bool:
+    """Check if formatted text has mismatched <think>/<​/think> counts.
+
+    Ported from torchspec/data/parse.py::has_unbalanced_thinking_tags.
+    """
+    return formatted_text.count("<think>") != formatted_text.count("</think>")
+
+
 def normalize_conversation(conversation: List[Dict]) -> List[Dict]:
     """Normalize ShareGPT format (from/value) to standard (role/content).
 
     Preserves reasoning_content from thinking/reasoning fields.
+
+    Ported from torchspec/data/preprocessing.py::_normalize_conversation.
     """
     if not conversation:
         return conversation
@@ -63,13 +96,24 @@ def normalize_conversation(conversation: List[Dict]) -> List[Dict]:
     return conversation
 
 
+# ---------------------------------------------------------------------------
+# KimiK25Parser (ported from torchspec/data/parse.py::KimiK25Parser)
+# ---------------------------------------------------------------------------
+
+
 class KimiK25Parser:
-    """Parser for Kimi-K2.5 model with manual string formatting.
+    """Parser for Kimi-K2.5 / Kimi-K3 models with manual string formatting.
+
+    Also used for Kimi-K3 (same tokenizer and chat format as K2.5).
 
     Handles:
     - Converting <|image|> placeholders to Kimi media token structure
     - Preserving <think>...</think> blocks in assistant responses
+    - Recovering missing <think> openers (dropped by some generation pipelines)
+    - Merging separate reasoning_content fields into <think> blocks
     - Generating loss mask for assistant content only
+
+    Ported from torchspec/data/parse.py::KimiK25Parser.
     """
 
     MEDIA_TOKEN = "<|media_begin|>image<|media_content|><|media_pad|><|media_end|>"
@@ -105,11 +149,6 @@ class KimiK25Parser:
         return "".join(text_parts)
 
     def _try_parse_multimodal_string(self, content: str):
-        """Parse stringified JSON multimodal content (e.g. llava_instruct).
-
-        Returns flattened text with MEDIA_TOKEN placeholders, or None if
-        the string is not parseable multimodal content.
-        """
         if not content.startswith("["):
             return None
         try:
@@ -124,6 +163,32 @@ class KimiK25Parser:
 
     def _strip_thinking(self, content: str) -> str:
         return self.THINK_PATTERN.sub("", content)
+
+    @staticmethod
+    def _recover_missing_think_open(content: str) -> str:
+        """Recover missing <think> opener — ported from TorchSpec."""
+        if _has_dropped_think_opener(content):
+            return "<think>" + content
+        return content
+
+    _REASONING_FIELDS = ("thinking", "thinking_content", "reasoning_content", "reasoning")
+
+    @classmethod
+    def _reasoning_from_field(cls, msg: dict) -> str:
+        """Extract reasoning content from message fields — ported from TorchSpec."""
+        for field in cls._REASONING_FIELDS:
+            value = msg.get(field)
+            if value:
+                return value
+        return ""
+
+    @classmethod
+    def _merge_reasoning_field(cls, msg: dict, content: str) -> str:
+        """Merge separate reasoning_content field into content — ported from TorchSpec."""
+        reasoning = cls._reasoning_from_field(msg)
+        if reasoning and "<think>" not in content and "</think>" not in content:
+            return f"<think>{reasoning}</think>{content}"
+        return content
 
     def _format_tool_calls(self, tool_calls: list) -> str:
         tc_parts = []
@@ -140,8 +205,11 @@ class KimiK25Parser:
     def format(self, conversation: List[Dict], add_generation_prompt: bool = False) -> str:
         """Build conversation string with Kimi-K2.5 special tokens.
 
-        Strips <think>...</think> from all assistant turns except the last one.
-        Injects <think></think> if assistant content doesn't start with <think>.
+        Behavior matches TorchSpec's KimiK25Parser.format() exactly:
+        - Strips <think>...</think> from all assistant turns except the last
+        - Recovers missing <think> openers on ALL assistant turns
+        - Merges reasoning_content field on the LAST assistant turn
+        - Injects <think></think> if assistant content doesn't start with <think>
         """
         parts = []
 
@@ -167,6 +235,7 @@ class KimiK25Parser:
                     content = self._format_content(content, role)
 
             if role == "assistant" and idx != last_assistant_idx:
+                content = self._recover_missing_think_open(content)
                 content = self._strip_thinking(content)
 
             if role == "system":
@@ -177,6 +246,9 @@ class KimiK25Parser:
                 tool_calls = msg.get("tool_calls")
                 if tool_calls:
                     content += self._format_tool_calls(tool_calls)
+                if idx == last_assistant_idx:
+                    content = self._merge_reasoning_field(msg, content)
+                    content = self._recover_missing_think_open(content)
                 if not content.startswith("<think>"):
                     content = "<think></think>" + content
                 parts.append(f"{self.ASSISTANT_HEADER}{content}{self.END_TOKEN}")
@@ -187,7 +259,7 @@ class KimiK25Parser:
                 parts.append(f"{self.TOOL_HEADER}{content}{self.END_TOKEN}")
 
         if add_generation_prompt:
-            parts.append(self.ASSISTANT_HEADER)
+            parts.append(f"{self.ASSISTANT_HEADER}<think>")
 
         return "".join(parts)
 
@@ -197,10 +269,7 @@ class KimiK25Parser:
         max_length: int,
         last_turn_only: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Format, tokenize, and compute assistant-only loss mask.
-
-        Returns (input_ids, loss_mask) — both 1-D tensors.
-        """
+        """Format, tokenize, and compute assistant-only loss mask."""
         text = self.format(conversation)
         return self._tokenize_with_loss_mask(text, max_length, last_turn_only)
 
@@ -213,6 +282,8 @@ class KimiK25Parser:
         """Tokenize text and compute loss mask via encode-prefix character mapping.
 
         Only content between ASSISTANT_HEADER and END_TOKEN gets loss_mask=1.
+
+        Ported from torchspec/data/parse.py::Parser._tokenize_with_loss_mask.
         """
         encoding = self.tokenizer(
             text,
@@ -251,7 +322,7 @@ class KimiK25Parser:
 
 
 # ---------------------------------------------------------------------------
-# Packed loss mask utilities (run-length encoding)
+# Packed loss mask utilities (ported from torchspec/data/utils.py)
 # ---------------------------------------------------------------------------
 
 
@@ -260,9 +331,6 @@ def pack_loss_mask(loss_mask: torch.Tensor) -> List[int]:
 
     Returns alternating [prompt_len, response_len, prompt_len, ...],
     always starting with prompt (0-valued segment).
-
-    Example:
-        [0, 0, 1, 1, 1, 0, 0, 1, 1, 0] -> [2, 3, 2, 2, 1]
     """
     if loss_mask.dim() > 1:
         loss_mask = loss_mask.squeeze()
@@ -287,11 +355,7 @@ def pack_loss_mask(loss_mask: torch.Tensor) -> List[int]:
 
 
 def unpack_loss_mask(packed: Union[List[int], str]) -> torch.Tensor:
-    """Reconstruct loss_mask tensor from packed form.
-
-    Example:
-        [2, 3, 2, 2, 1] -> tensor([0, 0, 1, 1, 1, 0, 0, 1, 1, 0])
-    """
+    """Reconstruct loss_mask tensor from packed form."""
     if isinstance(packed, str):
         packed = deserialize_packed_loss_mask(packed)
     if not packed:
