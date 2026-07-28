@@ -8,7 +8,6 @@ Reference: https://github.com/LightSeek-Foundation/TorchSpec
 License: MIT
 """
 
-import json
 import re
 from typing import Dict, List, Tuple, Union
 
@@ -148,19 +147,6 @@ class KimiK25Parser:
                 text_parts.append(self.MEDIA_TOKEN + "\n")
         return "".join(text_parts)
 
-    def _try_parse_multimodal_string(self, content: str):
-        if not content.startswith("["):
-            return None
-        try:
-            parsed = json.loads(content)
-        except (json.JSONDecodeError, TypeError):
-            return None
-        if not isinstance(parsed, list) or not parsed:
-            return None
-        if not isinstance(parsed[0], dict) or "type" not in parsed[0]:
-            return None
-        return self._flatten_multimodal_list(parsed)
-
     def _strip_thinking(self, content: str) -> str:
         return self.THINK_PATTERN.sub("", content)
 
@@ -228,11 +214,7 @@ class KimiK25Parser:
                 else:
                     content = str(content)
             else:
-                parsed = self._try_parse_multimodal_string(content)
-                if parsed is not None:
-                    content = parsed
-                else:
-                    content = self._format_content(content, role)
+                content = self._format_content(content, role)
 
             if role == "assistant" and idx != last_assistant_idx:
                 content = self._recover_missing_think_open(content)
