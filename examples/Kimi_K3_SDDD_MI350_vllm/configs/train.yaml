@@ -1,0 +1,157 @@
+# Kimi K3 DSpark SDDD — MI350 (vLLM, Batch-Alternating, 8-GPU Sequential)
+#
+# Batch-alternating mode: all 8 GPUs alternate between prefill and training.
+# K3's ~1TB MoE model requires TP=8, so 4+4 split is not possible.
+#
+# Draft model aligned with Inferact/Kimi-K3-DSpark config.json:
+#   hidden_size: 7168, num_hidden_layers: 5, num_attention_heads: 64
+#   target_layer_ids: [2, 23, 47, 71, 89]
+#   markov_rank: 256, markov_head_type: vanilla
+#   enable_confidence_head: true, confidence_head_with_markov: true
+#
+# Training hyperparameters aligned with TorchSpec reference:
+#   lr: 6e-4, warmup_ratio: 0.04, max_grad_norm: 0.5
+#   loss: ce_alpha=0.1, l1_alpha=0.9, confidence_alpha=1.0
+#
+# Batch-alternating data flow:
+#   1. Dataset with responses: kimi-mtp-dataset (~477K perfectblend)
+#   2. vLLM teacher does prefill (TP=8) — no generation needed
+#   3. Hidden states extracted at layers [2,23,47,71,89] via Mooncake → SHM
+#   4. After cache_batches prefills, vLLM shuts down
+#   5. Draft model loads to GPU, trains on cached hidden states (replicate, 8 GPUs)
+#   6. Draft offloaded to CPU, repeat from step 2
+#
+# Usage:
+#   bash examples/Kimi_K3_SDDD_MI350_vllm/run_kimi_k3.sh
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
+
+policy:
+  model_name: /dev/shm/Kimi-K3
+  training_backend: fsdp2
+  generation_backend: hf
+  max_total_sequence_length: 8192
+  train_global_batch_size: 8
+  train_micro_batch_size: 1
+  learning_rate: 6e-4
+  weight_decay: 0.0
+  max_grad_norm: 0.5
+  warmup_ratio: 0.04
+  lr_decay_style: cosine
+
+algorithm:
+  name: spec_distill
+  spec_distill:
+    draft_type: dspark
+    loss_type: dspark
+    sequential_mode: batch_alternating
+    cache_batches: 200
+    cache_dir: /tmp/teacher_cache
+    # DSpark position decay: w_k = exp(-k / gamma)
+    loss_decay_gamma: 4.0
+    num_target_layers: 5
+    spec_length: 7
+    aux_hidden_state_layer_ids: [2, 23, 47, 71, 89]
+    capture_mode: postnorm
+    anchor_num: 512
+    separate_last_hidden: true
+    shift_input_embeds: false
+    # DSpark loss weights
+    ce_loss_alpha: 0.1
+    l1_loss_alpha: 0.9
+    confidence_loss_alpha: 1.0
+  teacher:
+    model_name: /dev/shm/Kimi-K3
+    inference_backend: vllm
+    tensor_parallel_size: 8
+    gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+    quantization: ""
+    generate_mode: prefill
+    transport: mooncake
+  draft:
+    from_scratch: true
+    # ---- Aligned with Inferact/Kimi-K3-DSpark/config.json ----
+    num_layers: 5
+    num_heads: 64
+    num_kv_heads: 64
+    head_dim: 128
+    ffn_dim: 14336
+    rms_norm_eps: 1.0e-5
+    rope_theta: 50000.0
+    rope_scaling_type: yarn
+    rope_scaling_factor: 32.0
+    rope_original_max_pos: 32768
+    rope_beta_fast: 32.0
+    rope_beta_slow: 1.0
+    rope_mscale: 1.0
+    rope_mscale_all_dim: 1.0
+    use_aux_hidden_state: true
+    use_input_layernorm_in_first_layer: true
+    use_last_layernorm: true
+    use_mtp_layernorm: false
+    attention_bias: false
+    mlp_bias: false
+    dtype: bfloat16
+    # ---- MLA dimensions (Inferact/Kimi-K3-DSpark) ----
+    q_lora_rank: 1536
+    kv_lora_rank: 512
+    qk_nope_head_dim: 128
+    qk_rope_head_dim: 64
+    v_head_dim: 128
+    # ---- DSpark-specific ----
+    markov_rank: 256
+    markov_head_type: vanilla
+    enable_confidence_head: true
+    confidence_head_with_markov: true
+    mask_token_id: 163837
+    block_size: 7
+
+mooncake:
+  protocol: tcp
+  device_name: ""
+  global_segment_size: 16GB
+  local_buffer_size: 4GB
+
+quantization:
+  training:
+    fp8: null
+    lumen_norm: true
+    lumen_linear: true
+    hf_attn_patch: true
+  rollout_correction:
+    enabled: false
+
+dataset:
+  chat_template: kimi-k3
+  last_turn_loss_only: false
+  num_preprocess_workers: 16
+  cache_dir: /dev/shm/lumenrl_cache
+
+reward:
+  type: function
+  function: math_reward
+  dataset: /dev/shm/kimi-mtp-dataset-phase1/train.jsonl
+
+eval:
+  enabled: true
+  interval: 500
+  num_samples: 256
+  micro_batch_size: 4
+
+checkpointing:
+  checkpoint_dir: /dev/shm/checkpoints/kimi_k3_dspark_vllm
+  save_steps: 100
+  save_total_limit: 3
+  resume: true
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+# ~477K prompts / global_bs=8 ≈ 59630 steps/epoch. 1 epoch.
+# With cache_batches=200: 59630/200 ≈ 298 rounds of batch-alternating.
+# Effective batch=512 via grad_accum_steps=64 (512/8).
+num_training_steps: 59630
+seed: 42

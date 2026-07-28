@@ -460,9 +460,62 @@ class SpecDistillTrainer:
                 num_layers=num_layers,
                 block_size=8,
             )
+        elif draft_type == "dspark":
+            from lumenrl.models.dspark import DSparkModel
+
+            num_layers = draft_cfg.num_layers or 5
+            spec_length = spec_cfg.spec_length
+            num_heads = getattr(draft_cfg, "num_heads", None) or max(1, teacher_hidden_dim // 128)
+            num_kv_heads = getattr(draft_cfg, "num_kv_heads", None) or num_heads
+            head_dim = getattr(draft_cfg, "head_dim", None) or 128
+            ffn_dim = getattr(draft_cfg, "ffn_dim", None) or 14336
+            rms_norm_eps = getattr(draft_cfg, "rms_norm_eps", 1e-5)
+            rope_theta = getattr(draft_cfg, "rope_theta", 50000.0)
+
+            rope_scaling = None
+            rope_scaling_type = getattr(draft_cfg, "rope_scaling_type", None)
+            if rope_scaling_type:
+                rope_scaling = {
+                    "type": rope_scaling_type,
+                    "rope_type": rope_scaling_type,
+                    "factor": getattr(draft_cfg, "rope_scaling_factor", 32.0),
+                    "original_max_position_embeddings": getattr(draft_cfg, "rope_original_max_pos", 32768),
+                    "beta_fast": getattr(draft_cfg, "rope_beta_fast", 32.0),
+                    "beta_slow": getattr(draft_cfg, "rope_beta_slow", 1.0),
+                    "mscale": getattr(draft_cfg, "rope_mscale", 1.0),
+                    "mscale_all_dim": getattr(draft_cfg, "rope_mscale_all_dim", 1.0),
+                    "low_freq_factor": getattr(draft_cfg, "rope_low_freq_factor", 1.0),
+                    "high_freq_factor": getattr(draft_cfg, "rope_high_freq_factor", 4.0),
+                }
+
+            teacher_vocab_size = self._lm_head_weight.shape[0]
+            self._draft_model = DSparkModel(
+                hidden_dim=teacher_hidden_dim,
+                vocab_size=teacher_vocab_size,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                num_layers=num_layers,
+                num_target_layers=spec_cfg.num_target_layers,
+                block_size=getattr(draft_cfg, "block_size", 7),
+                ffn_dim=ffn_dim,
+                rms_norm_eps=rms_norm_eps,
+                rope_theta=rope_theta,
+                rope_scaling=rope_scaling,
+                anchor_num=spec_cfg.anchor_num,
+                markov_rank=getattr(draft_cfg, "markov_rank", 0),
+                markov_head_type=getattr(draft_cfg, "markov_head_type", "vanilla"),
+                enable_confidence_head=getattr(draft_cfg, "enable_confidence_head", False),
+                confidence_head_with_markov=getattr(draft_cfg, "confidence_head_with_markov", False),
+                mask_token_id=getattr(draft_cfg, "mask_token_id", 0),
+                q_lora_rank=getattr(draft_cfg, "q_lora_rank", 1536),
+                kv_lora_rank=getattr(draft_cfg, "kv_lora_rank", 512),
+                qk_nope_head_dim=getattr(draft_cfg, "qk_nope_head_dim", 128),
+                qk_rope_head_dim=getattr(draft_cfg, "qk_rope_head_dim", 64),
+                v_head_dim=getattr(draft_cfg, "v_head_dim", 128),
+            )
         else:
             raise ValueError(
-                f"Unknown draft_type: {draft_type!r}. Use 'eagle3' or 'dflash'."
+                f"Unknown draft_type: {draft_type!r}. Use 'eagle3', 'dflash', or 'dspark'."
             )
 
         if draft_type == "eagle3" and getattr(draft_cfg, "from_scratch", False):
@@ -1500,17 +1553,39 @@ class SpecDistillTrainer:
                     eval_attn_mask = eval_attn_mask[:, :T_teacher]
                 if spec_cfg.shift_input_embeds:
                     eval_attn_mask = eval_attn_mask.roll(-1, 1)
-                result = self._draft_model(
-                    token_embeds=token_embeds,
-                    aux_hidden_states=aux_hidden,
-                    teacher_lm_head_weight=lm_head_w,
-                    embed_weight=embed_w,
-                    loss_mask=loss_mask,
-                    target_ids=t_ids,
-                    loss_type=spec_cfg.loss_type,
-                    target_hidden_states=target_hs,
-                    attention_mask=eval_attn_mask,
-                )
+                draft_type = spec_cfg.draft_type.lower()
+                if draft_type == "dspark":
+                    raw_ids = cached["input_ids"].to(self._device)
+                    if raw_ids.shape[1] != T_teacher:
+                        raw_ids = raw_ids[:, :T_teacher]
+                    raw_embeds = F.embedding(raw_ids, embed_w)
+                    if raw_embeds.shape[1] != T_teacher:
+                        raw_embeds = raw_embeds[:, :T_teacher]
+                    result = self._draft_model(
+                        input_ids=raw_ids,
+                        token_embeds=raw_embeds,
+                        aux_hidden_states=aux_hidden,
+                        teacher_lm_head_weight=lm_head_w,
+                        embed_weight=embed_w,
+                        loss_mask=loss_mask,
+                        target_hidden_states=target_hs,
+                        ce_alpha=spec_cfg.ce_loss_alpha,
+                        l1_alpha=spec_cfg.l1_loss_alpha,
+                        conf_alpha=spec_cfg.confidence_loss_alpha,
+                        decay_gamma=spec_cfg.loss_decay_gamma,
+                    )
+                else:
+                    result = self._draft_model(
+                        token_embeds=token_embeds,
+                        aux_hidden_states=aux_hidden,
+                        teacher_lm_head_weight=lm_head_w,
+                        embed_weight=embed_w,
+                        loss_mask=loss_mask,
+                        target_ids=t_ids,
+                        loss_type=spec_cfg.loss_type,
+                        target_hidden_states=target_hs,
+                        attention_mask=eval_attn_mask,
+                    )
 
             step_losses = [float(l.detach()) for l in result["losses"]]
             step_accs = [float(a.detach()) for a in result["accuracies"]]
@@ -1541,10 +1616,14 @@ class SpecDistillTrainer:
                     arr[i] = float(t.item())
 
         # Compute weighted loss and simulated accept length
+        import math as _math
         total_loss = 0.0
         total_weight = 0.0
         for i, l in enumerate(avg_loss_per_pos):
-            w = spec_cfg.position_decay ** i
+            if draft_type == "dspark":
+                w = _math.exp(-i / spec_cfg.loss_decay_gamma)
+            else:
+                w = spec_cfg.position_decay ** i
             total_loss += w * l
             total_weight += w
 
@@ -2088,6 +2167,401 @@ class SpecDistillTrainer:
             metrics["accuracy"] = float(result["accuracy"].detach())
         return metrics
 
+    def _train_step_dspark(
+        self,
+        teacher_data: dict[str, torch.Tensor],
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor | None = None,
+    ) -> dict[str, float]:
+        """DSpark draft model training step (single micro-batch).
+
+        Passes raw (unshifted) input_ids to the model. Label construction
+        happens inside the model via anchor+offset (aligned with TorchSpec).
+        """
+        spec_cfg = self.config.algorithm.spec_distill
+        draft_dtype = next(self._draft_model.parameters()).dtype
+
+        aux_hidden = teacher_data["hidden_states"].to(device=self._device, dtype=draft_dtype)
+        input_ids = teacher_data["input_ids"].to(self._device)
+
+        if not hasattr(self, "_lm_head_w_gpu") or self._lm_head_w_gpu is None:
+            self._lm_head_w_gpu = self._lm_head_weight.to(device=self._device, dtype=draft_dtype)
+            self._embed_w_gpu = self._embed_weight.to(device=self._device, dtype=draft_dtype)
+        lm_head_w = self._lm_head_w_gpu
+        embed_w = self._embed_w_gpu
+
+        token_embeds = F.embedding(input_ids, embed_w)
+
+        if loss_mask is not None:
+            loss_mask = loss_mask.to(self._device)
+        else:
+            loss_mask = attention_mask.to(self._device)
+
+        target_hs = teacher_data.get("last_hidden_states")
+        if target_hs is not None:
+            target_hs = target_hs.to(device=self._device, dtype=draft_dtype)
+            if (
+                spec_cfg.separate_last_hidden
+                and self._norm_weight is not None
+            ):
+                variance = target_hs.float().pow(2).mean(-1, keepdim=True)
+                target_hs = (
+                    target_hs.float()
+                    * torch.rsqrt(variance + self._norm_eps)
+                ).to(draft_dtype) * self._norm_weight.to(
+                    device=self._device, dtype=draft_dtype
+                )
+
+        result = self._draft_model(
+            input_ids=input_ids,
+            token_embeds=token_embeds,
+            aux_hidden_states=aux_hidden,
+            teacher_lm_head_weight=lm_head_w,
+            embed_weight=embed_w,
+            loss_mask=loss_mask,
+            target_hidden_states=target_hs,
+            ce_alpha=spec_cfg.ce_loss_alpha,
+            l1_alpha=spec_cfg.l1_loss_alpha,
+            conf_alpha=spec_cfg.confidence_loss_alpha,
+            decay_gamma=spec_cfg.loss_decay_gamma,
+        )
+
+        total_loss = result["total_loss"]
+        num_accum = getattr(self, "_grad_accum_steps", 1)
+        (total_loss / num_accum).backward()
+
+        metrics: dict[str, float] = {"loss": float(total_loss.detach())}
+        metrics["ce_loss"] = float(result["ce_loss"])
+        metrics["tv_loss"] = float(result["tv_loss"])
+        metrics["conf_loss"] = float(result["conf_loss"])
+        for i, (step_loss, step_acc) in enumerate(
+            zip(result["losses"], result["accuracies"])
+        ):
+            metrics[f"step_{i}_loss"] = float(step_loss.detach())
+            metrics[f"step_{i}_acc"] = float(step_acc.detach())
+
+        return metrics
+
+    # ------------------------------------------------------------------
+    # Batch-alternating mode: disk cache + CPU offload
+    # ------------------------------------------------------------------
+
+    def _write_batch_to_disk(
+        self,
+        cache_dir: str,
+        round_idx: int,
+        batch_idx: int,
+        teacher_data: dict[str, torch.Tensor],
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+    ) -> None:
+        """Write one batch of teacher hidden states to NVMe disk cache."""
+        batch_dir = os.path.join(cache_dir, f"round_{round_idx}", f"batch_{batch_idx}")
+        os.makedirs(batch_dir, exist_ok=True)
+        meta: dict = {}
+        for key in self._TEACHER_KEYS:
+            t = teacher_data[key].contiguous()
+            raw = t.view(torch.uint8).numpy().ravel()
+            with open(f"{batch_dir}/{key}.bin", "wb") as f:
+                f.write(raw.tobytes())
+            meta[key] = list(t.shape)
+        for name, tensor in (("input_ids", input_ids), ("attention_mask", attention_mask), ("loss_mask", loss_mask)):
+            c = tensor.contiguous()
+            c.numpy().tofile(f"{batch_dir}/{name}.bin")
+            meta[name] = list(c.shape)
+        torch.save(meta, f"{batch_dir}/meta.pt")
+
+    def _load_batch_from_disk(
+        self,
+        cache_dir: str,
+        round_idx: int,
+        batch_idx: int,
+    ) -> dict[str, torch.Tensor]:
+        """Load one batch of cached teacher hidden states from disk."""
+        batch_dir = os.path.join(cache_dir, f"round_{round_idx}", f"batch_{batch_idx}")
+        meta = torch.load(f"{batch_dir}/meta.pt", weights_only=True)
+        result: dict = {}
+        for key in self._TEACHER_KEYS:
+            shape = meta[key]
+            nbytes = 2
+            for d in shape:
+                nbytes *= d
+            with open(f"{batch_dir}/{key}.bin", "rb") as f:
+                raw = f.read(nbytes)
+            t = torch.frombuffer(bytearray(raw), dtype=torch.uint8).clone()
+            result[key] = t.view(torch.bfloat16).reshape(shape)
+        for name in ("input_ids", "attention_mask", "loss_mask"):
+            if name not in meta:
+                continue
+            shape = meta[name]
+            t = torch.empty(shape, dtype=torch.int64)
+            with open(f"{batch_dir}/{name}.bin", "rb") as f:
+                f.readinto(t.numpy())
+            result[name] = t
+        if "loss_mask" not in result:
+            result["loss_mask"] = result["attention_mask"].clone()
+        return result
+
+    def _cleanup_round_cache(self, cache_dir: str, round_idx: int) -> None:
+        """Remove cached data for a completed round."""
+        import shutil
+        round_dir = os.path.join(cache_dir, f"round_{round_idx}")
+        if os.path.isdir(round_dir):
+            shutil.rmtree(round_dir, ignore_errors=True)
+            logger.info("[rank %d] Cleaned up cache: %s", self._rank, round_dir)
+
+    def _offload_draft_to_cpu(self) -> None:
+        """Move draft model and optimizer state to CPU, free GPU memory."""
+        # Remove composable replicate hooks before offloading to avoid
+        # double-wrapping when _load_draft_to_gpu re-applies replicate.
+        if hasattr(self._draft_model, "_replicate_api"):
+            del self._draft_model._replicate_api
+        for mod in self._draft_model.modules():
+            hooks_to_remove = []
+            for handle_id, hook in getattr(mod, "_forward_pre_hooks", {}).items():
+                if type(hook).__module__ and "replicate" in type(hook).__module__:
+                    hooks_to_remove.append(handle_id)
+            for hid in hooks_to_remove:
+                del mod._forward_pre_hooks[hid]
+            hooks_to_remove = []
+            for handle_id, hook in getattr(mod, "_forward_hooks", {}).items():
+                if type(hook).__module__ and "replicate" in type(hook).__module__:
+                    hooks_to_remove.append(handle_id)
+            for hid in hooks_to_remove:
+                del mod._forward_hooks[hid]
+
+        self._draft_model.to("cpu")
+        opt = self._optimizer
+        for mp in opt.fp32_params:
+            mp.data = mp.data.cpu()
+        for mg in opt.fp32_grads:
+            mg.data = mg.data.cpu()
+        for state in opt.optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.cpu()
+        self._lm_head_w_gpu = None
+        self._embed_w_gpu = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+        logger.info("[rank %d] Draft model offloaded to CPU", self._rank)
+
+    def _load_draft_to_gpu(self) -> None:
+        """Move draft model and optimizer state back to GPU, re-establish replicate."""
+        self._draft_model.to(self._device)
+
+        # After model.to(device), nn.Module creates new tensor objects.
+        # BF16Optimizer.model_params holds stale CPU references — rebuild.
+        self._optimizer.model_params = [
+            p for p in self._draft_model.parameters() if p.requires_grad
+        ]
+
+        opt = self._optimizer
+        for mp in opt.fp32_params:
+            mp.data = mp.data.to(self._device)
+        for mg in opt.fp32_grads:
+            mg.data = mg.data.to(self._device)
+        for state in opt.optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(self._device)
+
+        if self._is_distributed and self._world_size > 1:
+            from torch.distributed._composable.replicate import replicate
+            replicate(self._draft_model)
+
+        logger.info("[rank %d] Draft model reloaded to GPU", self._rank)
+
+    def _batch_alternating_train(self) -> None:
+        """Batch-alternating training loop for K3-class models requiring TP=full_node.
+
+        Phase A (rank 0): vLLM teacher prefill → write hidden states to disk cache
+        Phase B (all ranks): Load draft to GPU → train on cached batches → offload draft
+        """
+        if self._rank == 0:
+            for cb in self.callbacks:
+                cb.on_train_begin(self)
+
+        spec_cfg = self.config.algorithm.spec_distill
+        total_steps = int(self.config.num_training_steps)
+        cache_batches = spec_cfg.cache_batches
+        cache_dir = spec_cfg.cache_dir
+        draft_type = spec_cfg.draft_type.lower()
+        start_step = self.global_step
+
+        num_rounds = (total_steps - start_step + cache_batches - 1) // cache_batches
+
+        logger.info(
+            "[rank %d] Batch-alternating mode: total_steps=%d, cache_batches=%d, "
+            "num_rounds=%d, start_step=%d",
+            self._rank, total_steps, cache_batches, num_rounds, start_step,
+        )
+
+        # Offload draft before entering Phase A loop
+        self._offload_draft_to_cpu()
+
+        for round_idx in range(num_rounds):
+            round_start_step = start_step + round_idx * cache_batches
+            round_end_step = min(round_start_step + cache_batches, total_steps)
+
+            if round_end_step <= self.global_step:
+                logger.info("[rank %d] Skipping round %d (already completed)", self._rank, round_idx)
+                continue
+
+            round_num_batches = round_end_step - round_start_step
+
+            # ========== Phase A: Teacher prefill + disk cache (rank 0 only) ==========
+            if self._rank == 0:
+                logger.info(
+                    "[rank %d] Round %d Phase A: prefilling %d batches [step %d..%d)",
+                    self._rank, round_idx, round_num_batches,
+                    round_start_step, round_end_step,
+                )
+
+                teacher_cfg = self.config.algorithm.teacher
+                generate_mode = getattr(teacher_cfg, "generate_mode", "prefill")
+                pad_id = self._tokenizer.pad_token_id or 0
+
+                for batch_idx in range(round_num_batches):
+                    step = round_start_step + batch_idx
+                    ids, mask, loss_mask = self._get_batch_sequences(step)
+
+                    if generate_mode == "generate":
+                        data = self._teacher_generate_and_extract_rank0(
+                            ids, mask, recv_device=torch.device("cpu"),
+                        )
+                        if data is not None and "input_ids" in data:
+                            gen_ids = data["input_ids"]
+                            mask = (gen_ids != pad_id).long()
+                            loss_mask = mask.clone()
+                            ids = gen_ids
+                    else:
+                        data = self._teacher_inference_rank0(
+                            ids, mask, recv_device=torch.device("cpu"),
+                        )
+
+                    if data is not None:
+                        teacher_ids = data.get("input_ids", ids)
+                        teacher_data = {k: data[k] for k in self._TEACHER_KEYS}
+                        teacher_data["input_ids"] = teacher_ids
+                        self._write_batch_to_disk(
+                            cache_dir, round_idx, batch_idx,
+                            teacher_data, teacher_ids, mask, loss_mask,
+                        )
+                        del data, teacher_data
+
+                    if (batch_idx + 1) % 50 == 0:
+                        logger.info(
+                            "[rank %d] Phase A progress: %d/%d batches cached",
+                            self._rank, batch_idx + 1, round_num_batches,
+                        )
+
+                # Shut down vLLM engine to free GPU memory (Mooncake master stays alive)
+                if self._teacher_engine is not None:
+                    self._teacher_engine.shutdown()
+                    logger.info("[rank %d] vLLM engine shut down for Phase B", self._rank)
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+
+            if self._is_distributed:
+                torch.distributed.barrier()
+
+            # ========== Phase B: Draft model training on cached batches ==========
+            logger.info(
+                "[rank %d] Round %d Phase B: training on %d cached batches",
+                self._rank, round_idx, round_num_batches,
+            )
+
+            self._load_draft_to_gpu()
+            self._draft_model.train()
+
+            # Each cached batch = train_global_batch_size samples.
+            # One optimizer step per batch (grad_accum handled within
+            # _train_step_* via micro-batching). Each batch is an
+            # independent training step with its own optimizer update.
+            self._grad_accum_steps = 1
+
+            self._optimizer.zero_grad(set_to_none=True)
+            accum_count = 0
+
+            for batch_idx in range(round_num_batches):
+                step = round_start_step + batch_idx
+                self.global_step = step
+
+                if self._rank == 0:
+                    for cb in self.callbacks:
+                        cb.on_step_begin(self, step)
+
+                step_start = time.time()
+                loaded = self._load_batch_from_disk(cache_dir, round_idx, batch_idx)
+
+                cpu_data = {k: loaded[k] for k in self._TEACHER_KEYS}
+                input_ids = loaded["input_ids"]
+                attention_mask = loaded["attention_mask"]
+                loss_mask = loaded.get("loss_mask", attention_mask.clone())
+
+                mb_teacher = {k: v.to(self._device) for k, v in cpu_data.items()}
+                mb_teacher["input_ids"] = input_ids.to(self._device)
+
+                if draft_type == "dspark":
+                    m = self._train_step_dspark(mb_teacher, attention_mask, loss_mask)
+                elif draft_type == "eagle3":
+                    m = self._train_step_eagle3(mb_teacher, attention_mask, loss_mask)
+                else:
+                    m = self._train_step_dflash(mb_teacher, attention_mask, loss_mask)
+
+                del mb_teacher, loaded, cpu_data
+
+                grad_norm = self._optimizer.step()
+                self._optimizer.zero_grad(set_to_none=True)
+
+                metrics = dict(m)
+                metrics["grad_norm"] = float(grad_norm)
+                metrics["lr"] = self._optimizer.get_learning_rate()
+                metrics["timing/step_s"] = time.time() - step_start
+                metrics["seq/max_len"] = int(input_ids.shape[1])
+
+                if self._is_distributed:
+                    for k in list(metrics.keys()):
+                        t = torch.tensor(metrics[k], dtype=torch.float64, device=self._device)
+                        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.AVG)
+                        metrics[k] = float(t.item())
+
+                self.last_metrics = metrics
+                for cb in self.callbacks:
+                    cb.on_step_end(self, step, metrics)
+
+                del input_ids, attention_mask, loss_mask
+
+            # Offload draft back to CPU
+            self._offload_draft_to_cpu()
+
+            # Clean up disk cache for this round
+            self._cleanup_round_cache(cache_dir, round_idx)
+
+            if self._is_distributed:
+                torch.distributed.barrier()
+
+            # Restart vLLM engine for next round's Phase A
+            if round_idx + 1 < num_rounds and self._rank == 0 and self._teacher_engine is not None:
+                teacher_cfg = self.config.algorithm.teacher
+                teacher_name = teacher_cfg.model_name or self.config.policy.model_name
+                self._teacher_engine.start()
+                logger.info("[rank %d] vLLM engine restarted for round %d", self._rank, round_idx + 1)
+
+        if self._rank == 0:
+            for cb in self.callbacks:
+                cb.on_train_end(self)
+
+        logger.info(
+            "[rank %d] Batch-alternating training finished after %d steps.",
+            self._rank, total_steps,
+        )
+
     # ------------------------------------------------------------------
     # Main training loop
     # ------------------------------------------------------------------
@@ -2096,6 +2570,10 @@ class SpecDistillTrainer:
         """Spec Distill loop: teacher forward on dataset -> draft model train."""
         if self._draft_model is None and self._teacher_model is None and self._teacher_engine is None:
             raise RuntimeError("Call setup() before train().")
+
+        spec_cfg = self.config.algorithm.spec_distill
+        if getattr(spec_cfg, "sequential_mode", None) == "batch_alternating":
+            return self._batch_alternating_train()
 
         if self._rank == 0:
             for cb in self.callbacks:
@@ -2326,6 +2804,8 @@ class SpecDistillTrainer:
 
                     if draft_type == "eagle3":
                         m = self._train_step_eagle3(mb_teacher, mb_mask, mb_lm)
+                    elif draft_type == "dspark":
+                        m = self._train_step_dspark(mb_teacher, mb_mask, mb_lm)
                     else:
                         m = self._train_step_dflash(mb_teacher, mb_mask, mb_lm)
 
@@ -2375,6 +2855,8 @@ class SpecDistillTrainer:
                         mb_teacher = trimmed
                     if draft_type == "eagle3":
                         m = self._train_step_eagle3(mb_teacher, mb_mask, mb_lm)
+                    elif draft_type == "dspark":
+                        m = self._train_step_dspark(mb_teacher, mb_mask, mb_lm)
                     else:
                         m = self._train_step_dflash(mb_teacher, mb_mask, mb_lm)
                     for k, v in m.items():

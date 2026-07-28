@@ -135,6 +135,14 @@ class SpecDistillConfig:
     spec_length: int = 5
     shift_input_embeds: bool = False
     separate_last_hidden: bool = False
+    # Batch-alternating mode (K3-class models requiring TP=full_node)
+    sequential_mode: Optional[str] = None
+    cache_batches: int = 200
+    cache_dir: str = "/tmp/teacher_cache"
+    # DSpark loss weights
+    ce_loss_alpha: float = 0.1
+    l1_loss_alpha: float = 0.9
+    confidence_loss_alpha: float = 1.0
 
 
 @dataclass
@@ -194,6 +202,19 @@ class DraftModelConfig:
     max_window_layers: Optional[int] = None
     dtype: str = "float16"
     resume_from: Optional[str] = None
+    # MLA dimensions (DSpark / K3)
+    q_lora_rank: int = 1536
+    kv_lora_rank: int = 512
+    qk_nope_head_dim: int = 128
+    qk_rope_head_dim: int = 64
+    v_head_dim: int = 128
+    # DSpark-specific
+    markov_rank: int = 0
+    markov_head_type: str = "vanilla"
+    enable_confidence_head: bool = False
+    confidence_head_with_markov: bool = False
+    mask_token_id: int = 0
+    block_size: int = 7
 
 
 @dataclass
