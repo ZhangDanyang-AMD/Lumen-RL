@@ -108,6 +108,7 @@ class RLTrainer:
         self._ray_use_atom: bool = False
         self._ray_vllm_engine: Any = None
         self._ray_rollout_mgr: Any = None
+        self._last_weight_sync_metrics: dict[str, float] = {}
         self._is_distributed: bool = torch.distributed.is_initialized()
         self._rank: int = torch.distributed.get_rank() if self._is_distributed else 0
         self._world_size: int = torch.distributed.get_world_size() if self._is_distributed else 1
@@ -380,6 +381,11 @@ class RLTrainer:
             enable_sleep_mode=bool(vcfg.enable_sleep_mode),
             disable_log_stats=True,
         )
+        if bool(getattr(self.config.moe.r3, "enabled", False)):
+            # Patched vLLM/MILES captures [seq_len-1, num_layers, top_k]
+            # expert ids on the rollout engine. Fail-fast validation happens
+            # when assembling each response below.
+            engine_kwargs["enable_return_routed_experts"] = True
         if vcfg.max_model_len:
             engine_kwargs["max_model_len"] = int(vcfg.max_model_len)
         if vcfg.kv_cache_dtype and vcfg.kv_cache_dtype != "auto":
@@ -404,10 +410,23 @@ class RLTrainer:
         self._ray_vllm_engine = VLLMHttpEngine(
             mgr, sleep_level=int(vcfg.sleep_level), enable_sleep=bool(vcfg.enable_sleep_mode),
         )
+        weight_backend = str(getattr(self.config.weight_sync, "backend", "auto"))
+        if weight_backend == "rdma":
+            rdma_cfg = self.config.weight_sync.rdma
+            group_name = f"lumen-rdma-weights-{os.getpid()}"
+            mgr.init_rdma_weight_group(
+                self._actor_wg,
+                interface=str(rdma_cfg.interface),
+                hca=str(rdma_cfg.hca),
+                require_rdma=bool(rdma_cfg.require_rdma),
+                timeout_s=int(self.config.weight_sync.timeout_s),
+                group_name=group_name,
+            )
         logger.info(
-            "Ray vLLM rollout ready: %d replicas (TP=%d, separation=%s).",
+            "Ray vLLM rollout ready: %d replicas (TP=%d, separation=%s, weight_sync=%s).",
             mgr.num_replicas, tp,
             colocation_wg is not self._actor_wg,
+            weight_backend,
         )
 
     def _setup_ray_atom_rollout(self, model_name: str, vcfg: Any, atom_cfg: Any) -> None:
@@ -471,18 +490,25 @@ class RLTrainer:
 
     def _rollout_with_ray_vllm(
         self, prompts: list[str], num_generations: int, sampling_params: dict[str, Any] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, list[int], torch.Tensor | None]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        list[int],
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
         """Token-in/token-out DP rollout across colocated vLLM replicas.
 
-        Returns ``(sequences, seq_mask, prompt_lengths, rollout_log_probs)`` with
-        left-padded prompts and right-appended responses -- the same layout the
-        FSDP forward + reward code expects. ``rollout_log_probs`` is populated
-        only when ``vllm_cfg.calculate_log_probs`` is set (TIS/MIS correction).
+        Returns ``(sequences, seq_mask, prompt_lengths, rollout_log_probs,
+        rollout_routed_experts)``. R3 routes use the MILES contract
+        ``[batch, seq_len-1, num_layers, top_k]`` and align with the left-padded
+        token/log-prob positions.
         """
         vcfg = self.config.policy.generation.vllm_cfg
         tok = self._tokenizer
         pad_id = tok.pad_token_id or 0
         want_lp = bool(vcfg.calculate_log_probs)
+        want_r3 = bool(getattr(self.config.moe.r3, "enabled", False))
 
         # Send pre-tokenized prompt_token_ids (verl's token-in path), NOT the
         # prompt string. A controlled A/B (identical prompts/params/seed/base
@@ -515,6 +541,7 @@ class RLTrainer:
         seqs_tok: list[list[int]] = []
         plens: list[int] = []
         resp_lps: list[list[float]] = []
+        response_routes: list[torch.Tensor] = []
         for res in results:
             p_ids = res["prompt_token_ids"]
             g_ids = res["token_ids"]
@@ -522,6 +549,25 @@ class RLTrainer:
             plens.append(len(p_ids))
             if want_lp:
                 resp_lps.append(res.get("logprobs") or [0.0] * len(g_ids))
+            if want_r3:
+                raw_routes = res.get("routed_experts")
+                if raw_routes is None:
+                    raise RuntimeError(
+                        "moe.r3.enabled=true but vLLM returned no routed_experts. "
+                        "The rollout image must include the MILES vLLM patch and "
+                        "enable_return_routed_experts support."
+                    )
+                routes = torch.as_tensor(raw_routes)
+                expected = len(p_ids) + len(g_ids) - 1
+                # Some vLLM revisions expose the final, loss-unused token too.
+                if routes.shape[0] == expected + 1:
+                    routes = routes[:expected]
+                if routes.ndim != 3 or routes.shape[0] != expected:
+                    raise ValueError(
+                        "vLLM routed_experts shape mismatch: expected "
+                        f"[{expected}, num_layers, top_k], got {tuple(routes.shape)}"
+                    )
+                response_routes.append(routes.to(dtype=torch.int16, device="cpu"))
 
         max_len = max(len(s) for s in seqs_tok)
         b = len(seqs_tok)
@@ -550,11 +596,32 @@ class RLTrainer:
                     if 0 <= col < max_len - 1:
                         rollout_lp[i, col] = lp
 
+        rollout_routes = None
+        if want_r3:
+            if len(response_routes) != b:
+                raise RuntimeError(
+                    f"R3 captured {len(response_routes)} route tensors for {b} sequences."
+                )
+            num_layers = int(response_routes[0].shape[1])
+            topk = int(response_routes[0].shape[2])
+            rollout_routes = torch.full(
+                (b, max_len - 1, num_layers, topk),
+                -1,
+                dtype=torch.int16,
+            )
+            for i, (s, routes) in enumerate(zip(seqs_tok, response_routes)):
+                if routes.shape[1:] != (num_layers, topk):
+                    raise ValueError(
+                        "Inconsistent routed_experts layer/top-k shape across responses."
+                    )
+                start = max_len - len(s)
+                rollout_routes[i, start:start + routes.shape[0]] = routes
+
         sequences = sequences.to(self._device)
         seq_mask = seq_mask.to(self._device)
         if rollout_lp is not None:
             rollout_lp = rollout_lp.to(self._device)
-        return sequences, seq_mask, prompt_lengths, rollout_lp
+        return sequences, seq_mask, prompt_lengths, rollout_lp, rollout_routes
 
     def _ray_sampling_params(self, want_logprobs: bool) -> dict[str, Any]:
         """Sampling params matching _rollout_with_vllm for cross-transport parity."""
@@ -606,6 +673,19 @@ class RLTrainer:
         if mgr is None or self._actor_wg is None:
             return
 
+        backend = str(getattr(self.config.weight_sync, "backend", "auto"))
+        if backend == "rdma":
+            self._sync_weights_rdma(mgr)
+            return
+        if backend == "shared_folder":
+            self._sync_weights_safetensors(mgr)
+            return
+        if backend != "auto":
+            raise ValueError(
+                f"Unsupported weight_sync.backend={backend!r}; "
+                "expected auto, shared_folder, or rdma"
+            )
+
         separated = getattr(self, "_rollout_wg", None) is not None
         if separated or mgr.num_replicas < self._actor_wg.num_workers:
             if LUMENRL_DEBUG:
@@ -635,6 +715,63 @@ class RLTrainer:
         if sleeping:
             rollout_engine.wake(tags=["kv_cache"])
 
+    def _sync_weights_rdma(self, mgr) -> None:
+        """Broadcast HF-named BF16 buckets directly over a persistent RCCL group."""
+        import ray
+
+        if self._actor_wg is None:
+            return
+        if not getattr(mgr, "rdma_group_name", None):
+            raise RuntimeError("RDMA weight group is not initialized")
+        rollout_engine = self._ray_vllm_engine
+        sleeping = bool(getattr(rollout_engine, "enable_sleep", False))
+        if sleeping:
+            rollout_engine.wake(tags=["weights"])
+
+        version = int(self.global_step) + 1
+        cfg = self.config.weight_sync
+        started = time.perf_counter()
+        recv_refs = mgr.start_receive_weights_rdma(
+            version=version,
+            verify_full_load=bool(cfg.verify_full_load),
+        )
+        send_refs = self._actor_wg.execute_all_async(
+            "send_weights_rdma",
+            version=version,
+            bucket_size_mb=int(cfg.bucket_size_mb),
+        )
+        results = ray.get(
+            send_refs + recv_refs,
+            timeout=float(cfg.timeout_s),
+        )
+        sender = next(
+            (x for x in results[: len(send_refs)] if x.get("writer")),
+            None,
+        )
+        if sender is None:
+            raise RuntimeError("RDMA weight sync returned no source statistics")
+        total_s = time.perf_counter() - started
+        self._last_weight_sync_metrics = {
+            "timing/weight_sync_rdma_s": total_s,
+            "weight_sync/bytes": float(sender.get("bytes", 0.0)),
+            "weight_sync/gbps": float(sender.get("gbps", 0.0)),
+            "weight_sync/buckets": float(sender.get("buckets", 0.0)),
+            "weight_sync/version": float(version),
+            "weight_sync/backend_rdma": 1.0,
+        }
+        logger.info(
+            "RDMA weight sync committed: version=%d buckets=%d bytes=%.1fGB "
+            "broadcast=%.2fs effective=%.2fGb/s total=%.2fs",
+            version,
+            int(sender.get("buckets", 0)),
+            float(sender.get("bytes", 0)) / 1e9,
+            float(sender.get("seconds", 0)),
+            float(sender.get("gbps", 0)),
+            total_s,
+        )
+        if sleeping:
+            rollout_engine.wake(tags=["kv_cache"])
+
     def _sync_weights_safetensors(self, mgr) -> None:
         """Weight sync for TP>1 ATOM: export HF weights to /dev/shm, ATOM reloads."""
         t0 = time.time()
@@ -644,9 +781,15 @@ class RLTrainer:
         if self._actor_wg is None:
             return
 
-        sync_dir = Path(os.environ.get(
-            "LUMENRL_WEIGHT_SYNC_DIR", "/dev/shm/lumenrl_weight_sync",
-        ))
+        backend = str(getattr(self.config.weight_sync, "backend", "auto"))
+        configured_dir = (
+            str(self.config.weight_sync.shared_folder)
+            if backend == "shared_folder"
+            else os.environ.get(
+                "LUMENRL_WEIGHT_SYNC_DIR", "/dev/shm/lumenrl_weight_sync"
+            )
+        )
+        sync_dir = Path(configured_dir)
         sync_dir.mkdir(parents=True, exist_ok=True)
         # Run TP/EP gathers on every actor, but have rank 0 stream bounded
         # shards directly to the shared filesystem.  Returning a 57GB state
@@ -675,12 +818,54 @@ class RLTrainer:
 
         if sleeping:
             rollout_engine.wake(tags=["weights"])
-        mgr.reload_weights_from_path(str(sync_dir))
+        separated = getattr(self, "_rollout_wg", None) is not None
+        if separated and backend != "shared_folder":
+            source_url = str(export_meta.get("weight_url") or "")
+            if not source_url:
+                raise RuntimeError(
+                    "Separated rollout requires a training-node weight URL; "
+                    "the safetensors writer did not publish one."
+                )
+            rollout_sync_dir = os.environ.get(
+                "LUMENRL_ROLLOUT_WEIGHT_SYNC_DIR",
+                "/dev/shm/lumenrl_weight_sync_received",
+            )
+            logger.info(
+                "Weight sync (cross-node): %s -> %s",
+                source_url,
+                rollout_sync_dir,
+            )
+            mgr.reload_weights_from_http(source_url, rollout_sync_dir)
+        else:
+            mgr.reload_weights_from_path(str(sync_dir))
+        self._last_weight_sync_metrics = {
+            "timing/weight_sync_export_s": save_time,
+            "weight_sync/bytes": float(export_meta["total_bytes"]),
+            "weight_sync/backend_shared_folder": (
+                1.0 if backend == "shared_folder" else 0.0
+            ),
+        }
         if sleeping:
             rollout_engine.wake(tags=["kv_cache"])
 
     def _setup_ray_controller(self) -> None:
         """Initialize Ray cluster + worker groups for actor/ref orchestration."""
+        if str(getattr(self.config.weight_sync, "backend", "auto")) == "rdma":
+            rdma_cfg = self.config.weight_sync.rdma
+            os.environ["NCCL_IB_DISABLE"] = "0"
+            os.environ["NCCL_SOCKET_IFNAME"] = str(rdma_cfg.interface)
+            os.environ["NCCL_IB_HCA"] = str(rdma_cfg.hca)
+            os.environ["NCCL_IB_GID_INDEX"] = str(rdma_cfg.gid_index)
+            gdr_mode = str(rdma_cfg.gdr_mode).lower()
+            if gdr_mode == "required":
+                os.environ["NCCL_NET_GDR_LEVEL"] = "PHB"
+            elif gdr_mode == "off":
+                os.environ["NCCL_NET_GDR_LEVEL"] = "LOC"
+            elif gdr_mode != "auto":
+                raise ValueError(
+                    f"weight_sync.rdma.gdr_mode must be off, auto, or required; "
+                    f"got {rdma_cfg.gdr_mode!r}"
+                )
         if RayCluster is None or RayWorkerGroup is None:
             raise RuntimeError("Ray controller modules are unavailable in this environment.")
         if not self._use_atom:
@@ -1769,7 +1954,16 @@ class RLTrainer:
 
     def _collect_rollout_batch(
         self, step: int, num_generations: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, list[int], torch.Tensor, list[str], list[str], torch.Tensor | None]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        list[int],
+        torch.Tensor,
+        list[str],
+        list[str],
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
         """Generate the full (unsharded) rollout batch for one training step.
 
         Handles DAPO dynamic sampling (verl ``filter_groups``): when enabled,
@@ -1779,7 +1973,7 @@ class RLTrainer:
         ``train_global_batch_size // num_generations`` valid prompt groups are
         collected. Returns full-set tensors identical on every rank:
         ``(sequences, seq_mask, prompt_lengths, rewards, responses, gts_expanded,
-        rollout_log_probs)``.
+        rollout_log_probs, rollout_routed_experts)``.
         """
         from lumenrl.algorithms.dapo_sampling import filter_groups_keep_mask
 
@@ -1799,17 +1993,20 @@ class RLTrainer:
                 (getattr(self, "_ray_use_vllm", False) or getattr(self, "_ray_use_atom", False))
                 and self._ray_vllm_engine is not None
             ):
-                seqs, mask, plen, lp = self._rollout_with_ray_vllm(prompts, g)
+                seqs, mask, plen, lp, routes = self._rollout_with_ray_vllm(prompts, g)
             elif self._use_vllm:
                 seqs, mask, plen, lp = self._rollout_with_vllm(prompts, g)
+                routes = None
             elif self._use_atom and self._atom_engine is not None:
                 seqs, mask, plen = self._rollout_with_atom(prompts, g)
                 lp = None
+                routes = None
             else:
                 ids, am = self._tokenize_prompts(prompts)
                 seqs, mask, plen = self._rollout_phase(ids, am, g)
                 lp = None
-            return seqs, mask, plen, lp
+                routes = None
+            return seqs, mask, plen, lp, routes
 
         # Simple (no dynamic sampling) path: one round, return everything.
         if not use_filter:
@@ -1817,7 +2014,7 @@ class RLTrainer:
             self._prompt_cursor += gen_prompts
             if LUMENRL_DEBUG:
                 logger.info("[DBG] _collect_rollout: no-filter path, %d prompts × %d gen", gen_prompts, g)
-            seqs, mask, plen, lp = _one_round(prompts)
+            seqs, mask, plen, lp, routes = _one_round(prompts)
             if LUMENRL_DEBUG:
                 logger.info("[DBG] _collect_rollout: seqs=%s mask=%s plen=%s lp=%s",
                             list(seqs.shape), list(mask.shape), list(plen.shape) if hasattr(plen, 'shape') else len(plen),
@@ -1829,12 +2026,13 @@ class RLTrainer:
                 logger.info("[DBG] _collect_rollout: rewards=%s  acc_mean=%.4f  nonzero_reward=%d/%d",
                             list(rewards.shape), _acc_mean,
                             int((rewards.abs() > 1e-8).sum()), rewards.numel())
-            return seqs, mask, plen, rewards, responses, gts_exp, lp
+            return seqs, mask, plen, rewards, responses, gts_exp, lp, routes
 
         # Dynamic-sampling regeneration loop (verl filter_groups).
         acc_rows: list[torch.Tensor] = []
         acc_mask: list[torch.Tensor] = []
         acc_lp: list[torch.Tensor] = []
+        acc_routes: list[torch.Tensor] = []
         acc_plen: list[int] = []
         acc_rewards: list[torch.Tensor] = []
         acc_gts: list[str] = []
@@ -1850,7 +2048,7 @@ class RLTrainer:
             rounds += 1
             prompts, gts = self._get_prompts_range(self._prompt_cursor, gen_prompts)
             self._prompt_cursor += gen_prompts
-            seqs, mask, plen, lp = _one_round(prompts)
+            seqs, mask, plen, lp, routes = _one_round(prompts)
             gts_exp = [gt for gt in gts for _ in range(g)]
             rewards, _responses, accs = self._compute_rewards_full(seqs, plen, gts_exp)
 
@@ -1863,6 +2061,8 @@ class RLTrainer:
                 acc_rewards.append(rewards[kept_idx])
                 if want_lp and lp is not None:
                     acc_lp.append(lp[kept_idx])
+                if routes is not None:
+                    acc_routes.append(routes[kept_idx])
                 acc_plen.extend([int(plen[i]) for i in kept_idx])
                 acc_gts.extend([gts_exp[i] for i in kept_idx])
                 kept_prompts += len(kept_uids)
@@ -1891,6 +2091,29 @@ class RLTrainer:
         seq_mask = torch.cat([_lpad(t, S_max, 0) for t in acc_mask], dim=0)
         rewards = torch.cat(acc_rewards, dim=0)
         rollout_lp = torch.cat([_lpad(t, S_max - 1, 0.0) for t in acc_lp], dim=0) if acc_lp else None
+        rollout_routes = None
+        if acc_routes:
+            num_layers, topk = acc_routes[0].shape[2:]
+            padded_routes = []
+            for routes in acc_routes:
+                width = S_max - 1
+                if routes.shape[1] < width:
+                    pad = torch.full(
+                        (
+                            routes.shape[0],
+                            width - routes.shape[1],
+                            num_layers,
+                            topk,
+                        ),
+                        -1,
+                        dtype=routes.dtype,
+                        device=routes.device,
+                    )
+                    routes = torch.cat([pad, routes], dim=1)
+                else:
+                    routes = routes[:, routes.shape[1] - width:]
+                padded_routes.append(routes)
+            rollout_routes = torch.cat(padded_routes, dim=0)
 
         # Truncate to exactly train_prompts groups (whole groups of g rows each).
         keep_rows = train_prompts * g
@@ -1901,6 +2124,8 @@ class RLTrainer:
         gts_exp = acc_gts[:keep_rows]
         if rollout_lp is not None:
             rollout_lp = rollout_lp[:keep_rows]
+        if rollout_routes is not None:
+            rollout_routes = rollout_routes[:keep_rows]
 
         responses: list[str] = []
         if self._rank == 0:
@@ -1909,7 +2134,16 @@ class RLTrainer:
                 plen = prompt_lengths[i] if i < len(prompt_lengths) else 0
                 responses.append(self._tokenizer.decode(seq_cpu[i, plen:], skip_special_tokens=True))
 
-        return sequences, seq_mask, prompt_lengths, rewards, responses, gts_exp, rollout_lp
+        return (
+            sequences,
+            seq_mask,
+            prompt_lengths,
+            rewards,
+            responses,
+            gts_exp,
+            rollout_lp,
+            rollout_routes,
+        )
 
     def _set_reshard(self, reshard: bool) -> None:
         """Toggle FSDP2 reshard_after_forward on the actor model."""
@@ -2737,7 +2971,8 @@ class RLTrainer:
             # (filter_groups) + rollout log-probs internally; rewards are
             # computed once on the full set so degenerate groups can be filtered.
             (sequences, seq_mask, prompt_lengths, rewards_full,
-             responses_full, gts_exp_full, rollout_lp_full) = self._collect_rollout_batch(
+             responses_full, gts_exp_full, rollout_lp_full,
+             rollout_routes_full) = self._collect_rollout_batch(
                 step, num_generations,
             )
             gen_time = time.time() - t0
@@ -2774,6 +3009,8 @@ class RLTrainer:
                 rewards_full = rewards_full[_s:_e]
                 if rollout_lp_full is not None:
                     rollout_lp_full = rollout_lp_full[_s:_e]
+                if rollout_routes_full is not None:
+                    rollout_routes_full = rollout_routes_full[_s:_e]
                 if isinstance(prompt_lengths, list):
                     prompt_lengths = prompt_lengths[_s:_e]
                 gts_exp_full = gts_exp_full[_s:_e]
@@ -2847,6 +3084,8 @@ class RLTrainer:
                 _rlp = rollout_lp_full.to(self._device)
                 if _rlp.shape == old_log_probs.shape:
                     _batch_tensors["rollout_log_probs"] = _rlp
+            if rollout_routes_full is not None:
+                _batch_tensors["rollout_routed_experts"] = rollout_routes_full
 
             batch = DataProto(
                 tensors=_batch_tensors,
@@ -3225,6 +3464,7 @@ class RLTrainer:
         role: str,
         want_entropy: bool = False,
         attention_mask: torch.Tensor | None = None,
+        rollout_routed_experts: torch.Tensor | None = None,
     ):
         meta = {"calculate_entropy": True} if want_entropy else {}
         # verl-aligned packed forward on the worker needs the temperature (for
@@ -3239,6 +3479,10 @@ class RLTrainer:
         # ~7x inflated entropy. This is the packed-varlen forward's `attention_mask`.
         if attention_mask is not None:
             req_tensors["attention_mask"] = attention_mask.detach().cpu()
+        if rollout_routed_experts is not None:
+            req_tensors["rollout_routed_experts"] = (
+                rollout_routed_experts.detach().cpu()
+            )
         req = DataProto(tensors=req_tensors, meta=meta)
         role_cfg = self.config.controller.ray.actor if role == "actor" else self.config.controller.ray.ref
         out = wg.dispatch_and_call(
@@ -3338,13 +3582,113 @@ class RLTrainer:
         max_allocated = max(float(s.get("max_allocated_bytes", 0.0)) for s in stats)
         cur_reserved = max(float(s.get("reserved_bytes", 0.0)) for s in stats)
         cur_allocated = max(float(s.get("allocated_bytes", 0.0)) for s in stats)
+        cpu_used = max(float(s.get("cpu_memory_used_bytes", 0.0)) for s in stats)
         gb = 1024.0 ** 3
         return {
             "mem/actor_max_reserved_gb": max_reserved / gb,
             "mem/actor_max_allocated_gb": max_allocated / gb,
             "mem/actor_reserved_gb": cur_reserved / gb,
             "mem/actor_allocated_gb": cur_allocated / gb,
+            "actor/perf/cpu_memory_used_gb": cpu_used / gb,
+            "actor/perf/max_memory_allocated_gb": max_allocated / gb,
+            "actor/perf/max_memory_reserved_gb": max_reserved / gb,
+            "actor/perf/micro_batch_max_reserved_gb": max_reserved / gb,
         }
+
+    def _add_verl_metrics(
+        self,
+        metrics: dict[str, float],
+        batch: DataProto,
+        timing_raw: dict[str, float],
+        prompt_lengths: list[int],
+        response_lengths: list[int],
+    ) -> None:
+        """Populate the metric names used by the AMD-BF16-VERL dashboard."""
+        from lumenrl.trainer.metric_utils import (
+            compute_data_metrics,
+            compute_throughput_metrics,
+            compute_timing_metrics,
+        )
+
+        max_prompt_length = max(
+            0,
+            int(self.config.policy.max_total_sequence_length)
+            - int(self.config.policy.max_response_length),
+        )
+        batch.meta["max_prompt_length"] = max_prompt_length
+        metrics.update(compute_data_metrics(batch, use_critic=self._critic_worker is not None))
+        metrics.update(compute_timing_metrics(batch, timing_raw))
+
+        cluster_gpus = max(
+            1,
+            int(self.config.cluster.num_nodes) * int(self.config.cluster.gpus_per_node),
+        )
+        metrics.update(compute_throughput_metrics(batch, timing_raw, cluster_gpus))
+
+        # Actor aliases expected by verl's default W&B workspace.
+        aliases = {
+            "loss": ("actor/loss", "actor/pg_loss"),
+            "lr": ("actor/lr",),
+            "grad_norm": ("actor/grad_norm",),
+            "entropy": ("actor/entropy",),
+            "ppo_kl": ("actor/ppo_kl",),
+        }
+        for source, targets in aliases.items():
+            if source in metrics:
+                for target in targets:
+                    metrics.setdefault(target, float(metrics[source]))
+
+        metrics.setdefault("perf/mfu/actor", 0.0)
+        metrics.setdefault("perf/mfu/actor_infer", 0.0)
+        metrics["train/num_gen_batches"] = 1.0
+
+        seq_lengths = [
+            float(p + r) for p, r in zip(prompt_lengths, response_lengths)
+        ]
+        if seq_lengths:
+            metrics["global_seqlen/max"] = max(seq_lengths)
+            metrics["global_seqlen/min"] = min(seq_lengths)
+            metrics["global_seqlen/mean"] = sum(seq_lengths) / len(seq_lengths)
+            metrics["global_seqlen/minmax_diff"] = (
+                metrics["global_seqlen/max"] - metrics["global_seqlen/min"]
+            )
+            # The Ray dispatcher partitions the global batch across actor DP
+            # shards. Greedy balancing provides the same workload range used by
+            # the verl workspace without mutating the actual batch order here.
+            dp_mapping = getattr(self._actor_wg, "_dp_rank_mapping", None)
+            dp_size = max(1, len(set(dp_mapping or [0])))
+            loads = [0.0] * dp_size
+            for length in sorted(seq_lengths, reverse=True):
+                idx = min(range(dp_size), key=loads.__getitem__)
+                loads[idx] += length
+            metrics["global_seqlen/balanced_max"] = max(loads)
+            metrics["global_seqlen/balanced_min"] = min(loads)
+
+        # This workload has one model turn and no tools per sample.
+        metrics["num_turns/max"] = 1.0
+        metrics["num_turns/mean"] = 1.0
+        metrics["num_turns/min"] = 1.0
+
+        gen_time = float(timing_raw.get("gen", 0.0))
+        reward_time = float(timing_raw.get("reward", 0.0))
+        for suffix in ("max", "mean", "min"):
+            metrics[f"timing_s/agent_loop/generate_sequences/{suffix}"] = gen_time
+            metrics[f"timing_s/agent_loop/compute_score/{suffix}"] = reward_time
+            metrics[f"timing_s/agent_loop/num_preempted/{suffix}"] = 0.0
+            metrics[f"timing_s/agent_loop/tool_calls/{suffix}"] = 0.0
+        metrics["timing_s/agent_loop/slowest/generate_sequences"] = gen_time
+        metrics["timing_s/agent_loop/slowest/compute_score"] = reward_time
+        metrics["timing_s/agent_loop/slowest/num_preempted"] = 0.0
+        metrics["timing_s/agent_loop/slowest/tool_calls"] = 0.0
+        metrics["timing_s/agent_loop/slowest/prompt_length"] = float(
+            max(prompt_lengths, default=0)
+        )
+        metrics["timing_s/agent_loop/slowest/response_length"] = float(
+            max(response_lengths, default=0)
+        )
+
+        for name in ("save_checkpoint", "start_profile", "stop_profile"):
+            metrics.setdefault(f"timing_s/{name}", 0.0)
 
     @staticmethod
     def _display_step(step: int) -> int:
@@ -3385,11 +3729,13 @@ class RLTrainer:
             # ---- rollout ----
             gen_t0 = time.time()
             rollout_lp = None
+            rollout_routes = None
             if use_ray_rollout:
                 # verl-aligned online rollout across colocated replicas, with
                 # DAPO filter_groups dynamic sampling handled in the collector.
                 (sequences, seq_mask, prompt_lengths, rewards, responses,
-                 ground_truths_expanded, rollout_lp) = self._collect_rollout_batch(step, num_generations)
+                 ground_truths_expanded, rollout_lp,
+                 rollout_routes) = self._collect_rollout_batch(step, num_generations)
                 # free rollout KV so the FSDP training pass has GPU headroom.
                 self._ray_vllm_engine.sleep()
             else:
@@ -3402,6 +3748,7 @@ class RLTrainer:
             _rc_cfg_ray = self.config.quantization.rollout_correction
             _bypass_ray = getattr(_rc_cfg_ray, "bypass_mode", False)
 
+            old_log_prob_t0 = time.time()
             if _bypass_ray and rollout_lp is not None:
                 old_log_probs = rollout_lp
                 entropy_full = None
@@ -3411,7 +3758,10 @@ class RLTrainer:
                 old_log_probs, entropy_full = self._compute_log_probs_with_worker_group(
                     self._actor_wg, sequences, role="actor", want_entropy=True,
                     attention_mask=seq_mask,
+                    rollout_routed_experts=rollout_routes,
                 )
+            old_log_prob_time = time.time() - old_log_prob_t0
+            ref_t0 = time.time()
             if self._ref_wg is not None:
                 ref_log_probs = self._compute_log_probs_with_worker_group(
                     self._ref_wg, sequences, role="ref", attention_mask=seq_mask,
@@ -3419,11 +3769,13 @@ class RLTrainer:
             else:
                 ref_log_probs = torch.zeros_like(old_log_probs)
 
-            ref_time = max(0.0, time.time() - (gen_t0 + gen_time))
+            ref_time = time.time() - ref_t0
+            reward_t0 = time.time()
             if rewards is None:
                 rewards, responses = self._compute_rewards(
                     sequences, prompt_lengths, ground_truths, num_generations,
                 )
+            reward_time = time.time() - reward_t0
             response_mask = self._build_response_mask(sequences, seq_mask, prompt_lengths)
             response_lengths = [int(response_mask[i].sum().item()) for i in range(response_mask.shape[0])]
 
@@ -3437,6 +3789,8 @@ class RLTrainer:
             }
             if rollout_lp is not None:
                 tensors["rollout_log_probs"] = rollout_lp
+            if rollout_routes is not None:
+                tensors["rollout_routed_experts"] = rollout_routes
             batch = DataProto(
                 tensors=tensors,
                 meta={
@@ -3451,9 +3805,16 @@ class RLTrainer:
                     "temperature": float(
                         getattr(self.config.policy.generation.vllm_cfg, "temperature", 1.0) or 1.0
                     ),
+                    # Keep packed training on the same MILES token budget as
+                    # old-logprob inference. Without this, the engine falls
+                    # back to 8192 and creates roughly 4x as many backwards.
+                    "max_token_len_per_gpu": int(
+                        self.config.policy.max_token_len_per_gpu
+                    ),
                 },
             )
 
+            adv_t0 = time.time()
             batch = self._algorithm.compute_advantages(batch)
             batch = apply_rollout_correction(batch, self.config)
 
@@ -3464,6 +3825,7 @@ class RLTrainer:
             if _rc_want_ray:
                 from lumenrl.algorithms.rollout_correction import compute_rollout_correction_and_add_to_batch
                 batch, _rc_metrics_ray = compute_rollout_correction_and_add_to_batch(batch, _rc_cfg_ray)
+            adv_time = time.time() - adv_t0
 
             if use_ray_rollout:
                 # verl-aligned loss normalization: GLOBAL response-token count
@@ -3533,14 +3895,32 @@ class RLTrainer:
             sync_time = time.time() - t_sync
             if sync_time > 1.0:
                 metrics["timing/weight_sync_s"] = sync_time
+            metrics.update(self._last_weight_sync_metrics)
             metrics.update(self._collect_actor_memory_metrics())
 
             # Validation uses the rollout engine too, so run it after the fresh
             # actor weights have been synced and sleep/wake has restored KV cache.
+            val_t0 = time.time()
             val_steps = getattr(self.config, 'val_steps', 0)
             if val_steps > 0 and (step + 1) % val_steps == 0:
                 val_metrics = self.run_validation()
                 metrics.update(val_metrics)
+            val_time = time.time() - val_t0
+
+            timing_raw = {
+                "gen": gen_time,
+                "old_log_prob": old_log_prob_time,
+                "ref": ref_time,
+                "reward": reward_time,
+                "adv": adv_time,
+                "update_actor": train_time,
+                "update_weights": sync_time,
+                "testing": val_time,
+                "step": time.time() - step_start,
+            }
+            self._add_verl_metrics(
+                metrics, batch, timing_raw, prompt_lengths, response_lengths,
+            )
 
             self.last_metrics = metrics
             for k, v in metrics.items():
@@ -3628,7 +4008,7 @@ class RLTrainer:
             # colocated vLLM replicas (self._actor_model is None on the driver, so
             # the torchrun _rollout_phase fallback would crash).
             if getattr(self, "_ray_vllm_engine", None) is not None:
-                sequences, seq_mask, prompt_lengths, _ = self._rollout_with_ray_vllm(
+                sequences, seq_mask, prompt_lengths, _, _ = self._rollout_with_ray_vllm(
                     prompts, num_generations=1, sampling_params=self._ray_eval_sampling_params(),
                 )
             elif self._use_vllm and self._atom_engine is not None:
@@ -3692,10 +4072,27 @@ class RLTrainer:
 
         metrics: dict[str, float] = {
             "val-core/acc/mean@1": float(acc_t.mean()),
+            "val-core/math_dapo/acc/mean@1": float(acc_t.mean()),
+            "val-aux/math_dapo/reward/mean@1": float(scores_t.mean()),
+            "val-aux/math_dapo/score/mean@1": float(scores_t.mean()),
+            "val-aux/num_turns/max": 1.0,
+            "val-aux/num_turns/mean": 1.0,
+            "val-aux/num_turns/min": 1.0,
             "val/score_mean": float(scores_t.mean()),
             "val/response_length_mean": float(lengths_t.mean()),
             "val/num_samples": float(len(all_scores)),
         }
+        self._last_val_generations = [
+            {
+                "response": response,
+                "score": float(score),
+                "accuracy": float(acc),
+                "response_length": int(length),
+            }
+            for response, score, acc, length in zip(
+                all_responses, all_scores, all_acc, all_response_lengths
+            )
+        ]
         if self._rank == 0:
             logger.info(
                 "[eval] step=%d acc=%.4f score_mean=%.4f resp_len=%.1f n=%d",
@@ -3717,6 +4114,14 @@ class RLTrainer:
             except Exception:
                 pass
             self._profiler = None
+        if (
+            self._ray_rollout_mgr is not None
+            and getattr(self._ray_rollout_mgr, "rdma_group_name", None)
+        ):
+            try:
+                self._ray_rollout_mgr.destroy_rdma_weight_group(self._actor_wg)
+            except Exception:
+                logger.exception("Failed to destroy RDMA weight group cleanly")
         if self._actor_wg is not None:
             self._actor_wg.stop()
             self._actor_wg = None

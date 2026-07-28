@@ -150,6 +150,14 @@ class CheckpointCallback(Callback):
         ckpt_root = Path(self.checkpoint_dir)
         step_dir = ckpt_root / f"global_step_{global_step}"
         actor_dir = step_dir / "actor"
+        # Actor shards live on the training node's local filesystem while this
+        # callback runs on the controller node. Prune on the owning node before
+        # writing so checkpoint peak usage never exceeds save_total_limit.
+        trainer._actor_wg.execute_all_sync(
+            "prune_checkpoints",
+            str(ckpt_root),
+            max(0, self.save_total_limit - 1),
+        )
         actor_dir.mkdir(parents=True, exist_ok=True)
         trainer._actor_wg.execute_all_sync("save_checkpoint", str(actor_dir), global_step=global_step)
         meta = {
@@ -162,6 +170,11 @@ class CheckpointCallback(Callback):
         (ckpt_root / "latest_checkpointed_iteration.txt").write_text(str(global_step), encoding="utf-8")
         logger.info("Saved Ray checkpoint to %s (global_step=%d)", step_dir, global_step)
         self._prune_old_ray_checkpoints(ckpt_root)
+        trainer._actor_wg.execute_all_sync(
+            "prune_checkpoints",
+            str(ckpt_root),
+            self.save_total_limit,
+        )
 
     @staticmethod
     def _verify_checkpoint(path: Path, model, opt, step: int) -> None:
@@ -295,10 +308,25 @@ class WandbCallback(Callback):
         "rollout_correction/kl": "core/kl",
         "rollout_corr/kl": "core/kl",
         "mismatch_kl": "core/mismatch_kl",
+        "moe/r3_enabled": "core/r3_enabled",
+        "moe/r3_route_coverage": "core/r3_route_coverage",
+        "moe/r3_route_tokens": "core/r3_route_tokens",
         "entropy": "core/entropy",
         "grad_norm": "core/grad_norm",
         "loss": "core/loss",
         "mem/actor_max_reserved_gb": "core/max_reserved_mem_gb",
+    }
+    _VERL_ALIAS_MAP = {
+        "loss": ("actor/loss", "actor/pg_loss"),
+        "lr": ("actor/lr",),
+        "grad_norm": ("actor/grad_norm",),
+        "entropy": ("actor/entropy",),
+        "ppo_kl": ("actor/ppo_kl",),
+        "mem/actor_max_allocated_gb": ("actor/perf/max_memory_allocated_gb",),
+        "mem/actor_max_reserved_gb": (
+            "actor/perf/max_memory_reserved_gb",
+            "actor/perf/micro_batch_max_reserved_gb",
+        ),
     }
 
     def on_step_end(self, trainer: "RLTrainer", step: int, metrics: dict[str, float]) -> None:
@@ -306,11 +334,39 @@ class WandbCallback(Callback):
             return
         if trainer._rank != 0:
             return
-        # Full detailed metrics under train/, plus a curated core/ group.
-        payload = {f"train/{k}": v for k, v in metrics.items()}
+        # Log verl-compatible names at the root so the AMD-BF16-VERL workspace
+        # panels can be recreated verbatim. Keep the historical train/* aliases
+        # for existing LumenRL dashboards.
+        payload = dict(metrics)
+        payload.update(
+            {
+                f"train/{k}": v
+                for k, v in metrics.items()
+                if not k.startswith(("train/", "val-", "val/"))
+            }
+        )
+        for src, destinations in self._VERL_ALIAS_MAP.items():
+            if src in metrics:
+                for dst in destinations:
+                    payload.setdefault(dst, metrics[src])
         for src, dst in self._CORE_MAP.items():
             if src in metrics and dst not in payload:
                 payload[dst] = metrics[src]
+
+        val_generations = getattr(trainer, "_last_val_generations", None)
+        if val_generations and any(k.startswith("val-") for k in metrics):
+            payload["val/generations"] = self._wandb.Table(
+                columns=["response", "score", "accuracy", "response_length"],
+                data=[
+                    [
+                        row["response"],
+                        row["score"],
+                        row["accuracy"],
+                        row["response_length"],
+                    ]
+                    for row in val_generations
+                ],
+            )
         # 1-based step to align the wandb x-axis with verl (global_steps).
         wstep = step + 1
         payload["train/global_step"] = wstep

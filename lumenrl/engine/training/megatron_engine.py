@@ -53,14 +53,16 @@ LUMENRL_DEBUG = os.environ.get("LUMENRL_DEBUG", "0") in ("1", "true", "True")
 import math  # noqa: E402
 
 try:
-    from flash_attn import flash_attn_func as _flash_attn_func
+    from flash_attn import (
+        flash_attn_func as _flash_attn_func,
+        flash_attn_varlen_func as _flash_attn_varlen_func,
+    )
 except Exception:  # pragma: no cover - flash_attn optional
     _flash_attn_func = None
-
-try:
-    from aiter import flash_attn_varlen_func as _flash_attn_varlen_func
-except Exception:
-    _flash_attn_varlen_func = None
+    try:
+        from aiter import flash_attn_varlen_func as _flash_attn_varlen_func
+    except Exception:
+        _flash_attn_varlen_func = None
 
 
 def _gather_with_stride(
@@ -146,9 +148,6 @@ class FlashSelfAttentionCore(torch.nn.Module):
                     packed_seq_params.cu_seqlens_q.tolist()[:6],
                     packed_seq_params.max_seqlen_q,
                 )
-            needs_grad = torch.is_grad_enabled() and any(
-                t.requires_grad for t in [q, k, v]
-            )
             result = _flash_attn_varlen_func(
                 q, k, v,
                 cu_seqlens_q=packed_seq_params.cu_seqlens_q,
@@ -157,7 +156,6 @@ class FlashSelfAttentionCore(torch.nn.Module):
                 max_seqlen_k=packed_seq_params.max_seqlen_kv,
                 causal=True,
                 softmax_scale=self.softmax_scale,
-                return_lse=needs_grad,
             )
             out = result[0] if isinstance(result, tuple) else result
             if LUMENRL_DEBUG and self.layer_number == 1:
@@ -261,7 +259,9 @@ class MegatronEngine(BaseEngine):
         #   attention_backend="flash"  -> O(L) flash attn instead of O(L^2) local core
         #   log_probs_chunk_size>0     -> memory-efficient fused/chunked token log-prob
         self._attention_backend = str(ec.get("attention_backend") or "unfused").lower()
+        self._use_packed_sequences = bool(ec.get("use_packed_sequences", True))
         self._logprob_chunk_size = int(ec.get("log_probs_chunk_size") or 0)
+        self._r3_enabled = bool(ec.get("moe_enable_routing_replay", False))
 
         etp = ec.get("expert_tensor_parallel_size", None)
         if etp is not None:
@@ -354,7 +354,16 @@ class MegatronEngine(BaseEngine):
                 moe_ffn_hidden_size=moe_ffn if moe_ffn > 0 else hf["intermediate_size"],
                 moe_router_topk=int(hf.get("num_experts_per_tok", 8)),
                 moe_grouped_gemm=bool(ec.get("moe_grouped_gemm", False)),
+                # MCore defaults to allgather, which requires every dense-DP
+                # rank to contribute the same token count. RL batches contain
+                # variable-length responses, so EP ranks can otherwise enter
+                # different collectives and deadlock. All-to-all supports the
+                # variable token splits used by packed GRPO batches.
+                moe_token_dispatcher_type=str(
+                    ec.get("moe_token_dispatcher_type", "alltoall")
+                ),
                 expert_model_parallel_size=ep,
+                moe_enable_routing_replay=self._r3_enabled,
             )
             if shared_ffn > 0:
                 moe_kwargs["moe_shared_expert_intermediate_size"] = shared_ffn
@@ -369,6 +378,9 @@ class MegatronEngine(BaseEngine):
             add_qkv_bias=bool(hf.get("attention_bias", False)),
             normalization="RMSNorm", layernorm_epsilon=hf.get("rms_norm_eps", 1e-6),
             qk_layernorm=True, hidden_dropout=0.0, attention_dropout=0.0,
+            attention_softmax_in_fp32=bool(
+                ec.get("attention_softmax_in_fp32", False)
+            ),
             bf16=True, params_dtype=torch.bfloat16, pipeline_dtype=torch.bfloat16,
             tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp,
             sequence_parallel=bool(ec.get("sequence_parallel", False)),
@@ -573,8 +585,9 @@ class MegatronEngine(BaseEngine):
         if self._rank() == 0:
             n = sum(p.numel() for p in self.module.parameters() if p.requires_grad)
             logger.info(
-                "MegatronEngine: model+distributed-optimizer ready, %d params, dp_size=%d",
-                n, self.get_data_parallel_size(),
+                "MegatronEngine: model+distributed-optimizer ready, %d params, "
+                "dp_size=%d, MILES-R3=%s",
+                n, self.get_data_parallel_size(), self._r3_enabled,
             )
 
     # ------------------------------------------------------------------
@@ -690,6 +703,139 @@ class MegatronEngine(BaseEngine):
             return 0, 0
         return int(idx[0].item()), int(idx.numel())
 
+    # ---- MILES R3: rollout top-k expert-id replay ---------------------
+    def _r3_routes(self, batch: DataProto) -> torch.Tensor | None:
+        routes = batch.tensors.get("rollout_routed_experts")
+        if not self._r3_enabled:
+            return None
+        if routes is None:
+            raise RuntimeError(
+                "moe.r3.enabled=true but rollout_routed_experts is missing. "
+                "R3 must not silently fall back to training-time routing."
+            )
+        if routes.ndim != 4:
+            raise ValueError(
+                "rollout_routed_experts must have shape [batch, seq_len-1, "
+                f"num_layers, top_k], got {tuple(routes.shape)}"
+            )
+        return routes
+
+    def _r3_set_packed_routes(
+        self,
+        routes: torch.Tensor,
+        attention_mask: torch.Tensor,
+        packed,
+    ) -> None:
+        """Load one packed chunk into Megatron's native RouterReplay buffers.
+
+        vLLM captures routes for ``sequence_length - 1`` input positions. The
+        final sequence token and TP-alignment padding do not contribute to the
+        policy loss, but Megatron still routes them, so deterministic valid
+        expert ids are appended for those positions.
+        """
+        from megatron.core.transformer.moe.router_replay import (
+            RouterReplay,
+            RouterReplayAction,
+        )
+
+        instances = RouterReplay.global_router_replay_instances
+        if not instances:
+            raise RuntimeError(
+                "MILES R3 is enabled but Megatron created no RouterReplay "
+                "instances; check moe_enable_routing_replay and the Megatron fork."
+            )
+
+        topk = int(routes.shape[-1])
+        filler = torch.arange(topk, dtype=routes.dtype, device=routes.device)
+        rows: list[torch.Tensor] = []
+        for row in range(routes.shape[0]):
+            start, length = self._real_block(attention_mask[row])
+            if length <= 0:
+                continue
+            real = routes[row, start:start + max(0, length - 1)]
+            if real.shape[0] != max(0, length - 1):
+                raise ValueError(
+                    f"R3 route length mismatch for row {row}: got {real.shape[0]}, "
+                    f"expected {length - 1}"
+                )
+            rows.append(torch.cat(
+                [real, filler.view(1, 1, topk).expand(1, routes.shape[2], topk)],
+                dim=0,
+            ))
+
+        if not rows:
+            raise ValueError("R3 received a packed chunk with no real tokens.")
+        replay = torch.cat(rows, dim=0)
+        total_padded = int(packed.input_ids.shape[-1])
+        if replay.shape[0] < total_padded:
+            pad = filler.view(1, 1, topk).expand(
+                total_padded - replay.shape[0], routes.shape[2], topk,
+            )
+            replay = torch.cat([replay, pad], dim=0)
+        if replay.shape[0] != total_padded:
+            raise ValueError(
+                f"R3 packed token mismatch: routes={replay.shape[0]}, "
+                f"packed={total_padded}"
+            )
+
+        # Sequence parallel scatters the token dimension into contiguous TP
+        # shards before TopKRouter. Replay must use the identical local shard.
+        if bool(getattr(self._tfcfg, "sequence_parallel", False)) and self._tp_size > 1:
+            if replay.shape[0] % self._tp_size:
+                raise ValueError(
+                    f"R3 token count {replay.shape[0]} is not divisible by TP={self._tp_size}"
+                )
+            shard = replay.shape[0] // self._tp_size
+            replay = replay[self._tp_rank * shard:(self._tp_rank + 1) * shard]
+
+        if replay.shape[1] != len(instances):
+            raise ValueError(
+                f"R3 rollout has {replay.shape[1]} MoE layers but this Megatron "
+                f"stage has {len(instances)} RouterReplay instances."
+            )
+        RouterReplay.clear_global_indices()
+        RouterReplay.set_replay_data(
+            # Keep controller/Ray transport compact (int16), but torch.gather
+            # requires integer index tensors in int32/int64 on ROCm.
+            [
+                replay[:, layer, :].to(dtype=torch.int64).contiguous()
+                for layer in range(replay.shape[1])
+            ]
+        )
+        RouterReplay.set_global_router_replay_action(
+            RouterReplayAction.REPLAY_FORWARD
+        )
+
+    @staticmethod
+    def _r3_set_backward() -> None:
+        from megatron.core.transformer.moe.router_replay import (
+            RouterReplay,
+            RouterReplayAction,
+        )
+        RouterReplay.set_global_router_replay_action(
+            RouterReplayAction.REPLAY_BACKWARD
+        )
+
+    @staticmethod
+    def _r3_clear() -> None:
+        from megatron.core.transformer.moe.router_replay import RouterReplay
+        RouterReplay.clear_global_router_replay_action()
+        RouterReplay.clear_global_indices()
+
+    @staticmethod
+    def _r3_metrics(routes: torch.Tensor, attention_mask: torch.Tensor) -> dict[str, float]:
+        num_layers = int(routes.shape[2])
+        expected_positions = int(
+            (attention_mask.sum(dim=1).sub(1).clamp_min(0).sum() * num_layers).item()
+        )
+        valid = (routes >= 0).all(dim=-1)
+        valid_count = int(valid.sum().item())
+        return {
+            "moe/r3_enabled": 1.0,
+            "moe/r3_route_coverage": valid_count / max(1, expected_positions),
+            "moe/r3_route_tokens": float(valid_count // max(1, num_layers)),
+        }
+
     # ---- memory-efficient log-prob helpers (see FlashSelfAttentionCore/#2) ----
     def _token_logprob_train(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """Per-token log-prob with grad. Uses the fused single-buffer CE (optionally
@@ -743,6 +889,8 @@ class MegatronEngine(BaseEngine):
             )
 
         can_pack = (
+            self._use_packed_sequences
+            and
             self._attention_backend == "flash"
             and _flash_attn_varlen_func is not None
         )
@@ -750,6 +898,11 @@ class MegatronEngine(BaseEngine):
         if can_pack:
             return self._engine_compute_log_probs_packed(
                 seqs, am, B, S, want_ent, temperature, batch,
+            )
+        if self._r3_enabled:
+            raise RuntimeError(
+                "MILES R3 currently requires Megatron packed-sequence training "
+                "with flash attention; refusing an inconsistent row-wise forward."
             )
 
         # Fallback: row-by-row forward (unfused attention or no varlen)
@@ -819,6 +972,7 @@ class MegatronEngine(BaseEngine):
 
         max_tok = int(batch.meta.get("max_token_len_per_gpu", 8192) or 8192)
         seq_lens = am.sum(dim=1).long()
+        r3_routes = self._r3_routes(batch)
         print(f"[TRACE] _engine_compute_log_probs_packed: B={B} S={S} max_tok={max_tok} "
               f"seq_lens={seq_lens.tolist()}", flush=True)
 
@@ -857,7 +1011,15 @@ class MegatronEngine(BaseEngine):
                 packed = pack_sequences(ids_chunk, mask_chunk, tp_align=self._tp_size)
                 print(f"[TRACE] packed chunk {ci}: packed done, total_tokens={packed.input_ids.shape[-1]} "
                       f"cu_seqlens={packed.cu_seqlens.tolist()}", flush=True)
-                logits = self._forward_logits_packed(packed)
+                if r3_routes is not None:
+                    self._r3_set_packed_routes(
+                        r3_routes[cs:ce], am[cs:ce], packed,
+                    )
+                try:
+                    logits = self._forward_logits_packed(packed)
+                finally:
+                    if r3_routes is not None:
+                        self._r3_clear()
                 print(f"[TRACE] packed chunk {ci}: forward done, logits={list(logits.shape)}", flush=True)
 
                 if ci >= real_chunk_count:
@@ -885,6 +1047,11 @@ class MegatronEngine(BaseEngine):
 
                 del logits, flat_lp, packed, ids_chunk, mask_chunk
 
+        # Ensure packed forward work is complete before policy collectives.
+        # Keep allocator segments cached: empty_cache() repeatedly tears down
+        # ROCr allocations and can exhaust HSA queue/event resources in long
+        # runs. Expandable segments handle the varying packed shapes.
+        torch.cuda.synchronize()
         tensors = {"log_probs": lp_out, "input_ids": batch["input_ids"]}
         if want_ent:
             tensors["entropy"] = ent_out
@@ -1002,6 +1169,8 @@ class MegatronEngine(BaseEngine):
             )
 
         can_pack = (
+            self._use_packed_sequences
+            and
             self._attention_backend == "flash"
             and _flash_attn_varlen_func is not None
         )
@@ -1015,6 +1184,11 @@ class MegatronEngine(BaseEngine):
                 seqs, am, B, S, algo_name, temperature, bnt, dp, _cfg, t, meta,
             )
         else:
+            if self._r3_enabled:
+                raise RuntimeError(
+                    "MILES R3 currently requires Megatron packed-sequence "
+                    "training with flash attention."
+                )
             if LUMENRL_DEBUG:
                 logger.info("[DBG] engine_update_policy: using row-by-row fallback (attention_backend=%s)",
                             self._attention_backend)
@@ -1149,6 +1323,12 @@ class MegatronEngine(BaseEngine):
 
         max_tok = int(meta.get("max_token_len_per_gpu", 8192) or 8192)
         seq_lens = am.sum(dim=1).long()
+        r3_routes = t.get("rollout_routed_experts")
+        if self._r3_enabled and r3_routes is None:
+            raise RuntimeError(
+                "moe.r3.enabled=true but policy update received no "
+                "rollout_routed_experts."
+            )
 
         chunks: list[tuple[int, int]] = []
         start = 0
@@ -1174,6 +1354,8 @@ class MegatronEngine(BaseEngine):
         loss_accum = 0.0
         ppo_kl_sum = 0.0
         ppo_kl_tok = 0.0
+        pg_clip_sum = 0.0
+        pg_clip_lower_sum = 0.0
         rc_kl_sum = 0.0
         rc_kl_tok = 0.0
         n_rows = 0
@@ -1184,11 +1366,26 @@ class MegatronEngine(BaseEngine):
             ids_chunk = seqs[cs:ce].to("cuda")
             mask_chunk = am[cs:ce].to("cuda")
             packed = pack_sequences(ids_chunk, mask_chunk, tp_align=self._tp_size)
+            if r3_routes is not None:
+                self._r3_set_packed_routes(
+                    r3_routes[cs:ce], am[cs:ce], packed,
+                )
 
             if is_dummy:
-                with torch.no_grad():
-                    self._forward_logits_packed(packed)
-                del packed, ids_chunk, mask_chunk
+                # A padded chunk must execute the same forward *and backward*
+                # collective schedule as a real chunk. EP can span multiple
+                # dense-DP groups, whose token balancing may produce different
+                # real chunk counts. A no-grad forward here lets one group move
+                # on while another is still in MoE backward, deadlocking RCCL.
+                logits = self._forward_logits_packed(packed, model=self._ddp)
+                dummy_loss = logits.sum() * 0.0
+                if r3_routes is not None:
+                    self._r3_set_backward()
+                dummy_loss.backward()
+                if r3_routes is not None:
+                    self._r3_clear()
+                del logits, dummy_loss, packed, ids_chunk, mask_chunk
+                torch.cuda.synchronize()
                 continue
 
             logits = self._forward_logits_packed(packed, model=self._ddp)
@@ -1276,21 +1473,55 @@ class MegatronEngine(BaseEngine):
                         tok = float(mask.sum())
                         ppo_kl_sum += float(((old_lp - row_lp_t) * mask).sum())
                         ppo_kl_tok += tok
+                        neg_kl = torch.clamp(row_lp_t - old_lp, min=-20.0, max=20.0)
+                        ratio = torch.exp(neg_kl)
+                        clip_low = float(_cfg("clip_ratio_low", 0.2))
+                        clip_high = float(_cfg("clip_ratio_high", 0.28))
+                        pg1 = -adv * ratio
+                        pg2 = -adv * torch.clamp(
+                            ratio, 1.0 - clip_low, 1.0 + clip_high,
+                        )
+                        clip1 = torch.maximum(pg1, pg2)
+                        pg_clip_sum += float(((pg2 > pg1).float() * mask).sum())
+                        clip_c = float(_cfg("clip_ratio_c", 0.0))
+                        if clip_c > 0.0:
+                            pg3 = -adv * clip_c
+                            pg_clip_lower_sum += float(
+                                (
+                                    (clip1 > pg3).float()
+                                    * (adv < 0).float()
+                                    * mask
+                                ).sum()
+                            )
                         if rlp is not None:
                             rc_kl_sum += float(((rlp - row_lp_t) * mask).sum())
                             rc_kl_tok += tok
 
             if chunk_loss.requires_grad:
+                if r3_routes is not None:
+                    self._r3_set_backward()
                 chunk_loss.backward()
+            if r3_routes is not None:
+                self._r3_clear()
             del logits, flat_lp, token_log_probs, packed, chunk_loss
+            # Retire each chunk's HIP work before reusing allocator blocks.
+            # Do not empty the allocator cache here: a long run executes
+            # thousands of chunks, and repeatedly releasing segments exhausted
+            # HSA queue/event resources despite ample free VRAM. Expandable
+            # segments handle the varying packed shapes; release once below.
+            torch.cuda.synchronize()
 
-        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
         metrics: dict[str, float] = {
             "loss": loss_accum / max(1, n_rows),
         }
+        if r3_routes is not None:
+            metrics.update(self._r3_metrics(r3_routes, am))
         if ppo_kl_tok > 0:
             metrics["ppo_kl_sum"] = ppo_kl_sum
             metrics["ppo_kl_tok"] = ppo_kl_tok
+            metrics["actor/pg_clipfrac"] = pg_clip_sum / ppo_kl_tok
+            metrics["actor/pg_clipfrac_lower"] = pg_clip_lower_sum / ppo_kl_tok
         if rc_kl_tok > 0:
             metrics["rollout_corr_kl_sum"] = rc_kl_sum
             metrics["rollout_corr_kl_tok"] = rc_kl_tok

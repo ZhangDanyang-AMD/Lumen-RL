@@ -8,8 +8,9 @@
 #   distributed optimizer, flash attention, chunked log-prob,
 #   torch RMSNorm — no apex/TE)
 #
-# Rollout: vLLM AsyncLLM (BF16 weights + FP8 KV cache, TP=2 x 4 replicas,
-#   sleep_level=2)
+# 2-node training/inference separation:
+#   Node 0: vLLM inference (4 replicas x TP=2, 8 GPUs)
+#   Node 1: Megatron training (8 workers, TP=4, EP=8)
 #
 # FP8 per_block_fp8 is NOT used (Qwen3-30B-A3B MoE intermediate=768 causes
 # garbled output with 128x128 block quantization). BF16 weights + FP8 KV cache.
@@ -18,8 +19,23 @@
 #   Mean step 388.50s, AIME accuracy 0.665 -> 0.729
 
 cluster:
-  num_nodes: 1
+  num_nodes: 2
   gpus_per_node: 8
+  ray_address: "auto"
+
+weight_sync:
+  backend: rdma                    # shared_folder | rdma
+  shared_folder: /volumes/oss1/lumenrl_weight_sync/qwen3-30b-a3b
+  bucket_size_mb: 1024
+  timeout_s: 600
+  verify_full_load: true
+  rdma:
+    backend: rccl
+    require_rdma: true
+    hca: mlx5_0
+    interface: ens11np0
+    gid_index: 3
+    gdr_mode: auto
 
 controller:
   ray:
@@ -28,6 +44,14 @@ controller:
     actor:
       num_workers: 8
       dispatch_mode: dp_compute_proto
+      process_on_nodes: [8]
+      topology_tags:
+        node_ip: 172.25.12.3
+    rollout:
+      num_workers: 8
+      process_on_nodes: [8]
+      topology_tags:
+        node_ip: 172.25.12.1
 
 policy:
   model_name: /mnt/raid0/models/Qwen3-30B-A3B
@@ -36,9 +60,10 @@ policy:
   max_total_sequence_length: 9216        # 1024 prompt + 8192 response
   max_response_length: 8192             # MILES: 8k response cap
   train_global_batch_size: 256          # MILES: 32 prompts x 8 generations = 256
-  gen_batch_size: 64                    # over-sample prompts per round
+  gen_batch_size: 32                    # MILES rollout batch: 32 prompts
   train_micro_batch_size: 1
-  max_token_len_per_gpu: 32768           # MILES: --max-tokens-per-gpu 32768
+  max_token_len_per_gpu: 16384           # Stability margin for 192 GiB MI308X allocator/NCCL workspace
+  balance_batch: true                    # MILES: --balance-data
   learning_rate: 1.0e-6
   lr_warmup_steps: 10
   weight_decay: 0.1
@@ -54,13 +79,18 @@ policy:
       expert_tensor_parallel_size: 1    # MILES: ETP=1 (MoE layers no TP, dense layers TP=4)
       num_experts: 128
       moe_grouped_gemm: true
+      moe_token_dispatcher_type: alltoall # Variable-length packed batches require uneven EP token splits
       use_distributed_optimizer: true
+      grad_reduce_in_fp32: true            # MILES: --accumulate-allreduce-grads-in-fp32
+      attention_softmax_in_fp32: true      # MILES train/infer numerical alignment
       sequence_parallel: true
       recompute_granularity: full
       recompute_method: uniform
       recompute_num_layers: 1
       attention_backend: flash
+      use_packed_sequences: true        # MILES packed path; EP all-to-all supports variable token counts
       log_probs_chunk_size: 1024
+      optimizer_cpu_offload: true
     fsdp_cfg:
       param_offload: false
       optimizer_offload: false
@@ -70,8 +100,8 @@ policy:
       transport: ray_http
       ray_http_start_server: false
       tensor_parallel_size: 2            # TP=2: 8 GPUs / 2 = 4 replicas
-      kv_cache_dtype: fp8                # FP8 KV cache (not weight quantization)
-      gpu_memory_utilization: 0.60
+      kv_cache_dtype: auto               # MILES BF16 baseline; FP8 KV amplifies long-context mismatch
+      gpu_memory_utilization: 0.70       # MILES vLLM baseline
       max_model_len: 9216
       dtype: bfloat16
       enforce_eager: false
@@ -80,8 +110,8 @@ policy:
       max_num_seqs: 64
       quantization: ""
       calculate_log_probs: true
-      enable_sleep_mode: true
-      sleep_level: 2
+      enable_sleep_mode: false           # rollout has a dedicated 8-GPU node
+      sleep_level: 0
       update_weights_bucket_megabytes: 2048
       temperature: 1.0
       top_p: 1.0
@@ -106,13 +136,13 @@ quantization:
   rollout_correction:
     rollout_is: token
     rollout_is_threshold: 2.0
-    rollout_is_batch_normalize: false
+    rollout_is_batch_normalize: true      # MILES MIS/TIS keeps corrected gradient scale stable
 
 moe:
   r3:
     enabled: true
-    record_router_logits: true
-    replay_mode: distribution
+    record_router_logits: false          # MILES R3 transports top-k expert ids, not logits
+    replay_mode: hard_assignment         # replay rollout expert ids; recompute router weights
 
 reward:
   type: function
@@ -130,8 +160,8 @@ eval:
 
 checkpointing:
   checkpoint_dir: /mnt/raid0/ckpts/qwen3-30b-a3b-ep8/longrun
-  save_steps: 50
-  save_total_limit: 5
+  save_steps: 5
+  save_total_limit: 3
   resume: true
 
 logger:
@@ -139,7 +169,8 @@ logger:
   log_interval: 1
   wandb:
     project: LumenRL
-    name: qwen3-30b-a3b-grpo-ep8-miles-aligned
+    entity: danyzhan-amd
+    name: qwen3-30b-a3b-vllm-miles-200step-formal-r3-from0
 
-num_training_steps: 1000
+num_training_steps: 200
 seed: 10086

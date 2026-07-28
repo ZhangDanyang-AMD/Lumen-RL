@@ -158,8 +158,14 @@ class MegatronConfig:
     num_experts: Optional[int] = None
     moe_grouped_gemm: bool = False
     moe_use_legacy_grouped_gemm: bool = False
+    # alltoall supports uneven token counts across expert-parallel ranks;
+    # allgather requires equal sequence shapes and can deadlock on RL batches.
+    moe_token_dispatcher_type: str = "alltoall"
     # Distributed optimizer: shard FP32 master + Adam state across DP ranks.
     use_distributed_optimizer: bool = True
+    # MILES numerical-alignment knobs for BF16 training.
+    grad_reduce_in_fp32: bool = False
+    attention_softmax_in_fp32: bool = False
     # Activation recomputation (gradient checkpointing). Needed for long-sequence
     # training: the Megatron local-spec attention (no TE flash) keeps the full
     # O(seq^2) score matrix, so resp=20480 OOMs without recompute. Defaults off.
@@ -169,6 +175,7 @@ class MegatronConfig:
     # Long-sequence memory: flash attention (O(L) vs local O(L^2)) + memory-efficient
     # chunked/fused token log-prob. Both default off (unchanged smoke behavior).
     attention_backend: str = "unfused"           # "flash" | "unfused"
+    use_packed_sequences: bool = True            # varlen flash packing; disable for incompatible ROCm kernels
     log_probs_chunk_size: int = 0                # >0 enables fused/chunked log-prob
     sequence_parallel: bool = False              # TP>1: split LayerNorm/Dropout along seq dim
     expert_tensor_parallel_size: Optional[int] = None  # ETP for MoE layers (None=same as TP)
@@ -307,6 +314,9 @@ class PolicyConfig:
     lr_warmup_steps: int = 10
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.95
+    adam_eps: float = 1e-8
     warmup_ratio: float = 0.0
     min_lr: float = 0.0
     lr_decay_style: str = "cosine"       # constant, linear, cosine, WSD
@@ -657,6 +667,32 @@ class MooncakeTransferConfig:
 
 
 @dataclass
+class RDMAWeightSyncConfig:
+    """RCCL/RoCE transport settings for cross-node policy weight updates."""
+
+    backend: str = "rccl"
+    require_rdma: bool = True
+    hca: str = "mlx5_0"
+    interface: str = "ens11np0"
+    gid_index: int = 3
+    gdr_mode: str = "auto"  # off | auto | required
+
+
+@dataclass
+class WeightSyncConfig:
+    """Policy weight transport between separated training and rollout nodes."""
+
+    # auto preserves the legacy selection; production choices are
+    # shared_folder and rdma.
+    backend: str = "auto"  # auto | shared_folder | rdma
+    shared_folder: str = "/volumes/oss1/lumenrl_weight_sync"
+    bucket_size_mb: int = 1024
+    timeout_s: int = 600
+    verify_full_load: bool = True
+    rdma: RDMAWeightSyncConfig = field(default_factory=RDMAWeightSyncConfig)
+
+
+@dataclass
 class AsyncTrainingConfig:
     """Configuration for fully-async separated rollout + training."""
     enabled: bool = False
@@ -763,6 +799,7 @@ class LumenRLConfig:
     checkpointing: CheckpointConfig = field(default_factory=CheckpointConfig)
     logger: LoggerConfig = field(default_factory=LoggerConfig)
     mooncake: MooncakeTransferConfig = field(default_factory=MooncakeTransferConfig)
+    weight_sync: WeightSyncConfig = field(default_factory=WeightSyncConfig)
     async_training: AsyncTrainingConfig = field(default_factory=AsyncTrainingConfig)
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
     controller: ControllerConfig = field(default_factory=ControllerConfig)

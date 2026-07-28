@@ -125,10 +125,19 @@ class RayWorkerGroup:
         from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
         pgs = []
+        pinned_node_ip = self.pool.topology_tags.get("node_ip", "")
         for node_idx, count in enumerate(self.pool.process_on_nodes):
             if count <= 0:
                 continue
-            bundles = [{"GPU": 1, "CPU": 1} for _ in range(count)]
+            bundles = []
+            for _ in range(count):
+                bundle = {"GPU": 1, "CPU": 1}
+                if pinned_node_ip:
+                    # Ray exposes a unique built-in resource for every node.
+                    # A fractional request pins all STRICT_PACK bundles without
+                    # consuming the whole node resource per worker.
+                    bundle[f"node:{pinned_node_ip}"] = 0.001
+                bundles.append(bundle)
             pg = placement_group(
                 bundles,
                 strategy="STRICT_PACK",
@@ -138,9 +147,10 @@ class RayWorkerGroup:
 
         ray.get([pg.ready() for pg, _ in pgs])
         logger.info(
-            "Created %d placement groups for pool '%s': %s",
+            "Created %d placement groups for pool '%s': %s (node_ip=%s)",
             len(pgs), self.pool.name,
             [(pg.bundle_count, count) for pg, count in pgs],
+            pinned_node_ip or "auto",
         )
 
         RemoteWorker = ray.remote(self.worker_cls)
