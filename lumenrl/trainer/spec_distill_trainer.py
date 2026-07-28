@@ -1537,6 +1537,8 @@ class SpecDistillTrainer:
                         loss_mask = loss_mask.clone()
                         loss_mask[:, :nan_mask.shape[1]][nan_mask] = 0
                         target_hs = target_hs.nan_to_num_(0.0)
+                    if spec_cfg.separate_last_hidden and spec_cfg.draft_type.lower() == "dspark":
+                        aux_hidden = torch.cat([aux_hidden, target_hs], dim=-1)
                     if spec_cfg.separate_last_hidden and self._norm_weight is not None:
                         variance = target_hs.float().pow(2).mean(-1, keepdim=True)
                         target_hs = (
@@ -2200,10 +2202,13 @@ class SpecDistillTrainer:
         target_hs = teacher_data.get("last_hidden_states")
         if target_hs is not None:
             target_hs = target_hs.to(device=self._device, dtype=draft_dtype)
-            if (
-                spec_cfg.separate_last_hidden
-                and self._norm_weight is not None
-            ):
+            # When separate_last_hidden, vLLM splits aux layers: first N-1
+            # go into hidden_states, last goes into last_hidden_states.
+            # DSpark fc expects all N layers concatenated, so rejoin here
+            # (pre-norm). The post-norm version for L1 loss is computed below.
+            if spec_cfg.separate_last_hidden:
+                aux_hidden = torch.cat([aux_hidden, target_hs], dim=-1)
+            if self._norm_weight is not None and spec_cfg.separate_last_hidden:
                 variance = target_hs.float().pow(2).mean(-1, keepdim=True)
                 target_hs = (
                     target_hs.float()
