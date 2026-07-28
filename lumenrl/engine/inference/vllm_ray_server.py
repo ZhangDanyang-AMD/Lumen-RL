@@ -166,12 +166,21 @@ class VLLMRayServer:
         lps = None
         if want_lp and comp.logprobs is not None:
             lps = [float(comp.logprobs[i].get(t).logprob) for i, t in enumerate(tok)]
-        return {
+        out = {
             "text": comp.text,
             "prompt_token_ids": list(final.prompt_token_ids),
             "token_ids": tok,
             "logprobs": lps,
         }
+        # Rollout Routing Replay: the expert ids this engine actually selected,
+        # uint8 [prompt + response - 1, num_layers, top_k]. Row t is the routing
+        # of the forward at position t, i.e. the one that produced token t+1 --
+        # the same alignment as `logprobs`. Present only when the engine was
+        # built with enable_return_routed_experts.
+        routed = getattr(comp, "routed_experts", None)
+        if routed is not None:
+            out["routed_experts"] = routed
+        return out
 
     async def generate_batch(
         self,

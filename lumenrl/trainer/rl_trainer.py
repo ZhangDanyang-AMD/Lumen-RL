@@ -410,6 +410,9 @@ class RLTrainer:
             engine_kwargs["kv_cache_dtype"] = str(vcfg.kv_cache_dtype)
         if vcfg.quantization:
             engine_kwargs["quantization"] = str(vcfg.quantization)
+        if self._r3_rollout_replay:
+            # makes the engine attach the selected expert ids to every completion
+            engine_kwargs["enable_return_routed_experts"] = True
 
         mgr = VLLMReplicaManager(
             self._actor_wg,
@@ -485,6 +488,13 @@ class RLTrainer:
             int(engine_kwargs["tensor_parallel_size"]),
             engine_kwargs.get("online_quant_config"),
         )
+
+    @property
+    def _r3_rollout_replay(self) -> bool:
+        """Whether to carry rollout expert selections into the training forward."""
+        moe = getattr(self.config, "moe", None)
+        r3 = getattr(moe, "r3", None) if moe is not None else None
+        return bool(getattr(r3, "rollout_replay", False))
 
     def _rollout_with_ray_vllm(
         self, prompts: list[str], num_generations: int, sampling_params: dict[str, Any] | None = None,
@@ -562,7 +572,21 @@ class RLTrainer:
         seq_mask = seq_mask.to(self._device)
         if rollout_lp is not None:
             rollout_lp = rollout_lp.to(self._device)
-        return sequences, seq_mask, prompt_lengths, rollout_lp
+
+        # R3: keep the engine's expert selections per row. Ragged rather than a
+        # padded tensor -- [seq, 48, 8] uint8 padded to a common length is 12.7GB
+        # for a long-run batch versus ~350MB kept ragged.
+        ragged: dict[str, list[Any]] = {}
+        if self._r3_rollout_replay:
+            routing = [res.get("routed_experts") for res in results]
+            if any(r is None for r in routing):
+                raise RuntimeError(
+                    "moe.r3.rollout_replay is on but the rollout engine returned no "
+                    "routed_experts; the engine must be built with "
+                    "enable_return_routed_experts=True."
+                )
+            ragged["rollout_routing"] = routing
+        return sequences, seq_mask, prompt_lengths, rollout_lp, ragged
 
     def _ray_sampling_params(self, want_logprobs: bool) -> dict[str, Any]:
         """Sampling params matching _rollout_with_vllm for cross-transport parity."""
@@ -1707,7 +1731,8 @@ class RLTrainer:
 
     def _collect_rollout_batch(
         self, step: int, num_generations: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, list[int], torch.Tensor, list[str], list[str], torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor, list[int], torch.Tensor, list[str], list[str],
+               torch.Tensor | None, dict[str, list[Any]]]:
         """Generate the full (unsharded) rollout batch for one training step.
 
         Handles DAPO dynamic sampling (verl ``filter_groups``): when enabled,
@@ -1733,11 +1758,12 @@ class RLTrainer:
             gen_prompts = train_prompts
 
         def _one_round(prompts: list[str]):
+            rag: dict[str, list[Any]] = {}
             if (
                 (getattr(self, "_ray_use_vllm", False) or getattr(self, "_ray_use_atom", False))
                 and self._ray_vllm_engine is not None
             ):
-                seqs, mask, plen, lp = self._rollout_with_ray_vllm(prompts, g)
+                seqs, mask, plen, lp, rag = self._rollout_with_ray_vllm(prompts, g)
             elif self._use_vllm:
                 seqs, mask, plen, lp = self._rollout_with_vllm(prompts, g)
             elif self._use_atom and self._atom_engine is not None:
@@ -1747,16 +1773,16 @@ class RLTrainer:
                 ids, am = self._tokenize_prompts(prompts)
                 seqs, mask, plen = self._rollout_phase(ids, am, g)
                 lp = None
-            return seqs, mask, plen, lp
+            return seqs, mask, plen, lp, rag
 
         # Simple (no dynamic sampling) path: one round, return everything.
         if not use_filter:
             prompts, gts = self._get_prompts_range(self._prompt_cursor, gen_prompts)
             self._prompt_cursor += gen_prompts
-            seqs, mask, plen, lp = _one_round(prompts)
+            seqs, mask, plen, lp, rag = _one_round(prompts)
             gts_exp = [gt for gt in gts for _ in range(g)]
             rewards, responses, _accs = self._compute_rewards_full(seqs, plen, gts_exp)
-            return seqs, mask, plen, rewards, responses, gts_exp, lp
+            return seqs, mask, plen, rewards, responses, gts_exp, lp, rag
 
         # Dynamic-sampling regeneration loop (verl filter_groups).
         acc_rows: list[torch.Tensor] = []
@@ -1765,6 +1791,7 @@ class RLTrainer:
         acc_plen: list[int] = []
         acc_rewards: list[torch.Tensor] = []
         acc_gts: list[str] = []
+        acc_ragged: dict[str, list[Any]] = {}
         kept_prompts = 0
         rounds = 0
         max_rounds = fg.max_num_gen_batches if fg.max_num_gen_batches > 0 else 10_000
@@ -1777,7 +1804,7 @@ class RLTrainer:
             rounds += 1
             prompts, gts = self._get_prompts_range(self._prompt_cursor, gen_prompts)
             self._prompt_cursor += gen_prompts
-            seqs, mask, plen, lp = _one_round(prompts)
+            seqs, mask, plen, lp, rag = _one_round(prompts)
             gts_exp = [gt for gt in gts for _ in range(g)]
             rewards, _responses, accs = self._compute_rewards_full(seqs, plen, gts_exp)
 
@@ -1792,6 +1819,8 @@ class RLTrainer:
                     acc_lp.append(lp[kept_idx])
                 acc_plen.extend([int(plen[i]) for i in kept_idx])
                 acc_gts.extend([gts_exp[i] for i in kept_idx])
+                for key, rows in rag.items():
+                    acc_ragged.setdefault(key, []).extend(rows[i] for i in kept_idx)
                 kept_prompts += len(kept_uids)
             if self._rank == 0:
                 logger.info(
@@ -1826,6 +1855,7 @@ class RLTrainer:
         rewards = rewards[:keep_rows]
         prompt_lengths = acc_plen[:keep_rows]
         gts_exp = acc_gts[:keep_rows]
+        ragged = {k: v[:keep_rows] for k, v in acc_ragged.items()}
         if rollout_lp is not None:
             rollout_lp = rollout_lp[:keep_rows]
 
@@ -1836,7 +1866,7 @@ class RLTrainer:
                 plen = prompt_lengths[i] if i < len(prompt_lengths) else 0
                 responses.append(self._tokenizer.decode(seq_cpu[i, plen:], skip_special_tokens=True))
 
-        return sequences, seq_mask, prompt_lengths, rewards, responses, gts_exp, rollout_lp
+        return sequences, seq_mask, prompt_lengths, rewards, responses, gts_exp, rollout_lp, ragged
 
     def _set_reshard(self, reshard: bool) -> None:
         """Toggle FSDP2 reshard_after_forward on the actor model."""
@@ -2658,7 +2688,8 @@ class RLTrainer:
             # (filter_groups) + rollout log-probs internally; rewards are
             # computed once on the full set so degenerate groups can be filtered.
             (sequences, seq_mask, prompt_lengths, rewards_full,
-             responses_full, gts_exp_full, rollout_lp_full) = self._collect_rollout_batch(
+             responses_full, gts_exp_full, rollout_lp_full,
+             rollout_ragged) = self._collect_rollout_batch(
                 step, num_generations,
             )
             gen_time = time.time() - t0
@@ -3352,7 +3383,8 @@ class RLTrainer:
                 # verl-aligned online rollout across colocated replicas, with
                 # DAPO filter_groups dynamic sampling handled in the collector.
                 (sequences, seq_mask, prompt_lengths, rewards, responses,
-                 ground_truths_expanded, rollout_lp) = self._collect_rollout_batch(step, num_generations)
+                 ground_truths_expanded, rollout_lp,
+                 rollout_ragged) = self._collect_rollout_batch(step, num_generations)
                 # free rollout KV so the FSDP training pass has GPU headroom.
                 self._ray_vllm_engine.sleep()
             else:
@@ -3360,6 +3392,7 @@ class RLTrainer:
                 sequences, seq_mask, prompt_lengths = self._rollout_with_atom(prompts, num_generations)
                 rewards, responses = None, None
                 ground_truths_expanded = ground_truths * num_generations
+                rollout_ragged = {}
             gen_time = time.time() - gen_t0
 
             old_log_probs, entropy_full = self._compute_log_probs_with_worker_group(
@@ -3406,7 +3439,11 @@ class RLTrainer:
                         getattr(self.config.policy.generation.vllm_cfg, "temperature", 1.0) or 1.0
                     ),
                 },
+                # per-row, variable-length: R3 rollout routing rides here so that
+                # filter_groups selection and the DP split reindex it with the rows
+                ragged=rollout_ragged,
             )
+            batch.check_consistency()
 
             batch = self._algorithm.compute_advantages(batch)
             batch = apply_rollout_correction(batch, self.config)
@@ -3577,7 +3614,7 @@ class RLTrainer:
             # colocated vLLM replicas (self._actor_model is None on the driver, so
             # the torchrun _rollout_phase fallback would crash).
             if getattr(self, "_ray_vllm_engine", None) is not None:
-                sequences, seq_mask, prompt_lengths, _ = self._rollout_with_ray_vllm(
+                sequences, seq_mask, prompt_lengths, _, _ = self._rollout_with_ray_vllm(
                     prompts, num_generations=1, sampling_params=self._ray_eval_sampling_params(),
                 )
             elif self._use_vllm and self._atom_engine is not None:

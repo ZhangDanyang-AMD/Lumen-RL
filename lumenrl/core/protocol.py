@@ -18,12 +18,43 @@ class DataProto:
 
     Supports variable-length (remove-padding) sequences via optional
     ``cu_seqlens`` and ``seq_lens`` metadata tensors.
+
+    ``ragged`` carries per-row payloads that cannot be a rectangular tensor, as a
+    list with one entry per row. It is reindexed by every row operation exactly
+    like ``tensors``, which ``meta`` is not: ``meta`` is shallow-copied unchanged
+    into each chunk, so a per-row payload placed there would both survive
+    ``select_idxs`` with stale ordering and be replicated to every worker.
+    MoE rollout routing is the motivating case -- ``[seq_len, layers, top_k]``
+    per row, which is ~350MB packed for a long-run batch but 12.7GB if padded to
+    a common length.
     """
 
     def __init__(self, tensors: dict[str, torch.Tensor] | None = None,
-                 meta: dict[str, Any] | None = None) -> None:
+                 meta: dict[str, Any] | None = None,
+                 ragged: dict[str, list[Any]] | None = None) -> None:
         self.tensors: dict[str, torch.Tensor] = tensors or {}
         self.meta: dict[str, Any] = meta or {}
+        self.ragged: dict[str, list[Any]] = ragged or {}
+
+    def _ragged_at(self, index) -> dict[str, list[Any]]:
+        """Reindex every ragged column by a sequence of row positions."""
+        if not self.ragged:
+            return {}
+        rows = list(index)
+        return {k: [v[i] for i in rows] for k, v in self.ragged.items()}
+
+    @staticmethod
+    def _ragged_concat(protos: list["DataProto"]) -> dict[str, list[Any]]:
+        keys = [p for p in protos if p.ragged]
+        if not keys:
+            return {}
+        out: dict[str, list[Any]] = {}
+        for k in keys[0].ragged:
+            merged: list[Any] = []
+            for p in protos:
+                merged.extend(p.ragged.get(k, []))
+            out[k] = merged
+        return out
 
     # ------------------------------------------------------------------
     # Variable-length / remove-padding helpers
@@ -72,6 +103,8 @@ class DataProto:
 
     def __len__(self) -> int:
         if not self.tensors:
+            if self.ragged:
+                return len(next(iter(self.ragged.values())))
             return 0
         first_key = next(iter(self.tensors))
         return self.tensors[first_key].shape[0]
@@ -84,7 +117,7 @@ class DataProto:
         return list(self.tensors.keys())
 
     def check_consistency(self) -> None:
-        """Validate that all tensors share the same dim-0 batch size."""
+        """Validate that all tensors and ragged columns share the same row count."""
         if not self.tensors:
             return
         first_key = next(iter(self.tensors))
@@ -95,12 +128,19 @@ class DataProto:
                     "DataProto has inconsistent batch dimensions: "
                     f"{first_key} has {first_size}, {key} has {tensor.shape[0]}"
                 )
+        for key, rows in self.ragged.items():
+            if len(rows) != first_size:
+                raise ValueError(
+                    "DataProto has inconsistent batch dimensions: "
+                    f"{first_key} has {first_size}, ragged {key} has {len(rows)}"
+                )
 
     def to(self, device: str | torch.device) -> "DataProto":
-        """Move all tensors to the given device."""
+        """Move all tensors to the given device (ragged payloads stay put)."""
         return DataProto(
             tensors={k: v.to(device) for k, v in self.tensors.items()},
             meta=self.meta.copy(),
+            ragged={k: list(v) for k, v in self.ragged.items()},
         )
 
     def cpu(self) -> "DataProto":
@@ -147,7 +187,12 @@ class DataProto:
         for key, tensor in self.tensors.items():
             index = norm.to(device=tensor.device)
             out[key] = tensor[index]
-        return DataProto(tensors=out, meta=self.meta.copy())
+        rows = norm.nonzero(as_tuple=True)[0] if norm.dtype == torch.bool else norm
+        return DataProto(
+            tensors=out,
+            meta=self.meta.copy(),
+            ragged=self._ragged_at(int(i) for i in rows.tolist()),
+        )
 
     def split(self, num_chunks: int) -> list["DataProto"]:
         """Split batch into num_chunks equal parts along dim 0."""
@@ -159,7 +204,11 @@ class DataProto:
             start = i * self.batch_size // num_chunks
             end = (i + 1) * self.batch_size // num_chunks
             chunk_tensors = {k: v[start:end] for k, v in self.tensors.items()}
-            result.append(DataProto(tensors=chunk_tensors, meta=self.meta.copy()))
+            result.append(DataProto(
+                tensors=chunk_tensors,
+                meta=self.meta.copy(),
+                ragged={k: v[start:end] for k, v in self.ragged.items()},
+            ))
         return result
 
     @staticmethod
@@ -176,7 +225,11 @@ class DataProto:
             key: torch.cat([p.tensors[key] for p in non_empty], dim=0)
             for key in ref_keys
         }
-        return DataProto(tensors=merged_tensors, meta=non_empty[0].meta.copy())
+        return DataProto(
+            tensors=merged_tensors,
+            meta=non_empty[0].meta.copy(),
+            ragged=DataProto._ragged_concat(non_empty),
+        )
 
     @staticmethod
     def merge(protos: list["DataProto"]) -> "DataProto":
@@ -220,18 +273,24 @@ class DataProto:
                     parts = padded
             merged_tensors[key] = torch.cat(parts, dim=0)
 
-        return DataProto(tensors=merged_tensors, meta=non_empty[0].meta.copy())
+        return DataProto(
+            tensors=merged_tensors,
+            meta=non_empty[0].meta.copy(),
+            ragged=DataProto._ragged_concat(non_empty),
+        )
 
     def select(self, keys: list[str]) -> "DataProto":
         """Return a new DataProto with only the specified tensor keys."""
         return DataProto(
             tensors={k: self.tensors[k] for k in keys if k in self.tensors},
             meta=self.meta.copy(),
+            ragged={k: list(v) for k, v in self.ragged.items()},
         )
 
     def update(self, other: "DataProto") -> None:
-        """Update tensors and meta from another DataProto."""
+        """Update tensors, ragged columns and meta from another DataProto."""
         self.tensors.update(other.tensors)
+        self.ragged.update(other.ragged)
         self.meta.update(other.meta)
 
     def reorder(self, idxs: int | slice | list[int] | torch.Tensor) -> None:
@@ -242,6 +301,8 @@ class DataProto:
         for key, tensor in self.tensors.items():
             index = norm.to(device=tensor.device)
             self.tensors[key] = tensor[index]
+        rows = norm.nonzero(as_tuple=True)[0] if norm.dtype == torch.bool else norm
+        self.ragged = self._ragged_at(int(i) for i in rows.tolist())
 
     def pad_to_divisor(self, size_divisor: int) -> tuple["DataProto", int]:
         """Pad rows so batch size becomes divisible by ``size_divisor``."""
@@ -255,6 +316,7 @@ class DataProto:
             return DataProto(
                 tensors={k: v.clone() for k, v in self.tensors.items()},
                 meta=self.meta.copy(),
+                ragged={k: list(v) for k, v in self.ragged.items()},
             ), 0
 
         pad_size = size_divisor - remainder
@@ -270,6 +332,7 @@ class DataProto:
             return DataProto(
                 tensors={k: v.clone() for k, v in self.tensors.items()},
                 meta=self.meta.copy(),
+                ragged={k: list(v) for k, v in self.ragged.items()},
             )
         keep = max(self.batch_size - pad_size, 0)
         return self.select_idxs(slice(0, keep))
@@ -284,7 +347,17 @@ class DataProto:
                 repeated[key] = tensor.repeat_interleave(repeat_times, dim=0)
             else:
                 repeated[key] = tensor.unsqueeze(0).expand(repeat_times, *tensor.shape).reshape(-1, *tensor.shape[1:])
-        return DataProto(tensors=repeated, meta=self.meta.copy())
+        n = self.batch_size
+        order = (
+            [i for i in range(n) for _ in range(repeat_times)]
+            if interleave else
+            [i for _ in range(repeat_times) for i in range(n)]
+        )
+        return DataProto(
+            tensors=repeated,
+            meta=self.meta.copy(),
+            ragged=self._ragged_at(order),
+        )
 
     def sample_level_repeat(self, repeat_times: list[int] | tuple[int, ...] | torch.Tensor) -> "DataProto":
         """Repeat each row with per-sample repeat factors."""
@@ -310,14 +383,23 @@ class DataProto:
             key: tensor.repeat_interleave(repeats.to(device=tensor.device), dim=0)
             for key, tensor in self.tensors.items()
         }
-        return DataProto(tensors=repeated, meta=self.meta.copy())
+        order = [i for i, r in enumerate(repeats.tolist()) for _ in range(r)]
+        return DataProto(
+            tensors=repeated,
+            meta=self.meta.copy(),
+            ragged=self._ragged_at(order),
+        )
 
     def mini_batches(self, batch_size: int) -> Iterator["DataProto"]:
         """Yield mini-batches of the given size."""
         for start in range(0, self.batch_size, batch_size):
             end = min(start + batch_size, self.batch_size)
             chunk_tensors = {k: v[start:end] for k, v in self.tensors.items()}
-            yield DataProto(tensors=chunk_tensors, meta=self.meta.copy())
+            yield DataProto(
+                tensors=chunk_tensors,
+                meta=self.meta.copy(),
+                ragged={k: v[start:end] for k, v in self.ragged.items()},
+            )
 
     def add_router_distributions(self, layer_idx: int, logits: torch.Tensor) -> None:
         """Add MoE router distribution for a given layer (R3 support)."""

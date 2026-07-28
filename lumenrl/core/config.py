@@ -555,6 +555,18 @@ class R3Config:
     enabled: bool = False
     record_router_logits: bool = True
     replay_mode: str = "distribution"
+    # Rollout Routing Replay (arXiv 2510.11370): take the top-k expert ids the
+    # ROLLOUT engine actually selected and replay them in the training forward
+    # and backward, instead of re-deriving routing from the trainer's own
+    # hidden states. ``enabled`` above is the older trainer-internal replay
+    # (old-logprob forward -> update), which is a different mechanism.
+    #
+    # This is the only thing that removes train/rollout expert-selection flips
+    # rather than making them less likely: on Qwen3-30B-A3B, 6.4% of
+    # (token, layer) decisions change under a mere bf16->fp32 router recompute,
+    # so only ~4% of tokens route identically through all 48 layers, and forcing
+    # the gate to fp32 on both sides measured as no improvement at all.
+    rollout_replay: bool = False
 
 
 @dataclass
