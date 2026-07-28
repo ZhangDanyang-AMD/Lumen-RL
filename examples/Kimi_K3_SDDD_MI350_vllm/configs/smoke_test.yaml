@@ -110,6 +110,12 @@ dataset:
   num_preprocess_workers: 4
   cache_dir: /dev/shm/lumenrl_cache
 
+eval:
+  enabled: true
+  interval: 1
+  num_samples: 8
+  micro_batch_size: 2
+
 reward:
   type: function
   function: math_reward
