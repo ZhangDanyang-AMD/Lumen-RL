@@ -416,6 +416,10 @@ class ATOMReplicaManager:
         logger.info("ATOMReplicaManager: colocation infos = %s", infos)
 
         true_vocab_size = self._get_true_vocab_size()
+        # ATOM's no-eager compilation_config.level>0 rollout needs a live Dynamo, but the
+        # FSDP2 training actors must stay on TORCHDYNAMO_DISABLE=1. Scope the opt-in to the
+        # rollout actors here instead of letting the launcher export it process-tree wide.
+        dynamo_required = self._torch_compile_enabled()
         remote_cls = ray.remote(ATOMRayServer)
         for i, info in enumerate(infos):
             node_id = info["node_id"]
@@ -432,6 +436,8 @@ class ATOMReplicaManager:
             }
             if true_vocab_size is not None:
                 env_vars["LUMENRL_ATOM_TRUE_VOCAB_SIZE"] = str(true_vocab_size)
+            if dynamo_required:
+                env_vars["TORCHDYNAMO_DISABLE"] = "0"
             for key in (
                 "ATOM_ISOLATE_TORCH_COMPILE_CACHE",
                 "ATOM_LOG_LEVEL",
@@ -459,8 +465,19 @@ class ATOMReplicaManager:
             )
             self.servers.append(server)
 
+        logger.info(
+            "ATOMReplicaManager: rollout-scoped TORCHDYNAMO_DISABLE=%s (driver keeps %s)",
+            "0" if dynamo_required else "<inherited>",
+            os.environ.get("TORCHDYNAMO_DISABLE", "<unset>"),
+        )
         ray.get([s.launch.remote() for s in self.servers])
         logger.info("ATOMReplicaManager: launched %d colocated rollout replicas.", len(self.servers))
+
+    def _torch_compile_enabled(self) -> bool:
+        """True when the ATOM engine will run torch.compile (no-eager or level>0)."""
+        comp_cfg = self.engine_kwargs.get("compilation_config") or {}
+        level = int(comp_cfg.get("level", 0) or 0)
+        return level > 0 or not bool(self.engine_kwargs.get("enforce_eager", True))
 
     def _get_true_vocab_size(self) -> Optional[int]:
         try:
@@ -478,10 +495,10 @@ class ATOMReplicaManager:
         if os.getenv("ATOM_ISOLATE_TORCH_COMPILE_CACHE", "0") not in {"1", "true", "TRUE", "yes", "YES"}:
             return kwargs
 
-        comp_cfg = dict(kwargs.get("compilation_config") or {})
-        if int(comp_cfg.get("level", 0) or 0) <= 0 and bool(kwargs.get("enforce_eager", True)):
+        if not self._torch_compile_enabled():
             return kwargs
 
+        comp_cfg = dict(kwargs.get("compilation_config") or {})
         cache_root = os.getenv("ATOM_TORCH_COMPILE_CACHE_ROOT", "/tmp/atom_torch_compile_cache")
         safe_job_id = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in str(job_id))
         comp_cfg["cache_dir"] = os.path.join(cache_root, safe_job_id, f"replica_{replica_rank}")

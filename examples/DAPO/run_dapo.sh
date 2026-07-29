@@ -34,7 +34,15 @@ cd "$RL_ROOT/Lumen-RL"
 
 # ---- 通用 env（BF16/FP8 共用）----
 export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false TORCHDYNAMO_DISABLE=1 HYDRA_FULL_ERROR=1
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True NCCL_TIMEOUT=7200 NCCL_CUMEM_ENABLE=0
+export NCCL_TIMEOUT=7200 NCCL_CUMEM_ENABLE=0
+# Honor a caller-provided PYTORCH_CUDA_ALLOC_CONF, including an explicit empty value
+# (`PYTORCH_CUDA_ALLOC_CONF= ... bash run_dapo.sh`) to drop expandable_segments entirely.
+_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF-expandable_segments:True}"
+if [ -n "$_ALLOC_CONF" ]; then
+  export PYTORCH_CUDA_ALLOC_CONF="$_ALLOC_CONF"
+else
+  unset PYTORCH_CUDA_ALLOC_CONF
+fi
 export HIP_FORCE_DEV_KERNARG=1 HSA_NO_SCRATCH_RECLAIM=1 HSA_DISABLE_FRAGMENT_ALLOCATOR=1 CUDA_DEVICE_MAX_CONNECTIONS=1
 export VLLM_USE_V1=1 VLLM_ENABLE_V1_MULTIPROCESSING=1 VLLM_LOGGING_LEVEL=WARN ATOM_DISABLE_VLLM_PLUGIN=1
 export RAY_DEDUP_LOGS=0 RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
@@ -62,15 +70,26 @@ if [ "$MODE" = "atomfp8" ] || [ "$MODE" = "atom_fp8" ] || \
   unset ATOM_DISABLE_VLLM_PLUGIN
   export LUMENRL_ATOM_AITER_SRC="${LUMENRL_ATOM_AITER_SRC:-$AITER_DIR}"
   export PYTHONPATH="$RL_ROOT/Lumen-RL/examples/DAPO/atom_aiter_shim:$RL_ROOT/Lumen-RL:$AITER_DIR:$LUMEN_DIR:$ATOM_DIR:$USER_PYTHONPATH"
-  # ATOM FP8 正式方案：no-eager + compilation level=3，需开启 dynamo，且每个 colocated
-  # replica 用独立 torch compile cache，避免 8 个 rank0 并发写同一路径触发 Inductor rename race。
-  export TORCHDYNAMO_DISABLE=0 ATOM_ISOLATE_TORCH_COMPILE_CACHE=1
+  # ATOM FP8 正式方案：no-eager + compilation level=3。dynamo 只有 ATOM rollout 需要，
+  # 由 ATOMReplicaManager 通过 Ray runtime_env 注入 TORCHDYNAMO_DISABLE=0，这里保持全局
+  # TORCHDYNAMO_DISABLE=1，避免训练 actor 被动继承。每个 colocated replica 仍用独立
+  # torch compile cache，避免 8 个 rank0 并发写同一路径触发 Inductor rename race。
+  export ATOM_ISOLATE_TORCH_COMPILE_CACHE=1
   export ATOM_TORCH_COMPILE_CACHE_ROOT="${ATOM_TORCH_COMPILE_CACHE_ROOT:-/tmp/atom_torch_compile_cache}"
   export VLLM_ROCM_USE_AITER=0 VLLM_ROCM_USE_AITER_MHA=0 VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=0 VLLM_ROCM_USE_AITER_LINEAR=0
   # Match the vLLM fp8 training-side configuration exactly: standard Lumen FP8
   # blockwise2d linear + norm, no HF attention patch and no rollout-specific
   # early-return path. Rollout is ATOM; actor training stays on the vLLM fp8 path.
-  unset LUMEN_ROLLOUT
+  #
+  # Opt-in exception: a caller-provided LUMEN_ROLLOUT=ATOM (verl FP8 recipe knob)
+  # aligns the actor forward (norm/sdpa/linear/mlp) with ATOM inference. That path
+  # returns early in LumenConfig.enable(), so actor FP8 quantization is skipped and
+  # the actor trains in BF16 regardless of TRAIN_FP8.
+  if [ -z "${LUMEN_ROLLOUT:-}" ]; then
+    unset LUMEN_ROLLOUT
+  else
+    export LUMEN_ROLLOUT
+  fi
   export LUMEN_DISABLE_HF_ATTN_PATCH=1
   if [ "$ATOM_BF16" = "1" ]; then
     # Pure BF16 baseline: keep both actor and ATOM rollout unquantized. Avoid
@@ -136,6 +155,7 @@ patterns = (
     "VLLM::EngineCore",
     "EngineCore",
     "spawn_main",
+    "torch/_inductor/compile_worker",
     "multiprocessing.resource_tracker",
 )
 skip = {os.getpid(), os.getppid()}
