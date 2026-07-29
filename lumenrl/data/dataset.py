@@ -38,7 +38,10 @@ def _init_worker(tokenizer_path, max_length, last_turn_loss_only, min_loss_token
         tokenizer_path, trust_remote_code=True
     )
 
-    if chat_template in ("kimi-k25", "kimi-k3"):
+    if chat_template == "kimi-k3":
+        from lumenrl.data.kimi_k3_parser import KimiK3Parser
+        _worker_state["parser"] = KimiK3Parser(_worker_state["tokenizer"])
+    elif chat_template == "kimi-k25":
         _worker_state["parser"] = KimiK25Parser(_worker_state["tokenizer"])
     else:
         from lumenrl.data.hf_generation_parser import HFGenerationParser
