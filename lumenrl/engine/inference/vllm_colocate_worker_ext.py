@@ -106,6 +106,10 @@ class vLLMColocateWorkerExtension:
         from vllm.platforms import current_platform
 
         from lumenrl.engine.inference.bucketed_weight_transfer import BucketedWeightReceiver
+        from lumenrl.engine.inference.vllm_moe_weight_sync import (
+            FusedMoEWeightRouter,
+            assert_weight_sync_coverage,
+        )
 
         if getattr(self, "device", None) is None:
             dev_type = current_platform.device_type
@@ -171,9 +175,19 @@ class vLLMColocateWorkerExtension:
             device=self.device,
             use_shm=use_shm,
         )
-        receiver.receive_weights(
-            on_bucket_received=lambda weights: model.load_weights(weights)
-        )
+        # transformers 5.x sends MoE experts as fused 3D tensors, whose names
+        # match none of vLLM's per-expert mappings; the router loads those and
+        # everything else goes through vLLM's own load_weights.
+        router = FusedMoEWeightRouter(model)
+        loaded: set[str] = set()
+
+        def _load(weights):
+            passthrough, moe_loaded = router.route(weights)
+            loaded.update(moe_loaded)
+            loaded.update(model.load_weights(passthrough) or ())
+
+        receiver.receive_weights(on_bucket_received=_load)
+        assert_weight_sync_coverage(model, loaded, context="colocate-ipc")
 
         # Some post-load transforms are non-idempotent; run once after all buckets.
         try:
