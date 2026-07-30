@@ -75,6 +75,21 @@ policy:
       top_p: 1.0
       top_k: -1
 
+# Rollout Routing Replay: train on the experts the rollout actually selected.
+# Removes train/rollout expert-selection flips, which are unbiased but large.
+# Measured on the matching smoke: rollout_corr/kl 0.0016 -> 0.00044,
+# mismatch/chi2_seq 1.3e6 -> 1.35, mismatch/abs_diff -40%, +4% step time.
+#
+# NOTE this is necessary but NOT sufficient. A separate bug makes the IPC weight
+# sync silently drop every fused MoE expert tensor (transformers 5.x emits
+# `experts.gate_up_proj`, vLLM only recognises per-expert names), so the rollout
+# engine's experts stay frozen at their disk-loaded values. Until that is fixed,
+# rollout_corr/kl still climbs across a long run -- R3 lowers the level but
+# cannot flatten the slope, because the rollout weights themselves are stale.
+moe:
+  r3:
+    rollout_replay: true
+
 algorithm:
   name: dapo
   adv_estimator: grpo
