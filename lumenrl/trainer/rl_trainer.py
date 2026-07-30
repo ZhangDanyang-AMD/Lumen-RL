@@ -374,11 +374,11 @@ class RLTrainer:
         ``pipeline_model_parallel_size`` / ``context_parallel_size``.
         """
         backend = str(getattr(self.config.policy, "training_backend", "")).lower()
-        if backend not in ("megatron_native", "megatron-native"):
+        if backend not in ("megatron_native", "megatron-native", "megatron"):
             return 1
         try:
             meg = self.config.policy.training.megatron_cfg
-            tp = int(getattr(meg, "tensor_model_parallel_size", 1) or 1)
+            tp = int(getattr(meg, "tensor_model_parallel_size", None) or getattr(meg, "tensor_parallel_size", 1) or 1)
             pp = int(getattr(meg, "pipeline_model_parallel_size", 1) or 1)
             cp = int(getattr(meg, "context_parallel_size", 1) or 1)
         except Exception:

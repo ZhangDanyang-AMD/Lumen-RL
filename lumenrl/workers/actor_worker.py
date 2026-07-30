@@ -52,6 +52,8 @@ class LumenActorWorker(BaseWorker):
             backend_key = "fsdp2"
         elif backend_raw in ("megatron_native", "megatron-native"):
             backend_key = "megatron_native"
+        elif backend_raw in ("megatron",):
+            backend_key = "megatron"
         else:
             raise ValueError(f"Unknown policy.training_backend: {backend_raw}")
 
@@ -183,7 +185,7 @@ class LumenActorWorker(BaseWorker):
                 },
                 "seed": int(policy.get("seed", 42)),
             }
-        elif backend in ("megatron_native", "megatron-native"):
+        elif backend in ("megatron_native", "megatron-native", "megatron"):
             meg_cfg = training_cfg.get("megatron_cfg") or policy.get("megatron_cfg") or {}
             if not isinstance(meg_cfg, dict):
                 from dataclasses import asdict, is_dataclass
@@ -220,7 +222,8 @@ class LumenActorWorker(BaseWorker):
                     get_nested_config(self.config, "moe", "r3", "enabled", default=False)
                 ),
                 "param_offload": meg_cfg.get("param_offload", False),
-                "optimizer_offload": meg_cfg.get("optimizer_offload", False),
+                "optimizer_cpu_offload": meg_cfg.get("optimizer_cpu_offload", meg_cfg.get("optimizer_offload", False)),
+                "optimizer_offload_fraction": meg_cfg.get("optimizer_offload_fraction", 1.0),
                 "grad_offload": meg_cfg.get("grad_offload", False),
                 "seed": int(policy.get("seed", 42)),
                 "dtype": meg_cfg.get("dtype", "bf16"),
