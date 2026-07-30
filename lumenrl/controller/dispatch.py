@@ -273,6 +273,42 @@ DISPATCH_MODE_FN_REGISTRY: dict[DispatchMode, dict[str, DispatchFn | CollectFn]]
 }
 
 
+def dispatch_with_dp_ranks(
+    data: DataProto,
+    num_workers: int,
+    dp_rank_mapping: list[int],
+) -> list[DataProto]:
+    """Split *data* by dp_size unique ranks, route chunk[dp_rank] to each worker.
+
+    verl-aligned: workers with the same dp_rank (e.g. TP peers) receive
+    identical data so TP collectives stay consistent.
+    """
+    if len(dp_rank_mapping) != num_workers:
+        raise ValueError(
+            f"dp_rank_mapping length ({len(dp_rank_mapping)}) != num_workers ({num_workers})"
+        )
+    dp_size = len(set(dp_rank_mapping))
+    chunks = data.split(dp_size)
+    return [chunks[dp_rank_mapping[i]] for i in range(num_workers)]
+
+
+def collect_with_mask(
+    results: list[DataProto],
+    collect_mask: list[bool],
+) -> DataProto:
+    """Merge only the results where collect_mask[i] is True.
+
+    verl-aligned: TP/PP non-source ranks return duplicates; collect_mask
+    filters them out so each DP shard contributes exactly once.
+    """
+    if len(collect_mask) != len(results):
+        raise ValueError(
+            f"collect_mask length ({len(collect_mask)}) != results length ({len(results)})"
+        )
+    filtered = [r for r, keep in zip(results, collect_mask) if keep]
+    return DataProto.merge(filtered)
+
+
 def dispatch_proto(
     data: DataProto,
     num_workers: int,

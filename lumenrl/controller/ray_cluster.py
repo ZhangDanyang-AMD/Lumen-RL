@@ -29,6 +29,7 @@ class ResourcePool:
     max_colocate_count: int = 1
     detached: bool = False
     topology_tags: dict[str, str] = field(default_factory=dict)
+    use_placement_groups: bool = False
 
     def __post_init__(self) -> None:
         if not self.process_on_nodes:
@@ -123,7 +124,8 @@ class RayCluster:
                     detached: bool = False,
                     topology_tags: Optional[dict[str, str]] = None) -> ResourcePool:
         """Create a named resource pool."""
-        process_layout = process_on_nodes[:] if process_on_nodes is not None else [num_gpus]
+        explicit_pg = process_on_nodes is not None
+        process_layout = process_on_nodes[:] if explicit_pg else [num_gpus]
         pool = ResourcePool(
             name=name,
             num_gpus=num_gpus,
@@ -133,6 +135,7 @@ class RayCluster:
             max_colocate_count=max_colocate_count,
             detached=detached,
             topology_tags=dict(topology_tags or {}),
+            use_placement_groups=explicit_pg,
         )
         self._pools[name] = pool
         logger.info(

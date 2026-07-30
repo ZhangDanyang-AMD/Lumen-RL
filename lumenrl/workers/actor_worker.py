@@ -4,8 +4,15 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import resource
+import shutil
 from pathlib import Path
 from typing import Any
+
+# base_worker must be imported before torch so that HIP_VISIBLE_DEVICES
+# is set before HIP initialization (see base_worker.py module-level code).
+from lumenrl.workers.base_worker import BaseWorker, get_nested_config
 
 import torch
 import torch.nn.functional as F
@@ -18,7 +25,6 @@ from lumenrl.algorithms.loss_functions import (
 from lumenrl.core.protocol import DataProto
 from lumenrl.core.types import AlgorithmName, TrainingBackend
 from lumenrl.engine.training.base_engine import BaseEngine, EngineRegistry
-from lumenrl.workers.base_worker import BaseWorker, get_nested_config
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +85,19 @@ class LumenActorWorker(BaseWorker):
             )
 
         self._engine.initialize()
-        self._log.info("LumenActorWorker: initialized %s engine.", backend_key)
+
+        self._dispatch_dp_rank = self._engine.get_data_parallel_rank()
+        self._is_collect = self._engine.is_mp_src_rank_with_outputs()
+        self._log.info(
+            "LumenActorWorker: initialized %s engine (dp_rank=%d, is_collect=%s).",
+            backend_key, self._dispatch_dp_rank, self._is_collect,
+        )
+
+    def get_dp_rank(self) -> int:
+        return getattr(self, "_dispatch_dp_rank", self.rank)
+
+    def get_is_collect(self) -> bool:
+        return getattr(self, "_is_collect", True)
 
     def _probe_forward_entropy(self, model_name: str) -> None:
         """One-time sanity probe: entropy of the FSDP forward on a fixed clean
@@ -170,16 +188,16 @@ class LumenActorWorker(BaseWorker):
             if not isinstance(meg_cfg, dict):
                 from dataclasses import asdict, is_dataclass
                 meg_cfg = asdict(meg_cfg) if is_dataclass(meg_cfg) else dict(vars(meg_cfg))
+            r3_cfg = get_nested_config(self.config, "moe", "r3", default={}) or {}
+            if not isinstance(r3_cfg, dict):
+                from dataclasses import asdict, is_dataclass
+                r3_cfg = asdict(r3_cfg) if is_dataclass(r3_cfg) else dict(vars(r3_cfg))
             return {
-                "tensor_model_parallel_size": meg_cfg.get("tensor_model_parallel_size", 1),
-                "pipeline_model_parallel_size": meg_cfg.get("pipeline_model_parallel_size", 1),
+                "tensor_model_parallel_size": meg_cfg.get("tensor_model_parallel_size") or meg_cfg.get("tensor_parallel_size", 1),
+                "pipeline_model_parallel_size": meg_cfg.get("pipeline_model_parallel_size") or meg_cfg.get("pipeline_parallel_size", 1),
                 "context_parallel_size": meg_cfg.get("context_parallel_size", 1),
-                "expert_model_parallel_size": meg_cfg.get("expert_model_parallel_size", 1),
+                "expert_model_parallel_size": meg_cfg.get("expert_model_parallel_size") or meg_cfg.get("expert_parallel_size", 1),
                 "sequence_parallel": meg_cfg.get("sequence_parallel", False),
-                # MoE / Expert Parallel: forwarded to the native engine, which only
-                # consumes them when the HF config is detected as MoE (dense path
-                # ignores every ``moe_*``/``num_experts`` field). ``None`` means
-                # "auto-derive from the HF config".
                 "num_experts": meg_cfg.get("num_experts", None),
                 "moe_grouped_gemm": meg_cfg.get("moe_grouped_gemm", True),
                 "expert_tensor_parallel_size": meg_cfg.get("expert_tensor_parallel_size", None),
@@ -194,12 +212,12 @@ class LumenActorWorker(BaseWorker):
                 "moe_router_bias_update_rate": meg_cfg.get("moe_router_bias_update_rate", None),
                 "moe_token_dispatcher_type": meg_cfg.get("moe_token_dispatcher_type", "alltoall"),
                 "moe_permute_fusion": meg_cfg.get("moe_permute_fusion", False),
-                # R3 routing replay: record router logits during the old-logprob
-                # forward and replay them during the update so the importance ratio
-                # is not polluted by router drift (opt-in via moe.r3.enabled).
                 "r3_enabled": bool(
                     get_nested_config(self.config, "moe", "r3", "enabled", default=False)
                     or meg_cfg.get("r3_enabled", False)
+                ),
+                "moe_enable_routing_replay": bool(
+                    get_nested_config(self.config, "moe", "r3", "enabled", default=False)
                 ),
                 "param_offload": meg_cfg.get("param_offload", False),
                 "optimizer_offload": meg_cfg.get("optimizer_offload", False),
@@ -207,27 +225,34 @@ class LumenActorWorker(BaseWorker):
                 "seed": int(policy.get("seed", 42)),
                 "dtype": meg_cfg.get("dtype", "bf16"),
                 "use_distributed_optimizer": meg_cfg.get("use_distributed_optimizer", False),
-                # Activation recomputation for long sequences.
+                "grad_reduce_in_fp32": meg_cfg.get("grad_reduce_in_fp32", False),
+                "attention_softmax_in_fp32": meg_cfg.get("attention_softmax_in_fp32", False),
                 "recompute_granularity": meg_cfg.get("recompute_granularity", None),
                 "recompute_method": meg_cfg.get("recompute_method", None),
                 "recompute_num_layers": meg_cfg.get("recompute_num_layers", None),
-                # Memory-efficient chunked/fused log-prob.
+                "attention_backend": meg_cfg.get("attention_backend", "unfused"),
+                "use_packed_sequences": meg_cfg.get("use_packed_sequences", True),
                 "log_probs_chunk_size": meg_cfg.get("log_probs_chunk_size", 0),
-                # Dynamic-batch packing through TE packed-sequence attention.
                 "enable_dynamic_batch": meg_cfg.get("enable_dynamic_batch", False),
                 "max_tokens_per_gpu": meg_cfg.get("max_tokens_per_gpu", 0),
+                "num_layers_in_first_pipeline_stage": meg_cfg.get("num_layers_in_first_pipeline_stage"),
+                "num_layers_in_last_pipeline_stage": meg_cfg.get("num_layers_in_last_pipeline_stage"),
             }
         return {}
 
     def _build_optimizer_config(self, policy: dict) -> dict[str, Any]:
         lr = float(policy.get("learning_rate", policy.get("lr", 1e-6)))
-        return {
+        cfg = {
             "lr": lr,
             "weight_decay": float(policy.get("weight_decay", 0.01)),
             "clip_grad": float(policy.get("max_grad_norm", 1.0)),
             "lr_warmup_steps": int(policy.get("lr_warmup_steps", 10)),
             "lr_warmup_steps_ratio": float(policy.get("warmup_ratio", 0.0)),
         }
+        for key in ("adam_beta1", "adam_beta2", "adam_eps"):
+            if key in policy:
+                cfg[key] = float(policy[key])
+        return cfg
 
     def _build_model_config(self, policy: dict) -> dict[str, Any]:
         return {
@@ -269,9 +294,6 @@ class LumenActorWorker(BaseWorker):
         # Megatron backend owns its own (GPTModel) forward + logprob path.
         if hasattr(self._engine, "engine_compute_log_probs"):
             out = self._engine.engine_compute_log_probs(batch)
-            # Every TP/PP/CP member ran the collective forward on the same data.
-            # The engine designates one rank after CP reconstruction so the
-            # controller's DP merge does not duplicate this group's rows.
             src = getattr(self._engine, "is_mp_src_rank_with_outputs", None)
             if src is not None and not src():
                 return DataProto(meta=dict(batch.meta))
@@ -347,10 +369,11 @@ class LumenActorWorker(BaseWorker):
         with self._engine.eval_mode():
             with torch.no_grad():
                 for i in range(n_iters):
-                    lo, hi = chunks[min(i, n_rows - 1)]  # padding reuses the last chunk
+                    lo, hi = chunks[min(i, n_rows - 1)]
                     ids_row = sequences[lo:hi]
                     mask_row = am[lo:hi]
-                    packed = pack_sequences(ids_row, mask_row)
+                    _tp = getattr(self._engine, "_tp_size", 1) if self._engine is not None else 1
+                    packed = pack_sequences(ids_row, mask_row, tp_align=_tp)
                     r3_idx, r3_valid = self._pack_routing_chunk(
                         routing_rows[lo:hi] if routing_rows else None, packed,
                     )
@@ -580,23 +603,27 @@ class LumenActorWorker(BaseWorker):
         """Reset per-step CUDA/HIP peak memory counters for this actor rank."""
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
-            torch.cuda.empty_cache()
         return True
 
     def get_memory_stats(self) -> dict[str, float]:
         """Return current-step peak memory counters for this actor rank."""
+        # Linux reports ru_maxrss in KiB. Keep this alongside HIP memory so the
+        # controller can emit the same actor/perf memory family as verl.
+        cpu_memory_used_bytes = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024.0
         if not torch.cuda.is_available():
             return {
                 "max_reserved_bytes": 0.0,
                 "max_allocated_bytes": 0.0,
                 "reserved_bytes": 0.0,
                 "allocated_bytes": 0.0,
+                "cpu_memory_used_bytes": cpu_memory_used_bytes,
             }
         return {
             "max_reserved_bytes": float(torch.cuda.max_memory_reserved()),
             "max_allocated_bytes": float(torch.cuda.max_memory_allocated()),
             "reserved_bytes": float(torch.cuda.memory_reserved()),
             "allocated_bytes": float(torch.cuda.memory_allocated()),
+            "cpu_memory_used_bytes": cpu_memory_used_bytes,
         }
 
     def _policy_loss_fn(self, model_output, data):
@@ -744,9 +771,241 @@ class LumenActorWorker(BaseWorker):
         params, _ = self._engine.get_per_tensor_param()
         out: dict[str, torch.Tensor] = {}
         for name, param in params:
+            # Megatron collectives inside get_per_tensor_param() must run on
+            # every rank, but returning a complete CPU state from every Ray
+            # actor multiplies host/object-store usage by world size.  The
+            # controller only consumes states[0], so nonzero ranks participate
+            # in the generator collectives and discard the resulting tensors.
+            if self.rank != 0:
+                continue
             full = param.full_tensor() if isinstance(param, DTensor) else param
             out[name] = full.detach().cpu()
         return out
+
+    def get_rdma_rendezvous(self, interface: str) -> dict[str, Any]:
+        """Return an interface address and free TCPStore port on this actor."""
+        import fcntl
+        import socket
+        import struct
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            packed = struct.pack("256s", interface[:15].encode("utf-8"))
+            address = socket.inet_ntoa(
+                fcntl.ioctl(sock.fileno(), 0x8915, packed)[20:24]
+            )
+        finally:
+            sock.close()
+        return {"address": address, "port": self.find_free_port()}
+
+    def rdma_preflight(self, interface: str, hca: str) -> dict[str, Any]:
+        from pathlib import Path
+
+        uverbs = sorted(Path("/dev/infiniband").glob("uverbs*"))
+        hca_path = Path("/sys/class/infiniband") / hca
+        if not uverbs or not hca_path.exists():
+            raise RuntimeError(
+                f"RDMA unavailable in actor container: uverbs={uverbs}, hca={hca}"
+            )
+        rendezvous = self.get_rdma_rendezvous(interface)
+        return {
+            "interface": interface,
+            "hca": hca,
+            "uverbs": len(uverbs),
+            "address": rendezvous["address"],
+        }
+
+    def init_rdma_weight_group(
+        self,
+        master_addr: str,
+        master_port: int,
+        world_size: int,
+        group_name: str,
+        timeout_s: int = 600,
+    ) -> bool:
+        """Join the independent RCCL weight group as source rank zero."""
+        from datetime import timedelta
+
+        from lumenrl.utils.independent_process_group import (
+            init_independent_process_group,
+        )
+
+        if self.rank != 0:
+            raise RuntimeError("only actor rank zero may source RDMA weights")
+        existing = getattr(self, "_rdma_weight_group", None)
+        if existing is not None:
+            return True
+        self._rdma_weight_group = init_independent_process_group(
+            backend="nccl",
+            init_method=f"tcp://{master_addr}:{master_port}",
+            timeout=timedelta(seconds=int(timeout_s)),
+            world_size=int(world_size),
+            rank=0,
+            group_name=group_name,
+        )
+        self._rdma_weight_group_name = group_name
+        logger.info(
+            "Actor rank 0 joined RDMA weight group %s at %s:%d (world=%d)",
+            group_name,
+            master_addr,
+            master_port,
+            world_size,
+        )
+        return True
+
+    def send_weights_rdma(
+        self,
+        version: int,
+        bucket_size_mb: int,
+    ) -> dict[str, Any]:
+        """Collect Megatron HF tensors on all ranks; rank zero broadcasts them."""
+        if self._engine is None:
+            raise RuntimeError("init_model() must be called before RDMA weight sync")
+        params, _ = self._engine.get_per_tensor_param()
+        if self.rank != 0:
+            # Consume the conversion iterator on every rank. Megatron TP/EP
+            # collectives in get_per_tensor_param have already run collectively.
+            for _ in params:
+                pass
+            return {"writer": False}
+
+        group = getattr(self, "_rdma_weight_group", None)
+        if group is None:
+            raise RuntimeError("RDMA weight group is not initialized")
+        from lumenrl.engine.inference.rdma_weight_transfer import send_weight_stream
+
+        stats = send_weight_stream(
+            group,
+            params,
+            bucket_size_bytes=int(bucket_size_mb) * 1024 * 1024,
+            version=int(version),
+        )
+        stats["writer"] = True
+        logger.info("RDMA weight broadcast complete: %s", stats)
+        return stats
+
+    def destroy_rdma_weight_group(self) -> bool:
+        group = getattr(self, "_rdma_weight_group", None)
+        if group is not None:
+            import torch.distributed as dist
+
+            dist.destroy_process_group(group)
+            self._rdma_weight_group = None
+        return True
+
+    def export_state_dict_safetensors(
+        self,
+        sync_dir: str,
+        max_shard_bytes: int = 4 * 1024 * 1024 * 1024,
+    ) -> dict[str, Any]:
+        """Collectively export HF weights without returning them through Ray.
+
+        Every rank consumes the parameter generator so Megatron TP/EP
+        collectives make progress.  Rank 0 streams bounded CPU shards directly
+        to the shared filesystem; other ranks discard each gathered tensor.
+        """
+        if self._engine is None:
+            raise RuntimeError("init_model() must be called before exporting weights.")
+
+        import json
+
+        from safetensors.torch import save_file
+
+        output_dir = Path(sync_dir)
+        is_writer = self.rank == 0
+        if is_writer:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            for old in output_dir.glob("model-*.safetensors"):
+                old.unlink()
+
+        params, _ = self._engine.get_per_tensor_param()
+        shard: dict[str, torch.Tensor] = {}
+        shard_keys: list[list[str]] = []
+        temp_paths: list[Path] = []
+        current_bytes = 0
+        total_bytes = 0
+        num_params = 0
+
+        def flush_shard() -> None:
+            nonlocal shard, current_bytes
+            if not shard:
+                return
+            idx = len(temp_paths) + 1
+            path = output_dir / f"model-{idx:05d}.safetensors.tmp"
+            save_file(shard, str(path))
+            temp_paths.append(path)
+            shard_keys.append(list(shard))
+            shard = {}
+            current_bytes = 0
+
+        for name, param in params:
+            if not is_writer:
+                continue
+            tensor = param.detach().to("cpu").contiguous()
+            tensor_bytes = tensor.numel() * tensor.element_size()
+            if shard and current_bytes + tensor_bytes > max_shard_bytes:
+                flush_shard()
+            shard[name] = tensor
+            current_bytes += tensor_bytes
+            total_bytes += tensor_bytes
+            num_params += 1
+        if is_writer:
+            flush_shard()
+
+            weight_map: dict[str, str] = {}
+            shard_count = len(temp_paths)
+            for idx, (temp_path, keys) in enumerate(zip(temp_paths, shard_keys), 1):
+                filename = f"model-{idx:05d}-of-{shard_count:05d}.safetensors"
+                temp_path.replace(output_dir / filename)
+                for key in keys:
+                    weight_map[key] = filename
+
+            index = {
+                "metadata": {"total_size": total_bytes},
+                "weight_map": weight_map,
+            }
+            (output_dir / "model.safetensors.index.json").write_text(
+                json.dumps(index, indent=2)
+            )
+
+        weight_url = self._ensure_weight_http_server(output_dir) if is_writer else ""
+        return {
+            "writer": is_writer,
+            "num_params": num_params,
+            "total_bytes": total_bytes,
+            "num_shards": len(temp_paths),
+            "weight_url": weight_url,
+        }
+
+    def _ensure_weight_http_server(self, output_dir: Path) -> str:
+        """Expose exported shards to rollout nodes without assuming shared storage."""
+        server = getattr(self, "_weight_http_server", None)
+        server_root = getattr(self, "_weight_http_root", None)
+        if server is None or server_root != output_dir:
+            import functools
+            import http.server
+            import threading
+
+            class _QuietHandler(http.server.SimpleHTTPRequestHandler):
+                def log_message(self, _format, *_args) -> None:
+                    return
+
+            handler = functools.partial(_QuietHandler, directory=str(output_dir))
+            server = http.server.ThreadingHTTPServer(("0.0.0.0", 0), handler)
+            thread = threading.Thread(
+                target=server.serve_forever,
+                name="lumen-weight-http",
+                daemon=True,
+            )
+            thread.start()
+            self._weight_http_server = server
+            self._weight_http_root = output_dir
+            self._weight_http_thread = thread
+
+        import ray
+
+        host = ray.util.get_node_ip_address()
+        return f"http://{host}:{server.server_port}"
 
     def save_checkpoint(self, local_path: str, global_step: int = 0) -> bool:
         """Save this actor rank's sharded training state.
@@ -774,6 +1033,10 @@ class LumenActorWorker(BaseWorker):
         torch.save(module.state_dict(), path / f"model_world_size_{world}_rank_{rank}.pt")
         if optimizer is not None:
             torch.save(optimizer.state_dict(), path / f"optim_world_size_{world}_rank_{rank}.pt")
+            if hasattr(optimizer, "save_parameter_state"):
+                optimizer.save_parameter_state(
+                    str(path / f"optim_parameter_state_world_size_{world}_rank_{rank}.pt")
+                )
         extra = {
             "global_step": int(global_step),
             "lr_scheduler": scheduler.state_dict() if scheduler is not None else None,
@@ -786,6 +1049,28 @@ class LumenActorWorker(BaseWorker):
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
         return True
+
+    def prune_checkpoints(self, checkpoint_root: str, max_to_keep: int) -> list[str]:
+        """Prune actor shards on the node-local filesystem that owns them."""
+        if int(self.rank) != 0:
+            return []
+        root = Path(checkpoint_root)
+        if not root.is_dir():
+            return []
+        pattern = re.compile(r"global_step_(\d+)$")
+        checkpoints: list[tuple[int, Path]] = []
+        for child in root.iterdir():
+            match = pattern.match(child.name)
+            if child.is_dir() and match:
+                checkpoints.append((int(match.group(1)), child))
+        checkpoints.sort(key=lambda item: item[0])
+        removed: list[str] = []
+        while len(checkpoints) > max(0, int(max_to_keep)):
+            _, old = checkpoints.pop(0)
+            shutil.rmtree(old)
+            removed.append(str(old))
+            logger.info("Pruned actor-node checkpoint: %s", old)
+        return removed
 
     def load_checkpoint(self, local_path: str) -> int:
         """Load this actor rank's sharded training state and return global_step."""
@@ -804,13 +1089,31 @@ class LumenActorWorker(BaseWorker):
 
         model_path = path / f"model_world_size_{world}_rank_{rank}.pt"
         optim_path = path / f"optim_world_size_{world}_rank_{rank}.pt"
+        optim_parameter_path = (
+            path / f"optim_parameter_state_world_size_{world}_rank_{rank}.pt"
+        )
         extra_path = path / f"extra_state_world_size_{world}_rank_{rank}.pt"
         if not model_path.exists():
             raise FileNotFoundError(f"Missing actor checkpoint shard: {model_path}")
 
         module.load_state_dict(torch.load(model_path, map_location="cpu", weights_only=False))
-        if optimizer is not None and optim_path.exists():
+        has_parameter_state = any(path.glob("optim_parameter_state_world_size_*.pt"))
+        if optimizer is not None and optim_path.exists() and has_parameter_state:
             optimizer.load_state_dict(torch.load(optim_path, map_location="cpu", weights_only=False))
+        if optimizer is not None and has_parameter_state and hasattr(
+            optimizer, "load_parameter_state"
+        ):
+            optimizer.load_parameter_state(str(optim_parameter_path))
+        if optimizer is not None and hasattr(optimizer, "reload_model_params"):
+            # Mixed/distributed optimizers keep FP32 main parameters separate
+            # from the BF16 module. A module-only legacy checkpoint must copy
+            # restored weights into those main parameters before the next step.
+            optimizer.reload_model_params()
+            if not has_parameter_state:
+                logger.warning(
+                    "Checkpoint has no distributed optimizer parameter state; "
+                    "reinitialized optimizer main parameters from model weights."
+                )
         global_step = 0
         if extra_path.exists():
             extra = torch.load(extra_path, map_location="cpu", weights_only=False)

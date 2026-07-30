@@ -94,12 +94,92 @@ class vLLMColocateWorkerExtension:
         _monkey_patch_compute_logits(model, vocab_size)
         logger.info("monkey_patch_model: compute_logits OOV mask (vocab=%d)", vocab_size)
 
-        # MoE only: match the training side's fp32 router so top-k expert
-        # selection agrees. Must stay in sync with the trainer-side patch in
-        # lumenrl/engine/training/fsdp_backend.py.
         from lumenrl.moe.router_precision import enable_fp32_moe_router
 
         enable_fp32_moe_router(model)
+
+    def init_rdma_weight_group(
+        self,
+        master_addr: str,
+        master_port: int,
+        base_rank: int,
+        world_size: int,
+        group_name: str,
+        timeout_s: int = 600,
+    ) -> bool:
+        """Join an isolated RCCL weight-broadcast group."""
+        from datetime import timedelta
+
+        from lumenrl.utils.independent_process_group import (
+            init_independent_process_group,
+        )
+
+        groups = getattr(self, "_rdma_weight_groups", None)
+        if groups is None:
+            groups = {}
+            self._rdma_weight_groups = groups
+        if group_name in groups:
+            return True
+        rank = int(base_rank) + int(self.local_rank)
+        groups[group_name] = init_independent_process_group(
+            backend="nccl",
+            init_method=f"tcp://{master_addr}:{master_port}",
+            timeout=timedelta(seconds=int(timeout_s)),
+            world_size=int(world_size),
+            rank=rank,
+            group_name=group_name,
+        )
+        logger.warning(
+            "vLLM worker local_rank=%d joined RDMA weight group %s as rank=%d/%d",
+            self.local_rank,
+            group_name,
+            rank,
+            world_size,
+        )
+        return True
+
+    def receive_weights_rdma(
+        self,
+        group_name: str,
+        version: int,
+        verify_full_load: bool = True,
+    ) -> dict[str, float]:
+        """Receive HF-named GPU buckets over RCCL and load them in place."""
+        from vllm.platforms import current_platform
+
+        groups = getattr(self, "_rdma_weight_groups", {})
+        if group_name not in groups:
+            raise RuntimeError(f"RDMA weight group is not initialized: {group_name}")
+        if getattr(self, "device", None) is None:
+            self.device = torch.device(
+                f"{current_platform.device_type}:{self.local_rank}"
+            )
+        from lumenrl.engine.inference.rdma_weight_transfer import (
+            receive_weight_stream,
+        )
+
+        stats = receive_weight_stream(
+            groups[group_name],
+            self.model_runner.model,
+            device=self.device,
+            expected_version=int(version),
+            verify_full_load=bool(verify_full_load),
+        )
+        logger.warning(
+            "RDMA weight reload verified on local_rank=%d: %s",
+            self.local_rank,
+            stats,
+        )
+        return stats
+
+    def destroy_rdma_weight_group(self, group_name: str) -> bool:
+        groups = getattr(self, "_rdma_weight_groups", {})
+        group = groups.pop(group_name, None)
+        if group is not None:
+            import torch.distributed as dist
+
+            dist.destroy_process_group(group)
+        return True
 
     def update_weights_from_ipc(self, use_shm: bool = False) -> None:
         """Receive bucketed weights over ZMQ IPC and load them into the model."""
@@ -196,3 +276,63 @@ class vLLMColocateWorkerExtension:
             process_weights_after_loading(model, model_config, self.device)
         except Exception as exc:  # pragma: no cover - best effort parity with verl
             logger.warning("process_weights_after_loading skipped: %s", exc)
+
+    def reload_weights_from_safetensors(self, weight_dir: str) -> None:
+        """Load weights from safetensors on shared storage (separation mode)."""
+        import json
+        import os
+
+        from safetensors.torch import load_file
+        from vllm.platforms import current_platform
+
+        if getattr(self, "device", None) is None:
+            dev_type = current_platform.device_type
+            self.device = torch.device(f"{dev_type}:{self.local_rank}")
+
+        index_path = os.path.join(weight_dir, "model.safetensors.index.json")
+        if os.path.exists(index_path):
+            with open(index_path) as f:
+                index = json.load(f)
+            files = sorted(set(index["weight_map"].values()))
+        else:
+            files = sorted(
+                f for f in os.listdir(weight_dir) if f.endswith(".safetensors")
+            )
+
+        model = self.model_runner.model
+        loaded_names: set[str] = set()
+        external_weight_count = 0
+        for fname in files:
+            sd = load_file(os.path.join(weight_dir, fname))
+            external_weight_count += len(sd)
+            loaded = model.load_weights(list(sd.items()))
+            if loaded is None:
+                raise RuntimeError(
+                    "vLLM model.load_weights returned no load manifest; "
+                    "cannot verify online weight synchronization."
+                )
+            loaded_names.update(loaded)
+
+        expected_names = {name for name, _ in model.named_parameters()}
+        missing_names = sorted(expected_names - loaded_names)
+        if missing_names:
+            raise RuntimeError(
+                "Incomplete vLLM weight reload: "
+                f"loaded {len(loaded_names)}/{len(expected_names)} internal "
+                f"parameters from {external_weight_count} HF tensors; "
+                f"missing={missing_names[:20]}"
+            )
+
+        # The model was already transformed/compiled during engine startup.
+        # process_weights_after_loading() is not idempotent for all vLLM model
+        # implementations; running it after every reload can re-wrap modules
+        # and trigger a second multi-worker torch.compile.  Reload only replaces
+        # parameter data, then wait for all H2D copies before acknowledging RPC.
+        torch.cuda.synchronize(self.device)
+        logger.warning(
+            "reload_weights_from_safetensors: verified %d internal parameters "
+            "from %d HF tensors at %s",
+            len(loaded_names),
+            external_weight_count,
+            weight_dir,
+        )
