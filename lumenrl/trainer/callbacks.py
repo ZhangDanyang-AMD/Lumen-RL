@@ -140,8 +140,12 @@ class CheckpointCallback(Callback):
                 "yes" if "optimizer_state_dict" in state else "no",
                 state.get("scheduler_last_epoch", "N/A"),
             )
+            # Prune before writing: peak disk is then one checkpoint, not two.
+            # A 30B-A3B FSDP2 checkpoint (fp32 weights + optimizer) is ~342GB,
+            # so the transient second copy is the difference between fitting and
+            # filling the disk mid-write.
+            self._prune_old_checkpoints(ckpt_dir, keep=self.save_total_limit - 1)
             self._manager.save(state, path, global_step)
-            self._prune_old_checkpoints(ckpt_dir)
 
         if trainer._is_distributed:
             torch.distributed.barrier()
@@ -150,6 +154,10 @@ class CheckpointCallback(Callback):
         ckpt_root = Path(self.checkpoint_dir)
         step_dir = ckpt_root / f"global_step_{global_step}"
         actor_dir = step_dir / "actor"
+        # See _prune_old_checkpoints above: free the old checkpoint before the
+        # new one is written so peak usage is one checkpoint, not two.
+        ckpt_root.mkdir(parents=True, exist_ok=True)
+        self._prune_old_ray_checkpoints(ckpt_root, keep=self.save_total_limit - 1)
         actor_dir.mkdir(parents=True, exist_ok=True)
         trainer._actor_wg.execute_all_sync("save_checkpoint", str(actor_dir), global_step=global_step)
         meta = {
@@ -161,7 +169,6 @@ class CheckpointCallback(Callback):
         self._manager.save(meta, step_dir / f"checkpoint_{global_step}.pt", global_step)
         (ckpt_root / "latest_checkpointed_iteration.txt").write_text(str(global_step), encoding="utf-8")
         logger.info("Saved Ray checkpoint to %s (global_step=%d)", step_dir, global_step)
-        self._prune_old_ray_checkpoints(ckpt_root)
 
     @staticmethod
     def _verify_checkpoint(path: Path, model, opt, step: int) -> None:
@@ -203,7 +210,8 @@ class CheckpointCallback(Callback):
         except Exception as exc:
             logger.warning("CKPT VERIFY ERROR step=%d: %s", step, exc)
 
-    def _prune_old_checkpoints(self, ckpt_dir: Path) -> None:
+    def _prune_old_checkpoints(self, ckpt_dir: Path, keep: int | None = None) -> None:
+        keep = self.save_total_limit if keep is None else max(0, keep)
         pattern = re.compile(r"checkpoint_(\d+)\.pt$")
         ckpts: list[tuple[int, Path]] = []
         for p in ckpt_dir.iterdir():
@@ -211,7 +219,7 @@ class CheckpointCallback(Callback):
             if m:
                 ckpts.append((int(m.group(1)), p))
         ckpts.sort(key=lambda x: x[0])
-        while len(ckpts) > self.save_total_limit:
+        while len(ckpts) > keep:
             _, old = ckpts.pop(0)
             try:
                 old.unlink()
@@ -219,7 +227,8 @@ class CheckpointCallback(Callback):
             except OSError:
                 pass
 
-    def _prune_old_ray_checkpoints(self, ckpt_root: Path) -> None:
+    def _prune_old_ray_checkpoints(self, ckpt_root: Path, keep: int | None = None) -> None:
+        keep = self.save_total_limit if keep is None else max(0, keep)
         pattern = re.compile(r"global_step_(\d+)$")
         ckpts: list[tuple[int, Path]] = []
         for p in ckpt_root.iterdir():
@@ -229,7 +238,7 @@ class CheckpointCallback(Callback):
             if m:
                 ckpts.append((int(m.group(1)), p))
         ckpts.sort(key=lambda x: x[0])
-        while len(ckpts) > self.save_total_limit:
+        while len(ckpts) > keep:
             _, old = ckpts.pop(0)
             shutil.rmtree(old, ignore_errors=True)
             logger.info("Pruned old Ray checkpoint: %s", old)

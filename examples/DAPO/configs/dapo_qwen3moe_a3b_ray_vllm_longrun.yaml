@@ -143,15 +143,19 @@ eval:
 
 checkpointing:
   checkpoint_dir: "${oc.env:SCRATCH_ROOT}/ckpts/lumenrl-dapo/longrun-ray-vllm-moe-a3b"
-  save_steps: 50
-  save_total_limit: 5
+  # One FSDP2 checkpoint of this policy is ~342GB (fp32 weights + optimizer
+  # state across 8 shards), so only one can be kept. CheckpointCallback deletes
+  # the previous one BEFORE writing the new one: peak usage is one checkpoint,
+  # at the cost of a window where a crash mid-save leaves none.
+  save_steps: 10
+  save_total_limit: 1
   resume: true
 
 logger:
   wandb_enabled: true
   log_interval: 1
   wandb:
-    project: LUMEN_RL
+    project: LUMEN-RL-MOE
     name: longrun-ray-vllm-moe-a3b-verl-aligned
 
 num_training_steps: 1000
