@@ -1,237 +1,300 @@
 #!/bin/bash
+# Kimi K3 DSpark SDDD dashboard generator.
+#
+# Parses the training log directly (no docker/sudo needed), so it runs on the
+# login node against the NFS-visible log.
+#
+#   K3_LOG=~/train9k.log bash update_dashboard.sh
+#
+# Env overrides: K3_LOG, K3_DIR, K3_TOTAL_STEPS, K3_CACHE_BATCHES, K3_MA_WINDOW
+# K3_RESET=1 discards accumulated history and reparses from scratch.
 set -euo pipefail
+export K3_DIR="${K3_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 python3 << 'PYEOF'
-import sys, re, json, os, subprocess, math
-from datetime import datetime
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone
 
-container = "kimi_k3_dspark_v1"
-dir_path = "/home/danyzhan/Lumen-RL/dashboards/SDDD/Kimi_K3_SDDD_MI350"
-dashboard = os.path.join(dir_path, "dashboard.html")
-data_file = os.path.join(dir_path, "data.json")
-total_steps = 59630
-cache_batches = 200
+LOG = os.environ.get("K3_LOG", os.path.expanduser("~/train9k.log"))
+DIR = os.environ["K3_DIR"]
+MA_WINDOW = int(os.environ.get("K3_MA_WINDOW", "200"))
 
-# --- Load existing ---
-existing = {}
-max_existing_step = -1
-max_existing_eval_step = -1
-if os.path.exists(data_file):
+dashboard = os.path.join(DIR, "dashboard.html")
+data_file = os.path.join(DIR, "data.json")
+
+NPOS = 7
+KV = re.compile(r"([a-zA-Z0-9_/]+)=([0-9.eE+-]+)")
+TS = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+
+FIELDS = (["steps", "ts", "grad_norms", "losses", "lrs", "step_times",
+           "ce_losses", "tv_losses", "conf_losses"]
+          + [f"step_{i}_acc" for i in range(NPOS)]
+          + [f"step_{i}_loss" for i in range(NPOS)])
+EVAL_FIELDS = (["eval_steps", "eval_losses", "eval_acc_lens"]
+               + [f"eval_step_{i}_acc" for i in range(NPOS)]
+               + [f"eval_step_{i}_loss" for i in range(NPOS)])
+
+
+def parse_ts(line):
+    m = TS.match(line)
+    if not m:
+        return None
     try:
-        with open(data_file) as f:
-            existing = json.load(f)
-        if existing.get("steps"):
-            max_existing_step = max(existing["steps"])
-        if existing.get("eval_steps"):
-            max_existing_eval_step = max(existing["eval_steps"])
+        dt = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+        return dt.replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+# --- Run fingerprint: reset accumulated data when a new run starts ---------
+# The log is truncated on every launch, so identify the run by its banner.
+run_id = ""
+cfg = {}
+if not os.path.exists(LOG):
+    print(f"Log not found: {LOG}")
+    sys.exit(0)
+
+with open(LOG, errors="ignore") as fh:
+    head = fh.read(2_000_000)
+
+m = re.search(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*LumenRL starting:.*?steps=(\d+)",
+              head, re.M)
+if m:
+    cfg["start_time"], cfg["total_steps"] = m.group(1), int(m.group(2))
+else:
+    cfg["start_time"] = "?"
+run_id = f"{LOG}|{cfg.get('start_time')}|{cfg.get('total_steps')}"
+
+existing, offset = {}, 0
+if os.path.exists(data_file) and os.environ.get("K3_RESET", "") != "1":
+    try:
+        with open(data_file) as fh:
+            saved = json.load(fh)
+        existing = saved
+        # Freshly detected values win; saved ones only fill gaps.
+        for k, v in saved.get("cfg", {}).items():
+            cfg.setdefault(k, v)
+        if saved.get("run_id") == run_id:
+            offset = saved.get("log_offset", 0)
+        # Otherwise the log was truncated by a relaunch: re-read from the top
+        # but keep the history and append only steps we have not seen, so a
+        # container restart does not lose the curve. Delete data.json (or set
+        # K3_RESET=1) to start a genuinely new experiment.
     except Exception:
         existing = {}
+for f in FIELDS + EVAL_FIELDS:
+    existing.setdefault(f, [])
 
-# 7 positions (block_size=7), plus DSpark-specific loss components
-fields = ["steps","grad_norms","losses","lrs",
-          "step_0_acc","step_1_acc","step_2_acc","step_3_acc",
-          "step_4_acc","step_5_acc","step_6_acc",
-          "step_0_loss","step_1_loss","step_2_loss","step_3_loss",
-          "step_4_loss","step_5_loss","step_6_loss",
-          "ce_losses","tv_losses","conf_losses",
-          "step_times"]
-eval_fields = ["eval_steps","eval_losses","eval_acc_lens",
-               "eval_step_0_acc","eval_step_1_acc","eval_step_2_acc","eval_step_3_acc",
-               "eval_step_4_acc","eval_step_5_acc","eval_step_6_acc",
-               "eval_step_0_loss","eval_step_1_loss","eval_step_2_loss","eval_step_3_loss",
-               "eval_step_4_loss","eval_step_5_loss","eval_step_6_loss"]
-for f in fields + eval_fields:
-    if f not in existing:
-        existing[f] = []
+max_step = max(existing["steps"]) if existing["steps"] else -1
+max_eval_step = max(existing["eval_steps"]) if existing["eval_steps"] else -1
 
-# --- Parse docker logs ---
-container_running = True
-try:
-    tmp = os.path.join(dir_path, ".step_logs.tmp")
-    tmp_eval = os.path.join(dir_path, ".eval_logs.tmp")
-    log_path_result = subprocess.run(
-        ["docker", "inspect", container, "--format", "{{.LogPath}}"],
-        capture_output=True, text=True, timeout=10
-    )
-    log_path = log_path_result.stdout.strip()
-    log_exists = log_path and subprocess.run(["sudo", "test", "-f", log_path], capture_output=True, timeout=5).returncode == 0
-    if log_exists:
-        os.system(f"sudo grep -F 'callbacks: step=' {log_path} > {tmp}.raw 2>/dev/null")
-        os.system(f"sudo grep -F 'callbacks: eval step=' {log_path} > {tmp_eval}.raw 2>/dev/null")
-        for src, dst in [(f"{tmp}.raw", tmp), (f"{tmp_eval}.raw", tmp_eval)]:
-            with open(src) as _rf, open(dst, "w") as _wf:
-                for _line in _rf:
-                    try:
-                        _wf.write(json.loads(_line)["log"])
-                    except Exception:
-                        _wf.write(_line)
+
+# Config lines can sit anywhere in the log (vLLM worker noise pushes them far
+# past any fixed-size head read), so pick them up while streaming.
+CFG_PATTERNS = [
+    ("Batch-alternating mode",
+     re.compile(r"total_steps=(\d+), cache_batches=(\d+), num_rounds=(\d+)"),
+     lambda m: {"total_steps": int(m.group(1)), "cache_batches": int(m.group(2)),
+                "num_rounds": int(m.group(3))}),
+    ("cached samples", re.compile(r"Loaded (\d+) cached samples"),
+     lambda m: {"dataset_size": int(m.group(1))}),
+    ("BF16Optimizer",
+     re.compile(r"(\d+) trainable params.*?lr=([0-9.eE+-]+), decay=(\w+), "
+                r"warmup=(\d+)/(\d+)"),
+     lambda m: {"params": int(m.group(1)), "lr": float(m.group(2)),
+                "decay": m.group(3), "warmup": int(m.group(4))}),
+    ("train_global_batch_size", re.compile(r"train_global_batch_size=(\d+)"),
+     lambda m: {"batch_size": int(m.group(1))}),
+    ("max_total_sequence_length", re.compile(r"max_total_sequence_length=(\d+)"),
+     lambda m: {"seq_len": int(m.group(1))}),
+    ("anchor_num", re.compile(r"anchor_num=(\d+)"),
+     lambda m: {"anchor_num": int(m.group(1))}),
+]
+
+
+def scan_config(line):
+    for needle, pat, build in CFG_PATTERNS:
+        if needle in line:
+            m = pat.search(line)
+            if m:
+                cfg.update(build(m))
+
+# --- Incremental parse ------------------------------------------------------
+new_train = new_eval = 0
+with open(LOG, errors="ignore") as fh:
+    fh.seek(offset)
+    for line in fh:
+        if "callbacks: eval step=" in line:
+            d = dict(KV.findall(line[line.index("eval step="):]))
+            if "eval/loss" not in d or int(d["step"]) <= max_eval_step:
+                continue
             try:
-                os.remove(src)
-            except Exception:
-                pass
-    else:
-        os.system(f"docker logs {container} 2>&1 | grep -F 'callbacks: step=' > {tmp}")
-        os.system(f"docker logs {container} 2>&1 | grep -F 'callbacks: eval step=' > {tmp_eval}")
-    with open(tmp) as f:
-        raw = f.read()
-    with open(tmp_eval) as f:
-        raw_eval = f.read()
-    for fp in [tmp, tmp_eval]:
-        try:
-            os.remove(fp)
-        except Exception:
-            pass
-except Exception:
-    raw = ""
-    raw_eval = ""
-try:
-    ps = subprocess.run(["docker","ps","--filter",f"name={container}","--format","{{.Names}}"],
-                        capture_output=True, text=True, timeout=10)
-    container_running = container.strip() in ps.stdout.strip()
-except Exception:
-    container_running = False
+                accs = [float(d[f"eval/step_{i}_acc"]) for i in range(NPOS)]
+            except KeyError:
+                continue
+            # Accept length = 1 + sum_k prod_{j<=k} acc_j. The leading 1 is the
+            # token the target model emits itself, so a useless draft scores 1.0.
+            # eval/simulated_acc_len in the log omits that 1.
+            cum, acc_len = 1.0, 1.0
+            for a in accs:
+                cum *= a
+                acc_len += cum
+            existing["eval_steps"].append(int(d["step"]))
+            existing["eval_losses"].append(float(d["eval/loss"]))
+            existing["eval_acc_lens"].append(acc_len)
+            for i in range(NPOS):
+                existing[f"eval_step_{i}_acc"].append(accs[i])
+                existing[f"eval_step_{i}_loss"].append(
+                    float(d.get(f"eval/step_{i}_loss", 0)))
+            new_eval += 1
+        elif "callbacks: step=" in line:
+            d = dict(KV.findall(line[line.index("step="):]))
+            if "grad_norm" not in d or "step_0_acc" not in d:
+                continue
+            if int(d["step"]) <= max_step:
+                continue
+            loss = float(d.get("loss", "nan"))
+            if loss != loss:  # NaN
+                continue
+            existing["steps"].append(int(d["step"]))
+            existing["ts"].append(parse_ts(line) or 0.0)
+            existing["grad_norms"].append(float(d["grad_norm"]))
+            existing["losses"].append(loss)
+            existing["lrs"].append(float(d.get("lr", 0)))
+            existing["step_times"].append(float(d.get("timing/step_s", 0)))
+            existing["ce_losses"].append(float(d.get("ce_loss", 0)))
+            existing["tv_losses"].append(float(d.get("tv_loss", 0)))
+            existing["conf_losses"].append(float(d.get("conf_loss", 0)))
+            for i in range(NPOS):
+                existing[f"step_{i}_acc"].append(float(d.get(f"step_{i}_acc", 0)))
+                existing[f"step_{i}_loss"].append(float(d.get(f"step_{i}_loss", 0)))
+            new_train += 1
+        else:
+            scan_config(line)
+    new_offset = fh.tell()
 
-# --- Parse training steps (7 positions + DSpark losses) ---
-pattern = re.compile(
-    r'step=(\d+)\s+grad_norm=([^\s]+)\s+loss=([^\s]+)\s+lr=([^\s]+)\s+'
-    r'(?:ce_loss=([^\s]+)\s+tv_loss=([^\s]+)\s+conf_loss=([^\s]+)\s+)?'
-    r'(?:seq/max_len=([^\s]+)\s+)?'
-    r'step_0_acc=([^\s]+)\s+step_0_loss=([^\s]+)\s+'
-    r'step_1_acc=([^\s]+)\s+step_1_loss=([^\s]+)\s+'
-    r'step_2_acc=([^\s]+)\s+step_2_loss=([^\s]+)\s+'
-    r'step_3_acc=([^\s]+)\s+step_3_loss=([^\s]+)\s+'
-    r'step_4_acc=([^\s]+)\s+step_4_loss=([^\s]+)\s+'
-    r'step_5_acc=([^\s]+)\s+step_5_loss=([^\s]+)\s+'
-    r'step_6_acc=([^\s]+)\s+step_6_loss=([^\s]+)\s+'
-    r'timing/step_s=([^\s]+)')
-
-new_count = 0
-for m in pattern.finditer(raw):
-    step = int(m.group(1))
-    if m.group(3) == 'nan' or step <= max_existing_step:
-        continue
-    existing["steps"].append(step)
-    existing["grad_norms"].append(float(m.group(2)))
-    existing["losses"].append(float(m.group(3)))
-    existing["lrs"].append(float(m.group(4)))
-    existing["ce_losses"].append(float(m.group(5) or 0))
-    existing["tv_losses"].append(float(m.group(6) or 0))
-    existing["conf_losses"].append(float(m.group(7) or 0))
-    for i in range(7):
-        existing[f"step_{i}_acc"].append(float(m.group(9 + i*2)))
-        existing[f"step_{i}_loss"].append(float(m.group(10 + i*2)))
-    existing["step_times"].append(float(m.group(23)))
-    new_count += 1
-
-# --- Parse eval steps ---
-eval_pattern = re.compile(
-    r'eval step=(\d+)\s+eval/loss=([^\s]+)\s+eval/simulated_acc_len=([^\s]+)\s+'
-    r'eval/step_0_acc=([^\s]+)\s+eval/step_0_loss=([^\s]+)\s+'
-    r'eval/step_1_acc=([^\s]+)\s+eval/step_1_loss=([^\s]+)\s+'
-    r'eval/step_2_acc=([^\s]+)\s+eval/step_2_loss=([^\s]+)\s+'
-    r'eval/step_3_acc=([^\s]+)\s+eval/step_3_loss=([^\s]+)\s+'
-    r'eval/step_4_acc=([^\s]+)\s+eval/step_4_loss=([^\s]+)\s+'
-    r'eval/step_5_acc=([^\s]+)\s+eval/step_5_loss=([^\s]+)\s+'
-    r'eval/step_6_acc=([^\s]+)\s+eval/step_6_loss=([^\s]+)')
-
-eval_new = 0
-for m in eval_pattern.finditer(raw_eval):
-    step = int(m.group(1))
-    if step <= max_existing_eval_step:
-        continue
-    accs = [float(m.group(4+i*2)) for i in range(7)]
-    cum_prod = 1.0
-    corrected_acc_len = 1.0
-    for a in accs:
-        cum_prod *= a
-        corrected_acc_len += cum_prod
-
-    existing["eval_steps"].append(step)
-    existing["eval_losses"].append(float(m.group(2)))
-    existing["eval_acc_lens"].append(corrected_acc_len)
-    for i in range(7):
-        existing[f"eval_step_{i}_acc"].append(float(m.group(4+i*2)))
-        existing[f"eval_step_{i}_loss"].append(float(m.group(5+i*2)))
-    eval_new += 1
+total_steps = int(os.environ.get("K3_TOTAL_STEPS", cfg.get("total_steps", 36000)))
+cache_batches = int(os.environ.get("K3_CACHE_BATCHES", cfg.get("cache_batches", 500)))
+batch_size = cfg.get("batch_size", 8)
+dataset_size = cfg.get("dataset_size", 0)
+cfg.setdefault("anchor_num", 512)
 
 if not existing["steps"]:
-    print("No valid steps found"); sys.exit(0)
+    print(f"No training steps in {LOG} yet (run started {cfg.get('start_time')}, "
+          f"total_steps={total_steps}). Phase A probably still prefilling.")
+    sys.exit(0)
 
-with open(data_file, 'w') as f:
-    json.dump(existing, f)
+existing["run_id"] = run_id
+existing["log_offset"] = new_offset
+existing["cfg"] = cfg
+with open(data_file, "w") as fh:
+    json.dump(existing, fh)
 
-steps=existing["steps"]; losses=existing["losses"]; grad_norms=existing["grad_norms"]
-lrs=existing["lrs"]; step_times=existing["step_times"]
-ce_losses=existing["ce_losses"]; tv_losses=existing["tv_losses"]; conf_losses=existing["conf_losses"]
-sa = [existing[f"step_{i}_acc"] for i in range(7)]
-sl = [existing[f"step_{i}_loss"] for i in range(7)]
+steps = existing["steps"]
+losses = existing["losses"]
+grad_norms = existing["grad_norms"]
+lrs = existing["lrs"]
+step_times = existing["step_times"]
+ts = existing["ts"]
+ce_losses = existing["ce_losses"]
+tv_losses = existing["tv_losses"]
+conf_losses = existing["conf_losses"]
+sa = [existing[f"step_{i}_acc"] for i in range(NPOS)]
+sl = [existing[f"step_{i}_loss"] for i in range(NPOS)]
 n = len(steps)
 
-# Eval data
-e_steps=existing["eval_steps"]; e_losses=existing["eval_losses"]
-e_acc_lens=existing["eval_acc_lens"]
-ea = [existing[f"eval_step_{i}_acc"] for i in range(7)]
-el = [existing[f"eval_step_{i}_loss"] for i in range(7)]
+e_steps = existing["eval_steps"]
+e_losses = existing["eval_losses"]
+e_acc_lens = existing["eval_acc_lens"]
+ea = [existing[f"eval_step_{i}_acc"] for i in range(NPOS)]
+el = [existing[f"eval_step_{i}_loss"] for i in range(NPOS)]
 ne = len(e_steps)
 
-# --- Moving average ---
-def ma(arr, w=200):
+
+def ma(arr, w=MA_WINDOW):
     out, s = [], 0.0
     for i, v in enumerate(arr):
         s += v
-        if i >= w: s -= arr[i-w]
-        out.append(s / min(i+1, w))
+        if i >= w:
+            s -= arr[i - w]
+        out.append(s / min(i + 1, w))
     return out
 
-ml=ma(losses); mg=ma(grad_norms); mst=ma(step_times)
-mce=ma(ce_losses); mtv=ma(tv_losses); mcf=ma(conf_losses)
-msa = [ma(sa[i]) for i in range(7)]
 
-# Train-based accept length from MA'd accuracies (7 positions)
+ml, mg, mst = ma(losses), ma(grad_norms), ma(step_times)
+mce, mtv, mcf = ma(ce_losses), ma(tv_losses), ma(conf_losses)
+msa = [ma(sa[i]) for i in range(NPOS)]
+
 train_acc_len = []
 for i in range(n):
-    al_val = 1.0
-    cp = 1.0
-    for j in range(7):
+    val, cp = 1.0, 1.0
+    for j in range(NPOS):
         cp *= msa[j][i]
-        al_val += cp
-    train_acc_len.append(al_val)
+        val += cp
+    train_acc_len.append(val)
 
-# --- Subsample (max 2000) ---
+# --- Subsample to keep the page light --------------------------------------
 stride = max(1, n // 2000)
 idx = list(range(0, n, stride))
-if idx[-1] != n-1: idx.append(n-1)
+if idx[-1] != n - 1:
+    idx.append(n - 1)
 S = lambda a: [a[i] for i in idx]
 
-ps=S(steps)
-rl=S(losses); rg=S(grad_norms); rst=S(step_times)
-pl=S(ml); pg=S(mg); pt=S(mst); plr=S(lrs)
-pce=S(mce); ptv=S(mtv); pcf=S(mcf)
-rce=S(ce_losses); rtv=S(tv_losses); rcf=S(conf_losses)
-psa = [S(msa[i]) for i in range(7)]
-rsa = [S(sa[i]) for i in range(7)]
-psl = [S(ma(sl[i])) for i in range(7)]
-rsl = [S(sl[i]) for i in range(7)]
+ps = S(steps)
+rl, rg, rst = S(losses), S(grad_norms), S(step_times)
+pl, pg, pt, plr = S(ml), S(mg), S(mst), S(lrs)
+pce, ptv, pcf = S(mce), S(mtv), S(mcf)
+rce, rtv, rcf = S(ce_losses), S(tv_losses), S(conf_losses)
+psa = [S(msa[i]) for i in range(NPOS)]
+rsa = [S(sa[i]) for i in range(NPOS)]
+psl = [S(ma(sl[i])) for i in range(NPOS)]
+rsl = [S(sl[i]) for i in range(NPOS)]
 ptal = S(train_acc_len)
 
-# Round boundaries (every cache_batches steps)
-round_boundaries = list(range(0, int(steps[-1])+1, cache_batches))
+round_boundaries = list(range(0, int(steps[-1]) + 1, cache_batches))
 
-# --- Stats ---
-cur = steps[-1]; pct = cur/total_steps*100
+# --- Stats ------------------------------------------------------------------
+cur = steps[-1]
+pct = cur / total_steps * 100
 w = min(1000, n)
-al = sum(losses[-w:])/w
-w_eta = min(250, n)
-ast = sum(step_times[-w_eta:])/w_eta
-eta = (total_steps-cur)*ast/3600
-es_time = cur*ast; eh=int(es_time//3600); em=int((es_time%3600)//60)
-aa = [sum(sa[i][-w:])/w*100 for i in range(7)]
-status = "Training" if container_running else ("Completed" if cur>=total_steps-100 else "Stopped")
-now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+avg_loss = sum(losses[-w:]) / w
+avg_step_t = sum(step_times[-min(250, n):]) / min(250, n)
 
+# Wall-clock rate includes Phase A prefill and vLLM restarts, unlike
+# timing/step_s which only covers the Phase B optimizer step.
+valid_ts = [(s, t) for s, t in zip(steps, ts) if t > 0]
+if len(valid_ts) >= 2 and valid_ts[-1][0] > valid_ts[0][0]:
+    span = valid_ts[-1][1] - valid_ts[0][1]
+    wall_per_step = span / (valid_ts[-1][0] - valid_ts[0][0])
+else:
+    span, wall_per_step = 0.0, avg_step_t
+eta_h = (total_steps - cur) * wall_per_step / 3600
+eh, em = int(span // 3600), int((span % 3600) // 60)
+
+aa = [sum(sa[i][-w:]) / w * 100 for i in range(NPOS)]
+samples_seen = (cur + 1) * batch_size
+epochs = samples_seen / dataset_size if dataset_size else 0.0
+
+# The container may not be visible from the login node; fall back to log
+# freshness (a stalled log for >20 min means the run is not producing steps).
+age = datetime.now(timezone.utc).timestamp() - os.path.getmtime(LOG)
+if cur >= total_steps - 1:
+    status = "Completed"
+elif age < 1200:
+    status = "Training"
+else:
+    status = "Stopped"
+
+now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 latest_acc_len = e_acc_lens[-1] if e_acc_lens else 0.0
 latest_eval_loss = e_losses[-1] if e_losses else 0.0
 latest_train_acc_len = train_acc_len[-1] if train_acc_len else 0.0
 current_round = cur // cache_batches
+subtitle = (f"batch-alternating | lr={cfg.get('lr', 0):.1e} | bs={batch_size} | "
+            f"T={cfg.get('seq_len', '?')} | block_size=7 | anchor={cfg.get('anchor_num')} | "
+            f"cache_batches={cache_batches} | 8x MI355X (Replicate + vLLM TP=8)")
 
 html = f"""<!DOCTYPE html>
 <html lang="en"><head>
@@ -259,15 +322,16 @@ h1{{color:#58a6ff;margin:0 0 4px 0;font-size:22px;font-weight:600}}
 </head><body>
 <div class="header">
 <h1>Kimi K3 DSpark SDDD — MI350</h1>
-<p class="sub">batch-alternating | lr=6e-4 | bs=8 | block_size=7 | cache_batches={cache_batches} | 8x MI350 (Replicate + vLLM TP=8)</p>
-<p class="st st-{status.lower()}">{status} (Round {current_round})</p>
+<p class="sub">{subtitle}</p>
+<p class="st st-{status.lower()}">{status} (Round {current_round}) — started {cfg.get('start_time')} UTC</p>
 <div class="stats">
 <div class="s"><div class="sv">{cur:,} / {total_steps:,}</div><div class="sl">Step ({pct:.1f}%)</div></div>
+<div class="s"><div class="sv">{samples_seen:,}</div><div class="sl">Samples seen ({epochs:.2f} epoch of {dataset_size:,})</div></div>
 <div class="s"><div class="sv">{eh}h {em}m</div><div class="sl">Elapsed</div></div>
-<div class="s"><div class="sv">{al:.4f}</div><div class="sl">Avg Loss (last 1K)</div></div>
+<div class="s"><div class="sv">{avg_loss:.4f}</div><div class="sl">Avg Loss (last {w})</div></div>
 <div class="s"><div class="sv">{aa[0]:.1f} / {aa[1]:.1f} / {aa[2]:.1f} / {aa[3]:.1f} / {aa[4]:.1f} / {aa[5]:.1f} / {aa[6]:.1f}</div><div class="sl">Acc pos 0-6 (%)</div></div>
-<div class="s"><div class="sv">{ast*1000:.0f} ms</div><div class="sl">Step Time</div></div>
-<div class="s"><div class="sv">{eta:.1f} h</div><div class="sl">ETA</div></div>
+<div class="s"><div class="sv">{avg_step_t*1000:.0f} ms / {wall_per_step:.1f} s</div><div class="sl">Phase B step / wall per step</div></div>
+<div class="s"><div class="sv">{eta_h:.1f} h</div><div class="sl">ETA</div></div>
 <div class="s"><div class="sv">{latest_train_acc_len:.4f} / {latest_acc_len:.4f}</div><div class="sl">Accept Len (Train / Eval)</div></div>
 <div class="s"><div class="sv">{latest_eval_loss:.4f}</div><div class="sl">Eval Loss</div></div>
 </div></div>
@@ -301,20 +365,17 @@ var lr={json.dumps(plr)};
 var pce={json.dumps(pce)},ptv={json.dumps(ptv)},pcf={json.dumps(pcf)};
 var trainAccLen={json.dumps(ptal)};
 
-// Per-position accuracy (7 positions)
-var ra=[{','.join(json.dumps(rsa[i]) for i in range(7))}];
-var pa=[{','.join(json.dumps(psa[i]) for i in range(7))}];
-var rl_pos=[{','.join(json.dumps(rsl[i]) for i in range(7))}];
-var pl_pos=[{','.join(json.dumps(psl[i]) for i in range(7))}];
+var ra=[{','.join(json.dumps(rsa[i]) for i in range(NPOS))}];
+var pa=[{','.join(json.dumps(psa[i]) for i in range(NPOS))}];
+var rl_pos=[{','.join(json.dumps(rsl[i]) for i in range(NPOS))}];
+var pl_pos=[{','.join(json.dumps(psl[i]) for i in range(NPOS))}];
 
-// Eval data
 var es_e={json.dumps(e_steps)};
 var eloss={json.dumps(e_losses)};
 var eacclen={json.dumps(e_acc_lens)};
-var ea=[{','.join(json.dumps(ea[i]) for i in range(7))}];
-var el_e=[{','.join(json.dumps(el[i]) for i in range(7))}];
+var ea=[{','.join(json.dumps(ea[i]) for i in range(NPOS))}];
+var el_e=[{','.join(json.dumps(el[i]) for i in range(NPOS))}];
 
-// Round boundaries
 var roundBounds={json.dumps(round_boundaries)};
 
 var C=['#58a6ff','#3fb950','#d29922','#f778ba','#a371f7','#ff7b72','#79c0ff'];
@@ -322,7 +383,6 @@ var C=['#58a6ff','#3fb950','#d29922','#f778ba','#a371f7','#ff7b72','#79c0ff'];
 function L(id,traces,title,extra){{
   var layout=JSON.parse(JSON.stringify(dark));
   layout.title={{text:title,font:{{size:13,color:'#c9d1d9'}}}};
-  // Add round boundary annotations
   layout.shapes=roundBounds.map(function(x){{return {{type:'line',x0:x,x1:x,y0:0,y1:1,yref:'paper',line:{{color:'#30363d',width:1,dash:'dot'}}}}}});
   if(extra){{for(var k in extra){{if(k==='yaxis')Object.assign(layout.yaxis,extra[k]);else layout[k]=extra[k];}}}};
   Plotly.newPlot(id,traces,layout,{{responsive:true}});
@@ -344,12 +404,12 @@ L('c2',[
 L('c7',[
   {{x:s,y:trainAccLen,mode:'lines',name:'Train (MA)',line:{{color:'#d29922',width:2}}}},
   evaltr(es_e,eacclen,'Eval','#3fb950'),
-],'Accept Length (Train vs Eval)',{{yaxis:{{title:'Accept Length'}},legend:{{x:0.01,y:0.99,xanchor:'left',yanchor:'top'}}}});
+],'Accept Length = 1 + &Sigma;&prod;acc (target &ge; 3.0)',{{yaxis:{{title:'Accept Length'}},legend:{{x:0.01,y:0.99,xanchor:'left',yanchor:'top'}}}});
 
 L('c10',[
   raw(s,rce,'#58a6ff'),raw(s,rtv,'#3fb950'),raw(s,rcf,'#d29922'),
   {{x:s,y:pce,mode:'lines',name:'CE Loss',line:{{color:'#58a6ff',width:2}}}},
-  {{x:s,y:ptv,mode:'lines',name:'TV Loss',line:{{color:'#3fb950',width:2}}}},
+  {{x:s,y:ptv,mode:'lines',name:'TV/L1 Loss',line:{{color:'#3fb950',width:2}}}},
   {{x:s,y:pcf,mode:'lines',name:'Conf Loss',line:{{color:'#d29922',width:2}}}},
 ],'DSpark Loss Components',{{legend:{{x:0.01,y:0.99,xanchor:'left',yanchor:'top'}}}});
 
@@ -364,8 +424,8 @@ L('c3',[
 
 L('c4',[
   raw(s,rst_t.map(v=>v*1000),'#8b949e'),
-  {{x:s,y:tm.map(v=>v*1000),mode:'lines',name:'Total',line:{{color:'#8b949e',width:2}}}},
-],'Step Time (ms)',{{yaxis:{{title:'ms'}}}});
+  {{x:s,y:tm.map(v=>v*1000),mode:'lines',name:'Phase B step',line:{{color:'#8b949e',width:2}}}},
+],'Step Time (ms, Phase B only)',{{yaxis:{{title:'ms'}}}});
 
 L('c5',[
   ...Array.from({{length:7}},(_,i)=>raw(s,rl_pos[i],C[i])),
@@ -379,10 +439,12 @@ L('c9',[
 L('c6',[{{x:s,y:lr,mode:'lines',name:'LR',line:{{color:'#a5d6ff',width:2}}}}],
   'Learning Rate');
 </script>
-<p class="up">Updated: {now} | {n:,} train + {ne} eval points | Round boundaries every {cache_batches} steps</p>
+<p class="up">Updated: {now} | {n:,} train + {ne} eval points | source: {LOG} | round boundaries every {cache_batches} steps</p>
 </body></html>"""
 
-with open(dashboard, 'w') as f:
-    f.write(html)
-print(f"Dashboard updated: {n} train ({new_count} new) + {ne} eval ({eval_new} new), step {cur}, acc_len={latest_acc_len:.4f}, status: {status}")
+with open(dashboard, "w") as fh:
+    fh.write(html)
+print(f"Dashboard updated: {n} train ({new_train} new) + {ne} eval ({new_eval} new), "
+      f"step {cur}/{total_steps}, accept_len={latest_acc_len:.4f}, status={status}")
+print(f"  -> {dashboard}")
 PYEOF
