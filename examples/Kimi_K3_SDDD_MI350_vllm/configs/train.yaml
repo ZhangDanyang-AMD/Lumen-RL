@@ -32,7 +32,7 @@ policy:
   model_name: /dev/shm/Kimi-K3
   training_backend: fsdp2
   generation_backend: hf
-  max_total_sequence_length: 8192
+  max_total_sequence_length: 4096
   train_global_batch_size: 8
   train_micro_batch_size: 1
   learning_rate: 6e-4
@@ -50,6 +50,7 @@ algorithm:
     sequential_mode: batch_alternating
     cache_batches: 200
     cache_dir: /tmp/teacher_cache
+    grad_accum_steps: 64          # GBS = train_global_batch_size × grad_accum = 8 × 64 = 512
     # DSpark position decay: w_k = exp(-k / gamma)
     loss_decay_gamma: 4.0
     num_target_layers: 5
@@ -151,8 +152,7 @@ logger:
   wandb_enabled: false
   log_interval: 1
 
-# ~477K prompts / global_bs=8 ≈ 59630 steps/epoch. 1 epoch.
-# With cache_batches=200: 59630/200 ≈ 298 rounds of batch-alternating.
-# Effective batch=512 via grad_accum_steps=64 (512/8).
-num_training_steps: 59630
+# ~477K prompts / GBS=512 ≈ 932 optimizer steps. 1 epoch.
+# Forward batches = 932 × 64 = 59648. Rounds = 59648/200 ≈ 298.
+num_training_steps: 932
 seed: 42

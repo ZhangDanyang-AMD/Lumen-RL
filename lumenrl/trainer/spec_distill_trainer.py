@@ -1301,12 +1301,16 @@ class SpecDistillTrainer:
         sched_epoch = payload.get("scheduler_last_epoch")
         if sched_epoch is not None and hasattr(self._optimizer, "scheduler"):
             self._optimizer.scheduler.last_epoch = sched_epoch
-            self._optimizer.scheduler.step()
+            for pg, lr in zip(self._optimizer.scheduler.optimizer.param_groups,
+                              self._optimizer.scheduler.get_lr()):
+                pg["lr"] = lr
             logger.info("[rank %d] Restored scheduler to epoch %d (lr=%.2e)",
                         self._rank, sched_epoch, self._optimizer.get_learning_rate())
         elif hasattr(self._optimizer, "scheduler") and resumed_step > 0:
-            for _ in range(resumed_step):
-                self._optimizer.scheduler.step()
+            self._optimizer.scheduler.last_epoch = resumed_step
+            for pg, lr in zip(self._optimizer.scheduler.optimizer.param_groups,
+                              self._optimizer.scheduler.get_lr()):
+                pg["lr"] = lr
             logger.info("[rank %d] LR scheduler advanced to step %d (lr=%.2e)",
                         self._rank, resumed_step, self._optimizer.get_learning_rate())
 
@@ -2390,39 +2394,46 @@ class SpecDistillTrainer:
                 cb.on_train_begin(self)
 
         spec_cfg = self.config.algorithm.spec_distill
-        total_steps = int(self.config.num_training_steps)
+        grad_accum = max(1, spec_cfg.grad_accum_steps)
+        total_opt_steps = int(self.config.num_training_steps)
+        total_fwd_batches = total_opt_steps * grad_accum
         cache_batches = spec_cfg.cache_batches
         cache_dir = spec_cfg.cache_dir
         draft_type = spec_cfg.draft_type.lower()
-        start_step = self.global_step
+        start_opt_step = self.global_step
+        start_fwd_batch = start_opt_step * grad_accum
 
-        num_rounds = (total_steps - start_step + cache_batches - 1) // cache_batches
+        num_rounds = (total_fwd_batches - start_fwd_batch + cache_batches - 1) // cache_batches
 
         logger.info(
-            "[rank %d] Batch-alternating mode: total_steps=%d, cache_batches=%d, "
-            "num_rounds=%d, start_step=%d",
-            self._rank, total_steps, cache_batches, num_rounds, start_step,
+            "[rank %d] Batch-alternating mode: opt_steps=%d, grad_accum=%d, "
+            "fwd_batches=%d, cache_batches=%d, num_rounds=%d, start_opt_step=%d",
+            self._rank, total_opt_steps, grad_accum,
+            total_fwd_batches, cache_batches, num_rounds, start_opt_step,
         )
 
         # Offload draft before entering Phase A loop
         self._offload_draft_to_cpu()
 
-        for round_idx in range(num_rounds):
-            round_start_step = start_step + round_idx * cache_batches
-            round_end_step = min(round_start_step + cache_batches, total_steps)
+        cumulative_opt_steps = 0
 
-            if round_end_step <= self.global_step:
+        for round_idx in range(num_rounds):
+            round_fwd_start = start_fwd_batch + round_idx * cache_batches
+            round_fwd_end = min(round_fwd_start + cache_batches, total_fwd_batches)
+
+            if round_fwd_end <= start_fwd_batch:
                 logger.info("[rank %d] Skipping round %d (already completed)", self._rank, round_idx)
                 continue
 
-            round_num_batches = round_end_step - round_start_step
+            round_num_batches = round_fwd_end - round_fwd_start
+            round_start_opt_step = start_opt_step + cumulative_opt_steps
 
             # ========== Phase A: Teacher prefill + disk cache (rank 0 only) ==========
             if self._rank == 0:
                 logger.info(
-                    "[rank %d] Round %d Phase A: prefilling %d batches [step %d..%d)",
+                    "[rank %d] Round %d Phase A: prefilling %d batches [fwd %d..%d)",
                     self._rank, round_idx, round_num_batches,
-                    round_start_step, round_end_step,
+                    round_fwd_start, round_fwd_end,
                 )
 
                 teacher_cfg = self.config.algorithm.teacher
@@ -2430,8 +2441,8 @@ class SpecDistillTrainer:
                 pad_id = self._tokenizer.pad_token_id or 0
 
                 for batch_idx in range(round_num_batches):
-                    step = round_start_step + batch_idx
-                    ids, mask, loss_mask = self._get_batch_sequences(step)
+                    fwd_step = round_fwd_start + batch_idx
+                    ids, mask, loss_mask = self._get_batch_sequences(fwd_step)
 
                     if generate_mode == "generate":
                         data = self._teacher_generate_and_extract_rank0(
@@ -2476,32 +2487,47 @@ class SpecDistillTrainer:
                 torch.distributed.barrier()
 
             # ========== Phase B: Draft model training on cached batches ==========
+            num_opt_steps_this_round = (round_num_batches + grad_accum - 1) // grad_accum
             logger.info(
-                "[rank %d] Round %d Phase B: training on %d cached batches",
+                "[rank %d] Round %d Phase B: training on %d cached batches "
+                "(%d optimizer steps, grad_accum=%d)",
                 self._rank, round_idx, round_num_batches,
+                num_opt_steps_this_round, grad_accum,
             )
 
             self._load_draft_to_gpu()
             self._draft_model.train()
 
-            # Each cached batch = train_global_batch_size samples.
-            # One optimizer step per batch (grad_accum handled within
-            # _train_step_* via micro-batching). Each batch is an
-            # independent training step with its own optimizer update.
-            self._grad_accum_steps = 1
+            _use_grad_sync = (
+                self._is_distributed and self._world_size > 1
+                and grad_accum > 1
+                and hasattr(self._draft_model, "set_requires_gradient_sync")
+            )
 
             self._optimizer.zero_grad(set_to_none=True)
+            metrics_accum: dict[str, float] = {}
             accum_count = 0
+            opt_step_idx = 0
 
             for batch_idx in range(round_num_batches):
-                step = round_start_step + batch_idx
-                self.global_step = step
+                group_start = (batch_idx // grad_accum) * grad_accum
+                group_end = min(group_start + grad_accum, round_num_batches)
+                actual_group_size = group_end - group_start
+                self._grad_accum_steps = actual_group_size
 
-                if self._rank == 0:
-                    for cb in self.callbacks:
-                        cb.on_step_begin(self, step)
+                is_last_in_accum = (accum_count + 1 == actual_group_size)
 
-                step_start = time.time()
+                if _use_grad_sync:
+                    self._draft_model.set_requires_gradient_sync(is_last_in_accum)
+
+                if accum_count == 0:
+                    step = round_start_opt_step + opt_step_idx
+                    self.global_step = step
+                    if self._rank == 0:
+                        for cb in self.callbacks:
+                            cb.on_step_begin(self, step)
+                    step_start = time.time()
+
                 loaded = self._load_batch_from_disk(cache_dir, round_idx, batch_idx)
 
                 cpu_data = {k: loaded[k] for k in self._TEACHER_KEYS}
@@ -2521,26 +2547,38 @@ class SpecDistillTrainer:
 
                 del mb_teacher, loaded, cpu_data
 
-                grad_norm = self._optimizer.step()
-                self._optimizer.zero_grad(set_to_none=True)
+                for k, v in m.items():
+                    if isinstance(v, float) and v == v:
+                        metrics_accum[k] = metrics_accum.get(k, 0.0) + v
+                accum_count += 1
 
-                metrics = dict(m)
-                metrics["grad_norm"] = float(grad_norm)
-                metrics["lr"] = self._optimizer.get_learning_rate()
-                metrics["timing/step_s"] = time.time() - step_start
-                metrics["seq/max_len"] = int(input_ids.shape[1])
+                if is_last_in_accum:
+                    grad_norm = self._optimizer.step()
+                    self._optimizer.zero_grad(set_to_none=True)
 
-                if self._is_distributed:
-                    for k in list(metrics.keys()):
-                        t = torch.tensor(metrics[k], dtype=torch.float64, device=self._device)
-                        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.AVG)
-                        metrics[k] = float(t.item())
+                    metrics = {k: v / accum_count for k, v in metrics_accum.items()}
+                    metrics["grad_norm"] = float(grad_norm)
+                    metrics["lr"] = self._optimizer.get_learning_rate()
+                    metrics["timing/step_s"] = time.time() - step_start
+                    metrics["seq/max_len"] = int(input_ids.shape[1])
 
-                self.last_metrics = metrics
-                for cb in self.callbacks:
-                    cb.on_step_end(self, step, metrics)
+                    if self._is_distributed:
+                        for k in list(metrics.keys()):
+                            t = torch.tensor(metrics[k], dtype=torch.float64, device=self._device)
+                            torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.AVG)
+                            metrics[k] = float(t.item())
+
+                    self.last_metrics = metrics
+                    for cb in self.callbacks:
+                        cb.on_step_end(self, step, metrics)
+
+                    metrics_accum = {}
+                    accum_count = 0
+                    opt_step_idx += 1
 
                 del input_ids, attention_mask, loss_mask
+
+            cumulative_opt_steps += opt_step_idx
 
             # Offload draft back to CPU
             self._offload_draft_to_cpu()
@@ -2563,8 +2601,9 @@ class SpecDistillTrainer:
                 cb.on_train_end(self)
 
         logger.info(
-            "[rank %d] Batch-alternating training finished after %d steps.",
-            self._rank, total_steps,
+            "[rank %d] Batch-alternating training finished after %d optimizer steps "
+            "(%d forward batches).",
+            self._rank, total_opt_steps, total_fwd_batches,
         )
 
     # ------------------------------------------------------------------

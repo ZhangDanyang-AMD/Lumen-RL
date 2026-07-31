@@ -139,6 +139,7 @@ class SpecDistillConfig:
     sequential_mode: Optional[str] = None
     cache_batches: int = 200
     cache_dir: str = "/tmp/teacher_cache"
+    grad_accum_steps: int = 1
     # DSpark loss weights
     ce_loss_alpha: float = 0.1
     l1_loss_alpha: float = 0.9
