@@ -10,7 +10,7 @@
 #   enable_confidence_head: true, confidence_head_with_markov: true
 #
 # Training hyperparameters aligned with TorchSpec reference:
-#   lr: 6e-4, warmup_ratio: 0.04, max_grad_norm: 0.5
+#   lr: 6e-4, min_lr: 6e-5, warmup_ratio: 0.04, max_grad_norm: 1.0
 #   loss: ce_alpha=0.1, l1_alpha=0.9, confidence_alpha=1.0
 #
 # Batch-alternating data flow:
@@ -37,7 +37,8 @@ policy:
   train_micro_batch_size: 1
   learning_rate: 6e-4
   weight_decay: 0.0
-  max_grad_norm: 0.5
+  max_grad_norm: 1.0
+  min_lr: 6e-5
   warmup_ratio: 0.04
   lr_decay_style: cosine
 
