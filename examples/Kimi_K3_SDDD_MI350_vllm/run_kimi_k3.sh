@@ -48,7 +48,13 @@ fi
 
 # Environment
 export PYTHONUNBUFFERED=1
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# Deliberately NOT expandable_segments:True. On ROCm those segments are never
+# unmapped by empty_cache(), so the draft-training process keeps ~90 GiB of
+# address space after _offload_draft_to_cpu() and vLLM refuses to restart at
+# round 1 ("Free memory on device cuda:N is less than desired GPU memory
+# utilization"). Peak usage is ~103 GiB out of 288, so fragmentation is not a
+# concern here.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-}"
 export LUMENRL_LOG_LEVEL=INFO
 export NCCL_TIMEOUT=7200
 export GLOG_minloglevel="${GLOG_minloglevel:-3}"
@@ -76,15 +82,20 @@ if [ ! -f /dev/shm/kimi-mtp-dataset-phase1/train.jsonl ]; then
     python3 "${SCRIPT_DIR}/split_dataset.py"
 fi
 
-# Apply vLLM patches (volume-mounted, idempotent)
+# Apply vLLM patches (volume-mounted, idempotent).
+# Only for the 0.19.1 tree these patches were written against — applying them to
+# another vLLM build lands stray hunks and leaves .rej files behind.
 PATCH_DIR="${SCRIPT_DIR}/docker/patches/vllm/v0.19.1"
-if [ -d "${PATCH_DIR}" ]; then
+VLLM_VERSION=$(python3 -c "import vllm; print(vllm.__version__)" 2>/dev/null || echo "")
+if [ -d "${PATCH_DIR}" ] && [ "${VLLM_VERSION%%+*}" = "0.19.1" ]; then
     VLLM_DIR=$(python3 -c "import vllm, os; print(os.path.dirname(os.path.dirname(vllm.__file__)))" 2>/dev/null || echo "")
     if [ -n "${VLLM_DIR}" ]; then
         for p in "${PATCH_DIR}"/*.patch; do
             [ -f "$p" ] && (cd "$VLLM_DIR" && patch -p1 --forward < "$p" 2>/dev/null || true)
         done
     fi
+else
+    echo ">>> Skipping v0.19.1 vLLM patches (vllm=${VLLM_VERSION:-unknown})"
 fi
 
 cleanup_orphans() {
@@ -111,6 +122,14 @@ OVERRIDES=(
     "algorithm.teacher.model_name=${MODEL_PATH}"
     "checkpointing.checkpoint_dir=${CKPT_DIR}"
 )
+
+# Space-separated omegaconf dotlist entries, e.g.
+#   EXTRA_OVERRIDES="algorithm.spec_distill.cache_dir=/dev/shm/tc num_training_steps=20"
+if [ -n "${EXTRA_OVERRIDES:-}" ]; then
+    read -r -a _extra <<< "${EXTRA_OVERRIDES}"
+    OVERRIDES+=("${_extra[@]}")
+fi
+echo ">>> Overrides: ${OVERRIDES[*]}"
 
 MOONCAKE_NOISE_RE='scoped_vlog_timer|MasterClient::(Ping|FetchTasks)|transfer_task\.cpp|client_service\.cpp|BatchGet completed|Transfer (completed|engine operation)|Setting transfer result'
 

@@ -1,0 +1,104 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# LumenRL training image on top of the vLLM Kimi-K3 pre-release — MI355X (gfx950)
+#
+# Why this exists instead of Dockerfile.train:
+#   Kimi K3 (`KimiK3ForConditionalGeneration`) is not in any stable vLLM release.
+#   vLLM 0.19.1 and 0.24.0 both reject the architecture. K3 support only ships in
+#   the pre-release image `vllm/vllm-openai-rocm:kimi-k3`, which also carries the
+#   SituGLU / Latent-MoE / AttnRes / KDA kernels and `flydsl` that K3 needs.
+#
+# What is deliberately NOT done here (vs Dockerfile.train):
+#   - No vllm/v0.19.1 patches: they target a different tree, and this build
+#     already has `extract_hidden_states`, hybrid KV cache and the native
+#     `dspark` speculative method upstream.
+#   - No aiter reinstall: the base ships amd-aiter tuned for the K3 kernels.
+#     Overwriting it with third_party/aiter would risk the inference path.
+#   - No transformers/torch/datasets install: the base pins the versions vLLM
+#     K3 needs (transformers 5.14.1, torch 2.11). Only genuinely missing
+#     packages are added.
+#
+# Build:
+#   docker buildx build \
+#       -f examples/Kimi_K3_SDDD_MI350_vllm/Dockerfile.train.k3img \
+#       -t kimi_k3_dspark_k3img:latest .
+# ═══════════════════════════════════════════════════════════════════════════════
+FROM vllm/vllm-openai-rocm:kimi-k3
+
+WORKDIR /root/
+
+# ---- System dependencies (for the Mooncake source build) ----
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        git rsync dnsutils libibverbs-dev libnuma-dev \
+        cmake build-essential libjsoncpp-dev libgoogle-glog-dev \
+        wget golang-go pybind11-dev patch && \
+    rm -rf /var/lib/apt/lists/*
+
+# ---- Mooncake: pip scaffolding first, then source-build HIP backend ----
+RUN pip install --no-cache-dir "mooncake-transfer-engine==0.3.10.post1" 2>/dev/null || \
+    pip install --no-cache-dir "mooncake-transfer-engine-non-cuda>=0.3.10.post1"
+
+ARG MOONCAKE_COMMIT=f2853a80a494b999d2115449dfd153dd25f5b42d
+RUN git clone https://github.com/kvcache-ai/Mooncake.git /tmp/mooncake && \
+    cd /tmp/mooncake && \
+    git checkout ${MOONCAKE_COMMIT} && \
+    git submodule update --init --recursive && \
+    bash dependencies.sh -y && \
+    pip install pybind11 && \
+    export PATH="/usr/local/go/bin:$PATH" && \
+    mkdir build && cd build && \
+    cmake .. -DUSE_HIP=ON -DUSE_ETCD=ON && \
+    make -j$(nproc) && \
+    make install && \
+    SITE=$(python3 -c "import mooncake; import os; print(os.path.dirname(mooncake.__file__))") && \
+    SRC_STORE=$(find /tmp/mooncake/build -name 'store*.so' -path '*/mooncake-integration/*' | head -1) && \
+    SRC_ENGINE=$(find /tmp/mooncake/build -name 'engine*.so' -path '*/mooncake-integration/*' | head -1) && \
+    if [ -n "$SRC_STORE" ]; then \
+        rm -f "$SITE"/store*.so && cp -v "$SRC_STORE" "$SITE/store.so"; \
+    fi && \
+    if [ -n "$SRC_ENGINE" ]; then \
+        rm -f "$SITE"/engine*.so && cp -v "$SRC_ENGINE" "$SITE/engine.so"; \
+    fi && \
+    SRC_MASTER=$(find /tmp/mooncake/build -name 'mooncake_master' -type f -executable | head -1) && \
+    if [ -n "$SRC_MASTER" ]; then cp -v "$SRC_MASTER" "$SITE/mooncake_master"; fi && \
+    rm -rf /tmp/mooncake
+
+# ---- Missing Python packages only (keep base pins intact) ----
+RUN pip install --no-cache-dir omegaconf wandb
+
+# ---- Lumen: optional training kernels; LumenRL degrades gracefully without it ----
+# `import lumen` cannot be verified here: it reaches aiter, which needs rocminfo
+# and therefore a GPU. Verification happens at runtime instead.
+COPY third_party/Lumen /root/Lumen
+RUN cd /root/Lumen && pip install --no-deps -e .
+
+# ATOM is deliberately not installed. It registers itself as a vLLM *platform*
+# plugin, which would override platform detection for the K3 inference path, and
+# it is only reachable when algorithm.teacher.quantization requests mxfp4 — the
+# K3 weights are already mxfp4-pack-quantized, so we run with quantization="".
+
+# ---- LumenRL ----
+COPY . /root/lumenrl
+RUN cd /root/lumenrl && pip install --no-deps -e .
+
+# ---- Fail the build if the base pins were disturbed ----
+RUN python3 - <<'EOF'
+import inspect
+import torch, transformers, vllm
+import vllm.model_executor.models.registry as reg
+print("torch", torch.__version__, "transformers", transformers.__version__, "vllm", vllm.__version__)
+assert torch.__version__.startswith("2.11"), torch.__version__
+assert transformers.__version__.startswith("5.14"), transformers.__version__
+src = inspect.getsource(reg)
+assert "KimiK3ForConditionalGeneration" in src, "K3 architecture missing from vLLM registry"
+from vllm.model_executor.models.extract_hidden_states import (
+    CacheOnlyAttentionLayer, CacheOnlyAttentionMetadata,
+)
+print("base pins intact; KimiK3 registered; CacheOnly* symbols present")
+EOF
+
+ENV PYTORCH_ROCM_ARCH=gfx950
+ENV HIP_FORCE_DEV_KERNARG=1
+
+ENTRYPOINT []
+WORKDIR /root/lumenrl
