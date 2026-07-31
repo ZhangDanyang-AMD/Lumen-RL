@@ -293,6 +293,10 @@ def _apply_fsdp2_sharding(
 
     from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
 
+    from lumenrl.engine.training.fsdp_chunk_cat_fallback import install_chunk_cat_fallback
+
+    install_chunk_cat_fallback()
+
     param_dtype = _resolve_dtype(fsdp_config.get("param_dtype"), torch.bfloat16)
     reduce_dtype = _resolve_dtype(fsdp_config.get("reduce_dtype"), torch.float32)
     mp_policy = MixedPrecisionPolicy(
