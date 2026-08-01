@@ -15,7 +15,8 @@
 #
 # ⚠️ lr 和 train_global_batch_size 是绑在一起的，不能单独抄一个。
 # 参考配方是 lr=6e-4 @ bs=512；本文件跑 bs=64，线性缩放后 lr=7.5e-5。
-# 改 batch size 必须同步按 lr = 7.5e-5 × (bs/64) 缩放，且缩放后需重新验证。
+# 2026-07-31 有一轮把 lr=6e-4 直接配到 bs=8 上（等于超出线性缩放 64 倍），
+# 训练不发散但每样本收敛效率只有基线的 45%，2468 步后废弃。改 batch 必须同步改 lr。
 #
 # Batch-alternating data flow:
 #   1. Dataset with responses: kimi-mtp-dataset (~477K perfectblend)
@@ -36,12 +37,27 @@ policy:
   model_name: /dev/shm/Kimi-K3
   training_backend: fsdp2
   generation_backend: hf
+  # T=8192 从未端到端跑通过，实测 1000 步要 50 小时。2048 是所有已验证曲线的取值。
   max_total_sequence_length: 2048
+  # ⚠️ 2026-07-31：runbook 原值 bs=512 / lr=6e-4 实测**发散**，已回退到本行配方。
+  # 现象：step 2 时 ce_loss=11.30 还正常，step 3 跳到 26.60，之后一直 17-26，
+  # 全程高于 ln(163840)=12.007 的随机基线。
+  # 注意 bs=8 那轮同样用 6e-4 却没发散，所以这不是简单的"lr 绝对值太大"：
+  # 小 batch 梯度噪声大、又被 max_grad_norm=0.5 裁住，更新近似随机游走，
+  # 既没炸也基本没学到（收敛效率只有基线 45%）；bs=512 梯度干净，
+  # 同样的 6e-4 就真的推动了权重。6e-4 在这台机器上从未被验证过。
   train_global_batch_size: 64
   train_micro_batch_size: 1
+  # 唯一跑出健康曲线的取值（train1000_v4）。等于 runbook 的线性缩放：6e-4 × 64/512。
+  # 改 batch size 必须同步按 lr = 7.5e-5 × (bs/64) 缩放，且缩放后需重新验证。
   learning_rate: 7.5e-5
   weight_decay: 0.0
+  # Every curve on record was produced at 0.5. Measured grad_norm sits at
+  # 0.48-1.38 in steady state, so 1.0 lands mid-range and changes which steps
+  # get clipped; the random-init first step (grad_norm 116-148) would also take
+  # a step twice as large. Raise it only alongside a fresh baseline run.
   max_grad_norm: 0.5
+  # 保持 min_lr = lr/10，跟着 learning_rate 一起缩放。
   min_lr: 7.5e-6
   warmup_ratio: 0.04
   lr_decay_style: cosine
@@ -52,8 +68,22 @@ algorithm:
     draft_type: dspark
     loss_type: dspark
     sequential_mode: batch_alternating
+    # 一个 cached batch 的体积随 batch size 线性走：
+    #   bs=8 → 1.41 GB    bs=64 → 11.3 GB    bs=512 → 约 84 GB（实测）
+    #
+    # 两个约束：
+    #   1. /dev/shm 只有 1.3 TB → cache_batches × 单批体积必须放得下
+    #   2. Phase B 每个 rank 都会把整个 cached batch 读进自己的 CPU 内存
+    #      （spec_distill_trainer.py 的 _load_batch_from_disk，切 micro-batch 只省算力不省内存），
+    #      8 个 rank 的瞬时量 = 8 × 单批体积，而 tmpfs 占的是同一份 2.7 TiB 内存。
+    #
+    # bs=64 下 50 轮 → tmpfs 565 GB + 瞬时 90 GB，很宽裕（train1000_v4 实测取值）。
+    # 参考：bs=512 + cache_batches=10 时 Phase B 只剩 745 GB 余量，已经偏紧。
     cache_batches: 50
     cache_dir: /dev/shm/teacher_cache
+    # 不做跨 batch 梯度累积。每个 cached batch = 1 次 optimizer step。
+    # 有效 GBS = train_global_batch_size = 64。
+    # 如需更大 GBS，增大 grad_accum_steps 并同步按线性缩放调整 lr。
     grad_accum_steps: 1
     # DSpark position decay: w_k = exp(-k / gamma)
     loss_decay_gamma: 4.0
@@ -117,8 +147,21 @@ algorithm:
 mooncake:
   protocol: tcp
   device_name: ""
+  # ⚠️ 必须装得下**一整个 cached batch** 的 teacher hidden states。
+  # Phase A 是"先把整批 prefill 完、全部写进 Mooncake，消费端再逐个 key 取"，
+  # 所以整批要同时驻留，不能按 key 流式回收。
+  #
+  # 每条序列约 0.16 GB（hidden 2048×28672×2B + last_hidden 2048×7168×2B）：
+  #   bs=64  → 10 GB    16GB 够用，所以之前几轮都没暴露问题
+  #   bs=512 → 82 GB    16GB 装不下
+  #
+  # 2026-07-31 实测：bs=512 配 16GB 时写入报 code=-200（容量不足），
+  # 最早的 key 被挤掉，消费端等 k32 等满 90 秒后整个 run 挂掉。
+  # 改 batch size 必须同步核这一行。
+  # bs=64 需要 10 GB，32GB 给足 3 倍余量（原值 16GB 也够，放宽是为了容错）。
   global_segment_size: 32GB
   local_buffer_size: 8GB
+  # 原默认 90 秒。放宽到 300 秒纯属容错，不影响正常路径。
   get_retry_max_wait_seconds: 300.0
 
 quantization:
@@ -139,25 +182,60 @@ dataset:
 reward:
   type: function
   function: math_reward
+  # phase1 + phase2 合并并打散后的全量 476904 条（merge_shuffle_dataset.py，种子 20260731）。
+  # 取样是 (step*bs) % ds_len 的顺序滑窗、无 shuffle，所以必须用打散过的文件：
+  # 两个 phase 首尾拼接会让前半程只见 phase1、后半程只见 phase2。
+  # 只想复现旧的 phase1 基线时改回 /dev/shm/kimi-mtp-dataset-phase1/train.jsonl。
   dataset: /dev/shm/kimi-mtp-dataset-full/train.jsonl
 
 eval:
   enabled: true
+  # Long train（6527 步）用 100：给 65 个点，足够盯趋势，开销只有 65×25s ≈ 27 分钟（0.6%）。
+  # 用 25 的话是 261 次 × 25 秒 ≈ 1.8 小时（2.5%），不值。
+  # 短验证跑（1000 步）时改回 25，才能和 train1000_v4/v5 逐点对齐。
   interval: 100
+  # 256 条会占约 1.2 TB 内存（8 个 rank 各存一份完整 CPU 副本），全量跑必然 OOM。
   num_samples: 32
   micro_batch_size: 2
 
 checkpointing:
+  # /dev/shm 随 allocation 一起清空，checkpoint 必须落 NVMe（启动脚本会覆盖成 CKPT_DIR）。
   checkpoint_dir: /dev/shm/checkpoints/kimi_k3_dspark_vllm
+  # 与 cache_batches=50 对齐，**一轮存一次**，恰好落在 round 边界上：
+  # 崩了之后从边界恢复，不会有半轮 Phase A 白做。
+  #
+  # 按故障恢复逻辑定：teacher cache 在 /dev/shm，节点一挂就没，
+  # 必须重做当前轮 Phase A（50 批 × 23 秒 = 19.2 分钟）。
+  # save_steps=50 时最坏丢 50 × 12.3 秒 = 10.3 分钟 Phase B，已在地板之下，
+  # 再细没有收益。开销：单次保存 12 秒 × 131 次 ≈ 26 分钟（0.6%）。
+  # 磁盘不涨，save_total_limit=3 会删旧的，恒定 3 × 33 GB。
   save_steps: 50
   save_total_limit: 3
+  # 默认 true 会在新 run 里悄悄接上旧 checkpoint 继续跑，且不报错。重跑一律显式关掉。
   resume: false
 
 logger:
   wandb_enabled: false
   log_interval: 1
 
-# 全量 476904 条，预处理后实测 417769 条。
+# 全量 476904 条，预处理后实测 417769 条（跳掉 59135 条空 loss mask）。
 # Long train：跑满一个 epoch = 417769 / 64 = 6527 步。
+#
+# ⚠️ 6527 同时是**不泄漏 eval 集的上限**，不要往上取整。
+# eval 集是最后 32 条（索引 417737..417768），训练取样 (step*bs) % ds_len 从 0 顺序滑：
+#   6527 步 → 覆盖 0..417727，差 9 条够不到 eval 集 ✅
+#   6528 步 → 回绕进 eval 集 ❌
+#
+# ⏱️ 实测耗时约 **73 小时**（v5 跑 1000 步用了 11.1 小时，即每步等效 40.1 秒）。
+# 拆解：训练 12.3s + teacher 预填 23s + vLLM 重启摊薄 4.2s + eval 1.0s + ckpt 0.24s。
+# 注意**不能只用 12.3 秒去估**，那样会算出 22 小时，漏掉占大头的 Phase A 预填。
+#
+# ⚠️ 关于梯度累积，别再被旧注释误导：
+# `_grad_accum_steps` 不是配置项，是 spec_distill_trainer._plan_micro_batches 算出来的：
+#     num_mb = bs / train_micro_batch_size = 64 / 1 = 64
+#     _grad_accum_steps = ceil(num_mb / world_size) = 64 / 8 = 8
+# 它描述的是"一个 global batch 在每个 rank 上分 8 次 backward"，
+# **不会把有效 batch 放大**。有效 batch 恒等于 train_global_batch_size = 64。
+# 跨 cached batch（跨 optimizer step）没有任何累积：一个 cached batch = 一次 step。
 num_training_steps: 6527
 seed: 42
