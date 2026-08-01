@@ -24,7 +24,7 @@
 # than the optimization problem:
 #   - 8xMI350X, not 2x8 H100. Same global batch, half the GPUs, so ~2x step time.
 #   - vLLM TP=1 per colocated replica (verl uses gen_tp=2 across 16 GPUs).
-#   - gpu_memory_utilization 0.40, not verl's 0.5: verl offloads params/optimizer
+#   - gpu_memory_utilization 0.30, not verl's 0.5: verl offloads params/optimizer
 #     to CPU during generation, which the LumenRL Ray path cannot do, so the
 #     training memory stays resident and vLLM gets a smaller share.
 #   - Validation is greedy here; verl samples at temperature 0.6, top_p 1.0, n=1.
@@ -72,10 +72,16 @@ policy:
       transport: ray_http
       ray_http_start_server: false
       # verl uses 0.5, which it can afford because it offloads params/optimizer
-      # to CPU during generation; the LumenRL Ray path keeps them resident. 0.4
-      # of 252GiB leaves ~95GB for the actor, which is where the 20480-token
-      # long run peaked (mem/actor_max_reserved_gb 84.6-94.6).
-      gpu_memory_utilization: 0.40
+      # to CPU during generation; the LumenRL Ray path keeps them resident.
+      #
+      # 0.40 was tried and does not hold: vLLM takes ~101GB of the 252GiB card,
+      # the actor's allocator high-water mark reaches 117.6GB, and the ~33GB left
+      # is not enough for RCCL's buffers and the HSA runtime. A 101-step run died
+      # with HSA_STATUS_ERROR_OUT_OF_RESOURCES ("Available Free mem : 0 MB") in a
+      # collective. Live memory was flat throughout (allocated 42.8GB,
+      # max_allocated 75.6GB) -- the growth is allocator fragmentation, +0.086
+      # GB/step. At 0.30 the headroom is ~59GB instead.
+      gpu_memory_utilization: 0.30
       max_model_len: 22528
       dtype: bfloat16
       enforce_eager: true
