@@ -10,8 +10,12 @@
 #   enable_confidence_head: true, confidence_head_with_markov: true
 #
 # Training hyperparameters aligned with TorchSpec reference:
-#   lr: 6e-4, min_lr: 6e-5, warmup_ratio: 0.04, max_grad_norm: 1.0
 #   loss: ce_alpha=0.1, l1_alpha=0.9, confidence_alpha=1.0
+#   warmup_ratio: 0.04, weight_decay: 0.0, max_grad_norm: 0.5, cosine decay
+#
+# ⚠️ lr 和 train_global_batch_size 是绑在一起的，不能单独抄一个。
+# 参考配方是 lr=6e-4 @ bs=512；本文件跑 bs=64，线性缩放后 lr=7.5e-5。
+# 改 batch size 必须同步按 lr = 7.5e-5 × (bs/64) 缩放，且缩放后需重新验证。
 #
 # Batch-alternating data flow:
 #   1. Dataset with responses: kimi-mtp-dataset (~477K perfectblend)
@@ -32,13 +36,13 @@ policy:
   model_name: /dev/shm/Kimi-K3
   training_backend: fsdp2
   generation_backend: hf
-  max_total_sequence_length: 4096
-  train_global_batch_size: 8
+  max_total_sequence_length: 2048
+  train_global_batch_size: 64
   train_micro_batch_size: 1
-  learning_rate: 6e-4
+  learning_rate: 7.5e-5
   weight_decay: 0.0
-  max_grad_norm: 1.0
-  min_lr: 6e-5
+  max_grad_norm: 0.5
+  min_lr: 7.5e-6
   warmup_ratio: 0.04
   lr_decay_style: cosine
 
@@ -48,9 +52,9 @@ algorithm:
     draft_type: dspark
     loss_type: dspark
     sequential_mode: batch_alternating
-    cache_batches: 200
-    cache_dir: /tmp/teacher_cache
-    grad_accum_steps: 64          # GBS = train_global_batch_size × grad_accum = 8 × 64 = 512
+    cache_batches: 50
+    cache_dir: /dev/shm/teacher_cache
+    grad_accum_steps: 1
     # DSpark position decay: w_k = exp(-k / gamma)
     loss_decay_gamma: 4.0
     num_target_layers: 5
@@ -113,8 +117,9 @@ algorithm:
 mooncake:
   protocol: tcp
   device_name: ""
-  global_segment_size: 16GB
-  local_buffer_size: 4GB
+  global_segment_size: 32GB
+  local_buffer_size: 8GB
+  get_retry_max_wait_seconds: 300.0
 
 quantization:
   training:
@@ -134,25 +139,25 @@ dataset:
 reward:
   type: function
   function: math_reward
-  dataset: /dev/shm/kimi-mtp-dataset-phase1/train.jsonl
+  dataset: /dev/shm/kimi-mtp-dataset-full/train.jsonl
 
 eval:
   enabled: true
-  interval: 500
-  num_samples: 256
-  micro_batch_size: 4
+  interval: 100
+  num_samples: 32
+  micro_batch_size: 2
 
 checkpointing:
   checkpoint_dir: /dev/shm/checkpoints/kimi_k3_dspark_vllm
-  save_steps: 100
+  save_steps: 50
   save_total_limit: 3
-  resume: true
+  resume: false
 
 logger:
   wandb_enabled: false
   log_interval: 1
 
-# ~477K prompts / GBS=512 ≈ 932 optimizer steps. 1 epoch.
-# Forward batches = 932 × 64 = 59648. Rounds = 59648/200 ≈ 298.
-num_training_steps: 932
+# 全量 476904 条，预处理后实测 417769 条。
+# Long train：跑满一个 epoch = 417769 / 64 = 6527 步。
+num_training_steps: 6527
 seed: 42

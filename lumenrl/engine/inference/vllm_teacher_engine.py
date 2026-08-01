@@ -125,13 +125,19 @@ from vllm import LLM, SamplingParams
 # Patch vLLM bug: HiddenStatesCacheSpec.merge() unconditionally raises even
 # for a single-element list.  Fixed upstream but not in 0.19.1+rocm721.
 import copy as _copy
-from vllm.model_executor.models.extract_hidden_states import HiddenStatesCacheSpec as _HSCS
-@classmethod
-def _hscs_merge(cls, specs):
-    if all(spec == specs[0] for spec in specs[1:]):
-        return _copy.deepcopy(specs[0])
-    raise AssertionError("HiddenStatesCacheSpec must not be merged with other layers")
-_HSCS.merge = _hscs_merge
+try:
+    from vllm.model_executor.models.extract_hidden_states import (
+        HiddenStatesCacheSpec as _HSCS,
+    )
+except ImportError:
+    logger.info("HiddenStatesCacheSpec absent; skipping merge() patch")
+else:
+    @classmethod
+    def _hscs_merge(cls, specs):
+        if all(spec == specs[0] for spec in specs[1:]):
+            return _copy.deepcopy(specs[0])
+        raise AssertionError("HiddenStatesCacheSpec must not be merged with other layers")
+    _HSCS.merge = _hscs_merge
 
 engine_kwargs = dict(
     model=model_path,
@@ -143,7 +149,7 @@ engine_kwargs = dict(
     max_model_len=max_seq_len,
     max_num_batched_tokens=40000,
     max_num_seqs=128,
-    gpu_memory_utilization=0.90,
+    gpu_memory_utilization=float(os.environ.get("LUMENRL_TEACHER_GPU_MEM_UTIL", "0.90")),
     speculative_config={
         "method": "extract_hidden_states",
         "num_speculative_tokens": 1,

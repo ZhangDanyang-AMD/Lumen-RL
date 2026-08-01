@@ -85,34 +85,48 @@ class KimiK3Parser:
     def _prepare_messages(self, conversation: List[Dict]) -> List[Dict]:
         """Prepare messages for K3's apply_chat_template.
 
-        Extracts <think>...</think> from assistant content into the
-        reasoning_content field that encoding_k3.build_chat_segments expects.
+        Aligns with TorchSpec K2.5 reasoning handling (parse.py:488-504):
+        - Non-last assistant turns: strip <think>...</think> entirely
+        - Last assistant turn: keep reasoning in reasoning_content field
         """
+        last_assistant_idx = max(
+            (i for i, msg in enumerate(conversation) if isinstance(msg, dict) and msg.get("role") == "assistant"),
+            default=-1,
+        )
+
         messages = []
-        for msg in conversation:
+        for idx, msg in enumerate(conversation):
             entry = dict(msg)
             if entry.get("role") != "assistant":
                 messages.append(entry)
                 continue
 
             content = entry.get("content", "")
-            existing_reasoning = self._reasoning_from_field(entry)
 
-            if existing_reasoning:
-                reasoning = existing_reasoning
-                if "<think>" in content:
-                    _, content = self._extract_thinking(content)
+            if idx != last_assistant_idx:
+                if _has_dropped_think_opener(content):
+                    content = "<think>" + content
+                content = _THINK_PATTERN.sub("", content)
+                entry["content"] = content
+                for field in _REASONING_FIELDS:
+                    entry.pop(field, None)
             else:
-                reasoning, content = self._extract_thinking(content)
+                existing_reasoning = self._reasoning_from_field(entry)
+                if existing_reasoning:
+                    reasoning = existing_reasoning
+                    if "<think>" in content:
+                        _, content = self._extract_thinking(content)
+                else:
+                    reasoning, content = self._extract_thinking(content)
 
-            entry["content"] = content
-            if reasoning:
-                entry["reasoning_content"] = reasoning
-            else:
-                entry.pop("reasoning_content", None)
-            for field in _REASONING_FIELDS:
-                if field != "reasoning_content" and field in entry:
-                    del entry[field]
+                entry["content"] = content
+                if reasoning:
+                    entry["reasoning_content"] = reasoning
+                else:
+                    entry.pop("reasoning_content", None)
+                for field in _REASONING_FIELDS:
+                    if field != "reasoning_content" and field in entry:
+                        del entry[field]
 
             messages.append(entry)
 

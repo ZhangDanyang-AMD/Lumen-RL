@@ -2271,9 +2271,7 @@ class SpecDistillTrainer:
         meta: dict = {}
         for key in self._TEACHER_KEYS:
             t = teacher_data[key].contiguous()
-            raw = t.view(torch.uint8).numpy().ravel()
-            with open(f"{batch_dir}/{key}.bin", "wb") as f:
-                f.write(raw.tobytes())
+            t.view(torch.uint8).numpy().ravel().tofile(f"{batch_dir}/{key}.bin")
             meta[key] = list(t.shape)
         for name, tensor in (("input_ids", input_ids), ("attention_mask", attention_mask), ("loss_mask", loss_mask)):
             c = tensor.contiguous()
@@ -2320,27 +2318,24 @@ class SpecDistillTrainer:
             shutil.rmtree(round_dir, ignore_errors=True)
             logger.info("[rank %d] Cleaned up cache: %s", self._rank, round_dir)
 
+    def _move_draft_storage(self, device) -> None:
+        """Move draft model tensors in-place, preserving Parameter object identity.
+
+        Uses param.data assignment instead of model.to() so that composable
+        replicate's DDP Reducer and BF16Optimizer.model_params references
+        remain valid across CPU/GPU moves.
+        """
+        for param in self._draft_model.parameters(recurse=True):
+            param.data = param.data.to(device)
+            if param.grad is not None:
+                param.grad.data = param.grad.data.to(device)
+        for buf in self._draft_model.buffers(recurse=True):
+            if buf is not None:
+                buf.data = buf.data.to(device)
+
     def _offload_draft_to_cpu(self) -> None:
         """Move draft model and optimizer state to CPU, free GPU memory."""
-        # Remove composable replicate hooks before offloading to avoid
-        # double-wrapping when _load_draft_to_gpu re-applies replicate.
-        if hasattr(self._draft_model, "_replicate_api"):
-            del self._draft_model._replicate_api
-        for mod in self._draft_model.modules():
-            hooks_to_remove = []
-            for handle_id, hook in getattr(mod, "_forward_pre_hooks", {}).items():
-                if type(hook).__module__ and "replicate" in type(hook).__module__:
-                    hooks_to_remove.append(handle_id)
-            for hid in hooks_to_remove:
-                del mod._forward_pre_hooks[hid]
-            hooks_to_remove = []
-            for handle_id, hook in getattr(mod, "_forward_hooks", {}).items():
-                if type(hook).__module__ and "replicate" in type(hook).__module__:
-                    hooks_to_remove.append(handle_id)
-            for hid in hooks_to_remove:
-                del mod._forward_hooks[hid]
-
-        self._draft_model.to("cpu")
+        self._move_draft_storage("cpu")
         opt = self._optimizer
         for mp in opt.fp32_params:
             mp.data = mp.data.cpu()
@@ -2358,15 +2353,8 @@ class SpecDistillTrainer:
         logger.info("[rank %d] Draft model offloaded to CPU", self._rank)
 
     def _load_draft_to_gpu(self) -> None:
-        """Move draft model and optimizer state back to GPU, re-establish replicate."""
-        self._draft_model.to(self._device)
-
-        # After model.to(device), nn.Module creates new tensor objects.
-        # BF16Optimizer.model_params holds stale CPU references — rebuild.
-        self._optimizer.model_params = [
-            p for p in self._draft_model.parameters() if p.requires_grad
-        ]
-
+        """Move draft model and optimizer state back to GPU."""
+        self._move_draft_storage(self._device)
         opt = self._optimizer
         for mp in opt.fp32_params:
             mp.data = mp.data.to(self._device)
@@ -2376,12 +2364,31 @@ class SpecDistillTrainer:
             for k, v in state.items():
                 if isinstance(v, torch.Tensor):
                     state[k] = v.to(self._device)
-
-        if self._is_distributed and self._world_size > 1:
-            from torch.distributed._composable.replicate import replicate
-            replicate(self._draft_model)
-
         logger.info("[rank %d] Draft model reloaded to GPU", self._rank)
+
+    def _plan_micro_batches(self, batch_size: int, seq_len: int) -> list[tuple[int, int]]:
+        """Split a cached batch into per-rank micro-batches for Phase B training.
+
+        Returns (lo, hi) index pairs for this rank's share of the batch.
+        Sets self._grad_accum_steps to the number of micro-batches per rank
+        (used by _train_step_dspark for loss scaling).
+        """
+        configured_mb = int(getattr(self.config.policy, "train_micro_batch_size", 0) or 0)
+        if configured_mb > 0:
+            mb = min(configured_mb, batch_size)
+        else:
+            mb = max(1, min(max(1, 16384 // max(seq_len, 1)), batch_size))
+        num_mb = (batch_size + mb - 1) // mb
+        world_size = self._world_size if self._is_distributed else 1
+        if num_mb < world_size:
+            self._grad_accum_steps = num_mb
+            return [(i * mb, min((i + 1) * mb, batch_size)) for i in range(num_mb)]
+        self._grad_accum_steps = (num_mb + world_size - 1) // world_size
+        return [
+            (i * mb, min((i + 1) * mb, batch_size))
+            for i in range(num_mb)
+            if i % world_size == self._rank
+        ]
 
     def _batch_alternating_train(self) -> None:
         """Batch-alternating training loop for K3-class models requiring TP=full_node.
@@ -2513,7 +2520,6 @@ class SpecDistillTrainer:
                 group_start = (batch_idx // grad_accum) * grad_accum
                 group_end = min(group_start + grad_accum, round_num_batches)
                 actual_group_size = group_end - group_start
-                self._grad_accum_steps = actual_group_size
 
                 is_last_in_accum = (accum_count + 1 == actual_group_size)
 
@@ -2535,21 +2541,32 @@ class SpecDistillTrainer:
                 attention_mask = loaded["attention_mask"]
                 loss_mask = loaded.get("loss_mask", attention_mask.clone())
 
-                mb_teacher = {k: v.to(self._device) for k, v in cpu_data.items()}
-                mb_teacher["input_ids"] = input_ids.to(self._device)
+                mbs = self._plan_micro_batches(input_ids.shape[0], input_ids.shape[1])
+                if grad_accum > 1:
+                    self._grad_accum_steps *= actual_group_size
+                mb_metrics: dict[str, float] = {}
+                for lo, hi in mbs:
+                    mb_teacher = {k: v[lo:hi].to(self._device) for k, v in cpu_data.items()}
+                    mb_teacher["input_ids"] = input_ids[lo:hi].to(self._device)
+                    mb_mask = attention_mask[lo:hi]
+                    mb_loss_mask = loss_mask[lo:hi]
 
-                if draft_type == "dspark":
-                    m = self._train_step_dspark(mb_teacher, attention_mask, loss_mask)
-                elif draft_type == "eagle3":
-                    m = self._train_step_eagle3(mb_teacher, attention_mask, loss_mask)
-                else:
-                    m = self._train_step_dflash(mb_teacher, attention_mask, loss_mask)
+                    if draft_type == "dspark":
+                        m = self._train_step_dspark(mb_teacher, mb_mask, mb_loss_mask)
+                    elif draft_type == "eagle3":
+                        m = self._train_step_eagle3(mb_teacher, mb_mask, mb_loss_mask)
+                    else:
+                        m = self._train_step_dflash(mb_teacher, mb_mask, mb_loss_mask)
 
-                del mb_teacher, loaded, cpu_data
+                    for k, v in m.items():
+                        if isinstance(v, float) and v == v:
+                            mb_metrics[k] = mb_metrics.get(k, 0.0) + v / len(mbs)
+                    del mb_teacher
 
-                for k, v in m.items():
-                    if isinstance(v, float) and v == v:
-                        metrics_accum[k] = metrics_accum.get(k, 0.0) + v
+                del loaded, cpu_data
+
+                for k, v in mb_metrics.items():
+                    metrics_accum[k] = metrics_accum.get(k, 0.0) + v
                 accum_count += 1
 
                 if is_last_in_accum:

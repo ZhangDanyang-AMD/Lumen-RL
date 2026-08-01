@@ -215,7 +215,8 @@ class DSparkMLAAttention(nn.Module):
         if num_rep > 1:
             k_nope = k_nope.repeat_interleave(num_rep, dim=1)
             v = v.repeat_interleave(num_rep, dim=1)
-            k_rope_emb = k_rope_emb.repeat_interleave(num_rep, dim=1)
+
+        k_rope_emb = k_rope_emb.expand(-1, self.num_heads, -1, -1)
 
         # Full Q/K by concatenating nope + rope components
         q_full = torch.cat([q_nope, q_rope_emb], dim=-1)

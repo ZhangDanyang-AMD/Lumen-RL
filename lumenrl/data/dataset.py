@@ -8,6 +8,8 @@ Reference: https://github.com/LightSeek-Foundation/TorchSpec
 License: MIT
 """
 
+PARSER_VERSION = 3
+
 import hashlib
 import logging
 import multiprocessing as mp
@@ -129,7 +131,7 @@ def load_and_preprocess_dataset(
         f"{os.path.basename(dataset_path)}-{dataset_path}{file_stat}"
         f"-{tokenizer_path}-{max_length}-{chat_template}"
         f"-ltlo={last_turn_loss_only}-mlt={min_loss_tokens}"
-        f"-split={dataset_split}"
+        f"-split={dataset_split}-pv={PARSER_VERSION}"
     )
     cache_key = hashlib.md5(cache_params.encode()).hexdigest()
     cache_subdir = os.path.join(cache_dir, "tokenized_dataset")
