@@ -192,6 +192,12 @@ fi
 if [ -n "${RESUME_OVERRIDE:-}" ]; then
   EXTRA_OVERRIDES+=("checkpointing.resume=$RESUME_OVERRIDE")
 fi
+if [ -n "${CHECKPOINT_SAVE_STEPS:-}" ]; then
+  EXTRA_OVERRIDES+=("checkpointing.save_steps=$CHECKPOINT_SAVE_STEPS")
+fi
+if [ -n "${CHECKPOINT_SAVE_TOTAL_LIMIT:-}" ]; then
+  EXTRA_OVERRIDES+=("checkpointing.save_total_limit=$CHECKPOINT_SAVE_TOTAL_LIMIT")
+fi
 if [ -n "${WEIGHT_SYNC_BACKEND:-}" ]; then
   EXTRA_OVERRIDES+=("weight_sync.backend=$WEIGHT_SYNC_BACKEND")
 fi

@@ -704,13 +704,26 @@ class MegatronEngine(BaseEngine):
         return int(idx[0].item()), int(idx.numel())
 
     # ---- MILES R3: rollout top-k expert-id replay ---------------------
-    def _r3_routes(self, batch: DataProto) -> torch.Tensor | None:
-        routes = batch.tensors.get("rollout_routed_experts")
+    def _r3_routes(self, batch: DataProto) -> torch.Tensor | list[Any] | None:
         if not self._r3_enabled:
             return None
+        routes = batch.ragged.get("rollout_routing")
+        if routes is not None:
+            if len(routes) != batch.batch_size:
+                raise ValueError(
+                    "rollout_routing row count mismatch: "
+                    f"got {len(routes)}, expected {batch.batch_size}"
+                )
+            if any(row is None for row in routes):
+                raise RuntimeError(
+                    "moe.r3.enabled=true but rollout_routing contains missing rows."
+                )
+            return routes
+        routes = batch.tensors.get("rollout_routed_experts")
         if routes is None:
             raise RuntimeError(
-                "moe.r3.enabled=true but rollout_routed_experts is missing. "
+                "moe.r3.enabled=true but neither ragged rollout_routing nor "
+                "rollout_routed_experts is present. "
                 "R3 must not silently fall back to training-time routing."
             )
         if routes.ndim != 4:
@@ -722,7 +735,7 @@ class MegatronEngine(BaseEngine):
 
     def _r3_set_packed_routes(
         self,
-        routes: torch.Tensor,
+        routes: torch.Tensor | list[Any],
         attention_mask: torch.Tensor,
         packed,
     ) -> None:
@@ -745,21 +758,55 @@ class MegatronEngine(BaseEngine):
                 "instances; check moe_enable_routing_replay and the Megatron fork."
             )
 
-        topk = int(routes.shape[-1])
-        filler = torch.arange(topk, dtype=routes.dtype, device=routes.device)
+        dense = isinstance(routes, torch.Tensor)
+        if dense:
+            num_layers = int(routes.shape[2])
+            topk = int(routes.shape[3])
+            route_dtype = routes.dtype
+            route_device = routes.device
+        else:
+            if not routes:
+                raise ValueError("R3 received an empty ragged routing chunk.")
+            sample = torch.as_tensor(routes[0])
+            if sample.ndim != 3:
+                raise ValueError(
+                    "ragged rollout_routing rows must have shape "
+                    f"[seq_len-1, num_layers, top_k], got {tuple(sample.shape)}"
+                )
+            num_layers = int(sample.shape[1])
+            topk = int(sample.shape[2])
+            route_dtype = sample.dtype
+            route_device = sample.device
+        filler = torch.arange(topk, dtype=route_dtype, device=route_device)
         rows: list[torch.Tensor] = []
-        for row in range(routes.shape[0]):
+        for row in range(attention_mask.shape[0]):
             start, length = self._real_block(attention_mask[row])
             if length <= 0:
                 continue
-            real = routes[row, start:start + max(0, length - 1)]
+            if dense:
+                real = routes[row, start:start + max(0, length - 1)]
+            else:
+                raw = routes[row]
+                if isinstance(raw, torch.Tensor):
+                    real = raw.detach().to(
+                        device=route_device, dtype=route_dtype,
+                    ).clone()
+                else:
+                    real = torch.tensor(
+                        raw, device=route_device, dtype=route_dtype,
+                    )
+                if real.ndim != 3 or tuple(real.shape[1:]) != (num_layers, topk):
+                    raise ValueError(
+                        f"R3 routing for row {row} has shape {tuple(real.shape)}, "
+                        f"expected [seq_len-1, {num_layers}, {topk}]"
+                    )
             if real.shape[0] != max(0, length - 1):
                 raise ValueError(
                     f"R3 route length mismatch for row {row}: got {real.shape[0]}, "
                     f"expected {length - 1}"
                 )
             rows.append(torch.cat(
-                [real, filler.view(1, 1, topk).expand(1, routes.shape[2], topk)],
+                [real, filler.view(1, 1, topk).expand(1, num_layers, topk)],
                 dim=0,
             ))
 
@@ -769,7 +816,7 @@ class MegatronEngine(BaseEngine):
         total_padded = int(packed.input_ids.shape[-1])
         if replay.shape[0] < total_padded:
             pad = filler.view(1, 1, topk).expand(
-                total_padded - replay.shape[0], routes.shape[2], topk,
+                total_padded - replay.shape[0], num_layers, topk,
             )
             replay = torch.cat([replay, pad], dim=0)
         if replay.shape[0] != total_padded:
@@ -823,13 +870,23 @@ class MegatronEngine(BaseEngine):
         RouterReplay.clear_global_indices()
 
     @staticmethod
-    def _r3_metrics(routes: torch.Tensor, attention_mask: torch.Tensor) -> dict[str, float]:
-        num_layers = int(routes.shape[2])
+    def _r3_metrics(
+        routes: torch.Tensor | list[Any],
+        attention_mask: torch.Tensor,
+    ) -> dict[str, float]:
+        if isinstance(routes, torch.Tensor):
+            num_layers = int(routes.shape[2])
+            valid_count = int((routes >= 0).all(dim=-1).sum().item())
+        else:
+            sample = torch.as_tensor(routes[0])
+            num_layers = int(sample.shape[1])
+            valid_count = sum(
+                int((torch.as_tensor(row) >= 0).all(dim=-1).sum().item())
+                for row in routes
+            )
         expected_positions = int(
             (attention_mask.sum(dim=1).sub(1).clamp_min(0).sum() * num_layers).item()
         )
-        valid = (routes >= 0).all(dim=-1)
-        valid_count = int(valid.sum().item())
         return {
             "moe/r3_enabled": 1.0,
             "moe/r3_route_coverage": valid_count / max(1, expected_positions),
@@ -1181,7 +1238,7 @@ class MegatronEngine(BaseEngine):
 
         if can_pack:
             metrics = self._engine_update_policy_packed(
-                seqs, am, B, S, algo_name, temperature, bnt, dp, _cfg, t, meta,
+                batch, seqs, am, B, S, algo_name, temperature, bnt, dp, _cfg, t, meta,
             )
         else:
             if self._r3_enabled:
@@ -1314,7 +1371,7 @@ class MegatronEngine(BaseEngine):
         return metrics
 
     def _engine_update_policy_packed(
-        self, seqs, am, B, S, algo_name, temperature, bnt, dp, _cfg, t, meta,
+        self, batch, seqs, am, B, S, algo_name, temperature, bnt, dp, _cfg, t, meta,
     ) -> dict[str, float]:
         """Packed (varlen) forward + per-row loss + backward."""
         from lumenrl.engine.training.packing import (
@@ -1323,12 +1380,7 @@ class MegatronEngine(BaseEngine):
 
         max_tok = int(meta.get("max_token_len_per_gpu", 8192) or 8192)
         seq_lens = am.sum(dim=1).long()
-        r3_routes = t.get("rollout_routed_experts")
-        if self._r3_enabled and r3_routes is None:
-            raise RuntimeError(
-                "moe.r3.enabled=true but policy update received no "
-                "rollout_routed_experts."
-            )
+        r3_routes = self._r3_routes(batch)
 
         chunks: list[tuple[int, int]] = []
         start = 0
@@ -1842,6 +1894,79 @@ class MegatronEngine(BaseEngine):
             use_grouped_mlp=self._use_grouped_mlp,
         )
         return gen, None
+
+    def _dist_sharded_state_dict(self, is_loading: bool):
+        """Build a low-memory, DP-reshardable model and optimizer state."""
+        model_state = self.module.sharded_state_dict()
+        optimizer_state = self.optimizer.sharded_state_dict(
+            model_state,
+            is_loading=is_loading,
+            metadata={"distrib_optim_sharding_type": "dp_reshardable"},
+        )
+        return {"model": model_state, "optimizer": optimizer_state}
+
+    def save_dist_checkpoint(self, local_path: str, global_step: int = 0) -> bool:
+        """Save directly from each rank's owned optimizer buffers.
+
+        ``dp_reshardable`` avoids the DP-zero gather used by the legacy actor
+        checkpoint path, so saving does not materialize full optimizer copies
+        on every worker.
+        """
+        import megatron.core.dist_checkpointing as dc
+
+        state = self._dist_sharded_state_dict(is_loading=False)
+        state["global_step"] = int(global_step)
+        if self.lr_scheduler is not None:
+            state["lr_scheduler"] = self.lr_scheduler.state_dict()
+        os.makedirs(local_path, exist_ok=True)
+        dc.save(state, str(local_path))
+        if dist.is_initialized():
+            dist.barrier()
+        return True
+
+    @staticmethod
+    def _patch_hybrid_optimizer_checkpoint_load() -> None:
+        """Tolerate native-FP32 params in MCore's CPU-offload load hook.
+
+        MCore 0.15's ``HybridDeviceOptimizer`` assumes every state entry has a
+        separate FP32 master parameter. Qwen3 MoE also has parameters that are
+        already FP32, so those entries are intentionally absent from
+        ``param_to_fp32_param`` and the upstream hook raises ``KeyError``.
+        """
+        from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+
+        if getattr(HybridDeviceOptimizer, "_lumenrl_safe_fp32_restore", False):
+            return
+
+        def _update_mapped_fp32_params(optimizer) -> None:
+            if not optimizer.param_update_in_fp32:
+                return
+            for param, value in optimizer.state.items():
+                fp32_param = optimizer.param_to_fp32_param.get(param)
+                master_param = value.get("master_param")
+                if fp32_param is not None and master_param is not None:
+                    fp32_param.data.copy_(master_param)
+
+        HybridDeviceOptimizer._update_fp32_params_by_new_state = (
+            _update_mapped_fp32_params
+        )
+        HybridDeviceOptimizer._lumenrl_safe_fp32_restore = True
+
+    def load_dist_checkpoint(self, local_path: str) -> int:
+        """Restore a checkpoint saved by :meth:`save_dist_checkpoint`."""
+        import megatron.core.dist_checkpointing as dc
+
+        self._patch_hybrid_optimizer_checkpoint_load()
+        state = self._dist_sharded_state_dict(is_loading=True)
+        state["global_step"] = 0
+        loaded = dc.load(state, str(local_path))
+        self.module.load_state_dict(loaded["model"])
+        self.optimizer.load_state_dict(loaded["optimizer"])
+        if self.lr_scheduler is not None and loaded.get("lr_scheduler") is not None:
+            self.lr_scheduler.load_state_dict(loaded["lr_scheduler"])
+        if dist.is_initialized():
+            dist.barrier()
+        return int(loaded.get("global_step", 0))
 
 
 @EngineRegistry.register(model_type="language_model", backend="megatron")

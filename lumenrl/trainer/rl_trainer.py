@@ -541,7 +541,13 @@ class RLTrainer:
         tok = self._tokenizer
         pad_id = tok.pad_token_id or 0
         want_lp = bool(vcfg.calculate_log_probs)
-        want_r3 = bool(getattr(self.config.moe.r3, "enabled", False))
+        # Megatron MILES R3 uses ``enabled`` while the FSDP replay path uses
+        # ``rollout_replay``. Both consume the same per-completion expert ids,
+        # so retain the ragged payload for either mode.
+        want_r3 = bool(
+            getattr(self.config.moe.r3, "enabled", False)
+            or self._r3_rollout_replay
+        )
 
         # Send pre-tokenized prompt_token_ids (verl's token-in path), NOT the
         # prompt string. A controlled A/B (identical prompts/params/seed/base
@@ -635,15 +641,12 @@ class RLTrainer:
             rollout_lp = rollout_lp.to(self._device)
 
         ragged: dict[str, list[Any]] = {}
-        if self._r3_rollout_replay:
-            routing = [res.get("routed_experts") for res in results]
-            if any(r is None for r in routing):
-                raise RuntimeError(
-                    "moe.r3.rollout_replay is on but the rollout engine returned no "
-                    "routed_experts; the engine must be built with "
-                    "enable_return_routed_experts=True."
-                )
-            ragged["rollout_routing"] = routing
+        if want_r3:
+            # Use the validated/copied tensors assembled above. In particular,
+            # revisions that expose the final loss-unused route were trimmed to
+            # ``sequence_length - 1`` there; re-reading the raw results here
+            # would silently discard that normalization.
+            ragged["rollout_routing"] = response_routes
         return sequences, seq_mask, prompt_lengths, rollout_lp, ragged
 
     def _ray_sampling_params(self, want_logprobs: bool) -> dict[str, Any]:
@@ -3452,6 +3455,7 @@ class RLTrainer:
         want_entropy: bool = False,
         attention_mask: torch.Tensor | None = None,
         rollout_routed_experts: torch.Tensor | None = None,
+        rollout_routing: list[Any] | None = None,
     ):
         meta = {"calculate_entropy": True} if want_entropy else {}
         # verl-aligned packed forward on the worker needs the temperature (for
@@ -3470,7 +3474,15 @@ class RLTrainer:
             req_tensors["rollout_routed_experts"] = (
                 rollout_routed_experts.detach().cpu()
             )
-        req = DataProto(tensors=req_tensors, meta=meta)
+        req_ragged = {}
+        if rollout_routing is not None:
+            if len(rollout_routing) != int(sequences.shape[0]):
+                raise ValueError(
+                    "rollout_routing row count mismatch: "
+                    f"got {len(rollout_routing)}, expected {sequences.shape[0]}"
+                )
+            req_ragged["rollout_routing"] = list(rollout_routing)
+        req = DataProto(tensors=req_tensors, meta=meta, ragged=req_ragged)
         role_cfg = self.config.controller.ray.actor if role == "actor" else self.config.controller.ray.ref
         out = wg.dispatch_and_call(
             "compute_log_probs",
@@ -3805,6 +3817,7 @@ class RLTrainer:
                 old_log_probs, entropy_full = self._compute_log_probs_with_worker_group(
                     self._actor_wg, sequences, role="actor", want_entropy=True,
                     attention_mask=seq_mask,
+                    rollout_routing=rollout_ragged.get("rollout_routing"),
                 )
             old_log_prob_time = time.time() - old_log_prob_t0
             ref_t0 = time.time()
