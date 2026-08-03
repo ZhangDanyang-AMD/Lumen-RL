@@ -21,6 +21,7 @@ from lumenrl.algorithms.loss_functions import (
     asymmetric_clip_loss,
     kl_penalty,
     policy_gradient_loss,
+    sft_loss,
 )
 from lumenrl.core.protocol import DataProto
 from lumenrl.core.types import AlgorithmName, TrainingBackend
@@ -641,6 +642,27 @@ class LumenActorWorker(BaseWorker):
         L = token_log_probs.shape[-1]
         dev = token_log_probs.device
         meta = getattr(self, "_pol_meta", {}) or {}
+
+        # SFT dispatch: when task_type is "sft", use supervised loss instead of RL.
+        if meta.get("task_type") == "sft":
+            lm = data.get("loss_mask")
+            if lm is None:
+                lm = data.get("attention_mask")
+            lm = lm.to(dev).float()
+            # Shift loss_mask to align with log_probs (which predict token i+1).
+            if lm.shape[-1] == L + 1:
+                lm = lm[:, 1:]
+            lm = lm[..., :L]
+            dp = int(meta.get("dp_size", 1) or 1)
+            dp_group = None
+            if self._engine is not None:
+                dp_group = self._engine.get_data_parallel_group()
+            return sft_loss(
+                token_log_probs, lm,
+                loss_agg_mode=meta.get("loss_agg_mode", "token-mean"),
+                dp_size=dp, dp_group=dp_group,
+            )
+
         algo_name = str(meta.get("algorithm", "dapo")).lower()
 
         old_logp = data.get("old_log_probs")

@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "agg_loss",
+    "sft_loss",
     "policy_gradient_loss",
     "asymmetric_clip_loss",
     "gmpo_loss",
@@ -65,6 +66,56 @@ def agg_loss(
         return masked_sum(seq_losses, seq_mask) / max(global_batch_size, 1) * dp_size
 
     raise ValueError(f"Invalid loss_agg_mode: {loss_agg_mode!r}")
+
+
+def sft_loss(
+    log_probs: Tensor,
+    loss_mask: Tensor,
+    loss_agg_mode: str = "token-mean",
+    dp_size: int = 1,
+    dp_group=None,
+) -> tuple[Tensor, dict[str, float]]:
+    """Supervised fine-tuning NLL loss over masked tokens.
+
+    Args:
+        log_probs: Per-token log-probabilities ``[B, T]``.
+        loss_mask: Binary mask ``[B, T]`` (1 = supervised token).
+        loss_agg_mode: Aggregation mode forwarded to :func:`agg_loss`.
+        dp_size: Data-parallel world size for global normalization.
+        dp_group: Optional process group for cross-rank token count all-reduce.
+
+    Returns:
+        ``(loss, metrics_dict)`` matching the worker loss_fn contract.
+    """
+    import torch.distributed as dist
+
+    batch_num_tokens: Optional[int] = None
+    global_batch_size: Optional[int] = None
+
+    if loss_agg_mode == "token-mean":
+        num_tokens = loss_mask.sum()
+        if dp_group is not None and dist.is_initialized():
+            dist.all_reduce(num_tokens, group=dp_group)
+        batch_num_tokens = max(int(num_tokens.item()), 1)
+    else:
+        seq_mask = (loss_mask.sum(dim=-1) > 0).float()
+        num_seqs = seq_mask.sum()
+        if dp_group is not None and dist.is_initialized():
+            dist.all_reduce(num_seqs, group=dp_group)
+        global_batch_size = max(int(num_seqs.item()), 1)
+
+    loss = agg_loss(
+        -log_probs,
+        loss_mask,
+        loss_agg_mode,
+        dp_size=dp_size,
+        batch_num_tokens=batch_num_tokens,
+        global_batch_size=global_batch_size,
+    )
+    return loss, {
+        "sft_loss": float(loss.detach()),
+        "num_tokens": float(loss_mask.sum().detach()),
+    }
 
 
 def policy_gradient_loss(

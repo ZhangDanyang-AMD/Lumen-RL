@@ -1196,6 +1196,8 @@ class MegatronEngine(BaseEngine):
         if batch.batch_size == 0:
             return {"loss": 0.0, "lr": self._cur_lr(), "grad_norm": 0.0}
         meta = dict(batch.meta)
+        if meta.get("task_type") == "sft":
+            return self._engine_update_sft(batch)
         algo_name = str(meta.get("algorithm", "dapo")).lower()
         temperature = float(meta.get("temperature", 1.0) or 1.0)
         bnt = meta.get("batch_num_tokens")
@@ -1738,6 +1740,75 @@ class MegatronEngine(BaseEngine):
             metrics["rollout_corr_kl_sum"] = rc_kl[0]
             metrics["rollout_corr_kl_tok"] = rc_kl[1]
         return metrics
+
+    def _engine_update_sft(self, batch: DataProto) -> dict[str, float]:
+        """SFT training update: forward → log_probs → NLL → backward.
+
+        Uses global token-mean normalization with cross-DP all-reduce,
+        matching the FSDP2 path's ``sft_loss()`` behavior.
+        Row-by-row forward only (pack_sequences assumes left-padded input
+        but SFT data is right-padded).
+        """
+        meta = dict(batch.meta)
+        t = batch.tensors
+        seqs = t["input_ids"]
+        am = t.get("attention_mask")
+        if am is None:
+            am = torch.ones_like(seqs)
+        loss_masks = t["loss_mask"]
+        B, S = seqs.shape
+        dp = int(meta.get("dp_size", self.get_data_parallel_size()) or 1)
+
+        self.module.train()
+        self._ddp.zero_grad_buffer()
+        self.optimizer.zero_grad()
+
+        rows = []
+        for r in range(B):
+            start, L = self._real_block(am[r])
+            if L >= 2:
+                rows.append((r, start, L))
+
+        # Global token count for token-mean normalization (cross-DP all-reduce).
+        local_tokens = sum(
+            float(loss_masks[r, start + 1:start + L].sum()) for r, start, L in rows
+        )
+        num_tokens_t = torch.tensor(local_tokens, device="cuda")
+        dp_group = self.get_data_parallel_group()
+        if dp_group is not None and dist.is_initialized():
+            dist.all_reduce(num_tokens_t, group=dp_group)
+        global_num_tokens = max(int(num_tokens_t.item()), 1)
+
+        loss_accum = 0.0
+        token_accum = local_tokens
+
+        for r, start, L in rows:
+            ids = seqs[r, start:start + L].to("cuda")
+            logits = self._forward_logits(ids, model=self._ddp)
+            token_lp = self._token_logprob_train(logits[:-1], ids[1:])
+            mask = loss_masks[r, start + 1:start + L].to(token_lp.device).float()
+            Le = min(token_lp.shape[0], mask.shape[0])
+            token_lp = token_lp[:Le]
+            mask = mask[:Le]
+            if mask.sum() < 1:
+                del logits, token_lp
+                continue
+            loss = -(token_lp * mask).sum() / global_num_tokens * dp
+            loss.backward()
+            loss_accum += float(-(token_lp.detach() * mask).sum())
+            del logits, token_lp, loss
+
+        torch.cuda.empty_cache()
+        grad_norm = self._optimizer_step()
+        lr = self._sched_step()
+        avg_loss = loss_accum / max(token_accum, 1)
+        return {
+            "loss": avg_loss,
+            "sft_loss": avg_loss,
+            "num_tokens": token_accum,
+            "lr": lr,
+            "grad_norm": grad_norm,
+        }
 
     def _optimizer_step(self) -> float:
         """Reduce grads across DP (+reduce-scatter for the distributed optimizer),
