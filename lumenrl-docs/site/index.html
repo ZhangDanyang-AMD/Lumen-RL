@@ -459,19 +459,24 @@ MODE=atomfp8 STEPS=1000 bash examples/DAPO/run_dapo.sh</pre>
         <pre><a href="dashboards/SDDD/Kimi_K25_SDDD_MI350/phase2.html" target="_blank" style="color:var(--cyan)">Open Dashboard &rarr;</a></pre>
       </div>
       <div class="ecard">
-        <h3>Qwen3-8B DAPO &mdash; Sync</h3>
-        <p>Synchronous DAPO training with BF16 baseline.</p>
-        <pre><a href="dashboards/DAPO/Qwen3-8B-Base_BF16_DAPO-Sync.html" target="_blank" style="color:var(--cyan)">Open Dashboard &rarr;</a></pre>
+        <h3>Qwen3-30B-A3B MoE &mdash; Training-Inference Separation</h3>
+        <p>MoE DAPO training with training-inference separation on Megatron-Core backend.</p>
+        <img src="figures/Qwen3-30B-A3B-Lumen-RL-Moe-TI-Sep.png" alt="Qwen3-30B-A3B MoE TI-Sep training curves" style="width:100%;border-radius:6px;margin-top:8px;">
       </div>
       <div class="ecard">
-        <h3>Qwen3-8B DAPO &mdash; Async</h3>
-        <p>Fully-async DAPO training with overlapped rollout.</p>
-        <pre><a href="dashboards/DAPO/Qwen3-8B-Base_BF16_DAPO-Async.html" target="_blank" style="color:var(--cyan)">Open Dashboard &rarr;</a></pre>
+        <h3>Qwen3-30B-A3B MoE &mdash; Training-Inference Unified</h3>
+        <p>MoE DAPO training with training-inference unified (co-located) deployment.</p>
+        <img src="figures/Qwen3-30B-A3B-Lumen-RL-Moe-TI-Unified.png" alt="Qwen3-30B-A3B MoE TI-Unified training curves" style="width:100%;border-radius:6px;margin-top:8px;">
       </div>
-      <div class="ecard full">
-        <h3>BF16 Sync Baseline</h3>
-        <p>1a-bf16-sync configuration &mdash; synchronous BF16 training baseline for comparison.</p>
-        <pre><a href="dashboards/1a-bf16-sync/dashboard.html" target="_blank" style="color:var(--cyan)">Open Dashboard &rarr;</a></pre>
+      <div class="ecard">
+        <h3>Qwen3-8B DAPO &mdash; FP8</h3>
+        <p>FP8 quantized DAPO training (LumenRL vs verl), FSDP2 backend.</p>
+        <img src="figures/Qwen3-8B-Lumen-RL-fp8.png" alt="Qwen3-8B FP8 training curves" style="width:100%;border-radius:6px;margin-top:8px;">
+      </div>
+      <div class="ecard">
+        <h3>Qwen3-8B DAPO &mdash; BF16</h3>
+        <p>BF16 baseline DAPO training (LumenRL vs verl), FSDP2 backend.</p>
+        <img src="figures/Qwen3-8B-Lumen-RL-bf16.png" alt="Qwen3-8B BF16 training curves" style="width:100%;border-radius:6px;margin-top:8px;">
       </div>
     </div>
   </div>
@@ -1560,16 +1565,25 @@ new_sd = epm.reshard_for_inference(state_dict, train_ep_size=4, infer_ep_size=2)
 <tr><td>Kimi K2.5 Eagle3</td><td><a href="dashboards/SDDD/Kimi_K25_SDDD_MI350/phase2.html" target="_blank">Phase 2 Dashboard</a></td><td>Phase 2 mixed-domain fine-tuning</td></tr>
 </tbody></table>
 
-<h2>DAPO Dashboards</h2>
-<table class="dtbl"><thead><tr><th>Model</th><th>Dashboard</th><th>Description</th></tr></thead><tbody>
-<tr><td>Qwen3-8B-Base</td><td><a href="dashboards/DAPO/Qwen3-8B-Base_BF16_DAPO-Sync.html" target="_blank">BF16 DAPO Sync</a></td><td>Synchronous DAPO training (BF16 baseline)</td></tr>
-<tr><td>Qwen3-8B-Base</td><td><a href="dashboards/DAPO/Qwen3-8B-Base_BF16_DAPO-Async.html" target="_blank">BF16 DAPO Async</a></td><td>Fully-async DAPO training</td></tr>
+<h2>MoE Training (Qwen3-30B-A3B)</h2>
+<table class="dtbl"><thead><tr><th>Model</th><th>Mode</th><th>Description</th></tr></thead><tbody>
+<tr><td>Qwen3-30B-A3B</td><td>Training-Inference Separation</td><td>MoE DAPO with decoupled training and inference GPU groups (Megatron-Core)</td></tr>
+<tr><td>Qwen3-30B-A3B</td><td>Training-Inference Unified</td><td>MoE DAPO with co-located training and inference</td></tr>
 </tbody></table>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:16px 0;">
+<div><p style="margin:0 0 6px;font-weight:600;">Training-Inference Separation</p><img src="figures/Qwen3-30B-A3B-Lumen-RL-Moe-TI-Sep.png" alt="Qwen3-30B-A3B TI-Sep" style="width:100%;border-radius:6px;"></div>
+<div><p style="margin:0 0 6px;font-weight:600;">Training-Inference Unified</p><img src="figures/Qwen3-30B-A3B-Lumen-RL-Moe-TI-Unified.png" alt="Qwen3-30B-A3B TI-Unified" style="width:100%;border-radius:6px;"></div>
+</div>
 
-<h2>Async Training Dashboards</h2>
-<table class="dtbl"><thead><tr><th>Config</th><th>Dashboard</th><th>Description</th></tr></thead><tbody>
-<tr><td>1a-bf16-sync</td><td><a href="dashboards/1a-bf16-sync/dashboard.html" target="_blank">BF16 Sync Baseline</a></td><td>Synchronous BF16 training baseline</td></tr>
+<h2>Dense Training (Qwen3-8B)</h2>
+<table class="dtbl"><thead><tr><th>Model</th><th>Precision</th><th>Description</th></tr></thead><tbody>
+<tr><td>Qwen3-8B</td><td>FP8</td><td>FP8 quantized DAPO training (LumenRL vs verl comparison, FSDP2)</td></tr>
+<tr><td>Qwen3-8B</td><td>BF16</td><td>BF16 baseline DAPO training (LumenRL vs verl comparison, FSDP2)</td></tr>
 </tbody></table>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:16px 0;">
+<div><p style="margin:0 0 6px;font-weight:600;">FP8 (LumenRL vs verl)</p><img src="figures/Qwen3-8B-Lumen-RL-fp8.png" alt="Qwen3-8B FP8" style="width:100%;border-radius:6px;"></div>
+<div><p style="margin:0 0 6px;font-weight:600;">BF16 (LumenRL vs verl)</p><img src="figures/Qwen3-8B-Lumen-RL-bf16.png" alt="Qwen3-8B BF16" style="width:100%;border-radius:6px;"></div>
+</div>
 </div>
 
 </main>
