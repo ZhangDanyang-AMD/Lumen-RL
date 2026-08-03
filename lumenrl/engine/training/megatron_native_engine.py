@@ -1076,6 +1076,24 @@ class MegatronNativeEngine(MegatronBaseEngine):
         if rc_kl_tok > 0:
             metrics["rollout_corr_kl_sum"] = rc_kl_sum
             metrics["rollout_corr_kl_tok"] = rc_kl_tok
+
+        from lumenrl.engine.training.megatron_base_engine import _GAP_ROWS, _gap_dump_dir
+        _dump = _gap_dump_dir()
+        if _dump and _GAP_ROWS:
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            rows = [r for r in _GAP_ROWS if r["rollout_lp"] is not None]
+            if rows:
+                torch.save(
+                    {
+                        "train_lp": torch.cat([r["train_lp"] for r in rows]),
+                        "old_lp": torch.cat([r["old_lp"] for r in rows]),
+                        "rollout_lp": torch.cat([r["rollout_lp"] for r in rows]),
+                        "rc_kl_sum": rc_kl_sum, "rc_kl_tok": rc_kl_tok,
+                        "ppo_kl_sum": ppo_kl_sum, "ppo_kl_tok": ppo_kl_tok,
+                    },
+                    f"{_dump}/engine_gap_rank{rank}.pt",
+                )
+        _GAP_ROWS.clear()
         return metrics
 
     def engine_compute_log_probs(self, batch):

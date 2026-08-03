@@ -3465,6 +3465,24 @@ class RLTrainer:
             response_mask = self._build_response_mask(sequences, seq_mask, prompt_lengths)
             response_lengths = [int(response_mask[i].sum().item()) for i in range(response_mask.shape[0])]
 
+            # Opt-in diagnostic: dump the two per-token log-prob tensors that
+            # rollout_corr/kl is reduced from, so the trainer/rollout gap can be
+            # examined as a distribution instead of a single mean. A few tokens
+            # with huge errors means the two engines routed to different experts;
+            # a uniform shift across all tokens means a kernel-level numeric gap.
+            _dump = os.environ.get("LUMENRL_DUMP_LOGPROB_GAP")
+            if _dump and rollout_lp is not None and self._rank == 0:
+                torch.save(
+                    {
+                        "old_log_probs": old_log_probs.detach().float().cpu(),
+                        "rollout_log_probs": rollout_lp.detach().float().cpu(),
+                        "response_mask": response_mask.detach().cpu(),
+                        "step": int(step),
+                    },
+                    f"{_dump}/logprob_gap_step{step}.pt",
+                )
+                logger.info("dumped per-token log-prob gap for step %d to %s", step, _dump)
+
             tensors = {
                 "input_ids": sequences,
                 "attention_mask": seq_mask,

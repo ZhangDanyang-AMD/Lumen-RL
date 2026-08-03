@@ -33,6 +33,25 @@ from lumenrl.engine.training.qwen3_megatron_bridge import Qwen3Dims
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LUMENRL_LOGGING_LEVEL", "INFO"))
 
+# Scratch buffer for the log-prob gap diagnostic: per-row slices of the three
+# tensors that ppo_kl and rollout_corr/kl are reduced from.
+_GAP_ROWS: list = []
+# Ray actors are created without a runtime_env, so an env var exported next to
+# the driver does not reach them. Fall back to a sentinel file holding the
+# output directory, which every process in the container can see.
+_GAP_SENTINEL = "/tmp/lumenrl_gap_dump_dir"
+
+
+def _gap_dump_dir() -> str | None:
+    d = os.environ.get("LUMENRL_DUMP_LOGPROB_GAP")
+    if d:
+        return d
+    try:
+        with open(_GAP_SENTINEL) as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
 
 class _FusedTokenLogProb(torch.autograd.Function):
     """Memory-efficient per-token log-prob: ``log p(target) = logit_target - logsumexp``.
@@ -315,6 +334,16 @@ class MegatronBaseEngine(BaseEngine):
                 if rlp is not None:
                     stats["rc_kl_sum"] = float(((rlp - token_lp) * mask).sum())
                     stats["rc_kl_tok"] = tok
+                if _gap_dump_dir():
+                    # Keep the three log-probs the two KL metrics are built from,
+                    # already aligned and masked the way the metrics see them.
+                    m = mask.detach().bool().reshape(-1)
+                    _GAP_ROWS.append({
+                        "train_lp": token_lp.detach().float().reshape(-1)[m].cpu(),
+                        "old_lp": old_lp.detach().float().reshape(-1)[m].cpu(),
+                        "rollout_lp": rlp.detach().float().reshape(-1)[m].cpu()
+                        if rlp is not None else None,
+                    })
         return loss, stats
 
     # ---- engine-level compute_log_probs (actor delegates here) ----
@@ -459,6 +488,25 @@ class MegatronBaseEngine(BaseEngine):
         if rc_kl_tok > 0:
             metrics["rollout_corr_kl_sum"] = rc_kl_sum
             metrics["rollout_corr_kl_tok"] = rc_kl_tok
+
+        _dump = _gap_dump_dir()
+        if _dump and _GAP_ROWS:
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            rows = [r for r in _GAP_ROWS if r["rollout_lp"] is not None]
+            if rows:
+                torch.save(
+                    {
+                        "train_lp": torch.cat([r["train_lp"] for r in rows]),
+                        "old_lp": torch.cat([r["old_lp"] for r in rows]),
+                        "rollout_lp": torch.cat([r["rollout_lp"] for r in rows]),
+                        # The exact scalars this rank reported, so the metric
+                        # arithmetic can be reproduced from the raw tensors.
+                        "rc_kl_sum": rc_kl_sum, "rc_kl_tok": rc_kl_tok,
+                        "ppo_kl_sum": ppo_kl_sum, "ppo_kl_tok": ppo_kl_tok,
+                    },
+                    f"{_dump}/engine_gap_rank{rank}.pt",
+                )
+            _GAP_ROWS.clear()
         return metrics
 
     def _optimizer_step(self) -> float:
