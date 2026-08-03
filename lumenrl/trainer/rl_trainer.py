@@ -2846,23 +2846,7 @@ class RLTrainer:
 
             # --- Extended rollout correction: IS weights + rejection sampling ---
             # (verl/trainer/ppo/ray_trainer.py L1481-1567)
-            _rc_cfg = self.config.quantization.rollout_correction
-            _rc_metrics = {}
-            if _rc_cfg.rollout_is and "old_log_probs" in batch.tensors:
-                _rollout_lp = batch.tensors.get("rollout_log_probs", batch.tensors.get("fp8_logprobs"))
-                if _rollout_lp is not None:
-                    from lumenrl.quantization.rollout_correction import compute_rollout_is_weights, apply_rejection_sampling
-                    _rmask = batch.tensors.get("response_mask", batch.tensors.get("attention_mask"))
-                    _is_w, _rc_metrics = compute_rollout_is_weights(
-                        batch.tensors["old_log_probs"], _rollout_lp, _rmask,
-                        rollout_is=_rc_cfg.rollout_is,
-                        rollout_is_threshold=_rc_cfg.rollout_is_threshold,
-                        rollout_is_batch_normalize=_rc_cfg.rollout_is_batch_normalize,
-                    )
-                    batch.tensors["rollout_is_weights"] = _is_w
-                    if _rc_cfg.rollout_rs and _rc_cfg.rollout_rs_threshold > 0:
-                        _rmask = apply_rejection_sampling(_rmask, _is_w, _rc_cfg.rollout_rs_threshold)
-                        batch.tensors["response_mask"] = _rmask
+            _rc_metrics = self._apply_rollout_is_weights(batch)
 
             # --- Seqlen balanced partitioning ---
             # (verl/utils/seqlen_balancing.py, verl/trainer/ppo/ray_trainer.py L1098-1165)
@@ -3345,6 +3329,73 @@ class RLTrainer:
         """verl-style 1-based global step for logs/checkpoints/W&B."""
         return int(step) + 1
 
+    def _apply_rollout_is_weights(self, batch: DataProto) -> dict[str, float]:
+        """Truncated importance sampling between the rollout and training policies.
+
+        Derived from verl/trainer/ppo/ray_trainer.py L1481-1567. Writes
+        ``rollout_is_weights`` into the batch; the loss multiplies the per-token
+        surrogate by it. Without this call the configured
+        ``quantization.rollout_correction.rollout_is`` is inert -- the engines
+        read the key, never find it, and silently skip the correction.
+
+        Returns the ``rollout_correction/*`` diagnostics for the step's metrics.
+        """
+        rc = self.config.quantization.rollout_correction
+        if not rc.rollout_is or "old_log_probs" not in batch.tensors:
+            return {}
+        rollout_lp = batch.tensors.get("rollout_log_probs", batch.tensors.get("fp8_logprobs"))
+        if rollout_lp is None:
+            return {}
+
+        from lumenrl.quantization.rollout_correction import (
+            apply_rejection_sampling, compute_rollout_is_weights,
+        )
+
+        old_lp = batch.tensors["old_log_probs"]
+        mask = batch.tensors.get("response_mask", batch.tensors.get("attention_mask"))
+        # Entry i of each of these scores token i+1: the mask and the rollout
+        # log-probs are built pre-shifted ([:, 1:], width S-1) while
+        # ``old_log_probs`` may be padded out to the full width S depending on
+        # the backend. Same frame, so a common width lines them up.
+        W = min(old_lp.shape[-1], rollout_lp.shape[-1], mask.shape[-1])
+        old_w, roll_w, mask_w = old_lp[..., :W], rollout_lp[..., :W], mask[..., :W]
+
+        # ``rollout_log_probs`` is zero-initialised and then filled per reported
+        # token, so an exact 0.0 inside the response mask is ambiguous: either
+        # the engine never reported that position, or the token was so certain
+        # that log p underflowed to 0. Reading an unreported position literally
+        # means probability 1, the largest value possible, which saturates the IS
+        # ratio; substituting the trainer's own value makes the ratio 1. For a
+        # genuinely saturated token ``old_log_probs`` is ~0 there too, so the
+        # substitution costs nothing. The logged mean tells the two apart.
+        unreported = (roll_w == 0.0) & (mask_w > 0)
+        n_unreported = int(unreported.sum())
+        if n_unreported:
+            subst_mean = float(old_w[unreported].mean())
+            roll_w = torch.where(unreported, old_w, roll_w)
+            patched = rollout_lp.clone()
+            patched[..., :W] = roll_w
+            batch.tensors["rollout_log_probs"] = patched
+            logger.info(
+                "rollout_log_probs: %d of %d response positions are exactly 0.0; "
+                "substituted old_log_probs (mean %.4g there -- near 0 means the "
+                "token really was certain, large means a reporting gap)",
+                n_unreported, int(mask_w.sum()), subst_mean,
+            )
+
+        is_w, metrics = compute_rollout_is_weights(
+            old_w, roll_w, mask_w,
+            rollout_is=rc.rollout_is,
+            rollout_is_threshold=rc.rollout_is_threshold,
+            rollout_is_batch_normalize=rc.rollout_is_batch_normalize,
+        )
+        batch.tensors["rollout_is_weights"] = is_w
+        if rc.rollout_rs and rc.rollout_rs_threshold > 0:
+            batch.tensors["response_mask"] = apply_rejection_sampling(
+                mask_w, is_w, rc.rollout_rs_threshold,
+            )
+        return metrics
+
     def _train_with_ray_controller(self) -> None:
         """Ray worker orchestration path (no torch.distributed collectives)."""
         if self._algorithm is None or self._actor_wg is None:
@@ -3447,6 +3498,7 @@ class RLTrainer:
 
             batch = self._algorithm.compute_advantages(batch)
             batch = apply_rollout_correction(batch, self.config)
+            rc_metrics = self._apply_rollout_is_weights(batch)
 
             if use_ray_rollout:
                 # verl-aligned loss normalization: GLOBAL response-token count
@@ -3479,6 +3531,7 @@ class RLTrainer:
             if _ps is not None and _pt:
                 metrics["ppo_kl"] = _ps / max(_pt, 1e-6)
             self._finalize_mismatch_metrics(metrics)
+            metrics.update(rc_metrics)
 
             total_tok = int(seq_mask.sum().item())
             prompt_tok = int(sum(prompt_lengths))
