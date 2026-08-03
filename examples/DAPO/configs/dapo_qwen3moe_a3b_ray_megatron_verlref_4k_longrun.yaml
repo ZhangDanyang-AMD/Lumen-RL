@@ -21,9 +21,15 @@
 #
 # Topology matches the FSDP2 data-parallel width: TP=1, PP=1, CP=1, EP=8 -> DP=8.
 #
-# Memory is not tight here the way it is at 20480 -- the largest packed bin is
-# 6144 tokens rather than 22528 -- so full activation recomputation is off and
-# vLLM gets the 0.30 utilization the 4k smoke runs at.
+# MEMORY: the first attempt ran 91 steps and then hit HIP OOM inside the update,
+# on 3.44 GiB for the fp32 logits upcast, because a second job landed on the node
+# at 07:12 and took 41.9 GiB per card. Our own footprint was 156 GiB peak
+# reserved on the actor plus 86 GiB of vLLM at 0.30 utilization = 242 of 288 GiB,
+# so the ~46 GiB of headroom the run relied on disappeared. The settings below
+# bring the peak down far enough to coexist with a ~42 GiB neighbour:
+# recomputation on, packed bins halved, and vLLM at 0.25 (which is close to its
+# floor -- the 30.5B policy alone is ~61 GiB, so 0.25 x 288 leaves ~11 GiB of KV
+# cache and going lower stops the engine loading at all).
 #
 # Routers are fp32 on both sides (`moe_router_dtype: fp32` here plus
 # LUMENRL_FP32_MOE_ROUTER=1 in the launcher, which is the half that reaches the
@@ -69,9 +75,19 @@ policy:
       moe_permute_fusion: true
       moe_aux_loss_coeff: 0.0
       moe_router_dtype: fp32
+      # Full activation recomputation. Not needed to fit a 4k response on its
+      # own, but it is the cheapest ~20 GiB off the update transient when the
+      # card is shared.
+      recompute_granularity: full
+      recompute_method: uniform
+      recompute_num_layers: 1
       log_probs_chunk_size: 1024
       enable_dynamic_batch: true
-      max_tokens_per_gpu: 6144
+      # Note this does NOT bound the worst case: _build_bins gives any row longer
+      # than the budget a bin of its own, and prompt 2048 + response 4096 means a
+      # single row can reach ~5.1k tokens. It does stop every *packed* bin from
+      # also reaching 6k, which is what matters for the allocate/free churn.
+      max_tokens_per_gpu: 3072
     fsdp_cfg:
       param_offload: false
       optimizer_offload: false
@@ -79,7 +95,7 @@ policy:
     vllm_cfg:
       transport: ray_http
       ray_http_start_server: false
-      gpu_memory_utilization: 0.30
+      gpu_memory_utilization: 0.25
       max_model_len: 6144
       dtype: bfloat16
       enforce_eager: true
