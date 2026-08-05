@@ -562,7 +562,12 @@ class MegatronLumenDSV4Engine(MegatronEngine):
                 else:
                     local_full[key] = gathered[0]
 
-        # --- Phase 3: PP broadcast (each stage contributes its layers) ---
+        # --- Phase 3: PP streaming broadcast ---
+        # DSV4-Flash is ~568GB BF16 — accumulating all PP stages on one GPU
+        # would OOM (192GB per GPU). Instead, broadcast each stage's params
+        # and yield them immediately so the caller (send_weight_stream) can
+        # consume and release each tensor before the next stage arrives.
+        # Peak GPU memory = model shard + one stage's gathered params + bucket.
         if pp_size > 1:
             pp_group = mpu.get_pipeline_model_parallel_group()
             pp_global_ranks = dist.get_process_group_ranks(pp_group)
@@ -573,28 +578,33 @@ class MegatronLumenDSV4Engine(MegatronEngine):
                 layers_per_pp_rank=self._layers_per_pp_rank,
                 use_grouped_mlp=self._use_grouped_mlp,
             ))
+            del local_full  # free TP+EP gathered params
 
             all_meta: list = [None] * pp_size
             my_meta = {k: (v.shape, v.dtype) for k, v in local_hf.items()}
             dist.all_gather_object(all_meta, (pp_rank, my_meta), group=pp_group)
 
-            full_hf: dict[str, torch.Tensor] = {}
-            for src_pp, meta in all_meta:
-                src_global = pp_global_ranks[src_pp]
-                for key, (shape, dtype) in meta.items():
+            def _streaming_pp_gen():
+                nonlocal local_hf
+                for src_pp, meta in all_meta:
+                    src_global = pp_global_ranks[src_pp]
+                    for key, (shape, dtype) in meta.items():
+                        if src_pp == pp_rank:
+                            t = local_hf[key]
+                            if not t.is_cuda:
+                                t = t.cuda()
+                        else:
+                            t = torch.empty(shape, dtype=dtype, device="cuda")
+                        dist.broadcast(t, src=src_global, group=pp_group)
+                        yield key, t
+                        del t  # hint to release after caller consumes
+                    # After yielding all params from this stage, the caller's
+                    # bucket flush + GC reclaims this stage's memory before
+                    # the next stage's tensors are allocated.
                     if src_pp == pp_rank:
-                        t = local_hf[key]
-                        if not t.is_cuda:
-                            t = t.cuda()
-                    else:
-                        t = torch.empty(shape, dtype=dtype, device="cuda")
-                    dist.broadcast(t, src=src_global, group=pp_group)
-                    full_hf[key] = t
+                        local_hf = {}  # release local stage after yielding
 
-            def _gen():
-                for k, v in full_hf.items():
-                    yield k, v
-            return _gen(), None
+            return _streaming_pp_gen(), None
 
         # PP=1 path: convert directly
         gen = dsv4_megatron_to_hf(
