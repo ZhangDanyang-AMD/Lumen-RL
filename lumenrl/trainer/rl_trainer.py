@@ -761,10 +761,12 @@ class RLTrainer:
             version=version,
             verify_full_load=bool(cfg.verify_full_load),
         )
+        fp8_sync = bool(getattr(cfg, "fp8_quantize", False))
         send_refs = self._actor_wg.execute_all_async(
             "send_weights_rdma",
             version=version,
             bucket_size_mb=int(cfg.bucket_size_mb),
+            fp8_quantize=fp8_sync,
         )
         results = ray.get(
             send_refs + recv_refs,

@@ -884,8 +884,14 @@ class LumenActorWorker(BaseWorker):
         self,
         version: int,
         bucket_size_mb: int,
+        fp8_quantize: bool = False,
     ) -> dict[str, Any]:
-        """Collect Megatron HF tensors on all ranks; rank zero broadcasts them."""
+        """Collect Megatron HF tensors on all ranks; rank zero broadcasts them.
+
+        When ``fp8_quantize=True``, BF16 weights are quantized to FP8 e4m3 with
+        per-128x128-block scaling on the actor side before RDMA broadcast. This
+        halves transfer size and is compatible with vLLM's ``fp8_per_block`` mode.
+        """
         if self._engine is None:
             raise RuntimeError("init_model() must be called before RDMA weight sync")
         params, _ = self._engine.get_per_tensor_param()
@@ -899,6 +905,13 @@ class LumenActorWorker(BaseWorker):
         group = getattr(self, "_rdma_weight_group", None)
         if group is None:
             raise RuntimeError("RDMA weight group is not initialized")
+
+        if fp8_quantize:
+            from lumenrl.engine.inference.fp8_weight_quantizer import (
+                quantize_weights_fp8_per_block,
+            )
+            params = quantize_weights_fp8_per_block(params)
+
         from lumenrl.engine.inference.rdma_weight_transfer import send_weight_stream
 
         stats = send_weight_stream(
@@ -908,6 +921,7 @@ class LumenActorWorker(BaseWorker):
             version=int(version),
         )
         stats["writer"] = True
+        stats["fp8_quantized"] = fp8_quantize
         logger.info("RDMA weight broadcast complete: %s", stats)
         return stats
 

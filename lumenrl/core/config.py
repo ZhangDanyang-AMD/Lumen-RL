@@ -714,6 +714,7 @@ class WeightSyncConfig:
     bucket_size_mb: int = 1024
     timeout_s: int = 600
     verify_full_load: bool = True
+    fp8_quantize: bool = False  # Quantize BF16 weights to FP8 per-block before sync (halves transfer size)
     rdma: RDMAWeightSyncConfig = field(default_factory=RDMAWeightSyncConfig)
 
 
