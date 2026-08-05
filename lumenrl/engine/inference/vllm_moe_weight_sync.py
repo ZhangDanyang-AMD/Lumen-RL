@@ -14,6 +14,10 @@ mapping and falls through ``Qwen3MoeForCausalLM.load_weights``'s silent
 ``if is_expert_weight: continue`` branch: no exception, no loaded param, and
 93% of the policy's parameters never reach the rollout engine.
 
+vLLM >=0.22 adds a wrinkle: the expert buffers moved into a nested
+``RoutedExperts`` submodule, so their path gains a ``routed_experts`` segment
+while the trainer keeps sending the shorter HF name. See ``_CONTAINER_SEGMENTS``.
+
 This module closes that gap on the receiving side. ``FusedMoEWeightRouter``
 intercepts the fused tensors and feeds them to vLLM's own
 ``FusedMoE.weight_loader`` through its 3D "full load" path (one call per
@@ -45,6 +49,16 @@ logger.setLevel(os.getenv("LUMENRL_LOGGING_LEVEL", "WARN"))
 _FUSED_GATE_UP = "gate_up_proj"
 _FUSED_DOWN = "down_proj"
 _FUSED_LEAVES = (_FUSED_GATE_UP, _FUSED_DOWN)
+
+# vLLM submodules that hold the expert buffers *below* the layer the HF name
+# addresses: vLLM >=0.22 splits FusedMoE so the weights live in a nested
+# RoutedExperts registered as "routed_experts", making the parameter path
+# ``...mlp.experts.routed_experts.w13_weight`` while the trainer still sends
+# ``...mlp.experts.gate_up_proj``. Routing keys off the trainer's prefix, so a
+# discovered module also has to be reachable under the shortened name. Without
+# this every fused tensor misses the router and the coverage assertion reports
+# "left 96/435 rollout parameters untouched" (Qwen3-30B-A3B, 48 layers x 2).
+_CONTAINER_SEGMENTS = ("routed_experts",)
 
 # Parameters that a BF16 trainer legitimately never sends: quantization
 # artifacts that vLLM derives locally in process_weights_after_loading.
@@ -87,7 +101,11 @@ class FusedMoEWeightRouter:
             w2 = next((n for n in owned if n.endswith("w2_weight")), None)
             if w13 is None or w2 is None:
                 continue
-            self._experts[mod_name] = (module, f"{mod_name}.{w13}", f"{mod_name}.{w2}")
+            entry = (module, f"{mod_name}.{w13}", f"{mod_name}.{w2}")
+            for key in self._lookup_keys(mod_name):
+                # First writer wins: the exact module name is registered before any
+                # shortened alias, so a real FusedMoE can never be shadowed by one.
+                self._experts.setdefault(key, entry)
 
         if self._experts:
             logger.info(
@@ -95,6 +113,15 @@ class FusedMoEWeightRouter:
                 len(self._experts),
                 next(iter(self._experts)),
             )
+
+    @staticmethod
+    def _lookup_keys(mod_name: str) -> list[str]:
+        """The module's own name plus the prefix the trainer addresses it by."""
+        keys = [mod_name]
+        prefix, _, leaf = mod_name.rpartition(".")
+        if prefix and leaf in _CONTAINER_SEGMENTS:
+            keys.append(prefix)
+        return keys
 
     @property
     def active(self) -> bool:
