@@ -191,6 +191,11 @@ class MegatronConfig:
     # Frees ~2x model-size GPU memory at the cost of slower optimizer steps.
     optimizer_cpu_offload: bool = False
     optimizer_offload_fraction: float = 1.0      # fraction of states to offload (0.0-1.0)
+    # PP layer distribution: override uniform layer-per-stage split.
+    num_layers_in_first_pipeline_stage: Optional[int] = None
+    num_layers_in_last_pipeline_stage: Optional[int] = None
+    # R3 routing replay (MoE only)
+    moe_enable_routing_replay: bool = False
 
 
 @dataclass

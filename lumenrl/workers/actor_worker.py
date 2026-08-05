@@ -55,6 +55,8 @@ class LumenActorWorker(BaseWorker):
             backend_key = "megatron_native"
         elif backend_raw in ("megatron",):
             backend_key = "megatron"
+        elif backend_raw in ("megatron_lumen_dsv4",):
+            backend_key = "megatron_lumen_dsv4"
         else:
             raise ValueError(f"Unknown policy.training_backend: {backend_raw}")
 
@@ -186,7 +188,7 @@ class LumenActorWorker(BaseWorker):
                 },
                 "seed": int(policy.get("seed", 42)),
             }
-        elif backend in ("megatron_native", "megatron-native", "megatron"):
+        elif backend in ("megatron_native", "megatron-native", "megatron", "megatron_lumen_dsv4"):
             meg_cfg = training_cfg.get("megatron_cfg") or policy.get("megatron_cfg") or {}
             if not isinstance(meg_cfg, dict):
                 from dataclasses import asdict, is_dataclass

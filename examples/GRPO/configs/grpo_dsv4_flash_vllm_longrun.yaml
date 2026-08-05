@@ -1,0 +1,179 @@
+# DeepSeek-V4-Flash GRPO long run — Megatron-DSV4 TP4/PP4/EP4 + vLLM FP8 rollout (MI308X)
+#
+# Aligned with LMSYS MILES RL:
+#   GRPO 32x8 sampling, 4k response cap, global batch 256, no KL, TP4/PP4/EP4
+#   https://www.lmsys.org/blog/2026-03-17-rocm-miles-rl-amd/#performance
+#
+# Training: Megatron-DSV4 (TP=4, PP=4, EP=4, ETP=1, 256 experts,
+#   sequence-parallel, distributed optimizer, flash attention,
+#   chunked log-prob, optimizer_cpu_offload 75%)
+#
+# PP layer distribution: first stage=11 layers, last stage=10 layers
+#
+# 3-node training/inference separation:
+#   Nodes 0-1: Megatron-DSV4 training (16 workers, TP=4, PP=4, EP=4, 16 GPUs)
+#   Node 2:    vLLM inference (TP=8, FP8 per-block quantized, 8 GPUs)
+#
+# Rollout: vLLM AsyncLLM (FP8 per-block weights + FP8 KV cache, TP=8,
+#   enforce_eager, AITER kernels, gpu_memory_utilization=0.92)
+#
+# Weight sync: RDMA via RCCL (2048 MB buckets, 1200s timeout)
+
+cluster:
+  num_nodes: 3
+  gpus_per_node: 8
+  ray_address: "auto"
+
+weight_sync:
+  backend: rdma
+  shared_folder: /volumes/oss1/lumenrl_weight_sync/dsv4-flash
+  bucket_size_mb: 2048
+  timeout_s: 1200
+  verify_full_load: true
+  rdma:
+    backend: rccl
+    require_rdma: true
+    hca: mlx5_0
+    interface: ens11np0
+    gid_index: 3
+    gdr_mode: auto
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    actor:
+      num_workers: 16
+      dispatch_mode: dp_compute_proto
+      process_on_nodes: [8, 8]
+    rollout:
+      num_workers: 8
+      process_on_nodes: [8]
+      topology_tags:
+        node_ip: REPLACE_ME
+
+policy:
+  model_name: /root/models/DeepSeek-V4-Flash-BF16
+  training_backend: megatron_lumen_dsv4
+  generation_backend: vllm
+  max_total_sequence_length: 5120            # 1024 prompt + 4096 response
+  max_response_length: 4096
+  train_global_batch_size: 256               # 32 prompts x 8 generations = 256
+  gen_batch_size: 32
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 16384
+  balance_batch: true
+  learning_rate: 1.0e-6
+  lr_warmup_steps: 10
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  adam_beta1: 0.9
+  adam_beta2: 0.98
+  training:
+    optimizer_dtype: bf16
+    megatron_cfg:
+      tensor_model_parallel_size: 4
+      pipeline_model_parallel_size: 4
+      expert_model_parallel_size: 4
+      expert_tensor_parallel_size: 1
+      num_experts: 256
+      num_layers_in_first_pipeline_stage: 11
+      num_layers_in_last_pipeline_stage: 10
+      moe_grouped_gemm: true
+      moe_token_dispatcher_type: alltoall
+      use_distributed_optimizer: true
+      grad_reduce_in_fp32: true
+      attention_softmax_in_fp32: true
+      sequence_parallel: true
+      recompute_granularity: full
+      recompute_method: uniform
+      recompute_num_layers: 1
+      attention_backend: flash
+      use_packed_sequences: true
+      log_probs_chunk_size: 1024
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 0.75
+    fsdp_cfg:
+      param_offload: false
+      optimizer_offload: false
+      reshard_after_forward: true
+  generation:
+    vllm_cfg:
+      transport: ray_http
+      ray_http_start_server: false
+      tensor_parallel_size: 8
+      quantization: fp8_per_block
+      enforce_eager: true
+      kv_cache_dtype: fp8_e4m3
+      gpu_memory_utilization: 0.92
+      max_model_len: 16384
+      dtype: bfloat16
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 16384
+      max_num_seqs: 64
+      calculate_log_probs: true
+      enable_sleep_mode: false
+      sleep_level: 0
+      update_weights_bucket_megabytes: 2048
+      temperature: 0.8
+      top_p: 1.0
+      top_k: -1
+
+algorithm:
+  name: grpo
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  loss_agg_mode: token-mean
+  clip_ratio_high: 0.28
+  grpo:
+    num_generations: 8
+    kl_coeff: 0.0
+    clip_ratio: 0.2
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+    rollout_is_batch_normalize: true
+
+moe:
+  r3:
+    enabled: true
+    record_router_logits: false
+    replay_mode: hard_assignment
+
+reward:
+  type: function
+  function: lumenrl.rewards.math_reward.dapo_math_reward
+  dataset: /root/data_cached/dsv4-flash/dapo-math-17k.filtered.parquet
+  shuffle: true
+  shuffle_seed: 10086
+
+val_dataset: /root/data_cached/dsv4-flash/aime-2024.filtered.parquet
+val_steps: 10
+val_batch_size: 0
+eval:
+  enabled: true
+  num_samples: 0
+
+checkpointing:
+  checkpoint_dir: /root/ckpts/dsv4-flash/longrun
+  save_steps: 20
+  save_total_limit: 3
+  resume: true
+
+logger:
+  wandb_enabled: true
+  log_interval: 1
+  wandb:
+    project: LumenRL
+    entity: danyzhan-amd
+    name: dsv4-flash-grpo-vllm-3000step
+
+num_training_steps: 3000
+seed: 10086
