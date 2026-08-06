@@ -180,6 +180,22 @@ class MegatronConfig:
     # Dynamic-batch packing: concat multiple sequences into one packed TE forward.
     enable_dynamic_batch: bool = False
     max_tokens_per_gpu: int = 0                  # per-forward token budget (0 -> 21504)
+    # ---- initial weights from a Megatron dist-checkpoint instead of HF ----
+    # Models whose released checkpoint the HF-safetensors bridge cannot read
+    # (DeepSeek-V4 ships block-quantized FP8) are converted offline to torch_dist
+    # and loaded from here; ``dist_checkpointing.load`` reshards on the way in.
+    # ``model_name`` is then read only for config.json.
+    dist_checkpoint_path: Optional[str] = None
+    # Megatron's ``--deterministic-mode`` has no equivalent here because the
+    # engine has no argument parser, so it is a config field. Costs the fused
+    # kernels; buys run-to-run bitwise reproducibility, without which DSv4 flips
+    # ~1.6% of argmaxes between identical forwards -- which is why ``None`` means
+    # "let the model family decide" and DSv4 decides on.
+    deterministic_mode: Optional[bool] = None
+    # Skip the DDP wrapper and the distributed optimizer entirely. For a frozen
+    # reference policy or a forward-only bring-up, that is the FP32 master
+    # weights plus both Adam moments not allocated.
+    build_optimizer: bool = True
 
 
 @dataclass

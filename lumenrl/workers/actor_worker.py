@@ -216,6 +216,11 @@ class LumenActorWorker(BaseWorker):
                 # Dynamic-batch packing through TE packed-sequence attention.
                 "enable_dynamic_batch": meg_cfg.get("enable_dynamic_batch", False),
                 "max_tokens_per_gpu": meg_cfg.get("max_tokens_per_gpu", 0),
+                # Initial weights from an offline-converted Megatron
+                # dist-checkpoint rather than HF safetensors.
+                "dist_checkpoint_path": meg_cfg.get("dist_checkpoint_path", None),
+                "deterministic_mode": meg_cfg.get("deterministic_mode", None),
+                "build_optimizer": meg_cfg.get("build_optimizer", True),
             }
         return {}
 

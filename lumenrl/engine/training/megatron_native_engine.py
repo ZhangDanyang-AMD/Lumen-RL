@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 
 import torch
@@ -54,10 +55,20 @@ _LAYER_RE = re.compile(r"(decoder\.layers\.)(\d+)(\.)")
 
 def _pp_layer_offset_from_ssd(ssd) -> int:
     """Local->global layer offset for this pipeline stage, read from any plain
-    per-layer ShardedTensor (its ``global_offset[0]`` is the global layer idx)."""
+    per-layer ShardedTensor (its ``global_offset[0]`` is the global layer idx).
+
+    Expert tensors are excluded: under Expert Parallelism their leading axis
+    counts EXPERTS, so ``global_offset[0]`` is this rank's first global expert
+    index, and reading a layer offset off one gives ``ep_rank * experts_per_rank``
+    -- 32, 64, 96 ... on a 4-layer model. Whether that lands on an expert first
+    is decided by ``sharded_state_dict`` insertion order, which is why it can
+    hide indefinitely and then surface on a different architecture.
+    """
     from megatron.core.dist_checkpointing.mapping import ShardedTensor
 
     for key, st in ssd.items():
+        if ".experts." in key:
+            continue
         if isinstance(st, ShardedTensor) and st.prepend_axis_num >= 1:
             m = _LAYER_RE.search(key)
             if m:
@@ -87,6 +98,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
     # ``dsv4_megatron_bridge``. Class-level so the forward-side dispatch is
     # answerable before ``initialize`` has run.
     _is_dsv4 = False
+    _dsv4_align = 1
 
     def initialize(self) -> None:
         from megatron.core import parallel_state as mpu
@@ -158,12 +170,12 @@ class MegatronNativeEngine(MegatronBaseEngine):
         # read. Everything DSv4-specific lives in ``dsv4_megatron_bridge``.
         self._is_dsv4 = dsv4.is_dsv4(hf)
         if self._is_dsv4 and self._dynamic_batch:
-            # See ``_dsv4_require_unpacked``: DSv4 attention derives token
-            # positions from the tensor length alone, so a packed microbatch of
-            # several sequences would be read as one long sequence.
+            # See ``_dsv4_check_topology``: DSv4 attention derives token positions
+            # from the tensor length alone, so bin-packing several sequences into
+            # one microbatch would have them read as one long sequence.
             logger.warning(
                 "MegatronNativeEngine: DSv4 -> forcing enable_dynamic_batch=False "
-                "(its attention cannot consume cu_seqlens; see dsv4_megatron_bridge)."
+                "(its attention cannot consume cu_seqlens; see _dsv4_check_topology)."
             )
             self._dynamic_batch = False
 
@@ -258,12 +270,17 @@ class MegatronNativeEngine(MegatronBaseEngine):
             # Field-for-field equal to what Megatron's own parser produces from
             # miles' deepseek-v4-flash.sh, which is the config every existing DSv4
             # numerical reference was measured on.
+            det = ec.get("deterministic_mode")
             tfcfg = dsv4.build_dsv4_config(
                 hf, ec, tp=tp, pp=pp, cp=cp, ep=ep, etp=etp, sp=sp,
-                deterministic=bool(ec.get("deterministic_mode", True)),
+                # Unset means "the model family decides", and DSv4 decides on:
+                # non-deterministic forwards disagree with themselves on ~1.6% of
+                # argmaxes, swamping the train/rollout gap DAPO measures.
+                deterministic=True if det is None else bool(det),
             )
             if tfcfg.deterministic_mode:
                 dsv4.enable_deterministic_mode()
+            self._dsv4_align = dsv4.sequence_alignment(tfcfg)
         else:
             tfcfg = TransformerConfig(
                 num_layers=hf["num_hidden_layers"], hidden_size=hf["hidden_size"],
@@ -662,11 +679,12 @@ class MegatronNativeEngine(MegatronBaseEngine):
         from megatron.core.dist_checkpointing.mapping import ShardedTensor
         from lumenrl.engine.training.qwen3moe_megatron_bridge import _relabel_expert_index
 
-        d = self._dims
         ep = mpu.get_expert_model_parallel_world_size()
         etp = mpu.get_expert_tensor_parallel_world_size()
         tp = mpu.get_tensor_model_parallel_world_size()
-        num_local = d.num_experts // ep
+        # Not ``self._dims.num_experts``: DSv4 has no Qwen3-shaped dims, and the
+        # two agree wherever both exist.
+        num_local = self._num_experts // ep
 
         ssd = self.module.sharded_state_dict()
         offset = _pp_layer_offset_from_ssd(ssd)
@@ -748,8 +766,33 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 out[k] = t
         return list(out.items())
 
+    def _dsv4_router_bias_buffers(self):
+        """The aux-loss-free load-balancing bias, which is a buffer, not a param.
+
+        ``moe_router_enable_expert_bias`` updates it every step from the observed
+        expert load, and the rollout's top-k uses it. Left out of the weight sync
+        it would drift away from the trainer's routing, which is precisely the
+        divergence the importance ratio is supposed to be measuring. It is
+        replicated (full ``[num_experts]`` on every EP rank), so no gather.
+        """
+        ssd = self.module.sharded_state_dict()
+        offset = _pp_layer_offset_from_ssd(ssd)
+        return [
+            (_to_global_key(name, offset), buf.detach())
+            for name, buf in self.module.named_buffers()
+            if name.endswith("mlp.router.expert_bias")
+        ]
+
     def get_per_tensor_param(self, **kwargs):
         assert self.module is not None
+        if self._is_dsv4:
+            # The gather is shared: DSv4's grouped experts carry the same Megatron
+            # names Qwen3-MoE does. Only the naming on the way out differs, and it
+            # has to land on the DSv4 *checkpoint* names, because the rollout side
+            # feeds them to vLLM's own ``load_weights``.
+            named = self._full_megatron_named_params_moe()
+            named += self._dsv4_router_bias_buffers()
+            return dsv4.megatron_to_dsv4_native(named), None
         if getattr(self, "_is_moe", False):
             named = self._full_megatron_named_params_moe()
             gen = megatron_to_hf_moe(named, self._dims)
@@ -782,12 +825,18 @@ class MegatronNativeEngine(MegatronBaseEngine):
     # gradient finalization. Each microbatch is one packed bin of sequences.
 
     def _pp_setup_config(self) -> None:
-        """Wire the schedule's grad hooks onto the transformer config (once)."""
+        """Wire the schedule's grad hooks onto the transformer config (once).
+
+        Both hooks are backward-only, so a forward-only engine
+        (``build_optimizer=False``) leaves them unset rather than dereferencing
+        an optimizer it never built.
+        """
         if getattr(self, "_pp_cfg_ready", False):
             return
         from megatron.core.distributed import finalize_model_grads
-        self._tfcfg.finalize_model_grads_func = finalize_model_grads
-        self._tfcfg.grad_scale_func = self.optimizer.scale_loss
+        if self.optimizer is not None:
+            self._tfcfg.finalize_model_grads_func = finalize_model_grads
+            self._tfcfg.grad_scale_func = self.optimizer.scale_loss
         self._tfcfg.timers = None
         self._pp_cfg_ready = True
 
@@ -868,28 +917,38 @@ class MegatronNativeEngine(MegatronBaseEngine):
             local_offsets.append(end)
 
         local_total = local_offsets[-1]
-        # Sequence parallelism (required for MoE+TP) scatters the packed sequence
-        # across TP ranks, so the local token count must be a multiple of TP. Pad
-        # with a trailing dummy segment (its own cu_seqlens bin -> attention stays
-        # isolated; no layout entry -> its logits are never read for loss).
-        if self._sp and self._tp > 1:
-            pad = (-local_total) % self._tp
+        # Two independent reasons the token count may need rounding up:
+        #   * sequence parallelism (required for MoE+TP) scatters the packed
+        #     sequence across TP ranks, so it must be a multiple of TP;
+        #   * DSv4's compressor asserts ``seqlen % ratio == 0`` on every forward,
+        #     and RL sequence lengths are whatever the rollout produced.
+        # Either way the fix is the same: pad with a trailing dummy segment. It
+        # gets its own cu_seqlens bin so attention stays isolated, and no layout
+        # entry points at it, so its logits are never read for loss. Under DSv4
+        # cu_seqlens is ignored, but the padding is still invisible to the real
+        # positions because everything the attention does is causal.
+        align = self._tp if (self._sp and self._tp > 1) else 1
+        if self._is_dsv4:
+            align = math.lcm(align, self._dsv4_align)
+        if align > 1:
+            pad = (-local_total) % align
             if pad:
                 local_ids.append(torch.zeros(pad, dtype=torch.long, device=ids_list[0].device))
                 local_offsets.append(local_total + pad)
                 local_total = local_offsets[-1]
-            # SP variable-length efficiency: padding is bounded by TP-1 tokens per
-            # microbatch, i.e. <= (TP-1)/tokens. Log the ratio once (rank 0) so a
-            # longrun can confirm it stays negligible.
-            if not getattr(self, "_sp_pad_logged", False) and self._rank() == 0:
+            # Variable-length efficiency: padding is bounded by align-1 tokens
+            # per microbatch. Under SP alone that is negligible; under DSv4's
+            # 128-token alignment with one short sequence per microbatch it is
+            # not, so log the ratio once (rank 0) rather than leave it invisible.
+            if not getattr(self, "_pad_logged", False) and self._rank() == 0:
                 real = local_total - pad
                 logger.info(
-                    "MegatronNativeEngine SP pad: +%d/%d tokens (%.3f%%) per microbatch "
-                    "(bound=(TP-1)/tokens=%.3f%%)",
-                    pad, local_total, 100.0 * pad / max(1, local_total),
-                    100.0 * (self._tp - 1) / max(1, real),
+                    "MegatronNativeEngine forward pad: align=%d (+%d/%d tokens, %.2f%%) "
+                    "per microbatch; worst case (align-1)/tokens=%.2f%%",
+                    align, pad, local_total, 100.0 * pad / max(1, local_total),
+                    100.0 * (align - 1) / max(1, real),
                 )
-                self._sp_pad_logged = True
+                self._pad_logged = True
         tokens = torch.cat(local_ids, dim=0).view(1, local_total)
         # For RoPE + packed thd, Megatron derives positions from cu_seqlens and
         # CP rank; explicit position_ids are neither needed nor consumed.
@@ -1033,34 +1092,49 @@ class MegatronNativeEngine(MegatronBaseEngine):
             mbs.append({"rows": [], "ids_list": [torch.zeros(2, dtype=torch.long, device="cuda")]})
         return mbs
 
-    def _dsv4_require_unpacked(self) -> None:
-        """Refuse the topologies whose forward would silently glue sequences.
+    def _dsv4_check_topology(self) -> None:
+        """Refuse the topologies DSv4 is known or suspected to get wrong.
 
         ``DeepseekV4Attention.forward`` accepts ``packed_seq_params`` and never
         reads it: RoPE frequencies, the sliding window, the compressor's
         ``(p+1)//ratio`` grouping and the indexer's causal span are all derived
-        from the tensor's own length. Feed it a packed ``thd`` stream and it sees
-        one long sequence -- no error, just wrong attention. So DSv4 runs one
-        sequence per forward, which the PP/CP schedule and the Expert-Parallel
-        microbatch lockstep both rule out.
+        from the tensor's own length. So a microbatch holding several sequences
+        would be read as one long sequence -- no error, just wrong attention.
+        DSv4 therefore keeps ``enable_dynamic_batch=False``, which makes every
+        microbatch exactly one sequence and the packing degenerate; the pipeline
+        path is otherwise safe to use, and it is where the Expert-Parallel
+        microbatch lockstep lives.
 
-        Lifting this means teaching those four sites about ``cu_seqlens``.
+        Context parallelism is a different story: ``_pp_forward_model`` slices
+        the zigzag pairs TE expects, while the DSv4 attention does its own CP
+        bookkeeping (``get_q_positions_for_cp``, ``all_gather_cp``). The two
+        conventions have never been reconciled.
+
+        Pipeline parallelism is rejected for an unresolved reason rather than an
+        unimplemented one: mHC's ``layer_post`` returns a view, so the stage
+        boundary sends a non-contiguous tensor, and on a synthetic PP=2 probe
+        that silently changed the loss (1.77839053 -> 1.78812289). Until that is
+        reproduced and fixed on the real stack, PP is a wrong-answer risk.
         """
-        bad = {"pipeline_model_parallel_size": self._pp,
-               "context_parallel_size": self._cp,
-               "expert_model_parallel_size": self._ep}
+        if self._dynamic_batch:
+            raise RuntimeError(
+                "DSv4 cannot run with enable_dynamic_batch=True: several sequences in one "
+                "microbatch are read as one long sequence. initialize() forces it off, so "
+                "reaching this means something re-enabled it."
+            )
+        bad = {"context_parallel_size": self._cp, "pipeline_model_parallel_size": self._pp}
         bad = {k: v for k, v in bad.items() if v > 1}
         if bad:
             raise NotImplementedError(
-                f"DSv4 currently requires an unpacked forward, so {bad} is not supported yet "
-                f"(DeepseekV4Attention ignores packed_seq_params). Run tp/dp only, or teach "
-                f"the DSv4 attention to consume cu_seqlens."
+                f"DSv4 does not support {bad} yet -- see _dsv4_check_topology for which of "
+                f"the two is unimplemented and which is an open correctness question. "
+                f"TP / EP / DP are available."
             )
 
     def engine_update_policy(self, batch):
         if self._is_dsv4:
-            self._dsv4_require_unpacked()
-            return super().engine_update_policy(batch)
+            self._dsv4_check_topology()
+            return self._pp_update_policy(batch)
         if self._pp == 1 and self._cp == 1 and not getattr(self, "_is_moe", False):
             return super().engine_update_policy(batch)
         return self._pp_update_policy(batch)
@@ -1212,8 +1286,8 @@ class MegatronNativeEngine(MegatronBaseEngine):
 
     def engine_compute_log_probs(self, batch):
         if self._is_dsv4:
-            self._dsv4_require_unpacked()
-            return super().engine_compute_log_probs(batch)
+            self._dsv4_check_topology()
+            return self._pp_compute_log_probs(batch)
         if self._pp == 1 and self._cp == 1 and not getattr(self, "_is_moe", False):
             return super().engine_compute_log_probs(batch)
         return self._pp_compute_log_probs(batch)

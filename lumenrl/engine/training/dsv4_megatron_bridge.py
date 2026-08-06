@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import re
 from typing import Any
 
 import torch
@@ -320,6 +321,23 @@ def load_dsv4_dist_checkpoint(model: torch.nn.Module, ckpt_dir: str) -> dict:
     }
 
 
+def sequence_alignment(config: Any) -> int:
+    """Multiple that every forward's sequence length must be a multiple of.
+
+    ``DeepseekV4Compressor.forward_raw`` asserts ``seqlen >= ratio`` and
+    ``seqlen % ratio == 0`` (``ops/compressor.py:131``) on every compressed
+    layer, so a forward whose length is not a multiple of the largest
+    ``dsv4_compress_ratios`` entry dies in the assert. RL sequences are whatever
+    the rollout produced, so the caller has to pad up to this.
+
+    Padding goes at the *end*: attention is causal, the compressor groups by
+    ``(p+1)//ratio`` and the indexer's span is a causal prefix, so no real
+    position can see a trailing pad token.
+    """
+    ratios = getattr(config, "dsv4_compress_ratios", None) or [0]
+    return max(max(int(r) for r in ratios), 1)
+
+
 def keep_fp32_params(model: torch.nn.Module) -> list[str]:
     """Names of parameters the DSv4 plugin marks ``_keep_fp32``.
 
@@ -327,3 +345,109 @@ def keep_fp32_params(model: torch.nn.Module) -> list[str]:
     ``.to(bfloat16)`` over the module would silently halve their precision.
     """
     return [n for n, p in model.named_parameters() if getattr(p, "_keep_fp32", False)]
+
+
+# ---------------------------------------------------------------------------
+# Megatron -> DeepSeek-V4 checkpoint names, for rollout weight sync.
+#
+# The rollout side hands vLLM's own ``model.load_weights`` a list of
+# ``(name, tensor)``, so these must be the names the *released* checkpoint uses:
+# ``layers.0.attn.wq_a.weight``, ``layers.0.attn_norm.weight``, ``embed.weight``.
+# Two other namings are nearby and both wrong here -- vLLM's internal module
+# names (which fuse ``wq_a`` and ``wkv`` into ``fused_wqa_wkv``), and the
+# DeepSeek-HF rewrite (``model.layers.0.self_attn.wq_a.weight``) that
+# ``fp8_cast_bf16`` emits and SGLang's ``remap_weight_name_to_dpsk_hf_format``
+# converts to. Sending the HF rewrite gets ``KeyError:
+# 'layers.0.input_layernorm.weight'`` out of vLLM's loader.
+# ---------------------------------------------------------------------------
+
+_ATTN_SAME = (
+    "attn_sink", "q_norm.weight", "kv_norm.weight",
+    "wq_a.weight", "wq_b.weight", "wkv.weight", "wo_a.weight", "wo_b.weight",
+    "compressor.ape", "compressor.norm.weight",
+    "compressor.wgate.weight", "compressor.wkv.weight",
+    "indexer.compressor.ape", "indexer.compressor.norm.weight",
+    "indexer.compressor.wgate.weight", "indexer.compressor.wkv.weight",
+)
+# Megatron wraps the indexer's two projections in a ``linear_`` prefix.
+_ATTN_RENAMED = {
+    "indexer.linear_wq_b.weight": "indexer.wq_b.weight",
+    "indexer.linear_weights_proj.weight": "indexer.weights_proj.weight",
+}
+_TOP_LEVEL = {
+    "embedding.word_embeddings.weight": "embed.weight",
+    "output_layer.weight": "head.weight",
+    "decoder.final_layernorm.weight": "norm.weight",
+    "decoder.hc_head_params.hc_head_fn": "hc_head_fn",
+    "decoder.hc_head_params.hc_head_base": "hc_head_base",
+    "decoder.hc_head_params.hc_head_scale": "hc_head_scale",
+}
+_LAYER_SAME_PREFIXES = ("hc_attn_", "hc_ffn_")
+
+_MCORE_LAYER = re.compile(r"^decoder\.layers\.(\d+)\.(.*)$")
+_GROUPED_EXPERT = re.compile(r"^mlp\.experts\.linear_fc([12])\.weight(\d+)$")
+
+
+def megatron_to_dsv4_native(named_params):
+    """Yield ``(checkpoint_name, tensor)`` from GLOBAL-indexed Megatron params.
+
+    ``named_params`` is ``(megatron_name, tensor)`` with global layer numbers and
+    global expert indices, i.e. what ``_full_megatron_named_params_moe`` returns
+    after its TP/EP gather. Any ``module.`` wrapper prefix is stripped.
+
+    The one structural change is ``linear_fc1``: Megatron keeps SwiGLU's gate and
+    up projections fused along dim 0, the checkpoint keeps them apart as ``w1``
+    (gate) and ``w3`` (up), with ``w2`` for down.
+    """
+    for name, t in named_params:
+        for pre in ("module.module.", "module."):
+            if name.startswith(pre):
+                name = name[len(pre):]
+
+        if name in _TOP_LEVEL:
+            yield _TOP_LEVEL[name], t
+            continue
+
+        m = _MCORE_LAYER.match(name)
+        if m is None:
+            raise KeyError(f"no DSv4 checkpoint name for megatron param {name!r}")
+        layer, rest = m.group(1), m.group(2)
+        pfx = f"layers.{layer}"
+
+        if rest.startswith(_LAYER_SAME_PREFIXES):
+            yield f"{pfx}.{rest}", t
+        elif rest == "input_layernorm.weight":
+            yield f"{pfx}.attn_norm.weight", t
+        elif rest == "pre_mlp_layernorm.weight":
+            yield f"{pfx}.ffn_norm.weight", t
+        elif rest.startswith("self_attention."):
+            sub = rest[len("self_attention."):]
+            sub = _ATTN_RENAMED.get(sub, sub)
+            if sub not in _ATTN_SAME and sub not in _ATTN_RENAMED.values():
+                raise KeyError(f"no DSv4 checkpoint name for attention param {name!r}")
+            yield f"{pfx}.attn.{sub}", t
+        elif rest == "mlp.router.weight":
+            yield f"{pfx}.ffn.gate.weight", t
+        elif rest == "mlp.router.tid2eid":
+            # Hash routing: a token-id -> expert-id table, not a learned weight.
+            yield f"{pfx}.ffn.gate.tid2eid", t
+        elif rest == "mlp.router.expert_bias":
+            yield f"{pfx}.ffn.gate.bias", t
+        elif rest == "mlp.shared_experts.linear_fc1.weight":
+            gate, up = t.chunk(2, dim=0)
+            yield f"{pfx}.ffn.shared_experts.w1.weight", gate
+            yield f"{pfx}.ffn.shared_experts.w3.weight", up
+        elif rest == "mlp.shared_experts.linear_fc2.weight":
+            yield f"{pfx}.ffn.shared_experts.w2.weight", t
+        else:
+            em = _GROUPED_EXPERT.match(rest)
+            if em is None:
+                raise KeyError(f"no DSv4 checkpoint name for megatron param {name!r}")
+            which_fc, e = em.group(1), int(em.group(2))
+            base = f"{pfx}.ffn.experts.{e}"
+            if which_fc == "1":
+                gate, up = t.chunk(2, dim=0)
+                yield f"{base}.w1.weight", gate
+                yield f"{base}.w3.weight", up
+            else:
+                yield f"{base}.w2.weight", t
