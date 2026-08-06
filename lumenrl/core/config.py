@@ -196,6 +196,22 @@ class MegatronConfig:
     # reference policy or a forward-only bring-up, that is the FP32 master
     # weights plus both Adam moments not allocated.
     build_optimizer: bool = True
+    # ---- optimizer state in host memory (Megatron's HybridDeviceOptimizer) ----
+    # Keeps ``optimizer_offload_fraction`` of the FP32 master weights and Adam
+    # moments in pinned host RAM and runs their Adam step on the CPU. Distinct
+    # from ``is_optimizer_offload_enabled``, which moves the whole optimizer
+    # between host and device around each phase; this one is a permanent split.
+    #
+    # It is what makes a model too big for its GPUs trainable at all: the
+    # optimizer is 12 bytes/param against the weights' 2, and it is sharded over
+    # EP x EDP = world_size, so raising EP does not shrink it. Costs a CPU Adam
+    # step per iteration.
+    optimizer_cpu_offload: bool = False
+    # Fraction moved to the CPU, i.e. 1.0 offloads everything. Megatron's own
+    # dataclass default is 0.0, which would make ``optimizer_cpu_offload`` a
+    # no-op, so this default deliberately differs from it.
+    optimizer_offload_fraction: float = 1.0
+    overlap_cpu_optimizer_d2h_h2d: bool = True
 
 
 @dataclass

@@ -221,6 +221,12 @@ class LumenActorWorker(BaseWorker):
                 "dist_checkpoint_path": meg_cfg.get("dist_checkpoint_path", None),
                 "deterministic_mode": meg_cfg.get("deterministic_mode", None),
                 "build_optimizer": meg_cfg.get("build_optimizer", True),
+                # Optimizer state (and its Adam step) in pinned host RAM.
+                "optimizer_cpu_offload": meg_cfg.get("optimizer_cpu_offload", False),
+                "optimizer_offload_fraction": meg_cfg.get("optimizer_offload_fraction", 1.0),
+                "overlap_cpu_optimizer_d2h_h2d": meg_cfg.get(
+                    "overlap_cpu_optimizer_d2h_h2d", True
+                ),
             }
         return {}
 

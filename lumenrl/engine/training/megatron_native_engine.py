@@ -428,12 +428,38 @@ class MegatronNativeEngine(MegatronBaseEngine):
         )
         self._ddp = DDP(config=tfcfg, ddp_config=ddp_cfg, module=self.module)
 
+        opt_kwargs = {}
+        if bool(ec.get("optimizer_cpu_offload", False)):
+            # Megatron routes this to HybridDeviceOptimizer, which keeps
+            # ``offload_fraction`` of the master weights and Adam moments in
+            # pinned host RAM and steps them with torch's AdamW on the CPU.
+            #
+            # use_precision_aware_optimizer is not a precision choice here: the
+            # offload path reuses that flag's code path and Megatron asserts on
+            # it. All four state dtypes stay fp32.
+            frac = float(ec.get("optimizer_offload_fraction", 1.0))
+            opt_kwargs.update(
+                optimizer_cpu_offload=True,
+                use_precision_aware_optimizer=True,
+                optimizer_offload_fraction=frac,
+                overlap_cpu_optimizer_d2h_h2d=bool(
+                    ec.get("overlap_cpu_optimizer_d2h_h2d", True)
+                ),
+            )
+            if self._rank() == 0:
+                logger.info(
+                    "MegatronNativeEngine: optimizer CPU offload on, fraction=%.2f "
+                    "(that share of the 12 bytes/param of master weights and Adam "
+                    "moments lives in host RAM, and its step runs on the CPU)", frac,
+                )
+
         opt_cfg = OptimizerConfig(
             optimizer="adam", lr=float(oc.get("lr", 1e-6)),
             weight_decay=float(oc.get("weight_decay", 0.1)),
             adam_beta1=0.9, adam_beta2=0.95, adam_eps=1e-8,
             clip_grad=self._clip, bf16=True, fp16=False,
             params_dtype=torch.bfloat16, use_distributed_optimizer=True,
+            **opt_kwargs,
         )
         self.optimizer = get_megatron_optimizer(opt_cfg, model_chunks=[self._ddp])
 
