@@ -16,9 +16,16 @@
 #     zigzag slicing and DSv4's own CP bookkeeping have never been reconciled,
 #     PP because mHC's layer_post returns a view and a synthetic PP=2 probe
 #     silently changed the loss. See _dsv4_check_topology.
-#   * 4 nodes -> 1: develop here, scale after. At 4 nodes raise actor
-#     num_workers to 32 and add process_on_nodes: [8, 8, 8, 8] (a TP=8 rollout
-#     replica must be colocated on one node).
+# Despite the name this is also the multi-node recipe: nothing here depends on
+# the node count, so ~/4node/08_dsv4_megatron_multinode.sh reuses the file as-is
+# and injects cluster.num_nodes, controller.ray.actor.num_workers and
+# controller.ray.actor.process_on_nodes on the command line, all derived from its
+# node list. Validated at 2 nodes / 16 GPUs (EP=8, DP=2): 3 steps, exit 0,
+# rollout_corr/kl 2.74-3.32e-3 against the single-node 2.62-3.33e-3.
+#
+# process_on_nodes is the one that is not optional -- without it Ray picks
+# rank->node itself and a TP=8 rollout replica can straddle two nodes, which
+# VLLMReplicaManager.create rejects.
 #
 # ⚠️ model_name is a 4-LAYER slice, not the full 43-layer model. This is a
 # plumbing smoke. Build it with ~/dsv4/make_native_subset.py
