@@ -330,11 +330,6 @@ class MegatronLumenDSV4Engine(MegatronEngine):
             share_embeddings_and_output_weights=hf.get("tie_word_embeddings", False),
         )
 
-        # ---- Detect expert format ----
-        self._use_grouped_mlp = any(
-            ".experts.weight1" in n for n, _ in model.named_parameters()
-        )
-
         # ---- Load HF weights ----
         ep_rank = mpu.get_expert_model_parallel_rank() if num_experts > 0 else 0
         ep_size = mpu.get_expert_model_parallel_world_size() if num_experts > 0 else 1
@@ -350,13 +345,18 @@ class MegatronLumenDSV4Engine(MegatronEngine):
             ep_rank=ep_rank, ep_size=ep_size,
             pp_rank=pp_rank, pp_size=pp_size,
             layers_per_pp_rank=self._layers_per_pp_rank,
-            use_grouped_mlp=self._use_grouped_mlp,
+            use_grouped_mlp=True,
         )
         del hf_state
 
         # TP shard: hf_to_dsv4_megatron returns full tensors; the GPTModel's
-        # parallel linears only hold 1/tp of each weight. Shard using the
-        # partition metadata set by Megatron.
+        # parallel linears only hold 1/tp of each weight.
+        #
+        # Detect which params need TP sharding by comparing bridge output shape
+        # vs model param shape. This is more reliable than tensor_model_parallel
+        # because Lumen's LumenDuplicatedLinear sets tensor_model_parallel=True
+        # even though it's a full-size replicated weight (used for grad allreduce
+        # policy, not for weight partitioning).
         tp_rank = mpu.get_tensor_model_parallel_rank()
         etp_val = etp if etp is not None else 1
         etp_rank = (mpu.get_expert_tensor_parallel_rank()
@@ -365,15 +365,21 @@ class MegatronLumenDSV4Engine(MegatronEngine):
             for name, param in model.named_parameters():
                 if name not in meg_state:
                     continue
-                if not getattr(param, "tensor_model_parallel", False):
-                    continue
+                full = meg_state[name]
+                if full.shape == param.shape:
+                    continue  # same shape → no sharding needed (duplicated)
                 is_expert = (".experts." in name
                              and ".shared_experts." not in name)
                 shard_size = etp_val if is_expert else tp
                 shard_rank = etp_rank if is_expert else tp_rank
                 if shard_size <= 1:
                     continue
-                pdim = getattr(param, "partition_dim", 0)
+                # Detect partition dim from shape difference
+                pdim = 0
+                for d in range(min(full.ndim, param.ndim)):
+                    if full.shape[d] != param.shape[d]:
+                        pdim = d
+                        break
                 pstride = getattr(param, "partition_stride", 1)
                 meg_state[name] = _shard_with_stride(
                     meg_state[name], pdim, pstride, shard_rank, shard_size,
@@ -447,7 +453,7 @@ class MegatronLumenDSV4Engine(MegatronEngine):
             overlap_grad_reduce=bool(ec.get("overlap_grad_reduce", False)),
             use_distributed_optimizer=bool(ec.get("use_distributed_optimizer", True)),
             average_in_collective=True,
-            bucket_size=ec.get("bucket_size", None),
+            bucket_size=int(ec.get("bucket_size", None) or 500_000_000),
         )
         _gpu_diag("BEFORE DDP init")
         self._ddp = DDP(config=tfcfg, ddp_config=ddp_cfg, module=self.module)
@@ -466,6 +472,8 @@ class MegatronLumenDSV4Engine(MegatronEngine):
             use_distributed_optimizer=bool(ec.get("use_distributed_optimizer", True)),
             optimizer_cpu_offload=cpu_offload,
             optimizer_offload_fraction=offload_frac,
+            pin_cpu_grads=False,
+            pin_cpu_params=False,
         )
         _gpu_diag("BEFORE optimizer init")
         self.optimizer = get_megatron_optimizer(opt_cfg, model_chunks=[self._ddp])
@@ -576,7 +584,7 @@ class MegatronLumenDSV4Engine(MegatronEngine):
                 list(local_full.items()), self._dims,
                 pp_rank=pp_rank, pp_size=pp_size,
                 layers_per_pp_rank=self._layers_per_pp_rank,
-                use_grouped_mlp=self._use_grouped_mlp,
+                use_grouped_mlp=True,
             ))
             del local_full  # free TP+EP gathered params
 
@@ -610,7 +618,7 @@ class MegatronLumenDSV4Engine(MegatronEngine):
         gen = dsv4_megatron_to_hf(
             list(local_full.items()), self._dims,
             pp_rank=0, pp_size=1,
-            use_grouped_mlp=self._use_grouped_mlp,
+            use_grouped_mlp=True,
         )
         return gen, None
 

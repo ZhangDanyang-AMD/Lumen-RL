@@ -9,9 +9,9 @@ no fused QKV projection.  Each attention projection (wq_a, wq_b, wkv, wo_a,
 wo_b) is mapped individually.  Hyper-Connection parameters and compressor /
 indexer weights are conditional on per-layer ``compress_ratios``.
 
-MoE expert layout is the same as Qwen3 MoE: grouped-gemm ``weight1``
-(gate+up fused) and ``weight2`` (down), with router, expert bias, hash table
-(tid2eid), and shared expert.
+MoE expert layout uses Lumen's GroupedMLP per-expert indexed format:
+``linear_fc1.weight{E}`` (gate+up fused) and ``linear_fc2.weight{E}`` (down),
+with router, expert bias, hash table (tid2eid), and shared expert.
 """
 
 from __future__ import annotations
@@ -51,6 +51,59 @@ class DSV4Dims(Qwen3Dims):
     moe_topk: int = 6
 
 
+def _normalize_hf_keys(hf: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Normalize HF weight keys to deepseek-ai format.
+
+    RedHatAI/DeepSeek-V4-Flash-BF16 uses a simplified naming:
+        layers.{L}.attn.*    -> model.layers.{L}.self_attn.*
+        layers.{L}.attn_norm -> model.layers.{L}.input_layernorm
+        layers.{L}.ffn_norm  -> model.layers.{L}.post_attention_layernorm
+        embed.weight         -> model.embed_tokens.weight
+        head.weight          -> lm_head.weight
+        norm.weight          -> model.norm.weight
+        hc_head_*            -> model.hc_head_*
+
+    If keys already use the deepseek-ai format (model.layers.*), returns as-is.
+    """
+    if any(k.startswith("model.") for k in hf):
+        return hf  # already in deepseek-ai format
+
+    import re
+    mapped: dict[str, torch.Tensor] = {}
+    for key, tensor in hf.items():
+        new_key = key
+        if key == "embed.weight":
+            new_key = "model.embed_tokens.weight"
+        elif key == "head.weight":
+            new_key = "lm_head.weight"
+        elif key == "norm.weight":
+            new_key = "model.norm.weight"
+        elif key.startswith("hc_head_"):
+            new_key = f"model.{key}"
+        elif key.startswith("layers."):
+            new_key = "model." + key
+            # attn -> self_attn (but NOT attn_norm or attn_sink inside self_attn)
+            new_key = re.sub(r"\.attn\.", ".self_attn.", new_key)
+            new_key = new_key.replace(".attn_norm.", ".input_layernorm.")
+            new_key = new_key.replace(".ffn_norm.", ".post_attention_layernorm.")
+            # MoE: ffn.* -> mlp.*
+            new_key = re.sub(r"\.ffn\.gate\.tid2eid", ".mlp.topk.tid2eid", new_key)
+            new_key = re.sub(r"\.ffn\.gate\.bias", ".mlp.gate.e_score_correction_bias", new_key)
+            new_key = re.sub(r"\.ffn\.gate\.weight", ".mlp.gate.weight", new_key)
+            # Experts: ffn.experts.{E}.w1 -> mlp.experts.{E}.gate_proj
+            #          ffn.experts.{E}.w2 -> mlp.experts.{E}.down_proj
+            #          ffn.experts.{E}.w3 -> mlp.experts.{E}.up_proj
+            new_key = re.sub(r"\.ffn\.experts\.(\d+)\.w1\.", r".mlp.experts.\1.gate_proj.", new_key)
+            new_key = re.sub(r"\.ffn\.experts\.(\d+)\.w2\.", r".mlp.experts.\1.down_proj.", new_key)
+            new_key = re.sub(r"\.ffn\.experts\.(\d+)\.w3\.", r".mlp.experts.\1.up_proj.", new_key)
+            # Shared experts: ffn.shared_experts.w1 -> mlp.shared_experts.gate_proj
+            new_key = new_key.replace(".ffn.shared_experts.w1.", ".mlp.shared_experts.gate_proj.")
+            new_key = new_key.replace(".ffn.shared_experts.w2.", ".mlp.shared_experts.down_proj.")
+            new_key = new_key.replace(".ffn.shared_experts.w3.", ".mlp.shared_experts.up_proj.")
+        mapped[new_key] = tensor
+    return mapped
+
+
 def hf_to_dsv4_megatron(
     hf: dict[str, torch.Tensor],
     d: DSV4Dims,
@@ -59,7 +112,7 @@ def hf_to_dsv4_megatron(
     pp_rank: int = 0,
     pp_size: int = 1,
     layers_per_pp_rank: Optional[list[int]] = None,
-    use_grouped_mlp: bool = True,
+    use_grouped_mlp: bool = True,  # ignored — kept for API compat
 ) -> dict[str, torch.Tensor]:
     """Return a Megatron GPTModel state_dict from HF DeepSeek-V4-Flash weights.
 
@@ -72,7 +125,11 @@ def hf_to_dsv4_megatron(
 
     FP32 parameters (HC params, attn_sink, compressor APE/norm) are preserved
     without casting to bf16.
+
+    Supports both deepseek-ai (``model.layers.{L}.self_attn.*``) and RedHatAI
+    (``layers.{L}.attn.*``) key naming via automatic normalization.
     """
+    hf = _normalize_hf_keys(hf)
     m: dict[str, torch.Tensor] = {}
     is_first_pp = pp_rank == 0
     is_last_pp = pp_rank == pp_size - 1
@@ -113,10 +170,14 @@ def hf_to_dsv4_megatron(
 
         # -- MLA attention projections (no fused QKV) --
         m[mp + "self_attention.wq_a.weight"] = hf[hp + "self_attn.wq_a.weight"]
-        m[mp + "self_attention.q_norm.weight"] = hf[hp + "self_attn.q_norm.weight"]
+        q_norm_w = hf[hp + "self_attn.q_norm.weight"]
+        m[mp + "self_attention.q_norm.weight"] = q_norm_w
+        m[mp + "self_attention.q_norm._norm.weight"] = q_norm_w
         m[mp + "self_attention.wq_b.weight"] = hf[hp + "self_attn.wq_b.weight"]
         m[mp + "self_attention.wkv.weight"] = hf[hp + "self_attn.wkv.weight"]
-        m[mp + "self_attention.kv_norm.weight"] = hf[hp + "self_attn.kv_norm.weight"]
+        kv_norm_w = hf[hp + "self_attn.kv_norm.weight"]
+        m[mp + "self_attention.kv_norm.weight"] = kv_norm_w
+        m[mp + "self_attention.kv_norm._norm.weight"] = kv_norm_w
         m[mp + "self_attention.wo_a.weight"] = hf[hp + "self_attn.wo_a.weight"]
         m[mp + "self_attention.wo_b.weight"] = hf[hp + "self_attn.wo_b.weight"]
 
@@ -175,26 +236,17 @@ def hf_to_dsv4_megatron(
             if tid2eid_key in hf:
                 m[mp + "mlp.router.tid2eid"] = hf[tid2eid_key]
 
-            # Experts (grouped-gemm fused weight1/weight2)
-            if use_grouped_mlp:
-                gate_ups = []
-                downs = []
-                for e in range(expert_offset, expert_offset + num_local):
-                    gate = hf[hp + f"mlp.experts.{e}.gate_proj.weight"]
-                    up = hf[hp + f"mlp.experts.{e}.up_proj.weight"]
-                    down = hf[hp + f"mlp.experts.{e}.down_proj.weight"]
-                    gate_ups.append(torch.cat([gate, up], dim=0).t())
-                    downs.append(down.t())
-                m[mp + "mlp.experts.weight1"] = torch.cat(gate_ups, dim=1).contiguous()
-                m[mp + "mlp.experts.weight2"] = torch.cat(downs, dim=0).contiguous()
-            else:
-                for local_e, e in enumerate(range(expert_offset, expert_offset + num_local)):
-                    gate = hf[hp + f"mlp.experts.{e}.gate_proj.weight"]
-                    up = hf[hp + f"mlp.experts.{e}.up_proj.weight"]
-                    down = hf[hp + f"mlp.experts.{e}.down_proj.weight"]
-                    ep_prefix = mp + f"mlp.experts.local_experts.{local_e}."
-                    m[ep_prefix + "linear_fc1.weight"] = torch.cat([gate, up], dim=0).contiguous()
-                    m[ep_prefix + "linear_fc2.weight"] = down
+            # Experts — Lumen's GroupedMLP uses per-expert indexed format:
+            #   mlp.experts.linear_fc1.weight{E}  (gate+up fused, [2*moe_ffn, hidden])
+            #   mlp.experts.linear_fc2.weight{E}  (down, [hidden, moe_ffn])
+            for local_e, e in enumerate(range(expert_offset, expert_offset + num_local)):
+                gate = hf[hp + f"mlp.experts.{e}.gate_proj.weight"]
+                up = hf[hp + f"mlp.experts.{e}.up_proj.weight"]
+                down = hf[hp + f"mlp.experts.{e}.down_proj.weight"]
+                m[mp + f"mlp.experts.linear_fc1.weight{local_e}"] = torch.cat(
+                    [gate, up], dim=0,
+                ).contiguous()
+                m[mp + f"mlp.experts.linear_fc2.weight{local_e}"] = down
 
             # Shared expert
             if d.shared_expert_ffn > 0:
@@ -233,7 +285,7 @@ def dsv4_megatron_to_hf(
     pp_rank: int = 0,
     pp_size: int = 1,
     layers_per_pp_rank: Optional[list[int]] = None,
-    use_grouped_mlp: bool = True,
+    use_grouped_mlp: bool = True,  # ignored — kept for API compat
 ):
     """Yield ``(hf_name, tensor)`` from Megatron GPTModel named params.
 
@@ -356,31 +408,19 @@ def dsv4_megatron_to_hf(
             if tid2eid_key in md:
                 yield hp + "mlp.topk.tid2eid", get(tid2eid_key)
 
-            # Experts
-            if use_grouped_mlp:
-                w1 = get(mp + "mlp.experts.weight1")
-                w2 = get(mp + "mlp.experts.weight2")
-                chunk_fc1 = 2 * d.moe_ffn
-                chunk_fc2 = d.moe_ffn
-                for local_idx in range(d.num_experts):
-                    ep = hp + f"mlp.experts.{local_idx}."
-                    w1_e = w1[:, local_idx * chunk_fc1:(local_idx + 1) * chunk_fc1].t()
-                    gate_w = w1_e[:d.moe_ffn].contiguous()
-                    up_w = w1_e[d.moe_ffn:].contiguous()
-                    yield ep + "gate_proj.weight", gate_w
-                    yield ep + "up_proj.weight", up_w
-                    w2_e = w2[local_idx * chunk_fc2:(local_idx + 1) * chunk_fc2]
-                    yield ep + "down_proj.weight", w2_e.t().contiguous()
-            else:
-                for local_idx in range(d.num_experts):
-                    ep = hp + f"mlp.experts.{local_idx}."
-                    lp = mp + f"mlp.experts.local_experts.{local_idx}."
-                    fc1 = get(lp + "linear_fc1.weight")
-                    gate_w = fc1[:d.moe_ffn].contiguous()
-                    up_w = fc1[d.moe_ffn:].contiguous()
-                    yield ep + "gate_proj.weight", gate_w
-                    yield ep + "up_proj.weight", up_w
-                    yield ep + "down_proj.weight", get(lp + "linear_fc2.weight")
+            # Experts — Lumen's GroupedMLP per-expert indexed format:
+            #   mlp.experts.linear_fc1.weight{E} -> gate_proj + up_proj
+            #   mlp.experts.linear_fc2.weight{E} -> down_proj
+            for local_idx in range(d.num_experts):
+                ep = hp + f"mlp.experts.{local_idx}."
+                fc1 = get(mp + f"mlp.experts.linear_fc1.weight{local_idx}")
+                gate_w = fc1[:d.moe_ffn].contiguous()
+                up_w = fc1[d.moe_ffn:].contiguous()
+                yield ep + "gate_proj.weight", gate_w
+                yield ep + "up_proj.weight", up_w
+                yield ep + "down_proj.weight", get(
+                    mp + f"mlp.experts.linear_fc2.weight{local_idx}"
+                )
 
             # Shared expert
             if d.shared_expert_ffn > 0:

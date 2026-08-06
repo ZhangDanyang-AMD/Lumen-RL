@@ -64,6 +64,10 @@ def _should_quantize(name: str) -> bool:
     return True
 
 
+def _is_rocm() -> bool:
+    return hasattr(torch.version, "hip") and torch.version.hip is not None
+
+
 @torch.no_grad()
 def _per_block_cast_to_fp8(
     tensor: torch.Tensor,
@@ -73,6 +77,7 @@ def _per_block_cast_to_fp8(
 
     Returns ``(fp8_weight, scale_inv)`` where:
     - ``fp8_weight`` has the same shape, dtype ``torch.float8_e4m3fn``
+      (on ROCm, converted to ``float8_e4m3fnuz`` to match the platform FP8 format)
     - ``scale_inv`` has shape ``(ceil(M/block_m), ceil(N/block_n))``, dtype FP32
     """
     assert tensor.ndim == 2, f"Expected 2D tensor, got {tensor.ndim}D"
@@ -106,6 +111,19 @@ def _per_block_cast_to_fp8(
     # Reshape back and trim padding
     fp8_padded = blocks_fp8.permute(0, 2, 1, 3).reshape(PM, PN)
     fp8_weight = fp8_padded[:M, :N].contiguous()
+
+    # ROCm uses e4m3fnuz (not e4m3fn). Convert dtype + adjust scale.
+    if _is_rocm():
+        try:
+            from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+                normalize_e4m3fn_to_e4m3fnuz,
+            )
+            fp8_weight, scale_inv = normalize_e4m3fn_to_e4m3fnuz(
+                weight=fp8_weight, weight_scale=scale_inv,
+            )
+        except ImportError:
+            # vLLM normalize unavailable — do manual conversion
+            fp8_weight = fp8_weight.view(torch.uint8).to(torch.float8_e4m3fnuz)
 
     return fp8_weight, scale_inv
 

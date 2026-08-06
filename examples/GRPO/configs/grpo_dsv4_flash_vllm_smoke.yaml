@@ -47,7 +47,7 @@ controller:
       num_workers: 8
       process_on_nodes: [8]
       topology_tags:
-        node_ip: REPLACE_ME
+        node_ip: "10.194.132.76"
 
 policy:
   model_name: /root/models/DeepSeek-V4-Flash-BF16
@@ -89,7 +89,7 @@ policy:
       use_packed_sequences: true
       log_probs_chunk_size: 1024
       optimizer_cpu_offload: true
-      optimizer_offload_fraction: 0.75
+      optimizer_offload_fraction: 0.95
     fsdp_cfg:
       param_offload: false
       optimizer_offload: false
@@ -97,7 +97,7 @@ policy:
   generation:
     vllm_cfg:
       transport: ray_http
-      ray_http_start_server: false
+      ray_http_start_server: true
       tensor_parallel_size: 8
       quantization: fp8_per_block
       enforce_eager: true

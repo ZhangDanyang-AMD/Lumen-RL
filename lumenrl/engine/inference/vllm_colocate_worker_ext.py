@@ -144,7 +144,12 @@ class vLLMColocateWorkerExtension:
         version: int,
         verify_full_load: bool = True,
     ) -> dict[str, float]:
-        """Receive HF-named GPU buckets over RCCL and load them in place."""
+        """Receive HF-named GPU buckets over RCCL and load them in place.
+
+        For online FP8 quantized models (``fp8_per_block``), wraps the reload
+        with vLLM's layerwise quantization lifecycle so per-block FP8 scales
+        are rebuilt from the fresh BF16 weights after each update.
+        """
         from vllm.platforms import current_platform
 
         groups = getattr(self, "_rdma_weight_groups", {})
@@ -154,21 +159,53 @@ class vLLMColocateWorkerExtension:
             self.device = torch.device(
                 f"{current_platform.device_type}:{self.local_rank}"
             )
+
+        model = self.model_runner.model
+
         from lumenrl.engine.inference.rdma_weight_transfer import (
             receive_weight_stream,
         )
 
+        # When actor sends pre-quantized FP8 weights (fp8_quantize=True),
+        # the received tensors include .weight (fp8) + .weight_scale_inv (fp32).
+        # vLLM's load_weights writes them directly into the model's FP8 params
+        # — no online requant needed.
+        #
+        # When actor sends BF16 weights (fp8_quantize=False, default),
+        # we need the online requant lifecycle: prepare → load BF16 → finalize.
+        # The received dtype tells us which path to take after the first bucket.
+        is_online_quant = False
+        try:
+            from lumenrl.engine.inference.vllm_fp8_utils import is_online_quant_model
+            is_online_quant = is_online_quant_model(self.model_runner.vllm_config)
+        except Exception:
+            pass
+
+        if is_online_quant:
+            # Assume BF16 (fallback path) — prepare for online requant.
+            # If the received weights turn out to be FP8, load_weights will
+            # write them directly and finalize becomes a no-op for those layers.
+            from lumenrl.engine.inference.vllm_fp8_utils import (
+                finalize_online_quantized_weights_loading,
+                prepare_online_quantized_weights_for_loading,
+            )
+            prepare_online_quantized_weights_for_loading(model)
+
         stats = receive_weight_stream(
             groups[group_name],
-            self.model_runner.model,
+            model,
             device=self.device,
             expected_version=int(version),
             verify_full_load=bool(verify_full_load),
         )
+
+        if is_online_quant:
+            model_config = self.model_runner.vllm_config.model_config
+            finalize_online_quantized_weights_loading(model, model_config)
+
         logger.warning(
-            "RDMA weight reload verified on local_rank=%d: %s",
-            self.local_rank,
-            stats,
+            "RDMA weight reload verified on local_rank=%d (online_quant=%s): %s",
+            self.local_rank, is_online_quant, stats,
         )
         return stats
 

@@ -231,6 +231,27 @@ def condition_init_method(config, init_method):
     return True
 
 
+def patch_distrib_optimizer_fp32_detach(megatron_root: str) -> bool:
+    """Fix missing .detach() on FP32 param shard views in DistributedOptimizer.
+
+    The BF16 path uses model_param.detach().view(-1)[...] but the FP32 path
+    uses model_param.view(-1)[...] without .detach(). When FP32 params have
+    requires_grad=True (e.g. DSV4 HC params, attn_sink, compressor APE), the
+    view creates a non-leaf tensor, causing 'can't optimize a non-leaf Tensor'
+    when HybridDeviceOptimizer (CPU offload) validates param groups.
+    """
+    path = os.path.join(megatron_root, "megatron", "core", "optimizer", "distrib_optimizer.py")
+    with open(path) as f:
+        content = f.read()
+    old = "shard_model_param = model_param.view(-1)["
+    if old not in content:
+        return False
+    content = content.replace(old, "shard_model_param = model_param.detach().view(-1)[")
+    with open(path, "w") as f:
+        f.write(content)
+    return True
+
+
 def main(megatron_root: str) -> None:
     results = {
         "transformer_config.py": patch_transformer_config(megatron_root),
@@ -238,6 +259,7 @@ def main(megatron_root: str) -> None:
         "transformer_layer.py": patch_transformer_layer(megatron_root),
         "experimental_attention_variant_module_specs.py": patch_eav_specs(megatron_root),
         "tensor_parallel/layers.py": patch_tp_layers(megatron_root),
+        "optimizer/distrib_optimizer.py": patch_distrib_optimizer_fp32_detach(megatron_root),
     }
     print(f"Patched ROCm Megatron at {megatron_root}:")
     for name, ok in results.items():
