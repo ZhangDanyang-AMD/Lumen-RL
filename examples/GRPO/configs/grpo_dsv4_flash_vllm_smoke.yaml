@@ -31,7 +31,7 @@ weight_sync:
     backend: rccl
     require_rdma: true
     hca: mlx5_0
-    interface: ens11np0
+    interface: ens14np0
     gid_index: 3
     gdr_mode: auto
 
@@ -88,6 +88,7 @@ policy:
       attention_backend: flash
       use_packed_sequences: true
       log_probs_chunk_size: 1024
+      numa_affinity: true
       optimizer_cpu_offload: true
       optimizer_offload_fraction: 0.95
     fsdp_cfg:

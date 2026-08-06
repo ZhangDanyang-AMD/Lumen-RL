@@ -187,6 +187,8 @@ class MegatronConfig:
     # Dynamic-batch packing: concat multiple sequences into one packed TE forward.
     enable_dynamic_batch: bool = False
     max_tokens_per_gpu: int = 0                  # per-forward token budget (0 -> 21504)
+    # Bind each Ray actor to CPUs on the NUMA node local to its assigned GPU.
+    numa_affinity: bool = False
     # Optimizer CPU offload: move Adam states (exp_avg/exp_avg_sq) to CPU memory.
     # Frees ~2x model-size GPU memory at the cost of slower optimizer steps.
     optimizer_cpu_offload: bool = False

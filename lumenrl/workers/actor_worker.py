@@ -13,6 +13,10 @@ from typing import Any
 # base_worker must be imported before torch so that HIP_VISIBLE_DEVICES
 # is set before HIP initialization (see base_worker.py module-level code).
 from lumenrl.workers.base_worker import BaseWorker, get_nested_config
+from lumenrl.workers.numa_affinity import (
+    bind_current_process_to_gpu_numa,
+    current_physical_gpu_id,
+)
 
 import torch
 import torch.nn.functional as F
@@ -63,6 +67,21 @@ class LumenActorWorker(BaseWorker):
         model_name = str(policy.get("model_name", ""))
         training_cfg = policy.get("training", {}) or {}
         quant = get_nested_config(self.config, "quantization", "training", default={}) or {}
+
+        megatron_cfg = training_cfg.get("megatron_cfg", {}) or {}
+        if bool(megatron_cfg.get("numa_affinity", False)):
+            try:
+                physical_gpu_id = current_physical_gpu_id()
+            except Exception as exc:
+                self._log.warning(
+                    "NUMA affinity GPU detection failed; continuing unbound: %s",
+                    exc,
+                )
+            else:
+                bind_current_process_to_gpu_numa(
+                    physical_gpu_id,
+                    logger=self._log,
+                )
 
         engine_config = self._build_engine_config(backend_key, training_cfg, policy)
         optimizer_config = self._build_optimizer_config(policy)
