@@ -59,6 +59,42 @@ class RayWorkerGroup:
         self._worker_names: list[str] = worker_names[:] if worker_names is not None else []
         self._lazy_dispatch_state: dict[str, Any] = {}
         self._spawned_groups: dict[str, _SpawnSpec] = {}
+        self._pg: Any = None
+
+    def _pin_ranks_to_nodes(self, gpus_per_worker: float) -> list[int] | None:
+        """Make rank -> node deterministic, one placement-group bundle per node.
+
+        Ray's default actor scheduling decides rank->node on its own, which is fine
+        for data parallelism but not for a TP>1 rollout: `VLLMReplicaManager.create`
+        requires ranks ``i*tp .. i*tp+tp-1`` to share a node and raises "replica i
+        spans N nodes" otherwise. A STRICT_SPREAD placement group with one bundle
+        per node, plus an explicit bundle index per rank, pins the layout.
+
+        Only engages when the pool declares a multi-node layout via
+        ``process_on_nodes`` (e.g. ``[8, 8, 8, 8]``). Single-entry layouts -- every
+        existing config -- keep Ray's default scheduling untouched.
+        """
+        layout = [int(n) for n in (self.pool.process_on_nodes or []) if int(n) > 0]
+        if len(layout) < 2 or gpus_per_worker <= 0:
+            return None
+        if sum(layout) != self.num_workers:
+            logger.warning(
+                "process_on_nodes=%s sums to %d but the group has %d workers; "
+                "falling back to Ray's default placement.",
+                layout, sum(layout), self.num_workers,
+            )
+            return None
+
+        from ray.util.placement_group import placement_group
+
+        bundles = [{"GPU": float(n), "CPU": float(n)} for n in layout]
+        # STRICT_SPREAD forces one bundle per node, so bundle index == node index.
+        self._pg = placement_group(bundles, strategy="STRICT_SPREAD")
+        ray.get(self._pg.ready())
+        bundle_of = [i for i, n in enumerate(layout) for _ in range(n)]
+        logger.info("Pinned %d workers to %d nodes via placement group (layout=%s)",
+                    self.num_workers, len(layout), layout)
+        return bundle_of
 
     def start(self) -> None:
         """Create and start all workers in this group."""
@@ -80,9 +116,18 @@ class RayWorkerGroup:
             num_cpus=1,
         )(self.worker_cls)
 
+        bundle_of = self._pin_ranks_to_nodes(gpus_per_worker)
+
         for rank in range(self.num_workers):
             actor_name = f"{self.pool.name}:{self.worker_cls.__name__}:{rank}"
             options_kwargs: dict[str, Any] = {}
+            if bundle_of is not None:
+                from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+                options_kwargs["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
+                    placement_group=self._pg,
+                    placement_group_bundle_index=bundle_of[rank],
+                )
             if self.detached:
                 options_kwargs["name"] = actor_name
                 options_kwargs["lifetime"] = "detached"

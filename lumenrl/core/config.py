@@ -221,6 +221,10 @@ class VLLMConfig:
     trust_remote_code: bool = True
     # Rollout quantization: "" / "fp8" / "fp8_per_block" (vLLM `quantization=`)
     quantization: str = ""
+    # vLLM `moe_backend=`. "" leaves vLLM's own default. DeepSeek-V4 on gfx950 must
+    # pass "triton": the default auto-selects AITER and dies in the first forward at
+    # `moe_sorting_opus_fwd`, and "triton_unfused" is FP4-only and raises ValueError.
+    moe_backend: str = ""
     # When True, vLLM returns per-token rollout log-probs needed for TIS / MIS
     # rollout correction (verl: actor_rollout_ref.rollout.calculate_log_probs).
     calculate_log_probs: bool = False
