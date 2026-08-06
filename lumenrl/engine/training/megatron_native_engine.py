@@ -24,6 +24,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from lumenrl.core.protocol import DataProto
+from lumenrl.engine.training import dsv4_megatron_bridge as dsv4
 from lumenrl.engine.training.base_engine import EngineRegistry
 from lumenrl.engine.training.megatron_base_engine import MegatronBaseEngine
 from lumenrl.engine.training.qwen3_megatron_bridge import (
@@ -81,6 +82,11 @@ class MegatronNativeEngine(MegatronBaseEngine):
     ``MegatronBaseEngine``; only the model construction (TE spec, pipeline-stage
     aware) and HF weight I/O (TE-named bridge) differ.
     """
+
+    # DeepSeek-V4 takes a separate construction and weight path; see
+    # ``dsv4_megatron_bridge``. Class-level so the forward-side dispatch is
+    # answerable before ``initialize`` has run.
+    _is_dsv4 = False
 
     def initialize(self) -> None:
         from megatron.core import parallel_state as mpu
@@ -145,6 +151,22 @@ class MegatronNativeEngine(MegatronBaseEngine):
             hf = json.load(fh)
         head_dim = hf.get("head_dim", hf["hidden_size"] // hf["num_attention_heads"])
 
+        # DeepSeek-V4 is the one family the inline config below cannot describe:
+        # MLA head geometry, a 4-D hyper-connection residual stream, per-layer
+        # heterogeneous attention, and hash routing on the first layers. It also
+        # ships block-quantized FP8 weights that the HF-safetensors bridge cannot
+        # read. Everything DSv4-specific lives in ``dsv4_megatron_bridge``.
+        self._is_dsv4 = dsv4.is_dsv4(hf)
+        if self._is_dsv4 and self._dynamic_batch:
+            # See ``_dsv4_require_unpacked``: DSv4 attention derives token
+            # positions from the tensor length alone, so a packed microbatch of
+            # several sequences would be read as one long sequence.
+            logger.warning(
+                "MegatronNativeEngine: DSv4 -> forcing enable_dynamic_batch=False "
+                "(its attention cannot consume cu_seqlens; see dsv4_megatron_bridge)."
+            )
+            self._dynamic_batch = False
+
         # ---- MoE detection: HF config declares routed experts (Qwen3-MoE etc.) ----
         # Any of these HF keys marks a MoE model; an explicit engine_config
         # ``num_experts`` overrides. dense models keep every ``moe_*`` off.
@@ -173,7 +195,12 @@ class MegatronNativeEngine(MegatronBaseEngine):
             )
 
         moe_kwargs: dict = {}
-        if self._is_moe:
+        if self._is_dsv4:
+            # ``build_moe_dims`` and the ``Qwen3Dims`` twin below both read HF keys
+            # DSv4 does not have. Its dims are only consumed by the HF weight
+            # bridge (load + rollout weight sync), and DSv4 uses neither yet.
+            self._dims = None
+        elif self._is_moe:
             self._dims = build_moe_dims(hf)
             moe_ffn = self._dims.moe_ffn
             topk = int(ec.get("moe_router_topk") or hf.get("num_experts_per_tok") or 2)
@@ -227,31 +254,48 @@ class MegatronNativeEngine(MegatronBaseEngine):
             recompute_kwargs["recompute_method"] = ec.get("recompute_method") or "uniform"
             recompute_kwargs["recompute_num_layers"] = int(ec.get("recompute_num_layers") or 1)
 
-        tfcfg = TransformerConfig(
-            num_layers=hf["num_hidden_layers"], hidden_size=hf["hidden_size"],
-            num_attention_heads=hf["num_attention_heads"],
-            num_query_groups=hf["num_key_value_heads"], kv_channels=head_dim,
-            ffn_hidden_size=hf["intermediate_size"], gated_linear_unit=True,
-            activation_func=F.silu, add_bias_linear=False,
-            add_qkv_bias=bool(hf.get("attention_bias", False)),
-            normalization="RMSNorm", layernorm_epsilon=hf.get("rms_norm_eps", 1e-6),
-            qk_layernorm=True, hidden_dropout=0.0, attention_dropout=0.0,
-            bf16=True, params_dtype=torch.bfloat16, pipeline_dtype=torch.bfloat16,
-            tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp,
-            context_parallel_size=cp, sequence_parallel=sp,
-            use_cpu_initialization=True,
-            # PP: RL microbatches are variable-length (per-seq / packed thd), so
-            # the pipeline P2P must exchange tensor shapes dynamically instead of
-            # assuming a fixed [seq, mbs, hidden]. (alltoall MoE dispatcher just
-            # passes the dense-model config validation that rejects the default
-            # allgather dispatcher under variable_seq_lengths.)
-            variable_seq_lengths=(pp > 1),
-            moe_token_dispatcher_type="alltoall",
-            **moe_kwargs,
-            **recompute_kwargs,
-        )
+        if self._is_dsv4:
+            # Field-for-field equal to what Megatron's own parser produces from
+            # miles' deepseek-v4-flash.sh, which is the config every existing DSv4
+            # numerical reference was measured on.
+            tfcfg = dsv4.build_dsv4_config(
+                hf, ec, tp=tp, pp=pp, cp=cp, ep=ep, etp=etp, sp=sp,
+                deterministic=bool(ec.get("deterministic_mode", True)),
+            )
+            if tfcfg.deterministic_mode:
+                dsv4.enable_deterministic_mode()
+        else:
+            tfcfg = TransformerConfig(
+                num_layers=hf["num_hidden_layers"], hidden_size=hf["hidden_size"],
+                num_attention_heads=hf["num_attention_heads"],
+                num_query_groups=hf["num_key_value_heads"], kv_channels=head_dim,
+                ffn_hidden_size=hf["intermediate_size"], gated_linear_unit=True,
+                activation_func=F.silu, add_bias_linear=False,
+                add_qkv_bias=bool(hf.get("attention_bias", False)),
+                normalization="RMSNorm", layernorm_epsilon=hf.get("rms_norm_eps", 1e-6),
+                qk_layernorm=True, hidden_dropout=0.0, attention_dropout=0.0,
+                bf16=True, params_dtype=torch.bfloat16, pipeline_dtype=torch.bfloat16,
+                tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp,
+                context_parallel_size=cp, sequence_parallel=sp,
+                use_cpu_initialization=True,
+                # PP: RL microbatches are variable-length (per-seq / packed thd), so
+                # the pipeline P2P must exchange tensor shapes dynamically instead of
+                # assuming a fixed [seq, mbs, hidden]. (alltoall MoE dispatcher just
+                # passes the dense-model config validation that rejects the default
+                # allgather dispatcher under variable_seq_lengths.)
+                variable_seq_lengths=(pp > 1),
+                moe_token_dispatcher_type="alltoall",
+                **moe_kwargs,
+                **recompute_kwargs,
+            )
 
-        if self._is_moe:
+        if self._is_dsv4:
+            # Heterogeneous per layer (sliding / compressed+indexed /
+            # hyper-compressed), so no block-spec builder can produce it.
+            spec = dsv4.build_dsv4_spec(
+                tfcfg, dsa_topk_backend=str(ec.get("dsa_topk_backend", "torch")),
+            )
+        elif self._is_moe:
             # MoE: get_gpt_decoder_block_spec builds per-layer specs with the routed
             # expert MLP (grouped-GEMM TEGroupedLinear or sequential local experts)
             # and standalone pre-MLP RMSNorm, driven by the TransformerConfig MoE
@@ -277,33 +321,52 @@ class MegatronNativeEngine(MegatronBaseEngine):
             parallel_output=False,
         )
 
-        # ---- load HF weights via the TE-named bridge ----
-        logger.info(
-            "MegatronNativeEngine[%d]: loading HF weights (TE spec, moe=%s experts=%d "
-            "tp=%d pp=%d cp=%d ep=%d etp=%d) from %s",
-            self._rank(), self._is_moe, num_experts, tp, pp, cp, ep, etp, self.model_name,
-        )
-        hf_state = load_hf_safetensors(self.model_name)
-        if self._is_moe:
-            meg_state = self._shard_hf_for_moe(model, hf_state)
-        elif tp == 1 and pp == 1:
-            meg_state = hf_to_megatron(hf_state, self._dims, te=True)
+        if self._is_dsv4:
+            # DSv4 weights come from a torch_dist checkpoint converted offline
+            # (native FP8 -> bf16 HF -> torch_dist), because the released
+            # checkpoint is block-quantized FP8. ``dist_checkpointing.load``
+            # reshards it to this rank's TP/PP/EP on the way in.
+            ckpt = str(ec.get("dist_checkpoint_path") or self.model_name)
+            dsv4.materialize_dsv4(model)
+            report = dsv4.load_dsv4_dist_checkpoint(model, ckpt)
+            self.module = model
+            logger.info(
+                "MegatronNativeEngine[%d]: DSv4 loaded %.2fB params (%d tensors) from %s "
+                "| experts=%d topk=%d hash_layers=%d compress_ratios=%s hc_mult=%d "
+                "| tp=%d pp=%d cp=%d ep=%d etp=%d deterministic=%s",
+                self._rank(), report["num_params"] / 1e9, report["num_tensors"],
+                report["path"], tfcfg.num_moe_experts, tfcfg.moe_router_topk,
+                tfcfg.dsv4_n_hash_layers, tfcfg.dsv4_compress_ratios, tfcfg.dsv4_hc_mult,
+                tp, pp, cp, ep, etp, tfcfg.deterministic_mode,
+            )
         else:
-            # TP/PP>1: each rank keeps only its model-parallel shard. For TP the
-            # tensor is sliced along the sharded axis; for PP only this stage's
-            # layers are kept (the local key's global layer index comes from the
-            # ShardedTensor's global_offset). See ``_shard_hf_for_mp``.
-            meg_state = self._shard_hf_for_mp(model, hf_state)
-        del hf_state
-        missing = model.load_state_dict(meg_state, strict=False)
-        real_missing = [k for k in missing.missing_keys if "_extra_state" not in k]
-        if real_missing:
-            raise RuntimeError(f"Native(TE) load missing keys: {real_missing[:6]} ...")
-        del meg_state
-        self.module = model.cuda()
+            # ---- load HF weights via the TE-named bridge ----
+            logger.info(
+                "MegatronNativeEngine[%d]: loading HF weights (TE spec, moe=%s experts=%d "
+                "tp=%d pp=%d cp=%d ep=%d etp=%d) from %s",
+                self._rank(), self._is_moe, num_experts, tp, pp, cp, ep, etp, self.model_name,
+            )
+            hf_state = load_hf_safetensors(self.model_name)
+            if self._is_moe:
+                meg_state = self._shard_hf_for_moe(model, hf_state)
+            elif tp == 1 and pp == 1:
+                meg_state = hf_to_megatron(hf_state, self._dims, te=True)
+            else:
+                # TP/PP>1: each rank keeps only its model-parallel shard. For TP the
+                # tensor is sliced along the sharded axis; for PP only this stage's
+                # layers are kept (the local key's global layer index comes from the
+                # ShardedTensor's global_offset). See ``_shard_hf_for_mp``.
+                meg_state = self._shard_hf_for_mp(model, hf_state)
+            del hf_state
+            missing = model.load_state_dict(meg_state, strict=False)
+            real_missing = [k for k in missing.missing_keys if "_extra_state" not in k]
+            if real_missing:
+                raise RuntimeError(f"Native(TE) load missing keys: {real_missing[:6]} ...")
+            del meg_state
+            self.module = model.cuda()
         self._tfcfg = tfcfg
 
-        if self._is_moe and self._rank() == 0:
+        if self._is_moe and not self._is_dsv4 and self._rank() == 0:
             # Surface MoE + Expert-Parallel topology to the run log (stdout is
             # forwarded by Ray). Evidence of expert sharding / EP group width.
             print(
@@ -317,6 +380,22 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 f"aux_loss_coeff={moe_kwargs.get('moe_aux_loss_coeff')}",
                 flush=True,
             )
+
+        # An engine that only ever runs forwards (bring-up smoke test, or a
+        # frozen reference policy) can skip the DDP wrapper and the distributed
+        # optimizer. On the 27B DSv4 slice that is the difference between the
+        # bf16 weights alone and another ~330 GB of fp32 master + Adam moments,
+        # i.e. between fitting on one GPU and not.
+        if not bool(ec.get("build_optimizer", True)):
+            self._ddp = None
+            self.optimizer = None
+            self.lr_scheduler = None
+            logger.info(
+                "MegatronNativeEngine[%d]: forward-only (build_optimizer=False), "
+                "%d params, no DDP wrapper and no optimizer.",
+                self._rank(), sum(p.numel() for p in self.module.parameters()),
+            )
+            return
 
         # ---- distributed optimizer + scheduler ----
         from megatron.core.distributed import DistributedDataParallel as DDP
@@ -954,7 +1033,34 @@ class MegatronNativeEngine(MegatronBaseEngine):
             mbs.append({"rows": [], "ids_list": [torch.zeros(2, dtype=torch.long, device="cuda")]})
         return mbs
 
+    def _dsv4_require_unpacked(self) -> None:
+        """Refuse the topologies whose forward would silently glue sequences.
+
+        ``DeepseekV4Attention.forward`` accepts ``packed_seq_params`` and never
+        reads it: RoPE frequencies, the sliding window, the compressor's
+        ``(p+1)//ratio`` grouping and the indexer's causal span are all derived
+        from the tensor's own length. Feed it a packed ``thd`` stream and it sees
+        one long sequence -- no error, just wrong attention. So DSv4 runs one
+        sequence per forward, which the PP/CP schedule and the Expert-Parallel
+        microbatch lockstep both rule out.
+
+        Lifting this means teaching those four sites about ``cu_seqlens``.
+        """
+        bad = {"pipeline_model_parallel_size": self._pp,
+               "context_parallel_size": self._cp,
+               "expert_model_parallel_size": self._ep}
+        bad = {k: v for k, v in bad.items() if v > 1}
+        if bad:
+            raise NotImplementedError(
+                f"DSv4 currently requires an unpacked forward, so {bad} is not supported yet "
+                f"(DeepseekV4Attention ignores packed_seq_params). Run tp/dp only, or teach "
+                f"the DSv4 attention to consume cu_seqlens."
+            )
+
     def engine_update_policy(self, batch):
+        if self._is_dsv4:
+            self._dsv4_require_unpacked()
+            return super().engine_update_policy(batch)
         if self._pp == 1 and self._cp == 1 and not getattr(self, "_is_moe", False):
             return super().engine_update_policy(batch)
         return self._pp_update_policy(batch)
@@ -1105,6 +1211,9 @@ class MegatronNativeEngine(MegatronBaseEngine):
         return metrics
 
     def engine_compute_log_probs(self, batch):
+        if self._is_dsv4:
+            self._dsv4_require_unpacked()
+            return super().engine_compute_log_probs(batch)
         if self._pp == 1 and self._cp == 1 and not getattr(self, "_is_moe", False):
             return super().engine_compute_log_probs(batch)
         return self._pp_compute_log_probs(batch)
