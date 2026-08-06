@@ -389,8 +389,11 @@ class RLTrainer:
         from lumenrl.engine.inference.vllm_ray_server import VLLMReplicaManager
 
         seed = self.config.seed if getattr(vcfg, "seed", None) is None else vcfg.seed
+        # One engine per TP group of actors; TP=1 is the original layout of one
+        # engine per GPU. See VLLMReplicaManager for the grouping contract.
+        rollout_tp = max(1, int(getattr(vcfg, "tensor_parallel_size", 1) or 1))
         engine_kwargs: dict[str, Any] = dict(
-            tensor_parallel_size=1,
+            tensor_parallel_size=rollout_tp,
             gpu_memory_utilization=float(vcfg.gpu_memory_utilization),
             dtype=str(vcfg.dtype),
             enforce_eager=bool(vcfg.enforce_eager),
@@ -410,6 +413,17 @@ class RLTrainer:
             engine_kwargs["kv_cache_dtype"] = str(vcfg.kv_cache_dtype)
         if vcfg.quantization:
             engine_kwargs["quantization"] = str(vcfg.quantization)
+        if getattr(vcfg, "moe_backend", ""):
+            engine_kwargs["moe_backend"] = str(vcfg.moe_backend)
+        if rollout_tp > 1:
+            # The colocated path needs NCCL_CUMEM_ENABLE=0 for the CUDA-IPC weight
+            # sync, and vLLM's custom all-reduce allocates its shared buffers
+            # through cuMem: with both on, every TP worker dies in
+            # create_shared_buffer ("HIP error: invalid argument", surfacing as
+            # 'CustomAllreduce' object has no attribute '_ptr'). pynccl handles the
+            # intra-node all-reduce instead. TP=1 has no all-reduce, so leave its
+            # engine args untouched.
+            engine_kwargs["disable_custom_all_reduce"] = True
         if self._r3_rollout_replay:
             # makes the engine attach the selected expert ids to every completion
             engine_kwargs["enable_return_routed_experts"] = True
@@ -422,6 +436,7 @@ class RLTrainer:
             start_http=bool(vcfg.ray_http_start_server),
             max_concurrency=max(8, int(vcfg.max_num_seqs)),
             base_seed=(int(seed) if seed is not None else None),
+            tensor_parallel_size=rollout_tp,
         )
         mgr.create()
         self._ray_rollout_mgr = mgr
@@ -429,8 +444,8 @@ class RLTrainer:
             mgr, sleep_level=int(vcfg.sleep_level), enable_sleep=bool(vcfg.enable_sleep_mode),
         )
         logger.info(
-            "Ray vLLM rollout ready: %d colocated replicas (TP=1, ZMQ IPC weight sync).",
-            mgr.num_replicas,
+            "Ray vLLM rollout ready: %d colocated replicas (TP=%d, ZMQ IPC weight sync).",
+            mgr.num_replicas, rollout_tp,
         )
 
     def _setup_ray_atom_rollout(self, model_name: str, vcfg: Any, atom_cfg: Any) -> None:

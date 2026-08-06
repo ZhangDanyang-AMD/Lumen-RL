@@ -92,6 +92,14 @@ class MegatronNativeEngine(MegatronBaseEngine):
         from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
         from megatron.core.transformer.transformer_config import TransformerConfig
 
+        from lumenrl.engine.training.megatron_te_gemm_compat import (
+            install as install_te_gemm_compat,
+        )
+
+        # No-op unless megatron-core and TransformerEngine disagree about the
+        # general_gemm signature, which the MoE router path would otherwise hit.
+        install_te_gemm_compat()
+
         ec = self.engine_config
         tp = int(ec.get("tensor_model_parallel_size", 1))
         pp = int(ec.get("pipeline_model_parallel_size", 1))
