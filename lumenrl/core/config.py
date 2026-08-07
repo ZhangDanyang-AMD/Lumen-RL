@@ -728,11 +728,28 @@ class AsyncTrainingConfig:
 
 
 @dataclass
+class TorchProfilerScheduleConfig:
+    """Schedule for ``torch.profiler.schedule``.
+
+    The profiler cycles through skip_first -> (wait -> warmup -> active) x repeat.
+    Scheduling is only enabled when ``active > 0``; otherwise the profiler runs
+    in continuous mode.
+    """
+
+    skip_first: int = 0
+    wait: int = 0
+    warmup: int = 1
+    active: int = 3
+    repeat: int = 0
+
+
+@dataclass
 class TorchProfilerToolConfig:
     """Configuration for torch.profiler backend."""
 
     # Supported values: "cpu", "cuda", "memory", "shapes", "stack"
     contents: list[str] = field(default_factory=lambda: ["cpu", "cuda"])
+    schedule: Optional["TorchProfilerScheduleConfig"] = None
 
 
 @dataclass

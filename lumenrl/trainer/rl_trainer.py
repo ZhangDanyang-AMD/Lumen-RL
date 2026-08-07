@@ -3275,6 +3275,7 @@ class RLTrainer:
                                     self._optimizer.step()
                             grad_norm += _gn  # mean over optimizer steps (verl-aligned)
                             optimizer_steps += 1
+                        self._profiler.step()
                         continue
                     _nan_cnt = 0
                     _total_cnt = 0
@@ -3307,6 +3308,7 @@ class RLTrainer:
                         if v == v:
                             metrics_accum[k] = metrics_accum.get(k, 0.0) + v
                     step_count += 1
+                    self._profiler.step()
 
             if _do_engine_step:
                 self._engine.optimizer_zero_grad()
