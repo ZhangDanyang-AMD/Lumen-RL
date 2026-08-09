@@ -970,6 +970,10 @@ class MegatronNativeEngine(MegatronBaseEngine):
             v = _sub.get(key, algo_cfg_full.get(key, default))
             return default if v is None else v
 
+        loss_agg_mode = _cfg("loss_agg_mode", "token-mean")
+        global_batch_size = (
+            meta.get("global_batch_size") or batch.batch_size * dp
+        )
         t = batch.tensors
         seqs = t["input_ids"]
         am = t.get("attention_mask")
@@ -1013,7 +1017,18 @@ class MegatronNativeEngine(MegatronBaseEngine):
                         want_entropy=False,
                     )
                     token_lp = token_lp.view(1, -1)
-                    loss, stats = self._row_policy_loss(t, r, start, token_lp, algo_name, _cfg, bnt, dp)
+                    loss, stats = self._row_policy_loss(
+                        t,
+                        r,
+                        start,
+                        token_lp,
+                        algo_name,
+                        _cfg,
+                        bnt,
+                        dp,
+                        loss_agg_mode,
+                        global_batch_size,
+                    )
                     if loss is None:
                         continue
                     bin_loss = loss if bin_loss is None else bin_loss + loss

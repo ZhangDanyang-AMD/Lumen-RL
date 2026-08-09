@@ -2,13 +2,20 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from omegaconf import OmegaConf
 
-from lumenrl.core.config import LumenRLConfig
+from lumenrl.core.config import LumenRLConfig, WeightSyncConfig
 from lumenrl.core.types import AlgorithmName, GenerationBackend, TrainingBackend
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GRPO_YAML = REPO_ROOT / "configs" / "grpo_dense_bf16.yaml"
+DSV4_SMOKE_YAML = (
+    REPO_ROOT / "examples" / "GRPO" / "configs" / "grpo_dsv4_flash_vllm_smoke.yaml"
+)
+DSV4_LONGRUN_YAML = (
+    REPO_ROOT / "examples" / "GRPO" / "configs" / "grpo_dsv4_flash_vllm_longrun.yaml"
+)
 
 
 def test_default_config() -> None:
@@ -67,6 +74,75 @@ def test_fp8_config_values() -> None:
     assert merged.quantization.training.fp8_weight_cache is True
 
 
+def test_weight_sync_fp8_quantization_location() -> None:
+    assert (
+        WeightSyncConfig(
+            fp8_quantization_location="trainer",
+        ).resolve_fp8_quantize()
+        is True
+    )
+    assert (
+        WeightSyncConfig(
+            fp8_quantization_location="inference",
+        ).resolve_fp8_quantize()
+        is False
+    )
+    assert WeightSyncConfig(fp8_quantize=True).resolve_fp8_quantize() is True
+    assert WeightSyncConfig(fp8_quantize=False).resolve_fp8_quantize() is False
+
+
+def test_weight_sync_fp8_quantization_location_rejects_invalid_or_conflicting() -> None:
+    for config in (
+        WeightSyncConfig(fp8_quantization_location="invalid"),
+        WeightSyncConfig(
+            fp8_quantization_location="inference",
+            fp8_quantize=True,
+        ),
+    ):
+        with pytest.raises(ValueError, match="fp8_quantization_location"):
+            config.resolve_fp8_quantize()
+
+
+def test_weight_sync_fp8_location_requires_rdma_fp8_per_block_rollout() -> None:
+    for config, rollout_quantization in (
+        (
+            WeightSyncConfig(
+                backend="shared_folder",
+                fp8_quantization_location="trainer",
+            ),
+            "fp8_per_block",
+        ),
+        (
+            WeightSyncConfig(
+                backend="rdma",
+                fp8_quantization_location="trainer",
+            ),
+            None,
+        ),
+        (
+            WeightSyncConfig(
+                backend="rdma",
+                fp8_quantization_location="inference",
+            ),
+            "fp8",
+        ),
+    ):
+        with pytest.raises(ValueError, match="fp8_quantization_location"):
+            config.validate_fp8_quantization_location(rollout_quantization)
+
+
+def test_weight_sync_fp8_location_accepts_valid_and_legacy_configs() -> None:
+    WeightSyncConfig(
+        backend="rdma",
+        fp8_quantization_location="trainer",
+    ).validate_fp8_quantization_location("fp8_per_block")
+    WeightSyncConfig(
+        backend="rdma",
+        fp8_quantization_location="inference",
+    ).validate_fp8_quantization_location("fp8_per_block")
+    WeightSyncConfig().validate_fp8_quantization_location(None)
+
+
 def test_moe_config_values() -> None:
     cfg = LumenRLConfig.from_yaml(GRPO_YAML)
     assert cfg.moe.r3.enabled is False
@@ -108,3 +184,50 @@ def test_ray_controller_config_overrides() -> None:
     assert cfg.controller.ray.ref.dispatch_mode == "rank_zero"
     assert cfg.controller.ray.fuse_actor_ref is True
     assert cfg.controller.ray.topology_map["actor"] == "actor"
+
+
+def test_dsv4_smoke_disables_vllm_custom_all_reduce() -> None:
+    cfg = LumenRLConfig.from_yaml(DSV4_SMOKE_YAML)
+
+    assert cfg.policy.generation.vllm_cfg.disable_custom_all_reduce is True
+
+
+def test_dsv4_smoke_selects_fp8_quantization_location() -> None:
+    inference_cfg = LumenRLConfig.from_yaml(DSV4_SMOKE_YAML)
+    assert inference_cfg.weight_sync.fp8_quantization_location == "inference"
+    assert inference_cfg.weight_sync.resolve_fp8_quantize() is False
+
+    trainer_cfg = LumenRLConfig.from_yaml(
+        DSV4_SMOKE_YAML,
+        overrides=["weight_sync.fp8_quantization_location=trainer"],
+    )
+    assert trainer_cfg.weight_sync.resolve_fp8_quantize() is True
+
+
+def test_dsv4_smoke_preserves_sgd_and_uses_miles_grpo_semantics() -> None:
+    cfg = LumenRLConfig.from_yaml(DSV4_SMOKE_YAML)
+
+    assert cfg.policy.optimizer_type == "sgd"
+    assert cfg.policy.lr_warmup_steps == 0
+    assert cfg.policy.lr_decay_style == "constant"
+    assert cfg.policy.training.megatron_cfg.use_precision_aware_optimizer is False
+    assert cfg.algorithm.loss_agg_mode == "seq-mean-token-mean"
+    assert cfg.algorithm.grpo.clip_ratio == 0.2
+    assert cfg.algorithm.clip_ratio_high == 0.28
+    assert cfg.quantization.rollout_correction.rollout_is is None
+
+
+def test_dsv4_longrun_uses_miles_adam_and_grpo_semantics() -> None:
+    cfg = LumenRLConfig.from_yaml(DSV4_LONGRUN_YAML)
+
+    assert cfg.policy.optimizer_type == "adam"
+    assert cfg.policy.learning_rate == 1.0e-6
+    assert cfg.policy.weight_decay == 0.1
+    assert cfg.policy.adam_beta1 == 0.9
+    assert cfg.policy.adam_beta2 == 0.98
+    assert cfg.policy.lr_warmup_steps == 0
+    assert cfg.policy.lr_decay_style == "constant"
+    assert cfg.algorithm.loss_agg_mode == "seq-mean-token-mean"
+    assert cfg.algorithm.grpo.clip_ratio == 0.2
+    assert cfg.algorithm.clip_ratio_high == 0.28
+    assert cfg.quantization.rollout_correction.rollout_is is None

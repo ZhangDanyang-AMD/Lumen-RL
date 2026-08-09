@@ -204,6 +204,14 @@ class VLLMRayServer:
     ) -> Any:
         return await self.engine.collective_rpc(method, args=args, kwargs=kwargs or {})
 
+    async def get_rdma_capabilities(self) -> Any:
+        """Collect the RDMA capability contract from every TP worker."""
+        return await self.engine.collective_rpc(
+            "get_rdma_capabilities",
+            args=(),
+            kwargs={},
+        )
+
     async def update_weights_from_ipc(self, use_shm: bool = False) -> bool:
         """Start the in-worker IPC receiver; blocks until the sender completes."""
         await self.engine.collective_rpc(
@@ -264,6 +272,7 @@ class VLLMRayServer:
         group_name: str,
         version: int,
         verify_full_load: bool = True,
+        prequantized_fp8: bool = False,
     ) -> Any:
         stats = await self.engine.collective_rpc(
             "receive_weights_rdma",
@@ -271,6 +280,7 @@ class VLLMRayServer:
                 "group_name": group_name,
                 "version": int(version),
                 "verify_full_load": bool(verify_full_load),
+                "prequantized_fp8": bool(prequantized_fp8),
             },
         )
         await self.engine.reset_prefix_cache()
@@ -414,6 +424,8 @@ class VLLMReplicaManager:
         )
         self.servers: list = []
         self.rdma_group_name: str | None = None
+        self._rdma_capabilities_group: str | None = None
+        self._rdma_capabilities: tuple[dict[str, object], ...] = ()
 
     def create(self) -> None:
         """Create + launch server actors colocated with training/rollout workers.
@@ -584,6 +596,7 @@ class VLLMReplicaManager:
         """Create one persistent source+8-worker RCCL communicator."""
         import ray
 
+        self._clear_rdma_capabilities()
         if require_rdma:
             checks = [
                 actor_wg.call_single_async(0, "rdma_preflight", interface, hca)
@@ -636,19 +649,90 @@ class VLLMReplicaManager:
             "world_size": world_size,
         }
 
+    def _clear_rdma_capabilities(self) -> None:
+        self._rdma_capabilities_group = None
+        self._rdma_capabilities = ()
+
+    def _validate_rdma_capabilities(self) -> None:
+        if self._rdma_capabilities_group == self.rdma_group_name:
+            return
+
+        import ray
+
+        from lumenrl.engine.inference.rdma_protocol import RDMA_PROTOCOL_VERSION
+
+        validated: list[dict[str, object]] = []
+        for server_rank, server in enumerate(self.servers):
+            try:
+                rpc = server.get_rdma_capabilities
+                capabilities = ray.get(rpc.remote())
+            except Exception as exc:
+                raise RuntimeError(
+                    "RDMA capability handshake failed for "
+                    f"server={server_rank} "
+                    f"workers=0..{self.tensor_parallel_size - 1}: "
+                    "get_rdma_capabilities RPC is unavailable or failed"
+                ) from exc
+
+            if not isinstance(capabilities, (list, tuple)):
+                raise RuntimeError(
+                    "Invalid RDMA capability response for "
+                    f"server={server_rank} worker=unknown: expected a worker list"
+                )
+            if len(capabilities) != self.tensor_parallel_size:
+                raise RuntimeError(
+                    "Invalid RDMA capability response for "
+                    f"server={server_rank} worker=unknown: expected "
+                    f"{self.tensor_parallel_size} TP workers, got "
+                    f"{len(capabilities)}"
+                )
+
+            for worker_rank, capability in enumerate(capabilities):
+                identity = f"server={server_rank} worker={worker_rank}"
+                if not isinstance(capability, dict):
+                    raise RuntimeError(
+                        f"Invalid RDMA capability for {identity}: expected mapping"
+                    )
+                if capability.get("protocol_version") != RDMA_PROTOCOL_VERSION:
+                    raise RuntimeError(
+                        f"Incompatible RDMA capability for {identity}: "
+                        f"protocol_version={capability.get('protocol_version')!r}, "
+                        f"expected {RDMA_PROTOCOL_VERSION}"
+                    )
+                module_path = capability.get("module_path")
+                if not isinstance(module_path, str) or not module_path:
+                    raise RuntimeError(
+                        f"Incompatible RDMA capability for {identity}: "
+                        "module_path is missing"
+                    )
+                for field in ("online_quant_reload", "prequantized_stream"):
+                    if capability.get(field) is not True:
+                        raise RuntimeError(
+                            f"Incompatible RDMA capability for {identity}: "
+                            f"{field}={capability.get(field)!r}, expected True; "
+                            f"module_path={module_path}"
+                        )
+                validated.append(dict(capability))
+
+        self._rdma_capabilities = tuple(validated)
+        self._rdma_capabilities_group = self.rdma_group_name
+
     def start_receive_weights_rdma(
         self,
         *,
         version: int,
         verify_full_load: bool,
+        prequantized_fp8: bool = False,
     ) -> list:
         if not self.rdma_group_name:
             raise RuntimeError("RDMA weight group has not been initialized")
+        self._validate_rdma_capabilities()
         return [
             server.receive_weights_rdma.remote(
                 self.rdma_group_name,
                 int(version),
                 bool(verify_full_load),
+                bool(prequantized_fp8),
             )
             for server in self.servers
         ]
@@ -656,6 +740,7 @@ class VLLMReplicaManager:
     def destroy_rdma_weight_group(self, actor_wg=None) -> None:
         import ray
 
+        self._clear_rdma_capabilities()
         if not self.rdma_group_name:
             return
         refs = [
@@ -666,11 +751,14 @@ class VLLMReplicaManager:
             refs.append(
                 actor_wg.call_single_async(0, "destroy_rdma_weight_group")
             )
-        ray.get(refs)
-        self.rdma_group_name = None
+        try:
+            ray.get(refs)
+        finally:
+            self.rdma_group_name = None
 
     def shutdown(self) -> None:
         import ray
+        self._clear_rdma_capabilities()
         try:
             ray.get([s.shutdown.remote() for s in self.servers])
         except Exception:

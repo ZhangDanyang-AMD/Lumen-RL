@@ -16,6 +16,8 @@ with router, expert bias, hash table (tid2eid), and shared expert.
 
 from __future__ import annotations
 
+import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -65,10 +67,9 @@ def _normalize_hf_keys(hf: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
 
     If keys already use the deepseek-ai format (model.layers.*), returns as-is.
     """
-    if any(k.startswith("model.") for k in hf):
+    if any(k.startswith("model.layers.") for k in hf):
         return hf  # already in deepseek-ai format
 
-    import re
     mapped: dict[str, torch.Tensor] = {}
     for key, tensor in hf.items():
         new_key = key
@@ -102,6 +103,66 @@ def _normalize_hf_keys(hf: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
             new_key = new_key.replace(".ffn.shared_experts.w3.", ".mlp.shared_experts.up_proj.")
         mapped[new_key] = tensor
     return mapped
+
+
+def _expert_bias_or_zeros(
+    hf: Mapping[str, torch.Tensor],
+    layer_prefix: str,
+    num_experts: int,
+) -> torch.Tensor:
+    bias_key = layer_prefix + "mlp.gate.e_score_correction_bias"
+    if bias_key in hf:
+        return hf[bias_key].float()
+    router_weight = hf[layer_prefix + "mlp.gate.weight"]
+    return torch.zeros(
+        num_experts,
+        dtype=torch.float32,
+        device=router_weight.device,
+    )
+
+
+def _denormalize_redhat_key(key: str) -> str:
+    """Map a normalized DSV4 key back to the RedHat checkpoint/vLLM format."""
+    if key == "model.embed_tokens.weight":
+        return "embed.weight"
+    if key == "lm_head.weight":
+        return "head.weight"
+    if key == "model.norm.weight":
+        return "norm.weight"
+    if key.startswith("model.hc_head_"):
+        return key.removeprefix("model.")
+    if not key.startswith("model.layers."):
+        return key
+
+    key = key.removeprefix("model.")
+    key = key.replace(".input_layernorm.", ".attn_norm.")
+    key = key.replace(".post_attention_layernorm.", ".ffn_norm.")
+    key = key.replace(".self_attn.", ".attn.")
+    key = key.replace(".mlp.topk.tid2eid", ".ffn.gate.tid2eid")
+    key = key.replace(
+        ".mlp.gate.e_score_correction_bias",
+        ".ffn.gate.bias",
+    )
+    key = key.replace(".mlp.gate.weight", ".ffn.gate.weight")
+    key = re.sub(
+        r"\.mlp\.experts\.(\d+)\.gate_proj\.",
+        r".ffn.experts.\1.w1.",
+        key,
+    )
+    key = re.sub(
+        r"\.mlp\.experts\.(\d+)\.down_proj\.",
+        r".ffn.experts.\1.w2.",
+        key,
+    )
+    key = re.sub(
+        r"\.mlp\.experts\.(\d+)\.up_proj\.",
+        r".ffn.experts.\1.w3.",
+        key,
+    )
+    key = key.replace(".mlp.shared_experts.gate_proj.", ".ffn.shared_experts.w1.")
+    key = key.replace(".mlp.shared_experts.down_proj.", ".ffn.shared_experts.w2.")
+    key = key.replace(".mlp.shared_experts.up_proj.", ".ffn.shared_experts.w3.")
+    return key
 
 
 def hf_to_dsv4_megatron(
@@ -227,9 +288,11 @@ def hf_to_dsv4_megatron(
             m[mp + "mlp.router.weight"] = hf[hp + "mlp.gate.weight"]
 
             # Expert bias (e_score_correction_bias)
-            ebias_key = hp + "mlp.gate.e_score_correction_bias"
-            if ebias_key in hf:
-                m[mp + "mlp.router.expert_bias"] = hf[ebias_key]
+            m[mp + "mlp.router.expert_bias"] = _expert_bias_or_zeros(
+                hf,
+                hp,
+                d.num_experts,
+            )
 
             # Hash table (tid2eid) -- non-trainable
             tid2eid_key = hp + "mlp.topk.tid2eid"
@@ -294,14 +357,17 @@ def dsv4_megatron_to_hf(
     With PP > 1, maps local decoder layer indices back to global HF
     layer indices.
     """
-    md: dict[str, torch.Tensor] = {}
-    for name, t in named_params:
-        # Strip DDP/Float16Module wrappers
-        for pre in ("module.module.", "module."):
-            if name.startswith(pre):
-                name = name[len(pre):]
-                break
-        md[name] = t
+    if isinstance(named_params, Mapping):
+        md = named_params
+    else:
+        md: dict[str, torch.Tensor] = {}
+        for name, t in named_params:
+            # Strip DDP/Float16Module wrappers
+            for pre in ("module.module.", "module."):
+                if name.startswith(pre):
+                    name = name[len(pre):]
+                    break
+            md[name] = t
 
     def get(n):
         return md[n]

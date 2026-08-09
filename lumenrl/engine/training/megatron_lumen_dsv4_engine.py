@@ -19,8 +19,11 @@ Key differences from the Qwen3 parent:
 
 from __future__ import annotations
 
+import re
+from collections.abc import Iterator, Mapping
 import json
 import logging
+import math
 import os
 import sys
 from types import SimpleNamespace
@@ -33,11 +36,13 @@ from lumenrl.engine.training.base_engine import EngineRegistry
 from lumenrl.engine.training.dsv4_megatron_bridge import (
     DSV4Dims,
     DSV4_FLASH_COMPRESS_RATIOS,
+    _denormalize_redhat_key,
     dsv4_megatron_to_hf,
     hf_to_dsv4_megatron,
 )
 from lumenrl.engine.training.megatron_engine import (
     MegatronEngine,
+    _clear_stale_router_replay_instances,
     _gather_with_stride,
     _shard_with_stride,
 )
@@ -50,6 +55,237 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LUMENRL_LOGGING_LEVEL", "INFO"))
 
 
+def _dsv4_router_kwargs(
+    hf: Mapping[str, Any],
+    ec: Mapping[str, Any],
+) -> dict[str, Any]:
+    expected = {
+        "topk_method": "noaux_tc",
+        "scoring_func": "sqrtsoftplus",
+        "norm_topk_prob": True,
+    }
+    for name, value in expected.items():
+        if hf.get(name) != value:
+            raise ValueError(
+                f"DSV4 Megatron requires checkpoint {name}={value!r}, "
+                f"got {hf.get(name)!r}"
+            )
+
+    scaling_factor = float(hf.get("routed_scaling_factor", 1.0))
+    scaling_override = ec.get("moe_router_topk_scaling_factor")
+    if (
+        scaling_override is not None
+        and float(scaling_override) != scaling_factor
+    ):
+        raise ValueError(
+            "engine moe_router_topk_scaling_factor conflicts with checkpoint "
+            f"routed_scaling_factor={scaling_factor}"
+        )
+    return {
+        "moe_router_load_balancing_type": "none",
+        "moe_router_score_function": "sqrtsoftplus",
+        "moe_router_dtype": "fp32",
+        "moe_router_topk_scaling_factor": scaling_factor,
+        "moe_router_enable_expert_bias": True,
+        # DSV4's checkpoint bias is part of the frozen routing policy.
+        "moe_router_bias_update_rate": 0.0,
+    }
+
+
+def _optimizer_precision_kwargs(ec: Mapping[str, Any]) -> dict[str, Any]:
+    enabled = bool(ec.get("use_precision_aware_optimizer", False))
+    if not enabled:
+        return {"use_precision_aware_optimizer": False}
+    return {
+        "use_precision_aware_optimizer": True,
+        "main_grads_dtype": torch.float32,
+        "main_params_dtype": torch.float32,
+        "exp_avg_dtype": torch.float32,
+        "exp_avg_sq_dtype": torch.float32,
+    }
+
+
+def _register_checkpoint_static_buffers(
+    model: torch.nn.Module,
+    state: Mapping[str, torch.Tensor],
+) -> None:
+    """Materialize checkpoint-only router tables omitted by the model spec."""
+    for name, tensor in state.items():
+        if not name.endswith(".tid2eid"):
+            continue
+        module_path, leaf = name.rsplit(".", 1)
+        module = model.get_submodule(module_path)
+        if leaf in module._buffers:
+            continue
+        if hasattr(module, leaf):
+            delattr(module, leaf)
+        module.register_buffer(leaf, torch.empty_like(tensor), persistent=True)
+
+
+def _named_export_tensors(module) -> list[tuple[str, torch.Tensor]]:
+    return list(module.named_parameters())
+
+
+class _StreamingGatheredParamMapping(Mapping[str, torch.Tensor]):
+    """Materialize only the Megatron parameter currently requested by the bridge."""
+
+    _EXPERT_PATTERN = re.compile(
+        r"^(?P<prefix>.*\.experts\.linear_fc[12]\.weight)(?P<index>\d+)$"
+    )
+
+    def __init__(
+        self,
+        named_parameters,
+        *,
+        tp_size,
+        tp_group,
+        ep_size,
+        ep_group,
+        etp_size,
+        etp_group,
+        num_experts,
+        metadata=False,
+    ):
+        self._params = {}
+        for raw_name, param in named_parameters:
+            name = raw_name
+            for prefix in ("module.module.", "module."):
+                if name.startswith(prefix):
+                    name = name[len(prefix) :]
+                    break
+            self._params[name] = param
+        self._tp_size = int(tp_size)
+        self._tp_group = tp_group
+        self._ep_size = int(ep_size)
+        self._ep_group = ep_group
+        self._etp_size = int(etp_size)
+        self._etp_group = etp_group
+        self._num_experts = int(num_experts)
+        self._num_local_experts = max(1, self._num_experts // max(1, self._ep_size))
+        self._metadata = bool(metadata)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._params)
+
+    def __len__(self) -> int:
+        return len(self._params)
+
+    def _expert_location(self, key):
+        match = self._EXPERT_PATTERN.match(key)
+        if match is None or self._num_experts <= 0:
+            return None
+        global_index = int(match.group("index"))
+        if global_index >= self._num_experts:
+            return None
+        local_index = global_index % self._num_local_experts
+        source_ep_rank = global_index // self._num_local_experts
+        local_key = f"{match.group('prefix')}{local_index}"
+        return local_key, source_ep_rank
+
+    def __contains__(self, key) -> bool:
+        if key in self._params:
+            return True
+        location = self._expert_location(key)
+        return location is not None and location[0] in self._params
+
+    @staticmethod
+    def _partition_dim(param):
+        if hasattr(param, "_lumen_weight_partition_dim"):
+            return param._lumen_weight_partition_dim
+        if getattr(param, "tensor_model_parallel", False):
+            return int(getattr(param, "partition_dim", 0))
+        return None
+
+    @classmethod
+    def _meta_tensor(cls, param, group_size):
+        shape = list(param.shape)
+        partition_dim = cls._partition_dim(param)
+        if partition_dim is not None and group_size > 1:
+            shape[partition_dim] *= int(group_size)
+        return torch.empty(tuple(shape), dtype=param.dtype, device="meta")
+
+    def _materialize_local(self, param, *, expert):
+        group_size = self._etp_size if expert else self._tp_size
+        group = self._etp_group if expert else self._tp_group
+        if self._metadata:
+            return self._meta_tensor(param, group_size)
+        tensor = param.data
+        partition_dim = self._partition_dim(param)
+        if partition_dim is not None and group_size > 1 and group is not None:
+            parts = [torch.empty_like(tensor) for _ in range(group_size)]
+            dist.all_gather(parts, tensor, group=group)
+            tensor = _gather_with_stride(
+                parts,
+                partition_dim,
+                int(getattr(param, "partition_stride", 1)),
+            )
+        return tensor
+
+    def __getitem__(self, key):
+        location = self._expert_location(key)
+        if location is None:
+            try:
+                param = self._params[key]
+            except KeyError:
+                raise KeyError(key) from None
+            return self._materialize_local(param, expert=False)
+
+        local_key, source_ep_rank = location
+        try:
+            param = self._params[local_key]
+        except KeyError:
+            raise KeyError(key) from None
+        tensor = self._materialize_local(param, expert=True)
+        if self._metadata or self._ep_size <= 1 or self._ep_group is None:
+            return tensor
+        tensor = tensor.contiguous()
+        gathered = [
+            torch.empty(
+                tensor.shape,
+                dtype=tensor.dtype,
+                device=tensor.device,
+            )
+            for _ in range(self._ep_size)
+        ]
+        try:
+            dist.all_gather(gathered, tensor, group=self._ep_group)
+        except BaseException as exc:
+            try:
+                group_ranks = dist.get_process_group_ranks(self._ep_group)
+            except BaseException:
+                group_ranks = "<unavailable>"
+            raise RuntimeError(
+                "DSV4 expert export EP gather failed: "
+                f"key={key}, local_key={local_key}, "
+                f"source_ep_rank={source_ep_rank}, "
+                f"device={tensor.device}, shape={tuple(tensor.shape)}, "
+                f"stride={tensor.stride()}, dtype={tensor.dtype}, "
+                f"contiguous={tensor.is_contiguous()}, "
+                f"group_ranks={group_ranks}"
+            ) from exc
+        return gathered[source_ep_rank]
+
+
+def _configure_dsv4_indexer_environment(engine_config: dict[str, Any]) -> None:
+    """Export TileLang launch tuning before the DSV4 modules are imported."""
+    settings = (
+        ("v4_indexer_block_n", "V4_INDEXER_BLOCK_N"),
+        ("v4_indexer_num_stages", "V4_INDEXER_NUM_STAGES"),
+    )
+    for config_key, environment_key in settings:
+        if engine_config.get(config_key) is not None:
+            os.environ[environment_key] = str(engine_config[config_key])
+
+
+def _dsv4_sequence_alignment(
+    tensor_parallel_size: int, compress_ratios: list[int]
+) -> int:
+    """Return an input length accepted by TP and every DSV4 compressor."""
+    divisors = [max(1, int(tensor_parallel_size))]
+    divisors.extend(int(ratio) for ratio in compress_ratios if int(ratio) > 0)
+    return math.lcm(*divisors)
+
+
 class MegatronLumenDSV4Engine(MegatronEngine):
     """Megatron-Core GPTModel engine for DeepSeek-V4-Flash (BF16, TP/PP/EP/DP)."""
 
@@ -60,6 +296,7 @@ class MegatronLumenDSV4Engine(MegatronEngine):
         from megatron.core.transformer.transformer_config import TransformerConfig
 
         ec = self.engine_config
+        _configure_dsv4_indexer_environment(ec)
         tp = int(ec.get("tensor_model_parallel_size", 1))
         pp = int(ec.get("pipeline_model_parallel_size", 1))
         cp = int(ec.get("context_parallel_size", 1))
@@ -137,6 +374,9 @@ class MegatronLumenDSV4Engine(MegatronEngine):
                 compress_ratios = [int(x) for x in compress_ratios_raw]
         else:
             compress_ratios = list(DSV4_FLASH_COMPRESS_RATIOS)
+        self._input_sequence_alignment = _dsv4_sequence_alignment(
+            tp, compress_ratios
+        )
 
         hc_mult = int(ec.get("dsv4_hc_mult") or hf.get("hc_mult") or hf.get("dsv4_hc_mult", 4))
         o_groups = int(ec.get("dsv4_o_groups") or hf.get("o_groups") or hf.get("dsv4_o_groups", 8))
@@ -214,6 +454,7 @@ class MegatronLumenDSV4Engine(MegatronEngine):
                 expert_model_parallel_size=ep,
                 moe_enable_routing_replay=self._r3_enabled,
             )
+            moe_kwargs.update(_dsv4_router_kwargs(hf, ec))
             if shared_ffn > 0:
                 moe_kwargs["moe_shared_expert_intermediate_size"] = shared_ffn
 
@@ -317,6 +558,10 @@ class MegatronLumenDSV4Engine(MegatronEngine):
                 per_stage = total // pp_size
                 self._layers_per_pp_rank = [per_stage] * pp_size
 
+        _clear_stale_router_replay_instances(
+            self._r3_enabled,
+            dsv4_enabled=True,
+        )
         model = GPTModel(
             config=tfcfg,
             transformer_layer_spec=spec,
@@ -367,6 +612,7 @@ class MegatronLumenDSV4Engine(MegatronEngine):
                     continue
                 full = meg_state[name]
                 if full.shape == param.shape:
+                    param._lumen_weight_partition_dim = None
                     continue  # same shape → no sharding needed (duplicated)
                 is_expert = (".experts." in name
                              and ".shared_experts." not in name)
@@ -380,11 +626,13 @@ class MegatronLumenDSV4Engine(MegatronEngine):
                     if full.shape[d] != param.shape[d]:
                         pdim = d
                         break
+                param._lumen_weight_partition_dim = pdim
                 pstride = getattr(param, "partition_stride", 1)
                 meg_state[name] = _shard_with_stride(
                     meg_state[name], pdim, pstride, shard_rank, shard_size,
                 )
 
+        _register_checkpoint_static_buffers(model, meg_state)
         incompat = model.load_state_dict(meg_state, strict=False)
         real_missing = [k for k in incompat.missing_keys if "_extra_state" not in k]
         if real_missing:
@@ -461,12 +709,16 @@ class MegatronLumenDSV4Engine(MegatronEngine):
 
         cpu_offload = bool(ec.get("optimizer_cpu_offload", False))
         offload_frac = float(ec.get("optimizer_offload_fraction", 1.0))
+        optimizer_name = str(oc.get("optimizer", "adam")).lower()
+        if optimizer_name == "adamw":
+            optimizer_name = "adam"
         opt_cfg = OptimizerConfig(
-            optimizer="adam", lr=float(oc.get("lr", 1e-6)),
+            optimizer=optimizer_name, lr=float(oc.get("lr", 1e-6)),
             weight_decay=float(oc.get("weight_decay", 0.1)),
             adam_beta1=float(oc.get("adam_beta1", 0.9)),
             adam_beta2=float(oc.get("adam_beta2", 0.95)),
             adam_eps=float(oc.get("adam_eps", 1e-8)),
+            sgd_momentum=float(oc.get("sgd_momentum", 0.0)),
             clip_grad=self._clip, bf16=True, fp16=False,
             params_dtype=torch.bfloat16,
             use_distributed_optimizer=bool(ec.get("use_distributed_optimizer", True)),
@@ -474,6 +726,7 @@ class MegatronLumenDSV4Engine(MegatronEngine):
             optimizer_offload_fraction=offload_frac,
             pin_cpu_grads=False,
             pin_cpu_params=False,
+            **_optimizer_precision_kwargs(ec),
         )
         _gpu_diag("BEFORE optimizer init")
         self.optimizer = get_megatron_optimizer(opt_cfg, model_chunks=[self._ddp])
@@ -497,11 +750,7 @@ class MegatronLumenDSV4Engine(MegatronEngine):
 
     # ---- weight sync: Megatron -> HF named tensors ----
     def get_per_tensor_param(self, **kwargs):
-        """Yield ``(hf_name, full_tensor)`` with PP/TP/EP all-gather.
-
-        Same architecture-agnostic gather logic as the parent (phases 1-2),
-        but uses ``dsv4_megatron_to_hf`` for name conversion (phase 3 + PP=1).
-        """
+        """Yield HF tensors while bounding TP/EP/PP gather memory to one parameter."""
         assert self.module is not None
         from megatron.core import parallel_state as mpu
 
@@ -515,112 +764,89 @@ class MegatronLumenDSV4Engine(MegatronEngine):
                      if etp_size > 1 else None)
         pp_size = getattr(self, "_pp_size", 1)
         pp_rank = getattr(self, "_pp_rank", 0)
+        named_parameters = _named_export_tensors(self.module)
 
-        # --- Phase 1: TP all-gather local params ---
-        local_full: dict[str, torch.Tensor] = {}
-        for raw_name, param in self.module.named_parameters():
-            name = raw_name
-            for pre in ("module.module.", "module."):
-                if name.startswith(pre):
-                    name = name[len(pre):]
-                    break
-            p = param.data
+        def make_mapping(metadata):
+            return _StreamingGatheredParamMapping(
+                named_parameters,
+                tp_size=tp_size,
+                tp_group=tp_group,
+                ep_size=ep_size,
+                ep_group=ep_group,
+                etp_size=etp_size,
+                etp_group=etp_group,
+                num_experts=self._dims.num_experts,
+                metadata=metadata,
+            )
 
-            is_tp = getattr(param, "tensor_model_parallel", False)
-            if is_tp:
-                is_expert = ".experts." in name and ".shared_experts." not in name
-                g_size = etp_size if is_expert else tp_size
-                g_group = etp_group if is_expert else tp_group
-                if g_size > 1 and g_group is not None:
-                    parts = [torch.empty_like(p) for _ in range(g_size)]
-                    dist.all_gather(parts, p, group=g_group)
-                    p = _gather_with_stride(
-                        parts,
-                        getattr(param, "partition_dim", 0),
-                        getattr(param, "partition_stride", 1),
-                    )
-            local_full[name] = p
+        actual_mapping = make_mapping(metadata=False)
+        convert_kwargs = {
+            "pp_rank": pp_rank,
+            "pp_size": pp_size,
+            "layers_per_pp_rank": getattr(self, "_layers_per_pp_rank", None),
+            "use_grouped_mlp": True,
+        }
 
-        # --- Phase 2: EP all-gather expert tensors ---
-        if ep_size > 1 and ep_group is not None:
-            expert_keys = [
-                k for k in local_full
-                if ".experts." in k and ".shared_experts." not in k
-            ]
-            num_local_experts = max(1, self._dims.num_experts // ep_size)
-            for key in expert_keys:
-                local_t = local_full[key].contiguous()
-                if not local_t.is_cuda:
-                    local_t = local_t.cuda()
-                gathered = [torch.empty_like(local_t) for _ in range(ep_size)]
-                dist.all_gather(gathered, local_t, group=ep_group)
-                if "weight1" in key:
-                    local_full[key] = torch.cat(gathered, dim=1).contiguous()
-                elif "weight2" in key:
-                    local_full[key] = torch.cat(gathered, dim=0).contiguous()
-                elif ".local_experts." in key:
-                    head, rest = key.split("local_experts.", 1)
-                    local_idx_s, tail = rest.split(".", 1)
-                    local_idx = int(local_idx_s)
-                    del local_full[key]
-                    for src_ep_rank, part in enumerate(gathered):
-                        global_idx = src_ep_rank * num_local_experts + local_idx
-                        gkey = f"{head}local_experts.{global_idx}.{tail}"
-                        local_full[gkey] = part.contiguous()
-                else:
-                    local_full[key] = gathered[0]
+        def convert_for_rollout(mapping):
+            for key, tensor in dsv4_megatron_to_hf(
+                mapping,
+                self._dims,
+                **convert_kwargs,
+            ):
+                yield _denormalize_redhat_key(key), tensor
 
-        # --- Phase 3: PP streaming broadcast ---
-        # DSV4-Flash is ~568GB BF16 — accumulating all PP stages on one GPU
-        # would OOM (192GB per GPU). Instead, broadcast each stage's params
-        # and yield them immediately so the caller (send_weight_stream) can
-        # consume and release each tensor before the next stage arrives.
-        # Peak GPU memory = model shard + one stage's gathered params + bucket.
-        if pp_size > 1:
-            pp_group = mpu.get_pipeline_model_parallel_group()
-            pp_global_ranks = dist.get_process_group_ranks(pp_group)
+        # PP=1 still returns a lazy bridge generator: TP/EP collectives occur
+        # only when the caller requests the next HF tensor.
+        if pp_size <= 1:
+            return convert_for_rollout(actual_mapping), None
 
-            local_hf = dict(dsv4_megatron_to_hf(
-                list(local_full.items()), self._dims,
-                pp_rank=pp_rank, pp_size=pp_size,
-                layers_per_pp_rank=self._layers_per_pp_rank,
-                use_grouped_mlp=True,
-            ))
-            del local_full  # free TP+EP gathered params
+        # Build only shape/dtype metadata on the meta device. This establishes
+        # a common deterministic PP order without materializing gathered data.
+        metadata_mapping = make_mapping(metadata=True)
+        local_meta_tensors = convert_for_rollout(metadata_mapping)
+        my_meta = {
+            key: (tensor.shape, tensor.dtype)
+            for key, tensor in local_meta_tensors
+        }
 
-            all_meta: list = [None] * pp_size
-            my_meta = {k: (v.shape, v.dtype) for k, v in local_hf.items()}
-            dist.all_gather_object(all_meta, (pp_rank, my_meta), group=pp_group)
+        # Each PP group connects ranks with matching TP/EP coordinates.
+        # Share stage metadata once, then broadcast one real tensor at a time.
+        pp_group = mpu.get_pipeline_model_parallel_group()
+        pp_global_ranks = dist.get_process_group_ranks(pp_group)
+        all_meta: list = [None] * pp_size
+        dist.all_gather_object(all_meta, (pp_rank, my_meta), group=pp_group)
+        all_meta.sort(key=lambda item: item[0])
 
-            def _streaming_pp_gen():
-                nonlocal local_hf
-                for src_pp, meta in all_meta:
-                    src_global = pp_global_ranks[src_pp]
-                    for key, (shape, dtype) in meta.items():
-                        if src_pp == pp_rank:
-                            t = local_hf[key]
-                            if not t.is_cuda:
-                                t = t.cuda()
-                        else:
-                            t = torch.empty(shape, dtype=dtype, device="cuda")
-                        dist.broadcast(t, src=src_global, group=pp_group)
-                        yield key, t
-                        del t  # hint to release after caller consumes
-                    # After yielding all params from this stage, the caller's
-                    # bucket flush + GC reclaims this stage's memory before
-                    # the next stage's tensors are allocated.
-                    if src_pp == pp_rank:
-                        local_hf = {}  # release local stage after yielding
+        def _streaming_pp_gen():
+            for src_pp, meta in all_meta:
+                src_global = pp_global_ranks[src_pp]
+                source_iter = None
+                if src_pp == pp_rank:
+                    source_iter = iter(convert_for_rollout(actual_mapping))
+                for expected_key, (shape, dtype) in meta.items():
+                    if source_iter is not None:
+                        actual_key, tensor = next(source_iter)
+                        if actual_key != expected_key:
+                            raise RuntimeError(
+                                "DSV4 streaming metadata order mismatch: "
+                                f"expected {expected_key}, got {actual_key}"
+                            )
+                    else:
+                        tensor = torch.empty(shape, dtype=dtype, device="cuda")
+                    dist.broadcast(tensor, src=src_global, group=pp_group)
+                    yield expected_key, tensor
+                    del tensor
+                if source_iter is not None:
+                    try:
+                        extra_key, _ = next(source_iter)
+                    except StopIteration:
+                        pass
+                    else:
+                        raise RuntimeError(
+                            f"DSV4 streaming metadata omitted tensor {extra_key}"
+                        )
 
-            return _streaming_pp_gen(), None
-
-        # PP=1 path: convert directly
-        gen = dsv4_megatron_to_hf(
-            list(local_full.items()), self._dims,
-            pp_rank=0, pp_size=1,
-            use_grouped_mlp=True,
-        )
-        return gen, None
+        return _streaming_pp_gen(), None
 
 
 @EngineRegistry.register(model_type="language_model", backend="megatron_lumen_dsv4")

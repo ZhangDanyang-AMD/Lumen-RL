@@ -25,16 +25,18 @@ cluster:
   ray_address: "auto"
 
 weight_sync:
+  enabled: true
   backend: rdma
   shared_folder: /volumes/oss1/lumenrl_weight_sync/dsv4-flash
   bucket_size_mb: 2048
   timeout_s: 1200
   verify_full_load: true
+  fp8_quantization_location: trainer
   rdma:
     backend: rccl
     require_rdma: true
     hca: mlx5_0
-    interface: ens11np0
+    interface: ens14np0
     gid_index: 3
     gdr_mode: auto
 
@@ -50,7 +52,7 @@ controller:
       num_workers: 8
       process_on_nodes: [8]
       topology_tags:
-        node_ip: REPLACE_ME
+        node_ip: "10.194.132.76"
 
 policy:
   model_name: /root/models/DeepSeek-V4-Flash-BF16
@@ -63,8 +65,9 @@ policy:
   train_micro_batch_size: 1
   max_token_len_per_gpu: 16384
   balance_batch: true
+  optimizer_type: adam
   learning_rate: 1.0e-6
-  lr_warmup_steps: 10
+  lr_warmup_steps: 0
   weight_decay: 0.1
   max_grad_norm: 1.0
   lr_decay_style: constant
@@ -83,15 +86,18 @@ policy:
       moe_grouped_gemm: true
       moe_token_dispatcher_type: alltoall
       use_distributed_optimizer: true
-      grad_reduce_in_fp32: true
+      grad_reduce_in_fp32: false
       attention_softmax_in_fp32: true
       sequence_parallel: true
+      v4_indexer_block_n: 64
+      v4_indexer_num_stages: 1
       recompute_granularity: full
       recompute_method: uniform
       recompute_num_layers: 1
       attention_backend: flash
       use_packed_sequences: true
       log_probs_chunk_size: 1024
+      numa_affinity: true
       optimizer_cpu_offload: true
       optimizer_offload_fraction: 0.75
     fsdp_cfg:
@@ -101,10 +107,11 @@ policy:
   generation:
     vllm_cfg:
       transport: ray_http
-      ray_http_start_server: false
+      ray_http_start_server: true
       tensor_parallel_size: 8
       quantization: fp8_per_block
       enforce_eager: true
+      disable_custom_all_reduce: true
       kv_cache_dtype: fp8_e4m3
       gpu_memory_utilization: 0.92
       max_model_len: 16384
@@ -124,7 +131,7 @@ algorithm:
   name: grpo
   adv_estimator: grpo
   use_kl_in_reward: false
-  loss_agg_mode: token-mean
+  loss_agg_mode: seq-mean-token-mean
   clip_ratio_high: 0.28
   grpo:
     num_generations: 8
@@ -137,7 +144,7 @@ quantization:
   training:
     fp8: null
   rollout_correction:
-    rollout_is: token
+    rollout_is: null
     rollout_is_threshold: 2.0
     rollout_is_batch_normalize: true
 

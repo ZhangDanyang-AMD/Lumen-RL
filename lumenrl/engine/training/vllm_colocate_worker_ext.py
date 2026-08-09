@@ -62,20 +62,6 @@ def set_death_signal() -> None:
 class vLLMColocateWorkerExtension:
     """Mixed into the vLLM worker; receives IPC weight buckets and loads them."""
 
-    def get_rdma_capabilities(self) -> dict[str, object]:
-        """Return this worker's versioned RDMA reload capabilities."""
-        from lumenrl.engine.inference.rdma_protocol import (
-            RDMA_PROTOCOL_VERSION,
-            RDMACapability,
-        )
-
-        return RDMACapability(
-            protocol_version=RDMA_PROTOCOL_VERSION,
-            module_path=vLLMColocateWorkerExtension.__module__,
-            online_quant_reload=True,
-            prequantized_stream=True,
-        ).to_dict()
-
     def __new__(cls, **kwargs):
         set_death_signal()
         # Online per-block FP8 (verl-aligned `fp8_per_block`): the BF16 actor
@@ -158,7 +144,7 @@ class vLLMColocateWorkerExtension:
         version: int,
         verify_full_load: bool = True,
         prequantized_fp8: bool = False,
-    ) -> dict[str, object]:
+    ) -> dict[str, float]:
         """Receive HF-named GPU buckets over RCCL and load them in place.
 
         For online FP8 quantized models (``fp8_per_block``), wraps the reload
@@ -195,96 +181,12 @@ class vLLMColocateWorkerExtension:
         except Exception:
             pass
 
-        logger.warning(
-            "RDMA receiver mode on local_rank=%d: "
-            "online_quant=%s prequantized_fp8=%s",
-            self.local_rank,
-            is_online_quant,
-            prequantized_fp8,
-        )
         if prequantized_fp8 and not is_online_quant:
             raise RuntimeError(
                 "prequantized FP8 RDMA stream requires a vLLM "
                 "fp8_per_block online-quantized model"
             )
-        if is_online_quant and not prequantized_fp8:
-            from lumenrl.engine.inference.vllm_fp8_utils import (
-                ReloadFingerprintTracker,
-                finalize_online_quantized_weights_loading,
-                prepare_online_quantized_weights_for_loading,
-            )
-
-            # Snapshot resident BF16/FP8 state before prepare mutates reload state.
-            fingerprints = ReloadFingerprintTracker(model)
-            model_config = self.model_runner.vllm_config.model_config
-
-            def log_static_changes(phase: str) -> None:
-                try:
-                    changed = fingerprints.checkpoint_static_changed_names()
-                except Exception as exc:
-                    logger.error(
-                        "RDMA checkpoint-static diagnostic failed on "
-                        "local_rank=%d phase=%s: %s",
-                        self.local_rank,
-                        phase,
-                        exc,
-                    )
-                    return
-                if changed:
-                    logger.error(
-                        "RDMA checkpoint-static tensors changed on local_rank=%d "
-                        "phase=%s: %s",
-                        self.local_rank,
-                        phase,
-                        changed,
-                    )
-
-            reload_error: BaseException | None = None
-            try:
-                prepare_online_quantized_weights_for_loading(model)
-                log_static_changes("after_prepare")
-                stats = receive_weight_stream(
-                    groups[group_name],
-                    model,
-                    device=self.device,
-                    expected_version=int(version),
-                    verify_full_load=bool(verify_full_load),
-                    streamed_scales=False,
-                    fingerprint_tracker=fingerprints,
-                    finalize_fingerprints=False,
-                )
-                log_static_changes("after_load")
-            except BaseException as exc:
-                reload_error = exc
-                raise
-            finally:
-                finalize_error: BaseException | None = None
-                try:
-                    finalize_online_quantized_weights_loading(model, model_config)
-                    log_static_changes("after_finalize")
-                except BaseException as exc:
-                    finalize_error = exc
-                try:
-                    fingerprints.restore_checkpoint_static_tensors()
-                    log_static_changes("after_static_restore")
-                except BaseException as exc:
-                    if reload_error is None and finalize_error is None:
-                        raise
-                    logger.warning(
-                        "secondary RDMA checkpoint-static restore failure "
-                        "after reload/finalize error: %s",
-                        exc,
-                    )
-                if finalize_error is not None:
-                    if reload_error is None:
-                        raise finalize_error
-                    logger.warning(
-                        "secondary RDMA online FP8 finalize failure after "
-                        "reload error: %s",
-                        finalize_error,
-                    )
-            stats["verification"] = fingerprints.finalize()
-        elif prequantized_fp8:
+        if prequantized_fp8:
             from lumenrl.engine.inference.vllm_fp8_utils import (
                 prepare_prequantized_fp8_weights_for_loading,
             )
@@ -295,39 +197,32 @@ class vLLMColocateWorkerExtension:
                 self.local_rank,
                 metadata,
             )
-            stats = receive_weight_stream(
-                groups[group_name],
-                model,
-                device=self.device,
-                expected_version=int(version),
-                verify_full_load=bool(verify_full_load),
-                streamed_scales=True,
+        if is_online_quant and not prequantized_fp8:
+            # Assume BF16 (fallback path) — prepare for online requant.
+            # If the received weights turn out to be FP8, load_weights will
+            # write them directly and finalize becomes a no-op for those layers.
+            from lumenrl.engine.inference.vllm_fp8_utils import (
+                finalize_online_quantized_weights_loading,
+                prepare_online_quantized_weights_for_loading,
             )
-        else:
-            stats = receive_weight_stream(
-                groups[group_name],
-                model,
-                device=self.device,
-                expected_version=int(version),
-                verify_full_load=bool(verify_full_load),
-                streamed_scales=False,
-            )
+            prepare_online_quantized_weights_for_loading(model)
 
-        verification = stats.get("verification", {})
+        stats = receive_weight_stream(
+            groups[group_name],
+            model,
+            device=self.device,
+            expected_version=int(version),
+            verify_full_load=bool(verify_full_load),
+            streamed_scales=bool(prequantized_fp8),
+        )
+
+        if is_online_quant and not prequantized_fp8:
+            model_config = self.model_runner.vllm_config.model_config
+            finalize_online_quantized_weights_loading(model, model_config)
+
         logger.warning(
-            "RDMA reload checks complete on local_rank=%d "
-            "(online_quant=%s, prequantized_fp8=%s): "
-            "manifest=%s, static=checked, representatives=sampled, "
-            "first_source_snapshot=%s, exact_name_mappings=%s, "
-            "exact_name_change_checks=%s; summary=%s",
-            self.local_rank,
-            is_online_quant,
-            prequantized_fp8,
-            "checked" if verify_full_load else "disabled",
-            verification.get("first_source_snapshot", "unknown"),
-            verification.get("exact_name_mappings", 0),
-            verification.get("exact_name_change_checks", 0),
-            stats,
+            "RDMA weight reload verified on local_rank=%d (online_quant=%s): %s",
+            self.local_rank, is_online_quant, stats,
         )
         return stats
 
@@ -340,10 +235,7 @@ class vLLMColocateWorkerExtension:
             dist.destroy_process_group(group)
         return True
 
-    def update_weights_from_ipc(
-        self,
-        use_shm: bool = False,
-    ) -> dict[str, object] | None:
+    def update_weights_from_ipc(self, use_shm: bool = False) -> None:
         """Receive bucketed weights over ZMQ IPC and load them into the model."""
         from vllm.platforms import current_platform
 
@@ -377,19 +269,17 @@ class vLLMColocateWorkerExtension:
             # the first bucket, load each bucket as it arrives (the wrapped loaders
             # track per-layer completion across buckets), finalize AFTER the last.
             from lumenrl.engine.inference.vllm_fp8_utils import (
-                ReloadFingerprintTracker,
                 finalize_online_quantized_weights_loading,
                 prepare_online_quantized_weights_for_loading,
             )
 
+            prepare_online_quantized_weights_for_loading(model)
             receiver = BucketedWeightReceiver(
                 zmq_handle=self._get_zmq_handle(),
                 device=self.device,
                 use_shm=use_shm,
             )
             _stats = {"buckets": 0, "weights": 0}
-            fingerprints = ReloadFingerprintTracker(model)
-            prepare_online_quantized_weights_for_loading(model)
 
             def _load_online(weights):
                 # CRITICAL: the receiver hands out tensors that are VIEWS into the
@@ -402,45 +292,17 @@ class vLLMColocateWorkerExtension:
                 # deferred reload owns valid storage. (The standard BF16 path copies
                 # into params during the call, so it does not need this.)
                 cloned = [(n, t.clone()) for (n, t) in weights]
-                fingerprints.observe_source(cloned)
                 _stats["buckets"] += 1
                 _stats["weights"] += len(cloned)
                 model.load_weights(cloned)
 
-            load_error: BaseException | None = None
-            try:
-                receiver.receive_weights(on_bucket_received=_load_online)
-            except BaseException as exc:
-                load_error = exc
-                raise
-            finally:
-                try:
-                    finalize_online_quantized_weights_loading(model, model_config)
-                except BaseException as exc:
-                    if load_error is None:
-                        raise
-                    logger.warning(
-                        "secondary online FP8 finalize failure after reload "
-                        "error: %s",
-                        exc,
-                    )
-            fingerprint_summary = fingerprints.finalize()
-            summary = {
-                "online_quant": True,
-                **_stats,
-                "fingerprints": fingerprint_summary,
-            }
-            logger.warning(
-                "IPC online reload checks complete: manifest=not aggregated, "
-                "static=checked, representatives=sampled, "
-                "first_source_snapshot=%s, exact_name_mappings=%s, "
-                "exact_name_change_checks=%s; summary=%s",
-                fingerprint_summary.get("first_source_snapshot", "unknown"),
-                fingerprint_summary.get("exact_name_mappings", 0),
-                fingerprint_summary.get("exact_name_change_checks", 0),
-                summary,
+            receiver.receive_weights(on_bucket_received=_load_online)
+            finalize_online_quantized_weights_loading(model, model_config)
+            logger.info(
+                "online fp8 reload: buckets=%d weights=%d",
+                _stats["buckets"], _stats["weights"],
             )
-            return summary
+            return
 
         receiver = BucketedWeightReceiver(
             zmq_handle=self._get_zmq_handle(),

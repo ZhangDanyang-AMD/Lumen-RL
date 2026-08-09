@@ -246,6 +246,9 @@ class LumenActorWorker(BaseWorker):
                 "param_offload": meg_cfg.get("param_offload", False),
                 "optimizer_cpu_offload": meg_cfg.get("optimizer_cpu_offload", meg_cfg.get("optimizer_offload", False)),
                 "optimizer_offload_fraction": meg_cfg.get("optimizer_offload_fraction", 1.0),
+                "use_precision_aware_optimizer": meg_cfg.get(
+                    "use_precision_aware_optimizer", False
+                ),
                 "grad_offload": meg_cfg.get("grad_offload", False),
                 "seed": int(policy.get("seed", 42)),
                 "dtype": meg_cfg.get("dtype", "bf16"),
@@ -260,6 +263,8 @@ class LumenActorWorker(BaseWorker):
                 "log_probs_chunk_size": meg_cfg.get("log_probs_chunk_size", 0),
                 "enable_dynamic_batch": meg_cfg.get("enable_dynamic_batch", False),
                 "max_tokens_per_gpu": meg_cfg.get("max_tokens_per_gpu", 0),
+                "v4_indexer_block_n": meg_cfg.get("v4_indexer_block_n"),
+                "v4_indexer_num_stages": meg_cfg.get("v4_indexer_num_stages"),
                 "num_layers_in_first_pipeline_stage": meg_cfg.get("num_layers_in_first_pipeline_stage"),
                 "num_layers_in_last_pipeline_stage": meg_cfg.get("num_layers_in_last_pipeline_stage"),
             }
@@ -268,6 +273,7 @@ class LumenActorWorker(BaseWorker):
     def _build_optimizer_config(self, policy: dict) -> dict[str, Any]:
         lr = float(policy.get("learning_rate", policy.get("lr", 1e-6)))
         cfg = {
+            "optimizer": str(policy.get("optimizer_type", "adamw")).lower(),
             "lr": lr,
             "weight_decay": float(policy.get("weight_decay", 0.01)),
             "clip_grad": float(policy.get("max_grad_norm", 1.0)),
@@ -277,6 +283,8 @@ class LumenActorWorker(BaseWorker):
         for key in ("adam_beta1", "adam_beta2", "adam_eps"):
             if key in policy:
                 cfg[key] = float(policy[key])
+        if "sgd_momentum" in policy:
+            cfg["sgd_momentum"] = float(policy["sgd_momentum"])
         return cfg
 
     def _build_model_config(self, policy: dict) -> dict[str, Any]:
@@ -503,10 +511,34 @@ class LumenActorWorker(BaseWorker):
                     loss = asymmetric_clip_loss(
                         token_log_probs, old_logp, adv, clip_low, clip_high, mask=mask,
                     )
+                elif algo_name == AlgorithmName.GRPO.value:
+                    dp = int(batch.meta.get("dp_size", 1) or 1)
+                    loss_agg_mode = str(
+                        _cfg("loss_agg_mode", "token-mean")
+                    )
+                    global_batch_size = int(
+                        batch.meta.get("global_batch_size")
+                        or batch.batch_size * dp
+                    )
+                    loss = asymmetric_clip_loss(
+                        token_log_probs,
+                        old_logp,
+                        adv,
+                        float(_cfg("clip_ratio", 0.2)),
+                        float(_cfg("clip_ratio_high", 0.28)),
+                        mask=mask,
+                        batch_num_tokens=batch.meta.get("batch_num_tokens"),
+                        dp_size=dp,
+                        loss_agg_mode=loss_agg_mode,
+                        global_batch_size=global_batch_size,
+                    )
                 else:
-                    clip = float(_cfg("clip_ratio", 0.2))
                     loss = policy_gradient_loss(
-                        token_log_probs, old_logp, adv, clip, mask=mask,
+                        token_log_probs,
+                        old_logp,
+                        adv,
+                        float(_cfg("clip_ratio", 0.2)),
+                        mask=mask,
                     )
 
                 kl_c = float(_cfg("kl_coeff", 0.0))
@@ -620,7 +652,13 @@ class LumenActorWorker(BaseWorker):
             metrics[k] = (sum(v) / len(v)) if isinstance(v, list) and v else float(v)
         if "loss" in output:
             lv = output["loss"]
-            metrics["loss"] = (sum(lv) / len(lv)) if isinstance(lv, list) and lv else float(lv)
+            if isinstance(lv, list) and lv:
+                if str(batch.meta.get("algorithm", "")).lower() == AlgorithmName.GRPO.value:
+                    metrics["loss"] = float(sum(lv))
+                else:
+                    metrics["loss"] = sum(lv) / len(lv)
+            else:
+                metrics["loss"] = float(lv)
         metrics["lr"] = self._engine.lr_scheduler_step()
         return metrics
 
@@ -721,6 +759,11 @@ class LumenActorWorker(BaseWorker):
 
         bnt = meta.get("batch_num_tokens")
         dp = int(meta.get("dp_size", 1) or 1)
+        loss_agg_mode = str(_cfg("loss_agg_mode", "token-mean"))
+        global_batch_size = int(
+            meta.get("global_batch_size")
+            or token_log_probs.shape[0] * dp
+        )
         ris = data.get("rollout_is_weights")
         if ris is not None:
             ris = ris.to(dev)
@@ -734,9 +777,26 @@ class LumenActorWorker(BaseWorker):
                 mask=mask, clip_ratio_c=float(_cfg("clip_ratio_c", 0.0)),
                 batch_num_tokens=bnt, dp_size=dp, rollout_is_weights=ris,
             )
+        elif algo_name == AlgorithmName.GRPO.value:
+            loss = asymmetric_clip_loss(
+                token_log_probs,
+                old_logp,
+                adv,
+                float(_cfg("clip_ratio", 0.2)),
+                float(_cfg("clip_ratio_high", 0.28)),
+                mask=mask,
+                batch_num_tokens=bnt,
+                dp_size=dp,
+                loss_agg_mode=loss_agg_mode,
+                global_batch_size=global_batch_size,
+            )
         else:
             loss = policy_gradient_loss(
-                token_log_probs, old_logp, adv, float(_cfg("clip_ratio", 0.2)), mask=mask,
+                token_log_probs,
+                old_logp,
+                adv,
+                float(_cfg("clip_ratio", 0.2)),
+                mask=mask,
             )
 
         kl_c = float(_cfg("kl_coeff", 0.0))
@@ -913,6 +973,8 @@ class LumenActorWorker(BaseWorker):
         """
         if self._engine is None:
             raise RuntimeError("init_model() must be called before RDMA weight sync")
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
         params, _ = self._engine.get_per_tensor_param()
         if self.rank != 0:
             # Consume the conversion iterator on every rank. Megatron TP/EP

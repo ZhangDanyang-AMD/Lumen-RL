@@ -19,6 +19,30 @@ def _tensor_nbytes(tensor: torch.Tensor) -> int:
     return tensor.numel() * tensor.element_size()
 
 
+def _missing_reloadable_names(
+    expected_names: set[str],
+    loaded_names: set[str],
+    *,
+    streamed_scales: bool = False,
+) -> list[str]:
+    """Return missing checkpoint weights, excluding generated/static parameters."""
+    from lumenrl.engine.inference.vllm_fp8_utils import (
+        TensorNameClass,
+        classify_tensor_name,
+    )
+
+    missing = expected_names - loaded_names
+    return sorted(
+        name
+        for name in missing
+        if classify_tensor_name(
+            name,
+            streamed_scales=streamed_scales,
+        )
+        is TensorNameClass.RELOADABLE
+    )
+
+
 def _encode_bucket(
     weights: list[tuple[str, torch.Tensor]],
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -145,63 +169,122 @@ def receive_weight_stream(
     device: torch.device,
     expected_version: int,
     verify_full_load: bool = True,
-) -> dict[str, float]:
+    streamed_scales: bool = False,
+    fingerprint_tracker=None,
+    finalize_fingerprints: bool = True,
+) -> dict[str, Any]:
     """Receive RCCL buckets and load them directly into a resident vLLM model."""
+    from lumenrl.engine.inference.vllm_fp8_utils import ReloadFingerprintTracker
+
+    if not finalize_fingerprints and fingerprint_tracker is None:
+        raise ValueError(
+            "finalize_fingerprints=False requires an external fingerprint_tracker"
+        )
+    fingerprints = fingerprint_tracker
+    if fingerprints is None:
+        fingerprints = ReloadFingerprintTracker(
+            model,
+            streamed_scales=streamed_scales,
+        )
+    elif fingerprints.streamed_scales != bool(streamed_scales):
+        raise ValueError(
+            "fingerprint_tracker streamed_scales does not match RDMA stream mode"
+        )
     loaded_names: set[str] = set()
     total_bytes = 0
     total_weights = 0
     total_buckets = 0
     started = time.perf_counter()
+    last_source: dict[str, Any] | None = None
 
-    while True:
-        header = _broadcast_header(group, device=device)
-        command, metadata_bytes, payload_bytes, version = [
-            int(x) for x in header.cpu().tolist()
-        ]
-        if version != expected_version:
-            raise RuntimeError(
-                f"RDMA weight version mismatch: expected {expected_version}, got {version}"
+    def received_weights():
+        nonlocal total_bytes, total_weights, total_buckets, last_source
+        while True:
+            header = _broadcast_header(group, device=device)
+            command, metadata_bytes, payload_bytes, version = [
+                int(x) for x in header.cpu().tolist()
+            ]
+            if version != expected_version:
+                raise RuntimeError(
+                    f"RDMA weight version mismatch: expected {expected_version}, got {version}"
+                )
+            if command == _CMD_END:
+                return
+            if command != _CMD_BUCKET or metadata_bytes <= 0 or payload_bytes <= 0:
+                raise RuntimeError(f"invalid RDMA weight header: {header.tolist()}")
+
+            metadata_tensor = torch.empty(
+                metadata_bytes,
+                dtype=torch.uint8,
+                device=device,
             )
-        if command == _CMD_END:
-            break
-        if command != _CMD_BUCKET or metadata_bytes <= 0 or payload_bytes <= 0:
-            raise RuntimeError(f"invalid RDMA weight header: {header.tolist()}")
-
-        metadata_tensor = torch.empty(metadata_bytes, dtype=torch.uint8, device=device)
-        payload = torch.empty(payload_bytes, dtype=torch.uint8, device=device)
-        dist.broadcast(metadata_tensor, src=0, group=group)
-        dist.broadcast(payload, src=0, group=group)
-        metadata = json.loads(bytes(metadata_tensor.cpu().tolist()).decode("utf-8"))
-        weights: list[tuple[str, torch.Tensor]] = []
-        for entry in metadata:
-            dtype = getattr(torch, entry["dtype"])
-            start = int(entry["offset"])
-            end = start + int(entry["nbytes"])
-            value = payload[start:end].view(dtype).view(entry["shape"])
-            weights.append((entry["name"], value))
-
-        loaded = model.load_weights(weights)
-        if loaded is None:
-            raise RuntimeError(
-                "vLLM model.load_weights returned no manifest during RDMA reload"
+            payload = torch.empty(payload_bytes, dtype=torch.uint8, device=device)
+            dist.broadcast(metadata_tensor, src=0, group=group)
+            dist.broadcast(payload, src=0, group=group)
+            metadata = json.loads(
+                bytes(metadata_tensor.cpu().tolist()).decode("utf-8")
             )
-        loaded_names.update(loaded)
-        total_bytes += payload_bytes
-        total_weights += len(weights)
-        total_buckets += 1
+            total_bytes += payload_bytes
+            total_weights += len(metadata)
+            total_buckets += 1
+            for entry in metadata:
+                last_source = entry
+                dtype = getattr(torch, entry["dtype"])
+                start = int(entry["offset"])
+                end = start + int(entry["nbytes"])
+                value = (
+                    payload[start:end]
+                    .view(dtype)
+                    .view(entry["shape"])
+                    .cpu()
+                )
+                fingerprints.observe_source([(entry["name"], value)])
+                yield entry["name"], value
 
+    try:
+        loaded = model.load_weights(received_weights())
+    except Exception as exc:
+        if last_source is None:
+            raise
+        raise RuntimeError(
+            "vLLM model.load_weights failed while loading RDMA tensor: "
+            f"source={last_source['name']}; "
+            f"shape={tuple(last_source['shape'])}; "
+            f"dtype=torch.{last_source['dtype']}"
+        ) from exc
+    if loaded is None:
+        raise RuntimeError(
+            "vLLM model.load_weights returned no manifest during RDMA reload"
+        )
+    loaded_names.update(loaded)
+
+    # The transfer protocol mode is authoritative. Source observation may
+    # classify individual FP8 tensors, but it must not change whether scale
+    # tensors are required for the stream as a whole.
+    fingerprints.streamed_scales = bool(streamed_scales)
     if verify_full_load:
         expected_names = {name for name, _ in model.named_parameters()}
-        missing = sorted(expected_names - loaded_names)
+        if streamed_scales:
+            expected_names.update(
+                name
+                for name, _ in model.named_buffers()
+                if name.endswith("weight_scale_inv")
+            )
+        missing = _missing_reloadable_names(
+            expected_names,
+            loaded_names,
+            streamed_scales=streamed_scales,
+        )
         if missing:
             raise RuntimeError(
                 "Incomplete vLLM RDMA weight reload: "
+                f"streamed_scales={bool(streamed_scales)}; "
                 f"loaded {len(loaded_names)}/{len(expected_names)} internal "
                 f"parameters from {total_weights} HF tensors; missing={missing[:20]}"
             )
     torch.cuda.synchronize(device)
     elapsed = time.perf_counter() - started
-    return {
+    stats = {
         "version": float(expected_version),
         "buckets": float(total_buckets),
         "weights": float(total_weights),
@@ -210,3 +293,6 @@ def receive_weight_stream(
         "gbps": (total_bytes * 8 / 1e9 / elapsed) if elapsed > 0 else 0.0,
         "loaded_internal": float(len(loaded_names)),
     }
+    if finalize_fingerprints:
+        stats["verification"] = fingerprints.finalize()
+    return stats

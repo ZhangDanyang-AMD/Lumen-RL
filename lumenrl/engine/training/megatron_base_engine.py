@@ -232,7 +232,19 @@ class MegatronBaseEngine(BaseEngine):
         ent = torch.cat(ents, dim=0) if want_entropy else None
         return lp, ent
 
-    def _row_policy_loss(self, t, r, start, token_lp, algo_name, cfg_fn, bnt, dp):
+    def _row_policy_loss(
+        self,
+        t,
+        r,
+        start,
+        token_lp,
+        algo_name,
+        cfg_fn,
+        bnt,
+        dp,
+        loss_agg_mode,
+        global_batch_size,
+    ):
         """DAPO/PG loss + PPO-KL metrics for one sequence, given its (grad-carrying)
         per-token log-prob ``token_lp`` [1, Lm]. Returns ``(loss_tensor|None, stats|None)``.
         Shared by the packed and per-row training paths."""
@@ -282,9 +294,26 @@ class MegatronBaseEngine(BaseEngine):
                 mask=mask, clip_ratio_c=float(cfg_fn("clip_ratio_c", 0.0)),
                 batch_num_tokens=bnt, dp_size=dp, rollout_is_weights=ris,
             )
+        elif algo_name == AlgorithmName.GRPO.value:
+            loss = asymmetric_clip_loss(
+                token_lp,
+                old_lp,
+                adv,
+                float(cfg_fn("clip_ratio", 0.2)),
+                float(cfg_fn("clip_ratio_high", 0.28)),
+                mask=mask,
+                batch_num_tokens=bnt,
+                dp_size=dp,
+                loss_agg_mode=loss_agg_mode,
+                global_batch_size=global_batch_size,
+            )
         else:
             loss = policy_gradient_loss(
-                token_lp, old_lp, adv, float(cfg_fn("clip_ratio", 0.2)), mask=mask,
+                token_lp,
+                old_lp,
+                adv,
+                float(cfg_fn("clip_ratio", 0.2)),
+                mask=mask,
             )
         kl_c = float(cfg_fn("kl_coeff", 0.0))
         if kl_c > 0.0 and ref_lp is not None:
@@ -373,6 +402,8 @@ class MegatronBaseEngine(BaseEngine):
         if am is None:
             am = torch.ones_like(seqs)
         B, S = seqs.shape
+        loss_agg_mode = str(_cfg("loss_agg_mode", "token-mean"))
+        global_batch_size = int(meta.get("global_batch_size") or B * dp)
 
         self.module.train()
         self._ddp.zero_grad_buffer()
@@ -414,7 +445,10 @@ class MegatronBaseEngine(BaseEngine):
                     r, start, _L = rows[j]
                     seg = logits_packed[offsets[k]:offsets[k + 1]]           # [L,V]
                     token_lp = self._token_logprob_train(seg[:-1], ids_list[k][1:]).view(1, -1)
-                    loss, stats = self._row_policy_loss(t, r, start, token_lp, algo_name, _cfg, bnt, dp)
+                    loss, stats = self._row_policy_loss(
+                        t, r, start, token_lp, algo_name, _cfg, bnt, dp,
+                        loss_agg_mode, global_batch_size,
+                    )
                     if loss is None:
                         continue
                     bin_loss = loss if bin_loss is None else bin_loss + loss
@@ -427,7 +461,10 @@ class MegatronBaseEngine(BaseEngine):
                 ids = seqs[r, start:start + L].to("cuda")
                 logits = self._forward_logits(ids, model=self._ddp) / temperature  # [L,V] (grad)
                 token_lp = self._token_logprob_train(logits[:-1], ids[1:]).view(1, -1)  # [1,L-1]
-                loss, stats = self._row_policy_loss(t, r, start, token_lp, algo_name, _cfg, bnt, dp)
+                loss, stats = self._row_policy_loss(
+                    t, r, start, token_lp, algo_name, _cfg, bnt, dp,
+                    loss_agg_mode, global_batch_size,
+                )
                 if loss is None:
                     continue
                 loss.backward()
@@ -436,7 +473,11 @@ class MegatronBaseEngine(BaseEngine):
         grad_norm = self._optimizer_step()
         lr = self._sched_step()
         metrics = {
-            "loss": loss_accum / max(1, n_rows),
+            "loss": (
+                loss_accum
+                if algo_name == AlgorithmName.GRPO.value
+                else loss_accum / max(1, n_rows)
+            ),
             "lr": lr,
             "grad_norm": grad_norm,
         }

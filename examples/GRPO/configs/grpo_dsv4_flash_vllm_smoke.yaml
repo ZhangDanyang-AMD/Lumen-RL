@@ -22,11 +22,13 @@ cluster:
   ray_address: "auto"
 
 weight_sync:
+  enabled: true
   backend: rdma
   shared_folder: /volumes/oss1/lumenrl_weight_sync/dsv4-flash
   bucket_size_mb: 2048
   timeout_s: 1200
   verify_full_load: true
+  fp8_quantization_location: inference
   rdma:
     backend: rccl
     require_rdma: true
@@ -59,15 +61,17 @@ policy:
   gen_batch_size: 8
   train_micro_batch_size: 1
   max_token_len_per_gpu: 512
+  optimizer_type: sgd
+  sgd_momentum: 0.0
   learning_rate: 1.0e-6
-  lr_warmup_steps: 10
+  lr_warmup_steps: 0
   weight_decay: 0.1
   max_grad_norm: 1.0
   lr_decay_style: constant
   adam_beta1: 0.9
   adam_beta2: 0.98
   training:
-    optimizer_dtype: bf16
+    optimizer_dtype: fp32
     megatron_cfg:
       tensor_model_parallel_size: 4
       pipeline_model_parallel_size: 4
@@ -79,9 +83,14 @@ policy:
       moe_grouped_gemm: true
       moe_token_dispatcher_type: alltoall
       use_distributed_optimizer: true
-      grad_reduce_in_fp32: true
+      # DistributedOptimizer already keeps FP32 master parameters. FP32 grad
+      # buffers make HybridDeviceOptimizer receive non-leaf buffer views.
+      grad_reduce_in_fp32: false
       attention_softmax_in_fp32: true
       sequence_parallel: true
+      # MI300X has 64 KiB LDS; the TileLang defaults require over 96 KiB.
+      v4_indexer_block_n: 64
+      v4_indexer_num_stages: 1
       recompute_granularity: full
       recompute_method: uniform
       recompute_num_layers: 1
@@ -90,7 +99,7 @@ policy:
       log_probs_chunk_size: 1024
       numa_affinity: true
       optimizer_cpu_offload: true
-      optimizer_offload_fraction: 0.95
+      optimizer_offload_fraction: 1.0
     fsdp_cfg:
       param_offload: false
       optimizer_offload: false
@@ -102,6 +111,7 @@ policy:
       tensor_parallel_size: 8
       quantization: fp8_per_block
       enforce_eager: true
+      disable_custom_all_reduce: true
       kv_cache_dtype: fp8_e4m3
       gpu_memory_utilization: 0.92
       max_model_len: 512
@@ -121,7 +131,7 @@ algorithm:
   name: grpo
   adv_estimator: grpo
   use_kl_in_reward: false
-  loss_agg_mode: token-mean
+  loss_agg_mode: seq-mean-token-mean
   clip_ratio_high: 0.28
   grpo:
     num_generations: 8
@@ -134,7 +144,7 @@ quantization:
   training:
     fp8: null
   rollout_correction:
-    rollout_is: token
+    rollout_is: null
     rollout_is_threshold: 2.0
     rollout_is_batch_normalize: false
 
@@ -147,11 +157,11 @@ moe:
 reward:
   type: function
   function: lumenrl.rewards.math_reward.dapo_math_reward
-  dataset: /root/data_cached/dsv4-flash/dapo-math-17k.filtered.parquet
+  dataset: /dev/shm/datasets/dapo-math-17k/dapo-math-17k.jsonl
   shuffle: true
   shuffle_seed: 10086
 
-val_dataset: /root/data_cached/dsv4-flash/aime-2024.filtered.parquet
+val_dataset: /dev/shm/datasets/aime-2024/aime-2024.jsonl
 val_steps: 0
 val_batch_size: 0
 eval:

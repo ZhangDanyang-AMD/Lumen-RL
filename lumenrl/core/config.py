@@ -147,6 +147,10 @@ class MegatronConfig:
     # Requires seq length divisible by TP, so it is OFF by default for RL's
     # variable-length forwards (per-sequence / packed thd).
     sequence_parallel: bool = False
+    # DSV4 TileLang indexer launch tuning. MI300X requires block_n=64 and
+    # num_stages=1 to stay within its 64 KiB LDS limit.
+    v4_indexer_block_n: Optional[int] = None
+    v4_indexer_num_stages: Optional[int] = None
     # ---- MoE / Expert Parallel ----
     # ``num_experts`` (a.k.a. num_moe_experts) is auto-detected from the HF config
     # when None; set it explicitly only to override. All the ``moe_*`` knobs below
@@ -193,6 +197,9 @@ class MegatronConfig:
     # Frees ~2x model-size GPU memory at the cost of slower optimizer steps.
     optimizer_cpu_offload: bool = False
     optimizer_offload_fraction: float = 1.0      # fraction of states to offload (0.0-1.0)
+    # Let Megatron's optimizer own the FP32 master directly. With full CPU
+    # offload this avoids first materializing another FP32 master on GPU.
+    use_precision_aware_optimizer: bool = False
     # PP layer distribution: override uniform layer-per-stage split.
     num_layers_in_first_pipeline_stage: Optional[int] = None
     num_layers_in_last_pipeline_stage: Optional[int] = None
@@ -232,6 +239,7 @@ class VLLMConfig:
     gpu_id: Optional[int] = None
     dtype: str = "bfloat16"
     enforce_eager: bool = True
+    disable_custom_all_reduce: bool = False
     enable_chunked_prefill: bool = True
     max_num_batched_tokens: int = 8192
     max_num_seqs: int = 64
@@ -325,10 +333,12 @@ class PolicyConfig:
     train_micro_batch_size: int = 8
     max_token_len_per_gpu: int = 0
     ppo_mini_batch_size: int = 0
+    optimizer_type: str = "adamw"
     learning_rate: float = 1e-6
     lr_warmup_steps: int = 10
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
+    sgd_momentum: float = 0.0
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95
     adam_eps: float = 1e-8
@@ -557,7 +567,7 @@ class RolloutCorrectionConfig:
     method: str = "tis"
     clip: float = 1.5
     # IS weights (verl rollout_corr_helper.py)
-    rollout_is: str = ""                # "token" | "sequence" | ""
+    rollout_is: Optional[str] = ""      # "token" | "sequence" | "" | None
     rollout_is_threshold: str = "2.0"   # float or "lower_upper" (IcePop)
     rollout_is_batch_normalize: bool = False
     # Rejection sampling (11 criteria: token_k1/k2/k3, seq_sum/mean/max_k1/k2/k3)
@@ -709,6 +719,7 @@ class RDMAWeightSyncConfig:
 class WeightSyncConfig:
     """Policy weight transport between separated training and rollout nodes."""
 
+    enabled: bool = True
     # auto preserves the legacy selection; production choices are
     # shared_folder and rdma.
     backend: str = "auto"  # auto | shared_folder | rdma
@@ -717,7 +728,45 @@ class WeightSyncConfig:
     timeout_s: int = 600
     verify_full_load: bool = True
     fp8_quantize: bool = False  # Quantize BF16 weights to FP8 per-block before sync (halves transfer size)
+    fp8_quantization_location: str | None = None  # trainer | inference; None uses legacy fp8_quantize
     rdma: RDMAWeightSyncConfig = field(default_factory=RDMAWeightSyncConfig)
+
+    def resolve_fp8_quantize(self) -> bool:
+        """Return whether weight-sync copies are quantized on the trainer."""
+        location = self.fp8_quantization_location
+        if location is None:
+            return bool(self.fp8_quantize)
+        if location not in {"trainer", "inference"}:
+            raise ValueError(
+                "weight_sync.fp8_quantization_location must be "
+                f"'trainer' or 'inference', got {location!r}"
+            )
+        if self.fp8_quantize and location != "trainer":
+            raise ValueError(
+                "weight_sync.fp8_quantization_location='inference' conflicts "
+                "with legacy weight_sync.fp8_quantize=true"
+            )
+        return location == "trainer"
+
+    def validate_fp8_quantization_location(
+        self,
+        rollout_quantization: str | None,
+    ) -> None:
+        """Validate cross-component requirements for an explicit FP8 location."""
+        location = self.fp8_quantization_location
+        if location is None and not self.fp8_quantize:
+            return
+        self.resolve_fp8_quantize()
+        if self.backend != "rdma":
+            raise ValueError(
+                "weight_sync.fp8_quantization_location requires "
+                "weight_sync.backend='rdma'"
+            )
+        if rollout_quantization != "fp8_per_block":
+            raise ValueError(
+                "weight_sync.fp8_quantization_location requires "
+                "policy.generation.vllm_cfg.quantization='fp8_per_block'"
+            )
 
 
 @dataclass

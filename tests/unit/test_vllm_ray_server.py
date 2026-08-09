@@ -1,0 +1,152 @@
+from __future__ import annotations
+
+import asyncio
+import sys
+from types import ModuleType, SimpleNamespace
+
+import pytest
+
+from lumenrl.engine.inference.vllm_ray_server import (
+    VLLMRayServer,
+    VLLMReplicaManager,
+)
+
+CAPABILITY = {
+    "protocol_version": 2,
+    "module_path": "lumenrl.engine.inference.vllm_colocate_worker_ext",
+    "online_quant_reload": True,
+    "prequantized_stream": True,
+}
+
+
+class RemoteMethod:
+    def __init__(self, result=True):
+        self.result = result
+        self.calls = []
+
+    def remote(self, *args):
+        self.calls.append(args)
+        return self.result
+
+
+def install_fake_ray(monkeypatch):
+    fake_ray = ModuleType("ray")
+
+    def get(refs):
+        if isinstance(refs, BaseException):
+            raise refs
+        return refs
+
+    fake_ray.get = get
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+
+
+def make_manager(capabilities):
+    manager = VLLMReplicaManager(
+        SimpleNamespace(num_workers=1),
+        "model",
+        {"tensor_parallel_size": len(capabilities)},
+    )
+    server = SimpleNamespace(
+        get_rdma_capabilities=RemoteMethod(capabilities),
+        receive_weights_rdma=RemoteMethod("receive-ref"),
+        destroy_rdma_weight_group=RemoteMethod(True),
+    )
+    manager.servers = [server]
+    manager.rdma_group_name = "group-1"
+    return manager, server
+
+
+def test_server_collects_rdma_capabilities_from_all_tp_workers():
+    calls = []
+
+    class Engine:
+        async def collective_rpc(self, method, args=(), kwargs=None):
+            calls.append((method, args, kwargs))
+            return [CAPABILITY, CAPABILITY]
+
+    server = object.__new__(VLLMRayServer)
+    server.engine = Engine()
+
+    capabilities = asyncio.run(server.get_rdma_capabilities())
+
+    assert capabilities == [CAPABILITY, CAPABILITY]
+    assert calls == [("get_rdma_capabilities", (), {})]
+
+
+def test_manager_validates_once_per_rdma_group_before_receive_refs(monkeypatch):
+    install_fake_ray(monkeypatch)
+    manager, server = make_manager([CAPABILITY, CAPABILITY])
+
+    first = manager.start_receive_weights_rdma(
+        version=1,
+        verify_full_load=True,
+        prequantized_fp8=True,
+    )
+    second = manager.start_receive_weights_rdma(
+        version=2,
+        verify_full_load=False,
+        prequantized_fp8=False,
+    )
+
+    assert first == ["receive-ref"]
+    assert second == ["receive-ref"]
+    assert len(server.get_rdma_capabilities.calls) == 1
+    assert len(server.receive_weights_rdma.calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("capability", "error"),
+    [
+        ({**CAPABILITY, "protocol_version": 1}, "protocol_version"),
+        ({**CAPABILITY, "online_quant_reload": False}, "online_quant_reload"),
+        ({**CAPABILITY, "prequantized_stream": False}, "prequantized_stream"),
+    ],
+)
+def test_manager_rejects_incompatible_worker_before_receive_refs(
+    monkeypatch,
+    capability,
+    error,
+):
+    install_fake_ray(monkeypatch)
+    manager, server = make_manager([capability])
+
+    with pytest.raises(
+        RuntimeError,
+        match=rf"server=0 worker=0.*{error}",
+    ):
+        manager.start_receive_weights_rdma(
+            version=1,
+            verify_full_load=True,
+        )
+
+    assert server.receive_weights_rdma.calls == []
+
+
+def test_manager_reports_missing_capability_rpc_before_receive_refs(monkeypatch):
+    install_fake_ray(monkeypatch)
+    manager, server = make_manager([CAPABILITY])
+    del server.get_rdma_capabilities
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"server=0 workers=0\.\.0.*get_rdma_capabilities",
+    ):
+        manager.start_receive_weights_rdma(
+            version=1,
+            verify_full_load=True,
+        )
+
+    assert server.receive_weights_rdma.calls == []
+
+
+def test_destroyed_rdma_group_requires_a_new_handshake(monkeypatch):
+    install_fake_ray(monkeypatch)
+    manager, server = make_manager([CAPABILITY])
+
+    manager.start_receive_weights_rdma(version=1, verify_full_load=True)
+    manager.destroy_rdma_weight_group()
+    manager.rdma_group_name = "group-2"
+    manager.start_receive_weights_rdma(version=2, verify_full_load=True)
+
+    assert len(server.get_rdma_capabilities.calls) == 2

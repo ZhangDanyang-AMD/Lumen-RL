@@ -390,6 +390,9 @@ class RLTrainer:
         from lumenrl.engine.inference.vllm_http_engine import VLLMHttpEngine
         from lumenrl.engine.inference.vllm_ray_server import VLLMReplicaManager
 
+        self.config.weight_sync.validate_fp8_quantization_location(
+            getattr(vcfg, "quantization", None),
+        )
         seed = self.config.seed if getattr(vcfg, "seed", None) is None else vcfg.seed
         tp = int(getattr(vcfg, "tensor_parallel_size", 1) or 1)
         engine_kwargs: dict[str, Any] = dict(
@@ -397,6 +400,7 @@ class RLTrainer:
             gpu_memory_utilization=float(vcfg.gpu_memory_utilization),
             dtype=str(vcfg.dtype),
             enforce_eager=bool(vcfg.enforce_eager),
+            disable_custom_all_reduce=bool(vcfg.disable_custom_all_reduce),
             enable_chunked_prefill=bool(vcfg.enable_chunked_prefill),
             max_num_batched_tokens=int(vcfg.max_num_batched_tokens),
             max_num_seqs=int(vcfg.max_num_seqs),
@@ -756,12 +760,13 @@ class RLTrainer:
 
         version = int(self.global_step) + 1
         cfg = self.config.weight_sync
+        fp8_sync = cfg.resolve_fp8_quantize()
         started = time.perf_counter()
         recv_refs = mgr.start_receive_weights_rdma(
             version=version,
             verify_full_load=bool(cfg.verify_full_load),
+            prequantized_fp8=fp8_sync,
         )
-        fp8_sync = bool(getattr(cfg, "fp8_quantize", False))
         send_refs = self._actor_wg.execute_all_async(
             "send_weights_rdma",
             version=version,
@@ -786,16 +791,18 @@ class RLTrainer:
             "weight_sync/buckets": float(sender.get("buckets", 0.0)),
             "weight_sync/version": float(version),
             "weight_sync/backend_rdma": 1.0,
+            "weight_sync/fp8_trainer_quantized": float(fp8_sync),
         }
         logger.info(
             "RDMA weight sync committed: version=%d buckets=%d bytes=%.1fGB "
-            "broadcast=%.2fs effective=%.2fGb/s total=%.2fs",
+            "broadcast=%.2fs effective=%.2fGb/s total=%.2fs fp8_location=%s",
             version,
             int(sender.get("buckets", 0)),
             float(sender.get("bytes", 0)) / 1e9,
             float(sender.get("seconds", 0)),
             float(sender.get("gbps", 0)),
             total_s,
+            "trainer" if fp8_sync else "inference",
         )
         if sleeping:
             rollout_engine.wake(tags=["kv_cache"])
@@ -3567,6 +3574,7 @@ class RLTrainer:
             raise RuntimeError("Ray actor worker group is not initialized.")
         actor_role_cfg = self.config.controller.ray.actor
         n = self._actor_wg.num_workers
+        batch.meta.setdefault("global_batch_size", batch.batch_size)
         self._balance_rows_across_workers(batch, n)
 
         import ray
@@ -3957,10 +3965,11 @@ class RLTrainer:
 
             # ---- weight sync to rollout engine ----
             t_sync = time.time()
-            if use_ray_rollout:
-                self._sync_weights_ipc()   # wake weights -> ZMQ IPC -> wake KV
-            else:
-                self._sync_rollout_weights()
+            if getattr(self.config.weight_sync, "enabled", True):
+                if use_ray_rollout:
+                    self._sync_weights_ipc()   # wake weights -> ZMQ IPC -> wake KV
+                else:
+                    self._sync_rollout_weights()
             sync_time = time.time() - t_sync
             if sync_time > 1.0:
                 metrics["timing/weight_sync_s"] = sync_time
