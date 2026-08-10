@@ -10,6 +10,7 @@ import pytest
 import torch
 
 import lumenrl.engine.inference.rdma_weight_transfer as rdma
+import lumenrl.engine.inference.vllm_colocate_worker_ext as worker_ext
 import lumenrl.engine.inference.vllm_fp8_utils as fp8_utils
 from lumenrl.engine.inference.rdma_protocol import (
     RDMA_PROTOCOL_VERSION,
@@ -18,6 +19,81 @@ from lumenrl.engine.inference.rdma_protocol import (
 from lumenrl.engine.inference.vllm_colocate_worker_ext import (
     vLLMColocateWorkerExtension,
 )
+
+
+def test_all_gather_lifecycle_diagnostic_syncs_before_and_after(monkeypatch, caplog):
+    events = []
+
+    class FakeGroupCoordinator:
+        def all_gather(self, input_, use_custom=False, dim=-1):
+            events.append(("collective", input_.numel(), use_custom, dim))
+            return input_ + 1
+
+    install = getattr(
+        worker_ext,
+        "_install_all_gather_lifecycle_diagnostics",
+        None,
+    )
+    assert install is not None
+
+    monkeypatch.setenv("LUMENRL_DIAG_ALL_GATHER", "1")
+    monkeypatch.setenv("LUMENRL_DIAG_ALL_GATHER_NUMEL", "4")
+    monkeypatch.setattr(
+        torch.cuda,
+        "synchronize",
+        lambda device=None: events.append(("sync", device)),
+    )
+    caplog.set_level(logging.WARNING)
+
+    install(FakeGroupCoordinator)
+    install(FakeGroupCoordinator)
+    input_tensor = torch.arange(4, dtype=torch.bfloat16)
+    output = FakeGroupCoordinator().all_gather(input_tensor, dim=0)
+
+    assert events == [
+        ("sync", input_tensor.device),
+        ("collective", 4, False, 0),
+        ("sync", input_tensor.device),
+    ]
+    torch.testing.assert_close(output, input_tensor + 1)
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("phase=before_presync" in message for message in messages)
+    assert any("phase=after_presync" in message for message in messages)
+    assert any("phase=after_all_gather" in message for message in messages)
+
+
+def test_monkey_patch_model_installs_all_gather_lifecycle_diagnostic(monkeypatch):
+    import lumenrl.moe.router_precision as router_precision
+
+    events = []
+    model = object()
+    worker = object.__new__(vLLMColocateWorkerExtension)
+    worker.model_runner = SimpleNamespace(model=model)
+    monkeypatch.setattr(
+        worker_ext,
+        "_install_all_gather_lifecycle_diagnostics",
+        lambda: events.append("all_gather"),
+    )
+    monkeypatch.setattr(
+        worker_ext,
+        "_monkey_patch_compute_logits",
+        lambda patched_model, vocab_size: events.append(
+            ("compute_logits", patched_model, vocab_size)
+        ),
+    )
+    monkeypatch.setattr(
+        router_precision,
+        "enable_fp32_moe_router",
+        lambda patched_model: events.append(("router", patched_model)),
+    )
+
+    worker.monkey_patch_model(vocab_size=1024)
+
+    assert events == [
+        "all_gather",
+        ("compute_logits", model, 1024),
+        ("router", model),
+    ]
 
 
 def test_rdma_capability_is_immutable_and_json_serializable():

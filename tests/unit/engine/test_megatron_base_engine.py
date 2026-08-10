@@ -45,6 +45,70 @@ def test_native_engine_uses_shared_base() -> None:
     assert issubclass(MegatronNativeEngine, MegatronBaseEngine)
 
 
+def test_row_policy_loss_aligns_pre_shifted_response_mask_after_left_padding() -> None:
+    engine = object.__new__(MegatronBaseEngine)
+    token_log_probs = torch.zeros(1, 3, requires_grad=True)
+    tensors = {
+        # Global shifted-token columns.  The real sequence starts at column 2;
+        # its three transitions are prompt, response, response.
+        "old_log_probs": torch.zeros(1, 5),
+        "response_mask": torch.tensor([[0, 0, 0, 1, 1]]),
+        "advantages": torch.ones(1),
+    }
+
+    loss, _ = engine._row_policy_loss(
+        tensors,
+        r=0,
+        start=2,
+        token_lp=token_log_probs,
+        algo_name="grpo",
+        cfg_fn=lambda name, default: default,
+        bnt=None,
+        dp=1,
+        loss_agg_mode="token-mean",
+        global_batch_size=1,
+    )
+    assert loss is not None
+    loss.backward()
+
+    assert token_log_probs.grad is not None
+    assert token_log_probs.grad[0, 0].item() == 0.0
+    assert token_log_probs.grad[0, 1].item() != 0.0
+    assert token_log_probs.grad[0, 2].item() != 0.0
+
+
+def test_row_policy_loss_aligns_token_indexed_response_mask_after_left_padding() -> None:
+    engine = object.__new__(MegatronBaseEngine)
+    token_log_probs = torch.zeros(1, 3, requires_grad=True)
+    tensors = {
+        "input_ids": torch.tensor([[0, 0, 11, 12, 21, 22]]),
+        # Token-indexed width S: response tokens occupy input positions 4 and 5.
+        "response_mask": torch.tensor([[0, 0, 0, 0, 1, 1]]),
+        "old_log_probs": torch.zeros(1, 5),
+        "advantages": torch.ones(1),
+    }
+
+    loss, _ = engine._row_policy_loss(
+        tensors,
+        r=0,
+        start=2,
+        token_lp=token_log_probs,
+        algo_name="grpo",
+        cfg_fn=lambda name, default: default,
+        bnt=None,
+        dp=1,
+        loss_agg_mode="token-mean",
+        global_batch_size=1,
+    )
+    assert loss is not None
+    loss.backward()
+
+    assert token_log_probs.grad is not None
+    assert token_log_probs.grad[0, 0].item() == 0.0
+    assert token_log_probs.grad[0, 1].item() != 0.0
+    assert token_log_probs.grad[0, 2].item() != 0.0
+
+
 def test_native_pp_grpo_passes_sequence_normalization_under_dp_cp(
     monkeypatch,
 ) -> None:

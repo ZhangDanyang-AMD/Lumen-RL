@@ -1,0 +1,267 @@
+import sys
+from collections import UserDict
+from contextlib import nullcontext
+from types import SimpleNamespace
+
+import pytest
+import torch
+from omegaconf import OmegaConf
+
+try:
+    import resource  # noqa: F401
+except ModuleNotFoundError:
+    sys.modules["resource"] = SimpleNamespace(
+        RUSAGE_SELF=0,
+        getrusage=lambda _: SimpleNamespace(ru_maxrss=0),
+    )
+
+from lumenrl.engine.training.actor_worker import LumenActorWorker as TrainingActorWorker
+from lumenrl.core.protocol import DataProto
+from lumenrl.workers.actor_worker import LumenActorWorker
+
+
+def test_dsv4_indexer_launch_tuning_reaches_engine_config() -> None:
+    worker = object.__new__(LumenActorWorker)
+    worker.config = {}
+    training_cfg = {
+        "megatron_cfg": {
+            "v4_indexer_block_n": 64,
+            "v4_indexer_num_stages": 1,
+        }
+    }
+
+    engine_config = worker._build_engine_config(
+        "megatron_lumen_dsv4", training_cfg, {}
+    )
+
+    assert engine_config["v4_indexer_block_n"] == 64
+    assert engine_config["v4_indexer_num_stages"] == 1
+
+
+@pytest.mark.parametrize("worker_type", [LumenActorWorker, TrainingActorWorker])
+def test_precision_aware_optimizer_reaches_dsv4_engine_config(worker_type) -> None:
+    worker = object.__new__(worker_type)
+    worker.config = {}
+
+    engine_config = worker._build_engine_config(
+        "megatron_lumen_dsv4",
+        {"megatron_cfg": {"use_precision_aware_optimizer": True}},
+        {},
+    )
+
+    assert engine_config["use_precision_aware_optimizer"] is True
+
+
+@pytest.mark.parametrize("worker_type", [LumenActorWorker, TrainingActorWorker])
+def test_streamed_optimizer_settings_reach_dsv4_engine_config(worker_type) -> None:
+    worker = object.__new__(worker_type)
+    worker.config = {}
+
+    engine_config = worker._build_engine_config(
+        "megatron_lumen_dsv4",
+        {
+            "megatron_cfg": {
+                "streamed_optimizer_mode": "adam",
+                "streamed_optimizer_chunk_size_mib": 64,
+                "streamed_optimizer_moment_dtype": "bf16",
+            }
+        },
+        {},
+    )
+
+    assert engine_config["streamed_optimizer_mode"] == "adam"
+    assert engine_config["streamed_optimizer_chunk_size_mib"] == 64
+    assert engine_config["streamed_optimizer_moment_dtype"] == "bf16"
+
+
+@pytest.mark.parametrize("worker_type", [LumenActorWorker, TrainingActorWorker])
+@pytest.mark.parametrize(
+    ("megatron_cfg", "expected_mode", "expected_chunk_size_mib"),
+    [
+        ({}, "off", 256),
+        (
+            {
+                "streamed_optimizer_mode": "ADAM",
+                "streamed_optimizer_chunk_size_mib": "64",
+            },
+            "adam",
+            64,
+        ),
+    ],
+)
+def test_streamed_optimizer_settings_are_normalized_with_defaults(
+    worker_type,
+    megatron_cfg,
+    expected_mode,
+    expected_chunk_size_mib,
+) -> None:
+    worker = object.__new__(worker_type)
+    worker.config = {}
+
+    engine_config = worker._build_engine_config(
+        "megatron_lumen_dsv4",
+        {"megatron_cfg": megatron_cfg},
+        {},
+    )
+
+    assert engine_config["streamed_optimizer_mode"] == expected_mode
+    assert (
+        engine_config["streamed_optimizer_chunk_size_mib"]
+        == expected_chunk_size_mib
+    )
+
+
+@pytest.mark.parametrize("worker_type", [LumenActorWorker, TrainingActorWorker])
+@pytest.mark.parametrize(
+    "config_factory",
+    [
+        pytest.param(OmegaConf.create, id="dict-config"),
+        pytest.param(UserDict, id="user-dict"),
+    ],
+)
+def test_mapping_megatron_config_reaches_dsv4_engine_config(
+    worker_type,
+    config_factory,
+) -> None:
+    worker = object.__new__(worker_type)
+    worker.config = {}
+    megatron_cfg = config_factory(
+        {
+            "streamed_optimizer_mode": "ADAM",
+            "streamed_optimizer_chunk_size_mib": "64",
+            "tensor_model_parallel_size": 8,
+        }
+    )
+
+    engine_config = worker._build_engine_config(
+        "megatron_lumen_dsv4",
+        {"megatron_cfg": megatron_cfg},
+        {},
+    )
+
+    assert engine_config["streamed_optimizer_mode"] == "adam"
+    assert engine_config["streamed_optimizer_chunk_size_mib"] == 64
+    assert engine_config["tensor_model_parallel_size"] == 8
+
+
+@pytest.mark.parametrize("worker_type", [LumenActorWorker, TrainingActorWorker])
+@pytest.mark.parametrize(
+    "config_factory",
+    [
+        pytest.param(dict, id="dict"),
+        pytest.param(OmegaConf.create, id="dict-config"),
+    ],
+)
+@pytest.mark.parametrize("invalid_chunk_size_mib", [True, 1.5])
+def test_streamed_optimizer_rejects_lossy_chunk_size_coercion(
+    worker_type,
+    config_factory,
+    invalid_chunk_size_mib,
+) -> None:
+    worker = object.__new__(worker_type)
+    worker.config = {}
+    megatron_cfg = config_factory(
+        {"streamed_optimizer_chunk_size_mib": invalid_chunk_size_mib}
+    )
+
+    with pytest.raises(
+        (TypeError, ValueError),
+        match="streamed_optimizer_chunk_size_mib",
+    ):
+        worker._build_engine_config(
+            "megatron_lumen_dsv4",
+            {"megatron_cfg": megatron_cfg},
+            {},
+        )
+
+
+@pytest.mark.parametrize("worker_type", [LumenActorWorker, TrainingActorWorker])
+@pytest.mark.parametrize(
+    "config_factory",
+    [
+        pytest.param(dict, id="dict"),
+        pytest.param(OmegaConf.create, id="dict-config"),
+    ],
+)
+@pytest.mark.parametrize("chunk_size_mib", ["64", 64])
+def test_streamed_optimizer_normalizes_integer_chunk_size(
+    worker_type,
+    config_factory,
+    chunk_size_mib,
+) -> None:
+    worker = object.__new__(worker_type)
+    worker.config = {}
+    megatron_cfg = config_factory(
+        {"streamed_optimizer_chunk_size_mib": chunk_size_mib}
+    )
+
+    engine_config = worker._build_engine_config(
+        "megatron_lumen_dsv4",
+        {"megatron_cfg": megatron_cfg},
+        {},
+    )
+
+    assert engine_config["streamed_optimizer_chunk_size_mib"] == 64
+    assert isinstance(engine_config["streamed_optimizer_chunk_size_mib"], int)
+
+
+@pytest.mark.parametrize("worker_type", [LumenActorWorker, TrainingActorWorker])
+def test_actor_grpo_loss_uses_miles_asymmetric_sequence_mean(worker_type) -> None:
+    worker = object.__new__(worker_type)
+    worker._engine = None
+    worker._pol_meta = {
+        "algorithm": "grpo",
+        "algo_config": {
+            "loss_agg_mode": "seq-mean-token-mean",
+            "clip_ratio_high": 0.28,
+            "grpo": {"clip_ratio": 0.2},
+        },
+        "global_batch_size": 4,
+        "dp_size": 2,
+    }
+    ratios = torch.tensor([[2.0, 1.0], [0.5, 0.5]])
+    log_probs = ratios.log().requires_grad_(True)
+    data = {
+        "old_log_probs": torch.zeros_like(log_probs),
+        "advantages": torch.tensor([1.0, -1.0]),
+        "response_mask": torch.tensor([[1, 0], [1, 1]]),
+    }
+
+    loss, metrics = worker._policy_loss_fn({"log_probs": log_probs}, data)
+
+    torch.testing.assert_close(loss, torch.tensor((-1.28 + 0.8) / 2))
+    assert metrics["loss"] == pytest.approx(float(loss.detach()))
+
+
+@pytest.mark.parametrize("worker_type", [LumenActorWorker, TrainingActorWorker])
+def test_actor_grpo_reports_sum_of_global_microbatch_contributions(
+    worker_type,
+) -> None:
+    class FakeEngine:
+        @staticmethod
+        def train_mode():
+            return nullcontext()
+
+        @staticmethod
+        def train_batch(data, loss_fn):
+            return {
+                "loss": [0.2, 0.3],
+                "metrics": {"loss": [0.2, 0.3]},
+            }
+
+        @staticmethod
+        def lr_scheduler_step():
+            return 1.0e-6
+
+    worker = object.__new__(worker_type)
+    worker._engine = FakeEngine()
+    worker._logged_norm = True
+    worker.config = {}
+    batch = DataProto(
+        tensors={"input_ids": torch.ones(2, 2, dtype=torch.long)},
+        meta={"algorithm": "grpo"},
+    )
+
+    metrics = worker.update_policy(batch)
+
+    assert metrics["loss"] == pytest.approx(0.5)

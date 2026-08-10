@@ -1,3 +1,6 @@
+import importlib
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -5,9 +8,9 @@ import lumenrl.engine.training.megatron_lumen_dsv4_engine as dsv4_engine
 from lumenrl.engine.training.dsv4_megatron_bridge import DSV4Dims
 from lumenrl.engine.training.megatron_lumen_dsv4_engine import (
     MegatronLumenDSV4Engine,
-    _StreamingGatheredParamMapping,
     _dsv4_router_kwargs,
     _named_export_tensors,
+    _StreamingGatheredParamMapping,
 )
 
 
@@ -17,6 +20,392 @@ def _parameter(values, *, tensor_parallel=False, partition_dim=0):
     param.partition_dim = partition_dim
     param.partition_stride = 1
     return param
+
+
+def _cpu_adam(*, optimizer_type=torch.optim.Adam, **flags):
+    optimizer = optimizer_type([torch.nn.Parameter(torch.ones(1))])
+    optimizer.param_groups[0].update(flags)
+    return optimizer
+
+
+def _hybrid_optimizer(*, cpu_optimizers=None, **overrides):
+    values = {
+        "offload_fraction": 1.0,
+        "gpu_optimizer": None,
+        "cpu_optimizers": (
+            [_cpu_adam()]
+            if cpu_optimizers is None
+            else cpu_optimizers
+        ),
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _streamed_config(mode="adam", chunk_mib=256, **overrides):
+    values = {
+        "optimizer_cpu_offload": True,
+        "optimizer_offload_fraction": 1.0,
+        "streamed_optimizer_mode": mode,
+        "streamed_optimizer_chunk_size_mib": chunk_mib,
+    }
+    values.update(overrides)
+    return values
+
+
+def _patch_streamed_adam_capability(monkeypatch, value=True):
+    real_import_module = importlib.import_module
+    fake_module = SimpleNamespace(
+        LUMENRL_DSV4_CAPABILITY_STREAMED_ADAM=value,
+    )
+
+    def import_module(name, package=None):
+        if name == (
+            "megatron.core.optimizer.cpu_offloading.hybrid_optimizer"
+        ):
+            return fake_module
+        return real_import_module(name, package)
+
+    monkeypatch.setattr(importlib, "import_module", import_module)
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["bad", "", "ADAMW", " adam ", "ADAM", "SGD", "OFF"],
+)
+def test_streamed_optimizer_rejects_unknown_mode(mode):
+    with pytest.raises(ValueError, match="streamed_optimizer_mode"):
+        dsv4_engine._validate_streamed_optimizer_request(
+            _streamed_config(mode=mode),
+            object(),
+        )
+
+
+@pytest.mark.parametrize("moment_dtype", ["", "float16", "BF16", None, True])
+def test_streamed_optimizer_rejects_unknown_moment_dtype(moment_dtype):
+    with pytest.raises(ValueError, match="streamed_optimizer_moment_dtype"):
+        dsv4_engine._validate_streamed_optimizer_request(
+            _streamed_config(streamed_optimizer_moment_dtype=moment_dtype),
+            object(),
+        )
+
+
+@pytest.mark.parametrize("chunk_mib", [0, -1, 1.5, True, "256"])
+def test_streamed_optimizer_rejects_invalid_chunk_size(chunk_mib):
+    with pytest.raises(ValueError, match="streamed_optimizer_chunk_size_mib"):
+        dsv4_engine._validate_streamed_optimizer_request(
+            _streamed_config(mode="off", chunk_mib=chunk_mib),
+            object(),
+        )
+
+
+@pytest.mark.parametrize("chunk_mib", [1025, 10**100])
+def test_streamed_optimizer_rejects_oversized_chunk_size(chunk_mib):
+    with pytest.raises(ValueError, match="streamed_optimizer_chunk_size_mib"):
+        dsv4_engine._validate_streamed_optimizer_request(
+            _streamed_config(mode="off", chunk_mib=chunk_mib),
+            object(),
+        )
+
+
+def test_streamed_optimizer_accepts_and_converts_maximum_chunk_size(monkeypatch):
+    _patch_streamed_adam_capability(monkeypatch)
+    hybrid = _hybrid_optimizer()
+
+    configured = dsv4_engine._configure_streamed_optimizer_request(
+        _streamed_config(chunk_mib=1024),
+        hybrid,
+    )
+
+    assert configured == [hybrid]
+    assert hybrid._lumen_streamed_adam_chunk_numel == 1024 * 1024 * 1024 // 4
+
+
+def test_streamed_optimizer_off_accepts_unpatched_optimizer():
+    assert (
+        dsv4_engine._validate_streamed_optimizer_request(
+            _streamed_config(mode="off"),
+            object(),
+        )
+        is None
+    )
+
+
+def test_streamed_optimizer_sgd_preserves_capability_free_path():
+    hybrid = _hybrid_optimizer(cpu_optimizers=[torch.optim.SGD(
+        [torch.nn.Parameter(torch.ones(1))],
+        lr=0.1,
+    )])
+
+    assert (
+        dsv4_engine._validate_streamed_optimizer_request(
+            _streamed_config(mode="sgd"),
+            SimpleNamespace(optimizer=hybrid),
+        )
+        == [hybrid]
+    )
+
+
+@pytest.mark.parametrize("capability", [None, False])
+def test_streamed_adam_requires_runtime_capability(monkeypatch, capability):
+    _patch_streamed_adam_capability(monkeypatch, capability)
+
+    with pytest.raises(RuntimeError, match="LUMENRL_DSV4_CAPABILITY_STREAMED_ADAM"):
+        dsv4_engine._validate_streamed_optimizer_request(
+            _streamed_config(),
+            _hybrid_optimizer(),
+        )
+
+
+def test_streamed_adam_reports_unavailable_runtime_as_missing_capability(monkeypatch):
+    real_import_module = importlib.import_module
+
+    def import_module(name, package=None):
+        if name == (
+            "megatron.core.optimizer.cpu_offloading.hybrid_optimizer"
+        ):
+            raise ModuleNotFoundError(name)
+        return real_import_module(name, package)
+
+    monkeypatch.setattr(importlib, "import_module", import_module)
+
+    with pytest.raises(RuntimeError, match="LUMENRL_DSV4_CAPABILITY_STREAMED_ADAM"):
+        dsv4_engine._validate_streamed_optimizer_request(
+            _streamed_config(),
+            _hybrid_optimizer(),
+        )
+
+
+def test_streamed_adam_requires_hybrid_device_optimizer(monkeypatch):
+    _patch_streamed_adam_capability(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="HybridDeviceOptimizer"):
+        dsv4_engine._validate_streamed_optimizer_request(
+            _streamed_config(),
+            SimpleNamespace(optimizer=object()),
+        )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"optimizer_cpu_offload": False}, "optimizer_cpu_offload"),
+        ({"optimizer_offload_fraction": 0.875}, "full CPU offload"),
+    ],
+)
+def test_streamed_adam_requires_full_configured_cpu_offload(
+    monkeypatch,
+    overrides,
+    error,
+):
+    _patch_streamed_adam_capability(monkeypatch)
+
+    with pytest.raises(RuntimeError, match=error):
+        dsv4_engine._validate_streamed_optimizer_request(
+            _streamed_config(**overrides),
+            _hybrid_optimizer(),
+        )
+
+
+def test_streamed_adam_rejects_partial_runtime_offload(monkeypatch):
+    _patch_streamed_adam_capability(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="full CPU offload"):
+        dsv4_engine._validate_streamed_optimizer_request(
+            _streamed_config(),
+            _hybrid_optimizer(offload_fraction=0.875),
+        )
+
+
+def test_streamed_adam_rejects_gpu_sub_optimizer(monkeypatch):
+    _patch_streamed_adam_capability(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="GPU optimizer"):
+        dsv4_engine._validate_streamed_optimizer_request(
+            _streamed_config(),
+            _hybrid_optimizer(gpu_optimizer=object()),
+        )
+
+
+def test_streamed_adam_rejects_non_adam_cpu_optimizer(monkeypatch):
+    _patch_streamed_adam_capability(monkeypatch)
+    sgd = torch.optim.SGD([torch.nn.Parameter(torch.ones(1))], lr=0.1)
+
+    with pytest.raises(RuntimeError, match="Adam or AdamW"):
+        dsv4_engine._validate_streamed_optimizer_request(
+            _streamed_config(),
+            _hybrid_optimizer(cpu_optimizers=[sgd]),
+        )
+
+
+def test_streamed_adam_rejects_empty_cpu_optimizer_collection(monkeypatch):
+    _patch_streamed_adam_capability(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="at least one CPU Adam or AdamW"):
+        dsv4_engine._validate_streamed_optimizer_request(
+            _streamed_config(),
+            _hybrid_optimizer(cpu_optimizers=[]),
+        )
+
+
+@pytest.mark.parametrize(
+    "flag",
+    ["amsgrad", "differentiable", "capturable", "foreach"],
+)
+def test_streamed_adam_rejects_incompatible_group_flags(monkeypatch, flag):
+    _patch_streamed_adam_capability(monkeypatch)
+
+    with pytest.raises(RuntimeError, match=flag):
+        dsv4_engine._validate_streamed_optimizer_request(
+            _streamed_config(),
+            _hybrid_optimizer(cpu_optimizers=[_cpu_adam(**{flag: True})]),
+        )
+
+
+def test_streamed_adam_allows_fused_target_flag(monkeypatch):
+    _patch_streamed_adam_capability(monkeypatch)
+    hybrid = _hybrid_optimizer(cpu_optimizers=[_cpu_adam(fused=True)])
+
+    assert (
+        dsv4_engine._validate_streamed_optimizer_request(
+            _streamed_config(),
+            hybrid,
+        )
+        == [hybrid]
+    )
+
+
+def test_find_hybrid_device_optimizers_unwraps_nested_chains():
+    hybrid = _hybrid_optimizer()
+    wrapped = SimpleNamespace(
+        inner_optimizer=SimpleNamespace(
+            chained_optimizers=[
+                object(),
+                SimpleNamespace(optimizer=(object(), hybrid)),
+            ]
+        )
+    )
+
+    assert dsv4_engine._find_hybrid_device_optimizers(wrapped) == [hybrid]
+
+
+def test_find_hybrid_device_optimizers_handles_cycles():
+    first = SimpleNamespace()
+    second = SimpleNamespace(optimizer=first)
+    first.inner_optimizer = second
+    first.chained_optimizers = [first, second]
+
+    assert dsv4_engine._find_hybrid_device_optimizers(first) == []
+
+
+def test_chained_optimizer_ignores_asserting_singular_property(monkeypatch):
+    _patch_streamed_adam_capability(monkeypatch)
+    dense = _hybrid_optimizer()
+    expert = _hybrid_optimizer()
+
+    class ChainedOptimizer:
+        def __init__(self):
+            self.chained_optimizers = [dense, expert]
+
+        @property
+        def optimizer(self):
+            raise AssertionError("singular optimizer is invalid for MoE")
+
+    configured = dsv4_engine._configure_streamed_optimizer_request(
+        _streamed_config(chunk_mib=32),
+        ChainedOptimizer(),
+    )
+
+    assert configured == [dense, expert]
+    for hybrid in configured:
+        assert hybrid._lumen_streamed_optimizer_mode == "adam"
+        assert hybrid._lumen_streamed_adam_chunk_numel == 32 * 1024 * 1024 // 4
+        assert hybrid._lumen_streamed_adam_moment_dtype == torch.float32
+
+
+def test_multi_hdo_configuration_is_atomic(monkeypatch):
+    _patch_streamed_adam_capability(monkeypatch)
+    valid = _hybrid_optimizer()
+    invalid = _hybrid_optimizer(gpu_optimizer=object())
+    chained = SimpleNamespace(chained_optimizers=[invalid, valid])
+
+    with pytest.raises(RuntimeError, match="GPU optimizer"):
+        dsv4_engine._configure_streamed_optimizer_request(
+            _streamed_config(),
+            chained,
+        )
+
+    for hybrid in (valid, invalid):
+        assert not hasattr(hybrid, "_lumen_streamed_optimizer_mode")
+        assert not hasattr(hybrid, "_lumen_streamed_adam_chunk_numel")
+
+
+def test_find_hybrid_device_optimizers_returns_unique_deterministic_order():
+    first = _hybrid_optimizer()
+    second = _hybrid_optimizer()
+    wrapped = SimpleNamespace(
+        chained_optimizers=[first, second, first],
+        inner_optimizer=second,
+    )
+
+    assert dsv4_engine._find_hybrid_device_optimizers(wrapped) == [
+        first,
+        second,
+    ]
+
+
+def test_streamed_adam_settings_attach_only_after_validation(monkeypatch):
+    _patch_streamed_adam_capability(monkeypatch)
+    hybrid = _hybrid_optimizer()
+    wrapped = SimpleNamespace(inner_optimizer=hybrid)
+
+    configured = dsv4_engine._configure_streamed_optimizer_request(
+        _streamed_config(
+            chunk_mib=64,
+            streamed_optimizer_moment_dtype="bf16",
+        ),
+        wrapped,
+    )
+
+    assert configured == [hybrid]
+    assert hybrid._lumen_streamed_optimizer_mode == "adam"
+    assert hybrid._lumen_streamed_adam_chunk_numel == 64 * 1024 * 1024 // 4
+    assert hybrid._lumen_streamed_adam_moment_dtype == torch.bfloat16
+
+    invalid = _hybrid_optimizer(gpu_optimizer=object())
+    with pytest.raises(RuntimeError, match="GPU optimizer"):
+        dsv4_engine._configure_streamed_optimizer_request(
+            _streamed_config(),
+            invalid,
+        )
+    assert not hasattr(invalid, "_lumen_streamed_optimizer_mode")
+    assert not hasattr(invalid, "_lumen_streamed_adam_chunk_numel")
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        ("adam", "512 MiB"),
+        ("off", "0 MiB (disabled)"),
+        ("sgd", "runtime-sized/unknown"),
+    ],
+)
+def test_streamed_optimizer_staging_diagnostic(mode, expected):
+    assert (
+        dsv4_engine._streamed_optimizer_staging_diagnostic(mode, 256)
+        == expected
+    )
+
+
+def test_bf16_streamed_adam_reports_four_staging_buffers():
+    assert (
+        dsv4_engine._streamed_optimizer_staging_diagnostic(
+            "adam",
+            256,
+            torch.bfloat16,
+        )
+        == "1024 MiB"
+    )
 
 
 def test_noaux_tc_router_uses_checkpoint_scoring_and_normalization():

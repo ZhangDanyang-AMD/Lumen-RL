@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import importlib.util
-from pathlib import Path
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
-
 
 _PATCH_SCRIPT = (
     Path(__file__).parents[2]
@@ -165,6 +164,629 @@ class HybridDeviceOptimizer:
     assert "cpu_param.add_(staging_view, alpha=-lr)" in patched
     assert "orig_param.copy_(cpu_param" in patched
     assert not patcher.patch_hybrid_optimizer_streaming_sgd(str(tmp_path))
+
+
+def _write_hybrid_optimizer_fixture(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        """
+import torch
+
+
+class HybridDeviceOptimizer:
+    def step(self, closure=None):
+        self._sync_hdo_param_groups_to_sub_optimizers()
+
+        self._d2h_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self._d2h_stream):
+            self._set_sub_optimizer_grads()
+"""
+    )
+
+
+def test_patch_hybrid_optimizer_streams_full_offload_adam(tmp_path) -> None:
+    optimizer = (
+        tmp_path
+        / "megatron"
+        / "core"
+        / "optimizer"
+        / "cpu_offloading"
+        / "hybrid_optimizer.py"
+    )
+    _write_hybrid_optimizer_fixture(optimizer)
+
+    assert patcher.STREAMED_ADAM_CAPABILITY == (
+        "LUMENRL_DSV4_CAPABILITY_STREAMED_ADAM"
+    )
+    assert patcher.patch_hybrid_optimizer_streaming_adam(str(tmp_path))
+
+    patched = optimizer.read_text()
+    assert (
+        "from lumenrl.engine.training.streamed_adam import (" in patched
+    )
+    assert "AdamChunkOptions" in patched
+    assert "adam_step_chunk_" in patched
+    assert "initialize_adam_state" in patched
+    assert "def _validate_full_offload_streaming_adam(" in patched
+    assert "def _stream_full_offload_adam_step(self, closure=None):" in patched
+    assert "LUMENRL_DSV4_CAPABILITY_STREAMED_ADAM = True" in patched
+
+    adam_source = patched[
+        patched.index("    def _validate_full_offload_streaming_adam(") :
+        patched.index("    def step(self, closure=None):")
+    ]
+    assert 'getattr(self, "_lumen_streamed_adam_chunk_numel"' in adam_source
+    assert "torch.empty(" in adam_source
+    assert "(staging_rows, chunk_numel)" in adam_source
+    assert "staging_rows = 4 if moment_dtype == torch.bfloat16 else 2" in adam_source
+    assert "pin_memory=True" in adam_source
+    assert "for chunk_start in range(0, cpu_param.numel(), chunk_numel):" in adam_source
+    assert "finish_slot(slot)" in adam_source
+    assert "adam_step_chunk_(" in adam_source
+    assert "cpu_copy_map_grad" not in adam_source
+    assert "_set_sub_optimizer_grads" not in adam_source
+    assert "parameter_group={group_index}" in adam_source
+    assert "chunk={chunk_index}" in adam_source
+
+    first_patch = optimizer.read_text()
+    assert not patcher.patch_hybrid_optimizer_streaming_adam(str(tmp_path))
+    assert optimizer.read_text() == first_patch
+
+
+def _patched_hybrid_optimizer_source(tmp_path: Path) -> tuple[Path, str]:
+    optimizer = (
+        tmp_path
+        / "megatron"
+        / "core"
+        / "optimizer"
+        / "cpu_offloading"
+        / "hybrid_optimizer.py"
+    )
+    _write_hybrid_optimizer_fixture(optimizer)
+    assert patcher.patch_hybrid_optimizer_streaming_adam(str(tmp_path))
+    return optimizer, optimizer.read_text()
+
+
+def test_streamed_adam_syncs_groups_before_validation_and_state_mutation(
+    tmp_path,
+) -> None:
+    optimizer_path, patched = _patched_hybrid_optimizer_source(tmp_path)
+    method_start = patched.index(
+        "    def _stream_full_offload_adam_step(self, closure=None):"
+    )
+    method_end = patched.index("\n    def step(self, closure=None):", method_start)
+    method_source = patched[method_start:method_end]
+    assert method_source.index(
+        "self._sync_hdo_param_groups_to_sub_optimizers()"
+    ) < method_source.index(
+        "self._validate_full_offload_streaming_adam(closure)"
+    )
+    assert method_source.index(
+        "self._validate_full_offload_streaming_adam(closure)"
+    ) < method_source.index(
+        "initialize_adam_state(cpu_param, moment_dtype=moment_dtype)"
+    )
+    assert method_source.index(
+        'getattr(\n            self, "_lumen_streamed_adam_moment_dtype"'
+    ) < method_source.index(
+        "initialize_adam_state(cpu_param, moment_dtype=moment_dtype)"
+    )
+
+    namespace: dict[str, object] = {}
+    exec(compile(patched, str(optimizer_path), "exec"), namespace)
+    optimizer_type = namespace["HybridDeviceOptimizer"]
+    instance = optimizer_type.__new__(optimizer_type)
+    group = {"lr": 1.0, "betas": (0.1, 0.2), "weight_decay": 3.0}
+    observations = []
+
+    def sync_groups():
+        observations.append("sync")
+        group.update(lr=0.01, betas=(0.9, 0.98), weight_decay=0.1)
+
+    def validate(_closure):
+        observations.append(
+            ("validate", group["lr"], group["betas"], group["weight_decay"])
+        )
+        return []
+
+    instance._sync_hdo_param_groups_to_sub_optimizers = sync_groups
+    instance._validate_full_offload_streaming_adam = validate
+    instance._sync_sub_optimizers_state_to_hdo = lambda: observations.append(
+        "sync_state"
+    )
+
+    assert instance._stream_full_offload_adam_step() is None
+    assert observations == [
+        "sync",
+        ("validate", 0.01, (0.9, 0.98), 0.1),
+        "sync_state",
+    ]
+    assert instance._lumen_streamed_adam_last_h2d_event is None
+
+
+def test_streamed_adam_records_completion_event_before_final_sync(
+    tmp_path,
+) -> None:
+    _, patched = _patched_hybrid_optimizer_source(tmp_path)
+    method_start = patched.index(
+        "    def _stream_full_offload_adam_step(self, closure=None):"
+    )
+    method_end = patched.index("\n    def step(self, closure=None):", method_start)
+    method_source = patched[method_start:method_end]
+    copy_index = method_source.index(
+        "orig_chunk.copy_(cpu_chunk, non_blocking=True)"
+    )
+    event_assignment = (
+        "self._lumen_streamed_adam_last_h2d_event = "
+        "self._h2d_stream.record_event()"
+    )
+    assert event_assignment in method_source
+    event_index = method_source.index(event_assignment)
+    final_sync_index = method_source.index(
+        "self._h2d_stream.synchronize()", event_index
+    )
+
+    assert copy_index < event_index < final_sync_index
+
+
+def test_streamed_adam_patch_rejects_missing_h2d_completion_event(
+    tmp_path,
+) -> None:
+    optimizer, patched = _patched_hybrid_optimizer_source(tmp_path)
+    event_assignment = (
+        "            self._lumen_streamed_adam_last_h2d_event = "
+        "self._h2d_stream.record_event()\n"
+    )
+    malformed = patched.replace(event_assignment, "", 1)
+    optimizer.write_text(malformed)
+
+    with pytest.raises(RuntimeError, match="partial.*streamed Adam"):
+        patcher.patch_hybrid_optimizer_streaming_adam(str(tmp_path))
+
+    assert optimizer.read_text() == malformed
+
+
+class _FakeCudaTensor:
+    def __init__(self, numel: int, *, contiguous: bool = True):
+        self.is_cuda = True
+        self.is_sparse = False
+        self._numel = numel
+        self._contiguous = contiguous
+        self.grad = None
+        self.decoupled_grad = None
+
+    def numel(self):
+        return self._numel
+
+    def is_contiguous(self):
+        return self._contiguous
+
+
+def _streamed_adam_validation_fixture(
+    tmp_path,
+    *,
+    cpu_contiguous: bool = True,
+    original_contiguous: bool = True,
+    gradient_contiguous: bool = True,
+):
+    optimizer_path, patched = _patched_hybrid_optimizer_source(tmp_path)
+    namespace: dict[str, object] = {}
+    exec(compile(patched, str(optimizer_path), "exec"), namespace)
+    optimizer_type = namespace["HybridDeviceOptimizer"]
+    instance = optimizer_type.__new__(optimizer_type)
+
+    cpu_storage = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    if not cpu_contiguous:
+        cpu_storage = cpu_storage.t()
+    cpu_master = torch.nn.Parameter(cpu_storage)
+    optimizer = torch.optim.AdamW(
+        [cpu_master],
+        lr=0.02,
+        betas=(0.9, 0.98),
+        eps=1e-8,
+        weight_decay=0.1,
+        amsgrad=False,
+        foreach=False,
+        capturable=False,
+        differentiable=False,
+        fused=True,
+    )
+    gradient = _FakeCudaTensor(
+        cpu_master.numel(), contiguous=gradient_contiguous
+    )
+    original = _FakeCudaTensor(
+        cpu_master.numel(), contiguous=original_contiguous
+    )
+    original.decoupled_grad = gradient
+    instance.offload_fraction = 1.0
+    instance.gpu_optimizer = None
+    instance.cpu_optimizers = [optimizer]
+    instance.cpu_copys_map_gpu_param = {cpu_master: original}
+    instance._lumen_streamed_adam_chunk_numel = 4
+    return instance, optimizer, cpu_master
+
+
+def test_streamed_adam_accepts_target_fused_adamw_metadata(tmp_path) -> None:
+    instance, optimizer, cpu_master = _streamed_adam_validation_fixture(
+        tmp_path
+    )
+
+    validated = instance._validate_full_offload_streaming_adam()
+
+    assert len(validated) == 1
+    options = validated[0][-1]
+    assert options.lr == 0.02
+    assert (options.beta1, options.beta2) == (0.9, 0.98)
+    assert options.weight_decay == 0.1
+    assert options.decoupled_weight_decay is True
+    assert optimizer.param_groups[0]["fused"] is True
+    assert optimizer.param_groups[0]["foreach"] is False
+    assert cpu_master not in optimizer.state
+
+
+@pytest.mark.parametrize(
+    "flag",
+    ["amsgrad", "differentiable", "capturable", "foreach"],
+)
+def test_streamed_adam_rejects_semantically_incompatible_flags(
+    tmp_path, flag
+) -> None:
+    instance, optimizer, cpu_master = _streamed_adam_validation_fixture(
+        tmp_path
+    )
+    optimizer.param_groups[0][flag] = True
+
+    with pytest.raises(RuntimeError, match=rf"parameter_group=0 flag={flag}"):
+        instance._validate_full_offload_streaming_adam()
+
+    assert cpu_master not in optimizer.state
+    assert optimizer.state == {}
+
+
+@pytest.mark.parametrize(
+    "noncontiguous",
+    ["cpu_master", "original", "gradient"],
+)
+def test_streamed_adam_rejects_noncontiguous_tensors_before_state_mutation(
+    tmp_path, noncontiguous
+) -> None:
+    instance, optimizer, cpu_master = _streamed_adam_validation_fixture(
+        tmp_path,
+        cpu_contiguous=noncontiguous != "cpu_master",
+        original_contiguous=noncontiguous != "original",
+        gradient_contiguous=noncontiguous != "gradient",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=rf"contiguous.*parameter_group=0.*tensor={noncontiguous}",
+    ):
+        instance._validate_full_offload_streaming_adam()
+
+    assert cpu_master not in optimizer.state
+    assert optimizer.state == {}
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (
+            "staging.shape != (staging_rows, chunk_numel)",
+            "staging.shape != (2, chunk_numel)",
+        ),
+        ("                pin_memory=True,", "                pin_memory=False,"),
+        ("                dtype=torch.float32,", "                dtype=torch.float16,"),
+        (
+            "            or staging.dtype != torch.float32\n",
+            "            or staging.dtype != torch.float16\n",
+        ),
+        ("            or staging.dtype != torch.float32\n", ""),
+        ("                    slot = sequence % 2", "                    slot = sequence % 3"),
+        (
+            "        consumed = []",
+            "        self.cpu_copy_map_grad()\n        consumed = []",
+        ),
+        (
+            "        consumed = []",
+            "        self._set_sub_optimizer_grads()\n        consumed = []",
+        ),
+        (
+            "            if stream is None or stream is failed_stream:",
+            "            if stream is None:",
+        ),
+        ("            orig_param.grad = None", "            pass  # grad retained"),
+        (
+            "            event.synchronize()",
+            (
+                "            orig_chunk.copy_(cpu_chunk, non_blocking=True)\n"
+                "            event.synchronize()"
+            ),
+        ),
+        (
+            "        pending = [None, None]",
+            (
+                "        self._h2d_stream.synchronize()\n"
+                "        pending = [None, None]"
+            ),
+        ),
+        (
+            (
+                "            self._h2d_stream.synchronize()\n"
+                "        except Exception as exc:\n"
+                "            self._raise_streamed_adam_transfer_error("
+            ),
+            (
+                "            pass  # final sync removed\n"
+                "        except Exception as exc:\n"
+                "            self._raise_streamed_adam_transfer_error("
+            ),
+        ),
+        ("        def finish_slot(slot):", "        def finish_slot_broken(slot):"),
+    ],
+)
+def test_streamed_adam_patch_rejects_malformed_full_patch(
+    tmp_path, old, new
+) -> None:
+    optimizer, patched = _patched_hybrid_optimizer_source(tmp_path)
+    assert old in patched
+    malformed = patched.replace(old, new, 1)
+    optimizer.write_text(malformed)
+
+    with pytest.raises(RuntimeError, match="partial.*streamed Adam"):
+        patcher.patch_hybrid_optimizer_streaming_adam(str(tmp_path))
+
+    assert optimizer.read_text() == malformed
+
+
+def test_streamed_adam_transfer_failures_are_contextual_and_not_retried(
+    tmp_path,
+) -> None:
+    _, patched = _patched_hybrid_optimizer_source(tmp_path)
+    adam_source = patched[
+        patched.index("    def _validate_full_offload_streaming_adam(") :
+        patched.index("    def step(self, closure=None):")
+    ]
+    assert "streamed Adam D2H copy failed at " in adam_source
+    assert "streamed Adam D2H event recording failed at " in adam_source
+    assert "streamed Adam D2H synchronize failed at " in adam_source
+    assert "streamed Adam update failed at " in adam_source
+    assert "streamed Adam H2D scheduling failed at " in adam_source
+    assert "streamed Adam H2D completion event recording failed at " in adam_source
+    assert "streamed Adam final H2D synchronize failed at " in adam_source
+    assert "parameter_group={group_index} chunk={chunk_index}" in adam_source
+    assert "last_context = (group_index, chunk_index)" in adam_source
+    assert "raise RuntimeError(" in adam_source
+    assert ") from exc" in adam_source
+    assert adam_source.count("scratch.copy_(") == 1
+    assert adam_source.count("self._d2h_stream.record_event()") == 1
+    assert adam_source.count("event.synchronize()") == 1
+    assert adam_source.count("adam_step_chunk_(") == 1
+    assert adam_source.count("orig_chunk.copy_(cpu_chunk, non_blocking=True)") == 1
+    stream_source = adam_source[
+        adam_source.index(
+            "    def _stream_full_offload_adam_step(self, closure=None):"
+        ) :
+    ]
+    assert stream_source.count(
+        "self._raise_streamed_adam_transfer_error("
+    ) == 7
+
+
+def test_streamed_adam_transfer_error_quiesces_both_streams(
+    tmp_path,
+) -> None:
+    optimizer_path, patched = _patched_hybrid_optimizer_source(tmp_path)
+    namespace: dict[str, object] = {}
+    exec(compile(patched, str(optimizer_path), "exec"), namespace)
+    optimizer_type = namespace["HybridDeviceOptimizer"]
+    instance = optimizer_type.__new__(optimizer_type)
+    calls = []
+
+    class FakeStream:
+        def __init__(self, name, fail=False):
+            self.name = name
+            self.fail = fail
+
+        def synchronize(self):
+            calls.append(self.name)
+            if self.fail:
+                raise RuntimeError(f"{self.name} quiesce failed")
+
+    instance._d2h_stream = FakeStream("d2h", fail=True)
+    instance._h2d_stream = FakeStream("h2d")
+    cause = ValueError("original transfer failure")
+    message = "streamed Adam D2H copy failed at parameter_group=2 chunk=5"
+
+    with pytest.raises(RuntimeError, match=message) as exc_info:
+        instance._raise_streamed_adam_transfer_error(message, cause)
+
+    assert exc_info.value.__cause__ is cause
+    assert calls == ["d2h", "h2d"]
+
+
+def test_streamed_adam_final_sync_quiesces_other_stream_without_retry(
+    tmp_path,
+) -> None:
+    optimizer_path, patched = _patched_hybrid_optimizer_source(tmp_path)
+    namespace: dict[str, object] = {}
+    exec(compile(patched, str(optimizer_path), "exec"), namespace)
+    optimizer_type = namespace["HybridDeviceOptimizer"]
+    instance = optimizer_type.__new__(optimizer_type)
+    calls = []
+
+    class FakeStream:
+        def __init__(self, name, fail=False):
+            self.name = name
+            self.fail = fail
+
+        def synchronize(self):
+            calls.append(self.name)
+            if self.fail:
+                raise ValueError(f"{self.name} final sync failed")
+
+    instance._d2h_stream = FakeStream("d2h")
+    instance._h2d_stream = FakeStream("h2d", fail=True)
+    message = (
+        "streamed Adam final H2D synchronize failed at "
+        "parameter_group=2 chunk=5"
+    )
+
+    cause = None
+    try:
+        instance._h2d_stream.synchronize()
+    except ValueError as error:
+        cause = error
+        with pytest.raises(RuntimeError, match=message) as exc_info:
+            instance._raise_streamed_adam_transfer_error(
+                message,
+                cause,
+                failed_stream=instance._h2d_stream,
+            )
+
+    assert exc_info.value.__cause__ is cause
+    assert calls == ["h2d", "d2h"]
+
+
+def test_streamed_adam_dispatch_precedes_sgd_and_preserves_upstream(tmp_path) -> None:
+    optimizer = (
+        tmp_path
+        / "megatron"
+        / "core"
+        / "optimizer"
+        / "cpu_offloading"
+        / "hybrid_optimizer.py"
+    )
+    _write_hybrid_optimizer_fixture(optimizer)
+    assert patcher.patch_hybrid_optimizer_streaming_adam(str(tmp_path))
+    assert patcher.patch_hybrid_optimizer_streaming_sgd(str(tmp_path))
+
+    patched = optimizer.read_text()
+    step_source = patched[patched.index("    def step(self, closure=None):") :]
+    adam_dispatch = 'if streamed_optimizer_mode == "adam":'
+    sgd_dispatch = 'if streamed_optimizer_mode in (None, "sgd"):'
+    assert adam_dispatch in step_source
+    assert sgd_dispatch in step_source
+    assert step_source.index(adam_dispatch) < step_source.index(sgd_dispatch)
+    assert "if self._can_stream_full_offload_sgd():" in step_source
+    assert "_sync_hdo_param_groups_to_sub_optimizers()" in step_source
+
+
+@pytest.mark.parametrize(
+    "partial_marker",
+    [
+        "def _stream_full_offload_adam_step(self, closure=None):\n        pass\n",
+        "LUMENRL_DSV4_CAPABILITY_STREAMED_ADAM = True\n",
+        "from lumenrl.engine.training.streamed_adam import AdamChunkOptions\n",
+    ],
+)
+def test_streamed_adam_patch_rejects_partial_patch_without_writing(
+    tmp_path, partial_marker
+) -> None:
+    optimizer = (
+        tmp_path
+        / "megatron"
+        / "core"
+        / "optimizer"
+        / "cpu_offloading"
+        / "hybrid_optimizer.py"
+    )
+    _write_hybrid_optimizer_fixture(optimizer)
+    partial = optimizer.read_text().replace(
+        "class HybridDeviceOptimizer:\n",
+        partial_marker + "\nclass HybridDeviceOptimizer:\n",
+    )
+    optimizer.write_text(partial)
+
+    with pytest.raises(RuntimeError, match="partial.*streamed Adam"):
+        patcher.patch_hybrid_optimizer_streaming_adam(str(tmp_path))
+
+    assert optimizer.read_text() == partial
+
+
+def test_streamed_adam_patch_upgrades_known_fp32_only_version(tmp_path) -> None:
+    optimizer, current = _patched_hybrid_optimizer_source(tmp_path)
+    legacy = current.replace(
+        '        moment_dtype = getattr(\n'
+        '            self, "_lumen_streamed_adam_moment_dtype", torch.float32\n'
+        '        )\n'
+        '        if moment_dtype not in (torch.float32, torch.bfloat16):\n'
+        '            raise RuntimeError(\n'
+        '                "_lumen_streamed_adam_moment_dtype must be float32 or bfloat16"\n'
+        '            )\n',
+        "",
+        1,
+    )
+    legacy = legacy.replace("or tensor.dtype != moment_dtype", "or tensor.dtype != torch.float32", 1)
+    legacy = legacy.replace(
+        "initialize_adam_state(cpu_param, moment_dtype=moment_dtype)",
+        "initialize_adam_state(cpu_param)",
+        1,
+    )
+    legacy = legacy.replace(
+        '        moment_dtype = getattr(\n'
+        '            self, "_lumen_streamed_adam_moment_dtype", torch.float32\n'
+        '        )\n',
+        "",
+        1,
+    )
+    legacy = legacy.replace(
+        '        staging_rows = 4 if moment_dtype == torch.bfloat16 else 2\n',
+        "",
+        1,
+    )
+    legacy = legacy.replace("(staging_rows, chunk_numel)", "(2, chunk_numel)")
+    workspace_block = (
+        "                    exp_avg_workspace=(\n"
+        "                        staging[2, : exp_avg_chunk.numel()]\n"
+        "                        if moment_dtype == torch.bfloat16\n"
+        "                        else None\n"
+        "                    ),\n"
+        "                    exp_avg_sq_workspace=(\n"
+        "                        staging[3, : exp_avg_sq_chunk.numel()]\n"
+        "                        if moment_dtype == torch.bfloat16\n"
+        "                        else None\n"
+        "                    ),\n"
+    )
+    legacy = legacy.replace(workspace_block, "", 1)
+    optimizer.write_text(legacy)
+
+    assert patcher.patch_hybrid_optimizer_streaming_adam(str(tmp_path))
+    upgraded = optimizer.read_text()
+    assert patcher._streamed_adam_patch_state(upgraded) == "complete"
+    assert "_lumen_streamed_adam_moment_dtype" in upgraded
+    assert "exp_avg_workspace=" in upgraded
+
+
+def test_streamed_adam_patch_repairs_moment_dtype_ordering(tmp_path) -> None:
+    optimizer, current = _patched_hybrid_optimizer_source(tmp_path)
+    method_start = current.index(
+        "    def _stream_full_offload_adam_step(self, closure=None):"
+    )
+    method_end = current.index("\n    def step(self, closure=None):", method_start)
+    method = current[method_start:method_end]
+    moment_setup = (
+        '        moment_dtype = getattr(\n'
+        '            self, "_lumen_streamed_adam_moment_dtype", torch.float32\n'
+        '        )\n'
+    )
+    method = method.replace(moment_setup, "", 1)
+    method = method.replace(
+        '        staging_rows = 4 if moment_dtype == torch.bfloat16 else 2\n',
+        moment_setup
+        + '        staging_rows = 4 if moment_dtype == torch.bfloat16 else 2\n',
+        1,
+    )
+    optimizer.write_text(current[:method_start] + method + current[method_end:])
+
+    assert patcher.patch_hybrid_optimizer_streaming_adam(str(tmp_path))
+    repaired = optimizer.read_text()
+    repaired_method = repaired[
+        repaired.index("    def _stream_full_offload_adam_step(self, closure=None):") :
+        repaired.index("\n    def step(self, closure=None):")
+    ]
+    assert repaired_method.index(moment_setup) < repaired_method.index(
+        "initialize_adam_state(cpu_param, moment_dtype=moment_dtype)"
+    )
 
 
 def test_patch_transformer_config_admits_sqrtsoftplus_idempotently(tmp_path) -> None:
@@ -887,6 +1509,7 @@ _OPTIONAL_PATCHERS = (
     "patch_tp_layers",
     "patch_tp_copy_fp32_gradient_reduce",
     "patch_hybrid_optimizer_disable_foreach",
+    "patch_hybrid_optimizer_streaming_adam",
     "patch_hybrid_optimizer_streaming_sgd",
     "patch_distrib_optimizer_fp32_detach",
     "patch_distrib_optimizer_grad_copy",
@@ -943,6 +1566,28 @@ def test_main_validates_required_patches_and_reports_actual_router_source(
     patcher.main(str(tmp_path))
     second_output = capsys.readouterr().out
     assert "transformer/moe/moe_utils.py" in second_output
+
+
+def test_main_registers_streamed_adam_between_foreach_and_sgd(
+    tmp_path, monkeypatch
+) -> None:
+    _write_required_main_fixtures(tmp_path)
+    calls = []
+    for name in _OPTIONAL_PATCHERS:
+        monkeypatch.setattr(
+            patcher,
+            name,
+            lambda _root, patch_name=name: calls.append(patch_name) or False,
+        )
+
+    patcher.main(str(tmp_path))
+
+    assert calls.index("patch_hybrid_optimizer_disable_foreach") < calls.index(
+        "patch_hybrid_optimizer_streaming_adam"
+    )
+    assert calls.index("patch_hybrid_optimizer_streaming_adam") < calls.index(
+        "patch_hybrid_optimizer_streaming_sgd"
+    )
 
 
 def test_required_validation_rejects_config_substring_false_positive(

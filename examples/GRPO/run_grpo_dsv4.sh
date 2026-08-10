@@ -66,7 +66,7 @@ export LUMEN_DISABLE_HF_ATTN_PATCH=1
 
 # DSV4-specific env vars
 # vLLM uses AITER kernels for FP8 inference on MI308X
-export VLLM_ROCM_USE_AITER=1
+export VLLM_ROCM_USE_AITER="${VLLM_ROCM_USE_AITER:-1}"
 # Disable torch dynamo for DSV4 training stability
 export TORCHDYNAMO_DISABLE=1
 # MI308X GFX version override
@@ -114,7 +114,7 @@ done
 # ═══════════════════════════════════════════════════════════════════════
 # Config selection (vLLM only — no ATOM backend for DSV4)
 # ═══════════════════════════════════════════════════════════════════════
-if [ "$MODE" = "longrun" ]; then
+if [ "$MODE" = "longrun" ] || [ "${LUMENRL_WEIGHT_SYNC_VALIDATE:-0}" = "1" ]; then
   CONFIG=examples/GRPO/configs/grpo_dsv4_flash_vllm_longrun.yaml
 else
   CONFIG=examples/GRPO/configs/grpo_dsv4_flash_vllm_smoke.yaml
@@ -180,7 +180,14 @@ fi
 if [ -n "${WEIGHT_SYNC_BACKEND:-}" ]; then
   EXTRA_OVERRIDES+=("weight_sync.backend=$WEIGHT_SYNC_BACKEND")
 fi
-python3 -u -m lumenrl.trainer.main --config "$CONFIG" \
+if [ -n "${FP8_QUANTIZATION_LOCATION:-}" ]; then
+  EXTRA_OVERRIDES+=("weight_sync.fp8_quantization_location=$FP8_QUANTIZATION_LOCATION")
+fi
+ENTRYPOINT=(python3 -u -m lumenrl.trainer.main)
+if [ "${LUMENRL_WEIGHT_SYNC_VALIDATE:-0}" = "1" ]; then
+  ENTRYPOINT=(python3 -u examples/GRPO/dsv4/validate_weight_sync.py)
+fi
+"${ENTRYPOINT[@]}" --config "$CONFIG" \
   policy.model_name="$MODEL_PATH" \
   reward.dataset="$TRAIN_FILE" \
   val_dataset="$VAL_FILE" \

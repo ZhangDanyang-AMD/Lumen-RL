@@ -27,6 +27,56 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LUMENRL_LOGGING_LEVEL", "WARN"))
 
 
+def _install_all_gather_lifecycle_diagnostics(group_cls=None) -> None:
+    """Bracket one target-sized AITER AllGather with device synchronizations."""
+    if os.environ.get("LUMENRL_DIAG_ALL_GATHER", "0") != "1":
+        return
+    if group_cls is None:
+        from aiter.dist.parallel_state import GroupCoordinator
+
+        group_cls = GroupCoordinator
+
+    original = group_cls.all_gather
+    if getattr(original, "_lumenrl_lifecycle_diagnostic", False):
+        return
+    target_numel = int(os.environ.get("LUMENRL_DIAG_ALL_GATHER_NUMEL", "517120"))
+
+    def all_gather(self, input_, use_custom=False, dim=-1):
+        if input_.numel() != target_numel:
+            return original(self, input_, use_custom=use_custom, dim=dim)
+
+        storage = input_.untyped_storage()
+        logger.warning(
+            "[AG_LIFECYCLE] phase=before_presync rank=%s shape=%s dtype=%s "
+            "device=%s contiguous=%s ptr=%#x storage_ptr=%#x storage_nbytes=%d "
+            "storage_offset_bytes=%d dim=%d use_custom=%s",
+            getattr(self, "rank_in_group", getattr(self, "rank", "?")),
+            tuple(input_.shape),
+            input_.dtype,
+            input_.device,
+            input_.is_contiguous(),
+            input_.data_ptr(),
+            storage.data_ptr(),
+            storage.nbytes(),
+            input_.data_ptr() - storage.data_ptr(),
+            dim,
+            use_custom,
+        )
+        torch.cuda.synchronize(input_.device)
+        logger.warning("[AG_LIFECYCLE] phase=after_presync")
+        output = original(self, input_, use_custom=use_custom, dim=dim)
+        torch.cuda.synchronize(input_.device)
+        logger.warning(
+            "[AG_LIFECYCLE] phase=after_all_gather output_shape=%s output_ptr=%#x",
+            tuple(output.shape),
+            output.data_ptr(),
+        )
+        return output
+
+    all_gather._lumenrl_lifecycle_diagnostic = True
+    group_cls.all_gather = all_gather
+
+
 def _monkey_patch_compute_logits(model, vocab_size: int) -> None:
     """Mask out-of-vocab (padded) logits to -inf (verl monkey_patch_compute_logits).
 
@@ -104,6 +154,7 @@ class vLLMColocateWorkerExtension:
 
     def monkey_patch_model(self, vocab_size: int) -> None:
         """verl-aligned engine-init patch: mask OOV/padded logits to -inf."""
+        _install_all_gather_lifecycle_diagnostics()
         model = self.model_runner.model
         _monkey_patch_compute_logits(model, vocab_size)
         logger.info("monkey_patch_model: compute_logits OOV mask (vocab=%d)", vocab_size)

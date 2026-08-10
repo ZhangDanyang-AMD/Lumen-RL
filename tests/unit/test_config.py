@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+from dataclasses import fields
 from pathlib import Path
+from typing import get_type_hints
 
 import pytest
 from omegaconf import OmegaConf
 
-from lumenrl.core.config import LumenRLConfig, WeightSyncConfig
+from lumenrl.core.config import (
+    LumenRLConfig,
+    WeightSyncConfig,
+)
+from lumenrl.core.config import MegatronConfig as CoreMegatronConfig
+from lumenrl.core.config import VLLMConfig as CoreVLLMConfig
 from lumenrl.core.types import AlgorithmName, GenerationBackend, TrainingBackend
+from lumenrl.engine.training.config import MegatronConfig as TrainingMegatronConfig
+from lumenrl.engine.training.config import VLLMConfig as TrainingVLLMConfig
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GRPO_YAML = REPO_ROOT / "configs" / "grpo_dense_bf16.yaml"
@@ -31,6 +40,35 @@ def test_default_config() -> None:
     assert cfg.logger.wandb_enabled is False
     assert cfg.assembly.training_backend == "fsdp2"
     assert cfg.assembly.inference_backend == "atom"
+
+
+@pytest.mark.parametrize("config_type", [CoreMegatronConfig, TrainingMegatronConfig])
+def test_megatron_streamed_optimizer_defaults(config_type: type) -> None:
+    cfg = config_type()
+
+    assert cfg.streamed_optimizer_mode == "off"
+    assert cfg.streamed_optimizer_chunk_size_mib == 256
+
+
+def test_megatron_streamed_optimizer_schema_parity() -> None:
+    core_fields = {field.name: field for field in fields(CoreMegatronConfig)}
+    training_fields = {field.name: field for field in fields(TrainingMegatronConfig)}
+    core_hints = get_type_hints(CoreMegatronConfig)
+    training_hints = get_type_hints(TrainingMegatronConfig)
+
+    for name, annotation, default in (
+        ("streamed_optimizer_mode", str, "off"),
+        ("streamed_optimizer_chunk_size_mib", int, 256),
+        ("streamed_optimizer_moment_dtype", str, "fp32"),
+    ):
+        assert core_fields[name].name == training_fields[name].name == name
+        assert core_hints[name] == training_hints[name] == annotation
+        assert core_fields[name].default == training_fields[name].default == default
+
+
+def test_vllm_prefix_cache_schema_parity() -> None:
+    for config_type in (CoreVLLMConfig, TrainingVLLMConfig):
+        assert config_type().enable_prefix_caching is False
 
 
 def test_from_yaml() -> None:
@@ -220,7 +258,24 @@ def test_dsv4_smoke_preserves_sgd_and_uses_miles_grpo_semantics() -> None:
 def test_dsv4_longrun_uses_miles_adam_and_grpo_semantics() -> None:
     cfg = LumenRLConfig.from_yaml(DSV4_LONGRUN_YAML)
 
+    assert cfg.policy.generation.vllm_cfg.moe_backend == "auto"
+    assert cfg.policy.generation.vllm_cfg.linear_backend == "auto"
+    assert cfg.policy.generation.vllm_cfg.enable_prefix_caching is False
+    assert cfg.policy.generation.vllm_cfg.quantization == "fp8_per_block"
+    assert cfg.policy.generation.vllm_cfg.kv_cache_dtype == "fp8_e4m3"
+    assert cfg.policy.generation.vllm_cfg.calculate_log_probs is True
+    assert cfg.weight_sync.fp8_quantization_location == "inference"
+    assert cfg.policy.max_response_length == 4096
+    assert cfg.policy.max_total_sequence_length == 16384
+    assert cfg.policy.train_global_batch_size == 256
+    assert cfg.policy.gen_batch_size == 32
     assert cfg.policy.optimizer_type == "adam"
+    assert cfg.policy.training.megatron_cfg.optimizer_cpu_offload is True
+    assert cfg.policy.training.megatron_cfg.optimizer_offload_fraction == 1.0
+    assert cfg.policy.training.megatron_cfg.use_precision_aware_optimizer is True
+    assert cfg.policy.training.megatron_cfg.streamed_optimizer_mode == "adam"
+    assert cfg.policy.training.megatron_cfg.streamed_optimizer_chunk_size_mib == 256
+    assert cfg.policy.training.megatron_cfg.streamed_optimizer_moment_dtype == "bf16"
     assert cfg.policy.learning_rate == 1.0e-6
     assert cfg.policy.weight_decay == 0.1
     assert cfg.policy.adam_beta1 == 0.9
@@ -230,4 +285,10 @@ def test_dsv4_longrun_uses_miles_adam_and_grpo_semantics() -> None:
     assert cfg.algorithm.loss_agg_mode == "seq-mean-token-mean"
     assert cfg.algorithm.grpo.clip_ratio == 0.2
     assert cfg.algorithm.clip_ratio_high == 0.28
-    assert cfg.quantization.rollout_correction.rollout_is is None
+    assert cfg.quantization.rollout_correction.rollout_is == "token"
+    assert cfg.quantization.rollout_correction.rollout_is_batch_normalize is True
+    assert cfg.moe.r3.enabled is True
+    assert cfg.moe.r3.record_router_logits is False
+    assert cfg.checkpointing.save_steps == 5
+    assert cfg.checkpointing.save_total_limit == 2
+    assert cfg.num_training_steps == 200
