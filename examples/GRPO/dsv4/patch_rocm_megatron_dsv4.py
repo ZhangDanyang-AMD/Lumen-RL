@@ -25,7 +25,6 @@ import os
 import re
 import sys
 
-
 CHECKPOINT_REPLAY_CAPABILITY = (
     "LUMENRL_R3_CAPABILITY_CHECKPOINT_REPLAY_BACKWARD"
 )
@@ -33,6 +32,7 @@ ROUTER_REPLAY_FIFO_CAPABILITY = "LUMENRL_R3_CAPABILITY_ROUTER_REPLAY_FIFO"
 REPLAY_DIAGNOSTICS_CAPABILITY = (
     "LUMENRL_R3_CAPABILITY_REPLAY_DIAGNOSTICS"
 )
+STREAMED_ADAM_CAPABILITY = "LUMENRL_DSV4_CAPABILITY_STREAMED_ADAM"
 
 
 def _stamp_capabilities(content: str, markers: tuple[str, ...]) -> str:
@@ -1032,6 +1032,866 @@ def patch_hybrid_optimizer_disable_foreach(megatron_root: str) -> bool:
     return True
 
 
+def _streamed_adam_patch_state(content: str) -> str:
+    """Return ``absent``, ``complete``, or ``partial`` for streamed Adam."""
+    patch_markers = (
+        STREAMED_ADAM_CAPABILITY,
+        "lumenrl.engine.training.streamed_adam",
+        "_validate_full_offload_streaming_adam",
+        "_stream_full_offload_adam_step",
+        "_lumen_streamed_adam_chunk_numel",
+    )
+    has_marker = any(marker in content for marker in patch_markers)
+    if not has_marker:
+        return "absent"
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return "partial"
+    optimizer_class = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "HybridDeviceOptimizer"
+        ),
+        None,
+    )
+    if optimizer_class is None:
+        return "partial"
+    methods = {
+        node.name: node
+        for node in optimizer_class.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    required_methods = {
+        "_validate_full_offload_streaming_adam",
+        "_raise_streamed_adam_transfer_error",
+        "_stream_full_offload_adam_step",
+        "step",
+    }
+    imported_names = set()
+    for node in tree.body:
+        if (
+            isinstance(node, ast.ImportFrom)
+            and node.module == "lumenrl.engine.training.streamed_adam"
+        ):
+            imported_names.update(alias.name for alias in node.names)
+    required_imports = {
+        "AdamChunkOptions",
+        "adam_step_chunk_",
+        "initialize_adam_state",
+    }
+    capability_is_true = any(
+        isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == STREAMED_ADAM_CAPABILITY
+            for target in node.targets
+        )
+        and isinstance(node.value, ast.Constant)
+        and node.value.value is True
+        for node in tree.body
+    )
+    source_lines = content.splitlines(keepends=True)
+
+    def method_source(name: str) -> str:
+        node = methods.get(name)
+        if node is None or node.end_lineno is None:
+            return ""
+        return "".join(source_lines[node.lineno - 1 : node.end_lineno])
+
+    validate_source = method_source("_validate_full_offload_streaming_adam")
+    transfer_error_source = method_source(
+        "_raise_streamed_adam_transfer_error"
+    )
+    stream_source = method_source("_stream_full_offload_adam_step")
+    step_source = method_source("step")
+    validate_tokens = (
+        "_lumen_streamed_adam_chunk_numel",
+        "_lumen_streamed_adam_moment_dtype",
+        "AdamChunkOptions(",
+        "torch.optim.Adam",
+        "torch.optim.AdamW",
+        "cpu_copys_map_gpu_param",
+        "existing_state = optimizer.state.get(cpu_param)",
+        "tensor=cpu_master",
+        "not orig_param.is_contiguous()",
+        "tensor=original",
+        "not grad.is_contiguous()",
+        "tensor=gradient",
+    )
+    transfer_error_tokens = (
+        "failed_stream=None",
+        '("_d2h_stream", "_h2d_stream")',
+        "getattr(self, stream_name, None)",
+        "stream is None or stream is failed_stream",
+        "stream.synchronize()",
+        "except Exception:",
+        "raise RuntimeError(message) from exc",
+    )
+    stream_tokens = (
+        "staging.shape != (staging_rows, chunk_numel)",
+        "staging.dtype != torch.float32",
+        "(staging_rows, chunk_numel)",
+        "dtype=torch.float32",
+        "pin_memory=True",
+        "pending = [None, None]",
+        "slot = sequence % 2",
+        "def finish_slot(slot):",
+        "event.synchronize()",
+        "adam_step_chunk_(",
+        "exp_avg_workspace=",
+        "exp_avg_sq_workspace=",
+        "orig_chunk.copy_(cpu_chunk, non_blocking=True)",
+        "for chunk_start in range(0, cpu_param.numel(), chunk_numel):",
+        "scratch.copy_(",
+        "self._d2h_stream.record_event()",
+        "last_context = (group_index, chunk_index)",
+        "self._lumen_streamed_adam_last_h2d_event = None",
+        (
+            "self._lumen_streamed_adam_last_h2d_event = "
+            "self._h2d_stream.record_event()"
+        ),
+        "orig_param.decoupled_grad = None",
+        "orig_param.grad = None",
+        "self._sync_sub_optimizers_state_to_hdo()",
+        "streamed Adam D2H copy failed at ",
+        "streamed Adam D2H event recording failed at ",
+        "streamed Adam D2H synchronize failed at ",
+        "streamed Adam update failed at ",
+        "streamed Adam H2D scheduling failed at ",
+        "streamed Adam H2D completion event recording failed at ",
+        "streamed Adam final H2D synchronize failed at ",
+        "failed_stream=self._h2d_stream",
+    )
+    sync_index = stream_source.find(
+        "self._sync_hdo_param_groups_to_sub_optimizers()"
+    )
+    validate_index = stream_source.find(
+        "self._validate_full_offload_streaming_adam(closure)"
+    )
+    initialize_index = stream_source.find(
+        "initialize_adam_state(cpu_param, moment_dtype=moment_dtype)"
+    )
+    finish_start = stream_source.find("def finish_slot(slot):")
+    finish_end = stream_source.find("\n        consumed =", finish_start)
+    finish_source = stream_source[finish_start:finish_end]
+    d2h_copy_index = stream_source.find("scratch.copy_(")
+    record_event_index = stream_source.find("self._d2h_stream.record_event()")
+    h2d_copy_index = stream_source.find(
+        "orig_chunk.copy_(cpu_chunk, non_blocking=True)"
+    )
+    h2d_event_index = stream_source.find(
+        "self._lumen_streamed_adam_last_h2d_event = "
+        "self._h2d_stream.record_event()"
+    )
+    final_sync_index = stream_source.find(
+        "self._h2d_stream.synchronize()", h2d_event_index
+    )
+    final_context_index = stream_source.find(
+        "group_index, chunk_index = last_context"
+    )
+    final_error_index = stream_source.find(
+        "streamed Adam final H2D synchronize failed at "
+    )
+    clear_grad_index = stream_source.find("orig_param.grad = None")
+    stream_structure_is_complete = (
+        all(token in stream_source for token in stream_tokens)
+        and stream_source.count("(staging_rows, chunk_numel)") == 2
+        and stream_source.count("pending = [None, None]") == 1
+        and stream_source.count("event.synchronize()") == 1
+        and stream_source.count(
+            "orig_chunk.copy_(cpu_chunk, non_blocking=True)"
+        )
+        == 1
+        and stream_source.count("pin_memory=True") == 1
+        and stream_source.count("dtype=torch.float32") == 1
+        and stream_source.count("staging.dtype != torch.float32") == 1
+        and stream_source.count("slot = sequence % 2") == 1
+        and stream_source.count("scratch.copy_(") == 1
+        and stream_source.count("self._d2h_stream.record_event()") == 1
+        and stream_source.count(
+            "self._lumen_streamed_adam_last_h2d_event = "
+            "self._h2d_stream.record_event()"
+        )
+        == 1
+        and stream_source.count("self._h2d_stream.synchronize()") == 1
+        and stream_source.count(
+            "self._raise_streamed_adam_transfer_error("
+        )
+        == 7
+        and 0 <= sync_index < validate_index < initialize_index
+        and 0 <= d2h_copy_index < record_event_index
+        and 0 <= h2d_copy_index < h2d_event_index < final_sync_index
+        and 0 <= finish_start < finish_end
+        and finish_source.find("event.synchronize()")
+        < finish_source.find("adam_step_chunk_(")
+        < finish_source.find("orig_chunk.copy_(cpu_chunk, non_blocking=True)")
+        and 0 <= final_context_index < final_error_index < clear_grad_index
+        and "cpu_copy_map_grad" not in stream_source
+        and "_set_sub_optimizer_grads" not in stream_source
+    )
+    complete = (
+        required_methods <= methods.keys()
+        and required_imports <= imported_names
+        and capability_is_true
+        and all(token in validate_source for token in validate_tokens)
+        and '"fused",' not in validate_source
+        and all(
+            token in transfer_error_source
+            for token in transfer_error_tokens
+        )
+        and stream_structure_is_complete
+        and 'streamed_optimizer_mode == "adam"' in step_source
+    )
+    return "complete" if complete else "partial"
+
+
+def _upgrade_legacy_streamed_adam_patch(content: str) -> str | None:
+    """Upgrade the exact FP32-only streamed-Adam patch emitted previously."""
+    legacy_tokens = (
+        "LUMENRL_DSV4_CAPABILITY_STREAMED_ADAM = True",
+        "initialize_adam_state(cpu_param)",
+        "staging.shape != (2, chunk_numel)",
+        "torch.empty(\n                (2, chunk_numel),",
+        "or tensor.dtype != torch.float32",
+    )
+    if (
+        not all(token in content for token in legacy_tokens)
+        or "_lumen_streamed_adam_moment_dtype" in content
+        or "exp_avg_workspace=" in content
+    ):
+        return None
+
+    chunk_validation = '''        if chunk_numel <= 0:
+            raise RuntimeError(
+                "_lumen_streamed_adam_chunk_numel must be positive"
+            )
+'''
+    moment_validation = chunk_validation + '''        moment_dtype = getattr(
+            self, "_lumen_streamed_adam_moment_dtype", torch.float32
+        )
+        if moment_dtype not in (torch.float32, torch.bfloat16):
+            raise RuntimeError(
+                "_lumen_streamed_adam_moment_dtype must be float32 or bfloat16"
+            )
+'''
+    if content.count(chunk_validation) != 1:
+        return None
+    upgraded = content.replace(chunk_validation, moment_validation, 1)
+    upgraded = upgraded.replace(
+        "or tensor.dtype != torch.float32",
+        "or tensor.dtype != moment_dtype",
+        1,
+    )
+    upgraded = upgraded.replace(
+        "initialize_adam_state(cpu_param)",
+        "initialize_adam_state(cpu_param, moment_dtype=moment_dtype)",
+        1,
+    )
+    validated_marker = '''        if not validated:
+            self._sync_sub_optimizers_state_to_hdo()
+            return None
+'''
+    moment_setup = validated_marker + '''        moment_dtype = getattr(
+            self, "_lumen_streamed_adam_moment_dtype", torch.float32
+        )
+'''
+    if upgraded.count(validated_marker) != 1:
+        return None
+    upgraded = upgraded.replace(validated_marker, moment_setup, 1)
+    staging_marker = '''        staging = getattr(
+            self, "_lumen_streamed_adam_buffers", None)
+'''
+    if staging_marker not in upgraded:
+        staging_marker = '''        staging = getattr(self, "_lumen_streamed_adam_buffers", None)
+'''
+    if staging_marker not in upgraded:
+        return None
+    staging_setup = '''        staging_rows = 4 if moment_dtype == torch.bfloat16 else 2
+'''
+    upgraded = upgraded.replace(staging_marker, staging_setup + staging_marker, 1)
+    upgraded = upgraded.replace("(2, chunk_numel)", "(staging_rows, chunk_numel)")
+    call_marker = '''                    exp_avg_sq_chunk,
+                    step=step,
+'''
+    workspace_block = '''                    exp_avg_sq_chunk,
+                    exp_avg_workspace=(
+                        staging[2, : exp_avg_chunk.numel()]
+                        if moment_dtype == torch.bfloat16
+                        else None
+                    ),
+                    exp_avg_sq_workspace=(
+                        staging[3, : exp_avg_sq_chunk.numel()]
+                        if moment_dtype == torch.bfloat16
+                        else None
+                    ),
+                    step=step,
+'''
+    if upgraded.count(call_marker) != 1:
+        return None
+    return upgraded.replace(call_marker, workspace_block, 1)
+
+
+def _repair_streamed_adam_moment_ordering(content: str) -> str | None:
+    """Move moment dtype lookup before first-state initialization."""
+    method_start = content.find(
+        "    def _stream_full_offload_adam_step(self, closure=None):"
+    )
+    method_end = content.find("\n    def step(self, closure=None):", method_start)
+    if method_start < 0 or method_end < 0:
+        return None
+    method = content[method_start:method_end]
+    moment_setup = '''        moment_dtype = getattr(
+            self, "_lumen_streamed_adam_moment_dtype", torch.float32
+        )
+'''
+    initialize_index = method.find(
+        "initialize_adam_state(cpu_param, moment_dtype=moment_dtype)"
+    )
+    moment_index = method.find(moment_setup)
+    if moment_index < 0 or initialize_index < 0 or moment_index < initialize_index:
+        return None
+    validated_marker = '''        if not validated:
+            self._sync_sub_optimizers_state_to_hdo()
+            return None
+'''
+    if method.count(moment_setup) != 1 or method.count(validated_marker) != 1:
+        return None
+    method = method.replace(moment_setup, "", 1)
+    method = method.replace(
+        validated_marker,
+        validated_marker + moment_setup,
+        1,
+    )
+    return content[:method_start] + method + content[method_end:]
+
+
+def patch_hybrid_optimizer_streaming_adam(megatron_root: str) -> bool:
+    """Add bounded-memory full-offload Adam/AdamW chunk streaming."""
+    path = os.path.join(
+        megatron_root,
+        "megatron",
+        "core",
+        "optimizer",
+        "cpu_offloading",
+        "hybrid_optimizer.py",
+    )
+    with open(path) as f:
+        content = f.read()
+    state = _streamed_adam_patch_state(content)
+    if state == "complete":
+        repaired = _repair_streamed_adam_moment_ordering(content)
+        if repaired is not None:
+            with open(path, "w") as f:
+                f.write(repaired)
+            return True
+        return False
+    if state == "partial":
+        upgraded = _upgrade_legacy_streamed_adam_patch(content)
+        if upgraded is None or _streamed_adam_patch_state(upgraded) != "complete":
+            raise RuntimeError(
+                "HybridDeviceOptimizer has a partial streamed Adam patch; "
+                "refusing to modify it"
+            )
+        with open(path, "w") as f:
+            f.write(upgraded)
+        return True
+
+    class_marker = "class HybridDeviceOptimizer"
+    step_signature = "    def step(self, closure=None):\n"
+    if class_marker not in content or step_signature not in content:
+        return False
+    imports = '''import math
+
+from lumenrl.engine.training.streamed_adam import (
+    AdamChunkOptions,
+    adam_step_chunk_,
+    initialize_adam_state,
+)
+
+
+'''
+    content = content.replace(class_marker, imports + class_marker, 1)
+    methods = '''    def _validate_full_offload_streaming_adam(self, closure=None):
+        """Validate the complete streamed Adam step before mutating any state."""
+        if closure is not None:
+            raise RuntimeError(
+                "streamed full-offload Adam does not support closures"
+            )
+        if self.offload_fraction != 1.0:
+            raise RuntimeError(
+                "streamed full-offload Adam requires offload_fraction exactly 1.0"
+            )
+        if self.gpu_optimizer is not None:
+            raise RuntimeError(
+                "streamed full-offload Adam requires no GPU optimizer"
+            )
+        if not self.cpu_optimizers:
+            raise RuntimeError(
+                "streamed full-offload Adam requires a CPU optimizer"
+            )
+        chunk_numel = int(
+            getattr(self, "_lumen_streamed_adam_chunk_numel", 4 * 1024 * 1024)
+        )
+        if chunk_numel <= 0:
+            raise RuntimeError(
+                "_lumen_streamed_adam_chunk_numel must be positive"
+            )
+        moment_dtype = getattr(
+            self, "_lumen_streamed_adam_moment_dtype", torch.float32
+        )
+        if moment_dtype not in (torch.float32, torch.bfloat16):
+            raise RuntimeError(
+                "_lumen_streamed_adam_moment_dtype must be float32 or bfloat16"
+            )
+
+        validated = []
+        for optimizer_index, optimizer in enumerate(self.cpu_optimizers):
+            if not isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
+                raise RuntimeError(
+                    "streamed full-offload Adam requires torch.optim.Adam or "
+                    f"AdamW; optimizer={optimizer_index}"
+                )
+            for group_index, group in enumerate(optimizer.param_groups):
+                for flag in (
+                    "amsgrad",
+                    "differentiable",
+                    "capturable",
+                    "foreach",
+                ):
+                    if bool(group.get(flag, False)):
+                        raise RuntimeError(
+                            "streamed full-offload Adam has an incompatible flag; "
+                            f"parameter_group={group_index} flag={flag}"
+                        )
+                betas = group.get("betas", (0.9, 0.999))
+                if not (
+                    isinstance(betas, (tuple, list))
+                    and len(betas) == 2
+                ):
+                    raise RuntimeError(
+                        "streamed full-offload Adam has invalid betas; "
+                        f"parameter_group={group_index}"
+                    )
+                try:
+                    options = AdamChunkOptions(
+                        lr=float(group["lr"]),
+                        beta1=float(betas[0]),
+                        beta2=float(betas[1]),
+                        eps=float(group.get("eps", 1e-8)),
+                        weight_decay=float(group.get("weight_decay", 0.0)),
+                        maximize=bool(group.get("maximize", False)),
+                        decoupled_weight_decay=isinstance(
+                            optimizer, torch.optim.AdamW
+                        ),
+                    )
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "streamed full-offload Adam options are invalid; "
+                        f"parameter_group={group_index}"
+                    ) from exc
+                if (
+                    not math.isfinite(options.lr)
+                    or options.lr < 0
+                    or not math.isfinite(options.eps)
+                    or options.eps < 0
+                    or not math.isfinite(options.weight_decay)
+                    or options.weight_decay < 0
+                    or not math.isfinite(options.beta1)
+                    or not 0 <= options.beta1 < 1
+                    or not math.isfinite(options.beta2)
+                    or not 0 <= options.beta2 < 1
+                ):
+                    raise RuntimeError(
+                        "streamed full-offload Adam options are out of range; "
+                        f"parameter_group={group_index}"
+                    )
+                for cpu_param in group["params"]:
+                    if (
+                        cpu_param.device.type != "cpu"
+                        or cpu_param.dtype != torch.float32
+                        or not cpu_param.is_contiguous()
+                    ):
+                        raise RuntimeError(
+                            "streamed full-offload Adam requires contiguous CPU "
+                            "FP32 masters; "
+                            f"parameter_group={group_index} tensor=cpu_master"
+                        )
+                    if cpu_param not in self.cpu_copys_map_gpu_param:
+                        raise RuntimeError(
+                            "streamed full-offload Adam has no mapped CUDA "
+                            f"parameter; parameter_group={group_index}"
+                        )
+                    orig_param = self.cpu_copys_map_gpu_param[cpu_param]
+                    if not orig_param.is_cuda:
+                        raise RuntimeError(
+                            "streamed full-offload Adam requires a mapped CUDA "
+                            f"parameter; parameter_group={group_index}"
+                        )
+                    if not orig_param.is_contiguous():
+                        raise RuntimeError(
+                            "streamed full-offload Adam requires a contiguous "
+                            "mapped parameter; "
+                            f"parameter_group={group_index} tensor=original"
+                        )
+                    grad = getattr(orig_param, "decoupled_grad", None)
+                    if grad is None:
+                        grad = orig_param.grad
+                    if grad is None:
+                        continue
+                    if not grad.is_cuda or grad.is_sparse:
+                        raise RuntimeError(
+                            "streamed full-offload Adam requires mapped CUDA "
+                            f"dense gradients; parameter_group={group_index}"
+                        )
+                    if not grad.is_contiguous():
+                        raise RuntimeError(
+                            "streamed full-offload Adam requires a contiguous "
+                            "gradient; "
+                            f"parameter_group={group_index} tensor=gradient"
+                        )
+                    if grad.numel() != cpu_param.numel():
+                        raise RuntimeError(
+                            "streamed full-offload Adam gradient shape mismatch; "
+                            f"parameter_group={group_index}"
+                        )
+                    existing_state = optimizer.state.get(cpu_param)
+                    if existing_state:
+                        required = ("step", "exp_avg", "exp_avg_sq")
+                        if any(name not in existing_state for name in required):
+                            raise RuntimeError(
+                                "streamed full-offload Adam state is incomplete; "
+                                f"parameter_group={group_index}"
+                            )
+                        step = existing_state["step"]
+                        if (
+                            not torch.is_tensor(step)
+                            or step.numel() != 1
+                            or step.device.type != "cpu"
+                            or not math.isfinite(float(step.item()))
+                            or float(step.item()) < 0
+                            or not float(step.item()).is_integer()
+                        ):
+                            raise RuntimeError(
+                                "streamed full-offload Adam state step is invalid; "
+                                f"parameter_group={group_index}"
+                            )
+                        for name in ("exp_avg", "exp_avg_sq"):
+                            tensor = existing_state[name]
+                            if (
+                                tensor.device.type != "cpu"
+                                or tensor.dtype != moment_dtype
+                                or tensor.shape != cpu_param.shape
+                                or not tensor.is_contiguous()
+                            ):
+                                raise RuntimeError(
+                                    "streamed full-offload Adam state tensor is "
+                                    f"invalid; parameter_group={group_index} "
+                                    f"state={name}"
+                                )
+                    validated.append(
+                        (
+                            optimizer,
+                            group_index,
+                            group,
+                            cpu_param,
+                            orig_param,
+                            grad,
+                            options,
+                        )
+                    )
+        return validated
+
+    def _lumen_streamed_adam_rss(self, phase):
+        """Emit one RSS diagnostic for each allocation-sensitive phase."""
+        announced = getattr(self, "_lumen_streamed_adam_rss_announced", set())
+        if phase in announced:
+            return
+        rss_kib = "unavailable"
+        try:
+            with open("/proc/self/status") as status_file:
+                for line in status_file:
+                    if line.startswith("VmRSS:"):
+                        rss_kib = line.split(":", 1)[1].strip()
+                        break
+        except OSError:
+            pass
+        print(
+            f"[LumenRL] streamed Adam {phase}; rss={rss_kib}",
+            flush=True,
+        )
+        announced.add(phase)
+        self._lumen_streamed_adam_rss_announced = announced
+
+    def _raise_streamed_adam_transfer_error(
+        self, message, exc, failed_stream=None
+    ):
+        """Quiesce both transfer streams best-effort, then retain the cause."""
+        for stream_name in ("_d2h_stream", "_h2d_stream"):
+            stream = getattr(self, stream_name, None)
+            if stream is None or stream is failed_stream:
+                continue
+            try:
+                stream.synchronize()
+            except Exception:
+                pass
+        raise RuntimeError(message) from exc
+
+    def _stream_full_offload_adam_step(self, closure=None):
+        """Stream Adam updates through two pinned FP32 chunk buffers."""
+        self._lumen_streamed_adam_last_h2d_event = None
+        self._sync_hdo_param_groups_to_sub_optimizers()
+        validated = self._validate_full_offload_streaming_adam(closure)
+        if not validated:
+            self._sync_sub_optimizers_state_to_hdo()
+            return None
+        moment_dtype = getattr(
+            self, "_lumen_streamed_adam_moment_dtype", torch.float32
+        )
+
+        initialized_state = False
+        prepared = []
+        for (
+            optimizer,
+            group_index,
+            _group,
+            cpu_param,
+            orig_param,
+            grad,
+            options,
+        ) in validated:
+            state = optimizer.state.get(cpu_param)
+            if not state:
+                state = initialize_adam_state(cpu_param, moment_dtype=moment_dtype)
+                optimizer.state[cpu_param] = state
+                initialized_state = True
+            state["step"].add_(1)
+            step = int(state["step"].item())
+            prepared.append(
+                (
+                    group_index,
+                    cpu_param,
+                    orig_param,
+                    grad,
+                    state,
+                    step,
+                    options,
+                )
+            )
+        if initialized_state:
+            self._lumen_streamed_adam_rss("after state allocation")
+
+        chunk_numel = int(
+            getattr(self, "_lumen_streamed_adam_chunk_numel", 4 * 1024 * 1024)
+        )
+        staging_rows = 4 if moment_dtype == torch.bfloat16 else 2
+        staging = getattr(self, "_lumen_streamed_adam_buffers", None)
+        if (
+            staging is None
+            or staging.shape != (staging_rows, chunk_numel)
+            or staging.dtype != torch.float32
+            or not staging.is_pinned()
+        ):
+            staging = torch.empty(
+                (staging_rows, chunk_numel),
+                dtype=torch.float32,
+                device="cpu",
+                pin_memory=True,
+            )
+            self._lumen_streamed_adam_buffers = staging
+
+        self._d2h_stream.wait_stream(torch.cuda.current_stream())
+        pending = [None, None]
+
+        def finish_slot(slot):
+            item = pending[slot]
+            if item is None:
+                return
+            (
+                event,
+                group_index,
+                chunk_index,
+                cpu_chunk,
+                orig_chunk,
+                scratch,
+                exp_avg_chunk,
+                exp_avg_sq_chunk,
+                step,
+                options,
+            ) = item
+            try:
+                event.synchronize()
+            except Exception as exc:
+                self._raise_streamed_adam_transfer_error(
+                    "streamed Adam D2H synchronize failed at "
+                    f"parameter_group={group_index} chunk={chunk_index}",
+                    exc,
+                )
+            try:
+                adam_step_chunk_(
+                    cpu_chunk,
+                    scratch,
+                    exp_avg_chunk,
+                    exp_avg_sq_chunk,
+                    exp_avg_workspace=(
+                        staging[2, : exp_avg_chunk.numel()]
+                        if moment_dtype == torch.bfloat16
+                        else None
+                    ),
+                    exp_avg_sq_workspace=(
+                        staging[3, : exp_avg_sq_chunk.numel()]
+                        if moment_dtype == torch.bfloat16
+                        else None
+                    ),
+                    step=step,
+                    options=options,
+                )
+            except Exception as exc:
+                self._raise_streamed_adam_transfer_error(
+                    "streamed Adam update failed at "
+                    f"parameter_group={group_index} chunk={chunk_index}",
+                    exc,
+                )
+            try:
+                with torch.cuda.stream(self._h2d_stream):
+                    orig_chunk.copy_(cpu_chunk, non_blocking=True)
+            except Exception as exc:
+                self._raise_streamed_adam_transfer_error(
+                    "streamed Adam H2D scheduling failed at "
+                    f"parameter_group={group_index} chunk={chunk_index}",
+                    exc,
+                )
+            pending[slot] = None
+
+        consumed = []
+        sequence = 0
+        last_context = (-1, -1)
+        with torch.no_grad():
+            for (
+                group_index,
+                cpu_param,
+                orig_param,
+                grad,
+                state,
+                step,
+                options,
+            ) in prepared:
+                cpu_flat = cpu_param.view(-1)
+                orig_flat = orig_param.view(-1)
+                grad_flat = grad.view(-1)
+                exp_avg_flat = state["exp_avg"].view(-1)
+                exp_avg_sq_flat = state["exp_avg_sq"].view(-1)
+                for chunk_start in range(0, cpu_param.numel(), chunk_numel):
+                    chunk_index = chunk_start // chunk_numel
+                    chunk_end = min(chunk_start + chunk_numel, cpu_param.numel())
+                    slot = sequence % 2
+                    finish_slot(slot)
+                    scratch = staging[slot, : chunk_end - chunk_start]
+                    try:
+                        with torch.cuda.stream(self._d2h_stream):
+                            scratch.copy_(
+                                grad_flat[chunk_start:chunk_end],
+                                non_blocking=True,
+                            )
+                    except Exception as exc:
+                        self._raise_streamed_adam_transfer_error(
+                            "streamed Adam D2H copy failed at "
+                            f"parameter_group={group_index} chunk={chunk_index}",
+                            exc,
+                        )
+                    try:
+                        with torch.cuda.stream(self._d2h_stream):
+                            event = self._d2h_stream.record_event()
+                    except Exception as exc:
+                        self._raise_streamed_adam_transfer_error(
+                            "streamed Adam D2H event recording failed at "
+                            f"parameter_group={group_index} chunk={chunk_index}",
+                            exc,
+                        )
+                    pending[slot] = (
+                        event,
+                        group_index,
+                        chunk_index,
+                        cpu_flat[chunk_start:chunk_end],
+                        orig_flat[chunk_start:chunk_end],
+                        scratch,
+                        exp_avg_flat[chunk_start:chunk_end],
+                        exp_avg_sq_flat[chunk_start:chunk_end],
+                        step,
+                        options,
+                    )
+                    last_context = (group_index, chunk_index)
+                    sequence += 1
+                consumed.append(orig_param)
+            for index in range(max(0, sequence - 2), sequence):
+                finish_slot(index % 2)
+        group_index, chunk_index = last_context
+        try:
+            self._lumen_streamed_adam_last_h2d_event = self._h2d_stream.record_event()
+        except Exception as exc:
+            self._raise_streamed_adam_transfer_error(
+                "streamed Adam H2D completion event recording failed at "
+                f"parameter_group={group_index} chunk={chunk_index}",
+                exc,
+            )
+        try:
+            self._h2d_stream.synchronize()
+        except Exception as exc:
+            self._raise_streamed_adam_transfer_error(
+                "streamed Adam final H2D synchronize failed at "
+                f"parameter_group={group_index} chunk={chunk_index}",
+                exc,
+                failed_stream=self._h2d_stream,
+            )
+        for orig_param in consumed:
+            if hasattr(orig_param, "decoupled_grad"):
+                orig_param.decoupled_grad = None
+            orig_param.grad = None
+        self._sync_sub_optimizers_state_to_hdo()
+        self._lumen_streamed_adam_rss("after first step")
+        return None
+
+'''
+    content = content.replace(step_signature, methods + step_signature, 1)
+    adam_dispatch = (
+        '        streamed_optimizer_mode = getattr(\n'
+        '            self, "_lumen_streamed_optimizer_mode", None\n'
+        "        )\n"
+        '        if streamed_optimizer_mode == "adam":\n'
+        "            return self._stream_full_offload_adam_step(closure)\n\n"
+    )
+    content = content.replace(
+        step_signature,
+        step_signature + adam_dispatch,
+        1,
+    )
+    legacy_sgd_dispatch = (
+        "        if self._can_stream_full_offload_sgd():\n"
+        "            return self._stream_full_offload_sgd_step(closure)\n\n"
+    )
+    explicit_sgd_dispatch = (
+        '        if streamed_optimizer_mode in (None, "sgd"):\n'
+        "            if self._can_stream_full_offload_sgd():\n"
+        "                return self._stream_full_offload_sgd_step(closure)\n\n"
+    )
+    content = content.replace(
+        legacy_sgd_dispatch,
+        explicit_sgd_dispatch,
+        1,
+    )
+    content = _stamp_capabilities(content, (STREAMED_ADAM_CAPABILITY,))
+    if _streamed_adam_patch_state(content) != "complete":
+        raise RuntimeError(
+            "HybridDeviceOptimizer streamed Adam patch failed structural "
+            "postconditions; refusing to write it"
+        )
+    with open(path, "w") as f:
+        f.write(content)
+    return True
+
+
 def patch_hybrid_optimizer_streaming_sgd(megatron_root: str) -> bool:
     """Stream fully offloaded zero-momentum SGD grads through one CPU buffer."""
     path = os.path.join(
@@ -1150,15 +2010,38 @@ def patch_hybrid_optimizer_streaming_sgd(megatron_root: str) -> bool:
 
 '''
     content = content.replace(step_signature, methods + step_signature, 1)
-    step_preamble = (
-        "        if self._can_stream_full_offload_sgd():\n"
-        "            return self._stream_full_offload_sgd_step(closure)\n\n"
+    adam_dispatch = (
+        '        streamed_optimizer_mode = getattr(\n'
+        '            self, "_lumen_streamed_optimizer_mode", None\n'
+        "        )\n"
+        '        if streamed_optimizer_mode == "adam":\n'
+        "            return self._stream_full_offload_adam_step(closure)\n\n"
     )
-    content = content.replace(
-        step_signature,
-        step_signature + step_preamble,
-        1,
-    )
+    if adam_dispatch in content:
+        step_preamble = (
+            '        if streamed_optimizer_mode in (None, "sgd"):\n'
+            "            if self._can_stream_full_offload_sgd():\n"
+            "                return self._stream_full_offload_sgd_step(closure)\n\n"
+        )
+        content = content.replace(
+            adam_dispatch,
+            adam_dispatch + step_preamble,
+            1,
+        )
+    else:
+        step_preamble = (
+            '        streamed_optimizer_mode = getattr(\n'
+            '            self, "_lumen_streamed_optimizer_mode", None\n'
+            "        )\n"
+            '        if streamed_optimizer_mode in (None, "sgd"):\n'
+            "            if self._can_stream_full_offload_sgd():\n"
+            "                return self._stream_full_offload_sgd_step(closure)\n\n"
+        )
+        content = content.replace(
+            step_signature,
+            step_signature + step_preamble,
+            1,
+        )
     with open(path, "w") as f:
         f.write(content)
     return True
@@ -1312,6 +2195,9 @@ def main(megatron_root: str) -> None:
         "tensor_parallel/layers.py": patch_tp_layers(megatron_root),
         "tensor_parallel/mappings.py": patch_tp_copy_fp32_gradient_reduce(megatron_root),
         "optimizer/hybrid_optimizer.py": patch_hybrid_optimizer_disable_foreach(megatron_root),
+        "optimizer/hybrid_optimizer.py streaming Adam": patch_hybrid_optimizer_streaming_adam(
+            megatron_root
+        ),
         "optimizer/hybrid_optimizer.py streaming SGD": patch_hybrid_optimizer_streaming_sgd(
             megatron_root
         ),

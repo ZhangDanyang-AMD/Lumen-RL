@@ -26,6 +26,29 @@ from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
+_VLLM_RUNTIME_ENV_KEYS = (
+    "NCCL_IB_DISABLE",
+    "NCCL_SOCKET_IFNAME",
+    "NCCL_IB_HCA",
+    "NCCL_IB_GID_INDEX",
+    "NCCL_NET_GDR_LEVEL",
+    "NCCL_DMABUF_ENABLE",
+    "NCCL_DEBUG",
+    "NCCL_DEBUG_SUBSYS",
+    "NCCL_MSCCL_ENABLE",
+    "RCCL_MSCCL_ENABLE",
+    "VLLM_ROCM_USE_AITER",
+    "VLLM_ROCM_USE_AITER_MOE",
+    "LUMENRL_DIAG_ALL_GATHER",
+    "LUMENRL_DIAG_ALL_GATHER_NUMEL",
+)
+
+
+def _copy_vllm_runtime_env(env_vars: dict[str, str]) -> None:
+    for key in _VLLM_RUNTIME_ENV_KEYS:
+        if key in os.environ:
+            env_vars[key] = os.environ[key]
+
 
 class VLLMRayServer:
     """Ray actor hosting one vLLM AsyncLLM engine on a single pinned GPU."""
@@ -478,18 +501,7 @@ class VLLMReplicaManager:
                 "LUMEN_REPLICA_RANK": str(r),
                 "LUMEN_RAY_JOB_ID": str(job_id),
             }
-            for key in (
-                "NCCL_IB_DISABLE",
-                "NCCL_SOCKET_IFNAME",
-                "NCCL_IB_HCA",
-                "NCCL_IB_GID_INDEX",
-                "NCCL_NET_GDR_LEVEL",
-                "NCCL_DMABUF_ENABLE",
-                "NCCL_DEBUG",
-                "NCCL_DEBUG_SUBSYS",
-            ):
-                if key in os.environ:
-                    env_vars[key] = os.environ[key]
+            _copy_vllm_runtime_env(env_vars)
             server = remote_cls.options(
                 num_gpus=0,
                 num_cpus=1,

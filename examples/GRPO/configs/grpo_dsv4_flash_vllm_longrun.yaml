@@ -6,7 +6,8 @@
 #
 # Training: Megatron-DSV4 (TP=4, PP=4, EP=4, ETP=1, 256 experts,
 #   sequence-parallel, distributed optimizer, flash attention,
-#   chunked log-prob, optimizer_cpu_offload 75%)
+#   chunked log-prob, full optimizer CPU offload with BF16 moments and four
+#   256 MiB streamed-Adam staging buffers)
 #
 # PP layer distribution: first stage=11 layers, last stage=10 layers
 #
@@ -31,7 +32,7 @@ weight_sync:
   bucket_size_mb: 2048
   timeout_s: 1200
   verify_full_load: true
-  fp8_quantization_location: trainer
+  fp8_quantization_location: inference
   rdma:
     backend: rccl
     require_rdma: true
@@ -58,12 +59,14 @@ policy:
   model_name: /root/models/DeepSeek-V4-Flash-BF16
   training_backend: megatron_lumen_dsv4
   generation_backend: vllm
-  max_total_sequence_length: 5120            # 1024 prompt + 4096 response
+  max_total_sequence_length: 16384           # MILES --context-length
   max_response_length: 4096
-  train_global_batch_size: 256               # 32 prompts x 8 generations = 256
+  train_global_batch_size: 256               # 32 prompts x 8 generations
+  # GRPO currently ignores gen_batch_size unless DAPO filter_groups is enabled;
+  # rollout prompts = train_global_batch_size / algorithm.grpo.num_generations.
   gen_batch_size: 32
   train_micro_batch_size: 1
-  max_token_len_per_gpu: 16384
+  max_token_len_per_gpu: 8192                # MILES --max-tokens-per-gpu
   balance_batch: true
   optimizer_type: adam
   learning_rate: 1.0e-6
@@ -99,7 +102,11 @@ policy:
       log_probs_chunk_size: 1024
       numa_affinity: true
       optimizer_cpu_offload: true
-      optimizer_offload_fraction: 0.75
+      optimizer_offload_fraction: 1.0
+      use_precision_aware_optimizer: true
+      streamed_optimizer_mode: adam
+      streamed_optimizer_chunk_size_mib: 256
+      streamed_optimizer_moment_dtype: bf16
     fsdp_cfg:
       param_offload: false
       optimizer_offload: false
@@ -112,13 +119,16 @@ policy:
       quantization: fp8_per_block
       enforce_eager: true
       disable_custom_all_reduce: true
+      moe_backend: auto                       # AITER when VLLM_ROCM_USE_AITER=1
+      linear_backend: auto
       kv_cache_dtype: fp8_e4m3
       gpu_memory_utilization: 0.92
       max_model_len: 16384
       dtype: bfloat16
       enable_chunked_prefill: true
-      max_num_batched_tokens: 16384
-      max_num_seqs: 64
+      enable_prefix_caching: false            # Match the passing standalone probe
+      max_num_batched_tokens: 8192
+      max_num_seqs: 48                       # MILES --sglang-max-running-requests
       calculate_log_probs: true
       enable_sleep_mode: false
       sleep_level: 0
@@ -144,7 +154,7 @@ quantization:
   training:
     fp8: null
   rollout_correction:
-    rollout_is: null
+    rollout_is: token
     rollout_is_threshold: 2.0
     rollout_is_batch_normalize: true
 
@@ -170,8 +180,8 @@ eval:
 
 checkpointing:
   checkpoint_dir: /root/ckpts/dsv4-flash/longrun
-  save_steps: 20
-  save_total_limit: 3
+  save_steps: 5
+  save_total_limit: 2
   resume: true
 
 logger:
@@ -180,7 +190,7 @@ logger:
   wandb:
     project: LumenRL
     entity: danyzhan-amd
-    name: dsv4-flash-grpo-vllm-3000step
+    name: dsv4-flash-grpo-vllm-200step-is-r3
 
-num_training_steps: 3000
+num_training_steps: 200
 seed: 10086

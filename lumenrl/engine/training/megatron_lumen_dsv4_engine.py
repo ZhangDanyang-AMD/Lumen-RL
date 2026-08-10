@@ -19,23 +19,25 @@ Key differences from the Qwen3 parent:
 
 from __future__ import annotations
 
-import re
-from collections.abc import Iterator, Mapping
+import importlib
 import json
 import logging
 import math
 import os
+import re
 import sys
+from collections.abc import Iterator, Mapping
 from types import SimpleNamespace
 from typing import Any
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+
 from lumenrl.engine.training.base_engine import EngineRegistry
 from lumenrl.engine.training.dsv4_megatron_bridge import (
-    DSV4Dims,
     DSV4_FLASH_COMPRESS_RATIOS,
+    DSV4Dims,
     _denormalize_redhat_key,
     dsv4_megatron_to_hf,
     hf_to_dsv4_megatron,
@@ -53,6 +55,244 @@ from lumenrl.engine.training.qwen3_megatron_bridge import (
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LUMENRL_LOGGING_LEVEL", "INFO"))
+
+_STREAMED_ADAM_CAPABILITY = "LUMENRL_DSV4_CAPABILITY_STREAMED_ADAM"
+_HYBRID_OPTIMIZER_MODULE = (
+    "megatron.core.optimizer.cpu_offloading.hybrid_optimizer"
+)
+_MAX_STREAMED_OPTIMIZER_CHUNK_MIB = 1024
+
+
+def _safe_optimizer_attr(optimizer, name):
+    try:
+        return getattr(optimizer, name, None)
+    except Exception:
+        return None
+
+
+def _find_hybrid_device_optimizers(optimizer):
+    """Find every unique HDO through wrappers in deterministic traversal order."""
+    pending = [optimizer]
+    seen: set[int] = set()
+    hybrids = []
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, Mapping):
+            pending.extend(reversed(tuple(current.values())))
+            continue
+        if isinstance(current, (list, tuple)):
+            pending.extend(reversed(current))
+            continue
+        cpu_optimizers = _safe_optimizer_attr(current, "cpu_optimizers")
+        offload_fraction = _safe_optimizer_attr(current, "offload_fraction")
+        if cpu_optimizers is not None and offload_fraction is not None:
+            hybrids.append(current)
+            continue
+
+        children = []
+        for name in (
+            "chained_optimizers",
+            "optimizers",
+            "inner_optimizer",
+            "optimizer",
+        ):
+            child = _safe_optimizer_attr(current, name)
+            if child is not None:
+                children.append(child)
+        pending.extend(reversed(children))
+    return hybrids
+
+
+def _streamed_optimizer_settings(
+    engine_config: Mapping[str, Any],
+) -> tuple[str, int]:
+    mode = engine_config.get("streamed_optimizer_mode", "off")
+    if not isinstance(mode, str) or mode not in {"off", "sgd", "adam"}:
+        raise ValueError(
+            "streamed_optimizer_mode must be exactly one of off, sgd, or adam; "
+            f"got {mode!r}"
+        )
+    chunk_mib = engine_config.get(
+        "streamed_optimizer_chunk_size_mib",
+        256,
+    )
+    if (
+        isinstance(chunk_mib, bool)
+        or not isinstance(chunk_mib, int)
+        or chunk_mib <= 0
+        or chunk_mib > _MAX_STREAMED_OPTIMIZER_CHUNK_MIB
+    ):
+        raise ValueError(
+            "streamed_optimizer_chunk_size_mib must be a positive integer "
+            f"no greater than {_MAX_STREAMED_OPTIMIZER_CHUNK_MIB}; "
+            f"got {chunk_mib!r}"
+        )
+    return mode, chunk_mib
+
+
+def _streamed_optimizer_staging_diagnostic(
+    mode: str,
+    chunk_mib: int,
+    moment_dtype: torch.dtype = torch.float32,
+) -> str:
+    if mode == "adam":
+        buffers = 4 if moment_dtype == torch.bfloat16 else 2
+        return f"{buffers * chunk_mib} MiB"
+    if mode == "off":
+        return "0 MiB (disabled)"
+    return "runtime-sized/unknown"
+
+
+def _streamed_optimizer_moment_dtype(
+    engine_config: Mapping[str, Any],
+) -> torch.dtype:
+    value = engine_config.get("streamed_optimizer_moment_dtype", "fp32")
+    if value == "fp32":
+        return torch.float32
+    if value == "bf16":
+        return torch.bfloat16
+    raise ValueError(
+        "streamed_optimizer_moment_dtype must be exactly fp32 or bf16; "
+        f"got {value!r}"
+    )
+
+
+def _streamed_adam_runtime_capability() -> bool:
+    try:
+        module = importlib.import_module(_HYBRID_OPTIMIZER_MODULE)
+    except (ImportError, ModuleNotFoundError):
+        return False
+    return getattr(module, _STREAMED_ADAM_CAPABILITY, False) is True
+
+
+def _validate_streamed_optimizer_preconstruction(engine_config):
+    """Validate settings that do not depend on a constructed optimizer."""
+    mode, _ = _streamed_optimizer_settings(engine_config)
+    _streamed_optimizer_moment_dtype(engine_config)
+    capability = _streamed_adam_runtime_capability()
+    if mode != "adam":
+        return mode, capability
+    if engine_config.get("optimizer_cpu_offload", False) is not True:
+        raise RuntimeError(
+            "streamed Adam requires optimizer_cpu_offload=True"
+        )
+    try:
+        configured_fraction = float(
+            engine_config.get("optimizer_offload_fraction", 1.0)
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "streamed Adam requires full CPU offload with "
+            "optimizer_offload_fraction=1.0"
+        ) from exc
+    if configured_fraction != 1.0:
+        raise RuntimeError(
+            "streamed Adam requires full CPU offload with "
+            "optimizer_offload_fraction=1.0"
+        )
+    if not capability:
+        raise RuntimeError(
+            "streamed Adam requires patched Megatron runtime capability "
+            f"{_STREAMED_ADAM_CAPABILITY} is True"
+        )
+    return mode, True
+
+
+def _validate_streamed_optimizer_request(engine_config, optimizer):
+    """Validate a requested streamed optimizer before the first training step."""
+    mode, _ = _validate_streamed_optimizer_preconstruction(engine_config)
+    if mode == "off":
+        return None
+    hybrids = _find_hybrid_device_optimizers(optimizer)
+    if not hybrids:
+        raise RuntimeError(
+            f"streamed optimizer mode={mode} requires at least one "
+            "Megatron HybridDeviceOptimizer"
+        )
+    if mode == "sgd":
+        # The existing patched-SGD dispatch also supports an unset mode. Return
+        # all HDOs so callers can make the explicit request visible.
+        return hybrids
+
+    incompatible_flags = (
+        "amsgrad",
+        "differentiable",
+        "capturable",
+        "foreach",
+    )
+    for hybrid_index, hybrid in enumerate(hybrids):
+        try:
+            runtime_fraction = float(hybrid.offload_fraction)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "streamed Adam requires every HybridDeviceOptimizer to use "
+                f"full CPU offload; hybrid={hybrid_index}"
+            ) from exc
+        if runtime_fraction != 1.0:
+            raise RuntimeError(
+                "streamed Adam requires every HybridDeviceOptimizer to use "
+                f"full CPU offload; hybrid={hybrid_index}"
+            )
+        if getattr(hybrid, "gpu_optimizer", None) is not None:
+            raise RuntimeError(
+                "streamed Adam full CPU offload requires no GPU optimizer; "
+                f"hybrid={hybrid_index}"
+            )
+
+        cpu_optimizers = getattr(hybrid, "cpu_optimizers", None)
+        if not cpu_optimizers:
+            raise RuntimeError(
+                "streamed Adam requires at least one CPU Adam or AdamW "
+                f"optimizer per HDO; hybrid={hybrid_index}"
+            )
+        for optimizer_index, cpu_optimizer in enumerate(cpu_optimizers):
+            if not isinstance(
+                cpu_optimizer,
+                (torch.optim.Adam, torch.optim.AdamW),
+            ):
+                raise RuntimeError(  # noqa: TRY004
+                    "streamed Adam requires every CPU optimizer to be "
+                    "torch.optim.Adam or AdamW; "
+                    f"hybrid={hybrid_index} optimizer={optimizer_index}"
+                )
+            for group_index, group in enumerate(cpu_optimizer.param_groups):
+                for flag in incompatible_flags:
+                    if bool(group.get(flag, False)):
+                        raise RuntimeError(
+                            "streamed Adam has an incompatible optimizer flag: "
+                            f"hybrid={hybrid_index} "
+                            f"optimizer={optimizer_index} "
+                            f"parameter_group={group_index} {flag}=True"
+                        )
+    return hybrids
+
+
+def _configure_streamed_optimizer_request(engine_config, optimizer):
+    """Validate all HDOs, then attach Lumen-only settings atomically."""
+    hybrids = _validate_streamed_optimizer_request(engine_config, optimizer)
+    if hybrids is None:
+        return None
+    mode, chunk_mib = _streamed_optimizer_settings(engine_config)
+    moment_dtype = _streamed_optimizer_moment_dtype(engine_config)
+    chunk_numel = chunk_mib * (1024 * 1024 // 4)
+    for hybrid in hybrids:
+        hybrid._lumen_streamed_optimizer_mode = mode
+        if mode == "adam":
+            hybrid._lumen_streamed_adam_chunk_numel = chunk_numel
+            hybrid._lumen_streamed_adam_moment_dtype = moment_dtype
+    return hybrids
+
+
+def _rss_gib() -> float | None:
+    """Return this rank's peak RSS in GiB where getrusage is available."""
+    try:
+        import resource
+    except ImportError:
+        return None
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20
 
 
 def _dsv4_router_kwargs(
@@ -709,6 +949,25 @@ class MegatronLumenDSV4Engine(MegatronEngine):
 
         cpu_offload = bool(ec.get("optimizer_cpu_offload", False))
         offload_frac = float(ec.get("optimizer_offload_fraction", 1.0))
+        streamed_mode, streamed_capability = (
+            _validate_streamed_optimizer_preconstruction(ec)
+        )
+        _, streamed_chunk_mib = _streamed_optimizer_settings(ec)
+        streamed_moment_dtype = _streamed_optimizer_moment_dtype(ec)
+        streamed_staging = _streamed_optimizer_staging_diagnostic(
+            streamed_mode,
+            streamed_chunk_mib,
+            streamed_moment_dtype,
+        )
+        startup_message = (
+            "[LumenRL streamed optimizer] "
+            f"mode={streamed_mode} chunk={streamed_chunk_mib} MiB "
+            f"moments={str(streamed_moment_dtype).removeprefix('torch.')} "
+            f"staging={streamed_staging} "
+            f"capability={streamed_capability}"
+        )
+        print(startup_message, file=sys.stderr, flush=True)
+        logger.info(startup_message)
         optimizer_name = str(oc.get("optimizer", "adam")).lower()
         if optimizer_name == "adamw":
             optimizer_name = "adam"
@@ -728,8 +987,21 @@ class MegatronLumenDSV4Engine(MegatronEngine):
             pin_cpu_params=False,
             **_optimizer_precision_kwargs(ec),
         )
+        rss_gib = _rss_gib()
+        rss_value = (
+            "unavailable"
+            if rss_gib is None
+            else f"{rss_gib:.2f} GiB"
+        )
+        rss_message = (
+            f"[LumenRL RSS rank={self._rank()}] "
+            f"before_optimizer_state_allocation={rss_value}"
+        )
+        print(rss_message, file=sys.stderr, flush=True)
+        logger.info(rss_message)
         _gpu_diag("BEFORE optimizer init")
         self.optimizer = get_megatron_optimizer(opt_cfg, model_chunks=[self._ddp])
+        _configure_streamed_optimizer_request(ec, self.optimizer)
 
         warmup = int(oc.get("lr_warmup_steps", 10))
         base_lr = float(oc.get("lr", 1e-6))

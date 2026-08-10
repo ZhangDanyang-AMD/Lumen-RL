@@ -34,6 +34,17 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LUMENRL_LOGGING_LEVEL", "INFO"))
 
 
+def _response_mask_is_token_indexed(tensors: dict[str, torch.Tensor]) -> bool:
+    """Whether response_mask uses token columns [S], rather than log-prob columns [S-1]."""
+    response_mask = tensors.get("response_mask")
+    input_ids = tensors.get("input_ids")
+    return bool(
+        response_mask is not None
+        and input_ids is not None
+        and response_mask.shape[-1] >= input_ids.shape[-1]
+    )
+
+
 class _FusedTokenLogProb(torch.autograd.Function):
     """Memory-efficient per-token log-prob: ``log p(target) = logit_target - logsumexp``.
 
@@ -262,14 +273,19 @@ class MegatronBaseEngine(BaseEngine):
         old_lp = _col("old_log_probs", shift=False)
         if old_lp is None:
             return None, None
-        resp_mask = _col("response_mask", shift=True)
+        # Trainer masks are normally width S-1 and already aligned to log-prob
+        # columns. Preserve compatibility with token-indexed width-S masks.
+        resp_mask = _col(
+            "response_mask",
+            shift=_response_mask_is_token_indexed(t),
+        )
         adv_t = t.get("advantages")
         if adv_t is None:
             return None, None
         if adv_t.dim() == 1:
             adv = adv_t[r].to(dev).view(1, 1).expand(1, Lm).float()
         else:
-            adv = adv_t[r].to(dev)[start + 1:].reshape(1, -1).float()
+            adv = adv_t[r].to(dev)[start:].reshape(1, -1).float()
         ris = _col("rollout_is_weights", shift=False)
         ref_lp0 = _col("ref_log_probs", shift=False)
         rlp0 = _col("rollout_log_probs", shift=False)

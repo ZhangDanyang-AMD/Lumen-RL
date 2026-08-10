@@ -48,6 +48,20 @@ def _algo_num_generations(config: LumenRLConfig) -> int:
     return int(config.algorithm.grpo.num_generations)
 
 
+def _response_token_ids(
+    sequence: torch.Tensor,
+    attention_mask: torch.Tensor,
+    prompt_length: int,
+) -> torch.Tensor:
+    """Return response IDs from a left- or right-padded rollout row."""
+    real_positions = attention_mask.nonzero(as_tuple=True)[0]
+    if real_positions.numel() == 0:
+        return sequence[:0]
+    response_start = int(real_positions[0].item()) + int(prompt_length)
+    real_end = int(real_positions[-1].item()) + 1
+    return sequence[min(response_start, real_end):real_end]
+
+
 class RLTrainer:
     """Coordinates rollout, reference, reward, and actor for RL training.
 
@@ -402,12 +416,17 @@ class RLTrainer:
             enforce_eager=bool(vcfg.enforce_eager),
             disable_custom_all_reduce=bool(vcfg.disable_custom_all_reduce),
             enable_chunked_prefill=bool(vcfg.enable_chunked_prefill),
+            enable_prefix_caching=bool(vcfg.enable_prefix_caching),
             max_num_batched_tokens=int(vcfg.max_num_batched_tokens),
             max_num_seqs=int(vcfg.max_num_seqs),
             trust_remote_code=bool(vcfg.trust_remote_code),
             enable_sleep_mode=bool(vcfg.enable_sleep_mode),
             disable_log_stats=True,
         )
+        if str(vcfg.moe_backend) != "auto":
+            engine_kwargs["moe_backend"] = str(vcfg.moe_backend)
+        if str(vcfg.linear_backend) != "auto":
+            engine_kwargs["linear_backend"] = str(vcfg.linear_backend)
         if bool(getattr(self.config.moe.r3, "enabled", False)):
             # Patched vLLM/MILES captures [seq_len-1, num_layers, top_k]
             # expert ids on the rollout engine. Fail-fast validation happens
@@ -1962,6 +1981,7 @@ class RLTrainer:
     def _compute_rewards_full(
         self,
         sequences: torch.Tensor,
+        attention_mask: torch.Tensor,
         prompt_lengths: list[int],
         gts_expanded: list[str],
     ) -> tuple[torch.Tensor, list[str], list[float]]:
@@ -1977,9 +1997,11 @@ class RLTrainer:
         responses: list[str] = []
         if self._rank == 0:
             seq_cpu = sequences.cpu()
+            mask_cpu = attention_mask.cpu()
             for i in range(N):
                 plen = int(prompt_lengths[i]) if i < len(prompt_lengths) else 0
-                text = self._tokenizer.decode(seq_cpu[i, plen:], skip_special_tokens=True)
+                response_ids = _response_token_ids(seq_cpu[i], mask_cpu[i], plen)
+                text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
                 responses.append(text)
             rewards_t, details = compute_math_reward(responses, gts_expanded)
             rewards = rewards_t.to(self._device)
@@ -2056,7 +2078,7 @@ class RLTrainer:
                             list(seqs.shape), list(mask.shape), list(plen.shape) if hasattr(plen, 'shape') else len(plen),
                             list(lp.shape) if lp is not None else None)
             gts_exp = [gt for gt in gts for _ in range(g)]
-            rewards, responses, _accs = self._compute_rewards_full(seqs, plen, gts_exp)
+            rewards, responses, _accs = self._compute_rewards_full(seqs, mask, plen, gts_exp)
             if LUMENRL_DEBUG:
                 _acc_mean = float(torch.tensor(_accs).float().mean()) if _accs is not None and len(_accs) > 0 else -1.0
                 logger.info("[DBG] _collect_rollout: rewards=%s  acc_mean=%.4f  nonzero_reward=%d/%d",
@@ -2086,7 +2108,7 @@ class RLTrainer:
             self._prompt_cursor += gen_prompts
             seqs, mask, plen, lp, rag = _one_round(prompts)
             gts_exp = [gt for gt in gts for _ in range(g)]
-            rewards, _responses, accs = self._compute_rewards_full(seqs, plen, gts_exp)
+            rewards, _responses, accs = self._compute_rewards_full(seqs, mask, plen, gts_exp)
 
             uids = [i // g for i in range(seqs.shape[0])]
             keep_mask, kept_uids = filter_groups_keep_mask(accs, uids)
@@ -2142,9 +2164,11 @@ class RLTrainer:
         responses: list[str] = []
         if self._rank == 0:
             seq_cpu = sequences.cpu()
+            mask_cpu = seq_mask.cpu()
             for i in range(sequences.shape[0]):
                 plen = prompt_lengths[i] if i < len(prompt_lengths) else 0
-                responses.append(self._tokenizer.decode(seq_cpu[i, plen:], skip_special_tokens=True))
+                response_ids = _response_token_ids(seq_cpu[i], mask_cpu[i], plen)
+                responses.append(self._tokenizer.decode(response_ids, skip_special_tokens=True))
 
         return sequences, seq_mask, prompt_lengths, rewards, responses, gts_exp, rollout_lp, ragged
 
@@ -2442,6 +2466,7 @@ class RLTrainer:
     def _compute_rewards(
         self,
         sequences: torch.Tensor,
+        attention_mask: torch.Tensor,
         prompt_lengths: list[int],
         ground_truths: list[str],
         num_generations: int,
@@ -2451,10 +2476,15 @@ class RLTrainer:
         Returns rewards on ``self._device`` to avoid a CPU round-trip.
         """
         seq_cpu = sequences.cpu() if sequences.device.type != "cpu" else sequences
+        mask_cpu = (
+            attention_mask.cpu()
+            if attention_mask.device.type != "cpu"
+            else attention_mask
+        )
         responses = []
         for i in range(seq_cpu.shape[0]):
             plen = prompt_lengths[i]
-            response_ids = seq_cpu[i, plen:]
+            response_ids = _response_token_ids(seq_cpu[i], mask_cpu[i], plen)
             text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
             responses.append(text)
 
@@ -3842,7 +3872,7 @@ class RLTrainer:
             reward_t0 = time.time()
             if rewards is None:
                 rewards, responses = self._compute_rewards(
-                    sequences, prompt_lengths, ground_truths, num_generations,
+                    sequences, seq_mask, prompt_lengths, ground_truths, num_generations,
                 )
             reward_time = time.time() - reward_t0
             response_mask = self._build_response_mask(sequences, seq_mask, prompt_lengths)
@@ -4101,6 +4131,7 @@ class RLTrainer:
 
             # Decode + score (identical on every rank — sequences are broadcast).
             seq_cpu = sequences.cpu()
+            mask_cpu = seq_mask.cpu()
             responses = []
             keep = max(0, seq_cpu.shape[0] - pad_size)
             seq_cpu = seq_cpu[:keep]
@@ -4109,7 +4140,8 @@ class RLTrainer:
             ground_truths = ground_truths[:keep]
             for i in range(seq_cpu.shape[0]):
                 plen = int(prompt_lengths[i]) if i < len(prompt_lengths) else 0
-                responses.append(self._tokenizer.decode(seq_cpu[i, plen:], skip_special_tokens=True))
+                response_ids = _response_token_ids(seq_cpu[i], mask_cpu[i], plen)
+                responses.append(self._tokenizer.decode(response_ids, skip_special_tokens=True))
             rewards_t, details = compute_math_reward(responses, ground_truths)
 
             all_scores.extend(rewards_t.tolist())

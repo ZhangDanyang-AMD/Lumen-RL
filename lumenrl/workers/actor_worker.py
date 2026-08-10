@@ -7,6 +7,7 @@ import os
 import re
 import resource
 import shutil
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,22 @@ from lumenrl.core.types import AlgorithmName, TrainingBackend
 from lumenrl.engine.training.base_engine import BaseEngine, EngineRegistry
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_streamed_optimizer_chunk_size_mib(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError(
+            "streamed_optimizer_chunk_size_mib must be an integer or "
+            "canonical positive integer string"
+        )
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and re.fullmatch(r"[1-9]\d*", value):
+        return int(value)
+    raise ValueError(
+        "streamed_optimizer_chunk_size_mib must be an integer or "
+        "canonical positive integer string"
+    )
 
 
 class LumenActorWorker(BaseWorker):
@@ -211,7 +228,14 @@ class LumenActorWorker(BaseWorker):
             meg_cfg = training_cfg.get("megatron_cfg") or policy.get("megatron_cfg") or {}
             if not isinstance(meg_cfg, dict):
                 from dataclasses import asdict, is_dataclass
-                meg_cfg = asdict(meg_cfg) if is_dataclass(meg_cfg) else dict(vars(meg_cfg))
+                if isinstance(meg_cfg, Mapping):
+                    meg_cfg = dict(meg_cfg)
+                else:
+                    meg_cfg = (
+                        asdict(meg_cfg)
+                        if is_dataclass(meg_cfg)
+                        else dict(vars(meg_cfg))
+                    )
             r3_cfg = get_nested_config(self.config, "moe", "r3", default={}) or {}
             if not isinstance(r3_cfg, dict):
                 from dataclasses import asdict, is_dataclass
@@ -248,6 +272,18 @@ class LumenActorWorker(BaseWorker):
                 "optimizer_offload_fraction": meg_cfg.get("optimizer_offload_fraction", 1.0),
                 "use_precision_aware_optimizer": meg_cfg.get(
                     "use_precision_aware_optimizer", False
+                ),
+                "streamed_optimizer_mode": str(
+                    meg_cfg.get("streamed_optimizer_mode", "off")
+                ).lower(),
+                "streamed_optimizer_chunk_size_mib": (
+                    _normalize_streamed_optimizer_chunk_size_mib(
+                        meg_cfg.get("streamed_optimizer_chunk_size_mib", 256)
+                    )
+                ),
+                "streamed_optimizer_moment_dtype": meg_cfg.get(
+                    "streamed_optimizer_moment_dtype",
+                    "fp32",
                 ),
                 "grad_offload": meg_cfg.get("grad_offload", False),
                 "seed": int(policy.get("seed", 42)),

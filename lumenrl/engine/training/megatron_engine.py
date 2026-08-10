@@ -39,6 +39,9 @@ from lumenrl.algorithms.loss_functions import (
 from lumenrl.core.protocol import DataProto
 from lumenrl.core.types import AlgorithmName
 from lumenrl.engine.training.base_engine import BaseEngine, EngineRegistry
+from lumenrl.engine.training.megatron_base_engine import (
+    _response_mask_is_token_indexed,
+)
 from lumenrl.engine.training.qwen3_megatron_bridge import (
     Qwen3Dims,
     _pp_layer_range,
@@ -1826,14 +1829,17 @@ class MegatronEngine(BaseEngine):
             old_lp = _col("old_log_probs", shift=False)
             if old_lp is None:
                 continue
-            resp_mask = _col("response_mask", shift=True)
+            resp_mask = _col(
+                "response_mask",
+                shift=_response_mask_is_token_indexed(t),
+            )
             adv_t = t.get("advantages")
             if adv_t is None:
                 continue
             if adv_t.dim() == 1:
                 adv = adv_t[r].to(dev).view(1, 1).expand(1, Lm).float()
             else:
-                adv = adv_t[r].to(dev)[start + 1:].reshape(1, -1).float()
+                adv = adv_t[r].to(dev)[start:].reshape(1, -1).float()
             ris = _col("rollout_is_weights", shift=False)
             ref_lp0 = _col("ref_log_probs", shift=False)
             rlp0 = _col("rollout_log_probs", shift=False)
@@ -2031,7 +2037,10 @@ class MegatronEngine(BaseEngine):
                 old_lp = _col("old_log_probs", shift=False)
                 if old_lp is None:
                     continue
-                resp_mask = _col("response_mask", shift=True)
+                resp_mask = _col(
+                    "response_mask",
+                    shift=_response_mask_is_token_indexed(t),
+                )
                 adv_t_full = t.get("advantages")
                 if adv_t_full is None:
                     continue
@@ -2040,7 +2049,7 @@ class MegatronEngine(BaseEngine):
                 if adv_t_full.dim() == 1:
                     adv = adv_t_full[r_global].to(dev).view(1, 1).expand(1, Lm).float()
                 else:
-                    adv = adv_t_full[r_global].to(dev)[real_start + 1:].reshape(1, -1).float()
+                    adv = adv_t_full[r_global].to(dev)[real_start:].reshape(1, -1).float()
                 ris = _col("rollout_is_weights", shift=False)
                 ref_lp0 = _col("ref_log_probs", shift=False)
                 rlp0 = _col("rollout_log_probs", shift=False)
@@ -2228,7 +2237,10 @@ class MegatronEngine(BaseEngine):
                 dummy = torch.tensor(0.0, device="cuda", requires_grad=True)
                 return dummy, {}
 
-            resp_mask = _col("response_mask", shift=True)
+            resp_mask = _col(
+                "response_mask",
+                shift=_response_mask_is_token_indexed(t),
+            )
             adv_t_full = t.get("advantages")
             if adv_t_full is None:
                 dummy = torch.tensor(0.0, device="cuda", requires_grad=True)
@@ -2236,7 +2248,7 @@ class MegatronEngine(BaseEngine):
             if adv_t_full.dim() == 1:
                 adv = adv_t_full[r].to(dev).view(1, 1).expand(1, Lm).float()
             else:
-                adv = adv_t_full[r].to(dev)[start + 1:].reshape(1, -1).float()
+                adv = adv_t_full[r].to(dev)[start:].reshape(1, -1).float()
             ris = _col("rollout_is_weights", shift=False)
             ref_lp0 = _col("ref_log_probs", shift=False)
             rlp0 = _col("rollout_log_probs", shift=False)

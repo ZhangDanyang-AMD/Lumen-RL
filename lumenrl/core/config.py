@@ -197,6 +197,12 @@ class MegatronConfig:
     # Frees ~2x model-size GPU memory at the cost of slower optimizer steps.
     optimizer_cpu_offload: bool = False
     optimizer_offload_fraction: float = 1.0      # fraction of states to offload (0.0-1.0)
+    # Streaming mode: off | sgd | adam.
+    streamed_optimizer_mode: str = "off"
+    # Positive MiB; validated at DSV4 startup.
+    streamed_optimizer_chunk_size_mib: int = 256
+    # Persistent Adam moment storage; bf16 halves host-memory residency.
+    streamed_optimizer_moment_dtype: str = "fp32"
     # Let Megatron's optimizer own the FP32 master directly. With full CPU
     # offload this avoids first materializing another FP32 master on GPU.
     use_precision_aware_optimizer: bool = False
@@ -240,7 +246,10 @@ class VLLMConfig:
     dtype: str = "bfloat16"
     enforce_eager: bool = True
     disable_custom_all_reduce: bool = False
+    moe_backend: str = "auto"
+    linear_backend: str = "auto"
     enable_chunked_prefill: bool = True
+    enable_prefix_caching: bool = False
     max_num_batched_tokens: int = 8192
     max_num_seqs: int = 64
     swap_space: int = 4
