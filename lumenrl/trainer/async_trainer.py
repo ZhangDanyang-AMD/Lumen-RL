@@ -304,7 +304,7 @@ class AsyncRLTrainer:
             return [f"What is {idx} + {idx + 1}?"], [str(2 * idx + 1)]
 
         sample = self._dataset[idx % len(self._dataset)]
-        prompt_raw = sample.get("prompt") or sample.get("question") or sample.get("input") or ""
+        prompt_raw = sample.get("prompt") or sample.get("question") or sample.get("input") or sample.get("problem") or ""
         if isinstance(prompt_raw, list):
             text_parts = [m.get("content", "") for m in prompt_raw if isinstance(m, dict)]
             prompt_text = "\n".join(text_parts)
@@ -323,11 +323,14 @@ class AsyncRLTrainer:
                 rm_raw = _json.loads(rm_raw)
             except (_json.JSONDecodeError, TypeError):
                 rm_raw = {}
-        gt = (rm_raw.get("ground_truth", "") if isinstance(rm_raw, dict)
-              else sample.get("answer") or sample.get("solution") or "")
+        if isinstance(rm_raw, dict) and rm_raw.get("ground_truth", "") != "":
+            gt = rm_raw["ground_truth"]
+        else:
+            gt = (sample.get("answer") or sample.get("solution")
+                  or sample.get("expected_answer") or "")
 
         if self._tokenizer and hasattr(self._tokenizer, "apply_chat_template"):
-            raw = sample.get("prompt") or sample.get("question") or sample.get("input") or ""
+            raw = sample.get("prompt") or sample.get("question") or sample.get("input") or sample.get("problem") or ""
             if isinstance(raw, list):
                 try:
                     prompt_text = self._tokenizer.apply_chat_template(

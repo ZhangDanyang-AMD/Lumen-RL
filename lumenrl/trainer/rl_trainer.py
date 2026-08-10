@@ -38,6 +38,17 @@ from lumenrl.workers import LumenActorWorker, RefPolicyWorker
 logger = logging.getLogger(__name__)
 LUMENRL_DEBUG = os.environ.get("LUMENRL_DEBUG", "0") in ("1", "true", "True")
 
+# verl's DAPO math prompt. ``lumenrl.rewards.math_reward.compute_score`` is a
+# port of verl's ``math_dapo`` scorer, which grades only the last ``Answer:``
+# line — it is paired with this template upstream, so datasets that ship a bare
+# question (``problem``, ``question``) must be wrapped in it to be gradeable.
+_MATH_ANSWER_FORMAT_PROMPT = (
+    "Solve the following math problem step by step. The last line of your "
+    "response should be of the form Answer: $ANSWER (without quotes) where "
+    "$ANSWER is the answer to the problem.\n\n{question}\n\n"
+    'Remember to put your answer on its own line after "Answer:".'
+)
+
 
 def _algo_num_generations(config: LumenRLConfig) -> int:
     name = config.algorithm.name.lower()
@@ -129,6 +140,24 @@ class RLTrainer:
         if self._use_ray_controller:
             self._setup_ray_controller()
             return
+
+        # Single-process launch (`python examples/run_grpo.py`, no torchrun):
+        # FSDP2 needs a process group to wrap the model, and without the wrapper
+        # its MixedPrecisionPolicy never casts params, leaving an fp32 forward
+        # that the fused attention kernels reject. Bootstrap a 1-rank group so
+        # this path matches `torchrun --nproc_per_node=1`.
+        if not torch.distributed.is_initialized() and torch.cuda.is_available():
+            os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+            os.environ.setdefault("MASTER_PORT", "29500")
+            os.environ.setdefault("RANK", "0")
+            os.environ.setdefault("WORLD_SIZE", "1")
+            os.environ.setdefault("LOCAL_RANK", "0")
+            torch.cuda.set_device(self._device)
+            torch.distributed.init_process_group(backend="nccl")
+            self._is_distributed = True
+            self._rank = torch.distributed.get_rank()
+            self._world_size = torch.distributed.get_world_size()
+            logger.info("Bootstrapped single-rank process group (non-torchrun launch).")
 
         quant = {}
         tq = self.config.quantization.training
@@ -823,7 +852,7 @@ class RLTrainer:
         )
         export_meta = export_results[0]
 
-        orig = Path(self.config.policy.model_name)
+        orig = self._resolve_model_dir()
         for fname in ["config.json", "tokenizer_config.json", "tokenizer.json",
                       "special_tokens_map.json", "generation_config.json"]:
             src = orig / fname
@@ -1363,6 +1392,12 @@ class RLTrainer:
             p, gt = self._extract_prompt_gt(s)
             prompts.append(p)
             gts.append(gt)
+        if any(not p.strip() for p in prompts):
+            raise ValueError(
+                "Dataset produced empty prompts: no recognized prompt column in "
+                f"{list(samples[0].keys())}. Expected one of "
+                "'prompt'/'question'/'input'/'problem'."
+            )
         return prompts, gts
 
     def _extract_prompt_gt(self, s: dict) -> tuple[str, str]:
@@ -1374,7 +1409,7 @@ class RLTrainer:
         """
         import json as _json
 
-        prompt_raw = s.get("prompt") or s.get("question") or s.get("input") or ""
+        prompt_raw = s.get("prompt") or s.get("question") or s.get("input") or s.get("problem") or ""
         if isinstance(prompt_raw, list):
             prompt_text = "\n".join(m.get("content", "") for m in prompt_raw if isinstance(m, dict))
         elif isinstance(prompt_raw, str) and prompt_raw.startswith("["):
@@ -1395,13 +1430,27 @@ class RLTrainer:
         if isinstance(rm_raw, dict) and rm_raw.get("ground_truth", "") != "":
             gt = rm_raw.get("ground_truth", "")
         else:
-            gt = s.get("answer") or s.get("solution") or s.get("target") or ""
+            gt = s.get("answer") or s.get("solution") or s.get("target") or s.get("expected_answer") or ""
 
         if self._tokenizer is not None and hasattr(self._tokenizer, "apply_chat_template"):
             if isinstance(prompt_raw, list):
                 try:
                     prompt_text = self._tokenizer.apply_chat_template(
                         prompt_raw, tokenize=False, add_generation_prompt=True,
+                    )
+                except Exception:
+                    pass
+            else:
+                # Bare question text (e.g. OpenMathInstruct-2's ``problem``): the
+                # scorer only accepts an ``Answer:`` line, so the prompt has to
+                # ask for one. Wrap in the verl DAPO instruction and render it
+                # through the chat template, which also gives the model a stop
+                # token instead of rambling to the length cap.
+                prompt_text = _MATH_ANSWER_FORMAT_PROMPT.format(question=prompt_text)
+                try:
+                    prompt_text = self._tokenizer.apply_chat_template(
+                        [{"role": "user", "content": prompt_text}],
+                        tokenize=False, add_generation_prompt=True,
                     )
                 except Exception:
                     pass
@@ -1467,6 +1516,23 @@ class RLTrainer:
             for k, v in state.items():
                 if isinstance(v, torch.Tensor) and v.device.type == "cpu":
                     state[k] = v.to(self._device, non_blocking=True)
+
+    def _resolve_model_dir(self) -> Path:
+        """Local directory holding the base model's config/tokenizer files.
+
+        ``policy.model_name`` is often a hub ID (``Qwen/Qwen3-0.6B``) rather than
+        a path, in which case those files live in the HF cache snapshot. The
+        weights are already downloaded by this point, so this resolves offline.
+        """
+        path = Path(self.config.policy.model_name)
+        if path.is_dir():
+            return path
+        from huggingface_hub import snapshot_download
+
+        return Path(snapshot_download(
+            self.config.policy.model_name,
+            allow_patterns=["*.json", "*.txt", "*.model"],
+        ))
 
     def _sync_weights_to_atom(self) -> None:
         """Push updated FSDP2 weights to ATOM engine for next rollout.
@@ -1537,13 +1603,18 @@ class RLTrainer:
                 json.dumps(index, indent=2)
             )
 
-            orig = Path(self.config.policy.model_name)
+            orig = self._resolve_model_dir()
             for fname in ["config.json", "tokenizer_config.json", "tokenizer.json",
                           "special_tokens_map.json", "generation_config.json",
                           "vocab.json", "merges.txt"]:
                 src = orig / fname
                 if src.exists():
                     shutil.copy2(str(src), str(sync_dir / fname))
+            if not (sync_dir / "config.json").exists():
+                raise FileNotFoundError(
+                    f"Weight sync: no config.json found in {orig}; the rollout "
+                    f"engine cannot load {sync_dir}."
+                )
 
             save_time = time.time() - t0
             logger.info(
