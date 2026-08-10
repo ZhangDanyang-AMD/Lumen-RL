@@ -269,13 +269,16 @@ def _apply_fsdp2_sharding(
     """
     import torch.distributed as dist
 
-    if not dist.is_initialized():
-        logger.warning("torch.distributed not initialized; returning unsharded model.")
-        return model
-
-    rank = dist.get_rank()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     local_device = torch.device(f"cuda:{local_rank}")
+
+    if not dist.is_initialized():
+        # No process group: no sharding, but the model still has to live on the
+        # device the rest of the trainer uses.
+        logger.warning("torch.distributed not initialized; returning unsharded model.")
+        return model.to(local_device) if torch.cuda.is_available() else model
+
+    rank = dist.get_rank()
 
     model.to(local_device)
 
