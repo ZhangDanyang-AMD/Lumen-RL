@@ -1392,12 +1392,6 @@ class RLTrainer:
             p, gt = self._extract_prompt_gt(s)
             prompts.append(p)
             gts.append(gt)
-        if any(not p.strip() for p in prompts):
-            raise ValueError(
-                "Dataset produced empty prompts: no recognized prompt column in "
-                f"{list(samples[0].keys())}. Expected one of "
-                "'prompt'/'question'/'input'/'problem'."
-            )
         return prompts, gts
 
     def _extract_prompt_gt(self, s: dict) -> tuple[str, str]:
@@ -1420,6 +1414,16 @@ class RLTrainer:
                 prompt_text = prompt_raw
         else:
             prompt_text = str(prompt_raw)
+
+        # Validate here, before the instruction template is injected below —
+        # afterwards every prompt is non-empty regardless of the dataset, so a
+        # later check would never fire.
+        if not prompt_text.strip():
+            raise ValueError(
+                "Dataset row produced an empty prompt: no recognized prompt "
+                f"column in {list(s.keys())}. Expected one of "
+                "'prompt'/'question'/'input'/'problem'."
+            )
 
         rm_raw = s.get("reward_model", {})
         if isinstance(rm_raw, str):
