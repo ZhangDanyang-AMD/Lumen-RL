@@ -7,6 +7,7 @@ import os
 import re
 import resource
 import shutil
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -63,8 +64,22 @@ class LumenActorWorker(BaseWorker):
         self._engine: BaseEngine | None = None
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    def init_model(self) -> None:
+    def init_model(self, forward_only: bool = False) -> None:
         """Build policy network via EngineRegistry."""
+        if forward_only:
+            os.environ["LUMENRL_FORWARD_ONLY_INIT"] = "1"
+            os.environ["MHC_BACKEND"] = "triton"
+            os.environ["TILEKERNELS_DIR"] = "/workspace/TileKernels"
+            for source_root in (
+                "/workspace/Megatron-LM",
+                "/workspace/aiter",
+                "/workspace/TileKernels",
+            ):
+                if (
+                    Path(source_root).is_dir()
+                    and source_root not in sys.path
+                ):
+                    sys.path.insert(0, source_root)
         policy = get_nested_config(self.config, "policy", default={}) or {}
         backend_raw = str(
             policy.get("training_backend", TrainingBackend.FSDP2.value)
@@ -1000,6 +1015,7 @@ class LumenActorWorker(BaseWorker):
         version: int,
         bucket_size_mb: int,
         fp8_quantize: bool = False,
+        integrity_check: bool = False,
     ) -> dict[str, Any]:
         """Collect Megatron HF tensors on all ranks; rank zero broadcasts them.
 
@@ -1023,11 +1039,22 @@ class LumenActorWorker(BaseWorker):
         if group is None:
             raise RuntimeError("RDMA weight group is not initialized")
 
+        integrity_enabled = bool(integrity_check) or os.environ.get(
+            "LUMENRL_WEIGHT_SYNC_INTEGRITY", "0"
+        ) == "1"
+        if integrity_enabled:
+            from lumenrl.engine.inference.weight_integrity import (
+                require_finite_stream,
+            )
+            params = require_finite_stream(params, stage="export")
+
         if fp8_quantize:
             from lumenrl.engine.inference.fp8_weight_quantizer import (
                 quantize_weights_fp8_per_block,
             )
             params = quantize_weights_fp8_per_block(params)
+            if integrity_enabled:
+                params = require_finite_stream(params, stage="fp8_quantize")
 
         from lumenrl.engine.inference.rdma_weight_transfer import send_weight_stream
 
@@ -1055,12 +1082,15 @@ class LumenActorWorker(BaseWorker):
         self,
         sync_dir: str,
         max_shard_bytes: int = 4 * 1024 * 1024 * 1024,
+        include_names: list[str] | None = None,
     ) -> dict[str, Any]:
         """Collectively export HF weights without returning them through Ray.
 
         Every rank consumes the parameter generator so Megatron TP/EP
         collectives make progress.  Rank 0 streams bounded CPU shards directly
         to the shared filesystem; other ranks discard each gathered tensor.
+        ``include_names`` limits files written by rank 0 while preserving all
+        collective generator calls on every rank.
         """
         if self._engine is None:
             raise RuntimeError("init_model() must be called before exporting weights.")
@@ -1083,6 +1113,7 @@ class LumenActorWorker(BaseWorker):
         current_bytes = 0
         total_bytes = 0
         num_params = 0
+        selected_names = set(include_names) if include_names is not None else None
 
         def flush_shard() -> None:
             nonlocal shard, current_bytes
@@ -1098,6 +1129,8 @@ class LumenActorWorker(BaseWorker):
 
         for name, param in params:
             if not is_writer:
+                continue
+            if selected_names is not None and name not in selected_names:
                 continue
             tensor = param.detach().to("cpu").contiguous()
             tensor_bytes = tensor.numel() * tensor.element_size()

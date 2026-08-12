@@ -133,6 +133,38 @@ def test_worker_reports_actual_rdma_capabilities():
     }
 
 
+def test_worker_integrity_rpc_reports_first_bad_resident_tensor():
+    model = torch.nn.Module()
+    model.register_parameter(
+        "good",
+        torch.nn.Parameter(torch.ones(2), requires_grad=False),
+    )
+    model.register_buffer("bad_scale", torch.tensor([float("nan")]))
+    worker = object.__new__(vLLMColocateWorkerExtension)
+    worker.model_runner = SimpleNamespace(model=model)
+    worker.local_rank = 3
+
+    report = worker.inspect_weight_integrity()
+
+    assert report["local_rank"] == 3
+    assert report["all_finite"] is False
+    assert report["first_bad"]["name"] == "bad_scale"
+
+
+def test_worker_scale_rpc_reports_invalid_resident_scale():
+    model = torch.nn.Module()
+    model.register_buffer("weight_scale_inv", torch.tensor([1.0, 0.0]))
+    worker = object.__new__(vLLMColocateWorkerExtension)
+    worker.model_runner = SimpleNamespace(model=model)
+    worker.local_rank = 2
+
+    report = worker.inspect_fp8_scales()
+
+    assert report["local_rank"] == 2
+    assert report["all_valid"] is False
+    assert report["nonpositive_count"] == 1
+
+
 def test_prequantized_fp8_metadata_restores_weight_and_block_scale_types():
     class OriginalWeight(torch.nn.Parameter):
         @property

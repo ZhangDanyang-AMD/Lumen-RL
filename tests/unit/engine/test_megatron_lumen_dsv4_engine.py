@@ -1,4 +1,5 @@
 import importlib
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,28 @@ from lumenrl.engine.training.megatron_lumen_dsv4_engine import (
     _named_export_tensors,
     _StreamingGatheredParamMapping,
 )
+
+
+def test_resolve_dsv4_topk_backend_uses_canonical_name_with_legacy_alias():
+    assert hasattr(dsv4_engine, "_resolve_dsv4_topk_backend")
+    resolve = dsv4_engine._resolve_dsv4_topk_backend
+    assert resolve({}) == "torch"
+    assert resolve({"miles_dsa_topk_backend": "flashinfer"}) == "flashinfer"
+    assert resolve({"dsv4_dsa_topk_backend": "torch", "miles_dsa_topk_backend": "flashinfer"}) == "torch"
+
+
+def test_dsv4_actor_explicitly_disables_fp8_training():
+    source = inspect.getsource(MegatronLumenDSV4Engine.initialize)
+
+    assert "bf16=True" in source
+    assert "fp8=None" in source
+
+
+def test_dsv4_pp_uses_ordered_dynamic_shape_exchange():
+    source = inspect.getsource(MegatronLumenDSV4Engine.initialize)
+
+    assert 'pp_kwargs["variable_seq_lengths"] = True' in source
+    assert 'pp_kwargs["batch_p2p_comm"] = False' in source
 
 
 def _parameter(values, *, tensor_parallel=False, partition_dim=0):

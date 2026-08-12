@@ -1,8 +1,11 @@
 # DeepSeek-V4-Flash GRPO long run — Megatron-DSV4 TP4/PP4/EP4 + vLLM FP8 rollout (MI308X)
 #
-# Aligned with LMSYS MILES RL:
-#   GRPO 32x8 sampling, 4k response cap, global batch 256, no KL, TP4/PP4/EP4
-#   https://www.lmsys.org/blog/2026-03-17-rocm-miles-rl-amd/#performance
+# Aligned with LMSYS MILES RL semantics:
+#   BF16 actor, FP8 rollout, GRPO 32x8 sampling, 4k response cap,
+#   global batch 256, no KL.
+#   https://www.lmsys.org/blog/2026-07-10-rocm-miles-dsv4/
+# The local MI308X memory layout intentionally remains TP4/PP4/EP4 instead of
+# the published MI355X TP1/PP4/EP4 layout.
 #
 # Training: Megatron-DSV4 (TP=4, PP=4, EP=4, ETP=1, 256 experts,
 #   sequence-parallel, distributed optimizer, flash attention,
@@ -12,8 +15,8 @@
 # PP layer distribution: first stage=11 layers, last stage=10 layers
 #
 # 3-node training/inference separation:
-#   Nodes 0-1: Megatron-DSV4 training (16 workers, TP=4, PP=4, EP=4, 16 GPUs)
-#   Node 2:    vLLM inference (TP=8, FP8 per-block quantized, 8 GPUs)
+#   Nodes 0-1: Megatron-DSV4 BF16 training (16 workers, TP=4, PP=4, EP=4)
+#   Node 2: vLLM inference (1 replica, TP=8, FP8 per-block, 8 GPUs)
 #
 # Rollout: vLLM AsyncLLM (FP8 per-block weights + FP8 KV cache, TP=8,
 #   enforce_eager, AITER kernels, gpu_memory_utilization=0.92)
@@ -28,7 +31,7 @@ cluster:
 weight_sync:
   enabled: true
   backend: rdma
-  shared_folder: /volumes/oss1/lumenrl_weight_sync/dsv4-flash
+  shared_folder: /dev/shm/weight_sync/dsv4-flash
   bucket_size_mb: 2048
   timeout_s: 1200
   verify_full_load: true
@@ -36,8 +39,8 @@ weight_sync:
   rdma:
     backend: rccl
     require_rdma: true
-    hca: mlx5_0
-    interface: ens14np0
+    hca: ionic_0
+    interface: benic7p1
     gid_index: 3
     gdr_mode: auto
 
@@ -49,14 +52,16 @@ controller:
       num_workers: 16
       dispatch_mode: dp_compute_proto
       process_on_nodes: [8, 8]
+      topology_tags:
+        node_ips: "10.235.200.67,10.235.200.247"
     rollout:
       num_workers: 8
       process_on_nodes: [8]
       topology_tags:
-        node_ip: "10.194.132.76"
+        node_ips: "10.235.200.173"
 
 policy:
-  model_name: /root/models/DeepSeek-V4-Flash-BF16
+  model_name: /dev/shm/models/DeepSeek-V4-Flash-BF16
   training_backend: megatron_lumen_dsv4
   generation_backend: vllm
   max_total_sequence_length: 16384           # MILES --context-length
@@ -92,8 +97,6 @@ policy:
       grad_reduce_in_fp32: false
       attention_softmax_in_fp32: true
       sequence_parallel: true
-      v4_indexer_block_n: 64
-      v4_indexer_num_stages: 1
       recompute_granularity: full
       recompute_method: uniform
       recompute_num_layers: 1
@@ -167,11 +170,11 @@ moe:
 reward:
   type: function
   function: lumenrl.rewards.math_reward.dapo_math_reward
-  dataset: /root/data_cached/dsv4-flash/dapo-math-17k.filtered.parquet
+  dataset: /dev/shm/data/dsv4-flash/dapo-math-17k/dapo-math-17k.jsonl
   shuffle: true
   shuffle_seed: 10086
 
-val_dataset: /root/data_cached/dsv4-flash/aime-2024.filtered.parquet
+val_dataset: /dev/shm/data/dsv4-flash/aime-2024/aime-2024.jsonl
 val_steps: 10
 val_batch_size: 0
 eval:
@@ -179,7 +182,7 @@ eval:
   num_samples: 0
 
 checkpointing:
-  checkpoint_dir: /root/ckpts/dsv4-flash/longrun
+  checkpoint_dir: /dev/shm/checkpoints/dsv4-flash/longrun
   save_steps: 5
   save_total_limit: 2
   resume: true

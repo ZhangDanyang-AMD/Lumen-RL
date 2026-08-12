@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from collections.abc import Iterable
 from typing import Any
@@ -238,6 +239,17 @@ def receive_weight_stream(
                     .view(entry["shape"])
                     .cpu()
                 )
+                if os.environ.get("LUMENRL_WEIGHT_SYNC_INTEGRITY", "0") == "1":
+                    from lumenrl.engine.inference.weight_integrity import (
+                        sampled_tensor_integrity,
+                    )
+                    integrity = sampled_tensor_integrity(entry["name"], value)
+                    if not integrity["all_finite"]:
+                        raise FloatingPointError(
+                            "non-finite weight at stage=rdma_recv "
+                            f"bucket={total_buckets - 1} "
+                            f"tensor={entry['name']}: {integrity}"
+                        )
                 fingerprints.observe_source([(entry["name"], value)])
                 yield entry["name"], value
 

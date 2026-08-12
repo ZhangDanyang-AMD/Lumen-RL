@@ -17,6 +17,24 @@ from lumenrl.trainer import rl_trainer
 from lumenrl.trainer.rl_trainer import RLTrainer
 
 
+def test_dsv4_actor_model_parallel_size_uses_megatron_topology() -> None:
+    trainer = object.__new__(RLTrainer)
+    trainer.config = SimpleNamespace(
+        policy=SimpleNamespace(
+            training_backend="megatron_lumen_dsv4",
+            training=SimpleNamespace(
+                megatron_cfg=SimpleNamespace(
+                    tensor_model_parallel_size=4,
+                    pipeline_model_parallel_size=4,
+                    context_parallel_size=1,
+                )
+            ),
+        )
+    )
+
+    assert trainer._compute_actor_mp() == 16
+
+
 def test_response_token_ids_respect_left_padding_and_prompt_length() -> None:
     helper = getattr(rl_trainer, "_response_token_ids", None)
     assert helper is not None

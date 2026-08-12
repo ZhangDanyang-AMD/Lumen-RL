@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════════
-# DeepSeek-V4-Flash GRPO RL — Megatron TP4/PP4/EP4 + vLLM FP8 (MI308X)
+# DeepSeek-V4-Flash GRPO RL — Megatron TP4/PP4/EP4 + vLLM FP8 (MI300X)
 #
 # MILES-aligned: GRPO 32x8, 4k response, global batch 256, no KL, TP4/PP4/EP4
 # vLLM FP8 per-block rollout + FP8 KV cache + AITER kernels
@@ -24,8 +24,8 @@ if [ ! -f "$LUMEN_DIR/lumen/config.py" ]; then
 fi
 
 MODEL_PATH="${MODEL_PATH:-$DATA_ROOT/models/DeepSeek-V4-Flash-BF16}"
-TRAIN_FILE="${TRAIN_FILE:-$DATA_ROOT/data_cached/dsv4-flash/dapo-math-17k.filtered.parquet}"
-VAL_FILE="${VAL_FILE:-$DATA_ROOT/data_cached/dsv4-flash/aime-2024.filtered.parquet}"
+TRAIN_FILE="${TRAIN_FILE:-$DATA_ROOT/data/dsv4-flash/dapo-math-17k/dapo-math-17k.jsonl}"
+VAL_FILE="${VAL_FILE:-$DATA_ROOT/data/dsv4-flash/aime-2024/aime-2024.jsonl}"
 
 RUN_ID="${RUN_ID:-dsv4-flash-grpo-${MODE}-$(date +%Y%m%d-%H%M%S)}"
 LOG="${LOG:-$DATA_ROOT/logs/${RUN_ID}.log}"
@@ -41,11 +41,10 @@ export LD_LIBRARY_PATH="/opt/venv/lib/python3.12/site-packages/torch/lib:${LD_LI
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export NCCL_TIMEOUT=7200 NCCL_CUMEM_ENABLE=0
-# Cross-node weight broadcast uses the RoCE path validated in IB-RDMA-Test:
-# nodes ens11np0, mlx5_0, GID 3. RCCL owns the transport.
+# Cross-node weight broadcast uses the MI300X Broadcom RoCE path.
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
-export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-ens11np0}"
-export NCCL_IB_HCA="${NCCL_IB_HCA:-mlx5_0}"
+export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-benic7p1}"
+export NCCL_IB_HCA="${NCCL_IB_HCA:-ionic_0}"
 export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
 export NCCL_DMABUF_ENABLE="${NCCL_DMABUF_ENABLE:-0}"
 export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
@@ -65,11 +64,11 @@ export LUMENRL_DEBUG="${LUMENRL_DEBUG:-0}"
 export LUMEN_DISABLE_HF_ATTN_PATCH=1
 
 # DSV4-specific env vars
-# vLLM uses AITER kernels for FP8 inference on MI308X
+# vLLM uses AITER kernels for FP8 inference on MI300X
 export VLLM_ROCM_USE_AITER="${VLLM_ROCM_USE_AITER:-1}"
 # Disable torch dynamo for DSV4 training stability
 export TORCHDYNAMO_DISABLE=1
-# MI308X GFX version override
+# MI300X GFX version override
 export HSA_OVERRIDE_GFX_VERSION=9.4.2
 # Long runs must allow ROCm to reclaim kernel scratch/events. Forcing
 # HSA_NO_SCRATCH_RECLAIM=1 eventually exhausts HSA queue resources even when

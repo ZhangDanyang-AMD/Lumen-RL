@@ -48,10 +48,7 @@ from lumenrl.engine.training.megatron_engine import (
     _gather_with_stride,
     _shard_with_stride,
 )
-from lumenrl.engine.training.qwen3_megatron_bridge import (
-    _pp_layer_range,
-    load_hf_safetensors,
-)
+from lumenrl.engine.training.qwen3_megatron_bridge import load_hf_safetensors
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LUMENRL_LOGGING_LEVEL", "INFO"))
@@ -66,7 +63,7 @@ _MAX_STREAMED_OPTIMIZER_CHUNK_MIB = 1024
 def _safe_optimizer_attr(optimizer, name):
     try:
         return getattr(optimizer, name, None)
-    except Exception:
+    except (AssertionError, AttributeError, RuntimeError):
         return None
 
 
@@ -295,6 +292,15 @@ def _rss_gib() -> float | None:
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20
 
 
+def _resolve_dsv4_topk_backend(engine_config: Mapping[str, Any]) -> str:
+    return str(
+        engine_config.get(
+            "dsv4_dsa_topk_backend",
+            engine_config.get("miles_dsa_topk_backend", "torch"),
+        )
+    )
+
+
 def _dsv4_router_kwargs(
     hf: Mapping[str, Any],
     ec: Mapping[str, Any],
@@ -492,7 +498,7 @@ class _StreamingGatheredParamMapping(Mapping[str, torch.Tensor]):
         except BaseException as exc:
             try:
                 group_ranks = dist.get_process_group_ranks(self._ep_group)
-            except BaseException:
+            except (RuntimeError, ValueError):
                 group_ranks = "<unavailable>"
             raise RuntimeError(
                 "DSV4 expert export EP gather failed: "
@@ -507,7 +513,7 @@ class _StreamingGatheredParamMapping(Mapping[str, torch.Tensor]):
 
 
 def _configure_dsv4_indexer_environment(engine_config: dict[str, Any]) -> None:
-    """Export TileLang launch tuning before the DSV4 modules are imported."""
+    """Export optional indexer tuning before DSV4 modules are imported."""
     settings = (
         ("v4_indexer_block_n", "V4_INDEXER_BLOCK_N"),
         ("v4_indexer_num_stages", "V4_INDEXER_NUM_STAGES"),
@@ -533,7 +539,6 @@ class MegatronLumenDSV4Engine(MegatronEngine):
         from megatron.core import parallel_state as mpu
         from megatron.core.models.gpt.gpt_model import GPTModel
         from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-        from megatron.core.transformer.transformer_config import TransformerConfig
 
         ec = self.engine_config
         _configure_dsv4_indexer_environment(ec)
@@ -682,6 +687,7 @@ class MegatronLumenDSV4Engine(MegatronEngine):
             pp_kwargs["num_layers_in_last_pipeline_stage"] = int(last_pp_layers)
         if pp > 1:
             pp_kwargs["variable_seq_lengths"] = True
+            pp_kwargs["batch_p2p_comm"] = False
 
         moe_kwargs = {}
         if num_experts > 0:
@@ -717,6 +723,7 @@ class MegatronLumenDSV4Engine(MegatronEngine):
             attention_dropout=0.0,
             attention_softmax_in_fp32=bool(ec.get("attention_softmax_in_fp32", True)),
             bf16=True,
+            fp8=None,
             params_dtype=torch.bfloat16,
             pipeline_dtype=torch.bfloat16,
             tensor_model_parallel_size=tp,
@@ -753,18 +760,16 @@ class MegatronLumenDSV4Engine(MegatronEngine):
             **moe_kwargs,
             **pp_kwargs,
         )
-        # miles_dsa_topk_backend is not a dataclass field — set via setattr
-        # (get_dsv4_spec reads it from config at runtime)
-        tfcfg.miles_dsa_topk_backend = str(ec.get("miles_dsa_topk_backend", "torch"))
+        # This is a Lumen extension rather than an MLATransformerConfig field.
+        tfcfg.dsv4_dsa_topk_backend = _resolve_dsv4_topk_backend(ec)
 
-        # mock_args for get_dsv4_spec (it only reads miles_dsa_topk_backend)
+        # get_dsv4_spec copies this canonical Lumen argument onto the config.
         mock_args = SimpleNamespace(
-            miles_dsa_topk_backend=tfcfg.miles_dsa_topk_backend,
+            dsv4_dsa_topk_backend=tfcfg.dsv4_dsa_topk_backend,
         )
 
         # ---- Build GPTModel using Lumen's get_dsv4_spec ----
         from lumen.models.dsv4.megatron.spec import get_dsv4_spec
-        from megatron.core.models.gpt.gpt_model import GPTModel
 
         pp_rank = mpu.get_pipeline_model_parallel_rank()
         pp_size = mpu.get_pipeline_model_parallel_world_size()
@@ -913,11 +918,14 @@ class MegatronLumenDSV4Engine(MegatronEngine):
         # ---- Freeze non-trainable params ----
         # MoE router gates, expert bias, and tid2eid hash table
         for name, param in self.module.named_parameters():
-            if "mlp.router.weight" in name:
-                param.requires_grad_(False)
-            elif "mlp.router.expert_bias" in name:
-                param.requires_grad_(False)
-            elif "mlp.router.tid2eid" in name:
+            if any(
+                key in name
+                for key in (
+                    "mlp.router.weight",
+                    "mlp.router.expert_bias",
+                    "mlp.router.tid2eid",
+                )
+            ):
                 param.requires_grad_(False)
 
         n_params = sum(p.numel() for p in self.module.parameters())
@@ -927,6 +935,16 @@ class MegatronLumenDSV4Engine(MegatronEngine):
             f"({n_params * 2 / 2**30:.2f} GiB bf16), requires_grad={n_grad:,}",
             file=sys.stderr, flush=True,
         )
+
+        if os.environ.get("LUMENRL_FORWARD_ONLY_INIT", "0") == "1":
+            self._ddp = None
+            self.optimizer = None
+            self.lr_scheduler = None
+            logger.info(
+                "Forward-only Megatron initialization: skipped DDP, gradient "
+                "buffers, optimizer, and scheduler"
+            )
+            return
 
         # ---- Megatron DistributedDataParallel + optimizer ----
         from megatron.core.distributed import DistributedDataParallel as DDP

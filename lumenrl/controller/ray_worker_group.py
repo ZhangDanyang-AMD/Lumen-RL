@@ -33,6 +33,25 @@ def _prefixed_method(prefix: str, method: str) -> str:
     return f"{prefix}_{method}"
 
 
+def _placement_node_ips(
+    topology_tags: dict[str, str], group_count: int,
+) -> list[str]:
+    """Resolve an optional node pin for each positive placement group."""
+    node_ip = str(topology_tags.get("node_ip", "") or "").strip()
+    node_ips_raw = str(topology_tags.get("node_ips", "") or "").strip()
+    if node_ip and node_ips_raw:
+        raise ValueError("topology_tags cannot define both node_ip and node_ips")
+    if node_ips_raw:
+        node_ips = [value.strip() for value in node_ips_raw.split(",") if value.strip()]
+        if len(node_ips) != group_count:
+            raise ValueError(
+                "topology_tags.node_ips must contain one entry per positive "
+                f"process_on_nodes group: got {len(node_ips)}, expected {group_count}"
+            )
+        return node_ips
+    return [node_ip] * group_count
+
+
 class RayWorkerGroup:
     """A group of Ray actor workers for a single RL role.
 
@@ -125,10 +144,18 @@ class RayWorkerGroup:
         from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
         pgs = []
-        pinned_node_ip = self.pool.topology_tags.get("node_ip", "")
+        positive_group_count = sum(
+            1 for count in self.pool.process_on_nodes if count > 0
+        )
+        pinned_node_ips = _placement_node_ips(
+            self.pool.topology_tags, positive_group_count,
+        )
+        placement_idx = 0
         for node_idx, count in enumerate(self.pool.process_on_nodes):
             if count <= 0:
                 continue
+            pinned_node_ip = pinned_node_ips[placement_idx]
+            placement_idx += 1
             bundles = []
             for _ in range(count):
                 bundle = {"GPU": 1, "CPU": 1}
@@ -147,10 +174,10 @@ class RayWorkerGroup:
 
         ray.get([pg.ready() for pg, _ in pgs])
         logger.info(
-            "Created %d placement groups for pool '%s': %s (node_ip=%s)",
+            "Created %d placement groups for pool '%s': %s (node_ips=%s)",
             len(pgs), self.pool.name,
             [(pg.bundle_count, count) for pg, count in pgs],
-            pinned_node_ip or "auto",
+            [node_ip or "auto" for node_ip in pinned_node_ips],
         )
 
         RemoteWorker = ray.remote(self.worker_cls)

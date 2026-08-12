@@ -78,6 +78,65 @@ def test_patch_transformer_layer_wraps_tensor_attention_output(tmp_path) -> None
     assert not patcher.patch_transformer_layer(str(tmp_path))
 
 
+def test_patch_transformer_forward_integrates_hyper_connections(tmp_path) -> None:
+    transformer = tmp_path / "megatron" / "core" / "transformer"
+    transformer.mkdir(parents=True)
+    block = transformer / "transformer_block.py"
+    block.write_text(
+        """
+        self._build_layers()
+
+        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+
+        # Final layer norm.
+"""
+    )
+    layer = transformer / "transformer_layer.py"
+    layer.write_text(
+        """
+        self.bias_dropout_add_exec_handler = torch.enable_grad
+
+        # Residual connection.
+        residual = hidden_states
+
+        nvtx_range_pop(suffix="self_attention")
+
+        if isinstance(attention_output_with_bias, torch.Tensor):
+            attention_output_with_bias = (attention_output_with_bias, None)
+
+        with self.bias_dropout_add_exec_handler():
+            hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
+                attention_output_with_bias, residual, self.hidden_dropout
+            )
+
+        # Residual connection.
+        residual = hidden_states
+
+        # Optional Layer norm post the cross-attention.
+        pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
+
+        else:
+            return self._forward_post_mlp(mlp_output_with_bias, residual)
+
+    def _forward_post_mlp(self, mlp_output_with_bias, residual):
+        nvtx_range_push(suffix="mlp_bda")
+        if using_fused_tp_inference_kernel:
+            hidden_states = mlp_output_with_bias[0]
+"""
+    )
+
+    assert patcher.patch_transformer_block(str(tmp_path))
+    assert patcher.patch_transformer_layer(str(tmp_path))
+
+    block_text = block.read_text()
+    assert "self.hc_util.block_expand(hidden_states)" in block_text
+    assert "self.hc_util.block_head(" in block_text
+    layer_text = layer.read_text()
+    assert "hc_util.layer_pre(" in layer_text
+    assert "hc_util.layer_post(" in layer_text
+    assert "hc_ffn_post=hc_ffn_post" in layer_text
+
+
 def test_patch_hybrid_optimizer_disables_foreach_temporaries(tmp_path) -> None:
     optimizer = (
         tmp_path

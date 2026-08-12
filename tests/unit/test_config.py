@@ -267,9 +267,15 @@ def test_dsv4_longrun_uses_miles_adam_and_grpo_semantics() -> None:
     assert cfg.weight_sync.fp8_quantization_location == "inference"
     assert cfg.policy.max_response_length == 4096
     assert cfg.policy.max_total_sequence_length == 16384
+    assert cfg.policy.max_token_len_per_gpu == 8192
     assert cfg.policy.train_global_batch_size == 256
     assert cfg.policy.gen_batch_size == 32
     assert cfg.policy.optimizer_type == "adam"
+    assert cfg.quantization.training.fp8 is None
+    assert cfg.policy.training.megatron_cfg.tensor_model_parallel_size == 4
+    assert cfg.policy.training.megatron_cfg.pipeline_model_parallel_size == 4
+    assert cfg.policy.training.megatron_cfg.expert_model_parallel_size == 4
+    assert cfg.policy.training.megatron_cfg.grad_reduce_in_fp32 is False
     assert cfg.policy.training.megatron_cfg.optimizer_cpu_offload is True
     assert cfg.policy.training.megatron_cfg.optimizer_offload_fraction == 1.0
     assert cfg.policy.training.megatron_cfg.use_precision_aware_optimizer is True
@@ -291,4 +297,16 @@ def test_dsv4_longrun_uses_miles_adam_and_grpo_semantics() -> None:
     assert cfg.moe.r3.record_router_logits is False
     assert cfg.checkpointing.save_steps == 5
     assert cfg.checkpointing.save_total_limit == 2
+    assert cfg.cluster.num_nodes == 3
+    assert cfg.controller.ray.actor.process_on_nodes == [8, 8]
+    assert (
+        cfg.controller.ray.actor.topology_tags["node_ips"]
+        == "10.235.200.67,10.235.200.247"
+    )
+    assert cfg.controller.ray.rollout.num_workers == 8
+    assert cfg.controller.ray.rollout.process_on_nodes == [8]
+    assert (
+        cfg.controller.ray.rollout.topology_tags["node_ips"]
+        == "10.235.200.173"
+    )
     assert cfg.num_training_steps == 200

@@ -50,7 +50,44 @@ def compare_snapshots(
     }
 
 
-def _capture(trainer: Any, prompts: list[str], ground_truths: list[str], max_tokens: int) -> dict[str, Any]:
+def compare_cross_engine_logprobs(
+    rollout_logprobs: Any,
+    megatron_logprobs: Any,
+    response_mask: Any,
+) -> dict[str, int | float]:
+    """Compare vLLM and Megatron log-probs on response tokens only."""
+    if rollout_logprobs.shape != megatron_logprobs.shape:
+        raise ValueError(
+            "cross-engine log-prob shapes differ: "
+            f"{tuple(rollout_logprobs.shape)} != {tuple(megatron_logprobs.shape)}"
+        )
+    if response_mask.shape != rollout_logprobs.shape:
+        raise ValueError(
+            "response mask shape differs from log-probs: "
+            f"{tuple(response_mask.shape)} != {tuple(rollout_logprobs.shape)}"
+        )
+    selected_rollout = rollout_logprobs.float()[response_mask.bool()]
+    selected_megatron = megatron_logprobs.float()[response_mask.bool()]
+    if selected_rollout.numel() == 0:
+        raise ValueError("cross-engine comparison has no response tokens")
+    diff = selected_rollout - selected_megatron
+    return {
+        "token_count": int(diff.numel()),
+        "rollout_minus_megatron_mean": float(diff.mean().item()),
+        "logprob_mae": float(diff.abs().mean().item()),
+        "logprob_max_abs": float(diff.abs().max().item()),
+        "rollout_nll": float((-selected_rollout).mean().item()),
+        "megatron_nll": float((-selected_megatron).mean().item()),
+    }
+
+
+def _capture(
+    trainer: Any,
+    prompts: list[str],
+    ground_truths: list[str],
+    max_tokens: int,
+    temperature: float,
+) -> dict[str, Any]:
     from lumenrl.rewards.math_reward import compute_math_reward
 
     sequences, seq_mask, prompt_lengths, rollout_lp, _ = trainer._rollout_with_ray_vllm(
@@ -58,10 +95,11 @@ def _capture(trainer: Any, prompts: list[str], ground_truths: list[str], max_tok
         num_generations=1,
         sampling_params={
             "max_tokens": int(max_tokens),
-            "temperature": 0.0,
+            "temperature": float(temperature),
             "top_p": 1.0,
             "top_k": -1,
             "logprobs": 0,
+            "seed": 0,
         },
     )
     if rollout_lp is None:
@@ -98,7 +136,27 @@ def _capture(trainer: Any, prompts: list[str], ground_truths: list[str], max_tok
         "scores": [float(x) for x in rewards.tolist()],
         "accuracy": [1 if item["acc"] else 0 for item in details],
         "response_lengths": [len(x) for x in token_ids],
+        "_sequences": sequences,
+        "_seq_mask": seq_mask,
+        "_response_mask": response_mask,
+        "_rollout_logprobs": rollout_lp,
     }
+
+
+def _cross_engine_snapshot(trainer: Any, snapshot: dict[str, Any]) -> dict[str, int | float]:
+    if trainer._actor_wg is None:
+        raise RuntimeError("Megatron actor worker group is unavailable")
+    megatron_logprobs = trainer._compute_log_probs_with_worker_group(
+        trainer._actor_wg,
+        snapshot["_sequences"],
+        role="actor",
+        attention_mask=snapshot["_seq_mask"],
+    )
+    return compare_cross_engine_logprobs(
+        snapshot["_rollout_logprobs"].cpu(),
+        megatron_logprobs.cpu(),
+        snapshot["_response_mask"].cpu(),
+    )
 
 
 def _stage_summary(snapshot: dict[str, Any]) -> dict[str, float | int]:
@@ -111,6 +169,10 @@ def _stage_summary(snapshot: dict[str, Any]) -> dict[str, float | int]:
         "response_length_mean": sum(lengths) / max(1, len(lengths)),
         "response_length_max": max(lengths, default=0),
     }
+
+
+def _skip_sync_requested() -> bool:
+    return os.environ.get("LUMENRL_SYNC_VALIDATE_SKIP_SYNC", "0") == "1"
 
 
 def main() -> None:
@@ -129,6 +191,7 @@ def main() -> None:
 
     sample_count = max(1, int(os.environ.get("LUMENRL_SYNC_VALIDATE_SAMPLES", "4")))
     max_tokens = max(1, int(os.environ.get("LUMENRL_SYNC_VALIDATE_MAX_TOKENS", "512")))
+    temperature = float(config.policy.generation.vllm_cfg.temperature or 1.0)
     trainer = RLTrainer(config)
     try:
         trainer.setup()
@@ -141,18 +204,35 @@ def main() -> None:
         ground_truths = [pair[1] for pair in pairs]
 
         logger.info("Capturing base model twice before weight synchronization")
-        base_1 = _capture(trainer, prompts, ground_truths, max_tokens)
-        base_2 = _capture(trainer, prompts, ground_truths, max_tokens)
+        base_1 = _capture(trainer, prompts, ground_truths, max_tokens, temperature)
+        base_2 = _capture(trainer, prompts, ground_truths, max_tokens, temperature)
+        base_cross_engine = _cross_engine_snapshot(trainer, base_2)
+        if _skip_sync_requested():
+            result = {
+                "base_1": _stage_summary(base_1),
+                "base_2": _stage_summary(base_2),
+                "base_repeat": compare_snapshots(base_1, base_2),
+                "base_cross_engine": base_cross_engine,
+                "response_tails": {
+                    "base": [text[-240:] for text in base_2["responses"]],
+                },
+            }
+            logger.info(
+                "WEIGHT_SYNC_VALIDATION_JSON=%s",
+                json.dumps(result, ensure_ascii=False),
+            )
+            return
 
         logger.info("Synchronizing unchanged trainer weights (version 1)")
         trainer.global_step = 0
         trainer._sync_weights_ipc()
-        sync_1 = _capture(trainer, prompts, ground_truths, max_tokens)
+        sync_1 = _capture(trainer, prompts, ground_truths, max_tokens, temperature)
+        sync_cross_engine = _cross_engine_snapshot(trainer, sync_1)
 
         logger.info("Synchronizing the same unchanged trainer weights (version 2)")
         trainer.global_step = 1
         trainer._sync_weights_ipc()
-        sync_2 = _capture(trainer, prompts, ground_truths, max_tokens)
+        sync_2 = _capture(trainer, prompts, ground_truths, max_tokens, temperature)
 
         result = {
             "base_1": _stage_summary(base_1),
@@ -162,6 +242,8 @@ def main() -> None:
             "base_repeat": compare_snapshots(base_1, base_2),
             "base_to_sync": compare_snapshots(base_2, sync_1),
             "sync_repeat": compare_snapshots(sync_1, sync_2),
+            "base_cross_engine": base_cross_engine,
+            "sync_cross_engine": sync_cross_engine,
             "response_tails": {
                 "base": [text[-240:] for text in base_2["responses"]],
                 "sync": [text[-240:] for text in sync_1["responses"]],

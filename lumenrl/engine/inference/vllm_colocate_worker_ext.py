@@ -112,6 +112,33 @@ def set_death_signal() -> None:
 class vLLMColocateWorkerExtension:
     """Mixed into the vLLM worker; receives IPC weight buckets and loads them."""
 
+    def inspect_weight_integrity(self) -> dict[str, object]:
+        """Scan resident model parameters and buffers for the first NaN/Inf."""
+        from itertools import chain
+
+        from lumenrl.engine.inference.weight_integrity import scan_named_tensors
+
+        model = self.model_runner.model
+        report = scan_named_tensors(
+            chain(model.named_parameters(), model.named_buffers()),
+            stop_on_first_bad=True,
+        )
+        report["local_rank"] = int(self.local_rank)
+        return report
+
+    def inspect_fp8_scales(self) -> dict[str, object]:
+        """Summarize resident block-scale validity and dynamic range."""
+        from itertools import chain
+
+        from lumenrl.engine.inference.weight_integrity import scan_fp8_scales
+
+        model = self.model_runner.model
+        report = scan_fp8_scales(
+            chain(model.named_parameters(), model.named_buffers())
+        )
+        report["local_rank"] = int(self.local_rank)
+        return report
+
     def get_rdma_capabilities(self) -> dict[str, object]:
         """Return this worker's versioned RDMA reload capabilities."""
         from lumenrl.engine.inference.rdma_protocol import (
@@ -227,6 +254,12 @@ class vLLMColocateWorkerExtension:
             )
 
         model = self.model_runner.model
+        integrity_enabled = os.environ.get(
+            "LUMENRL_WEIGHT_SYNC_INTEGRITY", "0"
+        ) == "1"
+        integrity_reports: dict[str, object] = {}
+        if integrity_enabled:
+            integrity_reports["before_prepare"] = self.inspect_weight_integrity()
 
         from lumenrl.engine.inference.rdma_weight_transfer import (
             receive_weight_stream,
@@ -294,6 +327,10 @@ class vLLMColocateWorkerExtension:
             try:
                 prepare_online_quantized_weights_for_loading(model)
                 log_static_changes("after_prepare")
+                if integrity_enabled:
+                    integrity_reports["after_prepare"] = (
+                        self.inspect_weight_integrity()
+                    )
                 stats = receive_weight_stream(
                     groups[group_name],
                     model,
@@ -305,6 +342,10 @@ class vLLMColocateWorkerExtension:
                     finalize_fingerprints=False,
                 )
                 log_static_changes("after_load")
+                if integrity_enabled:
+                    integrity_reports["after_load"] = (
+                        self.inspect_weight_integrity()
+                    )
             except BaseException as exc:
                 reload_error = exc
                 raise
@@ -313,6 +354,10 @@ class vLLMColocateWorkerExtension:
                 try:
                     finalize_online_quantized_weights_loading(model, model_config)
                     log_static_changes("after_finalize")
+                    if integrity_enabled:
+                        integrity_reports["after_finalize"] = (
+                            self.inspect_weight_integrity()
+                        )
                 except BaseException as exc:
                     finalize_error = exc
                 try:
@@ -365,6 +410,9 @@ class vLLMColocateWorkerExtension:
             )
 
         verification = stats.get("verification", {})
+        if integrity_enabled:
+            integrity_reports["after_reload"] = self.inspect_weight_integrity()
+            stats["integrity"] = integrity_reports
         logger.warning(
             "RDMA reload checks complete on local_rank=%d "
             "(online_quant=%s, prequantized_fp8=%s): "

@@ -45,6 +45,15 @@ def test_native_engine_uses_shared_base() -> None:
     assert issubclass(MegatronNativeEngine, MegatronBaseEngine)
 
 
+def test_r3_validation_accepts_uint8_ids_for_256_experts() -> None:
+    engine = object.__new__(megatron_engine.MegatronEngine)
+    engine._dims = SimpleNamespace(num_experts=256)
+
+    engine._r3_validate_expert_ids(
+        torch.tensor([0, 1, 254, 255], dtype=torch.uint8)
+    )
+
+
 def test_row_policy_loss_aligns_pre_shifted_response_mask_after_left_padding() -> None:
     engine = object.__new__(MegatronBaseEngine)
     token_log_probs = torch.zeros(1, 3, requires_grad=True)
@@ -254,6 +263,41 @@ def test_rdma_weight_sync_releases_cuda_cache_before_gather(monkeypatch) -> None
     assert result == {"writer": False}
 
 
+def test_safetensors_export_can_select_diagnostic_weights(
+    monkeypatch, tmp_path
+) -> None:
+    class FakeEngine:
+        @staticmethod
+        def get_per_tensor_param():
+            return iter(
+                [
+                    ("embed.weight", torch.ones(2, 3)),
+                    ("layers.0.ffn.gate.weight", torch.full((2, 3), 2.0)),
+                    ("layers.0.ffn.experts.0.w1.weight", torch.full((2, 3), 3.0)),
+                ]
+            ), None
+
+    actor = LumenActorWorker(rank=0, world_size=1, config={})
+    actor._engine = FakeEngine()
+    monkeypatch.setattr(actor, "_ensure_weight_http_server", lambda _path: "")
+
+    result = actor.export_state_dict_safetensors(
+        str(tmp_path),
+        include_names=["embed.weight", "layers.0.ffn.gate.weight"],
+    )
+
+    import json
+
+    index = json.loads(
+        (tmp_path / "model.safetensors.index.json").read_text()
+    )
+    assert set(index["weight_map"]) == {
+        "embed.weight",
+        "layers.0.ffn.gate.weight",
+    }
+    assert result["num_params"] == 2
+
+
 def test_fused_token_log_prob_matches_reference_value_and_gradient() -> None:
     torch.manual_seed(7)
     target = torch.tensor([0, 3, 1, 4, 2], dtype=torch.long)
@@ -359,9 +403,10 @@ def test_grpo_rowwise_packed_and_pipeline_scaling_match() -> None:
     torch.testing.assert_close(pipeline_logp.grad, packed_logp.grad)
 
 
-def test_dsv4_indexer_tuning_is_exported_to_tilelang(monkeypatch) -> None:
+def test_dsv4_indexer_tuning_preserves_aiter_default(monkeypatch) -> None:
     monkeypatch.delenv("V4_INDEXER_BLOCK_N", raising=False)
     monkeypatch.delenv("V4_INDEXER_NUM_STAGES", raising=False)
+    monkeypatch.delenv("V4_INDEXER_IMPL", raising=False)
 
     assert hasattr(
         megatron_lumen_dsv4_engine, "_configure_dsv4_indexer_environment"
@@ -372,6 +417,7 @@ def test_dsv4_indexer_tuning_is_exported_to_tilelang(monkeypatch) -> None:
 
     assert os.environ["V4_INDEXER_BLOCK_N"] == "64"
     assert os.environ["V4_INDEXER_NUM_STAGES"] == "1"
+    assert "V4_INDEXER_IMPL" not in os.environ
 
 
 def test_dsv4_sequence_alignment_includes_compressor_ratios() -> None:

@@ -59,6 +59,15 @@ def test_vllm_runtime_env_propagates_all_gather_lifecycle_diagnostic(monkeypatch
     assert env_vars["LUMENRL_DIAG_ALL_GATHER_NUMEL"] == "517120"
 
 
+def test_vllm_runtime_env_propagates_weight_integrity_diagnostic(monkeypatch):
+    monkeypatch.setenv("LUMENRL_WEIGHT_SYNC_INTEGRITY", "1")
+    env_vars = {}
+
+    vllm_ray_server._copy_vllm_runtime_env(env_vars)
+
+    assert env_vars["LUMENRL_WEIGHT_SYNC_INTEGRITY"] == "1"
+
+
 class RemoteMethod:
     def __init__(self, result=True):
         self.result = result

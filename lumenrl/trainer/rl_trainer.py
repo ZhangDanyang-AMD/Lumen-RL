@@ -380,15 +380,19 @@ class RLTrainer:
         )
 
     def _compute_actor_mp(self) -> int:
-        """Total model-parallel size (TP x PP x CP) of the actor engine (Megatron
-        native path only).
+        """Total model-parallel size (TP x PP x CP) of a Megatron actor.
 
-        FSDP is pure DP (mp=1). The Megatron-Native engine consumes
+        FSDP is pure DP (mp=1). Megatron actor engines consume
         ``megatron_cfg.tensor_model_parallel_size`` /
         ``pipeline_model_parallel_size`` / ``context_parallel_size``.
         """
         backend = str(getattr(self.config.policy, "training_backend", "")).lower()
-        if backend not in ("megatron_native", "megatron-native", "megatron"):
+        if backend not in (
+            "megatron_native",
+            "megatron-native",
+            "megatron",
+            "megatron_lumen_dsv4",
+        ):
             return 1
         try:
             meg = self.config.policy.training.megatron_cfg
@@ -791,11 +795,19 @@ class RLTrainer:
             version=version,
             bucket_size_mb=int(cfg.bucket_size_mb),
             fp8_quantize=fp8_sync,
+            integrity_check=(
+                os.environ.get("LUMENRL_WEIGHT_SYNC_INTEGRITY", "0") == "1"
+            ),
         )
         results = ray.get(
             send_refs + recv_refs,
             timeout=float(cfg.timeout_s),
         )
+        self._last_weight_sync_integrity = [
+            result.get("integrity")
+            for result in results[len(send_refs):]
+            if isinstance(result, dict)
+        ]
         sender = next(
             (x for x in results[: len(send_refs)] if x.get("writer")),
             None,
@@ -1006,7 +1018,12 @@ class RLTrainer:
             spawned = fused_wg.spawn(["actor", "ref"])
             self._actor_wg = spawned["actor"]
             self._ref_wg = spawned["ref"]
-            self._actor_wg.call_all("init_model")
+            self._actor_wg.call_all(
+                "init_model",
+                forward_only=(
+                    os.environ.get("LUMENRL_FORWARD_ONLY_INIT", "0") == "1"
+                ),
+            )
             self._ref_wg.call_all("init_model")
             self._actor_wg.setup_dispatch_collect_info()
             self._ref_wg.setup_dispatch_collect_info()
@@ -1021,7 +1038,12 @@ class RLTrainer:
             )
             self._actor_wg.start()
             self._rendezvous_ray_group(self._actor_wg)
-            self._actor_wg.call_all("init_model")
+            self._actor_wg.call_all(
+                "init_model",
+                forward_only=(
+                    os.environ.get("LUMENRL_FORWARD_ONLY_INIT", "0") == "1"
+                ),
+            )
             self._actor_wg.setup_dispatch_collect_info()
 
         # Megatron model-parallel (TP/PP/CP): the actor world is a
@@ -1064,6 +1086,18 @@ class RLTrainer:
             self._ref_wg.call_all("init_model")
             self._ref_wg.setup_dispatch_collect_info()
 
+        if os.environ.get("LUMENRL_SKIP_ROLLOUT_INIT", "0") == "1":
+            self._ray_use_vllm = False
+            self._ray_use_atom = False
+            self._ray_rollout_mgr = None
+            self._ray_vllm_engine = None
+            self._atom_engine = None
+            logger.info(
+                "Actor-only diagnostic setup: skipped tokenizer, rollout "
+                "engine, and datasets"
+            )
+            return
+
         from transformers import AutoTokenizer
         self._tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         if self._tokenizer.pad_token is None:
@@ -1085,6 +1119,9 @@ class RLTrainer:
         else:
             from lumenrl.engine.inference.atom_engine import AtomEngine
             self._atom_engine = AtomEngine(config=atom_cfg, model_name=model_name)
+        if os.environ.get("LUMENRL_SKIP_DATASET_INIT", "0") == "1":
+            logger.info("Diagnostic setup: skipped train and validation datasets")
+            return
         self._load_dataset()
 
         # ---- Validation dataset ----
