@@ -932,9 +932,15 @@ class MegatronEngine(BaseEngine):
         num_experts = int(self._dims.num_experts)
         if num_experts <= 0:
             raise ValueError("R3 requires a positive global expert count")
-        invalid = (routes < 0) | (routes >= num_experts)
+        # Route captures use uint8 for models with up to 256 experts. Comparing
+        # a uint8 tensor with the Python integer 256 wraps the bound to zero,
+        # incorrectly marking every valid id as out of range.
+        routes_for_validation = routes.to(torch.int64)
+        invalid = (routes_for_validation < 0) | (
+            routes_for_validation >= num_experts
+        )
         if invalid.any():
-            bad_id = int(routes[invalid][0].item())
+            bad_id = int(routes_for_validation[invalid][0].item())
             raise ValueError(
                 f"R3 expert id {bad_id} is outside global range "
                 f"[0, {num_experts})"
