@@ -168,6 +168,13 @@ class TeacherConfig:
     generate_mode: str = "prefill"
     generate_max_tokens: int = 2048
     generate_temperature: float = 0.0
+    # How many of a round's batches to decode in one sweep. A sweep runs until
+    # its slowest sequence finishes, so a sweep holding a single batch spends
+    # its tail decoding a few rows at nearly the cost of a full slate; merging
+    # batches lets the scheduler backfill finished slots from the next batch.
+    # 0 = the whole round. Lower it only to bound peak host memory or to keep a
+    # sweep inside the command timeout.
+    generate_sweep_batches: int = 0
 
 
 @dataclass
@@ -292,6 +299,18 @@ class DatasetConfig:
     min_loss_tokens: int = 0
     num_preprocess_workers: int = 16
     cache_dir: str = "/dev/shm/lumenrl_cache"
+    # Drop samples that do not fit the window instead of truncating them.
+    # Truncation ends a conversation mid-response with no terminator, so the
+    # draft learns to continue text the teacher would never have produced.
+    drop_overlong: bool = False
+    # > 0 emits the generation prompt (context before the last assistant turn)
+    # alongside each sample and drops those whose prompt exceeds this many
+    # tokens. Required by generate_mode="generate": prompt and response share
+    # one window, so a prompt this long leaves the rest for the response.
+    max_prompt_tokens: int = 0
+    # Passed to K3's apply_chat_template. Non-thinking keeps the response inside
+    # a small window; thinking_effort defaults to "max" and can consume it whole.
+    thinking: bool = True
 
 
 @dataclass
