@@ -1,0 +1,230 @@
+# Kimi K3 DSpark Smoke Test — MI350 (ATOM teacher, Batch-Alternating)
+#
+# 在**与 train.yaml 完全相同的配方**上跑 5 步全链路验证。只有规模和输出路径不同；
+# 任何影响行为的字段都保持一致，因为跑另一套配方的 smoke 验证的是没人会跑的流水线。
+#
+# Phase A1: ATOM 解码 prompt → teacher 自己的 response（抓取关闭）
+# Phase A2: 同一个引擎重新 prefill 整条序列，抓 5 层隐藏态 → Mooncake（抓取打开）
+# Phase B:  torchrun replicate draft 训练（BF16）
+#
+# 要重点确认的事：
+#   1. B=64 解码能连续跑完 5 批不 GPU fault —— vLLM 是 15-20 批必崩
+#   2. 收到的隐藏态宽度 = 5 × 7168 = 35840，且每条的有效长度等于 prompt+response
+#      （如果 prefill 被切块，Mooncake 里只会剩最后一块，长度会短）
+#   3. switch_mode 在两遍之间来回切而引擎不重启（日志里不应出现重复的权重加载）
+#
+# 2026-08-08 新增的四项（这一版改动的正是它们）：
+#   4. thinking=true 渲染正确：prompt 里有 <|open|>think<|sep|>，且多轮历史的
+#      reasoning 被保留（不是一串空 think 块 —— 那是 PARSER_VERSION<6 的老 bug）
+#   5. 整轮合成一遍 sweep（320 条一次提交）后，拆回各批的结果仍与批边界对齐
+#   6. 开 CUDA graph 后隐藏态不变：graph 只捕获 decode，A2 的 prefill 必须仍走 eager
+#   7. Phase B 峰值显存 —— 这是决定能不能上 max_num_seqs=128/256 的关键数，
+#      跑的时候用 rocm-smi 采样，别只看跑没跑挂
+#
+# 刻意与 train.yaml 不同（且仅限这些）：
+#   num_training_steps 5、cache_batches 5、每步都 eval 且只用 8 条、
+#   独立的 cache_dir / checkpoint_dir，避免 smoke 污染正式 run。
+#
+# ⚠️ 刻意保持一致——改了就失去测试意义：
+#   train_global_batch_size 64: bs=8 时梯度累积路径（ceil(64/8)=8 次 backward）
+#     完全不会被走到，cached batch 也从 11.3 GB 缩到 1.41 GB，/dev/shm 压力测不出来。
+#   anchor_num 512: 峰值显存的主要驱动量（实测 57.8 GiB）。64 会把 OOM 风险测漏。
+#   max_num_seqs / max_num_batched_tokens: 前者决定解码批形态（正是 vLLM 崩的地方），
+#     后者是"prefill 不被切块"的保证，调小会让隐藏态被静默截断。
+#   四个 generate_* / dataset.* 字段：见各自的注释。
+#
+# Usage:
+#   bash examples/Kimi_K3_SDDD_MI350_ATOM/run_kimi_k3.sh --smoke-test
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
+
+policy:
+  model_name: /dev/shm/Kimi-K3
+  training_backend: fsdp2
+  generation_backend: hf
+  max_total_sequence_length: 2048
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  # ⚠️ 配方是 lr = 7.5e-5 × (bs/64)，bs=64 → 7.5e-5。
+  # 5 步不足以看出收敛差异，但照抄错误的 lr 到长训练会重演那次 45% 效率的失败。
+  learning_rate: 7.5e-5
+  min_lr: 7.5e-6
+  lr_decay_style: cosine
+  weight_decay: 0.0
+  # 所有已记录的曲线都是 0.5；1.0 会改变哪些步被裁剪。
+  max_grad_norm: 0.5
+  warmup_ratio: 0.04
+
+algorithm:
+  name: spec_distill
+  spec_distill:
+    draft_type: dspark
+    loss_type: dspark
+    sequential_mode: batch_alternating
+    # 刻意缩小：5 个 cached batch 就能走完一整轮 Phase A → Phase B 交替。
+    # bs=64 下每个 cached batch 约 11.3 GB，5 个约 57 GB，/dev/shm 放得下。
+    cache_batches: 5
+    # 不能用 /tmp：容器里的 /tmp 不是训练进程看到的那个 tmpfs。
+    cache_dir: /dev/shm/teacher_cache_atom_smoke
+    grad_accum_steps: 1
+    loss_decay_gamma: 4.0
+    num_target_layers: 5
+    spec_length: 7
+    # 与 train.yaml 一致：这五层是 draft 的特征契约，teacher 抓的必须是同一组。
+    aux_hidden_state_layer_ids: [2, 23, 47, 71, 89]
+    capture_mode: postnorm
+    # 与 train.yaml 一致。anchor_num 是峰值显存的主要驱动量（512 时实测 57.8 GiB），
+    # 用 64 跑 smoke 会把真实 run 的 OOM 风险测漏。
+    anchor_num: 512
+    # ⚠️ ATOM 必须 false（与 vLLM 版相反）：ATOM 的 hidden_states 已含全部 5 层、
+    # last_hidden_states 已过 final norm。true 会让 fc 收到 43008 而非 35840。
+    # 详见 train.yaml 的注释。
+    separate_last_hidden: false
+    shift_input_embeds: false
+    ce_loss_alpha: 0.1
+    l1_loss_alpha: 0.9
+    confidence_loss_alpha: 1.0
+  teacher:
+    model_name: /dev/shm/Kimi-K3
+    inference_backend: atom
+    tensor_parallel_size: 8
+    gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+    quantization: ""
+    # 与 train.yaml 一致：teacher 自己写 response（prompt-only on-policy）。
+    # ⚠️ 这一项和下面 dataset 的三个字段是绑在一起的，尤其是
+    # dataset.max_prompt_tokens——它为 0 时预处理不产出 prompt_ids，
+    # 生成路径会直接抛错。只改这一行会让 smoke 必然失败。
+    generate_mode: generate
+    # 与 train.yaml 一致。thinking=true 下实测 gen_mean 546、约 26% 撞顶，
+    # 撞顶是预期行为而非故障（截断对投机蒸馏无害，理由见 train.yaml）。
+    # smoke 里要确认的是 capped 比例落在 20-35% 这个量级，明显偏离说明渲染错了。
+    # 与 train.yaml 一致。必须 < max_model_len - max_prompt_tokens：填满窗口会让
+    # ATOM 的 block table 少一个槽位，worker 直接僵住。理由见 train.yaml。
+    generate_max_tokens: 992
+    # 与 train.yaml 一致：0 = 整轮合成一遍 sweep。smoke 的一轮是 5 批 320 条，
+    # 正好走到合并提交这条路径（逐批提交时它完全不会被执行）。
+    generate_sweep_batches: 0
+    generate_temperature: 0.0
+    transport: mooncake
+    # ---- ATOM 引擎参数，与 train.yaml 逐字一致 ----
+    # ⚠️ ATOM 对不认识的键是静默丢弃的；worker 里加了校验会对未知键抛错。
+    atom:
+      max_model_len: 2048
+      # 与 train.yaml 一致。这一项决定解码批形态（正是 vLLM 崩的地方），smoke 用小值
+      # 会把 256 并发下的 KDA recurrent state 行为整个测漏 —— 而那恰是这一版唯一
+      # 未充分验证的点。理由和实测数据见 train.yaml。
+      max_num_seqs: 256
+      # ⚠️ 必须 ≥ max_model_len，否则一条序列的 prefill 会被切成多个调度步，
+      # 而隐藏态按 request id 为 key 写入、后写覆盖先写，只会剩下最后一块。
+      max_num_batched_tokens: 32768
+      # ⚠️ 两者都必须 false，否则隐藏态被静默截断（缺 prompt 段 / 只剩末块）。
+      # 理由见 train.yaml 的详细注释。
+      enable_prefix_caching: false
+      enable_chunked_prefill: false
+      # 与 train.yaml 一致，理由见那边。0.85 下第二轮 teacher 重启必失败。
+      # ⚠️ smoke 要测到这条路必须跑满两轮（num_training_steps=10）：
+      # 默认的 5 步只有一轮，teacher 只启停一次，跨轮重启完全测不到。
+      gpu_memory_utilization: 0.90
+      # 不用 fp8：省的 1.8 GB/卡 是 0.6%，但 fp8 会把 query 一起降精度、
+      # K/V 还多走一次量化 round-trip，而隐藏态就是训练标签。详见 train.yaml。
+      kv_cache_dtype: bf16
+      # 与 train.yaml 一致：已实测关掉。graph pool 只占 0.24 GB，且捕获的全是
+      # max_q_len=1 的形状（只覆盖 decode，prefill 仍 eager），不碰 A2 的抓取路径。
+      # smoke 要确认的正是这一点：隐藏态宽度和有效长度不能因为开图而变化。
+      enforce_eager: false
+  draft:
+    from_scratch: true
+    num_layers: 5
+    num_heads: 64
+    num_kv_heads: 64
+    head_dim: 128
+    ffn_dim: 14336
+    rms_norm_eps: 1.0e-5
+    rope_theta: 50000.0
+    rope_scaling_type: yarn
+    rope_scaling_factor: 32.0
+    rope_original_max_pos: 32768
+    rope_beta_fast: 32.0
+    rope_beta_slow: 1.0
+    rope_mscale: 1.0
+    rope_mscale_all_dim: 1.0
+    use_aux_hidden_state: true
+    use_input_layernorm_in_first_layer: true
+    use_last_layernorm: true
+    use_mtp_layernorm: false
+    attention_bias: false
+    mlp_bias: false
+    dtype: bfloat16
+    q_lora_rank: 1536
+    kv_lora_rank: 512
+    qk_nope_head_dim: 128
+    qk_rope_head_dim: 64
+    v_head_dim: 128
+    markov_rank: 256
+    markov_head_type: vanilla
+    enable_confidence_head: true
+    confidence_head_with_markov: true
+    mask_token_id: 163837
+    block_size: 7
+
+mooncake:
+  protocol: tcp
+  device_name: ""
+  # 与 train.yaml 一致：bs=64 下要搬的隐藏态和正式 run 一样大，
+  # 16GB/4GB 是按 bs=8 配的，会在传输层触发重试而不是暴露真实行为。
+  global_segment_size: 32GB
+  local_buffer_size: 8GB
+  get_retry_max_wait_seconds: 300.0
+
+quantization:
+  training:
+    fp8: null
+    lumen_norm: true
+    lumen_linear: true
+    hf_attn_patch: true
+  rollout_correction:
+    enabled: false
+
+dataset:
+  chat_template: kimi-k3
+  last_turn_loss_only: false
+  num_preprocess_workers: 96
+  cache_dir: /dev/shm/lumenrl_cache
+  # ⚠️ 以下三项必须与 train.yaml 一致，原因有两层：
+  # 1. 它们进 tokenize 缓存键，不一致就会重新预处理出**另一份数据**，
+  #    smoke 验证的就不是正式 run 要用的数据了；
+  # 2. max_prompt_tokens 为 0 时不产出 prompt_ids，generate 模式直接抛错。
+  drop_overlong: true
+  max_prompt_tokens: 1024
+  # ⚠️ 必须 true 且与 train.yaml 一致。thinking 决定解码起点落在 think 还是
+  # response channel，false 渲染出来是另一份数据、另一个缓存键。
+  # smoke 要顺带确认渲染正确：日志里的 prompt 应包含 <|open|>think<|sep|>。
+  thinking: true
+
+eval:
+  enabled: true
+  interval: 1
+  num_samples: 8
+  micro_batch_size: 2
+
+reward:
+  type: function
+  function: math_reward
+  # 与 train.yaml 同一份打散后的全量数据。用 phase1 会命中不同的 tokenize 缓存键，
+  # 白等一遍预处理，而且验证的不是正式 run 的数据分布。
+  dataset: /dev/shm/kimi-mtp-dataset-full/train.jsonl
+
+checkpointing:
+  checkpoint_dir: /dev/shm/checkpoints/kimi_k3_dspark_atom_smoke
+  save_steps: 9999
+  save_total_limit: 1
+  resume: false
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 5
+seed: 42
