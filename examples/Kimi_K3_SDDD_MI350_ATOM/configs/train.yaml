@@ -1,0 +1,439 @@
+# Kimi K3 DSpark SDDD — MI350 (ATOM teacher, Batch-Alternating, 8-GPU Sequential)
+#
+# 与 Kimi_K3_SDDD_MI350_vllm/configs/train.yaml 是同一个配方，只把 teacher 的推理后端
+# 从 vLLM 换成 ATOM。draft、损失、lr、batch、数据集全部逐字保持一致，所以之前
+# vLLM prefill 跑出来的曲线仍然可以直接对比。
+#
+# 为什么换：vLLM 在 B=64 解码 K3 时每 15-20 批就会 GPU memory access fault
+# （KDA recurrent state 在请求撞上 max_tokens 时的 slot 处理，崩溃现场
+# num_output_tokens=[511,511,511]，正好差一个 token 到 512）。三种 MLA 配置
+# （fp8+aiter / fp8+TRITON / bf16+aiter）全部复现。一轮需要连续 50 批，
+# MTBF 短于一轮，而重启一次要 20 分钟 —— 这条路走不通。
+#
+# ATOM 带来的两个结构性变化：
+#   1. 隐藏态靠 forward hook 抓，与解码正交，所以**一个引擎实例同时服务两遍**。
+#      vLLM 那边 A1/A2 各需要一套引擎配置、每轮切换两次、每次重载 1.5 TB 权重；
+#      ATOM 只是发一条控制消息（switch_mode）。
+#   2. 抓取可以运行时开关，所以 A1 纯生成时不往 Mooncake 写 prompt 的隐藏态
+#      （B=64 下每批约 4.7 GB 的无用流量）。
+#
+# Batch-alternating data flow:
+#   1. Phase A1: ATOM 解码 prompt → teacher 自己的 response（抓取关闭）
+#   2. Phase A2: 把 prompt+response 整条重新 prefill，抓 [2,23,47,71,89] 层
+#      隐藏态，经 Mooncake → /dev/shm（抓取打开，同一个引擎）
+#   3. 攒满 cache_batches 批后，draft 上 GPU，在缓存的隐藏态上训练
+#   4. draft offload 回 CPU，回到第 1 步
+#
+# ── 2026-08-08：开 thinking + Phase A1 提速 ──────────────────────────────
+# 上一版（thinking=false、cap 512、逐批提交、eager）跑到 step 399 停下，train AL
+# 0.459 仍在爬。停训的原因是两件事必须一起改：
+#
+#   1. thinking 必须打开。K3 是 preserved thinking 模式、effort 只支持 max，
+#      thinking=false 把解码起点摁在模型没训练过的 channel 上。原先不敢开是怕
+#      think 块吃光预算，实测证明这个顾虑不成立（见 dataset.thinking）。
+#   2. Phase A1 占了一轮 73% 的墙钟，而槽位利用率只有 47.8%。两个原因：
+#      一批一提交（尾部空转）+ eager。分别值 1.5x 和 2.4x。
+#
+# 改动只在 teacher 侧和数据侧，draft/损失/lr/batch 一律没动，曲线仍可对比。
+# 显存水位（峰值 83% VRAM）与上一版完全一致 —— max_num_seqs 和
+# gpu_memory_utilization 都没动，只加了 0.24 GB 的 CUDA graph pool。
+#
+# 净效果（smoke 实测外推到 50 批一轮）：
+#   Phase A1  62 → 18 min      合并 sweep + CUDA graph + 256 槽
+#   Phase A2       约 12 min
+#   Phase B        约 9 min     50 步 × 11.3 s（序列变长，原来约 9 s）
+#   teacher 重载   约 5 min     Phase B 前引擎会被拆掉，下一轮重新加载
+#   一轮合计  85 → 约 44 min
+# 而且 token 量还翻了一倍多（cap 512 → 1024，gen_mean 245 → 546）。
+#
+# Usage:
+#   bash examples/Kimi_K3_SDDD_MI350_ATOM/run_kimi_k3.sh
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
+
+policy:
+  model_name: /dev/shm/Kimi-K3
+  training_backend: fsdp2
+  generation_backend: hf
+  # T=8192 从未端到端跑通过，实测 1000 步要 50 小时。2048 是所有已验证曲线的取值。
+  max_total_sequence_length: 2048
+  # ⚠️ lr 和 train_global_batch_size 是绑在一起的，不能单独抄一个。
+  # 参考配方是 lr=6e-4 @ bs=512；本文件跑 bs=64，线性缩放后 lr=7.5e-5。
+  # 2026-07-31 有一轮把 lr=6e-4 直接配到 bs=8 上（等于超出线性缩放 64 倍），
+  # 训练不发散但每样本收敛效率只有基线的 45%，2468 步后废弃。
+  # 同一天 bs=512 + 6e-4 实测**发散**（step 2 ce_loss=11.30 还正常，step 3 跳到
+  # 26.60，之后一直高于 ln(163840)=12.007 的随机基线）。改 batch 必须同步改 lr。
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  # 唯一跑出健康曲线的取值（train1000_v4）。等于 runbook 的线性缩放：6e-4 × 64/512。
+  learning_rate: 7.5e-5
+  weight_decay: 0.0
+  # 所有已记录的曲线都是 0.5。稳态实测 grad_norm 在 0.48-1.38，1.0 会改变哪些步
+  # 被裁剪，随机初始化的第一步（grad_norm 116-148）还会走出两倍大的更新。
+  max_grad_norm: 0.5
+  # 保持 min_lr = lr/10，跟着 learning_rate 一起缩放。
+  min_lr: 7.5e-6
+  warmup_ratio: 0.04
+  lr_decay_style: cosine
+
+algorithm:
+  name: spec_distill
+  spec_distill:
+    draft_type: dspark
+    loss_type: dspark
+    sequential_mode: batch_alternating
+    # 一个 cached batch 的体积随 batch size 线性走：
+    #   bs=8 → 1.41 GB    bs=64 → 11.3 GB    bs=512 → 约 84 GB（实测）
+    #
+    # 两个约束：
+    #   1. /dev/shm 只有 1.3 TB → cache_batches × 单批体积必须放得下
+    #   2. Phase B 每个 rank 都会把整个 cached batch 读进自己的 CPU 内存
+    #      （_load_batch_from_disk，切 micro-batch 只省算力不省内存），
+    #      8 个 rank 的瞬时量 = 8 × 单批体积，而 tmpfs 占的是同一份 2.7 TiB 内存。
+    #
+    # bs=64 下 50 轮 → tmpfs 565 GB + 瞬时 90 GB，很宽裕（train1000_v4 实测取值）。
+    cache_batches: 50
+    cache_dir: /dev/shm/teacher_cache_atom
+    # 不做跨 batch 梯度累积。每个 cached batch = 1 次 optimizer step。
+    # 有效 GBS = train_global_batch_size = 64。
+    grad_accum_steps: 1
+    # DSpark position decay: w_k = exp(-k / gamma)
+    loss_decay_gamma: 4.0
+    num_target_layers: 5
+    spec_length: 7
+    # ⚠️ 这五层就是 draft 的特征契约，teacher 必须抓同样的五层。
+    # ATOM 的 hook 抓的是 hidden_states + residual（层后残差流），语义等于
+    # capture_mode: postnorm，且 ATOM 自己的 DSpark checkpoint 就是这条路径产出的。
+    # 层数改了 num_target_layers 和 draft 的输入宽度都要跟着改。
+    aux_hidden_state_layer_ids: [2, 23, 47, 71, 89]
+    capture_mode: postnorm
+    # anchor_num 是峰值显存的主要驱动量（512 时实测 57.8 GiB）。
+    anchor_num: 512
+    # ⚠️ ATOM 必须 false，与 vLLM 版相反 —— 两边的存储约定不同：
+    #   vLLM：把 5 个 aux 层拆成「前 4 层 → hidden_states，第 5 层 →
+    #     last_hidden_states」，且是 pre-norm，所以 trainer 要拼回来再补 RMSNorm。
+    #   ATOM：hidden_states 直接就是全部 5 层（35840），last_hidden_states 是
+    #     模型最终层输出、且已过 final norm（kimi_k3.py 的 forward 结尾是
+    #     return self.norm(hidden_states)）。
+    # 设成 true 会让 trainer 多拼一次 → fc 收到 6*7168=43008 而不是 5*7168，
+    # 直接 shape 报错；norm 也会被重复施加一次。
+    separate_last_hidden: false
+    shift_input_embeds: false
+    # DSpark loss weights
+    ce_loss_alpha: 0.1
+    l1_loss_alpha: 0.9
+    confidence_loss_alpha: 1.0
+  teacher:
+    model_name: /dev/shm/Kimi-K3
+    inference_backend: atom
+    tensor_parallel_size: 8
+    gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+    quantization: ""
+    # On-policy：teacher 自己写 response，训练数据不再用数据集里的参考回答。
+    # 喂进去的是 prompt-only（dataset.max_prompt_tokens 让预处理产出 prompt_ids），
+    # 所以 response 与推理时的分布一致。
+    generate_mode: generate
+    # prompt 和 response 共享同一个 2048 窗口，所以 max_prompt_tokens=1024 的对侧就是 1024。
+    #
+    # 实测（768 条真实 prompt，thinking=true + effort=max，用 ATOM 引擎跑的一次性采样）：
+    # K3 自己的产出中位数只有 398 token（think 191 + response 192），但均值 1108、
+    # p90 2724、p99 撞满 8192 —— 多数问题只想一小会儿，少数会想到爆，尾部完全由 think
+    # 主导（think 均值 735 vs response 310）。
+    #
+    # ⚠️ 这里选 1024 而不是去覆盖 p90，依据是**截断对投机蒸馏无害**：
+    # draft 学的是「给定前缀预测 teacher 下一个 token」，截断序列每个位置上的 target
+    # 都是 teacher 真实产出的 token，_build_generated_masks 对整个生成段计 loss、
+    # 不要求 EOS，所以撞顶的行照样贡献满额监督、不会被静默清零。
+    # （这与 SFT 相反 —— dataset.drop_overlong 那条注释说的「学到继续写永远不会产出的
+    #   文本」只适用于把参考答案切一半的场景，不适用于 on-policy 自生成。）
+    #
+    # 于是 cap 纯粹是成本/长位置覆盖的权衡。实测每轮（50 批 × 64）A1 耗时：
+    #   cap  gen_mean  截断率   A1 @816 tok/s
+    #   512    376     42.7%     24.4 min
+    #  1024    546     26.0%     35.7 min   ← 取这个，窗口留在已验证的 2048
+    #  2048    745     15.0%     48.6 min   （窗口要开到 3072，未验证）
+    #
+    # ⚠️ 992 而不是 1024：prompt 和 response 必须给窗口留出余量，不能刚好填满。
+    # 一行长度正好等于 max_model_len 时，ATOM 会向 block table 要
+    # ceil((2048+1)/16)=129 个 block，而表按 max_model_len//16=128 分配，于是
+    # prepare_block_tables 抛 ValueError、worker 就此僵住——不是报错退出，而是
+    # 命令再也不返回，表现为轮次中途 10 分钟超时（实测烧掉两轮：Round 9 batch 12、
+    # Round 1 batch 11，且重放同一批必然复现）。
+    # 触发条件是同一行既顶满 prompt 预算又撞到生成上限，出现频率低到 smoke 测不出来，
+    # 所以 setup 里加了硬校验（gen + prompt >= max_model_len 直接拒绝启动）。
+    # 992 留 32 token（2 个 block）余量；截断率从 26.0% 微升到约 26.6%，可忽略。
+    generate_max_tokens: 992
+    # 一次 sweep 提交多少批。一遍 sweep 要等它最慢的那条序列结束，所以一批一遍时
+    # 尾部会用近乎满批的代价去解码剩下几行；合并之后调度器能用下一批回填空出的槽位。
+    # 实测这一项就值 1.5 倍（同参数下 64 条一批约 220 tok/s，768 条一遍 336 tok/s）。
+    # 0 = 整轮合成一遍。
+    generate_sweep_batches: 0
+    # 贪心，与 runbook 的 on-policy 配方一致，也保证同一份数据可复现。
+    # 三组不同引擎参数下 gen_mean 都落在 548-552、p50 405-411，确认可复现。
+    generate_temperature: 0.0
+    transport: mooncake
+    # ---- ATOM 引擎参数（会被过滤到 atom.config.Config 的字段上）----
+    # ⚠️ ATOM 对不认识的键是**静默丢弃**的，写错名字不会报错、只是无声失效。
+    # atom_teacher_engine 的 worker 因此加了一道校验，会对未知键直接抛错。
+    atom:
+      max_model_len: 2048
+      # ⚠️ 不再等于 train_global_batch_size。批大小决定的是一个 cached batch 有多少
+      # 条序列，而这一项决定解码时同时在飞多少条 —— 合并 sweep 之后一轮 3200 条一次
+      # 提交，槽位就是纯粹的吞吐旋钮了。
+      #
+      # 实测（窗口 2048、cap 1024、graph 全开、768 条 prompt，峰值 VRAM 由 rocm-smi
+      # 采样，均为 teacher 单独占卡）：
+      #    槽位  util   tok/s   teacher 峰值
+      #     64   0.85    816       83%
+      #    128   0.85   1055       85%
+      #    256   0.85   1900       88%   ← 取这个
+      #    256   0.88   1956       91%   （多 3% 显存只换 3% 速度，不值）
+      # 权重加载后的平台是 70%（约 202 GB/卡），差值就是 KV。
+      #
+      # ⚠️ 提 util 是错的方向。一开始以为 256 槽必须配 util 0.92，实测在 0.85 下就
+      # 装得下：窗口 2048 时每个 slot 的 per-request pool 只有约 27 MB，256 槽也才
+      # 6.9 GB。0.92 那档量到 1941 tok/s，和 0.85 的 1900 没有区别 —— 瓶颈从来是
+      # 槽位不是 util。
+      #
+      # 显存为什么不与训练冲突：trainer 在 Phase B 之前会把 teacher 引擎整个拆掉
+      # （日志 "Teacher engine shut down for Phase B"，VRAM 掉到 23%），所以真正的
+      # 约束只在 Phase A 内部 —— teacher + trainer 常驻（约 7%）。smoke 实测：
+      # 64 槽峰值 90%，256 槽峰值 89%，两者持平。
+      #
+      # ⚠️ 唯一未充分验证的是 256 并发下 KDA recurrent state 的长时间稳定性
+      # （smoke 只跑了 1.8 分钟解码）。这是可回退的：checkpoint 每轮一存，真崩了最多
+      # 损失一轮就能退回 64。注意这与 vLLM 的处境不同 —— 那边 MTBF（15-20 批）比
+      # 一轮（50 批）还短，退无可退。头几轮要盯 GPU fault。
+      max_num_seqs: 256
+      # ⚠️ 必须 ≥ max_model_len。隐藏态是按调度步、以 request id 为 key 写入的，
+      # 同一个 key 的第二次写会覆盖第一次；如果一条序列的 prefill 被切成多块，
+      # 最后只剩下最后一块。ATOM 自己那句 max_num_batched_tokens >= max_model_len
+      # 的断言是被注释掉的，所以这道保证只能由我们自己守（worker 里会检查）。
+      max_num_batched_tokens: 32768
+      # ⚠️ 必须为 false。命中的前缀不计入 scheduled_tokens，而隐藏态只覆盖
+      # 当次调度的 token —— A1 解码已经 prefill 过同一批 prompt，A2 抽取时
+      # prompt 段会整段命中缓存，于是写进 Mooncake 的特征直接缺掉 prompt。
+      enable_prefix_caching: false
+      # ⚠️ 必须为 false。ATOM 的 _store_hidden_states 不看 is_final_chunk，
+      # 被切块的 prefill 会把每一块写到同一个 key 上，只剩最后一块存活。
+      enable_chunked_prefill: false
+      # teacher 与训练共用同 8 张卡（时分复用，Phase A 期间 draft 已 offload）。
+      #
+      # ⚠️ 0.85 会让第二轮起的 teacher 重启失败，不要改回去。原因是"时分复用"
+      # 并不彻底：Phase B 跑完、draft offload 之后，训练进程仍占着约 23 GB
+      # （CUDA context + RCCL 约 6.4 GB，torch reserved 16.6 GB —— 其中只有
+      # 4.6 GB 是活着的 DDP 梯度桶，其余是碎片，段内有活块就还不回驱动）。
+      # teacher 的 KV 预算按启动那一刻的空闲显存算，这 23 GB 直接从预算里扣：
+      #   0.85 x 288 - 23 - 权重 219 = 2.5 GB < 256 槽所需的 13.39 GB → 启动失败
+      #   0.90 x 288 - 23 - 权重 219 = 16.5 GB → 够用，已跨轮实测
+      # Round 0 之所以能过是因为那时还没训练过、残余极小，单轮 smoke 测不到这条路。
+      gpu_memory_utilization: 0.90
+      # 不用 fp8：收益侧几乎为零，代价侧直接打在训练标签上。
+      # 收益：K3 是 kimi_linear，93 层里只有 full_attn_layers 那 24 层占 paged
+      #   KV cache（其余 69 层 KDA 走 recurrent state，与本项无关）。按 MLA
+      #   latent 576 维算，B=64 x 2048 token 也只有 ~3.6 GB/卡，fp8 省下的
+      #   1.8 GB 在每卡已占 250 GB 里是 0.6%。且 blocks 是按
+      #   gpu_memory_utilization 自动分的，fp8 真正换来的是并发容量翻倍，
+      #   而我们的批形态固定，装得下就够，多的容量没人用。
+      # 代价：aiter_mla 里 dtype_q = dtype_kv，fp8 KV 会把 query 一起拉到 fp8；
+      #   MLA prefill 还要从 paged cache decompress k/v，K/V 多走一次量化
+      #   round-trip。A2 抽的 5 层隐藏态就是 draft 的回归目标，teacher 侧的
+      #   量化噪声会原封不动变成标签噪声，而且不会有任何报错。
+      # 注：vLLM 上那个「fp8 会让 aiter kernel 断言 batch_size==1」的限制
+      #   在 ATOM 不存在，ATOM 的 aiter_mla 正常支持 fp8 —— 别拿它当理由。
+      kv_cache_dtype: bf16
+      # 已按「跑稳之后再关」的计划实测并关掉了。担心的显存代价没有出现：
+      #   CUDA graph capture memory: 20 graphs | pool(reserved)=0.24GB allocated=0.07GB
+      #   cudagraph capture cost: 8.28 seconds
+      # 0.24 GB/卡、8 秒捕获，换来 816 vs 336 tok/s（同参数、同 768 条 prompt）。
+      #
+      # 安全性：捕获的 20 张图全是 max_q_len=1 的形状（bs 从 1 到 max_num_seqs），
+      # 即**只覆盖 decode，prefill 仍走 eager**。A2 抽隐藏态是 prefill 路径，
+      # 不经过 graph replay，所以隐藏态契约不受影响。
+      enforce_eager: false
+  draft:
+    from_scratch: true
+    # ---- Aligned with Inferact/Kimi-K3-DSpark/config.json ----
+    num_layers: 5
+    num_heads: 64
+    num_kv_heads: 64
+    head_dim: 128
+    ffn_dim: 14336
+    rms_norm_eps: 1.0e-5
+    rope_theta: 50000.0
+    rope_scaling_type: yarn
+    rope_scaling_factor: 32.0
+    rope_original_max_pos: 32768
+    rope_beta_fast: 32.0
+    rope_beta_slow: 1.0
+    rope_mscale: 1.0
+    rope_mscale_all_dim: 1.0
+    use_aux_hidden_state: true
+    use_input_layernorm_in_first_layer: true
+    use_last_layernorm: true
+    use_mtp_layernorm: false
+    attention_bias: false
+    mlp_bias: false
+    dtype: bfloat16
+    # ---- MLA dimensions (Inferact/Kimi-K3-DSpark) ----
+    q_lora_rank: 1536
+    kv_lora_rank: 512
+    qk_nope_head_dim: 128
+    qk_rope_head_dim: 64
+    v_head_dim: 128
+    # ---- DSpark-specific ----
+    markov_rank: 256
+    markov_head_type: vanilla
+    enable_confidence_head: true
+    confidence_head_with_markov: true
+    mask_token_id: 163837
+    block_size: 7
+
+mooncake:
+  protocol: tcp
+  device_name: ""
+  # ⚠️ 必须装得下**一整个 cached batch** 的 teacher hidden states。
+  # Phase A2 是"先把整批 prefill 完、全部写进 Mooncake，消费端再逐个 key 取"，
+  # 所以整批要同时驻留，不能按 key 流式回收。
+  #
+  # 每条序列约 0.16 GB（hidden 2048×35840×2B + last_hidden 2048×7168×2B）：
+  #   bs=64  → 10 GB    bs=512 → 82 GB
+  #
+  # 2026-07-31 实测：bs=512 配 16GB 时写入报 code=-200（容量不足），
+  # 最早的 key 被挤掉，消费端等满 90 秒后整个 run 挂掉。改 batch size 必须同步核这一行。
+  # bs=64 需要 10 GB，32GB 给足 3 倍余量。
+  global_segment_size: 32GB
+  local_buffer_size: 8GB
+  # 原默认 90 秒。放宽到 300 秒纯属容错，不影响正常路径。
+  get_retry_max_wait_seconds: 300.0
+
+quantization:
+  training:
+    fp8: null
+    lumen_norm: true
+    lumen_linear: true
+    hf_attn_patch: true
+  rollout_correction:
+    enabled: false
+
+dataset:
+  chat_template: kimi-k3
+  last_turn_loss_only: false
+  # 节点有 236 核。每条样本要渲染两次（完整对话 + 生成 prompt），16 个 worker
+  # 处理 47 万条太慢，而这个值不进缓存键，调大没有副作用。
+  # thinking=true 全量实测：96 worker 下约 3 分钟。
+  num_preprocess_workers: 96
+  cache_dir: /dev/shm/lumenrl_cache
+  # 超长样本整条丢弃，不再截断。截断会让一段对话停在半句话上、没有终止符，
+  # draft 学到的是"继续写 teacher 永远不会产出的文本"。
+  #
+  # ⚠️ 这条只适用于**数据集里的参考答案**。on-policy 下 teacher 自己生成的 response
+  # 撞上 generate_max_tokens 不属于这种截断，见 teacher.generate_max_tokens 的说明。
+  # 而且在 generate 模式下这一项其实不决定样本存活：dataset.py 里
+  # check_total = drop_overlong and max_prompt_tokens <= 0，mpt>0 时恒为 false，
+  # 因为参考答案压根不参与训练，不该让它的长度淘汰短 prompt 的样本。
+  drop_overlong: true
+  # prompt 和 response 共享 2048 的窗口，1024 表示"至少留 1023 个 token 给回答"。
+  # generate 模式下这是**唯一**淘汰样本的过滤条件。
+  #
+  # thinking=true 下全量预处理实测：476904 → 存活 346475（72.7%）。
+  # 放宽到 2048 能存活 389299（81.6%，+42824 条），但那样窗口要开到 3072，
+  # 而 2048 是唯一端到端验证过的取值，所以维持 1024。
+  #
+  # 多轮样本（保留历史 reasoning 后 prompt p50 = 3179 token）在这个阈值下几乎全被
+  # 丢掉，训练集实际上只剩单轮。⚠️ 这不是开 thinking 带来的退化 —— thinking=false
+  # 时多轮 prompt 也在 2000 token 上下，同样过不了 1024，现行 run 一样没有多轮。
+  # 真要覆盖多轮，得同时抬 max_prompt_tokens 和窗口，是另一件事。
+  max_prompt_tokens: 1024
+  # ⚠️ 必须为 true。K3 是 preserved thinking 模式，且 reasoning_effort 只支持 max：
+  # apply_chat_template 的 thinking 参数控制的是解码起点落在哪个 channel
+  # （<|open|>think<|sep|> 还是 <|open|>response<|sep|>），thinking=false 等于把
+  # 模型摁在一个它没被训练过的起点上，多轮历史里的 reasoning_content 也会被剥掉。
+  #
+  # 之前设 false 的理由是「think 块会把 1000 token 预算吃光、response 一个字都没有」。
+  # 实测下来这个担心站不住：K3 产出的中位数只有 398 token，而且**截断对投机蒸馏无害**
+  # （见 teacher.generate_max_tokens）。即使 26% 的行在 1024 处撞顶，撞顶的也全是
+  # teacher 真实产出的 token，照样是有效监督。
+  #
+  # ⚠️ 依赖 kimi_k3_parser 的修复（PARSER_VERSION=6）：在此之前 _prepare_messages
+  # 会无条件剥掉非末轮 assistant 的 reasoning，thinking=true 渲染出来是一串空 think
+  # 块。旧缓存必须靠 PARSER_VERSION 失效掉，不能复用。
+  thinking: true
+
+reward:
+  type: function
+  function: math_reward
+  # phase1 + phase2 合并并打散后的全量 476904 条（种子 20260731）。
+  # 取样是 (step*bs) % ds_len 的顺序滑窗、无 shuffle，所以必须用打散过的文件：
+  # 两个 phase 首尾拼接会让前半程只见 phase1、后半程只见 phase2。
+  dataset: /dev/shm/kimi-mtp-dataset-full/train.jsonl
+
+eval:
+  enabled: true
+  # ⚠️ 待改（下次因故重启时一起动，不要为此专门重启）：现在这两个值给出的
+  # eval 噪声压不住信号。实测 step 1700/1800/1900 的 AL 是 1.149 / 1.048 /
+  # 1.084，极差 0.10；而这个阶段 200 步的预期真实增益只有 0.02 量级，噪声是
+  # 信号的五倍，读不出趋势。两个放大源：
+  #   1. 32 条样本本身抽样噪声就大；
+  #   2. AL 是七个位置接受率的累积乘积之和，约等于 p0×1.76，会把 p0 的相对
+  #      变化放大 ~2 倍（p0 只动 4.5%，AL 就动 8.8%）。
+  # 打算改成 interval: 50（每轮一次，单次 eval 只花约 77 秒，点数翻倍，是每
+  # 单位算力降噪最划算的一档）。num_samples 也想提到 64/96，但每条样本约占
+  # 1.2 GB CPU 内存（8 个 rank 各存一份完整副本），提之前必须先量内存余量。
+  #
+  # Long train（6135 步）用 100：给 61 个点，足够盯趋势。
+  # 短验证跑（1000 步）时改回 25，才能和 train1000_v4/v5 逐点对齐。
+  interval: 100
+  # 256 条会占约 1.2 TB 内存（8 个 rank 各存一份完整 CPU 副本），全量跑必然 OOM。
+  num_samples: 32
+  micro_batch_size: 2
+
+checkpointing:
+  # /dev/shm 随 allocation 一起清空，checkpoint 必须落 NVMe（启动脚本会覆盖成 CKPT_DIR）。
+  checkpoint_dir: /dev/shm/checkpoints/kimi_k3_dspark_atom
+  # 与 cache_batches=50 对齐，**一轮存一次**，恰好落在 round 边界上：
+  # 崩了之后从边界恢复，不会有半轮 Phase A 白做。
+  #
+  # 按故障恢复逻辑定：teacher cache 在 /dev/shm，节点一挂就没，必须重做当前轮
+  # Phase A。⚠️ vLLM 下实测是 50 批 × 103 秒 ≈ 86 分钟，ATOM 的耗时构成不一样
+  # （少了每轮两次 1.5 TB 权重重载，但 A2 多了一遍完整序列的 prefill），
+  # 必须用 smoke 实测的 Phase A 时间重估，不要照抄。
+  save_steps: 50
+  # 一个 checkpoint 31 GB，卷上还有 22 TB，留 12 个也只占 ~370 GB。
+  # 之前留 3 个（150 步）：想回到 2400 复算一段可疑的 eval 曲线时，它早被
+  # 轮末落盘挤掉了，只剩最近 150 步可退。12 个 ≈ 600 步 ≈ 10 小时回滚余地。
+  save_total_limit: 12
+  # 默认 true 会在新 run 里悄悄接上旧 checkpoint 继续跑，且不报错。重跑一律显式关掉。
+  resume: false
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+# 全量 476904 条，按 thinking=true + max_prompt_tokens=1024 预处理后实测保留 346475 条。
+# （thinking=false 时是 392725 条；开 thinking 后 prompt 变长，多丢 46250 条。）
+#
+# ⚠️ 5413 是**不泄漏 eval 集的上限**，不要往上取整。
+# eval 集是最后 32 条（索引 346443..346474），训练取样 (step*bs) % ds_len 从 0 顺序滑：
+#   5413 步 → 覆盖 0..346431，差 11 条够不到 eval 集 ✅
+#   5414 步 → 覆盖 0..346495，已经吃进 eval 集 53 条 ❌
+# 换数据集或改 max_prompt_tokens / thinking 后重算：
+#   floor((ds_len - eval.num_samples) / bs)
+# ds_len 不用猜，selfcheck/preprocess_dataset.py 会直接把这个数算出来。
+#
+# ⏱️ 总耗时要用 ATOM 的 smoke 实测重估，vLLM 时期的 73 小时（prefill、每步 40.1 秒）
+# 和 generate 模式的估算都不能直接套。
+# 参考：Phase A1 由 bench 实测反推是每轮约 35.7 分钟（3200 条 × gen_mean 546
+# ÷ 816 tok/s），对比 thinking=false + 逐批提交 + eager 时的 62 分钟。
+# A2 和 Phase B 的耗时随序列变长（每条约 335 → 703 token）会涨，必须用 smoke 实测。
+#
+# ⚠️ 关于梯度累积，别被旧注释误导：
+# `_grad_accum_steps` 不是配置项，是 _plan_micro_batches 算出来的：
+#     num_mb = bs / train_micro_batch_size = 64 / 1 = 64
+#     _grad_accum_steps = ceil(num_mb / world_size) = 64 / 8 = 8
+# 它描述的是"一个 global batch 在每个 rank 上分 8 次 backward"，
+# **不会把有效 batch 放大**。有效 batch 恒等于 train_global_batch_size = 64。
+num_training_steps: 5413
+seed: 42
