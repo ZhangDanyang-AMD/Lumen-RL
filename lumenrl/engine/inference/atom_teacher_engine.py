@@ -1,27 +1,33 @@
-"""ATOM-based teacher inference engine for Eagle3 speculative distillation.
+"""ATOM-based teacher inference engine for speculative distillation.
 
-Runs the teacher model in a **separate subprocess** on dedicated GPUs
-with tensor parallelism and optional MXFP4/FP8 quantization.  Designed
-for the 4+4 GPU split strategy:
+Runs the teacher in a **separate subprocess** using ATOM's ``AsyncLLMEngine``,
+which spawns one model-runner process per tensor-parallel rank internally. The
+auxiliary hidden states the draft model trains on are captured with
+``register_forward_hook`` on the selected decoder layers and shipped over
+**Mooncake TCP** — the same transport ``VllmTeacherEngine`` uses.
 
-- GPUs 0-3: training ranks (FSDP2, draft model)
-- GPUs 4-7: ATOM subprocess (TP=4, teacher model, forward-only)
+Because capture rides on hooks rather than on a speculative-decoding config, one
+engine serves both on-policy sweeps:
 
-The subprocess uses ATOM's ``AsyncLLMEngine`` (with ``RLHFModelRunner``)
-which handles TP process spawning internally via ``AsyncIOProcManager``.
-Hidden states (3 aux layers + last hidden) are captured via
-``register_forward_hook`` on decoder layers and transferred via
-**Mooncake TCP** — the same transport used by ``VllmTeacherEngine``.
+1. ``generate_tokens()`` — decode each prompt's continuation, submitting requests
+   with no external id. ATOM keys hidden-state writes on that id, so withholding
+   it parks capture and this is the stock ATOM decode path.
+2. ``extract_hidden_states()`` — prefill the finished sequences with data ids
+   supplied, writing aux + last hidden states to Mooncake.
 
-Three auxiliary hidden states from layers [1, N//2-1, N-4] are captured
-by ``RLHFModelRunner.configure_hidden_states()`` which registers hooks
-on the decoder layers without modifying any ``@support_torch_compile``
-model files.
+Switching between them costs nothing: capture is decided per request, so there is
+no mode to set and no restart. That is the reason this engine exists — the vLLM
+path needed a separate engine per sweep and reloaded K3's 1.5 TB of weights on
+every switch, and its K3 decode kernels faulted the GPU well before a 50-batch
+round finished.
 
-Requires ATOM from the ``sijyang/torchspec_dev`` branch which adds:
-- ``atom.rollout.async_engine.AsyncLLMEngine``
-- ``atom.rollout.model_runner_ext.RLHFModelRunner``
-- ``atom.rollout.engine_utility.EngineUtilityHandler``
+Which layers are captured comes from the training config and must match the
+draft model's feature contract; nothing here infers them from depth.
+
+Expects an ATOM build exposing ``atom.rollout`` (``AsyncLLMEngine``,
+``RLHFModelRunner``), plus a ``torchspec`` module providing ``MooncakeConfig``
+and ``EagleMooncakeStore`` — see this example's Dockerfile, which maps that name
+onto ``lumenrl.transfer``.
 """
 
 from __future__ import annotations
@@ -45,6 +51,26 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+
+def _pad_stack(tensors: list[torch.Tensor], length: int) -> torch.Tensor:
+    """Right-pad each tensor's first dim to ``length``, then stack into a batch."""
+    padded = []
+    for t in tensors:
+        if t.shape[0] > length:
+            raise ValueError(
+                f"sequence of {t.shape[0]} positions exceeds the batch width "
+                f"{length}; hidden states would have to be truncated",
+            )
+        if t.shape[0] < length:
+            pad = torch.zeros(
+                length - t.shape[0], *t.shape[1:],
+                dtype=t.dtype, device=t.device,
+            )
+            t = torch.cat([t, pad], dim=0)
+        padded.append(t)
+    return torch.stack(padded)
+
+
 _HIDDEN_XFER_DIR = os.environ.get(
     "LUMENRL_TEACHER_HIDDEN_DIR",
     "/dev/shm/lumenrl_teacher_hidden",
@@ -54,6 +80,34 @@ _READY_TIMEOUT_SECONDS = float(
 )
 _CMD_FIFO_OPEN_TIMEOUT_SECONDS = 10.0
 _DEFAULT_COMMAND_TIMEOUT_SECONDS = 600.0
+# Decoding is the longest-running command by far, so it gets its own budget
+# instead of tripping the control-message timeout. A fixed budget does not
+# survive sweeps that merge batches, so the budget is derived from the work the
+# sweep could do; this env var overrides it outright when set.
+_GENERATE_TIMEOUT_OVERRIDE = os.environ.get(
+    "LUMENRL_TEACHER_GENERATE_TIMEOUT_SECONDS"
+)
+_GENERATE_TIMEOUT_FLOOR_SECONDS = 3600.0
+# Measured on K3 at TP=8, B=64, max_tokens=1024, 768 prompts merged into one
+# sweep with CUDA graphs on: 515.7 s, i.e. 0.66 ms per prompt-token. 4x that
+# absorbs a colder cache and the eager fallback (which measured ~1.4 ms) while
+# still catching a hung engine.
+#
+# The earlier 9.1e-3 was calibrated against the batch-serial eager path and is
+# now 14x the real cost: a whole-round sweep would have sat for 8 hours before
+# reporting a hang. Recalibrate this whenever the decode path gets faster --
+# a timeout that never fires is not a safe default, it is a silent one.
+_GENERATE_SECONDS_PER_PROMPT_TOKEN = 2.6e-3
+
+
+def _generate_timeout_seconds(num_prompts: int, max_tokens: int) -> float:
+    """Wall-clock budget for one decode sweep."""
+    if _GENERATE_TIMEOUT_OVERRIDE:
+        return float(_GENERATE_TIMEOUT_OVERRIDE)
+    return max(
+        _GENERATE_TIMEOUT_FLOOR_SECONDS,
+        _GENERATE_SECONDS_PER_PROMPT_TOKEN * num_prompts * max_tokens,
+    )
 _SHUTDOWN_COMMAND_TIMEOUT_SECONDS = 5.0
 _WORKER_TERMINATE_GRACE_SECONDS = 10.0
 
@@ -75,7 +129,9 @@ _TEACHER_WORKER_SCRIPT = textwrap.dedent("""\
 import gc, json, os, sys, logging, time, socket, glob
 
 # ---- Ensure lumenrl is importable (for ATOM's fallback imports) ----
-for _p in ["/root/lumenrl/third_party/ATOM", "/root/lumenrl", os.getcwd()]:
+# third_party/ATOM is deliberately NOT on the path: the image installs a newer
+# ATOM at /app/ATOM, and the checked-in copy would shadow it.
+for _p in ["/root/lumenrl", os.getcwd()]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
@@ -113,6 +169,9 @@ max_batch = int(sys.argv[6])
 max_seq = int(sys.argv[7])
 atom_args_json = sys.argv[8] if len(sys.argv) > 8 else "{}"
 atom_extra = json.loads(atom_args_json)
+aux_ids_json = sys.argv[9] if len(sys.argv) > 9 else "[]"
+aux_layer_ids_arg = json.loads(aux_ids_json)
+start_mode = sys.argv[10] if len(sys.argv) > 10 else "extract"
 
 os.makedirs(hidden_dir, exist_ok=True)
 
@@ -171,21 +230,92 @@ engine_kwargs = dict(
     trust_remote_code=atom_extra.pop("trust_remote_code", True),
     max_num_batched_tokens=atom_extra.pop("max_num_batched_tokens", 32768),
     max_num_seqs=atom_extra.pop("max_num_seqs", 64),
+    # LumenRL's runner adds a capture toggle and a rank-0 write guard.
+    # AsyncLLMEngine only setdefaults this, so passing it wins.
+    runner_qualname=atom_extra.pop(
+        "runner_qualname",
+        "lumenrl.engine.inference.atom_runner_ext.LumenRLModelRunner",
+    ),
 )
 for k, v in atom_extra.items():
     engine_kwargs[k] = v
+
+# ATOM filters kwargs against its Config fields and drops the rest without a
+# word, so a mistyped tuning knob would silently do nothing. Fail instead.
+from dataclasses import fields as _dc_fields
+from atom.config import Config as _AtomConfig
+_known = {f.name for f in _dc_fields(_AtomConfig)} | {
+    "data_parallel_size", "data_parallel_master_port",
+}
+_unknown = sorted(set(engine_kwargs) - _known)
+if _unknown:
+    raise ValueError(
+        f"ATOM would ignore these engine settings: {_unknown}. "
+        f"They are not fields of atom.config.Config -- check for typos."
+    )
 
 logger.info("Creating AsyncLLMEngine: %s", engine_kwargs)
 engine = AsyncLLMEngine(model_path, **engine_kwargs)
 logger.info("AsyncLLMEngine created successfully")
 
 # ---- Configure hidden states extraction ----
-aux_layer_ids = [1, num_layers // 2 - 1, num_layers - 4]
+# Layer ids come from the training config: the draft model's feature contract
+# fixes both how many aux layers it consumes and which ones. Falling back to
+# Eagle3's 3-layer heuristic would silently produce features of the wrong width.
+if aux_layer_ids_arg:
+    aux_layer_ids = sorted(int(i) for i in aux_layer_ids_arg)
+    out_of_range = [i for i in aux_layer_ids if i >= num_layers or i < 0]
+    if out_of_range:
+        raise ValueError(
+            f"aux_hidden_state_layer_ids {out_of_range} are outside the "
+            f"teacher's {num_layers} layers; ATOM silently skips hooks for "
+            f"such layers, which would yield too few aux features"
+        )
+else:
+    aux_layer_ids = [1, num_layers // 2 - 1, num_layers - 4]
+    logger.warning(
+        "No aux_hidden_state_layer_ids configured; falling back to the Eagle3 "
+        "3-layer heuristic %s", aux_layer_ids,
+    )
+
 max_seq = engine_kwargs.get("max_model_len", max_seq)
+
+# ATOM writes a request's hidden states once per scheduler step, covering only
+# the tokens scheduled in that step, under a key that a later write overwrites.
+# It does not consult is_final_chunk. So anything that stops a prefill from
+# computing the whole sequence in one step silently truncates the features, and
+# the draft model would train on them without complaint. Three ways that happens,
+# all of which ATOM enables by default:
+batched_token_budget = engine_kwargs.get("max_num_batched_tokens", 0)
+if batched_token_budget and batched_token_budget < max_seq:
+    raise ValueError(
+        f"max_num_batched_tokens={batched_token_budget} is below "
+        f"max_seq_len={max_seq}: prefill would be split across steps and each "
+        f"step would overwrite the previous hidden states for the same request"
+    )
+if engine_kwargs.get("enable_chunked_prefill", True):
+    raise ValueError(
+        "enable_chunked_prefill must be false for hidden-state extraction: a "
+        "chunked prefill writes each chunk under the same Mooncake key, so only "
+        "the final chunk's hidden states survive"
+    )
+if engine_kwargs.get("enable_prefix_caching", True):
+    raise ValueError(
+        "enable_prefix_caching must be false for hidden-state extraction: a "
+        "cached prefix is excluded from the scheduled tokens, so the prompt's "
+        "hidden states would be missing entirely from the stored features"
+    )
+
 from lumenrl.transfer.eagle_mooncake_store import calculate_eagle3_buffer_size
+# Sized for one sequence, not the whole batch: hidden states are put per
+# request, so a batch-sized buffer would idle tens of GB of pinned host memory.
+# num_aux_layers must be passed explicitly — it defaults to Eagle3's 3, which
+# would under-size the buffer for K3's 5-layer contract.
 host_buf_size = calculate_eagle3_buffer_size(
-    max_seq_len=max_seq, batch_size=max_batch,
-    hidden_dim=hidden_dim, safety_margin=2.0,
+    max_seq_len=max_seq, batch_size=1,
+    hidden_dim=hidden_dim,
+    num_aux_layers=len(aux_layer_ids),
+    safety_margin=2.0,
 )
 mooncake_config = {
     "local_hostname": os.environ.get("MOONCAKE_LOCAL_HOSTNAME", "localhost"),
@@ -203,9 +333,20 @@ mooncake_config = {
     "hidden_dim": hidden_dim,
     "host_buffer_size": host_buf_size,
 }
-capture_mode = os.environ.get("LUMENRL_CAPTURE_MODE", "postnorm")
-engine.configure_hidden_states(aux_layer_ids, mooncake_config, capture_mode=capture_mode)
-logger.info("Hidden states configured: aux_layers=%s, capture_mode=%s", aux_layer_ids, capture_mode)
+# ATOM captures the post-layer residual stream (hidden_states + residual) via
+# forward hooks and has no capture_mode knob — the semantics are fixed and match
+# "postnorm". Passing one would be a TypeError.
+engine.configure_hidden_states(aux_layer_ids, mooncake_config)
+logger.info("Hidden states configured: aux_layers=%s", aux_layer_ids)
+
+# Capture needs no arm/park control message. ATOM keys every Mooncake write on a
+# request's external id, and LumenRLModelRunner additionally skips the capture
+# forward path for batches where no request carries one. So the sweep selects its
+# own behaviour purely by whether it submits data ids:
+#   extract sweep  -> generate_hidden_states(rows, data_ids)  -> captures, writes
+#   generate sweep -> preprocess() with no request_id         -> stock decode
+# Both share this one engine; "mode" is bookkeeping on the client side only.
+logger.info("Worker ready (start mode %s, capture is per-request)", start_mode)
 
 # ---- Signal ready ----
 resp_f = open(resp_fifo, "w")
@@ -214,6 +355,7 @@ resp_f.write(json.dumps({
     "hidden_dim": hidden_dim,
     "num_layers": num_layers,
     "aux_layer_indices": aux_layer_ids,
+    "mode": start_mode,
 }) + "\\n")
 resp_f.flush()
 
@@ -231,63 +373,145 @@ for line in cmd_f:
     if cmd == "extract_hidden":
         input_path = msg["input_path"]
         data = torch.load(input_path, map_location="cpu", weights_only=True)
-        input_ids_batch = data["input_ids"]  # [B, T]
+        input_ids_batch = data["input_ids"]  # [B, T], right-padded
         B, T = input_ids_batch.shape
         req_counter += 1
 
-        input_ids_list = [input_ids_batch[i].tolist() for i in range(B)]
-        data_ids = [f"atom_{os.getpid()}_{req_counter}_{i}" for i in range(B)]
+        # Trim padding per row. On-policy batches are ragged, and prefilling pad
+        # tokens would both waste compute and store hidden states for positions
+        # the loss masks out anyway.
+        lengths = data.get("lengths")
+        rows = []
+        for i in range(B):
+            if lengths is not None:
+                n = int(lengths[i])
+            else:
+                n = T
+            n = max(1, min(n, T))
+            rows.append(input_ids_batch[i][:n].tolist())
+
+        data_ids = [f"atom_{os.getpid()}_x{req_counter}_{i}" for i in range(B)]
 
         t0 = time.monotonic()
-        engine.generate_hidden_states(input_ids_list, data_ids)
+        engine.generate_hidden_states(rows, data_ids)
         elapsed = time.monotonic() - t0
-        logger.info("extract_hidden: B=%d, T=%d, %.2fs", B, T, elapsed)
+        logger.info(
+            "extract_hidden: B=%d, T=%d, tokens=%d, %.2fs",
+            B, T, sum(len(r) for r in rows), elapsed,
+        )
 
         resp_f.write(json.dumps({
             "status": "ok", "B": B, "T": T, "D": hidden_dim,
             "mooncake_keys": data_ids,
+            "seq_lens": {k: len(r) for k, r in zip(data_ids, rows)},
         }) + "\\n")
         resp_f.flush()
-        del data, input_ids_batch, input_ids_list
+        del data, input_ids_batch, rows
 
-    elif cmd == "generate_extract":
+    elif cmd == "generate_tokens":
         input_path = msg["input_path"]
+        output_path = msg["output_path"]
         max_tokens = msg.get("max_tokens", 2048)
         temperature = msg.get("temperature", 0.0)
         data = torch.load(input_path, map_location="cpu", weights_only=True)
-        input_ids_batch = data["input_ids"]
-        attn_mask = data.get("attention_mask")
-        B = input_ids_batch.shape[0]
+        prompt_batch = data["input_ids"]  # [B, T_prompt], right-padded
+        lengths = data.get("lengths")
+        B, T_prompt = prompt_batch.shape
         req_counter += 1
 
-        input_ids_list = []
+        prompts = []
         for i in range(B):
-            ids = input_ids_batch[i]
-            if attn_mask is not None:
-                valid_len = int(attn_mask[i].sum().item())
-                ids = ids[:valid_len]
-            else:
-                while len(ids) > 0 and ids[-1].item() == 0:
-                    ids = ids[:-1]
-            input_ids_list.append(ids.tolist())
-        data_ids = [f"atom_{os.getpid()}_{req_counter}_{i}" for i in range(B)]
+            n = int(lengths[i]) if lengths is not None else T_prompt
+            n = max(1, min(n, T_prompt))
+            prompts.append(prompt_batch[i][:n].tolist())
 
         from atom.sampling_params import SamplingParams
         sp = SamplingParams(max_tokens=max_tokens, temperature=temperature)
 
         t0 = time.monotonic()
-        results = engine.generate_with_hidden_states(input_ids_list, data_ids, sp)
-        elapsed = time.monotonic() - t0
-        logger.info("generate_extract: B=%d, max_tokens=%d, %.2fs", B, max_tokens, elapsed)
+        engine.core_mgr.reset_dp_router()
 
-        seq_lens = {r["data_id"]: r["seq_len"] for r in results}
+        # Submit one sequence at a time instead of through add_request() so the
+        # engine's own Sequence objects are in hand: their ids give an exact
+        # row mapping. ATOM's generate() instead sorts finished sequences by
+        # internal id and zips against input order, which assumes ids sort in
+        # submission order — pairing a prompt with another row's response would
+        # be silent training-data corruption.
+        #
+        # Deliberately no request_id: an external id is what tells ATOM where to
+        # write hidden states, so withholding it is what keeps this sweep from
+        # pushing the prompt prefill to Mooncake (gigabytes per batch that
+        # nobody reads).
+        io_proc = engine.io_processor
+        submitted = [io_proc.preprocess(p, sp) for p in prompts]
+        row_of_seq = {seq.id: i for i, seq in enumerate(submitted)}
+        if len(row_of_seq) != B:
+            raise RuntimeError(
+                f"generate_tokens: engine assigned duplicate sequence ids to "
+                f"{B} prompts ({len(row_of_seq)} unique); row mapping is unsafe"
+            )
+        engine.core_mgr.add_request(submitted)
+
+        by_row = {}
+        while not engine.is_finished() and (
+            engine.core_mgr.is_alive() or engine.core_mgr.is_rest()
+        ):
+            seqs = engine.step()
+            for internal_id, out in io_proc.postprocess(seqs).items():
+                row = row_of_seq.get(internal_id)
+                if row is None:
+                    raise RuntimeError(
+                        f"generate_tokens: engine returned sequence {internal_id} "
+                        f"that this sweep never submitted"
+                    )
+                by_row[row] = out
+        elapsed = time.monotonic() - t0
+
+        missing = [i for i in range(B) if i not in by_row]
+        if missing:
+            raise RuntimeError(
+                f"generate_tokens: {len(missing)}/{B} requests never returned "
+                f"(first missing row: {missing[0]})"
+            )
+
+        completions = []
+        finish_reasons = []
+        for i in range(B):
+            out = by_row[i]
+            completions.append([int(t) for t in out["token_ids"]])
+            finish_reasons.append(str(out.get("finish_reason", "")))
+            reported_prompt_len = out.get("num_tokens_input")
+            if reported_prompt_len is not None and int(reported_prompt_len) != len(prompts[i]):
+                raise RuntimeError(
+                    f"generate_tokens: row {i} prompt length mismatch "
+                    f"(sent {len(prompts[i])}, engine saw {reported_prompt_len}); "
+                    f"prompt/response pairing cannot be trusted"
+                )
+
+        gen_lens = [len(c) for c in completions]
+        logger.info(
+            "generate_tokens: B=%d, max_tokens=%d, gen_len min/mean/max=%d/%.1f/%d, %.2fs",
+            B, max_tokens, min(gen_lens), sum(gen_lens) / len(gen_lens),
+            max(gen_lens), elapsed,
+        )
+
+        # Token ids go through a file rather than the FIFO: B=64 x 512 tokens of
+        # JSON would exceed the pipe buffer and deadlock against a reader that is
+        # waiting for one line.
+        torch.save(
+            {
+                "prompt_lens": [len(p) for p in prompts],
+                "completions": completions,
+                "finish_reasons": finish_reasons,
+            },
+            output_path,
+        )
+
         resp_f.write(json.dumps({
-            "status": "ok", "B": B, "D": hidden_dim,
-            "mooncake_keys": data_ids,
-            "seq_lens": seq_lens,
+            "status": "ok", "B": B, "output_path": output_path,
         }) + "\\n")
         resp_f.flush()
-        del data, input_ids_batch, input_ids_list
+        del data, prompt_batch, prompts, completions
 
     elif cmd == "shutdown":
         try:
@@ -331,6 +555,7 @@ class AtomTeacherEngine:
         max_seq_len: int = 4096,
         local_device: torch.device | None = None,
         capture_mode: str = "postnorm",
+        aux_layer_ids: list[int] | None = None,
     ) -> None:
         self._model_name = model_name
         self._tp_size = tensor_parallel_size
@@ -344,6 +569,8 @@ class AtomTeacherEngine:
         self._max_seq = max_seq_len
         self._local_device = local_device or torch.device("cuda:0")
         self._capture_mode = capture_mode
+        self._configured_aux_layer_ids = list(aux_layer_ids or [])
+        self._mode = "extract"
 
         self._proc: subprocess.Popen | None = None
         self._fifo_dir: str | None = None
@@ -368,12 +595,65 @@ class AtomTeacherEngine:
             and self._proc.poll() is None
         )
 
+    @property
+    def _num_aux_layers(self) -> int:
+        """How many aux layers the transfer buffers must be sized for.
+
+        Buffer sizing helpers default to Eagle3's 3 layers; K3's contract is 5, so
+        every caller has to be explicit or the host buffer comes out too small to
+        hold a sequence.
+        """
+        if self._aux_layer_indices:
+            return len(self._aux_layer_indices)
+        if self._configured_aux_layer_ids:
+            return len(self._configured_aux_layer_ids)
+        return 3
+
+    @property
+    def mode(self) -> str:
+        """Which sweep the engine is set up for: ``"generate"`` or ``"extract"``."""
+        return self._mode
+
+    def switch_mode(self, mode: str) -> None:
+        """Retarget the engine between sweeps. Free: nothing has to be told.
+
+        ATOM decides per request whether to capture, keyed on whether the request
+        carries an external id, so the two sweeps differ only in what they submit
+        — the generate sweep withholds the id, the extract sweep supplies it. One
+        loaded model serves both, and this is bookkeeping so callers can assert
+        which sweep they are in. That is what makes on-policy rounds affordable:
+        the vLLM path tore the engine down and reloaded K3's 1.5 TB of weights on
+        every switch.
+        """
+        if mode not in ("generate", "extract"):
+            raise ValueError(f"unknown teacher mode: {mode!r}")
+        if self._mode != mode:
+            logger.info("AtomTeacherEngine: now in %s mode", mode)
+        self._mode = mode
+
     def _describe_worker_exit(self, exit_code: int) -> str:
         if exit_code < 0:
             sig = -exit_code
             signal_name = signal.Signals(sig).name if sig in signal.Signals._value2member_map_ else f"SIG{sig}"
             return f"exited by signal {signal_name} ({sig})"
         return f"exited with code {exit_code}"
+
+    def worker_log_tail(self, num_lines: int = 50) -> str:
+        """Last lines the worker wrote, or "" if they are unavailable.
+
+        The worker's stdout and stderr go only to this file, never to the
+        trainer log, so a worker that stops responding leaves no trace in the
+        place anyone looks first. Callers should pull the tail *before*
+        restarting: ``start`` reopens the file in write mode and truncates it.
+        """
+        try:
+            path = os.path.join(self._hidden_dir, "atom_teacher_worker.log")
+            if not os.path.exists(path):
+                return ""
+            with open(path) as f:
+                return "".join(f.readlines()[-num_lines:])
+        except Exception:
+            return ""
 
     def _terminate_worker(self, reason: str) -> None:
         if self._proc is None:
@@ -551,10 +831,19 @@ class AtomTeacherEngine:
                 )
             return resp_line
 
-    def start(self) -> None:
-        """Start the teacher worker subprocess and set up Mooncake store."""
+    def start(self, mode: str = "extract") -> None:
+        """Start the teacher worker subprocess and set up Mooncake store.
+
+        ``mode`` only selects which sweep the engine comes up ready for; both are
+        served by the same process, so callers switch with ``switch_mode()``
+        rather than restarting.
+        """
+        if mode not in ("generate", "extract"):
+            raise ValueError(f"unknown teacher mode: {mode!r}")
         if self.is_alive:
+            self.switch_mode(mode)
             return
+        self._mode = mode
 
         os.makedirs(self._hidden_dir, exist_ok=True)
 
@@ -644,8 +933,10 @@ class AtomTeacherEngine:
                 _hdim = 4096
             from lumenrl.transfer.eagle_mooncake_store import calculate_eagle3_buffer_size
             worker_host_buf = calculate_eagle3_buffer_size(
-                max_seq_len=self._max_seq, batch_size=self._max_batch,
-                hidden_dim=_hdim, safety_margin=2.0,
+                max_seq_len=self._max_seq, batch_size=1,
+                hidden_dim=_hdim,
+                num_aux_layers=self._num_aux_layers,
+                safety_margin=2.0,
             )
             env["MOONCAKE_HOST_BUFFER_SIZE"] = str(worker_host_buf)
 
@@ -676,6 +967,8 @@ class AtomTeacherEngine:
                 self._hidden_dir,
                 str(self._max_batch), str(self._max_seq),
                 atom_args_json,
+                json.dumps(self._configured_aux_layer_ids),
+                self._mode,
             ],
             stdin=subprocess.DEVNULL,
             stdout=self._worker_log_f,
@@ -692,15 +985,7 @@ class AtomTeacherEngine:
             )
             self._resp_f = open(self._resp_fifo, "r")
         except Exception as exc:
-            worker_log_tail = ""
-            try:
-                worker_log_path = os.path.join(self._hidden_dir, "atom_teacher_worker.log")
-                if os.path.exists(worker_log_path):
-                    with open(worker_log_path) as wlf:
-                        lines = wlf.readlines()
-                    worker_log_tail = "".join(lines[-50:])
-            except Exception:
-                pass
+            worker_log_tail = self.worker_log_tail()
             logger.error(
                 "AtomTeacherEngine: startup failed before READY or channel setup (%s). "
                 "Root-cause hint: worker crash, missing READY, or startup timeout.\n"
@@ -734,6 +1019,19 @@ class AtomTeacherEngine:
                 except Exception:
                     local_ip = socket.gethostbyname(socket.gethostname())
 
+                from lumenrl.transfer.eagle_mooncake_store import (
+                    calculate_eagle3_buffer_size,
+                )
+                # Reads happen one key at a time, so the buffer needs to hold a
+                # single sequence's aux stack — and it must be sized for the real
+                # aux-layer count, not the helper's 3-layer default.
+                recv_host_buf = calculate_eagle3_buffer_size(
+                    max_seq_len=self._max_seq, batch_size=1,
+                    hidden_dim=self._hidden_dim,
+                    num_aux_layers=self._num_aux_layers,
+                    safety_margin=2.0,
+                )
+
                 mc_cfg = MooncakeConfig(
                     master_server_address=getattr(mc, "master_server_address", ""),
                     metadata_server=getattr(mc, "metadata_server", ""),
@@ -742,6 +1040,7 @@ class AtomTeacherEngine:
                     device_name=getattr(mc, "device_name", ""),
                     global_segment_size=getattr(mc, "global_segment_size", "16GB"),
                     local_buffer_size=getattr(mc, "local_buffer_size", "4GB"),
+                    host_buffer_size=recv_host_buf,
                     max_seq_len=self._max_seq,
                     hidden_dim=self._hidden_dim,
                     get_retry_wait_seconds=getattr(mc, "get_retry_wait_seconds", 1.0),
@@ -819,7 +1118,16 @@ class AtomTeacherEngine:
             All tensors on ``recv_device`` or ``self._local_device``.
         """
         if not self.is_alive:
-            self.start()
+            self.start(mode="extract")
+        else:
+            self.switch_mode("extract")
+
+        if self._transport != "mooncake":
+            raise AssertionError(
+                "AtomTeacherEngine only implements the Mooncake transport",
+            )
+
+        lengths = attention_mask.sum(dim=1).to(torch.int64).cpu()
 
         with self._cmd_lock:
             self._req_counter += 1
@@ -827,7 +1135,7 @@ class AtomTeacherEngine:
             input_path = os.path.join(self._hidden_dir, f"{tag}_input.pt")
 
             torch.save(
-                {"input_ids": input_ids.cpu(), "attention_mask": attention_mask.cpu()},
+                {"input_ids": input_ids.cpu(), "lengths": lengths},
                 input_path,
             )
 
@@ -839,207 +1147,164 @@ class AtomTeacherEngine:
         if resp.get("status") != "ok":
             raise RuntimeError(f"extract_hidden failed: {resp}")
 
-        B = resp["B"]
         T = resp["T"]
         D = resp["D"]
 
         if recv_device is None:
             recv_device = self._local_device
 
-        if self._transport == "mooncake":
-            mooncake_keys = resp["mooncake_keys"]
-            num_aux = len(self._aux_layer_indices)
-            training_hidden_size = num_aux * D
+        mooncake_keys = resp["mooncake_keys"]
+        seq_lens = resp.get("seq_lens", {})
+        num_aux = len(self._aux_layer_indices)
+        training_hidden_size = num_aux * D
 
-            # Fetch per-request hidden states from Mooncake and stack
-            all_hs = []
-            all_ids = []
-            all_last_hs = []
+        # The teacher prefills each row trimmed to its real length, so entries are
+        # ragged; pad back to T so positions still line up with the caller's
+        # right-padded batch.
+        all_hs = []
+        all_ids = []
+        all_last_hs = []
 
-            for key in mooncake_keys:
-                shapes = {
-                    "hidden_states": (T, training_hidden_size),
-                    "input_ids": (T,),
-                    "last_hidden_states": (T, D),
-                }
-                dtypes = {
-                    "hidden_states": torch.bfloat16,
-                    "input_ids": torch.int64,
-                    "last_hidden_states": torch.bfloat16,
-                }
-
-                output = self._mooncake_store.get(
-                    key, shapes, dtypes, device=recv_device,
-                )
-
-                all_hs.append(output.hidden_states)
-                all_last_hs.append(output.last_hidden_states)
-                all_ids.append(output.input_ids)
-
-                self._mooncake_store.remove_eagle3_tensors(
-                    key, has_last_hidden_states=True, has_target=False,
-                )
-
-            hidden_states = torch.stack(all_hs)         # [B, T, 3*D]
-            last_hidden_states = torch.stack(all_last_hs)  # [B, T, D]
-            ret_ids = torch.stack(all_ids)               # [B, T]
-
-            # First aux layer as embed proxy (same convention as VllmTeacherEngine)
-            token_embeds = hidden_states[:, :, :D].clone()
-
-            return {
-                "hidden_states": hidden_states,
-                "token_embeds": token_embeds,
-                "input_ids": ret_ids,
-                "last_hidden_states": last_hidden_states,
+        for key in mooncake_keys:
+            T_i = int(seq_lens.get(key, T))
+            shapes = {
+                "hidden_states": (T_i, training_hidden_size),
+                "input_ids": (T_i,),
+                "last_hidden_states": (T_i, D),
             }
-        else:
-            raise AssertionError("MORI-IO transport not implemented for 3 aux layers")
+            dtypes = {
+                "hidden_states": torch.bfloat16,
+                "input_ids": torch.int64,
+                "last_hidden_states": torch.bfloat16,
+            }
 
-    def generate_and_extract_hidden_states(
+            output = self._mooncake_store.get(
+                key, shapes, dtypes, device=recv_device,
+            )
+
+            all_hs.append(output.hidden_states)
+            all_last_hs.append(output.last_hidden_states)
+            all_ids.append(output.input_ids)
+
+            self._mooncake_store.remove_eagle3_tensors(
+                key, has_last_hidden_states=True, has_target=False,
+            )
+
+        hidden_states = _pad_stack(all_hs, T)               # [B, T, num_aux*D]
+        last_hidden_states = _pad_stack(all_last_hs, T)     # [B, T, D]
+        ret_ids = _pad_stack(all_ids, T)                    # [B, T]
+
+        # First aux layer as embed proxy (same convention as VllmTeacherEngine)
+        token_embeds = hidden_states[:, :, :D].clone()
+
+        return {
+            "hidden_states": hidden_states,
+            "token_embeds": token_embeds,
+            "input_ids": ret_ids,
+            "last_hidden_states": last_hidden_states,
+        }
+
+    def generate_tokens(
         self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
+        prompt_ids: torch.Tensor,
+        prompt_mask: torch.Tensor,
         max_tokens: int = 2048,
         temperature: float = 0.0,
-        recv_device: torch.device | None = None,
-    ) -> dict[str, torch.Tensor]:
-        """Generate response + extract hidden states in one pass.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Decode the teacher's own continuation of each prompt.
 
-        Unlike extract_hidden_states() which does prefill-only on full
-        sequences, this method sends prompt-only tokens to the teacher,
-        generates a response, and captures hidden states at every position
-        (prompt + generated tokens).
+        This is the first of the two on-policy sweeps and produces tokens only.
+        Hidden states come from a second ``extract_hidden_states()`` pass over the
+        finished sequences: ATOM captures during prefill, so a decode sweep sees
+        activations one position at a time and cannot fill the batch in one go.
 
         Args:
-            input_ids: ``[B, T_prompt]`` prompt-only token ids.
-            attention_mask: ``[B, T_prompt]`` mask (1 = valid, 0 = pad).
-            max_tokens: Maximum tokens to generate per request.
+            prompt_ids: ``[B, T_prompt]`` right-padded prompt tokens.
+            prompt_mask: ``[B, T_prompt]`` mask (1 = real token, 0 = pad).
+            max_tokens: Cap on generated tokens per request.
             temperature: Sampling temperature (0.0 = greedy).
-            recv_device: Device for received tensors.
 
         Returns:
-            Same format as extract_hidden_states() — dict with
-            ``hidden_states`` ``[B, T_max, 3*D]``,
-            ``token_embeds`` ``[B, T_max, D]``,
-            ``last_hidden_states`` ``[B, T_max, D]``,
-            ``input_ids`` ``[B, T_max]``.
-            T_max = max(prompt_len + generated_len) across batch, padded.
+            ``(full_ids, seq_lens, prompt_lens)`` where ``full_ids`` is
+            ``[B, T_full]`` prompt+response right-padded with zeros, and the two
+            length vectors are ``[B]`` on CPU. Pad id 0 is a real token in K3's
+            vocabulary, so lengths cannot be recovered from ``full_ids`` and are
+            returned explicitly.
         """
         if not self.is_alive:
-            self.start()
+            self.start(mode="generate")
+        else:
+            self.switch_mode("generate")
+
+        prompt_lens = prompt_mask.sum(dim=1).to(torch.int64).cpu()
 
         with self._cmd_lock:
             self._req_counter += 1
             tag = f"req_{self._req_counter}"
-            input_path = os.path.join(self._hidden_dir, f"{tag}_input.pt")
+            input_path = os.path.join(self._hidden_dir, f"{tag}_prompt.pt")
+            output_path = os.path.join(self._hidden_dir, f"{tag}_gen.pt")
 
             torch.save(
-                {"input_ids": input_ids.cpu(), "attention_mask": attention_mask.cpu()},
+                {"input_ids": prompt_ids.cpu(), "lengths": prompt_lens},
                 input_path,
             )
 
-            resp = self._send_cmd_unlocked({
-                "cmd": "generate_extract",
-                "input_path": input_path,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-            })
+            resp = self._send_cmd_unlocked(
+                {
+                    "cmd": "generate_tokens",
+                    "input_path": input_path,
+                    "output_path": output_path,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                },
+                timeout_s=_generate_timeout_seconds(
+                    prompt_ids.shape[0], max_tokens
+                ),
+            )
 
         if resp.get("status") != "ok":
-            raise RuntimeError(f"generate_extract failed: {resp}")
+            raise RuntimeError(f"generate_tokens failed: {resp}")
 
-        B = resp["B"]
-        D = resp["D"]
+        payload = torch.load(output_path, map_location="cpu", weights_only=False)
+        try:
+            os.unlink(output_path)
+            os.unlink(input_path)
+        except OSError:
+            pass
 
-        if recv_device is None:
-            recv_device = self._local_device
+        completions = payload["completions"]
+        worker_prompt_lens = payload["prompt_lens"]
 
-        if self._transport == "mooncake":
-            mooncake_keys = resp["mooncake_keys"]
-            seq_lens = resp.get("seq_lens", {})
-            num_aux = len(self._aux_layer_indices)
-            training_hidden_size = num_aux * D
+        B = len(completions)
+        if B != prompt_ids.shape[0]:
+            raise RuntimeError(
+                f"generate_tokens returned {B} rows for a batch of "
+                f"{prompt_ids.shape[0]}",
+            )
 
-            all_hs = []
-            all_ids = []
-            all_last_hs = []
-            all_seq_lens = []
+        seq_lens = torch.tensor(
+            [int(worker_prompt_lens[i]) + len(completions[i]) for i in range(B)],
+            dtype=torch.int64,
+        )
+        T_full = int(seq_lens.max().item())
 
-            for key in mooncake_keys:
-                T_i = seq_lens.get(key)
-                if T_i is None:
-                    raise RuntimeError(
-                        f"Missing seq_len for key={key} in generate_extract response"
-                    )
-                all_seq_lens.append(T_i)
+        full_ids = torch.zeros(B, T_full, dtype=torch.long)
+        for i in range(B):
+            p_len = int(worker_prompt_lens[i])
+            full_ids[i, :p_len] = prompt_ids[i, :p_len].cpu()
+            if completions[i]:
+                comp = torch.tensor(completions[i], dtype=torch.long)
+                full_ids[i, p_len:p_len + comp.numel()] = comp
 
-                shapes = {
-                    "hidden_states": (T_i, training_hidden_size),
-                    "input_ids": (T_i,),
-                    "last_hidden_states": (T_i, D),
-                }
-                dtypes = {
-                    "hidden_states": torch.bfloat16,
-                    "input_ids": torch.int64,
-                    "last_hidden_states": torch.bfloat16,
-                }
+        empty = int((seq_lens == prompt_lens).sum().item())
+        if empty:
+            logger.warning(
+                "AtomTeacherEngine: %d/%d prompts produced no tokens; those rows "
+                "carry no on-policy signal",
+                empty, B,
+            )
 
-                output = self._mooncake_store.get(
-                    key, shapes, dtypes, device=recv_device,
-                )
-
-                all_hs.append(output.hidden_states)
-                all_last_hs.append(output.last_hidden_states)
-                all_ids.append(output.input_ids)
-
-                self._mooncake_store.remove_eagle3_tensors(
-                    key, has_last_hidden_states=True, has_target=False,
-                )
-
-            T_max = max(all_seq_lens)
-            pad_id = 0
-
-            def _pad_2d(tensors, T_max):
-                padded = []
-                for t in tensors:
-                    if t.shape[0] < T_max:
-                        pad = torch.zeros(
-                            T_max - t.shape[0], *t.shape[1:],
-                            dtype=t.dtype, device=t.device,
-                        )
-                        padded.append(torch.cat([t, pad], dim=0))
-                    else:
-                        padded.append(t)
-                return torch.stack(padded)
-
-            def _pad_1d(tensors, T_max, fill=0):
-                padded = []
-                for t in tensors:
-                    if t.shape[0] < T_max:
-                        pad = torch.full(
-                            (T_max - t.shape[0],), fill,
-                            dtype=t.dtype, device=t.device,
-                        )
-                        padded.append(torch.cat([t, pad], dim=0))
-                    else:
-                        padded.append(t)
-                return torch.stack(padded)
-
-            hidden_states = _pad_2d(all_hs, T_max)
-            last_hidden_states = _pad_2d(all_last_hs, T_max)
-            ret_ids = _pad_1d(all_ids, T_max, fill=pad_id)
-
-            token_embeds = hidden_states[:, :, :D].clone()
-
-            return {
-                "hidden_states": hidden_states,
-                "token_embeds": token_embeds,
-                "input_ids": ret_ids,
-                "last_hidden_states": last_hidden_states,
-            }
-        else:
-            raise AssertionError("MORI-IO transport not implemented for generate_extract")
+        return full_ids, seq_lens, prompt_lens
 
     def get_lm_head_weight(self) -> torch.Tensor:
         """Load the teacher's lm_head.weight from shared memory."""

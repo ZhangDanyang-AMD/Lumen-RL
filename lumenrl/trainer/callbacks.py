@@ -73,7 +73,16 @@ class CheckpointCallback(Callback):
     def on_step_end(self, trainer: "RLTrainer", step: int, metrics: dict[str, float]) -> None:
         if step % self.save_interval != 0:
             return
+        self.save_now(trainer, step, metrics)
 
+    def save_now(self, trainer: "RLTrainer", step: int, metrics: dict[str, float]) -> None:
+        """Write a checkpoint regardless of ``save_interval``.
+
+        Callers that know a particular moment is worth preserving — the end of a
+        batch-alternating round, say — use this so an unlucky step number cannot
+        silently skip the save. Must be called on every rank: the state is built
+        collectively even though only rank 0 writes it.
+        """
         rank = trainer._rank
         ckpt_dir = Path(self.checkpoint_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)

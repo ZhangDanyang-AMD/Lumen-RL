@@ -82,12 +82,50 @@ class KimiK3Parser:
                 return value
         return ""
 
-    def _prepare_messages(self, conversation: List[Dict]) -> List[Dict]:
+    def _split_reasoning(self, entry: Dict) -> Tuple[str, str]:
+        """Reasoning and remaining content for one assistant entry.
+
+        Prefers an explicit reasoning field over an inline ``<think>`` block, but
+        strips the inline block either way so it never reaches the renderer as
+        literal text (``<think>`` is not a K3 special token — it encodes as three
+        ordinary tokens).
+        """
+        content = entry.get("content", "")
+        existing = self._reasoning_from_field(entry)
+        if existing:
+            if "<think>" in content:
+                _, content = self._extract_thinking(content)
+            return existing, content
+        return self._extract_thinking(content)
+
+    @staticmethod
+    def _set_reasoning(entry: Dict, reasoning: str, content: str) -> None:
+        """Put reasoning where encoding_k3 looks for it, and nowhere else."""
+        entry["content"] = content
+        if reasoning:
+            entry["reasoning_content"] = reasoning
+        else:
+            entry.pop("reasoning_content", None)
+        for field in _REASONING_FIELDS:
+            if field != "reasoning_content" and field in entry:
+                del entry[field]
+
+    def _prepare_messages(
+        self, conversation: List[Dict], thinking: bool = True
+    ) -> List[Dict]:
         """Prepare messages for K3's apply_chat_template.
 
-        Aligns with TorchSpec K2.5 reasoning handling (parse.py:488-504):
-        - Non-last assistant turns: strip <think>...</think> entirely
-        - Last assistant turn: keep reasoning in reasoning_content field
+        The last assistant turn always keeps its reasoning in
+        ``reasoning_content``. What happens to *earlier* assistant turns depends
+        on the mode, and the distinction is not cosmetic:
+
+        - thinking=True: reasoning is preserved. K3 was trained in preserved
+          thinking history mode and its model card requires the full assistant
+          message — reasoning_content included — to be replayed. Dropping it
+          leaves empty think blocks in the history, which is a context the model
+          never saw in training.
+        - thinking=False: the think channel is not rendered at all, so reasoning
+          has nowhere to go and is stripped.
         """
         last_assistant_idx = max(
             (i for i, msg in enumerate(conversation) if isinstance(msg, dict) and msg.get("role") == "assistant"),
@@ -101,57 +139,90 @@ class KimiK3Parser:
                 messages.append(entry)
                 continue
 
-            content = entry.get("content", "")
-
-            if idx != last_assistant_idx:
-                if _has_dropped_think_opener(content):
-                    content = "<think>" + content
-                content = _THINK_PATTERN.sub("", content)
-                entry["content"] = content
-                for field in _REASONING_FIELDS:
-                    entry.pop(field, None)
-            else:
-                existing_reasoning = self._reasoning_from_field(entry)
-                if existing_reasoning:
-                    reasoning = existing_reasoning
-                    if "<think>" in content:
-                        _, content = self._extract_thinking(content)
-                else:
-                    reasoning, content = self._extract_thinking(content)
-
-                entry["content"] = content
-                if reasoning:
-                    entry["reasoning_content"] = reasoning
-                else:
-                    entry.pop("reasoning_content", None)
-                for field in _REASONING_FIELDS:
-                    if field != "reasoning_content" and field in entry:
-                        del entry[field]
-
+            reasoning, content = self._split_reasoning(entry)
+            keep = thinking or idx == last_assistant_idx
+            self._set_reasoning(entry, reasoning if keep else "", content)
             messages.append(entry)
 
         return messages
 
     def format(
-        self, conversation: List[Dict], add_generation_prompt: bool = False
+        self,
+        conversation: List[Dict],
+        add_generation_prompt: bool = False,
+        thinking: bool = True,
     ) -> str:
         """Format conversation into XTML string via K3's native tokenizer."""
-        messages = self._prepare_messages(conversation)
+        messages = self._prepare_messages(conversation, thinking=thinking)
         return self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
-            thinking=True,
+            thinking=thinking,
             add_generation_prompt=add_generation_prompt,
         )
+
+    def format_generation_prompt(
+        self, conversation: List[Dict], thinking: bool = True
+    ) -> str:
+        """Render the context that precedes the last assistant turn, as a prompt.
+
+        This is what an on-policy teacher is asked to complete: the same bytes a
+        serving stack would send, so the response the teacher produces carries no
+        train/inference rendering skew.
+
+        Reasoning in the history turns follows the mode, for the same reason as
+        in :meth:`_prepare_messages`: preserved under thinking=True because K3
+        requires the full assistant message replayed, stripped under
+        thinking=False because there is no think channel to put it in.
+        """
+        last_assistant_idx = max(
+            (
+                i
+                for i, msg in enumerate(conversation)
+                if isinstance(msg, dict) and msg.get("role") == "assistant"
+            ),
+            default=-1,
+        )
+        if last_assistant_idx < 0:
+            return ""
+
+        history = []
+        for msg in conversation[:last_assistant_idx]:
+            entry = dict(msg)
+            if entry.get("role") == "assistant":
+                reasoning, content = self._split_reasoning(entry)
+                self._set_reasoning(entry, reasoning if thinking else "", content)
+            history.append(entry)
+
+        if not history:
+            return ""
+
+        return self.tokenizer.apply_chat_template(
+            history,
+            tokenize=False,
+            thinking=thinking,
+            add_generation_prompt=True,
+        )
+
+    def parse_generation_prompt(
+        self, conversation: List[Dict], thinking: bool = True
+    ) -> torch.Tensor:
+        """Token ids of ``format_generation_prompt``; empty tensor when absent."""
+        text = self.format_generation_prompt(conversation, thinking=thinking)
+        if not text:
+            return torch.zeros(0, dtype=torch.long)
+        ids = self.tokenizer.encode(text, add_special_tokens=False)
+        return torch.tensor(ids, dtype=torch.long)
 
     def parse(
         self,
         conversation: List[Dict],
         max_length: int,
         last_turn_only: bool = False,
+        thinking: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Format, tokenize, and compute assistant-only loss mask."""
-        text = self.format(conversation)
+        text = self.format(conversation, thinking=thinking)
         return self._tokenize_with_loss_mask(text, max_length, last_turn_only)
 
     def _tokenize_with_loss_mask(

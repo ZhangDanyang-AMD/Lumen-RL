@@ -1,0 +1,271 @@
+# Kimi K3 DSpark Smoke Test — MI350 (ATOM teacher, Batch-Alternating)
+#
+# A 5-step end-to-end validation on **exactly the same recipe as train.yaml**.
+# Only the scale and the output paths differ; every field that affects behaviour
+# is kept identical, because a smoke test on a different recipe validates a
+# pipeline nobody is going to run.
+#
+# Phase A1: ATOM decodes prompt -> the teacher's own response (no capture)
+# Phase A2: the same engine re-prefills the full sequence and captures 5 layers
+#           of hidden states -> Mooncake (capture on)
+# Phase B:  torchrun replicate draft training (BF16)
+#
+# What to confirm:
+#   1. Decoding at B=64 gets through 5 consecutive batches without a GPU fault —
+#      vLLM crashes within 15-20 batches
+#   2. The received hidden states are 5 x 7168 = 35840 wide, and each row's
+#      effective length equals prompt+response (if the prefill were chunked, only
+#      the last chunk would survive in Mooncake and the length would be short)
+#   3. The sweeps alternate without the engine restarting (the log must not show
+#      a second weight load)
+#
+# Four additions from 2026-08-08, which are exactly what that revision changed:
+#   4. thinking=true renders correctly: the prompt contains <|open|>think<|sep|>
+#      and multi-turn history keeps its reasoning (not a string of empty think
+#      blocks — that is the old PARSER_VERSION<6 bug)
+#   5. With the whole round merged into one sweep (320 rows submitted at once),
+#      splitting the results back out still aligns with the batch boundaries
+#   6. Hidden states are unchanged with CUDA graphs on: graphs capture decode
+#      only, and A2's prefill must still run eager
+#   7. Phase B peak memory — the number that decides whether max_num_seqs can go
+#      to 128/256. Sample it with rocm-smi during the run; do not just check
+#      whether it crashed
+#
+# Deliberately different from train.yaml (and nothing else):
+#   num_training_steps 5, cache_batches 5, eval every step on only 8 samples, and
+#   separate cache_dir / checkpoint_dir so the smoke run cannot pollute the real
+#   one.
+#
+# /!\ Deliberately identical — changing these makes the test meaningless:
+#   train_global_batch_size 64: at bs=8 the gradient accumulation path
+#     (ceil(64/8)=8 backward passes) is never exercised at all, and a cached
+#     batch shrinks from 11.3 GB to 1.41 GB, so /dev/shm pressure goes untested.
+#   anchor_num 512: the main driver of peak memory (57.8 GiB measured). 64 would
+#     hide the OOM risk.
+#   max_num_seqs / max_num_batched_tokens: the first decides the decode batch
+#     shape (precisely where vLLM crashes), the second is the guarantee that
+#     prefill is not chunked; lowering it silently truncates hidden states.
+#   The four generate_* / dataset.* fields: see their individual notes.
+#
+# Usage:
+#   bash examples/Kimi_K3_SDDD_MI350_ATOM/run_kimi_k3.sh --smoke-test
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
+
+policy:
+  model_name: /dev/shm/Kimi-K3
+  training_backend: fsdp2
+  generation_backend: hf
+  max_total_sequence_length: 2048
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  # /!\ The recipe is lr = 7.5e-5 x (bs/64), so bs=64 -> 7.5e-5.
+  # Five steps cannot reveal a convergence difference, but copying the wrong lr
+  # into a long run would repeat that 45%-efficiency failure.
+  learning_rate: 7.5e-5
+  min_lr: 7.5e-6
+  lr_decay_style: cosine
+  weight_decay: 0.0
+  # Every recorded curve used 0.5; 1.0 would change which steps get clipped.
+  max_grad_norm: 0.5
+  warmup_ratio: 0.04
+
+algorithm:
+  name: spec_distill
+  spec_distill:
+    draft_type: dspark
+    loss_type: dspark
+    sequential_mode: batch_alternating
+    # Deliberately small: 5 cached batches are enough to walk a full Phase A ->
+    # Phase B alternation. At bs=64 each cached batch is about 11.3 GB, so 5 come
+    # to roughly 57 GB, which /dev/shm can hold.
+    cache_batches: 5
+    # /tmp will not do: the container's /tmp is not the tmpfs the training
+    # process sees.
+    cache_dir: /dev/shm/teacher_cache_atom_smoke
+    grad_accum_steps: 1
+    loss_decay_gamma: 4.0
+    num_target_layers: 5
+    spec_length: 7
+    # Same as train.yaml: these five layers are the draft's feature contract and
+    # the teacher must capture the same set.
+    aux_hidden_state_layer_ids: [2, 23, 47, 71, 89]
+    capture_mode: postnorm
+    # Same as train.yaml. anchor_num is the main driver of peak memory (57.8 GiB
+    # measured at 512); smoking with 64 would hide the real run's OOM risk.
+    anchor_num: 512
+    # /!\ Must be false on ATOM (the inverse of the vLLM variant): ATOM's
+    # hidden_states already holds all 5 layers and last_hidden_states has passed
+    # the final norm. true would make fc receive 43008 instead of 35840. See the
+    # note in train.yaml.
+    separate_last_hidden: false
+    shift_input_embeds: false
+    ce_loss_alpha: 0.1
+    l1_loss_alpha: 0.9
+    confidence_loss_alpha: 1.0
+  teacher:
+    model_name: /dev/shm/Kimi-K3
+    inference_backend: atom
+    tensor_parallel_size: 8
+    gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+    quantization: ""
+    # Same as train.yaml: the teacher writes the response itself (prompt-only
+    # on-policy).
+    # /!\ This field is bound to the three dataset fields below, especially
+    # dataset.max_prompt_tokens — when that is 0, preprocessing emits no
+    # prompt_ids and the generation path raises immediately. Changing this line
+    # alone guarantees the smoke test fails.
+    generate_mode: generate
+    # Same as train.yaml. With thinking=true, gen_mean measures 546 and about 26%
+    # of rows hit the cap; hitting the cap is expected behaviour, not a fault
+    # (truncation is harmless for speculative distillation — see train.yaml).
+    # What the smoke run should confirm is that the capped fraction lands in the
+    # 20-35% range; a clear deviation means the rendering is wrong.
+    # Also as in train.yaml, this must be < max_model_len - max_prompt_tokens:
+    # filling the window exactly leaves ATOM's block table one slot short and
+    # wedges the worker. See train.yaml for the reasoning.
+    generate_max_tokens: 992
+    # Same as train.yaml: 0 = the whole round in one sweep. A smoke round is 5
+    # batches of 320 rows, which is exactly enough to exercise the merged
+    # submission path (per-batch submission never executes it).
+    generate_sweep_batches: 0
+    generate_temperature: 0.0
+    transport: mooncake
+    # ---- ATOM engine parameters, verbatim from train.yaml ----
+    # /!\ ATOM silently discards unrecognised keys; the worker adds a validation
+    # pass that raises on unknown ones.
+    atom:
+      max_model_len: 2048
+      # Same as train.yaml. This decides the decode batch shape (precisely where
+      # vLLM crashes), and a small value in smoke would skip testing KDA
+      # recurrent-state behaviour at 256-way concurrency entirely — which is the
+      # one thing this revision has not adequately validated. Reasoning and
+      # measurements are in train.yaml.
+      max_num_seqs: 256
+      # /!\ Must be >= max_model_len, or a sequence's prefill gets split across
+      # scheduler steps; hidden states are keyed on request id and later writes
+      # overwrite earlier ones, so only the last chunk survives.
+      max_num_batched_tokens: 32768
+      # /!\ Both must be false, or hidden states are silently truncated (missing
+      # the prompt span, or only the final chunk). Full reasoning in train.yaml.
+      enable_prefix_caching: false
+      enable_chunked_prefill: false
+      # Same as train.yaml, see there for why. At 0.85 the round-2 teacher
+      # restart is certain to fail.
+      # /!\ Reaching that path in smoke requires two full rounds
+      # (num_training_steps=10): the default 5 steps are a single round, the
+      # teacher starts and stops once, and the cross-round restart is never
+      # tested.
+      gpu_memory_utilization: 0.90
+      # Not fp8: the 1.8 GB per card it saves is 0.6%, while fp8 also drags the
+      # query down in precision and puts K/V through an extra quantization round
+      # trip — and the hidden states are the training labels. See train.yaml.
+      kv_cache_dtype: bf16
+      # Same as train.yaml: measured and turned off. The graph pool takes only
+      # 0.24 GB and every captured shape has max_q_len=1 (decode only, prefill
+      # stays eager), so it never touches A2's capture path. That is exactly what
+      # the smoke run must confirm: hidden-state width and effective length must
+      # not change because graphs are enabled.
+      enforce_eager: false
+  draft:
+    from_scratch: true
+    num_layers: 5
+    num_heads: 64
+    num_kv_heads: 64
+    head_dim: 128
+    ffn_dim: 14336
+    rms_norm_eps: 1.0e-5
+    rope_theta: 50000.0
+    rope_scaling_type: yarn
+    rope_scaling_factor: 32.0
+    rope_original_max_pos: 32768
+    rope_beta_fast: 32.0
+    rope_beta_slow: 1.0
+    rope_mscale: 1.0
+    rope_mscale_all_dim: 1.0
+    use_aux_hidden_state: true
+    use_input_layernorm_in_first_layer: true
+    use_last_layernorm: true
+    use_mtp_layernorm: false
+    attention_bias: false
+    mlp_bias: false
+    dtype: bfloat16
+    q_lora_rank: 1536
+    kv_lora_rank: 512
+    qk_nope_head_dim: 128
+    qk_rope_head_dim: 64
+    v_head_dim: 128
+    markov_rank: 256
+    markov_head_type: vanilla
+    enable_confidence_head: true
+    confidence_head_with_markov: true
+    mask_token_id: 163837
+    block_size: 7
+
+mooncake:
+  protocol: tcp
+  device_name: ""
+  # Same as train.yaml: at bs=64 the hidden states to move are the same size as
+  # in the real run. 16GB/4GB were sized for bs=8 and would trigger retries in
+  # the transfer layer rather than exposing the real behaviour.
+  global_segment_size: 32GB
+  local_buffer_size: 8GB
+  get_retry_max_wait_seconds: 300.0
+
+quantization:
+  training:
+    fp8: null
+    lumen_norm: true
+    lumen_linear: true
+    hf_attn_patch: true
+  rollout_correction:
+    enabled: false
+
+dataset:
+  chat_template: kimi-k3
+  last_turn_loss_only: false
+  num_preprocess_workers: 96
+  cache_dir: /dev/shm/lumenrl_cache
+  # /!\ The following three must match train.yaml, for two reasons:
+  # 1. they are part of the tokenize cache key, so a mismatch reprocesses into
+  #    **a different dataset** and the smoke run no longer validates the data the
+  #    real run will use;
+  # 2. when max_prompt_tokens is 0 no prompt_ids are emitted and generate mode
+  #    raises immediately.
+  drop_overlong: true
+  max_prompt_tokens: 1024
+  # /!\ Must be true and must match train.yaml. thinking decides whether the
+  # decode starts on the think or the response channel; false renders a different
+  # dataset under a different cache key.
+  # The smoke run should confirm the rendering while it is at it: the prompt in
+  # the log should contain <|open|>think<|sep|>.
+  thinking: true
+
+eval:
+  enabled: true
+  interval: 1
+  num_samples: 8
+  micro_batch_size: 2
+
+reward:
+  type: function
+  function: math_reward
+  # The same shuffled full dataset as train.yaml. Using phase1 would hit a
+  # different tokenize cache key, wasting a full preprocessing pass and
+  # validating something other than the real run's data distribution.
+  dataset: /dev/shm/kimi-mtp-dataset-full/train.jsonl
+
+checkpointing:
+  checkpoint_dir: /dev/shm/checkpoints/kimi_k3_dspark_atom_smoke
+  save_steps: 9999
+  save_total_limit: 1
+  resume: false
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 5
+seed: 42
