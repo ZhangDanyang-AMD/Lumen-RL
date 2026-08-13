@@ -30,7 +30,7 @@ import torch.nn.functional as F
 
 from lumenrl.core.config import LumenRLConfig
 from lumenrl.core.protocol import DataProto
-from lumenrl.trainer.callbacks import Callback, LoggingCallback
+from lumenrl.trainer.callbacks import Callback, CheckpointCallback, LoggingCallback
 
 logger = logging.getLogger(__name__)
 
@@ -58,26 +58,26 @@ class _TeacherPrefetcher:
     def _loop(self) -> None:
         teacher_cfg = self._trainer.config.algorithm.teacher
         generate_mode = getattr(teacher_cfg, "generate_mode", "prefill")
-        pad_id = self._trainer._tokenizer.pad_token_id or 0
         while True:
             step = self._req_queue.get()
             if step is _PREFETCH_SENTINEL:
                 break
             try:
-                ids, mask, loss_mask = self._trainer._get_batch_sequences(step)
                 if generate_mode == "generate":
-                    data = self._trainer._teacher_generate_and_extract_rank0(
-                        ids, mask, recv_device=torch.device("cpu"),
+                    # Prefetching interleaves decode and extraction per batch, but
+                    # those need two different engines and only one fits in VRAM, so
+                    # a per-batch swap would reload 1.5 TB of weights every step.
+                    # generate_mode belongs in batch_alternating, which sweeps all
+                    # decodes first and then all extractions.
+                    raise RuntimeError(
+                        'generate_mode="generate" needs '
+                        'sequential_mode="batch_alternating"; the streaming '
+                        "prefetch path cannot host two teacher engines."
                     )
-                    if data is not None and "input_ids" in data:
-                        gen_ids = data["input_ids"]
-                        mask = (gen_ids != pad_id).long()
-                        loss_mask = mask.clone()
-                        ids = gen_ids
-                else:
-                    data = self._trainer._teacher_inference_rank0(
-                        ids, mask, recv_device=torch.device("cpu"),
-                    )
+                ids, mask, loss_mask = self._trainer._get_batch_sequences(step)
+                data = self._trainer._teacher_inference_rank0(
+                    ids, mask, recv_device=torch.device("cpu"),
+                )
                 self._res_queue.put((data, ids, mask, loss_mask))
             except Exception as e:
                 self._res_queue.put(e)
@@ -310,6 +310,9 @@ class SpecDistillTrainer:
 
         self._teacher_model: torch.nn.Module | None = None
         self._teacher_engine: Any | None = None  # AtomTeacherEngine, SglangTeacherEngine, or VllmTeacherEngine
+        # Measured on the first successful engine start; later restarts wait
+        # for at least this much VRAM instead of failing deep inside ATOM.
+        self._teacher_gpu_bytes: int | None = None
         self._mooncake_master: Any | None = None
         self._draft_model: torch.nn.Module | None = None
         self._lm_head_weight: torch.Tensor | None = None
@@ -685,6 +688,8 @@ class SpecDistillTrainer:
         self._load_dataset()
 
         # ---- Eval cache ----
+        self._check_generate_mode_prerequisites()
+
         eval_cfg = self.config.eval
         if eval_cfg.enabled:
             self._build_eval_cache(num_samples=eval_cfg.num_samples)
@@ -704,6 +709,52 @@ class SpecDistillTrainer:
             teacher_name,
             draft_type,
         )
+
+    def _check_generate_mode_prerequisites(self) -> None:
+        """Fail fast on settings that only break in generate_mode.
+
+        The MLA decode kernel choice used to be checked here, but the generation
+        engine now pins it itself (aiter MLA on, bf16 KV) since it is the only
+        combination on this build that batches decode without faulting.
+        """
+        teacher_cfg = self.config.algorithm.teacher
+        if getattr(teacher_cfg, "generate_mode", "prefill") != "generate":
+            return
+        if teacher_cfg.inference_backend not in ("vllm", "atom"):
+            return
+
+        gen_max = getattr(teacher_cfg, "generate_max_tokens", 0)
+        max_prompt = getattr(self.config.dataset, "max_prompt_tokens", 0)
+        max_seq = int(self.config.policy.max_total_sequence_length)
+        if gen_max and max_prompt and gen_max + max_prompt > max_seq:
+            logger.warning(
+                "[rank %d] generate_max_tokens=%d + max_prompt_tokens=%d exceeds "
+                "max_total_sequence_length=%d; the longest prompts will get less "
+                "than the configured generation budget.",
+                self._rank,
+                gen_max,
+                max_prompt,
+                max_seq,
+            )
+
+        # The engine's own window is the binding one, and it needs a slot beyond
+        # the sequence: a row of exactly max_model_len asks for one block more
+        # than the block table holds, and ATOM answers that by wedging the
+        # worker rather than raising. That surfaces as a ten-minute command
+        # timeout partway through a round, so it has to be caught here instead.
+        # It also only fires when a single row both fills the prompt budget and
+        # hits the generation cap, which took nine rounds to show up once and
+        # one round the next time -- far too rare to catch in a smoke test.
+        atom_cfg = getattr(teacher_cfg, "atom", None)
+        model_len = int(getattr(atom_cfg, "max_model_len", 0) or 0)
+        if gen_max and max_prompt and model_len and gen_max + max_prompt >= model_len:
+            raise ValueError(
+                f"generate_max_tokens={gen_max} + max_prompt_tokens={max_prompt} "
+                f"= {gen_max + max_prompt} leaves no room under "
+                f"atom.max_model_len={model_len}; a decoded row can reach that "
+                f"length exactly and wedge the teacher mid-round. Lower "
+                f"generate_max_tokens or raise max_model_len."
+            )
 
     def _setup_teacher_hf(self, teacher_name: str) -> None:
         """Load teacher model via HuggingFace (original path)."""
@@ -778,6 +829,13 @@ class SpecDistillTrainer:
 
             spec_cfg = getattr(self.config.algorithm, "spec_distill", None)
             capture_mode = getattr(spec_cfg, "capture_mode", "postnorm") if spec_cfg else "postnorm"
+            # The draft model was built for these exact teacher layers, so the
+            # teacher has to capture the same list rather than a depth-derived
+            # default -- a mismatch changes the feature width silently.
+            aux_override = (
+                getattr(spec_cfg, "aux_hidden_state_layer_ids", None)
+                if spec_cfg else None
+            )
 
             self._teacher_engine = AtomTeacherEngine(
                 model_name=teacher_name,
@@ -791,8 +849,15 @@ class SpecDistillTrainer:
                 max_seq_len=max_seq,
                 local_device=self._device,
                 capture_mode=capture_mode,
+                aux_layer_ids=list(aux_override) if aux_override else None,
             )
-            self._teacher_engine.start()
+            # Come up ready for whichever sweep runs first, so the first round does
+            # not pay for a mode switch it did not need.
+            self._teacher_engine.start(
+                mode="generate"
+                if getattr(teacher_cfg, "generate_mode", "prefill") == "generate"
+                else "extract",
+            )
             self._lm_head_weight = self._teacher_engine.get_lm_head_weight()
             self._embed_weight = self._teacher_engine.get_embed_weight()
             self._norm_weight, self._norm_eps = self._teacher_engine.get_norm_weight()
@@ -1067,41 +1132,59 @@ class SpecDistillTrainer:
     ) -> dict[str, torch.Tensor]:
         """Teacher forward via vLLM+ATOM engine (rank 0 only, then broadcast).
 
-        When ``generate_mode == "generate"``, the teacher generates responses
-        from prompt-only input and captures hidden states on the full sequence.
+        This is the extraction (prefill) path. Decoding lives elsewhere: on-policy
+        callers must decode first via ``_decode_batch_all_ranks`` and then hand the
+        resulting sequences here, because one engine cannot do both.
+        """
+        rank0_data = self._teacher_inference_rank0(input_ids, attention_mask)
+        return self._teacher_broadcast(rank0_data, input_ids)
+
+    def _decode_batch_all_ranks(
+        self,
+        prompt_ids: torch.Tensor,
+        prompt_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Decode on rank 0, then broadcast the sequences to every rank.
+
+        Requires the engine in "generate" mode. Returns
+        ``(full_ids, attention_mask, loss_mask)`` identically on all ranks.
         """
         teacher_cfg = self.config.algorithm.teacher
-        generate_mode = getattr(teacher_cfg, "generate_mode", "prefill")
+        prompt_lens = prompt_mask.sum(dim=1).cpu()
 
-        if generate_mode == "generate":
-            rank0_data = self._teacher_generate_and_extract_rank0(
-                input_ids, attention_mask,
+        if self._rank == 0:
+            full_ids, seq_lens, _ = self._teacher_engine.generate_tokens(
+                prompt_ids, prompt_mask,
+                max_tokens=getattr(teacher_cfg, "generate_max_tokens", 2048),
+                temperature=getattr(teacher_cfg, "generate_temperature", 0.0),
             )
-            result = self._teacher_broadcast(rank0_data, input_ids)
-            if self._rank == 0 and rank0_data is not None:
-                gen_ids = rank0_data["input_ids"]
-            else:
-                gen_ids = None
-            if self._is_distributed:
-                if self._rank == 0:
-                    gen_ids = gen_ids.to(self._device)
-                    gen_shape = torch.tensor(
-                        list(gen_ids.shape), dtype=torch.long, device=self._device,
-                    )
-                else:
-                    gen_shape = torch.zeros(2, dtype=torch.long, device=self._device)
-                torch.distributed.broadcast(gen_shape, src=0)
-                if self._rank != 0:
-                    gen_ids = torch.zeros(
-                        gen_shape[0].item(), gen_shape[1].item(),
-                        dtype=torch.long, device=self._device,
-                    )
-                torch.distributed.broadcast(gen_ids, src=0)
-            result["input_ids"] = gen_ids
-            return result
+            full_ids = full_ids.to(self._device)
+            seq_lens = seq_lens.to(self._device)
         else:
-            rank0_data = self._teacher_inference_rank0(input_ids, attention_mask)
-            return self._teacher_broadcast(rank0_data, input_ids)
+            full_ids = None
+            seq_lens = None
+
+        if self._is_distributed:
+            if self._rank == 0:
+                shape = torch.tensor(
+                    list(full_ids.shape), dtype=torch.long, device=self._device,
+                )
+            else:
+                shape = torch.zeros(2, dtype=torch.long, device=self._device)
+            torch.distributed.broadcast(shape, src=0)
+            B, T = int(shape[0].item()), int(shape[1].item())
+            if self._rank != 0:
+                full_ids = torch.zeros(B, T, dtype=torch.long, device=self._device)
+                # Rows are padded with token id 0, a real id in K3's vocabulary, so
+                # the lengths cannot be recovered from full_ids and must be sent.
+                seq_lens = torch.zeros(B, dtype=torch.long, device=self._device)
+            torch.distributed.broadcast(full_ids, src=0)
+            torch.distributed.broadcast(seq_lens, src=0)
+
+        attn, loss_mask = self._build_generated_masks(
+            seq_lens.cpu(), prompt_lens, full_ids.shape[1],
+        )
+        return full_ids, attn, loss_mask
 
     def _broadcast_batch_info(
         self, input_ids: torch.Tensor | None,
@@ -1188,6 +1271,9 @@ class SpecDistillTrainer:
                 num_workers=ds_cfg.num_preprocess_workers,
                 cache_dir=ds_cfg.cache_dir,
                 dataset_split=dataset_split,
+                drop_overlong=getattr(ds_cfg, "drop_overlong", False),
+                max_prompt_tokens=getattr(ds_cfg, "max_prompt_tokens", 0),
+                thinking=getattr(ds_cfg, "thinking", True),
             )
             self._dataset = None
             logger.info(
@@ -1278,6 +1364,14 @@ class SpecDistillTrainer:
         self.global_step = resumed_step
         logger.info("[rank %d] Checkpoint payload keys: %s", self._rank, list(payload.keys()))
 
+        # Restore on CPU. The teacher is already resident by the time setup gets
+        # here, and it plus the draft and its optimizer come to within a few
+        # hundred MiB of the 288 GiB card -- loading Adam's moments onto the GPU
+        # (which torch does by following each parameter's device) OOMs. Phase A
+        # runs with all of this offloaded anyway, and _batch_alternating_train
+        # offloads again before its first round, so CPU is where these belong.
+        self._offload_draft_to_cpu()
+
         sd = payload.get("model_state_dict")
         if sd and self._draft_model is not None:
             info = self._draft_model.load_state_dict(sd, strict=False)
@@ -1336,11 +1430,31 @@ class SpecDistillTrainer:
             num_samples = min(num_samples, ds_len)
             start_idx = ds_len - num_samples
             max_len = self.config.policy.max_total_sequence_length
-            pad_id = self._tokenizer.pad_token_id or 0
+            generate_mode = getattr(
+                self.config.algorithm.teacher, "generate_mode", "prefill"
+            )
 
             cache: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
             for idx in range(start_idx, ds_len):
                 item = self._preprocessed[idx]
+                if generate_mode == "generate":
+                    # Eval on the teacher's own greedy output, matching what the
+                    # draft will face at serving time. The stored answer is unused.
+                    ids = item.get("prompt_ids")
+                    if ids is None:
+                        raise RuntimeError(
+                            'generate_mode="generate" requires '
+                            "dataset.max_prompt_tokens > 0 so prompt_ids exist."
+                        )
+                    if isinstance(ids, list):
+                        ids = torch.tensor(ids, dtype=torch.long)
+                    attn = torch.ones(len(ids), dtype=torch.long)
+                    # Placeholder: the real loss mask is only knowable once the
+                    # response exists, and is rebuilt in _build_eval_teacher_cache.
+                    lm = torch.zeros(len(ids), dtype=torch.long)
+                    cache.append((ids.unsqueeze(0), attn.unsqueeze(0), lm.unsqueeze(0)))
+                    continue
+
                 ids = item["input_ids"]
                 if isinstance(ids, list):
                     ids = torch.tensor(ids, dtype=torch.long)
@@ -1436,6 +1550,30 @@ class SpecDistillTrainer:
             self._rank, len(cache), start_idx, ds_len - 1,
         )
 
+    def _pad_eval_micro_batch(
+        self,
+        ids_list: list[torch.Tensor],
+        mask_list: list[torch.Tensor],
+        lm_list: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Right-pad a group of single-row eval samples into one batch."""
+        max_len = max(ids.shape[1] for ids in ids_list)
+        padded_ids, padded_masks, padded_lm = [], [], []
+        for ids, mask, lm in zip(ids_list, mask_list, lm_list):
+            pad_len = max_len - ids.shape[1]
+            if pad_len > 0:
+                ids = F.pad(ids, (0, pad_len), value=self._tokenizer.pad_token_id)
+                mask = F.pad(mask, (0, pad_len), value=0)
+                lm = F.pad(lm, (0, pad_len), value=0)
+            padded_ids.append(ids)
+            padded_masks.append(mask)
+            padded_lm.append(lm)
+        return (
+            torch.cat(padded_ids, dim=0),
+            torch.cat(padded_masks, dim=0),
+            torch.cat(padded_lm, dim=0),
+        )
+
     def _build_eval_teacher_cache(self) -> None:
         """Pre-compute teacher outputs for all eval micro-batches at startup.
 
@@ -1448,42 +1586,76 @@ class SpecDistillTrainer:
 
         eval_cfg = self.config.eval
         mb_size = eval_cfg.micro_batch_size
+        generate_mode = getattr(
+            self.config.algorithm.teacher, "generate_mode", "prefill"
+        )
         all_ids = [c[0] for c in self._eval_cache]
         all_masks = [c[1] for c in self._eval_cache]
         all_lm = [c[2] for c in self._eval_cache]
 
+        # Same two-sweep shape as Phase A: decode every eval micro-batch first, then
+        # extract. Interleaving would swap engines per micro-batch, reloading 1.5 TB
+        # of weights each time.
+        decoded: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        if generate_mode == "generate":
+            # Every engine start re-profiles free VRAM to size its KV cache, and by
+            # this point the draft plus its optimizer state hold tens of GiB per
+            # GPU -- enough to drive that budget negative and abort the engine with
+            # "No available memory for the cache blocks". Phase A offloads before
+            # its own restarts for exactly this reason.
+            self._offload_draft_to_cpu()
+            self._restart_teacher_engine("generate")
+            if self._is_distributed:
+                torch.distributed.barrier()
+            # Decode every eval prompt in one sweep and split afterwards.
+            # ``micro_batch_size`` sizes the teacher *forward* below, where
+            # activations bound the batch; a decode sweep has no such limit, and
+            # honouring it here would run one sweep per two rows, each waiting
+            # out its slowest sequence with the engine near-idle.
+            prompts, prompt_masks, _ = self._pad_eval_micro_batch(
+                all_ids, all_masks, all_lm,
+            )
+            full_ids, attn, loss_mask = self._decode_batch_all_ranks(
+                prompts.to(self._device), prompt_masks.to(self._device),
+            )
+            for mb_start in range(0, len(all_ids), mb_size):
+                rows = slice(mb_start, min(mb_start + mb_size, len(all_ids)))
+                width = int(attn[rows].sum(dim=1).max())
+                decoded.append((
+                    full_ids[rows, :width],
+                    attn[rows, :width],
+                    loss_mask[rows, :width],
+                ))
+            self._restart_teacher_engine("extract")
+            if self._is_distributed:
+                torch.distributed.barrier()
+
         cache: list[dict[str, torch.Tensor]] = []
-        for mb_start in range(0, len(all_ids), mb_size):
+        for mb_idx, mb_start in enumerate(range(0, len(all_ids), mb_size)):
             mb_end = min(mb_start + mb_size, len(all_ids))
-            mb_ids_list = all_ids[mb_start:mb_end]
-            mb_masks_list = all_masks[mb_start:mb_end]
-            mb_lm_list = all_lm[mb_start:mb_end]
 
-            max_len = max(ids.shape[1] for ids in mb_ids_list)
-            padded_ids = []
-            padded_masks = []
-            padded_lm = []
-            for ids, mask, lm in zip(mb_ids_list, mb_masks_list, mb_lm_list):
-                pad_len = max_len - ids.shape[1]
-                if pad_len > 0:
-                    ids = F.pad(ids, (0, pad_len), value=self._tokenizer.pad_token_id)
-                    mask = F.pad(mask, (0, pad_len), value=0)
-                    lm = F.pad(lm, (0, pad_len), value=0)
-                padded_ids.append(ids)
-                padded_masks.append(mask)
-                padded_lm.append(lm)
-
-            input_ids = torch.cat(padded_ids, dim=0)
-            attention_mask = torch.cat(padded_masks, dim=0)
-            eval_loss_mask = torch.cat(padded_lm, dim=0)
+            if generate_mode == "generate":
+                # Sequences and masks both come from the decode sweep: the stored
+                # answer's loss mask describes text the teacher never produced.
+                input_ids, attention_mask, eval_loss_mask = decoded[mb_idx]
+                input_ids = input_ids.cpu()
+            else:
+                input_ids, attention_mask, eval_loss_mask = (
+                    self._pad_eval_micro_batch(
+                        all_ids[mb_start:mb_end], all_masks[mb_start:mb_end],
+                        all_lm[mb_start:mb_end],
+                    )
+                )
 
             teacher_data = self._teacher_forward(
                 input_ids.to(self._device), attention_mask.to(self._device),
             )
 
+            gen_ids = teacher_data["input_ids"].cpu()
+
             cache.append({
                 "hidden_states": teacher_data["hidden_states"].cpu(),
-                "input_ids": teacher_data["input_ids"].cpu(),
+                "input_ids": gen_ids,
                 "last_hidden_states": teacher_data.get("last_hidden_states", torch.tensor([])).cpu(),
                 "attention_mask": attention_mask,
                 "loss_mask": eval_loss_mask,
@@ -1491,6 +1663,18 @@ class SpecDistillTrainer:
             del teacher_data
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+        batch_alternating = getattr(
+            self.config.algorithm.spec_distill, "sequential_mode", None,
+        ) == "batch_alternating"
+        if generate_mode == "generate" and not batch_alternating:
+            # batch_alternating offloads again before its first round, so this
+            # restore would be undone immediately -- and on a resumed run it
+            # cannot even be paid for: Adam's moments add ~19 GiB on top of a
+            # teacher that is still fully resident, which is an OOM. On a fresh
+            # run it happens to fit only because the moments do not exist until
+            # the first optimizer step.
+            self._load_draft_to_gpu()
 
         self._eval_teacher_cache = cache
         logger.info(
@@ -1810,6 +1994,375 @@ class SpecDistillTrainer:
         return input_ids, attention_mask, attention_mask.clone()
 
     # ------------------------------------------------------------------
+    # On-policy generation helpers
+    # ------------------------------------------------------------------
+
+    def _get_batch_prompts(
+        self, step: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Batch of generation prompts for ``generate_mode="generate"``.
+
+        Returns ``(prompt_ids, attention_mask, prompt_lens)``. The prompt is the
+        conversation up to the last assistant turn plus K3's generation prompt,
+        precomputed at tokenize time; the teacher writes the response itself, so
+        the stored reference answer is never shown to it.
+
+        Requires ``dataset.max_prompt_tokens > 0`` so preprocessing emitted the
+        ``prompt_ids`` field.
+        """
+        if self._preprocessed is None:
+            raise RuntimeError(
+                'generate_mode="generate" needs a preprocessed dataset '
+                "(dataset.chat_template must be set)."
+            )
+
+        bs = max(1, self.config.policy.train_global_batch_size)
+        ds_len = len(self._preprocessed)
+        start = (step * bs) % ds_len
+        indices = [(start + i) % ds_len for i in range(bs)]
+
+        batch: list[torch.Tensor] = []
+        for idx in indices:
+            item = self._preprocessed[idx]
+            ids = item.get("prompt_ids")
+            if ids is None:
+                raise RuntimeError(
+                    'generate_mode="generate" requires dataset.max_prompt_tokens > 0 '
+                    "so that prompt_ids are precomputed; the cached dataset has none. "
+                    "Set it and let the tokenize cache rebuild."
+                )
+            if isinstance(ids, list):
+                ids = torch.tensor(ids, dtype=torch.long)
+            batch.append(ids)
+
+        pad_id = self._tokenizer.pad_token_id or 0
+        max_prompt = max(len(t) for t in batch)
+        padded, masks = [], []
+        for ids in batch:
+            pad_len = max_prompt - len(ids)
+            attn = torch.cat([
+                torch.ones(len(ids), dtype=torch.long),
+                torch.zeros(pad_len, dtype=torch.long),
+            ])
+            if pad_len > 0:
+                ids = torch.cat([ids, torch.full((pad_len,), pad_id, dtype=torch.long)])
+            padded.append(ids.unsqueeze(0))
+            masks.append(attn.unsqueeze(0))
+
+        prompt_lens = torch.tensor([len(t) for t in batch], dtype=torch.long)
+        return torch.cat(padded, dim=0), torch.cat(masks, dim=0), prompt_lens
+
+    @staticmethod
+    def _build_generated_masks(
+        seq_lens: torch.Tensor,
+        prompt_lens: torch.Tensor,
+        total_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Attention and loss masks for teacher-generated sequences.
+
+        ``seq_lens`` is prompt+response per row as returned by the engine, which
+        pads rows with token id 0 — a real id in K3's vocabulary, so the masks
+        cannot be recovered by comparing against ``pad_token_id``.
+
+        Loss covers the generated span only: the prompt is context the draft is
+        conditioned on, not a prediction target.
+        """
+        positions = torch.arange(total_len, dtype=torch.long).unsqueeze(0)
+        lens = seq_lens.view(-1, 1)
+        starts = prompt_lens.view(-1, 1).clamp(max=total_len)
+        attention_mask = (positions < lens).long()
+        loss_mask = ((positions >= starts) & (positions < lens)).long()
+        return attention_mask, loss_mask
+
+    def _restart_teacher_engine(self, mode: str) -> None:
+        """Bring the teacher engine up in ``mode``, replacing whatever is running.
+
+        Backends that can retarget a live engine (ATOM, whose hidden-state capture
+        rides on forward hooks and so is independent of decoding) do it in place.
+        For vLLM the two sweeps need different engine configs and only one fits in
+        VRAM, so switching means a full weight reload -- ~2-3 min for K3's 96
+        shards, paid twice per on-policy round.
+        """
+        if self._teacher_engine is None:
+            return
+        if self._teacher_engine.is_alive:
+            if self._teacher_engine.mode == mode:
+                return
+            if hasattr(self._teacher_engine, "switch_mode"):
+                self._teacher_engine.switch_mode(mode)
+                return
+            self._teacher_engine.shutdown()
+        self._reclaim_gpu_memory()
+        self._await_teacher_gpu_budget()
+        self._log_gpu_memory(f"before teacher start ({mode})")
+        free_before = (
+            torch.cuda.mem_get_info()[0] if torch.cuda.is_available() else 0
+        )
+        self._teacher_engine.start(mode=mode)
+        if torch.cuda.is_available() and self._teacher_gpu_bytes is None:
+            self._teacher_gpu_bytes = max(
+                0, free_before - torch.cuda.mem_get_info()[0]
+            )
+            logger.info(
+                "[rank %d] Teacher engine footprint measured at %.1f GiB; "
+                "later restarts will wait for that much to be free",
+                self._rank, self._teacher_gpu_bytes / 1024 ** 3,
+            )
+
+    # A killed worker's pages come back asynchronously -- observed at up to
+    # ~45 s on this node -- so a restart that arrives too early sees a short
+    # card through no fault of its own.
+    _TEACHER_MEMORY_WAIT_SECONDS = 180.0
+    _TEACHER_MEMORY_POLL_SECONDS = 5.0
+    # ATOM sizes its KV cache from what is free at startup, so it needs the
+    # headroom it had last time plus a little slack for allocation order.
+    _TEACHER_MEMORY_MARGIN_BYTES = 4 * 1024 ** 3
+
+    def _await_teacher_gpu_budget(self) -> None:
+        """Block until the driver has really given the teacher's VRAM back.
+
+        Releasing GPU memory is asynchronous, so the shortfall a restart sees
+        is sometimes only a race with the dead worker's cleanup. Polling turns
+        that into a wait. When the memory is genuinely gone the wait expires
+        and this says so with the numbers, which is the point: ATOM reports
+        the same shortfall as ``'LumenRLModelRunner' object has no attribute
+        'model'`` from inside its startup path, and tracing that back to VRAM
+        accounting cost the better part of a day.
+        """
+        if not torch.cuda.is_available() or self._teacher_gpu_bytes is None:
+            return
+        gib = 1024 ** 3
+        needed = self._teacher_gpu_bytes + self._TEACHER_MEMORY_MARGIN_BYTES
+        free = torch.cuda.mem_get_info()[0]
+        if free >= needed:
+            return
+
+        logger.warning(
+            "[rank %d] Only %.1f GiB free but the teacher needs %.1f GiB; "
+            "waiting up to %.0fs for the driver to reclaim it.",
+            self._rank, free / gib, needed / gib,
+            self._TEACHER_MEMORY_WAIT_SECONDS,
+        )
+        deadline = time.time() + self._TEACHER_MEMORY_WAIT_SECONDS
+        while time.time() < deadline:
+            time.sleep(self._TEACHER_MEMORY_POLL_SECONDS)
+            self._reclaim_gpu_memory()
+            free = torch.cuda.mem_get_info()[0]
+            if free >= needed:
+                logger.info(
+                    "[rank %d] Reclaim completed: %.1f GiB free, starting the "
+                    "teacher.", self._rank, free / gib,
+                )
+                return
+
+        self._log_gpu_memory("teacher start blocked")
+        raise RuntimeError(
+            f"Teacher engine cannot restart: {free / gib:.1f} GiB free on this "
+            f"device but it needs {needed / gib:.1f} GiB, and no more was "
+            f"reclaimed in {self._TEACHER_MEMORY_WAIT_SECONDS:.0f}s. Torch "
+            f"holds {torch.cuda.memory_reserved() / gib:.1f} GiB of that. When "
+            f"torch's share is small the rest is held outside the allocator -- "
+            f"check PYTORCH_CUDA_ALLOC_CONF and any teacher process that "
+            f"outlived its shutdown."
+        )
+
+    def _teacher_extract_with_retry(
+        self, ids, mask, round_idx: int, batch_idx: int, attempts: int = 3,
+    ):
+        """Extract one batch, replacing the teacher if it stops responding.
+
+        When the worker wedges it stops answering entirely, including shutdown,
+        so the command timeout is the only signal and the worker's own log is
+        the only evidence -- which is why the tail is dumped here before the
+        restart truncates it. That dump is what identified the one hang seen so
+        far as a block-table overflow, now prevented in
+        _check_generate_mode_prerequisites.
+
+        Note that a replay only helps a hang that is not a property of the
+        batch: the overflow above failed identically on all three attempts.
+        Retrying is safe either way, since extraction carries no state across
+        batches -- hidden states are keyed per request and the Mooncake master
+        outlives the engine.
+
+        Non-zero ranks sit at the Phase A barrier throughout. That barrier
+        already tolerates the ~29 min rank 0 spends here and its budget is
+        7200 s, which covers the retries with room to spare.
+        """
+        for attempt in range(1, attempts + 1):
+            try:
+                return self._teacher_inference_rank0(
+                    ids, mask, recv_device=torch.device("cpu"),
+                )
+            except TimeoutError as exc:
+                if attempt == attempts:
+                    raise
+                logger.error(
+                    "[rank %d] Round %d batch %d: teacher stopped responding "
+                    "(%s); restarting it and retrying (attempt %d/%d).\n"
+                    "--- worker log (last 50 lines) ---\n%s\n--- end worker log ---",
+                    self._rank, round_idx, batch_idx, exc, attempt, attempts,
+                    getattr(
+                        self._teacher_engine, "worker_log_tail", lambda: "",
+                    )(),
+                )
+                self._teacher_engine.shutdown()
+                self._reclaim_gpu_memory()
+                self._teacher_engine.start(mode="extract")
+
+    def _sanitize_token_ids(
+        self,
+        input_ids: torch.Tensor,
+        vocab_size: int,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Neutralise out-of-range ids before they reach the embedding gather.
+
+        An out-of-range index makes the gather read outside the table, which on
+        this stack does not raise: the queue aborts with
+        HSA_STATUS_ERROR_EXCEPTION and takes the rank down with SIGABRT, no
+        Python frame and nothing naming the batch. That is how one round in
+        twenty-six died, and the log said only that much.
+
+        Where the id sits decides whether it matters. The ids reaching Phase B
+        are not the ones Phase A sent: they are read back per row from Mooncake
+        and padded to a common width, so a stray value in the padding is outside
+        every mask and contributes nothing -- replacing it is exact, not a
+        patch. A stray value at a position the masks call real is corrupted
+        training data and must not be papered over, so that still raises, with
+        enough detail to identify the row.
+        """
+        bad = (input_ids < 0) | (input_ids >= vocab_size)
+        if not bool(bad.any()):
+            return input_ids
+
+        real_bad = bad & attention_mask.to(bad.device).bool()
+        rows, cols = torch.nonzero(bad, as_tuple=True)
+        lengths = attention_mask.to(bad.device).sum(dim=1)
+        sample = [
+            (int(r), int(c), int(input_ids[r, c]), int(lengths[r]))
+            for r, c in list(zip(rows.tolist(), cols.tolist()))[:5]
+        ]
+        if bool(real_bad.any()):
+            raise ValueError(
+                f"[rank {self._rank}] {int(real_bad.sum())} token id(s) out of "
+                f"range at unmasked positions (vocab_size={vocab_size}, "
+                f"width={input_ids.shape[1]}); first offenders as "
+                f"(row, col, id, row_len): {sample}. This is corrupted training "
+                f"data, not padding."
+            )
+        logger.warning(
+            "[rank %d] %d out-of-range token id(s) in padding only "
+            "(vocab_size=%d, width=%d); first offenders as "
+            "(row, col, id, row_len): %s. Replacing with 0 -- these positions "
+            "are masked out of the loss, so the substitution changes nothing.",
+            self._rank, int(bad.sum()), vocab_size, input_ids.shape[1], sample,
+        )
+        return input_ids.masked_fill(bad, 0)
+
+    @staticmethod
+    def _reclaim_gpu_memory() -> None:
+        """Return as much of this process's GPU memory to the driver as possible.
+
+        Order matters and used to be wrong here: ``empty_cache`` only releases
+        blocks the allocator already considers free, so collecting *after* it
+        leaves everything the collector just dropped sitting in the pool. The
+        teacher sizes its KV cache from whatever is free when it starts, so those
+        bytes come straight out of its budget.
+        """
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _log_gpu_memory(self, when: str) -> None:
+        """Record what this rank is still holding, and what the device has left.
+
+        The teacher's KV budget is whatever the trainer does not hold, so a
+        failure to allocate it is really a statement about this process. Without
+        these numbers the only evidence is ATOM's "exceeds available KV budget",
+        which reports the shortfall but not who caused it.
+        """
+        if not torch.cuda.is_available():
+            return
+        free, total = torch.cuda.mem_get_info()
+        gib = 1024 ** 3
+        allocated = torch.cuda.memory_allocated()
+        logger.info(
+            "[rank %d] GPU memory %s: free=%.1f/%.1f GiB | "
+            "torch allocated=%.1f reserved=%.1f GiB",
+            self._rank, when, free / gib, total / gib,
+            allocated / gib, torch.cuda.memory_reserved() / gib,
+        )
+        if allocated < gib:
+            return
+        # Anything still resident after an offload is a leak against the
+        # teacher's KV budget, and "allocated" alone does not say what it is.
+        sizes: dict[str, list[int]] = {}
+        for obj in gc.get_objects():
+            try:
+                if not torch.is_tensor(obj) or not obj.is_cuda:
+                    continue
+                nbytes = obj.untyped_storage().nbytes()
+            except Exception:
+                continue
+            key = f"{tuple(obj.shape)}x{obj.dtype}"
+            sizes.setdefault(key, []).append(nbytes)
+        top = sorted(sizes.items(), key=lambda kv: -sum(kv[1]))[:6]
+        for key, nbytes in top:
+            logger.info(
+                "[rank %d]   live cuda tensor %s: %d x %.2f GiB",
+                self._rank, key, len(nbytes), sum(nbytes) / gib,
+            )
+
+    def _teacher_generate_sweep_rank0(
+        self, steps: list[int],
+    ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Decode several batches in one sweep, then split the rows back apart.
+
+        A sweep ends only when its slowest sequence does. With one batch in
+        flight the engine spends the tail of every sweep decoding a handful of
+        rows at close to the cost of a full slate -- the weight traffic of a
+        decode step barely shrinks as slots empty. Submitting several batches
+        together lets the scheduler refill a finished slot from the next batch
+        instead of waiting the tail out.
+
+        This changes only how many requests are in flight. The batches were
+        always independent and were already buffered until the whole round
+        finished, so the sequences handed to the extraction sweep are the same
+        ones, in the same order.
+        """
+        teacher_cfg = self.config.algorithm.teacher
+        per_step = [self._get_batch_prompts(s) for s in steps]
+
+        # One sweep needs one prompt width; each batch is trimmed back to its
+        # own after decoding so a long prompt here cannot widen the rest.
+        width = max(p.shape[1] for p, _, _ in per_step)
+        prompt_ids = torch.cat(
+            [F.pad(p, (0, width - p.shape[1])) for p, _, _ in per_step]
+        )
+        prompt_mask = torch.cat(
+            [F.pad(m, (0, width - m.shape[1])) for _, m, _ in per_step]
+        )
+
+        full_ids, seq_lens, prompt_lens = self._teacher_engine.generate_tokens(
+            prompt_ids, prompt_mask,
+            max_tokens=getattr(teacher_cfg, "generate_max_tokens", 2048),
+            temperature=getattr(teacher_cfg, "generate_temperature", 0.0),
+        )
+
+        out: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        offset = 0
+        for prompts, _, _ in per_step:
+            rows = slice(offset, offset + prompts.shape[0])
+            lens = seq_lens[rows]
+            total_len = int(lens.max())
+            attn, loss_mask = self._build_generated_masks(
+                lens, prompt_lens[rows], total_len,
+            )
+            out.append((full_ids[rows, :total_len].contiguous(), attn, loss_mask))
+            offset += prompts.shape[0]
+        return out
+
+    # ------------------------------------------------------------------
     # Teacher forward
     # ------------------------------------------------------------------
 
@@ -1843,59 +2396,21 @@ class SpecDistillTrainer:
         Returns 3 aux hidden states [B,T,3*D], token_embeds [B,T,D],
         last_hidden_states [B,T,D] — same format as vLLM path.
 
-        When ``generate_mode == "generate"``, the teacher generates responses
-        from prompt-only input and captures hidden states during generation.
+        Extraction only. Under ``generate_mode="generate"`` the caller has already
+        decoded the sequences in a separate sweep and passes them in here; the
+        sglang backend has no decode sweep at all.
         """
         teacher_cfg = self.config.algorithm.teacher
-        generate_mode = getattr(teacher_cfg, "generate_mode", "prefill")
-
-        if generate_mode == "generate":
-            rank0_data = self._teacher_generate_and_extract_rank0(
-                input_ids, attention_mask,
+        if (
+            getattr(teacher_cfg, "generate_mode", "prefill") == "generate"
+            and teacher_cfg.inference_backend not in ("vllm", "atom")
+        ):
+            raise RuntimeError(
+                'generate_mode="generate" needs inference_backend "vllm" or '
+                f'"atom", not "{teacher_cfg.inference_backend}".'
             )
-            result = self._teacher_broadcast(rank0_data, input_ids)
-            if self._rank == 0 and rank0_data is not None:
-                gen_ids = rank0_data["input_ids"]
-            else:
-                gen_ids = None
-            if self._is_distributed:
-                if self._rank == 0:
-                    gen_ids = gen_ids.to(self._device)
-                    gen_shape = torch.tensor(
-                        list(gen_ids.shape), dtype=torch.long, device=self._device,
-                    )
-                else:
-                    gen_shape = torch.zeros(2, dtype=torch.long, device=self._device)
-                torch.distributed.broadcast(gen_shape, src=0)
-                if self._rank != 0:
-                    gen_ids = torch.zeros(
-                        gen_shape[0].item(), gen_shape[1].item(),
-                        dtype=torch.long, device=self._device,
-                    )
-                torch.distributed.broadcast(gen_ids, src=0)
-            result["input_ids"] = gen_ids
-            return result
-        else:
-            rank0_data = self._teacher_inference_rank0(input_ids, attention_mask)
-            return self._teacher_broadcast(rank0_data, input_ids)
-
-    def _teacher_generate_and_extract_rank0(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        recv_device: torch.device | None = None,
-    ) -> dict[str, torch.Tensor] | None:
-        """Generate + extract hidden states on rank 0 (generate mode)."""
-        if self._rank != 0:
-            return None
-        teacher_cfg = self.config.algorithm.teacher
-        max_tokens = getattr(teacher_cfg, "generate_max_tokens", 2048)
-        temperature = getattr(teacher_cfg, "generate_temperature", 0.0)
-        return self._teacher_engine.generate_and_extract_hidden_states(
-            input_ids, attention_mask,
-            max_tokens=max_tokens, temperature=temperature,
-            recv_device=recv_device,
-        )
+        rank0_data = self._teacher_inference_rank0(input_ids, attention_mask)
+        return self._teacher_broadcast(rank0_data, input_ids)
 
     def _teacher_forward_hf(
         self,
@@ -2196,6 +2711,9 @@ class SpecDistillTrainer:
         lm_head_w = self._lm_head_w_gpu
         embed_w = self._embed_w_gpu
 
+        input_ids = self._sanitize_token_ids(
+            input_ids, embed_w.shape[0], attention_mask,
+        )
         token_embeds = F.embedding(input_ids, embed_w)
 
         if loss_mask is not None:
@@ -2318,6 +2836,30 @@ class SpecDistillTrainer:
             shutil.rmtree(round_dir, ignore_errors=True)
             logger.info("[rank %d] Cleaned up cache: %s", self._rank, round_dir)
 
+    def _purge_stale_round_caches(self, cache_dir: str) -> None:
+        """Drop round caches orphaned by a previous process.
+
+        Phase B deletes each round's cache once it has consumed it, but a crash
+        mid-round leaves roughly 500 GB of it behind in tmpfs. Round indices
+        restart from zero on every resume, so any round directory present before
+        the first round runs belongs to a dead process. Left alone they stack up
+        until /dev/shm is full and the next Phase A dies writing hidden states —
+        which, with the container set to restart on failure, is a loop rather
+        than a single crash.
+        """
+        import shutil
+        if not os.path.isdir(cache_dir):
+            return
+        for name in sorted(os.listdir(cache_dir)):
+            stale = os.path.join(cache_dir, name)
+            if not name.startswith("round_") or not os.path.isdir(stale):
+                continue
+            shutil.rmtree(stale, ignore_errors=True)
+            logger.warning(
+                "[rank %d] Purged stale round cache left by an earlier run: %s",
+                self._rank, stale,
+            )
+
     def _move_draft_storage(self, device) -> None:
         """Move draft model tensors in-place, preserving Parameter object identity.
 
@@ -2325,13 +2867,28 @@ class SpecDistillTrainer:
         replicate's DDP Reducer and BF16Optimizer.model_params references
         remain valid across CPU/GPU moves.
         """
+        to_cpu = torch.device(device).type == "cpu"
         for param in self._draft_model.parameters(recurse=True):
             param.data = param.data.to(device)
             if param.grad is not None:
-                param.grad.data = param.grad.data.to(device)
+                # Going to CPU, the gradient is dead weight: the optimizer keeps
+                # its own fp32 copy and the next backward reallocates this one.
+                # Copying it across only to hold the reference would keep the
+                # allocator segment alive on the GPU side of the move.
+                param.grad = None if to_cpu else param.grad.data.to(device)
         for buf in self._draft_model.buffers(recurse=True):
             if buf is not None:
                 buf.data = buf.data.to(device)
+        # Caches kept as plain attributes rather than registered buffers are
+        # invisible to .buffers() and so used to survive the offload on the GPU.
+        # The rotary tables are the expensive case: sized by the draft's
+        # max_position_embeddings (1M) rather than by max_model_len, they hold
+        # ~5 GiB that comes straight out of the teacher's KV budget when it
+        # restarts for the next round.
+        for module in self._draft_model.modules():
+            for name, value in list(vars(module).items()):
+                if torch.is_tensor(value) and value.device.type != torch.device(device).type:
+                    setattr(module, name, value.to(device))
 
     def _offload_draft_to_cpu(self) -> None:
         """Move draft model and optimizer state to CPU, free GPU memory."""
@@ -2347,10 +2904,9 @@ class SpecDistillTrainer:
                     state[k] = v.cpu()
         self._lm_head_w_gpu = None
         self._embed_w_gpu = None
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
+        self._reclaim_gpu_memory()
         logger.info("[rank %d] Draft model offloaded to CPU", self._rank)
+        self._log_gpu_memory("after draft offload")
 
     def _load_draft_to_gpu(self) -> None:
         """Move draft model and optimizer state back to GPU."""
@@ -2390,12 +2946,43 @@ class SpecDistillTrainer:
             if i % world_size == self._rank
         ]
 
+    @staticmethod
+    def _assert_allocator_returns_memory() -> None:
+        """Refuse to run batch-alternating training under expandable_segments.
+
+        This loop hands the card back and forth between this process and the
+        teacher worker, so the only number that matters between rounds is what
+        the *driver* calls free -- the teacher is a separate process and cannot
+        borrow from torch's pool. Expandable segments break that: torch unmaps
+        its pool and reports ~5 GiB reserved while the driver still counts the
+        whole virtual reservation, which after a Phase B is ~113 GiB of the
+        288 GiB card. The teacher needs ~253 GiB, so every single round
+        transition fails.
+
+        It is a hard error rather than a warning because the run looks healthy
+        in between: each round trains its 50 steps, and the failure lands in
+        ATOM's startup path as a missing attribute on the model runner, with
+        nothing pointing back at the allocator.
+        """
+        conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+        if "expandable_segments:true" not in conf.lower().replace(" ", ""):
+            return
+        raise RuntimeError(
+            "PYTORCH_CUDA_ALLOC_CONF requests expandable_segments, which is "
+            "incompatible with batch-alternating training: memory freed by "
+            "this process stays reserved from the driver's point of view, so "
+            "the teacher engine cannot be restarted for the next Phase A. "
+            f"Unset it and relaunch (current value: {conf!r})."
+        )
+
     def _batch_alternating_train(self) -> None:
         """Batch-alternating training loop for K3-class models requiring TP=full_node.
 
         Phase A (rank 0): vLLM teacher prefill → write hidden states to disk cache
         Phase B (all ranks): Load draft to GPU → train on cached batches → offload draft
         """
+        self._assert_allocator_returns_memory()
+
         if self._rank == 0:
             for cb in self.callbacks:
                 cb.on_train_begin(self)
@@ -2422,6 +3009,12 @@ class SpecDistillTrainer:
         # Offload draft before entering Phase A loop
         self._offload_draft_to_cpu()
 
+        # Phase A writes the cache from rank 0 only, so rank 0 owns the cleanup.
+        # Phase B is fenced behind a barrier, so no rank can read a round while
+        # it is being purged.
+        if self._rank == 0:
+            self._purge_stale_round_caches(cache_dir)
+
         cumulative_opt_steps = 0
 
         for round_idx in range(num_rounds):
@@ -2445,25 +3038,51 @@ class SpecDistillTrainer:
 
                 teacher_cfg = self.config.algorithm.teacher
                 generate_mode = getattr(teacher_cfg, "generate_mode", "prefill")
-                pad_id = self._tokenizer.pad_token_id or 0
+
+                # On-policy rounds split Phase A into two sweeps, because decoding
+                # and hidden-state extraction cannot share one vLLM engine: the
+                # extract_hidden_states speculative config faults the GPU as soon as
+                # real decoding happens (see engine_mode in vllm_teacher_engine).
+                # A1 decodes every batch of the round with a plain engine; A2 replays
+                # those sequences through the extractor. Keeping the ids in between is
+                # cheap -- 50 x 64 x ~700 int64 is about 22 MB.
+                pregenerated: list[
+                    tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+                ] = []
+                if generate_mode == "generate":
+                    self._restart_teacher_engine("generate")
+                    t_gen = time.time()
+                    per_sweep = getattr(
+                        teacher_cfg, "generate_sweep_batches", 0
+                    ) or round_num_batches
+                    for sweep_start in range(0, round_num_batches, per_sweep):
+                        sweep = range(
+                            round_fwd_start + sweep_start,
+                            round_fwd_start
+                            + min(sweep_start + per_sweep, round_num_batches),
+                        )
+                        pregenerated.extend(
+                            self._teacher_generate_sweep_rank0(list(sweep))
+                        )
+                    logger.info(
+                        "[rank %d] Round %d Phase A1: decoded %d batches in "
+                        "%d sweep(s), %.1f min; switching to the extraction engine",
+                        self._rank, round_idx, round_num_batches,
+                        -(-round_num_batches // per_sweep),
+                        (time.time() - t_gen) / 60.0,
+                    )
+                    self._restart_teacher_engine("extract")
 
                 for batch_idx in range(round_num_batches):
                     fwd_step = round_fwd_start + batch_idx
-                    ids, mask, loss_mask = self._get_batch_sequences(fwd_step)
 
                     if generate_mode == "generate":
-                        data = self._teacher_generate_and_extract_rank0(
-                            ids, mask, recv_device=torch.device("cpu"),
-                        )
-                        if data is not None and "input_ids" in data:
-                            gen_ids = data["input_ids"]
-                            mask = (gen_ids != pad_id).long()
-                            loss_mask = mask.clone()
-                            ids = gen_ids
+                        ids, mask, loss_mask = pregenerated[batch_idx]
                     else:
-                        data = self._teacher_inference_rank0(
-                            ids, mask, recv_device=torch.device("cpu"),
-                        )
+                        ids, mask, loss_mask = self._get_batch_sequences(fwd_step)
+                    data = self._teacher_extract_with_retry(
+                        ids, mask, round_idx, batch_idx,
+                    )
 
                     if data is not None:
                         teacher_ids = data.get("input_ids", ids)
@@ -2481,14 +3100,15 @@ class SpecDistillTrainer:
                             self._rank, batch_idx + 1, round_num_batches,
                         )
 
-                # Shut down vLLM engine to free GPU memory (Mooncake master stays alive)
+                # Free the teacher's GPU memory for training (Mooncake master
+                # stays alive; the cached hidden states outlive the engine)
                 if self._teacher_engine is not None:
                     self._teacher_engine.shutdown()
-                    logger.info("[rank %d] vLLM engine shut down for Phase B", self._rank)
+                    logger.info(
+                        "[rank %d] Teacher engine shut down for Phase B", self._rank
+                    )
 
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
+            self._reclaim_gpu_memory()
 
             if self._is_distributed:
                 torch.distributed.barrier()
@@ -2600,18 +3220,48 @@ class SpecDistillTrainer:
             # Offload draft back to CPU
             self._offload_draft_to_cpu()
 
+            # Checkpoint the finished round before Phase A of the next one runs.
+            # Interval-based saves land on the *first* step of a round's Phase B,
+            # so a crash in the following Phase A — where the teacher engine
+            # restarts, and where most crashes land — rewinds past everything
+            # this round just learned: 50 steps plus the ~45 minutes needed to
+            # regenerate their cache. save_now bypasses the interval so this
+            # cannot depend on the round length dividing save_interval.
+            round_end_step = round_start_opt_step + opt_step_idx
+            if opt_step_idx > 0:
+                for cb in self.callbacks:
+                    if isinstance(cb, CheckpointCallback):
+                        cb.save_now(self, round_end_step, self.last_metrics or {})
+
             # Clean up disk cache for this round
             self._cleanup_round_cache(cache_dir, round_idx)
 
             if self._is_distributed:
                 torch.distributed.barrier()
 
-            # Restart vLLM engine for next round's Phase A
+            # Restart vLLM engine for next round's Phase A, in the mode that phase
+            # actually opens with. Starting an extraction engine here would be
+            # thrown away immediately by the A1 decode sweep -- a wasted 1.5 TB
+            # reload per round.
+            #
+            # Goes through _restart_teacher_engine rather than start() directly:
+            # this is the one place in the loop where the teacher has to find
+            # ~253 GiB that Phase B was using moments ago, so it is where a VRAM
+            # shortfall actually bites, and calling start() bare skipped both the
+            # reclaim and the check that reports the shortfall in those terms.
             if round_idx + 1 < num_rounds and self._rank == 0 and self._teacher_engine is not None:
-                teacher_cfg = self.config.algorithm.teacher
-                teacher_name = teacher_cfg.model_name or self.config.policy.model_name
-                self._teacher_engine.start()
-                logger.info("[rank %d] vLLM engine restarted for round %d", self._rank, round_idx + 1)
+                next_mode = (
+                    "generate"
+                    if getattr(
+                        self.config.algorithm.teacher, "generate_mode", "prefill"
+                    ) == "generate"
+                    else "extract"
+                )
+                self._restart_teacher_engine(next_mode)
+                logger.info(
+                    "[rank %d] vLLM engine restarted in %s mode for round %d",
+                    self._rank, next_mode, round_idx + 1,
+                )
 
         if self._rank == 0:
             for cb in self.callbacks:
