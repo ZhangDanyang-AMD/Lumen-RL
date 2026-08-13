@@ -15,6 +15,7 @@ are reconstructed with a differentiable CP all-reduce.
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import math
@@ -46,6 +47,95 @@ from lumenrl.engine.training.qwen3moe_megatron_bridge import (
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LUMENRL_LOGGING_LEVEL", "INFO"))
 
+
+def _mem_diag_on() -> bool:
+    return os.environ.get("LUMENRL_MEM_DIAG") == "1"
+
+
+def _mem_diag_begin(phase: str, mbs: list) -> None:
+    """Per-rank memory and microbatch shape at the start of a phase.
+
+    Exists because a standalone probe and the trainer disagreed by ~89 GB per
+    GPU on the same model, parallelism and sequence length, and the difference
+    has to be either the microbatch shape or something the trainer holds that
+    the probe does not. rocm-smi cannot tell those apart -- it sees the caching
+    allocator's pool -- so the answer needs allocated and reserved side by side,
+    from inside the process, on every rank rather than just rank 0.
+
+    ``print`` rather than ``logger``: the two sides of that comparison run in
+    different worlds. The trainer configures logging, a probe under plain
+    torchrun does not, so an INFO record there reaches the level-WARNING handler
+    of last resort and vanishes -- silently dropping exactly the half being
+    compared. Ray forwards actor stdout to the driver, so print reaches both.
+    """
+    if not _mem_diag_on():
+        return
+    lens = [int(x.numel()) for mb in mbs for x in mb["ids_list"]]
+    rows = sum(len(mb["rows"]) for mb in mbs)
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    shown = lens if len(lens) <= 8 else f"{lens[:8]}...(+{len(lens) - 8})"
+    print(
+        f"MEMDIAG[rank {rank}] {phase} begin: {len(mbs)} microbatches, {rows} rows, "
+        f"{sum(lens)} tokens, token lengths {shown} | "
+        f"allocated {torch.cuda.memory_allocated() / 2**30:.1f} GiB "
+        f"reserved {torch.cuda.memory_reserved() / 2**30:.1f} GiB",
+        flush=True,
+    )
+    torch.cuda.reset_peak_memory_stats()
+
+
+def _mem_diag_end(phase: str) -> None:
+    if not _mem_diag_on():
+        return
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    total = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+    print(
+        f"MEMDIAG[rank {rank}] {phase} end: "
+        f"peak allocated {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB, "
+        f"peak reserved {torch.cuda.max_memory_reserved() / 2**30:.1f} GiB "
+        f"of {total / 2**30:.0f}",
+        flush=True,
+    )
+
+
+def _mem_diag_note(phase: str) -> None:
+    """Memory at a point that is not a forward/backward phase."""
+    if not _mem_diag_on():
+        return
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    print(
+        f"MEMDIAG[rank {rank}] {phase}: "
+        f"allocated {torch.cuda.memory_allocated() / 2**30:.1f} GiB "
+        f"reserved {torch.cuda.memory_reserved() / 2**30:.1f} GiB",
+        flush=True,
+    )
+
+
+def _mem_diag_stream(phase: str, named):
+    """Pass ``named`` through, reporting the total streamed and the peak.
+
+    The two numbers together are the point: bytes streamed is the size of the
+    reconstructed model, and the peak says how much of it was resident at once.
+    When those are close the gather is materializing the model; when the peak
+    stays near its starting value the gather is streaming.
+    """
+    if not _mem_diag_on():
+        yield from named
+        return
+    total = count = 0
+    for name, t in named:
+        total += t.numel() * t.element_size()
+        count += 1
+        yield name, t
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    print(
+        f"MEMDIAG[rank {rank}] {phase}: streamed {count} tensors / "
+        f"{total / 2**30:.1f} GiB | "
+        f"peak allocated {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB "
+        f"peak reserved {torch.cuda.max_memory_reserved() / 2**30:.1f} GiB",
+        flush=True,
+    )
+
 import re  # noqa: E402
 
 # ``decoder.layers.{N}.`` -- state_dict keys use LOCAL (per-stage) layer numbers
@@ -53,27 +143,36 @@ import re  # noqa: E402
 _LAYER_RE = re.compile(r"(decoder\.layers\.)(\d+)(\.)")
 
 
-def _pp_layer_offset_from_ssd(ssd) -> int:
-    """Local->global layer offset for this pipeline stage, read from any plain
-    per-layer ShardedTensor (its ``global_offset[0]`` is the global layer idx).
+def _pp_layer_offset(module) -> int:
+    """Local->global layer offset for this pipeline stage, from the layers themselves.
 
-    Expert tensors are excluded: under Expert Parallelism their leading axis
-    counts EXPERTS, so ``global_offset[0]`` is this rank's first global expert
-    index, and reading a layer offset off one gives ``ep_rank * experts_per_rank``
-    -- 32, 64, 96 ... on a 4-layer model. Whether that lands on an expert first
-    is decided by ``sharded_state_dict`` insertion order, which is why it can
-    hide indefinitely and then surface on a different architecture.
+    ``TransformerLayer.layer_number`` is the GLOBAL 1-based index -- it is built
+    as ``local + get_transformer_layer_offset(...)`` -- and ``decoder.layers``
+    holds only this stage's layers, so the offset is the first one minus one.
+    Both name sources this offset is applied to (``named_parameters()`` and the
+    ``sharded_state_dict()`` DICT keys) use the local index, so they agree.
+
+    ⚠️ This used to be read out of checkpoint metadata instead: find a per-layer
+    ``ShardedTensor`` with ``prepend_axis_num >= 1`` and subtract the layer index
+    in its dict key from ``global_offset[0]``. That is only correct for a
+    HOMOGENEOUS block. ``TransformerBlock.sharded_state_dict`` takes a separate
+    branch when the layers differ -- which DSv4 hits, and so does anything with a
+    ``moe_layer_freq`` list or ``heterogeneous_block_specs`` -- and that branch
+    passes ``sharded_pp_offset = []``, putting the global index in the tensor's
+    ``key`` rather than in an offset axis. ``prepend_axis_num`` is then 0, no
+    candidate is ever found, and the offset came back 0 with no error.
+
+    At PP=1 the answer is 0 either way, which is why every run so far hid it. At
+    PP=2 the later stages republished their params under the FIRST stage's layer
+    numbers, so the names collided and the rollout weight sync shipped half the
+    model: ``probe_68 --pp 2`` reported 1592 missing / 14 extra tensors, and vLLM
+    died on ``KeyError: 'layers.0.attn.compressor.ape'`` -- layer 0 has no
+    compressor, layer 2 does.
     """
-    from megatron.core.dist_checkpointing.mapping import ShardedTensor
-
-    for key, st in ssd.items():
-        if ".experts." in key:
-            continue
-        if isinstance(st, ShardedTensor) and st.prepend_axis_num >= 1:
-            m = _LAYER_RE.search(key)
-            if m:
-                return int(st.global_offset[0]) - int(m.group(2))
-    return 0
+    layers = getattr(getattr(module, "decoder", None), "layers", None)
+    if not layers:
+        return 0
+    return int(layers[0].layer_number) - 1
 
 
 def _to_global_key(key: str, offset: int) -> str:
@@ -506,7 +605,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
         tp_rank = mpu.get_tensor_model_parallel_rank()
         ffn = self._dims.ffn
         ssd = model.sharded_state_dict()
-        offset = _pp_layer_offset_from_ssd(ssd)
+        offset = _pp_layer_offset(model)
 
         local_sd: dict = {}
         for key, st in ssd.items():
@@ -570,7 +669,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
 
         non_expert_full = _non_expert_hf_to_megatron(hf_state, d)
         ssd = model.sharded_state_dict()
-        offset = _pp_layer_offset_from_ssd(ssd)
+        offset = _pp_layer_offset(model)
 
         local_sd: dict = {}
         for name, p in model.named_parameters():
@@ -625,7 +724,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
 
         tp = mpu.get_tensor_model_parallel_world_size()
         ssd = self.module.sharded_state_dict()
-        offset = _pp_layer_offset_from_ssd(ssd)
+        offset = _pp_layer_offset(self.module)
         ffn = self._dims.ffn
         out: dict = {}
         group = mpu.get_tensor_model_parallel_group() if tp > 1 else None
@@ -673,36 +772,42 @@ class MegatronNativeEngine(MegatronBaseEngine):
         pp_group = mpu.get_pipeline_model_parallel_group()
         pp_rank = mpu.get_pipeline_model_parallel_rank()
         # exchange (key, shape, dtype) metadata so every rank joins each broadcast.
-        meta_local = [(k, tuple(v.shape), str(v.dtype)) for k, v in stage_params.items()]
+        # The dtype travels as a torch.dtype: all_gather_object pickles, and torch
+        # dtypes pickle to the same singletons, so there is no name-keyed map that
+        # can be missing an entry. See the MoE twin of this loop.
+        meta_local = [(k, tuple(v.shape), v.dtype) for k, v in stage_params.items()]
         gathered_meta: list = [None] * pp
         dist.all_gather_object(gathered_meta, meta_local, group=pp_group)
-        dtype_map = {
-            "torch.bfloat16": torch.bfloat16,
-            "torch.float32": torch.float32,
-            "torch.float16": torch.float16,
-        }
         out: dict = {}
         for src in range(pp):
             src_global = dist.get_global_rank(pp_group, src)
-            for (k, shape, dtype_s) in gathered_meta[src]:
+            for (k, shape, dtype) in gathered_meta[src]:
                 if src == pp_rank:
                     t = stage_params[k].contiguous()
                 else:
-                    t = torch.empty(shape, dtype=dtype_map[dtype_s], device="cuda")
+                    t = torch.empty(shape, dtype=dtype, device="cuda")
                 dist.broadcast(t, src=src_global, group=pp_group)
                 out[k] = t
         return list(out.items())
 
-    def _full_megatron_named_params_moe(self):
-        """Reconstruct the COMPLETE MoE model as (global_name, tensor) on every rank.
+    def _moe_stage_named_params(self):
+        """Yield this PP stage's params as (global_name, tensor), gathered.
 
-        Non-expert params: TP all-gather (attention shards) + PP broadcast. Expert
-        params: ETP-gather each local expert (fc1 gate/up column shards, fc2 row
-        shards), all-gather across the EP group with local->global expert relabel,
-        then PP broadcast. Expert names carry GLOBAL indices so ``megatron_to_hf_moe``
-        maps them back to HF ``mlp.experts.{e}.*``. Collective on all actors."""
+        Non-expert params: TP all-gather (attention shards). Expert params:
+        ETP-gather each local expert (fc1 gate/up column shards, fc2 row shards),
+        then all-gather across the EP group with local->global expert relabel.
+        Expert names carry GLOBAL indices so ``megatron_to_hf_moe`` maps them
+        back to HF ``mlp.experts.{e}.*``.
+
+        ⚠️ A generator, and every ``yield`` sits downstream of a collective, so
+        the caller MUST drain it on every rank. Abandoning it part-way leaves
+        the ranks that kept going waiting in an all-gather that never completes.
+        """
         from megatron.core import parallel_state as mpu
-        from megatron.core.dist_checkpointing.mapping import ShardedTensor
+        from megatron.core.dist_checkpointing.mapping import (
+            ShardedTensor,
+            ShardedTensorFactory,
+        )
         from lumenrl.engine.training.qwen3moe_megatron_bridge import _relabel_expert_index
 
         ep = mpu.get_expert_model_parallel_world_size()
@@ -713,12 +818,11 @@ class MegatronNativeEngine(MegatronBaseEngine):
         num_local = self._num_experts // ep
 
         ssd = self.module.sharded_state_dict()
-        offset = _pp_layer_offset_from_ssd(ssd)
+        offset = _pp_layer_offset(self.module)
         tp_group = mpu.get_tensor_model_parallel_group() if tp > 1 else None
         etp_group = mpu.get_expert_tensor_parallel_group() if etp > 1 else None
         ep_group = mpu.get_expert_model_parallel_group() if ep > 1 else None
 
-        stage: dict = {}
         for name, param in self.module.named_parameters():
             p = param.detach().contiguous()
             exp = _expert_local_index(name)
@@ -726,20 +830,48 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 # ---- non-expert: TP all-gather ----
                 gkey = _to_global_key(name, offset)
                 if tp == 1:
-                    stage[gkey] = p
+                    yield gkey, p
                     continue
                 gathered = [torch.empty_like(p) for _ in range(tp)]
                 dist.all_gather(gathered, p, group=tp_group)
                 st = ssd.get(name)
-                if isinstance(st, ShardedTensor):
+                if isinstance(st, ShardedTensorFactory):
+                    # SwiGLU fc1: Megatron fuses gate and up along dim 0, so each
+                    # rank holds [gate_shard ; up_shard] and a plain cat would
+                    # interleave them into [gate0, up0, gate1, up1]. Separate the
+                    # halves before concatenating. A factory is exactly how
+                    # Megatron marks that the checkpoint layout differs from the
+                    # runtime one, which is why it needs its own branch and why
+                    # matching only ShardedTensor silently shipped gathered[0]:
+                    # half-width shared-expert weights that vLLM rejected with
+                    # "load_merged_column_weight ... start out of range".
+                    #
+                    # ``p.shape[0] // 2`` rather than the dense path's
+                    # ``self._dims.ffn // tp``: same value, but DSv4 has no
+                    # Qwen3-shaped dims and leaves ``_dims`` None.
+                    sh = p.shape[0] // 2
+                    gate = torch.cat([g[:sh] for g in gathered], dim=0)
+                    up = torch.cat([g[sh:] for g in gathered], dim=0)
+                    yield gkey, torch.cat([gate, up], dim=0)
+                elif isinstance(st, ShardedTensor):
                     gshape = tuple(st.global_shape[st.prepend_axis_num:])
                     lshape = tuple(st.local_shape)
                     split_dim = next(
                         (dd for dd in range(len(lshape)) if lshape[dd] != gshape[dd]), None
                     )
-                    stage[gkey] = gathered[0] if split_dim is None else torch.cat(gathered, dim=split_dim)
+                    # split_dim None means genuinely replicated across TP. That is
+                    # common here and NOT a red flag: DSv4 replicates wq_a, wkv and
+                    # the indexer projections while still carrying Megatron's
+                    # ``tensor_model_parallel`` marker, so the marker cannot be used
+                    # to decide this -- only the shard metadata can.
+                    full = gathered[0] if split_dim is None else torch.cat(gathered, dim=split_dim)
+                    assert tuple(full.shape) == gshape, (
+                        f"TP gather rebuilt {name} as {tuple(full.shape)}, but its "
+                        f"shard metadata says the full tensor is {gshape}"
+                    )
+                    yield gkey, full
                 else:
-                    stage[gkey] = gathered[0]
+                    yield gkey, gathered[0]
                 continue
 
             # ---- expert: ETP gather -> full local expert tensor ----
@@ -754,43 +886,65 @@ class MegatronNativeEngine(MegatronBaseEngine):
                     p = torch.cat([gate, up], dim=0)
                 else:
                     p = torch.cat(g, dim=1)
+                del g
             # ---- EP all-gather -> relabel local->global expert index ----
             if ep == 1:
-                gname = _to_global_key(_relabel_expert_index(name, local_e), offset)
-                stage[gname] = p
+                yield _to_global_key(_relabel_expert_index(name, local_e), offset), p
                 continue
             g = [torch.empty_like(p) for _ in range(ep)]
             dist.all_gather(g, p, group=ep_group)
             for j in range(ep):
                 global_e = j * num_local + local_e
                 gname = _to_global_key(_relabel_expert_index(name, global_e), offset)
-                stage[gname] = g[j]
+                yield gname, g[j]
+                # The consumer has taken its copy. Dropping the reference here is
+                # what keeps the resident set at one all-gather instead of the
+                # whole model: with EP=32 this list alone is 32x the local shard.
+                g[j] = None
 
-        # ---- PP broadcast: every rank ends up with all stages' params ----
+    def _full_megatron_named_params_moe(self):
+        """Reconstruct the COMPLETE MoE model as (global_name, tensor) on every rank.
+
+        Streams rather than accumulates. That is not a refactor: the eager
+        version held the entire reconstructed model in GPU memory on every rank
+        before the first byte was sent -- 51.0 GiB measured on the 27.39B
+        4-layer slice, and ~529 GiB per rank for the full 43-layer model, which
+        no 288 GB card can hold. It is what put the trainer ~89 GB above a
+        standalone probe doing the same step, because a probe never syncs
+        weights. See the handoff's "the 89 GB" section.
+
+        ⚠️ Collective, and lazily so: see ``_moe_stage_named_params``. Drain it.
+        """
+        from megatron.core import parallel_state as mpu
+
         pp = mpu.get_pipeline_model_parallel_world_size()
         if pp == 1:
-            return list(stage.items())
+            yield from self._moe_stage_named_params()
+            return
+
+        # ---- PP broadcast: every rank ends up with all stages' params ----
+        # Still materializes the local stage, because a rank has to publish the
+        # shapes it owns before any rank can join the broadcasts.
+        stage: dict = dict(self._moe_stage_named_params())
         pp_group = mpu.get_pipeline_model_parallel_group()
         pp_rank = mpu.get_pipeline_model_parallel_rank()
-        meta_local = [(k, tuple(v.shape), str(v.dtype)) for k, v in stage.items()]
+        # The dtype travels as a torch.dtype, not as its name: all_gather_object
+        # pickles, and torch dtypes pickle to the same singletons. A name-keyed
+        # map here used to cover only the three float types and died with
+        # KeyError: 'torch.int32' on the first PP=2 weight sync -- a failure mode
+        # that only exists if the map can be incomplete.
+        meta_local = [(k, tuple(v.shape), v.dtype) for k, v in stage.items()]
         gathered_meta: list = [None] * pp
         dist.all_gather_object(gathered_meta, meta_local, group=pp_group)
-        dtype_map = {
-            "torch.bfloat16": torch.bfloat16,
-            "torch.float32": torch.float32,
-            "torch.float16": torch.float16,
-        }
-        out: dict = {}
         for src in range(pp):
             src_global = dist.get_global_rank(pp_group, src)
-            for (k, shape, dtype_s) in gathered_meta[src]:
+            for (k, shape, dtype) in gathered_meta[src]:
                 if src == pp_rank:
-                    t = stage[k].contiguous()
+                    t = stage.pop(k).contiguous()
                 else:
-                    t = torch.empty(shape, dtype=dtype_map[dtype_s], device="cuda")
+                    t = torch.empty(shape, dtype=dtype, device="cuda")
                 dist.broadcast(t, src=src_global, group=pp_group)
-                out[k] = t
-        return list(out.items())
+                yield k, t
 
     def _dsv4_router_bias_buffers(self):
         """The aux-loss-free load-balancing bias, which is a buffer, not a param.
@@ -799,33 +953,66 @@ class MegatronNativeEngine(MegatronBaseEngine):
         expert load, and the rollout's top-k uses it. Left out of the weight sync
         it would drift away from the trainer's routing, which is precisely the
         divergence the importance ratio is supposed to be measuring. It is
-        replicated (full ``[num_experts]`` on every EP rank), so no gather.
+        replicated (full ``[num_experts]`` on every EP rank), so no EP gather --
+        but it does need the same PP broadcast the params get, because a stage
+        holds only its own layers' buffers. Under PP=1 the local stage IS the
+        whole model, which is why this was a list comprehension and why the gap
+        only showed up as one missing tensor at PP=2
+        (``layers.3.ffn.gate.bias``).
         """
-        ssd = self.module.sharded_state_dict()
-        offset = _pp_layer_offset_from_ssd(ssd)
-        return [
+        from megatron.core import parallel_state as mpu
+
+        offset = _pp_layer_offset(self.module)
+        local = [
             (_to_global_key(name, offset), buf.detach())
             for name, buf in self.module.named_buffers()
             if name.endswith("mlp.router.expert_bias")
         ]
+        pp = mpu.get_pipeline_model_parallel_world_size()
+        if pp == 1:
+            return local
+
+        pp_group = mpu.get_pipeline_model_parallel_group()
+        pp_rank = mpu.get_pipeline_model_parallel_rank()
+        meta_local = [(k, tuple(v.shape), v.dtype) for k, v in local]
+        gathered_meta: list = [None] * pp
+        dist.all_gather_object(gathered_meta, meta_local, group=pp_group)
+        mine = dict(local)
+        out = []
+        for src in range(pp):
+            src_global = dist.get_global_rank(pp_group, src)
+            for (k, shape, dtype) in gathered_meta[src]:
+                t = (
+                    mine[k].contiguous() if src == pp_rank
+                    else torch.empty(shape, dtype=dtype, device="cuda")
+                )
+                dist.broadcast(t, src=src_global, group=pp_group)
+                out.append((k, t))
+        return out
 
     def get_per_tensor_param(self, **kwargs):
+        """Yield the whole model as (rollout_name, tensor), one tensor at a time.
+
+        ⚠️ Lazy, and every tensor comes out of a collective, so the caller must
+        drain the generator on every rank. Consuming it partially deadlocks.
+        """
         assert self.module is not None
+        _mem_diag_note("weight_sync gather begin")
         if self._is_dsv4:
             # The gather is shared: DSv4's grouped experts carry the same Megatron
             # names Qwen3-MoE does. Only the naming on the way out differs, and it
             # has to land on the DSv4 *checkpoint* names, because the rollout side
             # feeds them to vLLM's own ``load_weights``.
-            named = self._full_megatron_named_params_moe()
-            named += self._dsv4_router_bias_buffers()
-            return dsv4.megatron_to_dsv4_native(named), None
-        if getattr(self, "_is_moe", False):
-            named = self._full_megatron_named_params_moe()
-            gen = megatron_to_hf_moe(named, self._dims)
-            return gen, None
-        named = self._full_megatron_named_params()
-        gen = megatron_to_hf(named, self._dims, te=True)
-        return gen, None
+            named = itertools.chain(
+                self._full_megatron_named_params_moe(),
+                self._dsv4_router_bias_buffers(),
+            )
+            gen = dsv4.megatron_to_dsv4_native(named)
+        elif getattr(self, "_is_moe", False):
+            gen = megatron_to_hf_moe(self._full_megatron_named_params_moe(), self._dims)
+        else:
+            gen = megatron_to_hf(self._full_megatron_named_params(), self._dims, te=True)
+        return _mem_diag_stream("weight_sync gather", gen), None
 
     def is_mp_src_rank_with_outputs(self) -> bool:
         """Only TP-rank 0 / CP-rank 0 on the last pipeline stage reports output.
@@ -898,16 +1085,59 @@ class MegatronNativeEngine(MegatronBaseEngine):
         return mbs
 
     def _pp_forward_model(self, model, ids_list):
-        """Pack full sequences into this rank's zigzag ``thd`` token stream.
+        """Pack full sequences into this rank's ``thd`` token stream.
 
-        For CP rank ``r``, a sequence is padded to ``2*cp*chunk`` and sliced as
-        ``chunk[r] + chunk[2*cp-r-1]``. Packed ``cu_seqlens`` are cumulative
-        LOCAL lengths multiplied by CP size, as required by TE ring attention.
+        Two CP layouts, because the two attention implementations want different
+        ones and neither checks:
+
+        * **zigzag** (TE, the default). A sequence is padded to ``2*cp*chunk``
+          and rank ``r`` takes ``chunk[r] + chunk[2*cp-r-1]``. The pairing is
+          what keeps a causal mask's work balanced across ranks.
+        * **contiguous** (DSv4). Rank ``r`` takes ``chunk[r]`` only. DSv4 does
+          not use TE attention: it all-gathers KV itself and derives every
+          position from ``cp_rank * seqlen_local``
+          (``cp_utils.get_q_positions_for_cp`` is a single ``arange``), while
+          ``all_gather_cp`` relies on ``cat`` over ranks being natural token
+          order and the compressor's overlap gathers, transforms and re-slices
+          contiguously. Handing DSv4 zigzag shards is silently wrong -- wrong
+          RoPE, wrong causal spans -- because nothing on its side asserts the
+          layout. The load imbalance zigzag exists to fix is also much smaller
+          here: DSv4's attention is sparse (128-token window plus compressed
+          groups), so per-query work is nearly constant rather than growing with
+          position.
+
+        Packed ``cu_seqlens`` are cumulative LOCAL lengths multiplied by CP size,
+        as required by TE ring attention. DSv4 ignores ``packed_seq_params``
+        entirely.
         """
         from megatron.core import parallel_state as mpu
         from megatron.core.packed_seq_params import PackedSeqParams
 
         cp_rank = mpu.get_context_parallel_rank()
+
+        # Token-count alignment, computed BEFORE the CP split because under the
+        # contiguous layout the per-rank chunk itself has to be aligned.
+        #   * sequence parallelism (required for MoE+TP) scatters the packed
+        #     sequence across TP ranks, so it must be a multiple of TP;
+        #   * DSv4's compressor asserts ``seqlen % ratio == 0`` on every forward,
+        #     and under CP additionally ``seqlen % (ratio*2) == 0``, while RL
+        #     sequence lengths are whatever the rollout produced.
+        align = self._tp if (self._sp and self._tp > 1) else 1
+        if self._is_dsv4:
+            align = math.lcm(align, self._dsv4_align * (2 if self._cp > 1 else 1))
+
+        cp_contiguous = self._is_dsv4 and self._cp > 1
+        if cp_contiguous and len(ids_list) > 1:
+            # DSv4 reads the packed stream as ONE sequence (it ignores
+            # cu_seqlens), which is why enable_dynamic_batch is forced off and
+            # every microbatch holds a single sequence. Under CP that stops being
+            # merely wrong-attention and starts breaking the position arithmetic
+            # below, so refuse instead of computing something plausible.
+            raise RuntimeError(
+                f"DSv4 with CP={self._cp} needs one sequence per microbatch, got "
+                f"{len(ids_list)}; enable_dynamic_batch must stay False."
+            )
+
         local_ids = []
         local_offsets = [0]
         layouts = []
@@ -916,6 +1146,23 @@ class MegatronNativeEngine(MegatronBaseEngine):
             if self._cp == 1:
                 chunk = length
                 sliced = ids.view(-1)
+            elif cp_contiguous:
+                # ``chunk`` is rounded up to ``align`` so the padded sequence
+                # divides evenly and NO trailing pad is needed. That is not
+                # cosmetic: DSv4 takes this rank's global positions to be
+                # ``[cp_rank*seqlen_local, (cp_rank+1)*seqlen_local)``, so any
+                # padding sitting between two ranks' shards would shift every
+                # later position by ``cp_rank*pad`` and silently corrupt RoPE
+                # and the causal spans.
+                chunk = -(-length // self._cp)
+                chunk = -(-chunk // align) * align
+                padded_length = self._cp * chunk
+                ids_padded = (
+                    F.pad(ids.view(-1), (0, padded_length - length), value=0)
+                    if padded_length > length else ids.view(-1)
+                )
+                start = cp_rank * chunk
+                sliced = ids_padded[start:start + chunk]
             else:
                 chunk = (length + 2 * self._cp - 1) // (2 * self._cp)
                 padded_length = 2 * self._cp * chunk
@@ -937,25 +1184,24 @@ class MegatronNativeEngine(MegatronBaseEngine):
                     "chunk": chunk,
                     "local_start": begin,
                     "local_end": end,
+                    # Recorded rather than re-derived: the reconstruction in
+                    # ``_cp_row_logprob_entropy`` has to invert exactly this
+                    # split, and the two must not be able to drift apart.
+                    "cp_layout": "contiguous" if cp_contiguous else "zigzag",
                 }
             )
             local_ids.append(sliced)
             local_offsets.append(end)
 
         local_total = local_offsets[-1]
-        # Two independent reasons the token count may need rounding up:
-        #   * sequence parallelism (required for MoE+TP) scatters the packed
-        #     sequence across TP ranks, so it must be a multiple of TP;
-        #   * DSv4's compressor asserts ``seqlen % ratio == 0`` on every forward,
-        #     and RL sequence lengths are whatever the rollout produced.
-        # Either way the fix is the same: pad with a trailing dummy segment. It
-        # gets its own cu_seqlens bin so attention stays isolated, and no layout
-        # entry points at it, so its logits are never read for loss. Under DSv4
-        # cu_seqlens is ignored, but the padding is still invisible to the real
-        # positions because everything the attention does is causal.
-        align = self._tp if (self._sp and self._tp > 1) else 1
-        if self._is_dsv4:
-            align = math.lcm(align, self._dsv4_align)
+        # Pad the packed stream with a trailing dummy segment. It gets its own
+        # cu_seqlens bin so attention stays isolated, and no layout entry points
+        # at it, so its logits are never read for loss. Under DSv4 cu_seqlens is
+        # ignored, but the padding is still invisible to the real positions
+        # because everything the attention does is causal.
+        #
+        # Under the contiguous layout every chunk is already a multiple of
+        # ``align``, so this is a no-op there -- which is the point.
         if align > 1:
             pad = (-local_total) % align
             if pad:
@@ -1025,10 +1271,15 @@ class MegatronNativeEngine(MegatronBaseEngine):
 
         cp_rank = mpu.get_context_parallel_rank()
         chunk = int(layout["chunk"])
-        global_starts = (
-            cp_rank * chunk,
-            (2 * self._cp - cp_rank - 1) * chunk,
-        )
+        # Invert whatever split _pp_forward_model chose. One chunk under the
+        # contiguous layout, the zigzag pair otherwise.
+        if layout.get("cp_layout") == "contiguous":
+            global_starts = (cp_rank * chunk,)
+        else:
+            global_starts = (
+                cp_rank * chunk,
+                (2 * self._cp - cp_rank - 1) * chunk,
+            )
         logits_parts = []
         target_parts = []
         spans = []
@@ -1131,16 +1382,72 @@ class MegatronNativeEngine(MegatronBaseEngine):
         path is otherwise safe to use, and it is where the Expert-Parallel
         microbatch lockstep lives.
 
-        Context parallelism is a different story: ``_pp_forward_model`` slices
-        the zigzag pairs TE expects, while the DSv4 attention does its own CP
-        bookkeeping (``get_q_positions_for_cp``, ``all_gather_cp``). The two
-        conventions have never been reconciled.
+        Pipeline parallelism: MEASURED CORRECT on both sides, so it is no longer
+        refused. Two independent checks, because one of them is not enough:
 
-        Pipeline parallelism is rejected for an unresolved reason rather than an
-        unimplemented one: mHC's ``layer_post`` returns a view, so the stage
-        boundary sends a non-contiguous tensor, and on a synthetic PP=2 probe
-        that silently changed the loss (1.77839053 -> 1.78812289). Until that is
-        reproduced and fixed on the real stack, PP is a wrong-answer risk.
+        * training -- ``probe_69`` (``run_probes.sh topology``) diffs log-probs,
+          loss and grad_norm against a PP=1 baseline at the SAME EP. PP=2 EP=4 vs
+          PP=1 EP=4: bitwise-equal log-probs (max |d| 0.0 over 255 positions),
+          bitwise-equal loss (-0.04613047), grad_norm to 4.5e-08.
+        * rollout weight sync -- ``probe_68 --pp 2`` (``PP=2 run_probes.sh
+          syncshapes``): 3176/3176 tensors, 0 missing, 0 extra, 0 shape mismatch.
+          probe_69 cannot see this path at all, because it never syncs weights.
+
+        Getting the second one to pass took two fixes, both PP-only and both
+        invisible at PP=1: ``_pp_layer_offset`` (the stage offset was read out of
+        checkpoint metadata in a way that only works for homogeneous blocks, so
+        later stages republished their params under the first stage's layer
+        numbers and half the model never shipped) and the PP broadcast for the
+        router's ``expert_bias`` buffers (a stage holds only its own).
+
+        The old synthetic PP=2 probe's differing loss (1.77839053 -> 1.78812289)
+        was a measurement artifact, not a PP defect: its baseline did not hold EP
+        fixed. Changing EP alone moves these numbers by far more than PP does --
+        PP=2 EP=4 against an EP=8 baseline reports a grad_norm gap of 2.35e-03,
+        all of which is the EP change (PP=1 EP=4 and PP=2 EP=4 agree to 4.5e-08),
+        and the reference deviation moves from 5.106e-02 at EP=8 to 5.212e-02 at
+        EP=4. Anything comparing topologies has to change exactly one at a time.
+        ``MHC_CONTIGUOUS`` was therefore never implicated; consistent with its own
+        comment that a non-contiguous p2p send only makes NCCL warn.
+
+        The old synthetic PP=2 probe's differing loss (1.77839053 -> 1.78812289)
+        was a measurement artifact, not a PP defect: its baseline did not hold EP
+        fixed. Changing EP alone moves these numbers by far more than PP does --
+        PP=2 EP=4 against an EP=8 baseline reports a grad_norm gap of 2.35e-03,
+        all of which is the EP change (PP=1 EP=4 and PP=2 EP=4 agree to 4.5e-08),
+        and the reference deviation moves from 5.106e-02 at EP=8 to 5.212e-02 at
+        EP=4. Anything comparing topologies has to change exactly one at a time.
+        ``MHC_CONTIGUOUS`` was therefore never implicated; consistent with its own
+        comment that a non-contiguous p2p send only makes NCCL warn.
+
+        The plumbing this relies on: mHC makes the tensor crossing a stage
+        boundary 4-D ``[s, b, hc, d]``, which the vendored p2p accounts for
+        (``_communicate_shapes`` uses ``num_dims = 4 if config.dsv4_mode``);
+        ``variable_seq_lengths`` is set whenever pp > 1 so the shape is exchanged
+        rather than inferred from config; and the hc streams survive the boundary
+        because ``transformer_block`` expands only on ``pre_process`` and
+        collapses only on ``post_process``.
+
+        Context parallelism: MEASURED WRONG, still refused. The layout conflict
+        described below is handled -- ``_pp_forward_model`` emits contiguous
+        shards for DSv4 instead of the zigzag pairs TE wants, and records the
+        choice so ``_cp_row_logprob_entropy`` inverts the same split -- but that
+        is not sufficient. CP=2 EP=4 against PP=1 CP=1 EP=4 differs on 509 of 511
+        positions, **starting at global position 0**, max |d log-prob| 3.86e-01.
+
+        Position 0's logit can only depend on token 0, so the three suspects that
+        motivated the layout work cannot produce this: a chunk-alignment shift, a
+        position offset and an off-by-one in the reconstruction all leave a clean
+        prefix. Padding is also ruled out -- the run above tiles the reference to
+        512 tokens so that ``chunk`` lands on 256 exactly and there is no padding
+        at all, and it fails the same way as the 256-token run (250/255, also from
+        position 0). What is left is DSv4's own CP attention: it all-gathers KV
+        over the CP group and derives every position from ``cp_rank *
+        seqlen_local`` (``cp_utils.get_q_positions_for_cp`` is a single
+        ``arange``), and something in that path -- most likely the causal masking
+        over the gathered KV or the compressor's ``overlap_transform_with_cp`` --
+        does not reproduce the single-device result. Not investigated further: CP
+        is not needed for the DAPO runs.
         """
         if self._dynamic_batch:
             raise RuntimeError(
@@ -1148,13 +1455,12 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 "microbatch are read as one long sequence. initialize() forces it off, so "
                 "reaching this means something re-enabled it."
             )
-        bad = {"context_parallel_size": self._cp, "pipeline_model_parallel_size": self._pp}
-        bad = {k: v for k, v in bad.items() if v > 1}
-        if bad:
+        if self._cp > 1:
             raise NotImplementedError(
-                f"DSv4 does not support {bad} yet -- see _dsv4_check_topology for which of "
-                f"the two is unimplemented and which is an open correctness question. "
-                f"TP / EP / DP are available."
+                f"DSv4 does not support context_parallel_size={self._cp}: the forward is "
+                f"measured wrong, not merely unimplemented -- probe_69 sees 509/511 log-prob "
+                f"positions differ from a CP=1 baseline, starting at position 0. "
+                f"See _dsv4_check_topology. TP / PP / EP / DP are available."
             )
 
     def engine_update_policy(self, batch):
@@ -1198,6 +1504,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
         self.module.train()
         self._ddp.zero_grad_buffer()
         self.optimizer.zero_grad()
+        _mem_diag_begin("update", mbs)
 
         if num_mb == 0:
             # keep the pipeline in lockstep even with no data (rare); no step.
@@ -1260,7 +1567,9 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 num_microbatches=num_mb, seq_length=1, micro_batch_size=1, forward_only=False,
             )
 
+        _mem_diag_end("update")
         update_successful, grad_norm, _ = self.optimizer.step()
+        _mem_diag_end("update+optstep")
         if not update_successful:
             logger.warning("PP optimizer.step reported update_successful=False")
         lr = self._sched_step()
@@ -1336,6 +1645,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
         mbs = self._pad_mbs_for_ep(mbs)
         num_mb = len(mbs)
         self.module.eval()
+        _mem_diag_begin("log_probs", mbs)
 
         lp_out = torch.zeros(B, S, dtype=torch.float32)
         ent_out = torch.zeros(B, S, dtype=torch.float32) if want_ent else None
@@ -1387,6 +1697,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
                     if want_ent and ent is not None:
                         ent_out[r, start:start + L - 1] = ent
         self.module.train()
+        _mem_diag_end("log_probs")
         tensors = {"log_probs": lp_out, "input_ids": batch["input_ids"]}
         if want_ent:
             tensors["entropy"] = ent_out

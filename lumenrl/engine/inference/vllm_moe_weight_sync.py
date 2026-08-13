@@ -318,7 +318,11 @@ class FusedMoEWeightRouter:
 
 
 def assert_weight_sync_coverage(
-    model: torch.nn.Module, loaded: Iterable[str], *, context: str = "ipc"
+    model: torch.nn.Module,
+    loaded: Iterable[str],
+    *,
+    context: str = "ipc",
+    default_mode: str = "error",
 ) -> None:
     """Fail loudly when a weight sync left parameters at their previous values.
 
@@ -328,9 +332,11 @@ def assert_weight_sync_coverage(
     train/rollout divergence, not a crash. Comparing the loaded set against
     ``named_parameters`` turns that into an immediate error.
 
-    ``LUMENRL_WEIGHT_SYNC_CHECK`` selects ``error`` (default), ``warn`` or ``off``.
+    ``LUMENRL_WEIGHT_SYNC_CHECK`` selects ``error``, ``warn`` or ``off``, and
+    overrides ``default_mode``. Callers whose loaded-name set is not known to be
+    directly comparable to ``named_parameters`` pass ``default_mode="warn"``.
     """
-    mode = os.environ.get("LUMENRL_WEIGHT_SYNC_CHECK", "error").lower()
+    mode = os.environ.get("LUMENRL_WEIGHT_SYNC_CHECK", default_mode).lower()
     if mode == "off":
         return
 

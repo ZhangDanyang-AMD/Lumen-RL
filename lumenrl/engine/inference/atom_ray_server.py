@@ -442,6 +442,7 @@ class ATOMReplicaManager:
                 "ATOM_ISOLATE_TORCH_COMPILE_CACHE",
                 "ATOM_LOG_LEVEL",
                 "ATOM_USE_TORCH_RMSNORM",
+                "ATOM_FORCE_ATTN_TRITON",
                 "VERL_ATOM_AGENT_LOG",
                 "VERL_MEMORY_AGENT_LOG",
             ):

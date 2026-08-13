@@ -214,6 +214,16 @@ def build_dsv4_config(
         moe_router_topk_scaling_factor=float(hf.get("routed_scaling_factor", 1.0)),
         moe_router_load_balancing_type="seq_aux_loss",
         moe_aux_loss_coeff=float(ec.get("moe_aux_loss_coeff", 0.0) or 0.0),
+        # Plumbed because it was NOT, and its absence made an experiment silently
+        # meaningless. The engine's own ``moe_router_dtype`` handling lives in the
+        # ``elif self._is_moe`` branch that DSv4 never takes, so a run that asked
+        # for fp32 routing got bf16 and looked like evidence that fp32 changes
+        # nothing. Megatron warns about exactly this config ("a large number of
+        # experts (>=32) without fp32 routing"), and with 256 experts scored in
+        # bf16 a last-bit difference can flip a top-k choice. Default stays None
+        # so this changes no existing run.
+        moe_router_dtype=(str(ec["moe_router_dtype"])
+                          if ec.get("moe_router_dtype") else None),
         moe_token_dispatcher_type="alltoall",
         moe_grouped_gemm=bool(ec.get("moe_grouped_gemm", True)),
         moe_permute_fusion=bool(ec.get("moe_permute_fusion", False)),

@@ -32,6 +32,44 @@ class BaseWorker(ABC):
         self.config: dict[str, Any] = dict(config or {})
         self._log = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
         self._configure_logging()
+        self._ensure_gpu_isolation()
+
+    def _ensure_gpu_isolation(self) -> None:
+        """Narrow this actor to its assigned GPU if Ray did not do it.
+
+        Everything downstream -- ``setup_distributed``'s ``local_rank=0``,
+        ``init_model``'s ``model.to(local_device)``, FSDP2's DeviceMesh -- assumes
+        Ray has already set CUDA/HIP_VISIBLE_DEVICES so this actor's only device
+        is ``cuda:0``. On some images Ray's accelerator detection fails and it
+        never writes that variable: every actor then sees all 8 GPUs, lands on
+        card 0, and the training step dies with "Multiple ranks detected using the
+        same GPU on this node". Ray's *assignment* is still right, so restore the
+        assumption instead of teaching each consumer about physical indices.
+
+        ⚠️ Must run before anything initializes CUDA in this process -- torch reads
+        the variable at its first CUDA call and caches the result. The actor
+        constructor is the earliest hook we own.
+        """
+        import os
+
+        if any(os.environ.get(v) for v in
+               ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")):
+            return
+        try:
+            import ray
+
+            assigned = ray.get_gpu_ids()
+        except Exception:
+            return
+        if not assigned:
+            return
+        ids = ",".join(str(g) for g in assigned)
+        os.environ["CUDA_VISIBLE_DEVICES"] = ids
+        os.environ["HIP_VISIBLE_DEVICES"] = ids
+        self._log.warning(
+            "Ray left the visible-device variables unset; pinning this actor to "
+            "its assigned GPU(s) %s so local_rank 0 is correct", ids,
+        )
 
     def _configure_logging(self) -> None:
         """Ensure worker logs include rank for multi-actor debugging."""

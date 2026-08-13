@@ -1,0 +1,242 @@
+# DeepSeek-V4-Flash, all 43 layers: DAPO on 4 nodes / 32 GPUs of MI355X.
+#
+# The full-model counterpart of dapo_dsv4_flash_ray_vllm_megatron_1node_smoke.yaml,
+# which is a 4-layer slice. Everything that defines the optimization problem is
+# copied from it unchanged. The differences are all forced by 284 B parameters
+# not fitting where 27 B did, and there are only three of them:
+#
+#   * expert_model_parallel_size 8 -> 32. Not a tuning choice. The optimizer is
+#     12 bytes/parameter and Megatron shards it over EP x EDP = world_size, so
+#     the 277 B of experts cost ~104 GB/GPU at world=32 whatever EP is, and EP
+#     may as well take all 32 ranks. Measured by probe_66: 15.97 B parameters
+#     per rank, 189.6 GiB peak after one DAPO step.
+#
+#     TP and PP are no longer closed to DSv4 -- TP is end-to-end verified at
+#     TP=2 and PP at PP=2 -- but neither helps here. PP cannot divide 43 layers:
+#     transformer_block asserts num_layers % pp == 0, 43 is prime, and the uneven
+#     knobs (num_layers_in_first/last_pipeline_stage) are not plumbed through
+#     dsv4_megatron_bridge. TP would only shard the 7 B of non-expert weights and
+#     costs an all-gather per layer. CP is still refused, and now because it is
+#     measured wrong rather than unimplemented. See _dsv4_check_topology.
+#
+#     ⚠️ "189.6 GiB, no offload needed" was measured on a ~130-token sequence.
+#     At 1280 it is 192.6 GiB, and THIS config runs 6144, which has never been
+#     measured. Run probe_66 with SEQ=6144 BUILD_OPTIMIZER=1 before trusting
+#     optimizer_cpu_offload=false below.
+#   * recompute full/uniform/1. 43 layers of MLA activations do not fit next to
+#     the optimizer. Same setting miles uses.
+#   * rollout quantization "" -> fp8_per_block, and this is the one thing here
+#     that no earlier run has exercised. See the generation block.
+#
+# Also unlike the slice: filter_groups is ON. The slice fed layer 3's residual
+# to lm_head and could never solve a problem, so every group was dropped for
+# acc=0; the real model is a trained base model (probe_66 measured perplexity
+# 2.88 on ordinary prose) and dynamic sampling is part of DAPO.
+#
+# Launch with ~/4node/08_dsv4_megatron_multinode.sh, which injects
+# cluster.num_nodes, controller.ray.actor.num_workers and
+# controller.ray.actor.process_on_nodes from its node list. process_on_nodes is
+# not optional: without it Ray picks rank->node itself and a TP=8 rollout replica
+# can straddle two nodes, which VLLMReplicaManager.create rejects.
+#
+#   CFG=examples/DAPO/configs/dapo_dsv4_flash_full43_ray_vllm_megatron_4node.yaml \
+#   MODEL_PATH=/mnt/m2m_nobackup/xysheng/models/DeepSeek-V4-Flash-Base-bf16-native \
+#   RAY=1 STEPS=3 bash ~/4node/08_dsv4_megatron_multinode.sh
+#
+# That MODEL_PATH is stage 4 of rebuild_full_l43.sh. The stage did not exist
+# until this config needed it: fp8_cast_bf16 renames tensors into DeepSeek-HF
+# form, which vLLM's DSv4 loader rejects with
+# `KeyError: 'layers.0.input_layernorm.weight'`.
+
+cluster:
+  num_nodes: 4
+  gpus_per_node: 8
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    actor:
+      num_workers: 32
+      dispatch_mode: dp_compute_proto
+      process_on_nodes: [8, 8, 8, 8]
+
+policy:
+  # BF16 weights under the CHECKPOINT's own tensor names (make_native_bf16.py),
+  # with the MTP block dropped -- fp8_cast_bf16 does not recognise those names
+  # and leaves them FP8, which does not belong in a directory whose config.json
+  # no longer declares quantization_config. vLLM builds MTP as a separate model
+  # for speculative decoding only, so the main rollout never asks for it.
+  #
+  # The two obvious alternatives both fail: the released FP8 directory leaves
+  # vLLM holding statically quantized parameters that the BF16 weight sync
+  # cannot write ("'Parameter' object has no attribute
+  # 'load_merged_column_weight'"), and fp8_cast_bf16's own output is BF16 but
+  # renamed into DeepSeek-HF form, which vLLM's DSv4 loader rejects ("KeyError:
+  # 'layers.0.input_layernorm.weight'").
+  #
+  # The trainer reads only config.json from here; its weights come from
+  # dist_checkpoint_path.
+  model_name: "/mnt/m2m_nobackup/xysheng/models/DeepSeek-V4-Flash-Base-bf16-native"
+  training_backend: megatron_native
+  generation_backend: vllm
+  max_total_sequence_length: 6144       # 2048 prompt budget + 4096 response
+  max_response_length: 4096
+  train_global_batch_size: 128
+  gen_batch_size: 24
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 6144
+  learning_rate: 1.0e-6
+  lr_warmup_steps: 0
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  training:
+    optimizer_dtype: bf16
+    megatron_cfg:
+      use_distributed_optimizer: true
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      context_parallel_size: 1
+      # All 32 ranks. See the header for why this is not a knob.
+      expert_model_parallel_size: 32
+      dist_checkpoint_path: "/mnt/m2m_nobackup/xysheng/models/DeepSeek-V4-Flash-Base_torch_dist"
+      # 43 layers of activations do not fit alongside the optimizer.
+      recompute_granularity: full
+      recompute_method: uniform
+      recompute_num_layers: 1
+      # OFF, but no longer because offload is unsafe. probe_65 found that in
+      # precision-aware mode only the FP32 parameters that happened to land on
+      # the CPU side got updated -- 9 of 27 on the slice, silently, and those are
+      # the hyper-connection weights, so a run with offload on was quietly
+      # training a different model. That is a Megatron upstream bug in
+      # hybrid_optimizer._get_sub_optimizer_param_groups and it is FIXED
+      # (27/27 on the slice, loss and grad_norm bitwise unchanged).
+      #
+      # So this is now purely a memory decision, and it is off only because
+      # EP=32 was measured to fit without it. ⚠️ That measurement is at ~130 and
+      # 1280 tokens, not the 6144 this config runs. If probe_66 at SEQ=6144 does
+      # not leave room for the colocated rollout, turn it on -- either here or
+      # with 08_...'s EXTRA= -- and expect 261/261 rather than the 87/261 the
+      # full model reported before the fix.
+      optimizer_cpu_offload: false
+      deterministic_mode: true
+      moe_grouped_gemm: true
+      moe_aux_loss_coeff: 0.0
+      log_probs_chunk_size: 1024
+      # DeepseekV4Attention derives token positions from the tensor length and
+      # never reads packed_seq_params, so bin-packing several sequences into one
+      # microbatch has them read as one long sequence -- no error, wrong
+      # attention. The engine forces this off; it is spelled out so the reason
+      # travels with the run.
+      enable_dynamic_batch: false
+    fsdp_cfg:
+      param_offload: false
+      optimizer_offload: false
+  generation:
+    vllm_cfg:
+      transport: ray_http
+      ray_http_start_server: false
+      # 32 actors / TP 8 = 4 replicas, one per node. TP=1 is not an option: it
+      # faults with `Memory access fault` on gfx950 for every MoE backend tried.
+      tensor_parallel_size: 8
+      kv_cache_dtype: fp8_e4m3
+      # The default auto-selects AITER and dies in the first forward at
+      # `moe_sorting_opus_fwd`; `triton_unfused` is FP4-only.
+      moe_backend: triton
+      # ⚠️ The one genuinely new thing in this file. At 284 B a BF16 rollout is
+      # 71 GB/GPU at TP=8, which does not fit beside a 190+ GiB trainer; online
+      # per-block FP8 is 36. It is also the only FP8 rollout LumenRL can weight-
+      # sync into: a statically quantized model rejects BF16 tensors, whereas
+      # `fp8_per_block` makes vLLM own the quantization, so each sync loads BF16
+      # through vLLM's layerwise-reload lifecycle and re-derives the per-128-block
+      # scales (vllm_fp8_utils.py, exercised so far only on dense Qwen3-8B).
+      quantization: fp8_per_block
+      # Budget per GPU, against 288 GB: ~36 for the FP8 weights and the rest for
+      # KV and the prefill. DSv4's MLA latent KV is 576 elements/token/layer, so
+      # 32 sequences x 6144 tokens is only ~5 GB at fp8_e4m3 -- the trainer is
+      # what needs the room, not the cache.
+      gpu_memory_utilization: 0.18
+      max_model_len: 6144
+      dtype: bfloat16
+      enforce_eager: true
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 2048
+      max_num_seqs: 32
+      calculate_log_probs: true
+      # vLLM's cumem sleep is broken on this ROCm stack (frees nothing, then
+      # wake_up re-maps and OOMs), so rollout and trainer memory are additive
+      # and the budget above has to hold both.
+      enable_sleep_mode: false
+      update_weights_bucket_megabytes: 512
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+
+moe:
+  r3:
+    rollout_replay: false
+
+algorithm:
+  name: dapo
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  loss_agg_mode: token-mean
+  dapo:
+    num_generations: 16
+    kl_coeff: 0.0
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 10.0
+    dynamic_sampling: true
+    token_level_pg: true
+    overlong_reward_shaping: true
+    max_resp_len: 4096
+    # ON, unlike the slice: this model can actually solve the problems, so
+    # groups with zero reward variance are the ones DAPO means to drop.
+    filter_groups:
+      enable: true
+      metric: acc
+      max_num_gen_batches: 10
+    overlong_buffer:
+      enable: true
+      len: 512
+      penalty_factor: 1.0
+      log: false
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+    rollout_is_batch_normalize: false
+
+reward:
+  type: function
+  function: lumenrl.rewards.math_reward.dapo_math_reward
+  dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet"
+  shuffle: true
+  shuffle_seed: 10086
+
+val_dataset: ""
+val_steps: 0
+val_batch_size: 0
+eval:
+  enabled: false
+  num_samples: 0
+
+checkpointing:
+  checkpoint_dir: ""
+  save_steps: 1000
+  save_total_limit: 0
+  resume: false
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 3
+seed: 10086

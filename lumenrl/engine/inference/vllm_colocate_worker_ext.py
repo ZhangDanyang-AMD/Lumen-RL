@@ -146,6 +146,7 @@ class vLLMColocateWorkerExtension:
                 use_shm=use_shm,
             )
             _stats = {"buckets": 0, "weights": 0}
+            online_loaded: set[str] = set()
 
             def _load_online(weights):
                 # CRITICAL: the receiver hands out tensors that are VIEWS into the
@@ -160,13 +161,22 @@ class vLLMColocateWorkerExtension:
                 cloned = [(n, t.clone()) for (n, t) in weights]
                 _stats["buckets"] += 1
                 _stats["weights"] += len(cloned)
-                model.load_weights(cloned)
+                online_loaded.update(model.load_weights(cloned) or ())
 
             receiver.receive_weights(on_bucket_received=_load_online)
             finalize_online_quantized_weights_loading(model, model_config)
             logger.info(
                 "online fp8 reload: buckets=%d weights=%d",
                 _stats["buckets"], _stats["weights"],
+            )
+            # Warn rather than raise: under layerwise reload the names
+            # load_weights reports back are not known to line up with
+            # named_parameters the way they do on the BF16 path, so a mismatch
+            # here is a lead, not a verdict. Worth having anyway -- a silently
+            # dropped expert shard shows up later only as a slow train/rollout
+            # divergence, and this branch is the one no run has exercised.
+            assert_weight_sync_coverage(
+                model, online_loaded, context="colocate-ipc-online", default_mode="warn"
             )
             return
 
