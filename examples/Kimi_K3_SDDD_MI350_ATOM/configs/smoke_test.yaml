@@ -1,37 +1,51 @@
 # Kimi K3 DSpark Smoke Test — MI350 (ATOM teacher, Batch-Alternating)
 #
-# 在**与 train.yaml 完全相同的配方**上跑 5 步全链路验证。只有规模和输出路径不同；
-# 任何影响行为的字段都保持一致，因为跑另一套配方的 smoke 验证的是没人会跑的流水线。
+# A 5-step end-to-end validation on **exactly the same recipe as train.yaml**.
+# Only the scale and the output paths differ; every field that affects behaviour
+# is kept identical, because a smoke test on a different recipe validates a
+# pipeline nobody is going to run.
 #
-# Phase A1: ATOM 解码 prompt → teacher 自己的 response（抓取关闭）
-# Phase A2: 同一个引擎重新 prefill 整条序列，抓 5 层隐藏态 → Mooncake（抓取打开）
-# Phase B:  torchrun replicate draft 训练（BF16）
+# Phase A1: ATOM decodes prompt -> the teacher's own response (no capture)
+# Phase A2: the same engine re-prefills the full sequence and captures 5 layers
+#           of hidden states -> Mooncake (capture on)
+# Phase B:  torchrun replicate draft training (BF16)
 #
-# 要重点确认的事：
-#   1. B=64 解码能连续跑完 5 批不 GPU fault —— vLLM 是 15-20 批必崩
-#   2. 收到的隐藏态宽度 = 5 × 7168 = 35840，且每条的有效长度等于 prompt+response
-#      （如果 prefill 被切块，Mooncake 里只会剩最后一块，长度会短）
-#   3. switch_mode 在两遍之间来回切而引擎不重启（日志里不应出现重复的权重加载）
+# What to confirm:
+#   1. Decoding at B=64 gets through 5 consecutive batches without a GPU fault —
+#      vLLM crashes within 15-20 batches
+#   2. The received hidden states are 5 x 7168 = 35840 wide, and each row's
+#      effective length equals prompt+response (if the prefill were chunked, only
+#      the last chunk would survive in Mooncake and the length would be short)
+#   3. The sweeps alternate without the engine restarting (the log must not show
+#      a second weight load)
 #
-# 2026-08-08 新增的四项（这一版改动的正是它们）：
-#   4. thinking=true 渲染正确：prompt 里有 <|open|>think<|sep|>，且多轮历史的
-#      reasoning 被保留（不是一串空 think 块 —— 那是 PARSER_VERSION<6 的老 bug）
-#   5. 整轮合成一遍 sweep（320 条一次提交）后，拆回各批的结果仍与批边界对齐
-#   6. 开 CUDA graph 后隐藏态不变：graph 只捕获 decode，A2 的 prefill 必须仍走 eager
-#   7. Phase B 峰值显存 —— 这是决定能不能上 max_num_seqs=128/256 的关键数，
-#      跑的时候用 rocm-smi 采样，别只看跑没跑挂
+# Four additions from 2026-08-08, which are exactly what that revision changed:
+#   4. thinking=true renders correctly: the prompt contains <|open|>think<|sep|>
+#      and multi-turn history keeps its reasoning (not a string of empty think
+#      blocks — that is the old PARSER_VERSION<6 bug)
+#   5. With the whole round merged into one sweep (320 rows submitted at once),
+#      splitting the results back out still aligns with the batch boundaries
+#   6. Hidden states are unchanged with CUDA graphs on: graphs capture decode
+#      only, and A2's prefill must still run eager
+#   7. Phase B peak memory — the number that decides whether max_num_seqs can go
+#      to 128/256. Sample it with rocm-smi during the run; do not just check
+#      whether it crashed
 #
-# 刻意与 train.yaml 不同（且仅限这些）：
-#   num_training_steps 5、cache_batches 5、每步都 eval 且只用 8 条、
-#   独立的 cache_dir / checkpoint_dir，避免 smoke 污染正式 run。
+# Deliberately different from train.yaml (and nothing else):
+#   num_training_steps 5, cache_batches 5, eval every step on only 8 samples, and
+#   separate cache_dir / checkpoint_dir so the smoke run cannot pollute the real
+#   one.
 #
-# ⚠️ 刻意保持一致——改了就失去测试意义：
-#   train_global_batch_size 64: bs=8 时梯度累积路径（ceil(64/8)=8 次 backward）
-#     完全不会被走到，cached batch 也从 11.3 GB 缩到 1.41 GB，/dev/shm 压力测不出来。
-#   anchor_num 512: 峰值显存的主要驱动量（实测 57.8 GiB）。64 会把 OOM 风险测漏。
-#   max_num_seqs / max_num_batched_tokens: 前者决定解码批形态（正是 vLLM 崩的地方），
-#     后者是"prefill 不被切块"的保证，调小会让隐藏态被静默截断。
-#   四个 generate_* / dataset.* 字段：见各自的注释。
+# /!\ Deliberately identical — changing these makes the test meaningless:
+#   train_global_batch_size 64: at bs=8 the gradient accumulation path
+#     (ceil(64/8)=8 backward passes) is never exercised at all, and a cached
+#     batch shrinks from 11.3 GB to 1.41 GB, so /dev/shm pressure goes untested.
+#   anchor_num 512: the main driver of peak memory (57.8 GiB measured). 64 would
+#     hide the OOM risk.
+#   max_num_seqs / max_num_batched_tokens: the first decides the decode batch
+#     shape (precisely where vLLM crashes), the second is the guarantee that
+#     prefill is not chunked; lowering it silently truncates hidden states.
+#   The four generate_* / dataset.* fields: see their individual notes.
 #
 # Usage:
 #   bash examples/Kimi_K3_SDDD_MI350_ATOM/run_kimi_k3.sh --smoke-test
@@ -47,13 +61,14 @@ policy:
   max_total_sequence_length: 2048
   train_global_batch_size: 64
   train_micro_batch_size: 1
-  # ⚠️ 配方是 lr = 7.5e-5 × (bs/64)，bs=64 → 7.5e-5。
-  # 5 步不足以看出收敛差异，但照抄错误的 lr 到长训练会重演那次 45% 效率的失败。
+  # /!\ The recipe is lr = 7.5e-5 x (bs/64), so bs=64 -> 7.5e-5.
+  # Five steps cannot reveal a convergence difference, but copying the wrong lr
+  # into a long run would repeat that 45%-efficiency failure.
   learning_rate: 7.5e-5
   min_lr: 7.5e-6
   lr_decay_style: cosine
   weight_decay: 0.0
-  # 所有已记录的曲线都是 0.5；1.0 会改变哪些步被裁剪。
+  # Every recorded curve used 0.5; 1.0 would change which steps get clipped.
   max_grad_norm: 0.5
   warmup_ratio: 0.04
 
@@ -63,24 +78,28 @@ algorithm:
     draft_type: dspark
     loss_type: dspark
     sequential_mode: batch_alternating
-    # 刻意缩小：5 个 cached batch 就能走完一整轮 Phase A → Phase B 交替。
-    # bs=64 下每个 cached batch 约 11.3 GB，5 个约 57 GB，/dev/shm 放得下。
+    # Deliberately small: 5 cached batches are enough to walk a full Phase A ->
+    # Phase B alternation. At bs=64 each cached batch is about 11.3 GB, so 5 come
+    # to roughly 57 GB, which /dev/shm can hold.
     cache_batches: 5
-    # 不能用 /tmp：容器里的 /tmp 不是训练进程看到的那个 tmpfs。
+    # /tmp will not do: the container's /tmp is not the tmpfs the training
+    # process sees.
     cache_dir: /dev/shm/teacher_cache_atom_smoke
     grad_accum_steps: 1
     loss_decay_gamma: 4.0
     num_target_layers: 5
     spec_length: 7
-    # 与 train.yaml 一致：这五层是 draft 的特征契约，teacher 抓的必须是同一组。
+    # Same as train.yaml: these five layers are the draft's feature contract and
+    # the teacher must capture the same set.
     aux_hidden_state_layer_ids: [2, 23, 47, 71, 89]
     capture_mode: postnorm
-    # 与 train.yaml 一致。anchor_num 是峰值显存的主要驱动量（512 时实测 57.8 GiB），
-    # 用 64 跑 smoke 会把真实 run 的 OOM 风险测漏。
+    # Same as train.yaml. anchor_num is the main driver of peak memory (57.8 GiB
+    # measured at 512); smoking with 64 would hide the real run's OOM risk.
     anchor_num: 512
-    # ⚠️ ATOM 必须 false（与 vLLM 版相反）：ATOM 的 hidden_states 已含全部 5 层、
-    # last_hidden_states 已过 final norm。true 会让 fc 收到 43008 而非 35840。
-    # 详见 train.yaml 的注释。
+    # /!\ Must be false on ATOM (the inverse of the vLLM variant): ATOM's
+    # hidden_states already holds all 5 layers and last_hidden_states has passed
+    # the final norm. true would make fc receive 43008 instead of 35840. See the
+    # note in train.yaml.
     separate_last_hidden: false
     shift_input_embeds: false
     ce_loss_alpha: 0.1
@@ -92,47 +111,63 @@ algorithm:
     tensor_parallel_size: 8
     gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
     quantization: ""
-    # 与 train.yaml 一致：teacher 自己写 response（prompt-only on-policy）。
-    # ⚠️ 这一项和下面 dataset 的三个字段是绑在一起的，尤其是
-    # dataset.max_prompt_tokens——它为 0 时预处理不产出 prompt_ids，
-    # 生成路径会直接抛错。只改这一行会让 smoke 必然失败。
+    # Same as train.yaml: the teacher writes the response itself (prompt-only
+    # on-policy).
+    # /!\ This field is bound to the three dataset fields below, especially
+    # dataset.max_prompt_tokens — when that is 0, preprocessing emits no
+    # prompt_ids and the generation path raises immediately. Changing this line
+    # alone guarantees the smoke test fails.
     generate_mode: generate
-    # 与 train.yaml 一致。thinking=true 下实测 gen_mean 546、约 26% 撞顶，
-    # 撞顶是预期行为而非故障（截断对投机蒸馏无害，理由见 train.yaml）。
-    # smoke 里要确认的是 capped 比例落在 20-35% 这个量级，明显偏离说明渲染错了。
-    # 与 train.yaml 一致。必须 < max_model_len - max_prompt_tokens：填满窗口会让
-    # ATOM 的 block table 少一个槽位，worker 直接僵住。理由见 train.yaml。
+    # Same as train.yaml. With thinking=true, gen_mean measures 546 and about 26%
+    # of rows hit the cap; hitting the cap is expected behaviour, not a fault
+    # (truncation is harmless for speculative distillation — see train.yaml).
+    # What the smoke run should confirm is that the capped fraction lands in the
+    # 20-35% range; a clear deviation means the rendering is wrong.
+    # Also as in train.yaml, this must be < max_model_len - max_prompt_tokens:
+    # filling the window exactly leaves ATOM's block table one slot short and
+    # wedges the worker. See train.yaml for the reasoning.
     generate_max_tokens: 992
-    # 与 train.yaml 一致：0 = 整轮合成一遍 sweep。smoke 的一轮是 5 批 320 条，
-    # 正好走到合并提交这条路径（逐批提交时它完全不会被执行）。
+    # Same as train.yaml: 0 = the whole round in one sweep. A smoke round is 5
+    # batches of 320 rows, which is exactly enough to exercise the merged
+    # submission path (per-batch submission never executes it).
     generate_sweep_batches: 0
     generate_temperature: 0.0
     transport: mooncake
-    # ---- ATOM 引擎参数，与 train.yaml 逐字一致 ----
-    # ⚠️ ATOM 对不认识的键是静默丢弃的；worker 里加了校验会对未知键抛错。
+    # ---- ATOM engine parameters, verbatim from train.yaml ----
+    # /!\ ATOM silently discards unrecognised keys; the worker adds a validation
+    # pass that raises on unknown ones.
     atom:
       max_model_len: 2048
-      # 与 train.yaml 一致。这一项决定解码批形态（正是 vLLM 崩的地方），smoke 用小值
-      # 会把 256 并发下的 KDA recurrent state 行为整个测漏 —— 而那恰是这一版唯一
-      # 未充分验证的点。理由和实测数据见 train.yaml。
+      # Same as train.yaml. This decides the decode batch shape (precisely where
+      # vLLM crashes), and a small value in smoke would skip testing KDA
+      # recurrent-state behaviour at 256-way concurrency entirely — which is the
+      # one thing this revision has not adequately validated. Reasoning and
+      # measurements are in train.yaml.
       max_num_seqs: 256
-      # ⚠️ 必须 ≥ max_model_len，否则一条序列的 prefill 会被切成多个调度步，
-      # 而隐藏态按 request id 为 key 写入、后写覆盖先写，只会剩下最后一块。
+      # /!\ Must be >= max_model_len, or a sequence's prefill gets split across
+      # scheduler steps; hidden states are keyed on request id and later writes
+      # overwrite earlier ones, so only the last chunk survives.
       max_num_batched_tokens: 32768
-      # ⚠️ 两者都必须 false，否则隐藏态被静默截断（缺 prompt 段 / 只剩末块）。
-      # 理由见 train.yaml 的详细注释。
+      # /!\ Both must be false, or hidden states are silently truncated (missing
+      # the prompt span, or only the final chunk). Full reasoning in train.yaml.
       enable_prefix_caching: false
       enable_chunked_prefill: false
-      # 与 train.yaml 一致，理由见那边。0.85 下第二轮 teacher 重启必失败。
-      # ⚠️ smoke 要测到这条路必须跑满两轮（num_training_steps=10）：
-      # 默认的 5 步只有一轮，teacher 只启停一次，跨轮重启完全测不到。
+      # Same as train.yaml, see there for why. At 0.85 the round-2 teacher
+      # restart is certain to fail.
+      # /!\ Reaching that path in smoke requires two full rounds
+      # (num_training_steps=10): the default 5 steps are a single round, the
+      # teacher starts and stops once, and the cross-round restart is never
+      # tested.
       gpu_memory_utilization: 0.90
-      # 不用 fp8：省的 1.8 GB/卡 是 0.6%，但 fp8 会把 query 一起降精度、
-      # K/V 还多走一次量化 round-trip，而隐藏态就是训练标签。详见 train.yaml。
+      # Not fp8: the 1.8 GB per card it saves is 0.6%, while fp8 also drags the
+      # query down in precision and puts K/V through an extra quantization round
+      # trip — and the hidden states are the training labels. See train.yaml.
       kv_cache_dtype: bf16
-      # 与 train.yaml 一致：已实测关掉。graph pool 只占 0.24 GB，且捕获的全是
-      # max_q_len=1 的形状（只覆盖 decode，prefill 仍 eager），不碰 A2 的抓取路径。
-      # smoke 要确认的正是这一点：隐藏态宽度和有效长度不能因为开图而变化。
+      # Same as train.yaml: measured and turned off. The graph pool takes only
+      # 0.24 GB and every captured shape has max_q_len=1 (decode only, prefill
+      # stays eager), so it never touches A2's capture path. That is exactly what
+      # the smoke run must confirm: hidden-state width and effective length must
+      # not change because graphs are enabled.
       enforce_eager: false
   draft:
     from_scratch: true
@@ -172,8 +207,9 @@ algorithm:
 mooncake:
   protocol: tcp
   device_name: ""
-  # 与 train.yaml 一致：bs=64 下要搬的隐藏态和正式 run 一样大，
-  # 16GB/4GB 是按 bs=8 配的，会在传输层触发重试而不是暴露真实行为。
+  # Same as train.yaml: at bs=64 the hidden states to move are the same size as
+  # in the real run. 16GB/4GB were sized for bs=8 and would trigger retries in
+  # the transfer layer rather than exposing the real behaviour.
   global_segment_size: 32GB
   local_buffer_size: 8GB
   get_retry_max_wait_seconds: 300.0
@@ -192,15 +228,19 @@ dataset:
   last_turn_loss_only: false
   num_preprocess_workers: 96
   cache_dir: /dev/shm/lumenrl_cache
-  # ⚠️ 以下三项必须与 train.yaml 一致，原因有两层：
-  # 1. 它们进 tokenize 缓存键，不一致就会重新预处理出**另一份数据**，
-  #    smoke 验证的就不是正式 run 要用的数据了；
-  # 2. max_prompt_tokens 为 0 时不产出 prompt_ids，generate 模式直接抛错。
+  # /!\ The following three must match train.yaml, for two reasons:
+  # 1. they are part of the tokenize cache key, so a mismatch reprocesses into
+  #    **a different dataset** and the smoke run no longer validates the data the
+  #    real run will use;
+  # 2. when max_prompt_tokens is 0 no prompt_ids are emitted and generate mode
+  #    raises immediately.
   drop_overlong: true
   max_prompt_tokens: 1024
-  # ⚠️ 必须 true 且与 train.yaml 一致。thinking 决定解码起点落在 think 还是
-  # response channel，false 渲染出来是另一份数据、另一个缓存键。
-  # smoke 要顺带确认渲染正确：日志里的 prompt 应包含 <|open|>think<|sep|>。
+  # /!\ Must be true and must match train.yaml. thinking decides whether the
+  # decode starts on the think or the response channel; false renders a different
+  # dataset under a different cache key.
+  # The smoke run should confirm the rendering while it is at it: the prompt in
+  # the log should contain <|open|>think<|sep|>.
   thinking: true
 
 eval:
@@ -212,8 +252,9 @@ eval:
 reward:
   type: function
   function: math_reward
-  # 与 train.yaml 同一份打散后的全量数据。用 phase1 会命中不同的 tokenize 缓存键，
-  # 白等一遍预处理，而且验证的不是正式 run 的数据分布。
+  # The same shuffled full dataset as train.yaml. Using phase1 would hit a
+  # different tokenize cache key, wasting a full preprocessing pass and
+  # validating something other than the real run's data distribution.
   dataset: /dev/shm/kimi-mtp-dataset-full/train.jsonl
 
 checkpointing:
