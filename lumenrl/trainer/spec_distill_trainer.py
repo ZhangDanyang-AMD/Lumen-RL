@@ -313,6 +313,9 @@ class SpecDistillTrainer:
         # Measured on the first successful engine start; later restarts wait
         # for at least this much VRAM instead of failing deep inside ATOM.
         self._teacher_gpu_bytes: int | None = None
+        # The configured value, kept because the effective one is recomputed per
+        # start from what this process still holds.
+        self._teacher_base_gpu_util: float | None = None
         self._mooncake_master: Any | None = None
         self._draft_model: torch.nn.Module | None = None
         self._lm_head_weight: torch.Tensor | None = None
@@ -1837,6 +1840,21 @@ class SpecDistillTrainer:
     # Data loading helpers
     # ------------------------------------------------------------------
 
+    def _trainable_len(self, ds_len: int) -> int:
+        """Number of leading rows the training sampler is allowed to touch.
+
+        ``_build_eval_cache`` holds out the *tail* of the shuffled dataset, and the
+        sampler wraps at ``(step * bs) % len``. Taking that modulus over the full
+        length is only safe for a single epoch: the moment a run wraps, it walks
+        straight through the eval slice and trains on it. Excluding the tail here
+        makes the wrap land back at row 0 instead, which is what multi-epoch
+        training needs to keep eval meaningful.
+        """
+        if not self.config.eval.enabled:
+            return ds_len
+        held = min(int(self.config.eval.num_samples), ds_len)
+        return max(1, ds_len - held)
+
     def _get_batch_sequences(
         self, step: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1852,7 +1870,7 @@ class SpecDistillTrainer:
         if self._preprocessed is not None:
             from lumenrl.data.kimi_k25_parser import unpack_loss_mask
 
-            ds_len = len(self._preprocessed)
+            ds_len = self._trainable_len(len(self._preprocessed))
             start = (step * bs) % ds_len
             indices = [(start + i) % ds_len for i in range(bs)]
             max_len = self.config.policy.max_total_sequence_length
@@ -1920,7 +1938,7 @@ class SpecDistillTrainer:
                 for i in range(bs)
             ]
         else:
-            dataset_len = len(self._dataset)
+            dataset_len = self._trainable_len(len(self._dataset))
             start = (step * bs) % dataset_len
             indices = [(start + i) % dataset_len for i in range(bs)]
             samples = [self._dataset[idx] for idx in indices]
@@ -2017,7 +2035,7 @@ class SpecDistillTrainer:
             )
 
         bs = max(1, self.config.policy.train_global_batch_size)
-        ds_len = len(self._preprocessed)
+        ds_len = self._trainable_len(len(self._preprocessed))
         start = (step * bs) % ds_len
         indices = [(start + i) % ds_len for i in range(bs)]
 
@@ -2098,6 +2116,7 @@ class SpecDistillTrainer:
         free_before = (
             torch.cuda.mem_get_info()[0] if torch.cuda.is_available() else 0
         )
+        self._compensate_teacher_utilization()
         self._teacher_engine.start(mode=mode)
         if torch.cuda.is_available() and self._teacher_gpu_bytes is None:
             self._teacher_gpu_bytes = max(
@@ -2107,6 +2126,61 @@ class SpecDistillTrainer:
                 "[rank %d] Teacher engine footprint measured at %.1f GiB; "
                 "later restarts will wait for that much to be free",
                 self._rank, self._teacher_gpu_bytes / 1024 ** 3,
+            )
+
+    def _compensate_teacher_utilization(self) -> None:
+        """Raise the teacher's memory fraction by whatever this process still holds.
+
+        ATOM sizes its KV pool as::
+
+            non_torch  = (total - free) - its_own_reserved
+            available  = min(total * utilization - weights - non_torch
+                             - safety_margin, free)
+
+        ``total - free`` is device-wide, so everything the trainer still holds
+        lands in ``non_torch`` and is charged against a budget that is a fixed
+        fraction of the *whole* device. The teacher's affordable footprint
+        therefore shrinks one-for-one with the trainer's residual, even though
+        that residual is exactly what the fraction was supposed to leave room for.
+
+        Measured on this node (252 GiB cards, weights ~217.6 GiB, ~13.6 GiB held
+        after Phase B and the draft offload), the two starts want opposite things
+        and no single value satisfies both:
+
+            first start, 0.94  -> KV 14.3 GiB, leaves the trainer 20 GiB  (ok)
+            first start, 0.96  -> KV 19.3 GiB, leaves the trainer 15 GiB  (OOMs)
+            restart,     0.94  -> KV  0.7 GiB                            (dies)
+            restart,     0.96  -> KV  5.7 GiB                            (ok)
+
+        Adding ``residual / total`` cancels the charge exactly, so the teacher
+        gets the same absolute footprint at every start and the configured value
+        keeps meaning what it says on a quiet device. Over-allocation is not a
+        risk: ATOM clamps ``available_for_kv`` to physically free memory.
+        """
+        if not torch.cuda.is_available():
+            return
+        atom_cfg = getattr(self._teacher_engine, "_atom_config", None)
+        if not isinstance(atom_cfg, dict):
+            return
+        base = self._teacher_base_gpu_util
+        if base is None:
+            base = float(atom_cfg.get("gpu_memory_utilization", 0.9))
+            self._teacher_base_gpu_util = base
+        free, total = torch.cuda.mem_get_info()
+        if total <= 0:
+            return
+        resident = max(0, total - free)
+        # 0.995 rather than 1.0: ATOM's own 2% safety margin is inside the
+        # budget, and leaving nothing at all has no upside once the physical
+        # clamp is doing the real work.
+        util = min(0.995, base + resident / total)
+        atom_cfg["gpu_memory_utilization"] = util
+        if abs(util - base) > 1e-6:
+            logger.info(
+                "Teacher gpu_memory_utilization %.3f -> %.3f: this process still "
+                "holds %.1f GiB, which ATOM would otherwise charge against its "
+                "own KV budget",
+                base, util, resident / 1024 ** 3,
             )
 
     # A killed worker's pages come back asynchronously -- observed at up to
@@ -2273,6 +2347,56 @@ class SpecDistillTrainer:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    def _log_gpu_memory_all_ranks(self, when: str) -> None:
+        """Log free VRAM on every rank's device, not just this one.
+
+        The teacher comes back as eight tensor-parallel model runners, one per GPU,
+        and each sizes its pools from the free memory it finds on its own device.
+        A single training rank holding more than the others is therefore enough to
+        fail the restart, and is invisible to the rank-0-only snapshot: it surfaces
+        only as ``ModelRunner<k> proc died unexpectedly (exitcode=1)``, with the
+        actual reason in a worker log.
+
+        /!\\ Collective. Every rank must reach it, so it belongs next to a barrier,
+        not inside a rank-0 branch.
+        """
+        if not (
+            torch.cuda.is_available()
+            and self._is_distributed
+            and self._world_size > 1
+        ):
+            self._log_gpu_memory(when)
+            return
+        free, total = torch.cuda.mem_get_info()
+        local = torch.tensor(
+            [float(free), float(total), float(torch.cuda.memory_reserved())],
+            device=self._device,
+            dtype=torch.float64,
+        )
+        gathered = [torch.zeros_like(local) for _ in range(self._world_size)]
+        torch.distributed.all_gather(gathered, local)
+        if self._rank != 0:
+            return
+        gib = 1024 ** 3
+        frees = [g[0].item() / gib for g in gathered]
+        resv = [g[2].item() / gib for g in gathered]
+        logger.info(
+            "GPU memory %s, all ranks (GiB free): %s",
+            when,
+            "  ".join(f"r{i}={f:.1f}" for i, f in enumerate(frees)),
+        )
+        logger.info(
+            "GPU memory %s, all ranks (GiB torch-reserved): %s",
+            when,
+            "  ".join(f"r{i}={v:.1f}" for i, v in enumerate(resv)),
+        )
+        logger.info(
+            "GPU memory %s: tightest device is rank %d with %.1f GiB free "
+            "(spread %.1f GiB); the teacher sizes its pools per device, so this "
+            "is the number its restart has to fit into",
+            when, frees.index(min(frees)), min(frees), max(frees) - min(frees),
+        )
+
     def _log_gpu_memory(self, when: str) -> None:
         """Record what this rank is still holding, and what the device has left.
 
@@ -2301,8 +2425,18 @@ class SpecDistillTrainer:
             try:
                 if not torch.is_tensor(obj) or not obj.is_cuda:
                     continue
+                # torch.compile leaves FakeTensors reachable from dynamo's
+                # caches, and their sizes are SymInts, not ints. Summing and
+                # sorting those forces a guard on a shape env that is no longer
+                # active, which raises "vr must not be None for symbol s18" and
+                # takes the run down -- from a logging helper. They also occupy
+                # no memory, which is the only thing this function measures.
+                if obj.is_meta or isinstance(obj, torch._subclasses.FakeTensor):
+                    continue
                 nbytes = obj.untyped_storage().nbytes()
             except Exception:
+                continue
+            if not isinstance(nbytes, int):
                 continue
             key = f"{tuple(obj.shape)}x{obj.dtype}"
             sizes.setdefault(key, []).append(nbytes)
@@ -2812,10 +2946,35 @@ class SpecDistillTrainer:
             nbytes = 2
             for d in shape:
                 nbytes *= d
-            with open(f"{batch_dir}/{key}.bin", "rb") as f:
-                raw = f.read(nbytes)
-            t = torch.frombuffer(bytearray(raw), dtype=torch.uint8).clone()
-            result[key] = t.view(torch.bfloat16).reshape(shape)
+            # Map the file instead of reading it. The previous form,
+            #   torch.frombuffer(bytearray(f.read(n)), ...).clone()
+            # made three full copies of every tensor: read() allocated a bytes
+            # object, bytearray() copied it to get something mutable, and clone()
+            # copied again to own the memory. aux_hidden_states alone is
+            # [16, 8165, 35840] bf16 = 9.4 GB, so that was ~28 GB of
+            # single-threaded memcpy per step, and this function was measured at
+            # 70-104 s of a 90-140 s optimizer step -- 80-92% of it.
+            #
+            # The cache lives on tmpfs, so mapping it is not merely fewer copies,
+            # it is none: the pages already exist and the per-micro-batch H2D
+            # reads them where they are. This is the same thing _load_from_shm
+            # does with the same data.
+            path = f"{batch_dir}/{key}.bin"
+            # from_file *extends* a file that is shorter than nbytes rather than
+            # failing, so a truncated write would silently become zero-padded
+            # hidden states. Only a size check catches that.
+            actual = os.path.getsize(path)
+            if actual < nbytes:
+                raise RuntimeError(
+                    f"cache file {path} is {actual} bytes, expected {nbytes}; "
+                    f"the Phase A write for this batch did not complete"
+                )
+            storage = torch.UntypedStorage.from_file(
+                path, shared=True, nbytes=nbytes,
+            )
+            result[key] = (
+                torch.empty(0, dtype=torch.bfloat16).set_(storage).reshape(shape)
+            )
         for name in ("input_ids", "attention_mask", "loss_mask"):
             if name not in meta:
                 continue
@@ -3135,6 +3294,13 @@ class SpecDistillTrainer:
             metrics_accum: dict[str, float] = {}
             accum_count = 0
             opt_step_idx = 0
+            # Where the step actually goes. Added after an optimisation that made
+            # the model's own forward+backward ~26x cheaper moved the step time
+            # not at all: profiled in isolation a micro-batch is 262 ms, so 16 of
+            # them are 4.2 s against a measured 110 s step, and the rest was
+            # being attributed by guesswork. The sync costs one barrier per
+            # micro-batch and is what makes the split meaningful.
+            t_load = t_h2d = t_compute = t_opt = 0.0
 
             for batch_idx in range(round_num_batches):
                 group_start = (batch_idx // grad_accum) * grad_accum
@@ -3153,8 +3319,11 @@ class SpecDistillTrainer:
                         for cb in self.callbacks:
                             cb.on_step_begin(self, step)
                     step_start = time.time()
+                    t_load = t_h2d = t_compute = t_opt = 0.0
 
+                _t0 = time.time()
                 loaded = self._load_batch_from_disk(cache_dir, round_idx, batch_idx)
+                t_load += time.time() - _t0
 
                 cpu_data = {k: loaded[k] for k in self._TEACHER_KEYS}
                 input_ids = loaded["input_ids"]
@@ -3166,17 +3335,25 @@ class SpecDistillTrainer:
                     self._grad_accum_steps *= actual_group_size
                 mb_metrics: dict[str, float] = {}
                 for lo, hi in mbs:
+                    _t0 = time.time()
                     mb_teacher = {k: v[lo:hi].to(self._device) for k, v in cpu_data.items()}
                     mb_teacher["input_ids"] = input_ids[lo:hi].to(self._device)
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    t_h2d += time.time() - _t0
                     mb_mask = attention_mask[lo:hi]
                     mb_loss_mask = loss_mask[lo:hi]
 
+                    _t0 = time.time()
                     if draft_type == "dspark":
                         m = self._train_step_dspark(mb_teacher, mb_mask, mb_loss_mask)
                     elif draft_type == "eagle3":
                         m = self._train_step_eagle3(mb_teacher, mb_mask, mb_loss_mask)
                     else:
                         m = self._train_step_dflash(mb_teacher, mb_mask, mb_loss_mask)
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    t_compute += time.time() - _t0
 
                     for k, v in m.items():
                         if isinstance(v, float) and v == v:
@@ -3190,13 +3367,25 @@ class SpecDistillTrainer:
                 accum_count += 1
 
                 if is_last_in_accum:
+                    _t0 = time.time()
                     grad_norm = self._optimizer.step()
                     self._optimizer.zero_grad(set_to_none=True)
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    t_opt += time.time() - _t0
 
                     metrics = {k: v / accum_count for k, v in metrics_accum.items()}
                     metrics["grad_norm"] = float(grad_norm)
                     metrics["lr"] = self._optimizer.get_learning_rate()
-                    metrics["timing/step_s"] = time.time() - step_start
+                    step_s = time.time() - step_start
+                    metrics["timing/step_s"] = step_s
+                    metrics["timing/cache_load_s"] = t_load
+                    metrics["timing/h2d_s"] = t_h2d
+                    metrics["timing/fwd_bwd_s"] = t_compute
+                    metrics["timing/optimizer_s"] = t_opt
+                    metrics["timing/other_s"] = (
+                        step_s - t_load - t_h2d - t_compute - t_opt
+                    )
                     metrics["seq/max_len"] = int(input_ids.shape[1])
 
                     if self._is_distributed:
@@ -3238,6 +3427,10 @@ class SpecDistillTrainer:
 
             if self._is_distributed:
                 torch.distributed.barrier()
+
+            # Every rank's device, immediately before rank 0 tries to fit the
+            # teacher back onto all eight of them.
+            self._log_gpu_memory_all_ranks(f"before round {round_idx + 1} teacher restart")
 
             # Restart vLLM engine for next round's Phase A, in the mode that phase
             # actually opens with. Starting an extraction engine here would be

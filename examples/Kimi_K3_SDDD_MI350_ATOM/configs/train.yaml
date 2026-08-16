@@ -1,62 +1,43 @@
-# Kimi K3 DSpark SDDD — MI350 (ATOM teacher, Batch-Alternating, 8-GPU Sequential)
+# Kimi K3 DSpark SDDD — MI350 (ATOM teacher, off-policy prefill, 8-GPU sequential)
 #
-# The same recipe as Kimi_K3_SDDD_MI350_vllm/configs/train.yaml, with only the
-# teacher's inference backend swapped from vLLM to ATOM. Draft, loss, lr, batch
-# and dataset are all kept verbatim, so the curves measured under vLLM prefill
-# remain directly comparable.
+# Second-generation recipe. The first run is documented in
+# amd-rl-runbook/kimi-k3-dspark-sddd-lumenrl-atom-runbook.md; the analysis behind
+# every change here is in
+# amd-rl-runbook/kimi-k3-dspark-torchspec-alignment-log.md.
 #
-# Why the switch: decoding K3 at B=64, vLLM hits a GPU memory access fault every
-# 15-20 batches (KDA recurrent-state slot handling when a request runs into
-# max_tokens; at the crash, num_output_tokens=[511,511,511] — one token short of
-# 512). All three MLA configurations reproduce it (fp8+aiter / fp8+TRITON /
-# bf16+aiter). A round needs 50 consecutive batches, the MTBF is shorter than a
-# round, and a restart costs 20 minutes — that path is a dead end.
+# -- Why this file was rewritten ---------------------------------------------
+# The first run converged (eval AL 1.863 at step 5000 of 5413) and then served
+# at 6.0% acceptance on ATOM against the official Kimi-K3 target, where
+# Inferact's released DSpark draft measures 26.1% on the identical stack. The
+# draft had been trained under an attention definition ATOM does not implement:
 #
-# Two structural consequences of ATOM:
-#   1. Hidden states are captured through forward hooks, orthogonal to decoding,
-#      so **one engine instance serves both sweeps**. On vLLM, A1 and A2 each
-#      need their own engine config, switched twice per round, reloading 1.5 TB
-#      of weights every time. On ATOM the two sweeps differ only in whether the
-#      request carries an external id.
-#   2. Capture can be skipped per request, so the pure-generation A1 sweep does
-#      not push prompt hidden states to Mooncake (~4.7 GB per batch at B=64 that
-#      nobody reads).
+#   1. RoPE rotation. LumenRL rotated NeoX half-split; DeepSeek/Kimi MLA — and
+#      therefore TorchSpec, and therefore ATOM under the published config —
+#      rotates interleaved pairs. Note ATOM's config key for this is
+#      `rope_interleave` wired to aiter's `is_neox_style`, so its meaning is the
+#      inverse of its name.
+#   2. Softmax scale. LumenRL used 1/sqrt(qk_head_dim); TorchSpec and ATOM both
+#      widen it by yarn_get_mscale(factor, mscale_all_dim)^2 = 1.8133x.
 #
-# Batch-alternating data flow:
-#   1. Phase A1: ATOM decodes prompt -> the teacher's own response (no capture)
-#   2. Phase A2: the full prompt+response is re-prefilled and layers
-#      [2,23,47,71,89] are captured, Mooncake -> /dev/shm (capture on, same engine)
-#   3. Once cache_batches batches are collected, the draft goes onto the GPUs and
-#      trains on the cached hidden states
-#   4. The draft is offloaded back to CPU; return to step 1
+# Both are fixed in lumenrl/models/dspark.py and asserted numerically by
+# selfcheck/verify_rope_alignment.py, which rebuilds ATOM's own rotary embedding
+# through the same get_rope call the server makes and compares. Serving knobs
+# were used to paper over both during the benchmark (rope_interleave: true,
+# mscale 0/0) and recovered 6.01% -> 14.82%; they are not used any more, because
+# a checkpoint that needs them is not a K3DSparkModel checkpoint.
 #
-# -- 2026-08-08: thinking enabled + Phase A1 sped up -------------------------
-# The previous revision (thinking=false, cap 512, one batch per sweep, eager) was
-# stopped at step 399 with train AL 0.459 and still climbing. It was stopped
-# because two things had to change together:
+# Hyperparameters are now copied from TorchSpec's reference recipe,
+# configs/vllm_kimi_k3_dspark_stage1.yaml, instead of being re-derived. See
+# policy:.
 #
-#   1. thinking has to be on. K3 is a preserved-thinking model and only supports
-#      effort=max; thinking=false pins the decode start on a channel the model
-#      was never trained for. The reason for leaving it off was fear that the
-#      think block would eat the whole budget, and measurement showed that fear
-#      is unfounded (see dataset.thinking).
-#   2. Phase A1 took 73% of a round's wall clock at only 47.8% slot utilisation.
-#      Two causes: submitting one batch at a time (idle tail) and eager mode,
-#      worth 1.5x and 2.4x respectively.
-#
-# The changes are confined to the teacher and the data side; draft, loss, lr and
-# batch are untouched, so the curves stay comparable. The memory watermark (peak
-# 83% VRAM) is identical to the previous revision — neither max_num_seqs nor
-# gpu_memory_utilization moved, only a 0.24 GB CUDA graph pool was added.
-#
-# Net effect (smoke measurements extrapolated to a 50-batch round):
-#   Phase A1  62 -> 18 min      merged sweep + CUDA graph + 256 slots
-#   Phase A2       ~12 min
-#   Phase B        ~9 min       50 steps x 11.3 s (sequences got longer, was ~9 s)
-#   teacher reload ~5 min       the engine is torn down before Phase B and
-#                               reloaded for the next round
-#   round total  85 -> ~44 min
-# And this is with more than twice the tokens (cap 512 -> 1024, gen_mean 245 -> 546).
+# -- Data flow ----------------------------------------------------------------
+#   1. Phase A: ATOM re-prefills each dataset row's full prompt+response and
+#      captures layers [2,23,47,71,89], Mooncake -> /dev/shm. There is no decode
+#      sweep; responses were pre-generated by K3 in a separate pass, which makes
+#      this a cached on-policy distillation run through the off-policy path.
+#   2. Once cache_batches batches are collected, the draft goes onto the GPUs and
+#      trains on the cached hidden states.
+#   3. The draft is offloaded back to CPU; return to step 1.
 #
 # Usage:
 #   bash examples/Kimi_K3_SDDD_MI350_ATOM/run_kimi_k3.sh
@@ -66,35 +47,52 @@ cluster:
   num_nodes: 1
 
 policy:
-  model_name: /dev/shm/Kimi-K3
+  model_name: /home/jimguo12/k3-target-official
   training_backend: fsdp2
   generation_backend: hf
-  # T=8192 has never run end to end; measured, 1000 steps would take 50 hours.
-  # 2048 is the value behind every validated curve.
-  max_total_sequence_length: 2048
-  # /!\ lr and train_global_batch_size are bound together; do not copy one alone.
-  # The reference recipe is lr=6e-4 @ bs=512; this file runs bs=64, so linear
-  # scaling gives lr=7.5e-5.
-  # On 2026-07-31 a run put lr=6e-4 straight onto bs=8 (64x above linear
-  # scaling). It did not diverge, but per-sample convergence efficiency was only
-  # 45% of baseline, and it was abandoned after 2468 steps.
-  # The same day, bs=512 + 6e-4 **diverged**: ce_loss=11.30 at step 2 was still
-  # sane, step 3 jumped to 26.60, and it stayed above the ln(163840)=12.007
-  # random baseline from then on. Changing the batch means changing the lr.
-  train_global_batch_size: 64
+  # 8192, up from the first run's 2048. TorchSpec stage1 trains at 32768, but that
+  # is 8 dedicated training GPUs on 2 nodes with inference on another 4; here the
+  # teacher time-shares the same 8 GPUs.
+  #
+  # Confirmed against the cached on-policy set rather than assumed: rows are
+  # mean 1071, p50 568, p90 2441, p99 6399 tokens, so **8192 keeps 98.7%**
+  # (106,366 of 107,760). 16384 would keep 100%, and costs more than it is worth —
+  # the extra 1,394 rows nearly double the padded batch width (worst cached batch
+  # 186 GiB against 98 GiB), which drops cache_batches from 10 to 6 and adds ~75
+  # reloads across the run. 4096 would still keep 96.1% if the budget ever demands
+  # it.
+  #
+  # /!\ Known gap, deliberately accepted: the target is served at
+  # max_model_len 16384, so the draft will meet positions it never trained on and
+  # is relying on YaRN extrapolation there. The 1.3% dropped are exactly the
+  # longest-reasoning rows, and the dataset already biases against them (every row
+  # that hit the 15328-token generation cap was dropped upstream for having no
+  # closing think marker). Worth watching in eval before blaming anything else.
+  #
+  # /!\ Every hidden-state budget in this file scales linearly with it — see the
+  # sizing table under mooncake:.
+  max_total_sequence_length: 8192
+  # ---- Optimizer block copied from TorchSpec vllm_kimi_k3_dspark_stage1.yaml.
+  # /!\ These are a set; do not re-derive one from another. The first run scaled
+  # lr linearly from a 6e-4 @ bs=512 recipe and got 7.5e-5 @ bs=64. TorchSpec's
+  # reference is 5e-5 @ bs=128 — 2.7x below what that scaling law predicts — and
+  # it is the recipe behind a draft that serves at 26%.
+  #
+  # TorchSpec expresses the batch as 8 ranks x micro_batch_size 1 x
+  # draft_accumulation_steps 16 = 128. LumenRL derives the same: _plan_micro_batches
+  # computes ceil((128 / 1) / 8) = 16 backward passes per rank, and the effective
+  # batch stays 128. `_grad_accum_steps` is not a config field.
+  train_global_batch_size: 128
   train_micro_batch_size: 1
-  # The only value that has produced a healthy curve (train1000_v4). Equal to the
-  # runbook's linear scaling: 6e-4 x 64/512.
-  learning_rate: 7.5e-5
-  weight_decay: 0.0
-  # Every recorded curve used 0.5. In steady state grad_norm measures 0.48-1.38,
-  # so 1.0 would change which steps get clipped, and the randomly initialised
-  # first step (grad_norm 116-148) would take a twice-as-large update.
-  max_grad_norm: 0.5
-  # Keep min_lr = lr/10; it scales with learning_rate.
-  min_lr: 7.5e-6
-  warmup_ratio: 0.04
+  learning_rate: 5.0e-5
+  min_lr: 0.0
   lr_decay_style: cosine
+  weight_decay: 0.0
+  # 1.0, from TorchSpec. The first run's 0.5 was chosen against a grad_norm
+  # distribution (0.48-1.38) measured under the old lr and batch, so it does not
+  # transfer.
+  max_grad_norm: 1.0
+  warmup_ratio: 0.04
 
 algorithm:
   name: spec_distill
@@ -102,36 +100,73 @@ algorithm:
     draft_type: dspark
     loss_type: dspark
     sequential_mode: batch_alternating
-    # A cached batch scales linearly with batch size:
-    #   bs=8 -> 1.41 GB    bs=64 -> 11.3 GB    bs=512 -> ~84 GB (measured)
+    # /!\ Down from the first run's 50, because a cached batch grew ~8x with the
+    # batch size and the window. Sized against tmpfs, which is the binding
+    # constraint:
+    #   (5 aux + 1 token_embeds + 1 last_hidden) x 7168 x 2 B = 98 KiB per token
+    # /dev/shm is 1.5 TiB, less the 238 GiB mooncake segment and the dataset and
+    # tokenizer caches, so ~1288 GiB is usable; taken at 85% that is 1095 GiB.
     #
-    # Two constraints:
-    #   1. /dev/shm is only 1.3 TB -> cache_batches x batch size must fit
-    #   2. In Phase B every rank reads a whole cached batch into its own CPU
-    #      memory (_load_batch_from_disk; splitting into micro-batches saves
-    #      compute, not memory), so the instantaneous cost is 8 x one batch, and
-    #      the tmpfs draws on that same 2.7 TiB of RAM.
+    # Measured on the cached on-policy set at this window (preprocess_dataset.py):
+    # a cached batch pads to its own longest row, and over the batches the sampler
+    # actually builds that is **median 85.0 GiB, worst 98.0 GiB** — so the ceiling
+    # is **11** and 10 sits at 980 GiB with real margin.
     #
-    # At bs=64, 50 rounds -> 565 GB of tmpfs plus 90 GB instantaneous, which is
-    # comfortable (the value measured in train1000_v4).
-    cache_batches: 50
+    # /!\ Size against the worst batch, not the median: one long batch in a round
+    # fills tmpfs and the round dies. A previous revision said 20 (2.1 TB) and
+    # would have died partway through round 0.
+    #
+    # /!\ Do not repeat the units error this line used to contain: the batch
+    # figures are GiB and a 1.5 "TB" budget is 1.5 TiB. Mixing them overstates the
+    # ceiling by 7%, which is most of the margin.
+    #
+    # Worth knowing where the space goes: median row is 568 tokens but median
+    # batch pads to ~7100, so ~92% of the cache is padding. TorchSpec exposes
+    # `length_group_size` for exactly this and sets it to 1 (off); grouping by
+    # length would shrink cached batches several-fold and cut the reload count
+    # with it. Left off here to keep batch composition identical to the reference.
+    #
+    # Host RAM no longer binds: Phase B used to read a whole batch into every
+    # rank's own memory, but _load_batch_from_disk now maps the tmpfs pages, so
+    # the eight ranks share one copy instead of holding 8 x 103 GB.
+    #
+    # This also sets the wall clock. Phase B is 9.5 s/step against 104 s/batch of
+    # Phase A prefill and an 11 min teacher reload per round, so what
+    # cache_batches really buys is fewer reloads: 10 costs ~66 h of reloading
+    # across the run, and every batch added takes ~6 h off that. Raise it only
+    # against a measured round-0 cache directory, not against this arithmetic —
+    # real batches pad to 7250-8165 rather than 8192, so there is maybe 10% of
+    # slack, not a second batch's worth.
+    cache_batches: 10
     cache_dir: /dev/shm/teacher_cache_atom
     # No gradient accumulation across batches. One cached batch = one optimizer
-    # step. Effective GBS = train_global_batch_size = 64.
+    # step. Effective GBS = train_global_batch_size = 128.
     grad_accum_steps: 1
-    # DSpark position decay: w_k = exp(-k / gamma)
+    # TorchSpec dspark_loss_decay_gamma. Position decay w_k = exp(-k / gamma).
     loss_decay_gamma: 4.0
+    # TorchSpec dspark_num_target_layers
     num_target_layers: 5
+    # TorchSpec ttt_length / dflash_block_size. draft.block_size must agree: the
+    # trainer reads spec_length but passes block_size to the model.
     spec_length: 7
-    # /!\ These five layers are the draft's feature contract; the teacher must
-    # capture exactly the same five. ATOM's hook captures hidden_states +
-    # residual (the post-layer residual stream), which is semantically equal to
-    # capture_mode: postnorm, and ATOM's own DSpark checkpoint came out of this
-    # path. Changing the layers means changing num_target_layers and the draft's
-    # input width along with it.
+    # /!\ Deliberately NOT TorchSpec's [7, 31, 47, 63, 87]. That is the repo's
+    # example stage1 value; the *released* Inferact Kimi-K3-DSpark checkpoint —
+    # the one measuring 26.13% — declares [2, 23, 47, 71, 89], and so did the
+    # first LumenRL run.
+    #
+    # These ids are not training-only. ATOM reads them back at serving time
+    # (atom/config.py -> dspark_target_layer_ids) to pick which target layers to
+    # feed the draft, under the same "output of layer i" convention that
+    # configure_hidden_states() captures with — so no +1 shift applies on this
+    # path, whatever TorchSpec's own vLLM plumbing does.
+    #
+    # Keeping them is what makes this run's curves comparable to the first one's,
+    # which is the only way to attribute a change to the attention fix rather
+    # than to a different feature contract.
     aux_hidden_state_layer_ids: [2, 23, 47, 71, 89]
     capture_mode: postnorm
-    # anchor_num is the main driver of peak memory (57.8 GiB measured at 512).
+    # TorchSpec dspark_num_anchors, and the main driver of Phase B peak GPU
+    # memory (57.8 GiB measured at 512 with the 2048 window).
     anchor_num: 512
     # /!\ Must be false on ATOM, the inverse of the vLLM variant, because the two
     # storage conventions differ:
@@ -147,182 +182,143 @@ algorithm:
     # applied a second time.
     separate_last_hidden: false
     shift_input_embeds: false
-    # DSpark loss weights
+    # TorchSpec dspark_ce_loss_alpha / _l1_loss_alpha / _confidence_head_alpha
     ce_loss_alpha: 0.1
     l1_loss_alpha: 0.9
     confidence_loss_alpha: 1.0
   teacher:
-    model_name: /dev/shm/Kimi-K3
+    model_name: /home/jimguo12/k3-target-official
     inference_backend: atom
     tensor_parallel_size: 8
     gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
     quantization: ""
-    # On-policy: the teacher writes the response itself; the dataset's reference
-    # answer is no longer used as training data. What goes in is prompt-only
-    # (dataset.max_prompt_tokens makes preprocessing emit prompt_ids), so the
-    # response matches the distribution seen at inference time.
-    generate_mode: generate
-    # Prompt and response share one 2048 window, so the counterpart of
-    # max_prompt_tokens=1024 is 1024.
+    # /!\ Off-policy prefill, changed from the first run's `generate`. The
+    # responses were already written by K3 in a separate decode pass, so the
+    # teacher only re-prefills prompt+response out of input_ids and captures
+    # hidden states.
     #
-    # Measured (768 real prompts, thinking=true + effort=max, a one-off sampling
-    # run on the ATOM engine): K3's own output has a median of just 398 tokens
-    # (think 191 + response 192), but a mean of 1108, p90 of 2724 and a p99 that
-    # saturates 8192 — most questions get a short think, a few think forever, and
-    # the tail is entirely think-driven (think mean 735 vs response 310).
-    #
-    # /!\ 1024 was chosen over covering p90 because **truncation is harmless for
-    # speculative distillation**: the draft learns "given a prefix, predict the
-    # teacher's next token", and in a truncated sequence every position's target
-    # is still a token the teacher really produced. _build_generated_masks scores
-    # the whole generated span and does not require an EOS, so a row that hits
-    # the cap still contributes full supervision and is not silently zeroed.
-    # (This is the opposite of SFT — the "learns to continue text the teacher
-    #  would never produce" argument in dataset.drop_overlong applies only to
-    #  cutting a reference answer in half, not to on-policy self-generation.)
-    #
-    # So the cap is purely a cost / long-position-coverage trade-off. Measured
-    # Phase A1 time per round (50 batches x 64):
-    #   cap  gen_mean  truncated  A1 @816 tok/s
-    #   512    376       42.7%     24.4 min
-    #  1024    546       26.0%     35.7 min   <- chosen; window stays at the
-    #                                            validated 2048
-    #  2048    745       15.0%     48.6 min   (needs a 3072 window, unvalidated)
-    #
-    # /!\ 992 rather than 1024: prompt and response must leave the window some
-    # slack instead of filling it exactly. When a row's length lands exactly on
-    # max_model_len, ATOM asks the block table for ceil((2048+1)/16)=129 blocks
-    # while the table was allocated max_model_len//16=128, so
-    # prepare_block_tables raises ValueError and the worker wedges — it does not
-    # exit with an error, the command simply never returns, showing up as a
-    # 10-minute timeout mid-round (this burned two rounds: Round 9 batch 12 and
-    # Round 1 batch 11, and replaying the same batch reproduces it every time).
-    # It triggers only when a single row both fills the prompt budget and hits
-    # the generation cap, which is rare enough that smoke tests never see it, so
-    # setup now hard-validates it (gen + prompt >= max_model_len refuses to
-    # start). 992 leaves 32 tokens (2 blocks) of slack; the truncation rate rises
-    # from 26.0% to about 26.6%, which is negligible.
-    generate_max_tokens: 992
-    # How many batches to submit in one sweep. A sweep runs until its slowest
-    # sequence finishes, so a sweep holding a single batch spends its tail
-    # decoding a few rows at nearly the cost of a full slate; merging lets the
-    # scheduler backfill freed slots from the next batch. This alone is worth
-    # 1.5x (at identical parameters, 64 rows per batch gives ~220 tok/s while 768
-    # rows in one sweep gives 336 tok/s). 0 = the whole round in one sweep.
-    generate_sweep_batches: 0
-    # Greedy, matching the runbook's on-policy recipe and keeping the same data
-    # reproducible. Across three different engine configurations gen_mean landed
-    # at 548-552 and p50 at 405-411, confirming reproducibility.
-    generate_temperature: 0.0
+    # Three consequences, all simplifications:
+    #   - Phase A1 disappears; a round is extract + train, losing ~15.6 min.
+    #   - dataset.max_prompt_tokens no longer has to be > 0 (it exists to emit
+    #     prompt_ids for the generate path), so the whole-sequence length filter
+    #     comes back on — see dataset.drop_overlong.
+    #   - generate_max_tokens / generate_sweep_batches / generate_temperature are
+    #     unused, and the block-table wedge that cost the first run two rounds
+    #     (a row landing exactly on max_model_len) cannot fire.
+    generate_mode: prefill
     transport: mooncake
     # ---- ATOM engine parameters (filtered onto atom.config.Config fields) ----
     # /!\ ATOM **silently discards** keys it does not recognise, so a misspelled
     # name fails without a word. atom_teacher_engine's worker therefore adds a
     # validation pass that raises on unknown keys.
     atom:
-      max_model_len: 2048
-      # /!\ No longer equal to train_global_batch_size. The batch size decides
-      # how many sequences a cached batch holds, while this decides how many are
-      # in flight while decoding — with merged sweeps a round submits all 3200
-      # rows at once, so this is purely a throughput knob.
-      #
-      # Measured (window 2048, cap 1024, graphs on, 768 prompts; peak VRAM
-      # sampled with rocm-smi, teacher alone on the GPUs):
-      #   slots  util   tok/s   teacher peak
-      #     64   0.85    816       83%
-      #    128   0.85   1055       85%
-      #    256   0.85   1900       88%   <- chosen
-      #    256   0.88   1956       91%   (3% more memory for 3% more speed)
-      # The plateau after weight loading is 70% (~202 GB/card); the difference is
-      # the KV cache.
-      #
-      # /!\ Raising util is the wrong lever. The initial assumption was that 256
-      # slots would need util 0.92; measurement shows it fits at 0.85, because at
-      # a 2048 window each slot's per-request pool is only about 27 MB, so 256
-      # slots come to 6.9 GB. The 0.92 setting measured 1941 tok/s against 0.85's
-      # 1900 — no difference. The bottleneck was always slots, never util.
-      #
-      # Why this does not collide with training: the trainer tears the whole
-      # teacher engine down before Phase B (log line "Teacher engine shut down
-      # for Phase B", VRAM drops to 23%), so the real constraint lives inside
-      # Phase A, where teacher and trainer (~7%) coexist. Measured in smoke: 64
-      # slots peak at 90%, 256 slots at 89% — the same.
-      #
-      # /!\ The one thing not adequately validated is the long-run stability of
-      # the KDA recurrent state at 256-way concurrency (smoke only decoded for
-      # 1.8 minutes). This is recoverable: a checkpoint is saved every round, so
-      # a genuine crash costs one round before falling back to 64. Note this is
-      # unlike vLLM's situation, where the MTBF (15-20 batches) was shorter than
-      # a round (50 batches) and there was nowhere to fall back to. Watch for GPU
-      # faults in the first few rounds.
-      max_num_seqs: 256
+      max_model_len: 8192
+      # /!\ Down from the first run's 256, which was tuned for decode throughput
+      # at a 2048 window. There is no decode here, and each slot's state is 4x
+      # larger. The 2026-08-14 serving benchmark hit this wall from the other
+      # side: K3's KDA recurrent-state cache scales linearly with max_num_seqs
+      # and at 64 slots wanted 28.9 GB per rank against a 19 GB budget. Prefill
+      # concurrency is not the round's bottleneck; measure before raising it.
+      max_num_seqs: 32
       # /!\ Must be >= max_model_len. Hidden states are written per scheduler
       # step, keyed on request id, and a second write to the same key overwrites
       # the first; if a sequence's prefill is split into several chunks, only the
-      # last one survives. ATOM's own max_num_batched_tokens >= max_model_len
-      # assertion is commented out, so this guarantee is ours to keep (the worker
-      # checks it).
-      max_num_batched_tokens: 32768
+      # last one survives. ATOM's own assertion for this is commented out, so
+      # this guarantee is ours to keep (the worker checks it). 8192 is exactly
+      # max_model_len, so the longest single sequence still lands in one scheduler
+      # step and the guarantee holds. This is the floor: any lower and long rows
+      # get chunked and silently lose all but their last chunk.
+      #
+      # /!\ This also sets the *transient* prefill activation peak, which is the
+      # scarcest resource at a round restart. From the two budget lines the engine
+      # prints (first start vs restart):
+      #
+      #                            first start   restart
+      #   utilization                      0.9    0.9497
+      #   budget                     226.79 GB  239.30 GB
+      #   non_torch                   11.69 GB   23.61 GB
+      #   KV + state pool             12.82 GB   13.41 GB
+      #   left for activations        30.23 GB   17.72 GB
+      #
+      # The 11.92 GB jump in non_torch is the trainer's residual (DDP gradient
+      # buckets, see the alignment log). _compensate_teacher_utilization hands
+      # that back as budget so the KV pool stays viable, which is the only reason
+      # the teacher starts at all — but the memory is not really there, so it is
+      # taken out of activation headroom instead.
+      #
+      # 32768 failed outright. 16384 halved the peak exactly as intended (the
+      # failing allocation went 3,732,930,560 -> 1,864,368,128 B) and still was
+      # not enough: seven ranks reported 226-918 MB free at the moment of failure.
+      # These are allocator *warnings*, not exceptions — the request never
+      # completes and the engine crawls instead of dying, surfacing as "teacher
+      # stopped responding to cmd=extract_hidden after 600.0s". Batches that
+      # normally take 10-20 s took 57 s, 201 s, or blew the 600 s timeout; that
+      # cost round 1 about 14 min and round 2 about 4 min, out of a 22 min round.
+      #
+      # 8192 halves the peak once more. Engine time roughly doubles, but prefill
+      # is only ~12 s of a ~75 s batch, so the round pays ~9% to stop losing
+      # 4-14 min of it. Do not raise this without first freeing the trainer's
+      # residual — that residual is the width of the squeeze.
+      max_num_batched_tokens: 8192
       # /!\ Must be false. Cache-hit prefixes are not counted in
       # scheduled_tokens, and hidden states only cover the tokens scheduled in
-      # that step — A1's decode has already prefilled the same prompts, so during
-      # the A2 extract the whole prompt span hits the cache and the features
-      # written to Mooncake are missing the prompt entirely.
+      # that step.
       enable_prefix_caching: false
       # /!\ Must be false. ATOM's _store_hidden_states does not check
       # is_final_chunk, so a chunked prefill writes every chunk to the same key
       # and only the last one survives.
       enable_chunked_prefill: false
-      # The teacher shares all 8 GPUs with training (time-multiplexed; the draft
-      # is already offloaded during Phase A).
+      # 0.90 is the value for a *quiet* device, and the trainer now raises it per
+      # start by whatever it still holds — see
+      # _compensate_teacher_utilization(). Do not tune this to fix a restart
+      # failure; the two starts want opposite values and no single one works.
       #
-      # /!\ 0.85 makes the teacher restart fail from round 2 onward; do not put
-      # it back. The reason is that the time multiplexing is not clean: after
-      # Phase B finishes and the draft is offloaded, the training process still
-      # holds about 23 GB (CUDA context + RCCL ~6.4 GB, torch reserved 16.6 GB —
-      # of which only 4.6 GB are live DDP gradient buckets, the rest being
-      # fragmentation, since a segment holding any live block cannot go back to
-      # the driver). The teacher's KV budget is computed from the free memory at
-      # the moment it starts, so those 23 GB come straight out of it:
-      #   0.85 x 288 - 23 - 219 (weights) = 2.5 GB < the 13.39 GB that 256 slots
-      #                                     need -> startup fails
-      #   0.90 x 288 - 23 - 219 (weights) = 16.5 GB -> enough, verified across
-      #                                     rounds
-      # Round 0 gets through because nothing has trained yet and the residue is
-      # tiny, which is why a single-round smoke test cannot reach this path.
+      # ATOM sizes KV as `utilization x total - weights - non_torch - 2% margin`,
+      # where non_torch is `(total - free) - its_own_reserved` and so contains
+      # everything *this* process holds. Measured here (252 GiB cards, weights
+      # ~217.6 GiB per rank, ~13.6 GiB held after Phase B and the draft offload,
+      # even across all eight ranks to within 0.4 GiB):
+      #
+      #   first start 0.94 -> KV 14.3 GiB, trainer left 20 GiB   ok
+      #   first start 0.96 -> KV 19.3 GiB, trainer left 15 GiB   trainer OOMs
+      #   restart     0.94 -> KV  0.7 GiB                        dies
+      #   restart     0.96 -> KV  5.7 GiB                        ok
+      #
+      # /!\ Both failures were observed, in that order, on this node. 0.90 dies at
+      # the restart with `InsufficientPoolBudget: state pool needs 1797488640B of
+      # -7714532004B`, reported as `ModelRunner7/8 proc died (exitcode=1)` — a rank
+      # index that invites a per-device memory theory. It is not one.
       gpu_memory_utilization: 0.90
-      # Not fp8: the upside is near zero and the cost lands directly on the
-      # training labels.
-      # Upside: K3 is kimi_linear, and of its 93 layers only the 24
-      #   full_attn_layers use the paged KV cache (the other 69 KDA layers use a
-      #   recurrent state and are unaffected). At an MLA latent of 576 dims,
-      #   B=64 x 2048 tokens is only ~3.6 GB per card, so the 1.8 GB fp8 saves is
-      #   0.6% of the 250 GB already resident. Blocks are also allocated
-      #   automatically from gpu_memory_utilization, so what fp8 really buys is
-      #   double the concurrency capacity — and our batch shape is fixed, so
-      #   fitting is enough and the extra capacity goes unused.
-      # Cost: in aiter_mla, dtype_q = dtype_kv, so an fp8 KV cache drags the
-      #   query down to fp8 too; MLA prefill also has to decompress k/v from the
-      #   paged cache, putting K/V through an extra quantization round trip. The
-      #   5 layers of hidden states A2 extracts are exactly the draft's
-      #   regression target, so quantization noise on the teacher side becomes
-      #   label noise verbatim, and nothing reports an error.
-      # Note: vLLM's restriction where fp8 makes the aiter kernel assert
-      #   batch_size==1 does not exist on ATOM, whose aiter_mla supports fp8
-      #   normally — do not use that as the justification.
-      kv_cache_dtype: bf16
-      # Measured and turned off, as planned once the run was stable. The memory
-      # cost that was feared did not materialise:
-      #   CUDA graph capture memory: 20 graphs | pool(reserved)=0.24GB allocated=0.07GB
-      #   cudagraph capture cost: 8.28 seconds
-      # 0.24 GB per card and 8 seconds of capture, in exchange for 816 vs 336
-      # tok/s (identical parameters, the same 768 prompts).
+      # /!\ fp8, matching serving. An earlier revision of this file set bf16 to
+      # keep the labels clean, reasoning that fp8 saves only ~1.8 GB of the 250 GB
+      # resident (0.6%, since only 24 of K3's 93 layers use the paged KV cache;
+      # the other 69 are KDA recurrent state) while aiter_mla ties
+      # dtype_q = dtype_kv and MLA prefill decompresses k/v from the paged cache,
+      # so the noise lands in the 5 aux layers the draft regresses against.
       #
-      # Safety: all 20 captured graphs have max_q_len=1 shapes (batch sizes from
-      # 1 to max_num_seqs), i.e. they **cover decode only; prefill stays eager**.
-      # A2's hidden-state extraction is a prefill path and never goes through
-      # graph replay, so the hidden-state contract is unaffected.
-      enforce_eager: false
+      # Every clause of that is true and the conclusion was still wrong, because
+      # it never asked what the draft is served under. The benchmark that produced
+      # both the 6.01% and the reference 26.13% ran the target with
+      #   'kv_cache_dtype': 'fp8', 'index_cache_dtype': 'fp8'
+      # (k3-bench/results/server_ropefix-official.log). Since prefill reads k/v
+      # back out of the paged cache, extracting labels at bf16 and serving at fp8
+      # means the draft is fitted to context features it will never see — the same
+      # class of train/serve mismatch as the RoPE convention, and arrived at the
+      # same way, by reasoning about one side in isolation.
+      #
+      # Clean labels are the wrong labels when the deployment target is quantized.
+      kv_cache_dtype: fp8
+      # Set for the same reason: serving sets it explicitly and ATOM's default is
+      # None. /!\ Unlike kv_cache_dtype this one is not yet confirmed to touch the
+      # prefill path at all, so it is matched on principle rather than on measured
+      # effect. What is confirmed is that Phase A runs and trains with both set —
+      # see the fp8 smoke run in the alignment log.
+      index_cache_dtype: fp8
+      # /!\ true here, unlike the first run, and it costs nothing: ATOM captures
+      # graphs for decode shapes only (all 20 have max_q_len=1), and off-policy
+      # prefill never decodes, so the 8.28 s of capture and 0.24 GB of pool would
+      # buy exactly zero replays. TorchSpec's reference config also runs eager.
+      enforce_eager: true
   draft:
     from_scratch: true
     # ---- Aligned with Inferact/Kimi-K3-DSpark/config.json ----
@@ -333,6 +329,20 @@ algorithm:
     ffn_dim: 14336
     rms_norm_eps: 1.0e-5
     rope_theta: 50000.0
+    # /!\ This rope block must stay byte-identical to the rope_parameters the
+    # export writes into config.json, which is the published Inferact block.
+    # ATOM reads it back to build the draft's rotary embedding and its softmax
+    # scale, so trainer and server have to derive both from the same numbers.
+    # output/export_dspark_hf.py cross-checks this file against what it emits and
+    # refuses to export on a mismatch; selfcheck/verify_rope_alignment.py checks
+    # the resulting numerics against ATOM's own get_rope.
+    #
+    # /!\ mscale/mscale_all_dim are 1.0, not 0.0. They cancel in the cos/sin
+    # cache (which is scaled by their ratio) but they do NOT cancel in the
+    # softmax scale, which both TorchSpec and ATOM widen by
+    # yarn_get_mscale(factor, mscale_all_dim)^2 = 1.8133x. The first run's draft
+    # had to be served with 0.0/0.0 to force ATOM down to the un-widened scale
+    # the trainer was using; the trainer now applies the widening itself.
     rope_scaling_type: yarn
     rope_scaling_factor: 32.0
     rope_original_max_pos: 32768
@@ -364,22 +374,22 @@ algorithm:
 mooncake:
   protocol: tcp
   device_name: ""
-  # /!\ Must hold the teacher hidden states of **one whole cached batch**.
-  # Phase A2 prefills the entire batch, writes all of it into Mooncake, and only
-  # then does the consumer fetch key by key, so the whole batch has to be
-  # resident at once; it cannot be reclaimed key by key as it streams.
-  #
-  # About 0.16 GB per sequence (hidden 2048x35840x2B + last_hidden 2048x7168x2B):
-  #   bs=64  -> 10 GB    bs=512 -> 82 GB
-  #
-  # Measured 2026-07-31: bs=512 against a 16GB segment returns code=-200 on write
-  # (out of capacity), the oldest keys are evicted, and the consumer brings the
-  # whole run down after waiting the full 90 seconds. Re-check this line whenever
-  # the batch size changes. bs=64 needs 10 GB; 32GB leaves 3x headroom.
-  global_segment_size: 32GB
-  local_buffer_size: 8GB
-  # The default was 90 seconds. Widening it to 300 is pure fault tolerance and
-  # does not affect the normal path.
+  # /!\ Must hold the hidden states of one whole cached batch: Phase A writes the
+  # entire batch before the consumer reads the first key, so it cannot be
+  # reclaimed as it streams. Sizing, at (5 aux + 1 last) x 7168 x 2 B = 84 KB per
+  # token:
+  #   first run  bs=64,  T=2048 -> 0.16 GB/seq -> 10 GB/batch (32GB was 3x headroom)
+  #   this run   bs=128, T=8192 -> 0.69 GB/seq -> 90 GB/batch worst case
+  # 256GB keeps the same ~3x headroom against the worst case. Measured
+  # 2026-07-31: undersizing returns code=-200 on write, evicts the oldest keys,
+  # and the consumer dies after the retry window rather than reporting the cause.
+  # /!\ Re-check this line whenever the batch size or the window changes.
+  global_segment_size: 256GB
+  # 16GB, from TorchSpec. Sized per *sequence*, not per batch — hidden states are
+  # put per request — and a sequence grew 4x with the window.
+  local_buffer_size: 16GB
+  # The default was 90 seconds. Widening it is pure fault tolerance and does not
+  # affect the normal path.
   get_retry_max_wait_seconds: 300.0
 
 quantization:
@@ -393,53 +403,42 @@ quantization:
 
 dataset:
   chat_template: kimi-k3
-  last_turn_loss_only: false
-  # The node has 236 cores. Each sample is rendered twice (full conversation plus
-  # generation prompt), so 16 workers are far too slow for 470k samples, and this
-  # value is not part of the cache key, so raising it has no side effects.
-  # Measured on the full set with thinking=true: about 3 minutes at 96 workers.
+  # /!\ true, from TorchSpec (last_turn_loss_only), against the first run's
+  # false. Supervising only the final assistant turn is what the reference recipe
+  # trains, and in a cached on-policy set the final turn is the one K3 actually
+  # wrote — earlier turns are dataset history, a different distribution.
+  # This is part of the tokenize cache key, so changing it reprocesses.
+  last_turn_loss_only: "true"
+  # TorchSpec min_loss_tokens: DSpark needs at least two complete seven-token
+  # diffusion blocks, so a row with fewer supervised tokens teaches nothing.
+  min_loss_tokens: 14
+  # The node has 256 cores. Each sample is rendered twice, so 16 workers are far
+  # too slow for 470k samples, and this value is not part of the cache key.
   num_preprocess_workers: 96
   cache_dir: /dev/shm/lumenrl_cache
-  # Discard oversized samples entirely instead of truncating them. Truncation
-  # leaves a conversation stopped mid-sentence with no terminator, so what the
-  # draft learns is to "continue text the teacher would never produce".
-  #
-  # /!\ This applies only to **the dataset's reference answers**. An on-policy
-  # response of the teacher's own hitting generate_max_tokens is not this kind of
-  # truncation; see the note on teacher.generate_max_tokens. And in generate mode
-  # this flag does not actually decide sample survival: in dataset.py,
-  # check_total = drop_overlong and max_prompt_tokens <= 0, which is always false
-  # when mpt>0, because the reference answer takes no part in training and its
-  # length should not eliminate a sample with a short prompt.
+  # In prefill mode this is the filter that matters. dataset.py only checks the
+  # total length when max_prompt_tokens <= 0 (with mpt>0 the reference answer
+  # takes no part in training, so its length must not eliminate a sample) — and
+  # here the reference answer *is* the training data, so the check has to be on.
+  # Rows longer than max_total_sequence_length are dropped rather than truncated:
+  # a truncated conversation stops mid-sentence with no terminator, and what the
+  # draft would learn is to continue text the teacher never produced.
   drop_overlong: true
-  # Prompt and response share the 2048 window, so 1024 means "leave at least 1023
-  # tokens for the answer". In generate mode this is the **only** filter that
-  # eliminates samples.
+  # /!\ 0, not the first run's 1024. Non-zero exists to emit prompt_ids for the
+  # generate path; setting it here would both waste a rendering pass and, per the
+  # note above, disable the total-length filter off-policy prefill depends on.
   #
-  # Measured over the full set with thinking=true: 476904 -> 346475 survive
-  # (72.7%). Relaxing to 2048 would keep 389299 (81.6%, +42824), but that needs a
-  # 3072 window, and 2048 is the only value validated end to end, so 1024 stands.
-  #
-  # Multi-turn samples (prompt p50 = 3179 tokens once history reasoning is
-  # preserved) are almost entirely dropped at this threshold, so the training set
-  # is effectively single-turn. /!\ This is not a regression introduced by
-  # enabling thinking — with thinking=false the multi-turn prompts sat around
-  # 2000 tokens and failed the same 1024 filter, so the current run has no
-  # multi-turn data either way. Really covering multi-turn means raising
-  # max_prompt_tokens and the window together, which is a separate exercise.
-  max_prompt_tokens: 1024
+  # It also un-does the first run's biggest data limitation. At mpt=1024 with
+  # thinking=true, multi-turn rows (prompt p50 = 3179 tokens once history
+  # reasoning is preserved) were almost entirely dropped and the training set was
+  # effectively single-turn. With the filter moved to the whole sequence against
+  # an 8192 window, most of them survive.
+  max_prompt_tokens: 0
   # /!\ Must be true. K3 is a preserved-thinking model and reasoning_effort only
   # supports max: apply_chat_template's thinking argument controls which channel
   # the decode starts on (<|open|>think<|sep|> versus <|open|>response<|sep|>),
   # so thinking=false pins the model on a starting point it was never trained
   # for, and reasoning_content in multi-turn history gets stripped as well.
-  #
-  # It was previously set false on the argument that "the think block will eat
-  # the 1000-token budget and leave no response at all". Measurement does not
-  # support that: K3's output has a median of only 398 tokens, and **truncation
-  # is harmless for speculative distillation** (see teacher.generate_max_tokens).
-  # Even with 26% of rows hitting the cap at 1024, what got capped is still
-  # entirely tokens the teacher really produced, so it remains valid supervision.
   #
   # /!\ Depends on the kimi_k3_parser fix (PARSER_VERSION=6): before it,
   # _prepare_messages unconditionally stripped reasoning from non-final assistant
@@ -450,98 +449,101 @@ dataset:
 reward:
   type: function
   function: math_reward
-  # The full 476904 samples with phase1 and phase2 merged and shuffled (seed
-  # 20260731). Sampling is a sequential sliding window at (step*bs) % ds_len with
-  # no shuffle, so the file itself has to be shuffled: concatenating the two
-  # phases head to tail would show only phase1 in the first half of the run and
-  # only phase2 in the second.
-  dataset: /dev/shm/kimi-mtp-dataset-full/train.jsonl
+  # slippedJim/ATOM_regen_seeklight_kimi_mtp — every final assistant turn in
+  # lightseekorg/kimi-mtp-dataset regenerated by K3 itself, which is what makes
+  # this a cached on-policy run: the teacher decoded once, offline, and Phase A1
+  # is gone from the loop for good.
+  #
+  # /!\ Currently the **partial** release: 107,760 verified rows, 33% of the
+  # source, the rest still generating. Staged as train.jsonl regardless of the
+  # remote name, so dropping the full file over it invalidates the tokenize cache
+  # by itself (the key includes size and mtime) and nothing else has to change.
+  #
+  # /!\ Prompts are verbatim from the source dataset and only the last turn is
+  # K3's, which is why dataset.last_turn_loss_only must stay true — see there.
+  #
+  # Pre-shuffling the file is not required: load_and_preprocess_dataset shuffles
+  # with seed=42 before tokenizing, so the sequential sampler already walks a
+  # random order. It is also harmless.
+  dataset: /dev/shm/atom-regen-kimi-mtp/train.jsonl
 
 eval:
   enabled: true
-  # /!\ To be changed (fold it into the next restart that happens for another
-  # reason; do not restart just for this): as they stand, these two values leave
-  # eval noise larger than the signal. Measured AL at steps 1700/1800/1900 was
-  # 1.149 / 1.048 / 1.084, a spread of 0.10, while the expected true gain over
-  # 200 steps at that stage is on the order of 0.02 — noise five times the
-  # signal, from which no trend can be read. Two amplifiers:
-  #   1. 32 samples is simply a noisy sample size;
-  #   2. AL is the sum of the cumulative products of seven positions' acceptance
-  #      rates, roughly p0 x 1.76, which magnifies p0's relative movement about
-  #      2x (p0 moving 4.5% moves AL 8.8%).
-  # The plan is interval: 50 (once per round; a single eval costs only about 77
-  # seconds, so this doubles the points and is the best noise reduction per unit
-  # of compute). num_samples should go to 64/96 as well, but each sample costs
-  # about 1.2 GB of CPU memory (all 8 ranks keep a full copy), so the headroom
-  # has to be measured first.
+  # Once per round at cache_batches=10. The first run used 100 with 50-step
+  # rounds (every other round) and could not read a trend out of it.
+  interval: 10
+  # /!\ Raised from the first run's 32, which left eval noise (+/-0.015) as large
+  # as the 100-step signal it was meant to measure. Two amplifiers: 32 is simply
+  # a small sample, and AL is a sum of cumulative products over 7 positions
+  # (~p0 x 1.76), which magnifies p0's relative movement about 2x.
   #
-  # The long train (6135 steps) uses 100, giving 61 points, enough to watch a
-  # trend. For a short validation run (1000 steps), set it back to 25 to line up
-  # point for point with train1000_v4/v5.
-  interval: 100
-  # 256 samples would take about 1.2 TB of RAM (all 8 ranks keep a full CPU
-  # copy), so running the full set is a guaranteed OOM.
-  num_samples: 32
+  # The ceiling is host RAM: every rank keeps a full copy, so a sample costs
+  # 8 x 84 KB per token. 128 is provisional — confirm against the smoke run's
+  # measured Phase B peak before a long run.
+  num_samples: 128
   micro_batch_size: 2
 
 checkpointing:
   # /dev/shm is wiped along with the allocation, so checkpoints have to land on
-  # NVMe (the launch script overrides this with CKPT_DIR).
+  # real storage (the launch script overrides this with CKPT_DIR).
   checkpoint_dir: /dev/shm/checkpoints/kimi_k3_dspark_atom
-  # Aligned with cache_batches=50, i.e. **once per round**, landing exactly on a
+  # Aligned with cache_batches=10, i.e. once per round, landing exactly on a
   # round boundary: recovery starts from the boundary and no half a Phase A is
-  # wasted.
-  #
-  # Set from the failure-recovery logic: the teacher cache lives in /dev/shm and
-  # is gone the moment the node is, so the current round's Phase A has to be
-  # redone. /!\ Under vLLM this measured 50 batches x 103 seconds ~= 86 minutes;
-  # ATOM's cost is composed differently (no two 1.5 TB weight reloads per round,
-  # but A2 adds a full-sequence prefill), so re-estimate it from a smoke-measured
-  # Phase A rather than copying the number.
-  save_steps: 50
-  # A checkpoint is 31 GB and the volume has 22 TB free, so keeping 12 costs only
-  # ~370 GB. Keeping 3 (150 steps) meant that when a suspicious stretch of the
-  # eval curve needed recomputing from step 2400, that checkpoint had long since
-  # been pruned by the round-end saves, leaving only the last 150 steps to fall
-  # back to. 12 is ~600 steps ~= 10 hours of rollback room.
+  # wasted. The teacher cache lives in /dev/shm and is gone the moment the node
+  # is, so the current round's Phase A always has to be redone.
+  save_steps: 10
+  # A checkpoint is 31 GiB (33.4 GB measured: bf16 weights + fp32 master + Adam
+  # m/v over 2.39B params), so 12 of them is ~400 GB and has to land on real
+  # storage, not the tmpfs this line names — run_docker.sh overrides it with
+  # CKPT_DIR for exactly that reason. At save_steps=10 this is 120 steps of
+  # rollback room, not the 240 it was when save_steps was 20;
+  # the first run needed exactly that when a suspicious stretch of the eval
+  # curve had to be recomputed and the checkpoint had already been pruned.
   save_total_limit: 12
   # The default of true will quietly pick up an old checkpoint and continue in
   # what was meant to be a new run, without complaining. Always set it off
   # explicitly for a fresh run.
+  #
+  # /!\ This line is not what the live run uses: run_docker.sh passes
+  # checkpointing.resume=true in EXTRA_OVERRIDES, and the override wins. That is
+  # deliberate — the container has restart-on-failure, so a crash has to come back
+  # up on the last checkpoint rather than silently restarting training from zero.
+  # _resume_from_checkpoint takes the highest-numbered checkpoint and restores
+  # global_step, optimizer state and the LR schedule; the data offset is derived
+  # from global_step, so the sampler continues instead of replaying rows.
   resume: false
 
 logger:
   wandb_enabled: false
   log_interval: 1
 
-# 476904 samples in total; preprocessing with thinking=true and
-# max_prompt_tokens=1024 measured 346475 survivors. (With thinking=false it was
-# 392725; enabling thinking lengthens prompts and drops 46250 more.)
+# Measured 2026-08-15 with the fields in this file: 107,760 raw rows -> **106,366**
+# survivors at an 8192 window (98.7%), the 1,394 dropped all for exceeding it.
+# One epoch is floor((106366 - 128) / 128) = 829 steps.
 #
-# /!\ 5413 is the **upper bound that does not leak the eval set**; do not round
-# it up. The eval set is the last 32 samples (indices 346443..346474), and
-# training samples sequentially from 0 at (step*bs) % ds_len:
-#   5413 steps -> covers 0..346431, 11 short of the eval set  [ok]
-#   5414 steps -> covers 0..346495, 53 samples into the eval set  [bad]
-# Recompute after changing the dataset or max_prompt_tokens / thinking:
-#   floor((ds_len - eval.num_samples) / bs)
-# ds_len does not have to be guessed; selfcheck/preprocess_dataset.py prints it.
+# **2 epochs = 1658.** The point of this run is an early reading on whether the
+# RoPE, mscale and fp8 corrections actually move 6.01%, not a finished draft; the
+# definitive run waits for the full release (the set is 33% decoded). TorchSpec
+# uses num_epochs: 5, which over a third of the data would be 4145 steps and ~4
+# days — worth it once the answer to "did the fixes work" is known, not before.
 #
-# Total runtime has to be re-estimated from ATOM smoke measurements. Neither the
-# 73 hours from the vLLM era (prefill, 40.1 s per step) nor the generate-mode
-# estimate carries over. For reference: Phase A1 works out to about 35.7 minutes
-# per round from the bench numbers (3200 rows x gen_mean 546 / 816 tok/s),
-# against 62 minutes with thinking=false, per-batch submission and eager mode.
-# A2 and Phase B both grow as sequences lengthen (about 335 -> 703 tokens each)
-# and must be measured in smoke.
+# Unlike a single-epoch bound this is NOT limited by the eval slice: the sampler
+# wraps at (step*bs) % ds_len, so training revisits rows deliberately. What must
+# still hold is that it never reaches the final `eval.num_samples` rows, which the
+# sampler cannot do as long as it walks whole batches from 0.
 #
-# /!\ On gradient accumulation, do not be misled by older comments:
-# `_grad_accum_steps` is not a config field, it is derived in
-# _plan_micro_batches:
-#     num_mb = bs / train_micro_batch_size = 64 / 1 = 64
-#     _grad_accum_steps = ceil(num_mb / world_size) = 64 / 8 = 8
-# It describes "one global batch split into 8 backward passes on each rank" and
-# **does not enlarge the effective batch**, which stays exactly
-# train_global_batch_size = 64.
-num_training_steps: 5413
+# Recompute after changing the dataset or any field in the tokenize cache key
+# (max_length, max_prompt_tokens, last_turn_loss_only, min_loss_tokens,
+# thinking). The arguments must match this file exactly, or preprocessing builds
+# a second cache and the run pays for it twice. Run it at 16384 first — the
+# largest window under consideration — since survival at any smaller window is
+# then just a count over the reported distribution:
+#   python3 examples/Kimi_K3_SDDD_MI350_ATOM/selfcheck/preprocess_dataset.py \
+#       --dataset /dev/shm/atom-regen-kimi-mtp/train.jsonl \
+#       --tokenizer /home/jimguo12/k3-target-official \
+#       --max-length 8192 --max-prompt-tokens 0 \
+#       --last-turn-loss-only true --min-loss-tokens 14 \
+#       --eval-samples 128 --batch-size 128
+num_training_steps: 1658
+# TorchSpec seed
 seed: 42

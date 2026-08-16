@@ -561,6 +561,14 @@ class AtomTeacherEngine:
         self._tp_size = tensor_parallel_size
         self._gpu_ids = gpu_ids or list(range(tensor_parallel_size))
         self._hidden_dir = _HIDDEN_XFER_DIR
+        self._start_seq = 0
+        # Distinguishes one trainer process's worker logs from the next one's. The
+        # pid cannot do it: inside the container the worker's pid is deterministic
+        # (418 every time), so after a container restart the new process reuses
+        # both the pid and the sequence counter and overwrites the logs of the run
+        # that crashed -- which is exactly the evidence needed at that point.
+        self._run_stamp = time.strftime("%m%d-%H%M%S")
+        self._worker_log_path: str | None = None
         self._mooncake_config = mooncake_config
         self._transport = transport
         self._quantization = quantization
@@ -643,12 +651,12 @@ class AtomTeacherEngine:
 
         The worker's stdout and stderr go only to this file, never to the
         trainer log, so a worker that stops responding leaves no trace in the
-        place anyone looks first. Callers should pull the tail *before*
-        restarting: ``start`` reopens the file in write mode and truncates it.
+        place anyone looks first. ``start`` writes a new file per attempt, so the
+        crashed worker's log stays on disk after a restart.
         """
         try:
-            path = os.path.join(self._hidden_dir, "atom_teacher_worker.log")
-            if not os.path.exists(path):
+            path = self._worker_log_path
+            if not path or not os.path.exists(path):
                 return ""
             with open(path) as f:
                 return "".join(f.readlines()[-num_lines:])
@@ -955,7 +963,23 @@ class AtomTeacherEngine:
 
         atom_args_json = json.dumps(self._atom_config)
 
-        worker_log_path = os.path.join(self._hidden_dir, "atom_teacher_worker.log")
+        # One file per start, not one per run. The teacher is restarted every
+        # round, and a single reused path meant that a crash was overwritten by
+        # the next attempt's log before anyone could read it — including by the
+        # automatic container restart, which is how the round-1 startup failure
+        # lost its own traceback. The tail dumped on failure is only 50 lines and
+        # is usually all NCCL teardown noise.
+        # /!\ The counter alone is not enough: the container restarts on failure and
+        # the new process starts counting at 1 again. Neither is the pid, which is
+        # deterministic inside the container -- see _run_stamp, which is what
+        # actually separates one process's logs from its successor's.
+        self._start_seq += 1
+        worker_log_path = os.path.join(
+            self._hidden_dir,
+            f"atom_teacher_worker.{self._run_stamp}.{os.getpid()}"
+            f".{self._start_seq:03d}.{self._mode}.log",
+        )
+        self._worker_log_path = worker_log_path
         self._worker_log_f = open(worker_log_path, "w")
         logger.info("AtomTeacherEngine: worker log -> %s", worker_log_path)
 

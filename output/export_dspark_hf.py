@@ -5,6 +5,13 @@ Architecture aligned with Inferact/Kimi-K3-DSpark:
 - 5 dense layers, VanillaMarkov head (rank=256), confidence head
 - embed_tokens + lm_head frozen from K3 base model (bfloat16)
 - Trained weights in bfloat16
+
+The emitted config.json is what ATOM reads back to decide the draft's rotation
+convention, softmax scale and which target layers to feed it. Every field below
+that also exists in the training YAML is therefore cross-checked against it
+(`--train-config`), because a silent disagreement here is invisible until the
+draft benchmarks badly: the first run shipped at 6% acceptance against a
+reference draft's 26% for exactly that class of mismatch.
 """
 import argparse
 import json
@@ -13,6 +20,84 @@ import os
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
+
+
+def _draft_cfg_from_yaml(path: str) -> dict:
+    """Read the training YAML's draft/spec_distill blocks, flattened."""
+    import yaml
+
+    with open(path) as f:
+        y = yaml.safe_load(f)
+    algo = (y.get("algorithm") or {})
+    return {
+        "draft": (algo.get("draft") or {}),
+        "spec_distill": (algo.get("spec_distill") or {}),
+    }
+
+
+def _check_against_training_config(config: dict, train_cfg: dict) -> list[str]:
+    """Return a list of fields the exported config and the YAML disagree on."""
+    draft = train_cfg["draft"]
+    spec = train_cfg["spec_distill"]
+    rope = config["rope_parameters"]
+
+    # (label, exported value, YAML value) for every field that exists on both
+    # sides. Anything the YAML does not carry is left to the export's own
+    # defaults, which is why the architecture dims are absent here.
+    pairs = [
+        ("num_hidden_layers", config["num_hidden_layers"], draft.get("num_layers")),
+        ("num_attention_heads", config["num_attention_heads"], draft.get("num_heads")),
+        ("num_key_value_heads", config["num_key_value_heads"], draft.get("num_kv_heads")),
+        ("intermediate_size", config["intermediate_size"], draft.get("ffn_dim")),
+        ("q_lora_rank", config["q_lora_rank"], draft.get("q_lora_rank")),
+        ("kv_lora_rank", config["kv_lora_rank"], draft.get("kv_lora_rank")),
+        ("qk_nope_head_dim", config["qk_nope_head_dim"], draft.get("qk_nope_head_dim")),
+        ("qk_rope_head_dim", config["qk_rope_head_dim"], draft.get("qk_rope_head_dim")),
+        ("v_head_dim", config["v_head_dim"], draft.get("v_head_dim")),
+        ("rms_norm_eps", config["rms_norm_eps"], draft.get("rms_norm_eps")),
+        ("markov_rank", config["markov_rank"], draft.get("markov_rank")),
+        ("markov_head_type", config["markov_head_type"], draft.get("markov_head_type")),
+        ("mask_token_id", config["mask_token_id"], draft.get("mask_token_id")),
+        ("enable_confidence_head", config["enable_confidence_head"],
+         draft.get("enable_confidence_head")),
+        ("confidence_head_with_markov", config["confidence_head_with_markov"],
+         draft.get("confidence_head_with_markov")),
+        ("rope_theta", config["rope_theta"], draft.get("rope_theta")),
+        ("rope_parameters.rope_theta", rope["rope_theta"], draft.get("rope_theta")),
+        ("rope_parameters.rope_type", rope["rope_type"], draft.get("rope_scaling_type")),
+        ("rope_parameters.factor", rope["factor"], draft.get("rope_scaling_factor")),
+        ("rope_parameters.original_max_position_embeddings",
+         rope["original_max_position_embeddings"], draft.get("rope_original_max_pos")),
+        ("rope_parameters.beta_fast", rope["beta_fast"], draft.get("rope_beta_fast")),
+        ("rope_parameters.beta_slow", rope["beta_slow"], draft.get("rope_beta_slow")),
+        ("rope_parameters.mscale", rope["mscale"], draft.get("rope_mscale")),
+        ("rope_parameters.mscale_all_dim", rope["mscale_all_dim"],
+         draft.get("rope_mscale_all_dim")),
+        ("num_target_layers", config["num_target_layers"], spec.get("num_target_layers")),
+        ("target_layer_ids", config["target_layer_ids"],
+         spec.get("aux_hidden_state_layer_ids")),
+    ]
+
+    problems = []
+    for label, exported, trained in pairs:
+        if trained is None:
+            continue
+        if isinstance(exported, float) or isinstance(trained, float):
+            same = abs(float(exported) - float(trained)) < 1e-12
+        else:
+            same = list(exported) == list(trained) if isinstance(exported, list) else exported == trained
+        if not same:
+            problems.append(f"  {label}: exporting {exported!r} but trained with {trained!r}")
+
+    # rope_interleave has no YAML counterpart because the trainer has exactly one
+    # rotation convention. Emitting the key at all would tell ATOM to use the
+    # other one.
+    if "rope_interleave" in config:
+        problems.append(
+            "  rope_interleave: must not be emitted -- ATOM maps it to "
+            "is_neox_style, i.e. the half-split rotation the trainer does not use"
+        )
+    return problems
 
 
 def find_safetensor_shard(model_dir: str, key: str) -> str:
@@ -39,6 +124,11 @@ def main():
                         help="Path to Kimi-K3 base model (for frozen embed_tokens/lm_head)")
     parser.add_argument("--output", default="/home/danyzhan/Lumen-RL/output/Kimi_K3_DSpark_HF",
                         help="Output directory for HF model")
+    parser.add_argument("--train-config",
+                        default="examples/Kimi_K3_SDDD_MI350_ATOM/configs/train.yaml",
+                        help="Training YAML to cross-check the emitted config.json against")
+    parser.add_argument("--skip-config-check", action="store_true",
+                        help="Export even if config.json disagrees with the training YAML")
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -210,6 +300,25 @@ def main():
             "mscale_all_dim": 1.0,
         },
     }
+
+    if not args.skip_config_check:
+        if not os.path.exists(args.train_config):
+            raise SystemExit(
+                f"--train-config {args.train_config} not found. Point it at the YAML "
+                f"this checkpoint was trained with, or pass --skip-config-check."
+            )
+        problems = _check_against_training_config(
+            config, _draft_cfg_from_yaml(args.train_config),
+        )
+        if problems:
+            raise SystemExit(
+                "config.json disagrees with " + args.train_config + ":\n"
+                + "\n".join(problems)
+                + "\n\nATOM reads these back at serving time, so a mismatch here is a "
+                  "draft served under different attention than it was trained with."
+            )
+        print(f"config.json cross-checked against {args.train_config}: OK")
+
     with open(os.path.join(args.output, "config.json"), "w") as f:
         json.dump(config, f, indent=2)
 
