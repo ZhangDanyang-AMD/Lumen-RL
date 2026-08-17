@@ -14,6 +14,18 @@
 #   BENCH_DIR      dir holding run_client.py        (default /home/jimguo12/k3-bench)
 #   SERVER_PORT    HTTP port                        (default 8000)
 #   NUM_SPEC       --num-speculative-tokens         (default 7)
+#   MAX_NUM_SEQS   --max-num-seqs                   (default 8)
+#   QUESTION_SETS  space-separated name:path pairs  (default mtbench:$BENCH_DIR/mt_bench_question.jsonl)
+#
+# max_num_seqs defaults to 8 because that is what the 2026-08-14 runs used and
+# because K3's KDA recurrent state is allocated per slot: at 64 the state pool
+# alone asks for 28.91 GB against a ~19 GB KV budget and the engine refuses to
+# start. The client is serial, so nothing above 1 is exercised anyway.
+#
+# Multiple question sets share one server on purpose. Loading K3 costs ~20
+# minutes, and /debug/mtp_stats is cumulative but the client records the counters
+# before and after its own run and reports the delta, so each set still gets an
+# isolated measurement. Restarting per set would buy nothing and cost an hour.
 
 set -uo pipefail
 
@@ -32,9 +44,10 @@ NUM_SPEC="${NUM_SPEC:-7}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-3600}"
 
+QUESTION_SETS="${QUESTION_SETS:-mtbench:${BENCH_DIR}/mt_bench_question.jsonl}"
+
 mkdir -p "$RESULT_DIR"
 SERVER_LOG="$RESULT_DIR/server_${LABEL}.log"
-RESULT_JSON="$RESULT_DIR/bench_${LABEL}.json"
 CONTAINER="atom-dspark-${LABEL}"
 
 echo "=== benchmark_dspark: $LABEL ==="
@@ -96,7 +109,7 @@ docker run -d --name "$CONTAINER" \
     -tp 8 \
     --trust-remote-code \
     --max-model-len 16384 \
-    --max-num-seqs "${MAX_NUM_SEQS:-64}" \
+    --max-num-seqs "${MAX_NUM_SEQS:-8}" \
     --max-num-batched-tokens 10240 \
     --gpu-memory-utilization 0.93 \
     --block-size 128 \
@@ -132,15 +145,26 @@ docker logs "$CONTAINER" 2>&1 \
   | grep -aiE "dspark|hidden states extraction|rope|aux" \
   | tail -40 >"$RESULT_DIR/startup_${LABEL}.log"
 
-python3 "$BENCH_DIR/run_client.py" \
-  --base-url "http://127.0.0.1:${SERVER_PORT}" \
-  --model Kimi-K3 \
-  --questions "$BENCH_DIR/mt_bench_question.jsonl" \
-  --num-prompts "$NUM_PROMPTS" \
-  --max-tokens "$MAX_TOKENS" \
-  --label "$LABEL" \
-  --out "$RESULT_JSON"
-rc=$?
+rc=0
+for entry in $QUESTION_SETS; do
+  set_name="${entry%%:*}"
+  set_path="${entry#*:}"
+  if [[ ! -f "$set_path" ]]; then
+    echo "!!! question set $set_name not found at $set_path, skipping"
+    rc=1
+    continue
+  fi
+  echo
+  echo "=== question set: $set_name ($set_path) ==="
+  python3 "$BENCH_DIR/run_client.py" \
+    --base-url "http://127.0.0.1:${SERVER_PORT}" \
+    --model Kimi-K3 \
+    --questions "$set_path" \
+    --num-prompts "$NUM_PROMPTS" \
+    --max-tokens "$MAX_TOKENS" \
+    --label "${LABEL}-${set_name}" \
+    --out "$RESULT_DIR/bench_${LABEL}-${set_name}.json" || rc=$?
+  echo "result -> $RESULT_DIR/bench_${LABEL}-${set_name}.json"
+done
 
-echo "result -> $RESULT_JSON"
 exit $rc
