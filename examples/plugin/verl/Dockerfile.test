@@ -1,0 +1,60 @@
+# verl + LumenRL plugin test image (FSDP2 + ATOM FP8).
+# Layered on top of the existing LumenRL image that already has
+# aiter, ATOM, Lumen, mori, and torch compiled for MI300X (gfx942).
+#
+# Usage:
+#   docker build -f examples/plugin/verl/Dockerfile.test -t lumenrl-verl-fp8 .
+#   docker run --rm -it --device /dev/kfd --device /dev/dri \
+#     --group-add video --group-add render --shm-size 64g \
+#     -v /home/danyzhan/models:/data \
+#     -e DATA_ROOT=/data lumenrl-verl-fp8
+
+ARG BASE_IMAGE=zhangdanyangamd/lumen-rl:qwen3-30b-a3b-308x-actor260805
+FROM ${BASE_IMAGE}
+
+WORKDIR /workspace
+
+# ─── Update LumenRL source (adds plugin/ directory) ─────────────────────────
+COPY . /workspace/Lumen-RL-new
+RUN rm -rf /workspace/Lumen-RL/lumenrl /workspace/Lumen-RL/examples && \
+    cp -a /workspace/Lumen-RL-new/lumenrl /workspace/Lumen-RL/lumenrl && \
+    cp -a /workspace/Lumen-RL-new/examples /workspace/Lumen-RL/examples && \
+    cp /workspace/Lumen-RL-new/pyproject.toml /workspace/Lumen-RL/pyproject.toml && \
+    cp /workspace/Lumen-RL-new/setup.py /workspace/Lumen-RL/setup.py && \
+    rm -rf /workspace/Lumen-RL-new
+
+# ─── Backup ROCm torch before pip overwrites it ─────────────────────────────
+RUN cp -a /opt/venv/lib/python3.12/site-packages/torch /tmp/_torch_rocm_backup && \
+    cp -a /opt/venv/lib/python3.12/site-packages/torch*.dist-info /tmp/ 2>/dev/null || true
+
+# ─── Install verl + LumenRL + deps (pip will pull CUDA torch, we'll revert) ─
+RUN git config --global --add safe.directory /workspace/Lumen-RL && \
+    pip install --no-cache-dir verl 'transformers>=5.5.3,<5.11,!=5.6.0' && \
+    cd /workspace/Lumen-RL && pip install -e ".[test]"
+
+# ─── Restore ROCm torch (overwrite CUDA torch that pip pulled) ──────────────
+RUN rm -rf /opt/venv/lib/python3.12/site-packages/torch && \
+    mv /tmp/_torch_rocm_backup /opt/venv/lib/python3.12/site-packages/torch && \
+    rm -rf /opt/venv/lib/python3.12/site-packages/torch-*.dist-info && \
+    mv /tmp/torch*.dist-info /opt/venv/lib/python3.12/site-packages/ 2>/dev/null || true && \
+    rm -rf /opt/venv/lib/python3.12/site-packages/nvidia* /opt/venv/lib/python3.12/site-packages/cuda* && \
+    python3 -c "import torch; print(f'torch {torch.__version__}, CUDA: {torch.cuda.is_available()}')"
+
+# ─── Remove hard-coded strategy assert in verl so plugins can register custom backends
+RUN VERL_ENGINE_CFG="$(pip show verl 2>/dev/null | awk '/^Location:/{print $2}')/verl/workers/config/engine.py" && \
+    sed -i 's/assert self\.strategy in \["fsdp", "fsdp2"\].*/# assert removed for plugin extensibility/' "$VERL_ENGINE_CFG"
+
+# ─── RL training dependencies ───────────────────────────────────────────────
+# amdsmi: required for Ray to detect AMD GPUs
+# cachetools: required by verl v0 legacy trainer
+RUN pip install --no-cache-dir datasets "math_verify[antlr4_13_2]" amdsmi cachetools
+
+# ─── Verify torch is ROCm version ────────────────────────────────────────────
+RUN python3 -c "import torch; v=torch.__version__; print(f'torch={v}'); assert 'rocm' in v, f'Expected ROCm torch, got {v}'"
+
+ENV DATA_ROOT=/data
+ENV PYTHONPATH="/workspace/Lumen-RL:/workspace/ATOM:/workspace/aiter:/workspace/Lumen:${PYTHONPATH:-}"
+
+WORKDIR /workspace/Lumen-RL
+
+CMD ["bash", "examples/plugin/verl/run.sh"]

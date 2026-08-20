@@ -75,55 +75,128 @@ class ATOMRolloutAdapter:
 # LumenRLFSDP2Engine — verl BaseEngine shim for FSDP2 training
 # ---------------------------------------------------------------------------
 
-class LumenRLFSDP2Engine:
-    """Delegates to ``lumenrl.engine.training.fsdp_engine.FSDP2EngineWithLMHead``.
+def _make_engine_classes():
+    """Lazily create engine adapter classes that inherit from verl's BaseEngine.
 
-    Supports Lumen FP8 training via the ``quant_config`` constructor parameter.
+    Deferred to avoid importing verl at module-level (it may not be installed).
     """
+    from verl.workers.engine.base import BaseEngine as VerlBaseEngine
 
-    def __init__(self, *args: Any, **kwargs: Any):
-        from lumenrl.engine.training.fsdp_engine import FSDP2EngineWithLMHead
+    # Collect all methods from BaseEngine that raise NotImplementedError
+    # and generate forwarding methods to self._inner.
+    _delegate_methods = []
+    import inspect as _inspect
+    for _name, _method in _inspect.getmembers(VerlBaseEngine, predicate=_inspect.isfunction):
+        if _name.startswith("_"):
+            continue
+        try:
+            src = _inspect.getsource(_method)
+            if "raise NotImplementedError" in src:
+                _delegate_methods.append(_name)
+        except (OSError, TypeError):
+            pass
 
-        self._inner = FSDP2EngineWithLMHead(*args, **kwargs)
+    class _LumenRLFSDP2Engine(VerlBaseEngine):
+        """Delegates to ``lumenrl.engine.training.fsdp_engine.FSDP2EngineWithLMHead``."""
 
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._inner, name)
+        @staticmethod
+        def _convert_verl_config(**kwargs: Any) -> dict:
+            """Convert verl config dicts to LumenRL-compatible dicts."""
+            from lumenrl.core.config import HFModelConfig, LoRAConfig, FSDPEngineConfig, OptimizerConfig
+            import dataclasses
 
-    @property
-    def is_param_offload_enabled(self) -> bool:
-        return self._inner.is_param_offload_enabled
+            def _instantiate(src: Any, dc_cls: type) -> Any:
+                """Instantiate a LumenRL dataclass from a verl config dict/object."""
+                if isinstance(src, dc_cls):
+                    return src
+                raw = dict(src) if hasattr(src, "items") else {}
+                valid = {f.name for f in dataclasses.fields(dc_cls)}
+                filtered = {}
+                for k, v in raw.items():
+                    if k in valid:
+                        f_type = {f.name: f.type for f in dataclasses.fields(dc_cls)}.get(k)
+                        if dataclasses.is_dataclass(f_type) and hasattr(v, "items"):
+                            filtered[k] = _instantiate(v, f_type)
+                        else:
+                            filtered[k] = v
+                return dc_cls(**filtered)
 
-    @property
-    def is_optimizer_offload_enabled(self) -> bool:
-        return self._inner.is_optimizer_offload_enabled
+            result: dict = {}
 
+            if "model_config" in kwargs:
+                mc = dict(kwargs["model_config"]) if hasattr(kwargs["model_config"], "items") else {}
+                if "path" in mc and "local_path" not in mc:
+                    mc["local_path"] = mc.pop("path")
+                if "lora" in mc and not isinstance(mc["lora"], LoRAConfig):
+                    mc["lora"] = _instantiate(mc["lora"], LoRAConfig)
+                result["model_config"] = _instantiate(mc, HFModelConfig)
 
-# ---------------------------------------------------------------------------
-# LumenRLMegatronEngine — verl BaseEngine shim delegating to LumenRL
-# ---------------------------------------------------------------------------
+            if "engine_config" in kwargs:
+                result["engine_config"] = _instantiate(kwargs["engine_config"], FSDPEngineConfig)
 
-class LumenRLMegatronEngine:
-    """Delegates to ``lumenrl.engine.training.megatron_engine.MegatronEngine``.
+            if "optimizer_config" in kwargs:
+                result["optimizer_config"] = _instantiate(kwargs["optimizer_config"], OptimizerConfig)
 
-    Only the two abstract properties required by verl's ``BaseEngine`` are
-    explicitly forwarded; everything else goes through ``__getattr__``.
-    """
+            for k in ("model_name", "quant_config"):
+                if k in kwargs:
+                    result[k] = kwargs[k]
 
-    def __init__(self, *args: Any, **kwargs: Any):
-        from lumenrl.engine.training.megatron_engine import MegatronEngineWithLMHead
+            return result
 
-        self._inner = MegatronEngineWithLMHead(*args, **kwargs)
+        def __init__(self, *args: Any, **kwargs: Any):
+            from lumenrl.engine.training.fsdp_engine import FSDP2EngineWithLMHead
+            converted = self._convert_verl_config(**kwargs)
+            self._inner = FSDP2EngineWithLMHead(*args, **converted)
 
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._inner, name)
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._inner, name)
 
-    @property
-    def is_param_offload_enabled(self) -> bool:
-        return self._inner.is_param_offload_enabled
+        @property
+        def is_param_offload_enabled(self) -> bool:
+            return self._inner.is_param_offload_enabled
 
-    @property
-    def is_optimizer_offload_enabled(self) -> bool:
-        return self._inner.is_optimizer_offload_enabled
+        @property
+        def is_optimizer_offload_enabled(self) -> bool:
+            return self._inner.is_optimizer_offload_enabled
+
+    # Dynamically add forwarding methods for all BaseEngine abstract methods
+    for _mname in _delegate_methods:
+        if _mname not in _LumenRLFSDP2Engine.__dict__:
+            def _make_forwarder(name):
+                def _forwarder(self, *a, **kw):
+                    return getattr(self._inner, name)(*a, **kw)
+                _forwarder.__name__ = name
+                return _forwarder
+            setattr(_LumenRLFSDP2Engine, _mname, _make_forwarder(_mname))
+
+    class _LumenRLMegatronEngine(VerlBaseEngine):
+        """Delegates to ``lumenrl.engine.training.megatron_engine.MegatronEngine``."""
+
+        def __init__(self, *args: Any, **kwargs: Any):
+            from lumenrl.engine.training.megatron_engine import MegatronEngineWithLMHead
+            self._inner = MegatronEngineWithLMHead(*args, **kwargs)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._inner, name)
+
+        @property
+        def is_param_offload_enabled(self) -> bool:
+            return self._inner.is_param_offload_enabled
+
+        @property
+        def is_optimizer_offload_enabled(self) -> bool:
+            return self._inner.is_optimizer_offload_enabled
+
+    for _mname in _delegate_methods:
+        if _mname not in _LumenRLMegatronEngine.__dict__:
+            def _make_forwarder(name):
+                def _forwarder(self, *a, **kw):
+                    return getattr(self._inner, name)(*a, **kw)
+                _forwarder.__name__ = name
+                return _forwarder
+            setattr(_LumenRLMegatronEngine, _mname, _make_forwarder(_mname))
+
+    return _LumenRLFSDP2Engine, _LumenRLMegatronEngine
 
 
 # ---------------------------------------------------------------------------
@@ -150,26 +223,42 @@ def register() -> None:
     except ImportError:
         logger.warning("lumenrl: verl.workers.rollout.base not importable; skipped rollout registration")
 
+    # Also register in RolloutReplicaRegistry (used by v0 legacy trainer)
     try:
-        from lumenrl.engine.training.base_engine import BaseEngine, EngineRegistry
+        from verl.workers.rollout.replica import RolloutReplicaRegistry
 
-        # Make adapter classes formal BaseEngine subclasses at runtime
-        # so that EngineRegistry.register()'s issubclass check passes.
-        LumenRLFSDP2Engine.__bases__ = (BaseEngine,)
-        LumenRLMegatronEngine.__bases__ = (BaseEngine,)
+        def _load_atom():
+            from lumenrl.plugin.verl.atom_replica import ATOMRolloutReplica
+            return ATOMRolloutReplica
 
-        EngineRegistry.register(
+        if "atom" not in RolloutReplicaRegistry._registry:
+            RolloutReplicaRegistry.register("atom", _load_atom)
+            logger.info("lumenrl: registered ATOM in RolloutReplicaRegistry (v0 compat)")
+    except ImportError:
+        pass
+
+    try:
+        from verl.workers.engine.base import EngineRegistry as VerlEngineRegistry
+
+        FSDP2Cls, MegatronCls = _make_engine_classes()
+
+        VerlEngineRegistry.register(
             model_type="language_model",
             backend=["lumenrl_fsdp", "lumenrl_fsdp2"],
             device=["cuda"],
-        )(LumenRLFSDP2Engine)
-        logger.info("lumenrl: registered lumenrl_fsdp/lumenrl_fsdp2 in EngineRegistry")
+        )(FSDP2Cls)
+        logger.info("lumenrl: registered lumenrl_fsdp/lumenrl_fsdp2 in verl EngineRegistry")
 
-        EngineRegistry.register(
+        VerlEngineRegistry.register(
             model_type="language_model",
             backend="lumenrl_megatron",
             device=["cuda"],
-        )(LumenRLMegatronEngine)
-        logger.info("lumenrl: registered lumenrl_megatron in EngineRegistry")
-    except ImportError:
-        logger.warning("lumenrl: EngineRegistry not importable; skipped engine registration")
+        )(MegatronCls)
+        logger.info("lumenrl: registered lumenrl_megatron in verl EngineRegistry")
+    except Exception as e:
+        logger.warning("lumenrl: engine registration failed: %s", e)
+
+
+# Auto-register when this module is imported (verl's plugin loader calls
+# _ep.load() which imports this module but doesn't call register()).
+register()

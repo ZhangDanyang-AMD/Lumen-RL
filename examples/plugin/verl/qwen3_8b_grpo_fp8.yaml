@@ -1,0 +1,87 @@
+# verl + LumenRL plugin: Qwen3-8B GRPO with lumenrl_fsdp2 + ATOM FP8 rollout.
+#
+# Inherits verl's full default config via _generated_ppo_trainer,
+# then overrides only the fields needed for the LumenRL plugin.
+
+defaults:
+  - _generated_ppo_trainer
+  - _self_
+
+# use_v1 requires transfer_queue which is not on PyPI; use legacy trainer
+
+
+actor_rollout_ref:
+  hybrid_engine: true
+  model:
+    path: ${oc.env:DATA_ROOT}/Qwen3-8B-Base
+    enable_gradient_checkpointing: true
+    use_remove_padding: true
+
+  actor:
+    strategy: lumenrl_fsdp2
+    ppo_mini_batch_size: 128
+    ppo_micro_batch_size_per_gpu: 1
+    grad_clip: 1.0
+    use_torch_compile: false
+    optim:
+      lr: 1.0e-6
+      weight_decay: 0.1
+      lr_scheduler_type: constant
+      lr_warmup_steps: 10
+    fsdp_config:
+      param_offload: false
+      optimizer_offload: false
+
+  rollout:
+    name: atom
+    mode: async
+    log_prob_micro_batch_size_per_gpu: 1
+    gpu_memory_utilization: 0.30
+    tensor_model_parallel_size: 1
+    dtype: bfloat16
+    max_model_len: 2048
+    enable_chunked_prefill: true
+    max_num_batched_tokens: 4096
+    max_num_seqs: 64
+    quantization: fp8_per_block
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+
+  ref:
+    fsdp_config:
+      param_offload: true
+
+data:
+  train_files: ${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet
+  val_files: ${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/aime-2024.filtered.parquet
+  train_batch_size: 128
+  max_prompt_length: 1024
+  max_response_length: 2048
+
+algorithm:
+  adv_estimator: grpo
+  filter_groups:
+    enable: false
+  kl_ctrl:
+    kl_coeff: 0.0
+
+reward:
+  custom_reward_function:
+    path: pkg://lumenrl.rewards.math_reward
+    name: dapo_math_reward
+
+critic:
+  enable: false
+
+trainer:
+  total_training_steps: 3
+  logger:
+    - console
+  project_name: lumenrl-plugin-verl
+  experiment_name: qwen3-8b-grpo-fsdp2-atom-fp8
+  n_gpus_per_node: 8
+  nnodes: 1
+  save_freq: -1
+  val_before_train: false
+  use_v1: false
