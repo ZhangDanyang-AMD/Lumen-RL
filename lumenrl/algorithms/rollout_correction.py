@@ -494,6 +494,59 @@ def _resolve_rollout_correction_config(config: Any) -> RolloutCorrectionConfig:
     raise TypeError(f"Expected RolloutCorrectionConfig, got {type(config)!r}")
 
 
+def _clean_batch_logprobs(
+    batch: DataProto,
+) -> tuple[Tensor, Tensor, Tensor, str]:
+    """Line up the three tensors the IS ratio is built from, and de-alias zeros.
+
+    Entry i of each scores token i+1, but the widths need not agree: the mask
+    and the rollout log-probs are built pre-shifted (``[:, 1:]``, width S-1)
+    while ``old_log_probs`` may be padded out to the full width S depending on
+    the training backend. Same frame, so a common width lines them up.
+    """
+    old_lp = batch.tensors["old_log_probs"]
+    rollout_lp = batch.tensors.get(
+        "rollout_log_probs", batch.tensors.get("fp8_logprobs")
+    )
+    mask_key = "response_mask" if "response_mask" in batch.tensors else "attention_mask"
+    mask = batch.tensors.get(mask_key)
+    if rollout_lp is None or mask is None:
+        raise KeyError(
+            "rollout correction needs rollout_log_probs (or fp8_logprobs) and "
+            "response_mask (or attention_mask) in the batch"
+        )
+
+    width = min(old_lp.shape[-1], rollout_lp.shape[-1], mask.shape[-1])
+    old_w, roll_w, mask_w = (
+        old_lp[..., :width], rollout_lp[..., :width], mask[..., :width],
+    )
+
+    # ``rollout_log_probs`` is zero-initialised and then filled per reported
+    # token, so an exact 0.0 inside the response mask is ambiguous: either the
+    # engine never reported that position, or the token was so certain that
+    # log p underflowed to 0. Reading an unreported position literally means
+    # probability 1, the largest value possible, which saturates the IS ratio;
+    # substituting the trainer's own value makes the ratio 1. For a genuinely
+    # saturated token ``old_log_probs`` is ~0 there too, so the substitution
+    # costs nothing. The logged mean tells the two apart.
+    unreported = (roll_w == 0.0) & (mask_w > 0)
+    n_unreported = int(unreported.sum())
+    if n_unreported:
+        subst_mean = float(old_w[unreported].mean())
+        roll_w = torch.where(unreported, old_w, roll_w)
+        patched = rollout_lp.clone()
+        patched[..., :width] = roll_w
+        batch.tensors["rollout_log_probs"] = patched
+        logger.info(
+            "rollout_log_probs: %d of %d response positions are exactly 0.0; "
+            "substituted old_log_probs (mean %.4g there -- near 0 means the "
+            "token really was certain, large means a reporting gap)",
+            n_unreported, int(mask_w.sum()), subst_mean,
+        )
+
+    return old_w, roll_w, mask_w, mask_key
+
+
 def compute_rollout_correction_and_add_to_batch(
     batch: DataProto, config: Any,
 ) -> tuple[DataProto, dict[str, float]]:
@@ -508,10 +561,12 @@ def compute_rollout_correction_and_add_to_batch(
     r_rs = rcfg.rollout_rs or None
     r_rs_th = rcfg.rollout_rs_threshold or None
 
+    old_w, roll_w, mask_w, mask_key = _clean_batch_logprobs(batch)
+
     is_weights, modified_mask, metrics = compute_rollout_correction_and_rejection_mask(
-        old_log_prob=batch.tensors["old_log_probs"],
-        rollout_log_prob=batch.tensors["rollout_log_probs"],
-        response_mask=batch.tensors["response_mask"],
+        old_log_prob=old_w,
+        rollout_log_prob=roll_w,
+        response_mask=mask_w,
         rollout_is=r_is,
         rollout_is_threshold=r_is_th,
         rollout_is_batch_normalize=rcfg.rollout_is_batch_normalize,
@@ -519,7 +574,16 @@ def compute_rollout_correction_and_add_to_batch(
         rollout_rs_threshold=r_rs_th,
     )
 
-    batch.tensors["response_mask"] = modified_mask
+    # The width alignment above may have narrowed the mask; splice the result
+    # back rather than reshaping the batch, since the columns past the common
+    # width were never compared and other consumers expect the full width.
+    original_mask = batch.tensors[mask_key]
+    if modified_mask.shape[-1] == original_mask.shape[-1]:
+        batch.tensors[mask_key] = modified_mask
+    else:
+        spliced = original_mask.clone()
+        spliced[..., : modified_mask.shape[-1]] = modified_mask
+        batch.tensors[mask_key] = spliced
     if is_weights is not None:
         batch.tensors["rollout_is_weights"] = is_weights
 
