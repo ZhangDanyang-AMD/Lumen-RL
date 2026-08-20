@@ -24,6 +24,7 @@ from lumenrl.algorithms.loss_functions import (
     policy_gradient_loss,
     sft_loss,
 )
+from lumenrl.utils.checkpoint import checkpoint_rank_phases
 from lumenrl.core.protocol import DataProto
 from lumenrl.core.types import AlgorithmName, TrainingBackend
 from lumenrl.engine.training.base_engine import BaseEngine, EngineRegistry
@@ -483,6 +484,9 @@ class LumenActorWorker(BaseWorker):
             if old_logp is not None and adv is not None:
                 old_logp = old_logp.to(token_log_probs.device)
                 adv = adv.to(token_log_probs.device)
+                ris = batch.tensors.get("rollout_is_weights")
+                if ris is not None:
+                    ris = ris.to(token_log_probs.device)
 
                 if adv.dim() == 1:
                     adv = adv.unsqueeze(-1).expand_as(token_log_probs)
@@ -491,6 +495,8 @@ class LumenActorWorker(BaseWorker):
 
                 if old_logp.shape[-1] != token_log_probs.shape[-1]:
                     old_logp = old_logp[..., :token_log_probs.shape[-1]]
+                if ris is not None and ris.shape[-1] != token_log_probs.shape[-1]:
+                    ris = ris[..., :token_log_probs.shape[-1]]
 
                 # Prefer response_mask (PPO loss is over response tokens only).
                 # log_probs[:, j] predicts target token j+1, so shift the mask by
@@ -522,6 +528,7 @@ class LumenActorWorker(BaseWorker):
                     clip_high = float(_cfg("clip_ratio_high", 0.28))
                     loss = asymmetric_clip_loss(
                         token_log_probs, old_logp, adv, clip_low, clip_high, mask=mask,
+                        rollout_is_weights=ris,
                     )
                 elif algo_name == AlgorithmName.GRPO.value:
                     dp = int(batch.meta.get("dp_size", 1) or 1)
@@ -543,6 +550,7 @@ class LumenActorWorker(BaseWorker):
                         dp_size=dp,
                         loss_agg_mode=loss_agg_mode,
                         global_batch_size=global_batch_size,
+                        rollout_is_weights=ris,
                     )
                 else:
                     loss = policy_gradient_loss(
@@ -801,6 +809,7 @@ class LumenActorWorker(BaseWorker):
                 dp_size=dp,
                 loss_agg_mode=loss_agg_mode,
                 global_batch_size=global_batch_size,
+                rollout_is_weights=ris,
             )
         else:
             loss = policy_gradient_loss(
@@ -1151,7 +1160,11 @@ class LumenActorWorker(BaseWorker):
         path.mkdir(parents=True, exist_ok=True)
         # Native Megatron engine: use sharded dist-checkpoint (no DP duplication,
         # resharding-capable) instead of per-rank torch.save of full weights.
-        if hasattr(self._engine, "save_dist_checkpoint"):
+        use_rank_local = (
+            os.environ.get("LUMENRL_CHECKPOINT_FORMAT", "").lower()
+            == "rank_local"
+        )
+        if not use_rank_local and hasattr(self._engine, "save_dist_checkpoint"):
             self._engine.save_dist_checkpoint(str(path), global_step=global_step)
             return True
         rank = int(self.rank)
@@ -1162,24 +1175,55 @@ class LumenActorWorker(BaseWorker):
         if module is None:
             raise RuntimeError("Engine has no module to checkpoint.")
 
-        torch.save(module.state_dict(), path / f"model_world_size_{world}_rank_{rank}.pt")
-        if optimizer is not None:
-            torch.save(optimizer.state_dict(), path / f"optim_world_size_{world}_rank_{rank}.pt")
-            if hasattr(optimizer, "save_parameter_state"):
-                optimizer.save_parameter_state(
-                    str(path / f"optim_parameter_state_world_size_{world}_rank_{rank}.pt")
+        distributed = torch.distributed.is_initialized()
+        for active_ranks in checkpoint_rank_phases(rank, world):
+            if rank in active_ranks:
+                torch.save(
+                    module.state_dict(),
+                    path / f"model_world_size_{world}_rank_{rank}.pt",
                 )
-        extra = {
-            "global_step": int(global_step),
-            "lr_scheduler": scheduler.state_dict() if scheduler is not None else None,
-            "rng": {
-                "cpu": torch.get_rng_state(),
-                "cuda": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
-            },
-        }
-        torch.save(extra, path / f"extra_state_world_size_{world}_rank_{rank}.pt")
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
+                if optimizer is not None:
+                    torch.save(
+                        optimizer.state_dict(),
+                        path / f"optim_world_size_{world}_rank_{rank}.pt",
+                    )
+                    if hasattr(optimizer, "save_parameter_state"):
+                        optimizer.save_parameter_state(
+                            str(
+                                path
+                                / f"optim_parameter_state_world_size_{world}_rank_{rank}.pt"
+                            )
+                        )
+                extra = {
+                    "global_step": int(global_step),
+                    "lr_scheduler": (
+                        scheduler.state_dict() if scheduler is not None else None
+                    ),
+                    "rng": {
+                        "cpu": torch.get_rng_state(),
+                        "cuda": (
+                            torch.cuda.get_rng_state()
+                            if torch.cuda.is_available()
+                            else None
+                        ),
+                    },
+                }
+                torch.save(
+                    extra,
+                    path / f"extra_state_world_size_{world}_rank_{rank}.pt",
+                )
+                del extra
+                import gc
+
+                gc.collect()
+                try:
+                    import ctypes
+
+                    ctypes.CDLL("libc.so.6").malloc_trim(0)
+                except (OSError, AttributeError):
+                    pass
+            if distributed:
+                torch.distributed.barrier()
         return True
 
     def prune_checkpoints(self, checkpoint_root: str, max_to_keep: int) -> list[str]:
@@ -1209,7 +1253,11 @@ class LumenActorWorker(BaseWorker):
         if self._engine is None:
             raise RuntimeError("init_model() must be called before load_checkpoint().")
         path = Path(local_path)
-        if hasattr(self._engine, "load_dist_checkpoint"):
+        use_rank_local = (
+            os.environ.get("LUMENRL_CHECKPOINT_FORMAT", "").lower()
+            == "rank_local"
+        )
+        if not use_rank_local and hasattr(self._engine, "load_dist_checkpoint"):
             return self._engine.load_dist_checkpoint(str(path))
         rank = int(self.rank)
         world = int(self.world_size)
@@ -1225,41 +1273,67 @@ class LumenActorWorker(BaseWorker):
             path / f"optim_parameter_state_world_size_{world}_rank_{rank}.pt"
         )
         extra_path = path / f"extra_state_world_size_{world}_rank_{rank}.pt"
-        if not model_path.exists():
-            raise FileNotFoundError(f"Missing actor checkpoint shard: {model_path}")
-
-        module.load_state_dict(torch.load(model_path, map_location="cpu", weights_only=False))
-        has_parameter_state = any(path.glob("optim_parameter_state_world_size_*.pt"))
-        if optimizer is not None and optim_path.exists() and has_parameter_state:
-            optimizer.load_state_dict(torch.load(optim_path, map_location="cpu", weights_only=False))
-        if optimizer is not None and has_parameter_state and hasattr(
-            optimizer, "load_parameter_state"
-        ):
-            optimizer.load_parameter_state(str(optim_parameter_path))
-        if optimizer is not None and hasattr(optimizer, "reload_model_params"):
-            # Mixed/distributed optimizers keep FP32 main parameters separate
-            # from the BF16 module. A module-only legacy checkpoint must copy
-            # restored weights into those main parameters before the next step.
-            optimizer.reload_model_params()
-            if not has_parameter_state:
-                logger.warning(
-                    "Checkpoint has no distributed optimizer parameter state; "
-                    "reinitialized optimizer main parameters from model weights."
-                )
         global_step = 0
-        if extra_path.exists():
-            extra = torch.load(extra_path, map_location="cpu", weights_only=False)
-            global_step = int(extra.get("global_step", 0))
-            sched_state = extra.get("lr_scheduler")
-            if scheduler is not None and sched_state is not None:
-                scheduler.load_state_dict(sched_state)
-            rng = extra.get("rng") or {}
-            if rng.get("cpu") is not None:
-                torch.set_rng_state(rng["cpu"])
-            if torch.cuda.is_available() and rng.get("cuda") is not None:
-                torch.cuda.set_rng_state(rng["cuda"])
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
+        distributed = torch.distributed.is_initialized()
+        for active_ranks in checkpoint_rank_phases(rank, world):
+            if rank in active_ranks:
+                if not model_path.is_file():
+                    raise FileNotFoundError(
+                        f"Missing actor checkpoint shard: {model_path}"
+                    )
+                module_state = torch.load(
+                    model_path, map_location="cpu", weights_only=False
+                )
+                module.load_state_dict(module_state)
+                del module_state
+                has_parameter_state = optim_parameter_path.is_file()
+                if optimizer is not None and optim_path.is_file():
+                    optim_state = torch.load(
+                        optim_path, map_location="cpu", weights_only=False
+                    )
+                    optimizer.load_state_dict(optim_state)
+                    del optim_state
+                if optimizer is not None and hasattr(
+                    optimizer, "load_parameter_state"
+                ):
+                    if not has_parameter_state:
+                        raise FileNotFoundError(
+                            "Missing distributed optimizer parameter state: "
+                            f"{optim_parameter_path}"
+                        )
+                    optimizer.load_parameter_state(str(optim_parameter_path))
+                elif optimizer is not None and hasattr(
+                    optimizer, "reload_model_params"
+                ):
+                    optimizer.reload_model_params()
+                if extra_path.is_file():
+                    extra = torch.load(
+                        extra_path, map_location="cpu", weights_only=False
+                    )
+                    global_step = int(extra.get("global_step", 0))
+                    sched_state = extra.get("lr_scheduler")
+                    if scheduler is not None and sched_state is not None:
+                        scheduler.load_state_dict(sched_state)
+                    rng = extra.get("rng") or {}
+                    if rng.get("cpu") is not None:
+                        torch.set_rng_state(rng["cpu"])
+                    if (
+                        torch.cuda.is_available()
+                        and rng.get("cuda") is not None
+                    ):
+                        torch.cuda.set_rng_state(rng["cuda"])
+                    del extra
+                import gc
+
+                gc.collect()
+                try:
+                    import ctypes
+
+                    ctypes.CDLL("libc.so.6").malloc_trim(0)
+                except (OSError, AttributeError):
+                    pass
+            if distributed:
+                torch.distributed.barrier()
         return global_step
 
     def update_weights_ipc_send(

@@ -19,12 +19,15 @@ Supports:
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import logging
 import os
 import re
-from contextlib import nullcontext
+from collections.abc import Mapping
+from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -56,6 +59,144 @@ logger.setLevel(os.getenv("LUMENRL_LOGGING_LEVEL", "INFO"))
 LUMENRL_DEBUG = os.environ.get("LUMENRL_DEBUG", "0") in ("1", "true", "True")
 
 import math  # noqa: E402
+
+
+def _checkpoint_tensor_fingerprints(
+    state: Any,
+    *,
+    chunk_bytes: int = 64 * 1024 * 1024,
+) -> dict[str, dict[str, Any]]:
+    """Hash every persistent tensor without materializing full-sized copies."""
+    fingerprints: dict[str, dict[str, Any]] = {}
+
+    def update_digest(digest: Any, tensor: torch.Tensor) -> None:
+        """Hash a tensor in logical row-major order with bounded staging memory."""
+        tensor = tensor.detach()
+        if tensor.numel() == 0:
+            return
+        if tensor.is_contiguous():
+            byte_view = tensor.view(torch.uint8).reshape(-1)
+            for start in range(0, byte_view.numel(), chunk_bytes):
+                chunk = byte_view[start : start + chunk_bytes]
+                if chunk.device.type != "cpu":
+                    chunk = chunk.cpu()
+                digest.update(memoryview(chunk.numpy()))
+            return
+
+        max_elements = max(1, chunk_bytes // tensor.element_size())
+        if tensor.numel() <= max_elements or tensor.ndim == 0:
+            update_digest(digest, tensor.contiguous())
+            return
+
+        elements_per_row = tensor[0].numel()
+        if elements_per_row <= max_elements:
+            rows_per_chunk = max(1, max_elements // elements_per_row)
+            for start in range(0, tensor.shape[0], rows_per_chunk):
+                update_digest(
+                    digest,
+                    tensor[start : start + rows_per_chunk].contiguous(),
+                )
+            return
+
+        for row in tensor.unbind(0):
+            update_digest(digest, row)
+
+    def visit(value: Any, path: str) -> None:
+        if isinstance(value, torch.Tensor):
+            tensor = value.detach()
+            digest = hashlib.sha256()
+            update_digest(digest, tensor)
+            fingerprints[path] = {
+                "shape": list(tensor.shape),
+                "dtype": str(tensor.dtype),
+                "numel": tensor.numel(),
+                "sha256": digest.hexdigest(),
+            }
+            return
+        if isinstance(value, Mapping):
+            for key in sorted(value, key=str):
+                child_path = f"{path}.{key}" if path else str(key)
+                visit(value[key], child_path)
+            return
+        if isinstance(value, (list, tuple)):
+            for index, child in enumerate(value):
+                child_path = f"{path}.{index}" if path else str(index)
+                visit(child, child_path)
+            return
+        if type(value).__name__ == "LocalNonpersistentObject":
+            return
+        wrapped = getattr(value, "data", None)
+        if wrapped is not None and wrapped is not value:
+            visit(wrapped, path)
+
+    visit(state, "")
+    return fingerprints
+
+
+def _verify_checkpoint_tensor_fingerprints(
+    expected: Mapping[str, Mapping[str, Any]],
+    actual: Mapping[str, Mapping[str, Any]],
+    *,
+    stage: str,
+) -> None:
+    """Require exact tensor metadata and byte hashes at a checkpoint boundary."""
+    expected_keys = set(expected)
+    actual_keys = set(actual)
+    if expected_keys != actual_keys:
+        missing = sorted(expected_keys - actual_keys)
+        unexpected = sorted(actual_keys - expected_keys)
+        raise RuntimeError(
+            f"Checkpoint fingerprint mismatch during {stage}: "
+            f"missing={missing[:8]} unexpected={unexpected[:8]}"
+        )
+    for path in sorted(expected_keys):
+        if dict(expected[path]) != dict(actual[path]):
+            raise RuntimeError(
+                f"Checkpoint tensor mismatch during {stage}: {path}; "
+                f"saved={dict(expected[path])} loaded={dict(actual[path])}"
+            )
+
+
+def _checkpoint_fingerprint_manifest_path(
+    local_path: str | os.PathLike[str],
+    rank: int,
+) -> Path:
+    return Path(local_path) / f"tensor_fingerprints_rank_{rank:05d}.json"
+
+
+def _save_checkpoint_fingerprint_manifest(
+    local_path: str | os.PathLike[str],
+    state: Any,
+    *,
+    rank: int,
+) -> Path:
+    fingerprints = _checkpoint_tensor_fingerprints(state)
+    manifest_path = _checkpoint_fingerprint_manifest_path(local_path, rank)
+    payload = {
+        "version": 1,
+        "rank": rank,
+        "tensor_count": len(fingerprints),
+        "fingerprints": fingerprints,
+    }
+    manifest_path.write_text(
+        json.dumps(payload, sort_keys=True),
+        encoding="utf-8",
+    )
+    return manifest_path
+
+
+def _verify_checkpoint_fingerprint_manifest(
+    local_path: str | os.PathLike[str],
+    state: Any,
+    *,
+    rank: int,
+    stage: str,
+) -> None:
+    manifest_path = _checkpoint_fingerprint_manifest_path(local_path, rank)
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    expected = payload["fingerprints"]
+    actual = _checkpoint_tensor_fingerprints(state)
+    _verify_checkpoint_tensor_fingerprints(expected, actual, stage=stage)
 
 
 _DSV4_R3_RUNTIME_CAPABILITIES = (
@@ -146,6 +287,58 @@ def _pad_token_ids_for_sequence_parallel(
     if padding == 0:
         return token_ids
     return F.pad(token_ids, (0, padding), value=0)
+
+
+def _pad_token_ids_to_pipeline_length(
+    token_ids: torch.Tensor, pipeline_sequence_length: int
+) -> torch.Tensor:
+    """Right-pad one PP microbatch to the schedule's fixed activation length."""
+    target = int(pipeline_sequence_length)
+    if token_ids.numel() > target:
+        raise ValueError(
+            f"token row length {token_ids.numel()} exceeds PP schedule length {target}"
+        )
+    return F.pad(token_ids, (0, target - token_ids.numel()), value=0)
+
+
+@contextmanager
+def _fixed_pipeline_shapes(config):
+    """Disable Megatron's dynamic shape exchange for uniformly padded PP rows."""
+    had_value = hasattr(config, "variable_seq_lengths")
+    saved_value = getattr(config, "variable_seq_lengths", None)
+    config.variable_seq_lengths = False
+    try:
+        yield
+    finally:
+        if had_value:
+            config.variable_seq_lengths = saved_value
+        else:
+            delattr(config, "variable_seq_lengths")
+
+
+def _pipeline_shape_adjuster(config):
+    """Preserve DSV4 mHC residual streams across fixed-shape PP boundaries."""
+    if not getattr(config, "dsv4_mode", False):
+        return None
+    hc_mult = int(getattr(config, "dsv4_hc_mult", 1) or 1)
+    if hc_mult <= 1:
+        return None
+
+    def adjust(recv_shapes, send_shapes):
+        def expand(shapes):
+            expanded = []
+            for shape in shapes:
+                if len(shape) != 3:
+                    raise RuntimeError(
+                        f"expected PP activation shape [s,b,d], got {tuple(shape)}"
+                    )
+                sequence, batch, hidden = shape
+                expanded.append((sequence, batch, hc_mult, hidden))
+            return expanded
+
+        return expand(recv_shapes), expand(send_shapes)
+
+    return adjust
 
 
 def _flatten_pipeline_logits(
@@ -932,15 +1125,24 @@ class MegatronEngine(BaseEngine):
         num_experts = int(self._dims.num_experts)
         if num_experts <= 0:
             raise ValueError("R3 requires a positive global expert count")
-        # Route captures use uint8 for models with up to 256 experts. Comparing
-        # a uint8 tensor with the Python integer 256 wraps the bound to zero,
-        # incorrectly marking every valid id as out of range.
-        routes_for_validation = routes.to(torch.int64)
-        invalid = (routes_for_validation < 0) | (
-            routes_for_validation >= num_experts
-        )
+        # Avoid casting the complete route tensor just for validation. PyTorch
+        # wraps an out-of-range scalar bound to the tensor dtype (uint8(256)=0),
+        # so omit comparisons that the dtype's representable range guarantees.
+        if routes.dtype == torch.bool:
+            invalid = routes if num_experts <= 1 else torch.zeros_like(routes)
+        elif routes.dtype.is_floating_point:
+            invalid = (routes < 0) | (routes >= num_experts)
+        else:
+            dtype_info = torch.iinfo(routes.dtype)
+            invalid = (
+                routes < 0
+                if dtype_info.min < 0
+                else torch.zeros_like(routes, dtype=torch.bool)
+            )
+            if num_experts <= dtype_info.max:
+                invalid = invalid | (routes >= num_experts)
         if invalid.any():
-            bad_id = int(routes_for_validation[invalid][0].item())
+            bad_id = int(routes[invalid][0].item())
             raise ValueError(
                 f"R3 expert id {bad_id} is outside global range "
                 f"[0, {num_experts})"
@@ -1653,13 +1855,24 @@ class MegatronEngine(BaseEngine):
         input_alignment = max(
             1, int(getattr(self, "_input_sequence_alignment", self._tp_size))
         )
+        schedule_sequence_length = (
+            (S + input_alignment - 1) // input_alignment
+        ) * input_alignment
 
         def _forward_step(data_iterator, model):
             r, start, L, ids = next(data_iterator)
             if L < 2:
-                dummy = torch.zeros(1, 1, self._dims.hidden, device="cuda", dtype=torch.bfloat16)
+                dummy = torch.zeros(
+                    schedule_sequence_length,
+                    1,
+                    self._dims.hidden,
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                )
                 return dummy, _partial(_logprob_loss_func, r, start, L, None, temperature, want_ent)
-            padded_ids = _pad_token_ids_for_sequence_parallel(ids, input_alignment)
+            padded_ids = _pad_token_ids_to_pipeline_length(
+                ids, schedule_sequence_length
+            )
             padded_length = padded_ids.numel()
             inp = padded_ids.view(1, padded_length)
             pos = torch.arange(padded_length, device=ids.device).view(1, padded_length)
@@ -1682,18 +1895,19 @@ class MegatronEngine(BaseEngine):
         if r3_routes is not None:
             self._r3_clear()
         try:
-            with torch.no_grad():
-                forward_backward_func(
-                    forward_step_func=_forward_step,
-                    data_iterator=mb_iter,
-                    model=[self.module],
-                    num_microbatches=B,
-                    seq_length=((S + input_alignment - 1) // input_alignment)
-                    * input_alignment,
-                    micro_batch_size=1,
-                    forward_only=True,
-                    collect_non_loss_data=False,
-                )
+            with _fixed_pipeline_shapes(config):
+                with torch.no_grad():
+                    forward_backward_func(
+                        forward_step_func=_forward_step,
+                        data_iterator=mb_iter,
+                        model=[self.module],
+                        num_microbatches=B,
+                        seq_length=schedule_sequence_length,
+                        micro_batch_size=1,
+                        forward_only=True,
+                        collect_non_loss_data=False,
+                        adjust_tensor_shapes_fn=_pipeline_shape_adjuster(config),
+                    )
         finally:
             config.timers = saved_timers
             if r3_routes is not None:
@@ -1882,6 +2096,7 @@ class MegatronEngine(BaseEngine):
                     dp_size=dp,
                     loss_agg_mode=loss_agg_mode,
                     global_batch_size=global_batch_size,
+                    rollout_is_weights=ris,
                 )
             else:
                 loss = policy_gradient_loss(
@@ -2092,6 +2307,7 @@ class MegatronEngine(BaseEngine):
                         dp_size=dp,
                         loss_agg_mode=loss_agg_mode,
                         global_batch_size=global_batch_size,
+                        rollout_is_weights=ris,
                     )
                 else:
                     row_loss = policy_gradient_loss(
@@ -2291,6 +2507,7 @@ class MegatronEngine(BaseEngine):
                     dp_size=dp,
                     loss_agg_mode=loss_agg_mode,
                     global_batch_size=global_batch_size,
+                    rollout_is_weights=ris,
                 )
             else:
                 loss = policy_gradient_loss(
@@ -2321,18 +2538,27 @@ class MegatronEngine(BaseEngine):
         input_alignment = max(
             1, int(getattr(self, "_input_sequence_alignment", self._tp_size))
         )
+        schedule_sequence_length = (
+            (S + input_alignment - 1) // input_alignment
+        ) * input_alignment
 
         def _forward_step(data_iterator, model):
             mb = next(data_iterator)
             if mb["L"] < 2:
                 dummy = torch.zeros(
-                    1, 1, self._dims.hidden, device="cuda", dtype=torch.bfloat16,
+                    schedule_sequence_length,
+                    1,
+                    self._dims.hidden,
+                    device="cuda",
+                    dtype=torch.bfloat16,
                     requires_grad=True,
                 )
                 return dummy, _partial(_train_loss_func, mb)
             ids = mb["ids"]
             L = mb["L"]
-            padded_ids = _pad_token_ids_for_sequence_parallel(ids, input_alignment)
+            padded_ids = _pad_token_ids_to_pipeline_length(
+                ids, schedule_sequence_length
+            )
             padded_length = padded_ids.numel()
             inp = padded_ids.view(1, padded_length)
             pos = torch.arange(padded_length, device=ids.device).view(1, padded_length)
@@ -2369,16 +2595,17 @@ class MegatronEngine(BaseEngine):
                     self._r3_hash_metrics(r3_routes, seqs, am)
                 )
         try:
-            forward_backward_func(
-                forward_step_func=_forward_step,
-                data_iterator=mb_iter,
-                model=[self._ddp],
-                num_microbatches=B,
-                seq_length=((S + input_alignment - 1) // input_alignment)
-                * input_alignment,
-                micro_batch_size=1,
-                forward_only=False,
-            )
+            with _fixed_pipeline_shapes(config):
+                forward_backward_func(
+                    forward_step_func=_forward_step,
+                    data_iterator=mb_iter,
+                    model=[self._ddp],
+                    num_microbatches=B,
+                    seq_length=schedule_sequence_length,
+                    micro_batch_size=1,
+                    forward_only=False,
+                    adjust_tensor_shapes_fn=_pipeline_shape_adjuster(config),
+                )
             if dsv4_acceptance:
                 # Capture before clear_indices() destroys native replay state.
                 r3_acceptance.update(
@@ -2637,21 +2864,27 @@ class MegatronEngine(BaseEngine):
         return gen, None
 
     def _dist_sharded_state_dict(self, is_loading: bool):
-        """Build a low-memory, DP-reshardable model and optimizer state."""
+        """Build model and HDO-compatible distributed optimizer state.
+
+        ``dp_reshardable`` assumes optimizer parameter ordering matches the
+        grad-buffer layout. Precision-aware CPU offload reorders native-FP32
+        and BF16 shards, so use the gather/scatter representation that
+        canonicalizes those shards before saving.
+        """
         model_state = self.module.sharded_state_dict()
         optimizer_state = self.optimizer.sharded_state_dict(
             model_state,
             is_loading=is_loading,
-            metadata={"distrib_optim_sharding_type": "dp_reshardable"},
+            metadata={"distrib_optim_sharding_type": "dp_zero_gather_scatter"},
         )
         return {"model": model_state, "optimizer": optimizer_state}
 
     def save_dist_checkpoint(self, local_path: str, global_step: int = 0) -> bool:
         """Save directly from each rank's owned optimizer buffers.
 
-        ``dp_reshardable`` avoids the DP-zero gather used by the legacy actor
-        checkpoint path, so saving does not materialize full optimizer copies
-        on every worker.
+        The optimizer state uses DP-zero gather/scatter because the
+        precision-aware HybridDeviceOptimizer stores param-shaped CPU state
+        rather than bucket-shaped state.
         """
         import megatron.core.dist_checkpointing as dc
 
@@ -2660,6 +2893,27 @@ class MegatronEngine(BaseEngine):
         if self.lr_scheduler is not None:
             state["lr_scheduler"] = self.lr_scheduler.state_dict()
         os.makedirs(local_path, exist_ok=True)
+        if os.environ.get("LUMENRL_VERIFY_CHECKPOINT_ROUNDTRIP") == "1":
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
+            manifest_path = None
+            # HDO already occupies most host RAM. Hash ranks one at a time so
+            # checkpoint inspection cannot OOM all workers simultaneously.
+            for active_rank in range(world_size):
+                if rank == active_rank:
+                    manifest_path = _save_checkpoint_fingerprint_manifest(
+                        local_path,
+                        state,
+                        rank=rank,
+                    )
+                if dist.is_initialized():
+                    dist.barrier()
+            assert manifest_path is not None
+            logger.info(
+                "Saved pre-checkpoint tensor fingerprints: rank=%d path=%s",
+                rank,
+                manifest_path,
+            )
         dc.save(state, str(local_path))
         if dist.is_initialized():
             dist.barrier()
@@ -2698,13 +2952,46 @@ class MegatronEngine(BaseEngine):
         import megatron.core.dist_checkpointing as dc
 
         self._patch_hybrid_optimizer_checkpoint_load()
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        manifest_path = _checkpoint_fingerprint_manifest_path(local_path, rank)
+        verify_round_trip = (
+            os.environ.get("LUMENRL_VERIFY_CHECKPOINT_ROUNDTRIP") == "1"
+            or manifest_path.is_file()
+        )
+        if verify_round_trip and not manifest_path.is_file():
+            raise FileNotFoundError(
+                f"Missing checkpoint fingerprint manifest: {manifest_path}"
+            )
         state = self._dist_sharded_state_dict(is_loading=True)
         state["global_step"] = 0
         loaded = dc.load(state, str(local_path))
+        if verify_round_trip:
+            _verify_checkpoint_fingerprint_manifest(
+                local_path,
+                loaded,
+                rank=rank,
+                stage="serialized checkpoint load",
+            )
         self.module.load_state_dict(loaded["model"])
         self.optimizer.load_state_dict(loaded["optimizer"])
         if self.lr_scheduler is not None and loaded.get("lr_scheduler") is not None:
             self.lr_scheduler.load_state_dict(loaded["lr_scheduler"])
+        if verify_round_trip:
+            restored = self._dist_sharded_state_dict(is_loading=False)
+            restored["global_step"] = int(loaded.get("global_step", 0))
+            if self.lr_scheduler is not None:
+                restored["lr_scheduler"] = self.lr_scheduler.state_dict()
+            _verify_checkpoint_fingerprint_manifest(
+                local_path,
+                restored,
+                rank=rank,
+                stage="restored live model and optimizer",
+            )
+            logger.info(
+                "Checkpoint tensor fingerprints match exactly: rank=%d path=%s",
+                rank,
+                local_path,
+            )
         if dist.is_initialized():
             dist.barrier()
         return int(loaded.get("global_step", 0))

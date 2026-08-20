@@ -322,6 +322,7 @@ class MegatronBaseEngine(BaseEngine):
                 dp_size=dp,
                 loss_agg_mode=loss_agg_mode,
                 global_batch_size=global_batch_size,
+                rollout_is_weights=ris,
             )
         else:
             loss = policy_gradient_loss(

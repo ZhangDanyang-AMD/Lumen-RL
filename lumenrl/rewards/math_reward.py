@@ -1,9 +1,9 @@
 """DAPO-style math reward: verify answers against ground truth.
 
-Ported from verl/utils/reward_score/math_dapo.py (Apache-2.0, Bytedance & EleutherAI)
-to match verl's scoring exactly: the minerva criterion extracts the last ``Answer:``
-line, normalizes both sides, and compares as strings. No ``math_verify`` symbolic
-check is used, so the reward signal stays aligned with the verl baseline.
+Ported from verl/utils/reward_score/math_dapo.py (Apache-2.0, Bytedance & EleutherAI).
+The minerva criterion extracts the last ``Answer:`` line, with a final
+``\boxed{...}`` fallback for benchmark prompts that do not prescribe the
+training response format. No symbolic ``math_verify`` check is used.
 """
 
 from __future__ import annotations
@@ -85,18 +85,18 @@ def normalize_final_answer(final_answer: str) -> str:
 def compute_score(solution_str: str, ground_truth: str) -> dict:
     """Compute reward for a single (solution, ground_truth) pair.
 
-    Mirrors verl ``math_dapo.compute_score`` with ``strict_box_verify=False``
-    (the minerva criterion): take the last 300 chars, extract the answer after
-    the last ``Answer:`` line, normalize both prediction and ground truth, then
-    compare as strings. No symbolic ``math_verify`` fallback, so scores match
-    the verl baseline bit-for-bit.
+    Take the last 300 chars and extract the answer after the last ``Answer:``
+    line. If that marker is absent, accept the last LaTeX ``\boxed{...}``
+    expression used by standard math benchmark outputs. Normalize both sides
+    and compare as strings; no symbolic ``math_verify`` fallback is used.
 
     Returns dict with keys: score (float), acc (bool), pred (str).
     """
     solution_str = solution_str[-300:]
 
     match = re.findall(r"(?i)Answer\s*:\s*([^\n]+)", solution_str)
-    extracted = match[-1] if match else "[INVALID]"
+    boxed = last_boxed_only_string(solution_str)
+    extracted = match[-1] if match else remove_boxed(boxed) if boxed else "[INVALID]"
     pred = normalize_final_answer(extracted)
     gt = normalize_final_answer(ground_truth)
 

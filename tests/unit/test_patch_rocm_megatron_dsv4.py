@@ -184,6 +184,48 @@ def test_patch_distrib_optimizer_routes_offloaded_grads_without_gpu_fp32_copy(
     assert not patcher.patch_distrib_optimizer_grad_copy(str(tmp_path))
 
 
+def test_patch_distrib_optimizer_checkpoint_matches_reordered_hdo_params(
+    tmp_path,
+) -> None:
+    optimizer = (
+        tmp_path / "megatron" / "core" / "optimizer" / "distrib_optimizer.py"
+    )
+    optimizer.parent.mkdir(parents=True)
+    optimizer.write_text(
+        """
+        (
+            self.model_float16_groups,
+            self.model_fp32_groups,
+            self.shard_float16_groups,
+            self.shard_fp32_groups,
+            self.shard_fp32_from_float16_groups,
+        ) = self._build_model_and_main_param_groups(
+            self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges, config
+        )
+
+    def load_parameter_state_from_dp_zero(self, state_dict, *, update_legacy_format=False):
+                for model_param, tensors in recv_tensors.items():
+                    self._set_main_param_and_optimizer_states(model_param, tensors)
+
+    @torch.no_grad()
+    def load_parameter_state_from_fully_reshardable(self, state_dict: dict):
+        pass
+"""
+    )
+
+    assert hasattr(patcher, "patch_distrib_optimizer_hdo_checkpoint")
+    assert patcher.patch_distrib_optimizer_hdo_checkpoint(str(tmp_path))
+
+    patched = optimizer.read_text()
+    assert "checkpoint order must match optimizer.param_groups" in patched
+    assert (
+        "self.model_param_group_index_map[model_param] = "
+        "(group_index, group_order)"
+    ) in patched
+    assert "self.optimizer._sync_hdo_state_to_sub_optimizers()" in patched
+    assert not patcher.patch_distrib_optimizer_hdo_checkpoint(str(tmp_path))
+
+
 def test_patch_hybrid_optimizer_streams_full_offload_sgd(tmp_path) -> None:
     optimizer = (
         tmp_path
@@ -1572,6 +1614,7 @@ _OPTIONAL_PATCHERS = (
     "patch_hybrid_optimizer_streaming_sgd",
     "patch_distrib_optimizer_fp32_detach",
     "patch_distrib_optimizer_grad_copy",
+    "patch_distrib_optimizer_hdo_checkpoint",
 )
 
 

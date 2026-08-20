@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import inspect
 import sys
 from types import ModuleType
 from types import SimpleNamespace
@@ -31,6 +32,15 @@ from lumenrl.engine.training.megatron_native_engine import MegatronNativeEngine
 from lumenrl.workers.actor_worker import LumenActorWorker
 
 
+def test_megatron_base_grpo_applies_rollout_importance_weights() -> None:
+    source = inspect.getsource(MegatronBaseEngine._row_policy_loss)
+    grpo_branch = source.split(
+        "elif algo_name == AlgorithmName.GRPO.value:", 1
+    )[1].split("\n        else:", 1)[0]
+
+    assert "rollout_is_weights=ris" in grpo_branch
+
+
 def test_megatron_backends_are_registered_for_existing_configs() -> None:
     language_backends = EngineRegistry._engines["language_model"]
     value_backends = EngineRegistry._engines["value_model"]
@@ -43,6 +53,137 @@ def test_megatron_backends_are_registered_for_existing_configs() -> None:
 
 def test_native_engine_uses_shared_base() -> None:
     assert issubclass(MegatronNativeEngine, MegatronBaseEngine)
+
+
+def test_megatron_engine_checkpoint_uses_hdo_compatible_optimizer_state() -> None:
+    model_state = {"model": object()}
+    optimizer_state = {"optimizer": object()}
+
+    class ModuleStub:
+        def sharded_state_dict(self):
+            return model_state
+
+    class OptimizerStub:
+        def sharded_state_dict(self, state, *, is_loading, metadata):
+            assert state is model_state
+            assert is_loading is False
+            assert metadata == {
+                "distrib_optim_sharding_type": "dp_zero_gather_scatter"
+            }
+            return optimizer_state
+
+    engine = megatron_engine.MegatronEngine.__new__(
+        megatron_engine.MegatronEngine
+    )
+    engine.module = ModuleStub()
+    engine.optimizer = OptimizerStub()
+
+    assert engine._dist_sharded_state_dict(False) == {
+        "model": model_state,
+        "optimizer": optimizer_state,
+    }
+
+
+def test_checkpoint_fingerprints_detect_tensor_data_mismatch() -> None:
+    class ShardedTensorStub:
+        def __init__(self, data):
+            self.data = data
+
+    saved = {
+        "model": {"weight": ShardedTensorStub(torch.tensor([1.0, 2.0]))},
+        "optimizer": {"exp_avg": torch.tensor([3.0, 4.0])},
+    }
+    restored = {
+        "model": {"weight": ShardedTensorStub(torch.tensor([1.0, 2.0]))},
+        "optimizer": {"exp_avg": torch.tensor([3.0, 5.0])},
+    }
+
+    expected = megatron_engine._checkpoint_tensor_fingerprints(saved)
+    actual = megatron_engine._checkpoint_tensor_fingerprints(restored)
+
+    with pytest.raises(RuntimeError, match=r"optimizer\.exp_avg"):
+        megatron_engine._verify_checkpoint_tensor_fingerprints(
+            expected,
+            actual,
+            stage="post-load",
+        )
+
+
+def test_checkpoint_fingerprints_hash_noncontiguous_tensors_in_bounded_chunks() -> None:
+    contiguous = torch.arange(48, dtype=torch.float32).reshape(6, 8)
+    noncontiguous = contiguous.t()
+
+    expected = megatron_engine._checkpoint_tensor_fingerprints(
+        {"weight": noncontiguous.contiguous()},
+        chunk_bytes=16,
+    )
+    actual = megatron_engine._checkpoint_tensor_fingerprints(
+        {"weight": noncontiguous},
+        chunk_bytes=16,
+    )
+
+    assert not noncontiguous.is_contiguous()
+    assert actual == expected
+
+
+def test_checkpoint_fingerprint_manifest_round_trip(tmp_path) -> None:
+    saved = {
+        "model": {"weight": torch.tensor([1.0, 2.0])},
+        "optimizer": {"exp_avg": torch.tensor([3.0, 4.0])},
+    }
+    restored = {
+        "model": {"weight": torch.tensor([1.0, 2.0])},
+        "optimizer": {"exp_avg": torch.tensor([3.0, 4.0])},
+    }
+
+    manifest = megatron_engine._save_checkpoint_fingerprint_manifest(
+        tmp_path,
+        saved,
+        rank=7,
+    )
+
+    assert manifest.name == "tensor_fingerprints_rank_00007.json"
+    megatron_engine._verify_checkpoint_fingerprint_manifest(
+        tmp_path,
+        restored,
+        rank=7,
+        stage="post-load",
+    )
+
+
+def test_dist_checkpoint_save_writes_verification_manifest(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    state = {"model": {"weight": torch.tensor([1.0])}, "optimizer": {}}
+    fake_megatron = ModuleType("megatron")
+    fake_megatron.__path__ = []
+    fake_core = ModuleType("megatron.core")
+    fake_core.__path__ = []
+    fake_dc = ModuleType("megatron.core.dist_checkpointing")
+    fake_dc.save = lambda saved, path: None
+    fake_core.dist_checkpointing = fake_dc
+    fake_megatron.core = fake_core
+    monkeypatch.setitem(sys.modules, "megatron", fake_megatron)
+    monkeypatch.setitem(sys.modules, "megatron.core", fake_core)
+    monkeypatch.setitem(
+        sys.modules,
+        "megatron.core.dist_checkpointing",
+        fake_dc,
+    )
+    monkeypatch.setenv("LUMENRL_VERIFY_CHECKPOINT_ROUNDTRIP", "1")
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+
+    engine = megatron_engine.MegatronEngine.__new__(
+        megatron_engine.MegatronEngine
+    )
+    engine.lr_scheduler = None
+    engine._dist_sharded_state_dict = lambda is_loading: state
+
+    assert engine.save_dist_checkpoint(str(tmp_path), global_step=1)
+    assert (
+        tmp_path / "tensor_fingerprints_rank_00000.json"
+    ).is_file()
 
 
 def test_r3_validation_accepts_uint8_ids_for_256_experts() -> None:
@@ -328,6 +469,50 @@ def test_pipeline_tokens_are_padded_to_tensor_parallel_alignment() -> None:
 
     assert padded.tolist() == [11, 12, 13, 14, 15, 16, 0, 0]
     assert padded.numel() % 4 == 0
+
+
+def test_pipeline_tokens_are_padded_to_fixed_schedule_length() -> None:
+    token_ids = torch.tensor([11, 12, 13, 14])
+
+    assert hasattr(megatron_engine, "_pad_token_ids_to_pipeline_length")
+    padded = megatron_engine._pad_token_ids_to_pipeline_length(
+        token_ids, pipeline_sequence_length=8
+    )
+
+    assert padded.tolist() == [11, 12, 13, 14, 0, 0, 0, 0]
+
+
+def test_fixed_pipeline_shapes_restore_dynamic_shape_config_on_error() -> None:
+    config = SimpleNamespace(variable_seq_lengths=True)
+
+    with pytest.raises(RuntimeError, match="schedule failed"):
+        with megatron_engine._fixed_pipeline_shapes(config):
+            assert config.variable_seq_lengths is False
+            raise RuntimeError("schedule failed")
+
+    assert config.variable_seq_lengths is True
+
+
+def test_dsv4_pipeline_shape_adjuster_preserves_hyper_connection_streams() -> None:
+    config = SimpleNamespace(dsv4_mode=True, dsv4_hc_mult=4)
+
+    adjust = megatron_engine._pipeline_shape_adjuster(config)
+    recv_shapes, send_shapes = adjust(
+        [(1152, 1, 4096)],
+        [(1152, 1, 4096)],
+    )
+
+    assert recv_shapes == [(1152, 1, 4, 4096)]
+    assert send_shapes == [(1152, 1, 4, 4096)]
+
+
+def test_pp_logprob_and_update_wire_dsv4_shape_adjuster() -> None:
+    for method in (
+        megatron_engine.MegatronEngine._engine_compute_log_probs_pp,
+        megatron_engine.MegatronEngine._engine_update_policy_pp,
+    ):
+        source = inspect.getsource(method)
+        assert "adjust_tensor_shapes_fn=_pipeline_shape_adjuster(config)" in source
 
 
 def test_pipeline_logits_discard_sequence_parallel_padding() -> None:

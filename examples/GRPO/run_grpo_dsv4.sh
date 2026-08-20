@@ -3,7 +3,7 @@
 # DeepSeek-V4-Flash GRPO RL — Megatron TP4/PP4/EP4 + vLLM FP8 (MI300X)
 #
 # MILES-aligned: GRPO 32x8, 4k response, global batch 256, no KL, TP4/PP4/EP4
-# vLLM FP8 per-block rollout + FP8 KV cache + AITER kernels
+# vLLM FP8 per-block rollout weights + FP8 KV cache + AITER kernels
 #
 # Usage:
 #   MODE=smoke   STEPS=3    bash examples/GRPO/run_grpo_dsv4.sh   # smoke test
@@ -47,8 +47,10 @@ export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-benic7p1}"
 export NCCL_IB_HCA="${NCCL_IB_HCA:-ionic_0}"
 export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
 export NCCL_DMABUF_ENABLE="${NCCL_DMABUF_ENABLE:-0}"
-export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
-export NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-INIT,NET}"
+# Keep production logs free of per-collective transport noise. PyTorch/Ray
+# watchdog exceptions and process failures remain visible independently.
+export NCCL_DEBUG="${NCCL_DEBUG:-VERSION}"
+export NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-INIT}"
 export HIP_FORCE_DEV_KERNARG=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export RAY_DEDUP_LOGS=0 RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
@@ -81,8 +83,9 @@ export HSA_DISABLE_FRAGMENT_ALLOCATOR="${HSA_DISABLE_FRAGMENT_ALLOCATOR:-0}"
 # needs to reconcile expert routing, not a second attention-position mismatch.
 export USE_ROCM_AITER_ROPE_BACKEND=0
 
-# vLLM v1
-export VLLM_USE_V1=1 VLLM_ENABLE_V1_MULTIPROCESSING=1 VLLM_LOGGING_LEVEL=WARN
+# vLLM v1. Keep expected layerwise FP8 reload and shared-memory wait warnings
+# out of production logs; process failures still surface at ERROR level.
+export VLLM_USE_V1=1 VLLM_ENABLE_V1_MULTIPROCESSING=1 VLLM_LOGGING_LEVEL=ERROR
 export ATOM_DISABLE_VLLM_PLUGIN=1
 
 # PYTHONPATH — Lumen DSV4 modules + miles shim for bootstrap Megatron compatibility

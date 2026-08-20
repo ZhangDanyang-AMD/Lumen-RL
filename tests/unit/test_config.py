@@ -262,6 +262,8 @@ def test_dsv4_longrun_uses_miles_adam_and_grpo_semantics() -> None:
     assert cfg.policy.generation.vllm_cfg.linear_backend == "auto"
     assert cfg.policy.generation.vllm_cfg.enable_prefix_caching is False
     assert cfg.policy.generation.vllm_cfg.quantization == "fp8_per_block"
+    # The DSV4 fp8_ds_mla attention layout requires an FP8 KV cache. MILES does
+    # not override its SGLang rollout to BF16 KV, so keep the backend contract.
     assert cfg.policy.generation.vllm_cfg.kv_cache_dtype == "fp8_e4m3"
     assert cfg.policy.generation.vllm_cfg.calculate_log_probs is True
     assert cfg.weight_sync.fp8_quantization_location == "inference"
@@ -270,12 +272,18 @@ def test_dsv4_longrun_uses_miles_adam_and_grpo_semantics() -> None:
     assert cfg.policy.max_token_len_per_gpu == 8192
     assert cfg.policy.train_global_batch_size == 256
     assert cfg.policy.gen_batch_size == 32
+    assert cfg.val_steps == 5
+    assert cfg.eval.num_generations == 8
+    assert cfg.eval.temperature == 0.8
+    assert cfg.eval.top_p == 0.7
+    assert cfg.eval.top_k == -1
     assert cfg.policy.optimizer_type == "adam"
+    assert cfg.quantization.rollout.precision == "fp8"
     assert cfg.quantization.training.fp8 is None
     assert cfg.policy.training.megatron_cfg.tensor_model_parallel_size == 4
     assert cfg.policy.training.megatron_cfg.pipeline_model_parallel_size == 4
     assert cfg.policy.training.megatron_cfg.expert_model_parallel_size == 4
-    assert cfg.policy.training.megatron_cfg.grad_reduce_in_fp32 is False
+    assert cfg.policy.training.megatron_cfg.grad_reduce_in_fp32 is True
     assert cfg.policy.training.megatron_cfg.optimizer_cpu_offload is True
     assert cfg.policy.training.megatron_cfg.optimizer_offload_fraction == 1.0
     assert cfg.policy.training.megatron_cfg.use_precision_aware_optimizer is True
@@ -292,21 +300,21 @@ def test_dsv4_longrun_uses_miles_adam_and_grpo_semantics() -> None:
     assert cfg.algorithm.grpo.clip_ratio == 0.2
     assert cfg.algorithm.clip_ratio_high == 0.28
     assert cfg.quantization.rollout_correction.rollout_is == "token"
-    assert cfg.quantization.rollout_correction.rollout_is_batch_normalize is True
+    assert cfg.quantization.rollout_correction.rollout_is_batch_normalize is False
     assert cfg.moe.r3.enabled is True
     assert cfg.moe.r3.record_router_logits is False
-    assert cfg.checkpointing.save_steps == 5
+    assert cfg.checkpointing.save_steps == 25
     assert cfg.checkpointing.save_total_limit == 2
     assert cfg.cluster.num_nodes == 3
     assert cfg.controller.ray.actor.process_on_nodes == [8, 8]
     assert (
         cfg.controller.ray.actor.topology_tags["node_ips"]
-        == "10.235.200.67,10.235.200.247"
+        == "10.235.200.172,10.235.200.57"
     )
     assert cfg.controller.ray.rollout.num_workers == 8
     assert cfg.controller.ray.rollout.process_on_nodes == [8]
     assert (
         cfg.controller.ray.rollout.topology_tags["node_ips"]
-        == "10.235.200.173"
+        == "10.235.200.32"
     )
     assert cfg.num_training_steps == 200

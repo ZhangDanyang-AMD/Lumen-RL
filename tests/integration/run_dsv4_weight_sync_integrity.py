@@ -68,6 +68,28 @@ def _one_token_probe(manager: Any) -> dict[str, Any]:
     }
 
 
+def configure_diagnostic(config: Any) -> int:
+    """Apply diagnostic-only settings and return the requested sync count."""
+    repeat_raw = os.environ.get("LUMENRL_WEIGHT_SYNC_REPEAT", "1")
+    try:
+        repeat_count = int(repeat_raw)
+    except ValueError as exc:
+        raise ValueError(
+            "LUMENRL_WEIGHT_SYNC_REPEAT must be a positive integer"
+        ) from exc
+    if repeat_count <= 0:
+        raise ValueError(
+            "LUMENRL_WEIGHT_SYNC_REPEAT must be a positive integer"
+        )
+    config.checkpointing.resume = (
+        os.environ.get("LUMENRL_WEIGHT_SYNC_RESUME", "0") == "1"
+    )
+    config.eval.enabled = False
+    config.logger.wandb_enabled = False
+    config.moe.r3.enabled = False
+    return repeat_count
+
+
 def main() -> None:
     from lumenrl.core.config import LumenRLConfig
     from lumenrl.trainer.main import _setup_logging
@@ -78,10 +100,7 @@ def main() -> None:
     os.environ["LUMENRL_SKIP_DATASET_INIT"] = "1"
     _setup_logging()
     config = LumenRLConfig.from_cli()
-    config.checkpointing.resume = False
-    config.eval.enabled = False
-    config.logger.wandb_enabled = False
-    config.moe.r3.enabled = False
+    repeat_count = configure_diagnostic(config)
     if not config.weight_sync.enabled:
         raise ValueError("weight_sync.enabled must be true")
     if str(config.weight_sync.backend) != "rdma":
@@ -96,24 +115,46 @@ def main() -> None:
         before = _inspect_replicas(manager)
         scales_before = _inspect_replicas(manager, "inspect_fp8_scales")
         probe_before = _one_token_probe(manager)
-        trainer.global_step = 0
-        trainer._sync_weights_rdma(manager)
-        after = _inspect_replicas(manager)
-        scales_after = _inspect_replicas(manager, "inspect_fp8_scales")
-        probe_after = _one_token_probe(manager)
+        rounds = []
+        for sync_index in range(repeat_count):
+            trainer.global_step = int(trainer._resume_step) + sync_index
+            trainer._sync_weights_rdma(manager)
+            after = _inspect_replicas(manager)
+            scales_after = _inspect_replicas(manager, "inspect_fp8_scales")
+            probe_after = _one_token_probe(manager)
+            round_result = {
+                "sync_index": sync_index,
+                "global_step": trainer.global_step,
+                "after": summarize_replica_reports(after),
+                "scales_after": scales_after,
+                "probe_after": probe_after,
+                "receiver_phases": getattr(
+                    trainer,
+                    "_last_weight_sync_integrity",
+                    None,
+                ),
+                "metrics": trainer._last_weight_sync_metrics,
+            }
+            rounds.append(round_result)
+            print(
+                "WEIGHT_SYNC_ROUND_JSON=" + json.dumps(round_result),
+                flush=True,
+            )
+            if not round_result["after"]["all_finite"]:
+                raise RuntimeError(
+                    f"vLLM model became non-finite after sync {sync_index}"
+                )
+            if not probe_after["all_finite"]:
+                raise RuntimeError(
+                    f"vLLM one-token logprob became non-finite after sync {sync_index}"
+                )
         result = {
             "before": summarize_replica_reports(before),
-            "after": summarize_replica_reports(after),
             "scales_before": scales_before,
-            "scales_after": scales_after,
             "probe_before": probe_before,
-            "probe_after": probe_after,
-            "receiver_phases": getattr(
-                trainer,
-                "_last_weight_sync_integrity",
-                None,
-            ),
-            "metrics": trainer._last_weight_sync_metrics,
+            "resume_step": trainer._resume_step,
+            "repeat_count": repeat_count,
+            "rounds": rounds,
         }
         print(
             "WEIGHT_SYNC_INTEGRITY_JSON=" + json.dumps(result),
@@ -121,10 +162,8 @@ def main() -> None:
         )
         if not result["before"]["all_finite"]:
             raise RuntimeError("vLLM model is non-finite before weight sync")
-        if not result["after"]["all_finite"]:
-            raise RuntimeError("vLLM model became non-finite after weight sync")
-        if not probe_before["all_finite"] or not probe_after["all_finite"]:
-            raise RuntimeError("vLLM one-token logprob became non-finite")
+        if not probe_before["all_finite"]:
+            raise RuntimeError("vLLM one-token logprob was non-finite before sync")
     finally:
         trainer.cleanup()
 

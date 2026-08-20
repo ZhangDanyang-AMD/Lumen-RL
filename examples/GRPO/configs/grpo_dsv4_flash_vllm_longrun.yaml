@@ -33,15 +33,15 @@ weight_sync:
   backend: rdma
   shared_folder: /dev/shm/weight_sync/dsv4-flash
   bucket_size_mb: 2048
-  timeout_s: 1200
+  timeout_s: 7200
   verify_full_load: true
   fp8_quantization_location: inference
   rdma:
     backend: rccl
     require_rdma: true
     hca: ionic_0
-    interface: benic7p1
-    gid_index: 3
+    interface: ens50f0
+    gid_index: 1
     gdr_mode: auto
 
 controller:
@@ -53,12 +53,12 @@ controller:
       dispatch_mode: dp_compute_proto
       process_on_nodes: [8, 8]
       topology_tags:
-        node_ips: "10.235.200.67,10.235.200.247"
+        node_ips: "10.235.200.172,10.235.200.57"
     rollout:
       num_workers: 8
       process_on_nodes: [8]
       topology_tags:
-        node_ips: "10.235.200.173"
+        node_ips: "10.235.200.32"
 
 policy:
   model_name: /dev/shm/models/DeepSeek-V4-Flash-BF16
@@ -94,7 +94,7 @@ policy:
       moe_grouped_gemm: true
       moe_token_dispatcher_type: alltoall
       use_distributed_optimizer: true
-      grad_reduce_in_fp32: false
+      grad_reduce_in_fp32: true
       attention_softmax_in_fp32: true
       sequence_parallel: true
       recompute_granularity: full
@@ -124,6 +124,8 @@ policy:
       disable_custom_all_reduce: true
       moe_backend: auto                       # AITER when VLLM_ROCM_USE_AITER=1
       linear_backend: auto
+      # DSV4's fp8_ds_mla attention layout requires FP8 KV cache; MILES does
+      # not override its SGLang rollout to BF16 KV.
       kv_cache_dtype: fp8_e4m3
       gpu_memory_utilization: 0.92
       max_model_len: 16384
@@ -153,13 +155,15 @@ algorithm:
 
 quantization:
   rollout:
-    precision: bf16
+    precision: fp8
   training:
     fp8: null
   rollout_correction:
     rollout_is: token
     rollout_is_threshold: 2.0
-    rollout_is_batch_normalize: true
+    # Match the MILES DSV4 --use-tis recipe: clamp exp(train-rollout) at 2.0
+    # and apply it directly to the per-token GRPO loss without renormalization.
+    rollout_is_batch_normalize: false
 
 moe:
   r3:
@@ -170,20 +174,24 @@ moe:
 reward:
   type: function
   function: lumenrl.rewards.math_reward.dapo_math_reward
-  dataset: /dev/shm/data/dsv4-flash/dapo-math-17k/dapo-math-17k.jsonl
+  dataset: /dev/shm/datasets/dapo-math-17k/dapo-math-17k.jsonl
   shuffle: true
   shuffle_seed: 10086
 
-val_dataset: /dev/shm/data/dsv4-flash/aime-2024/aime-2024.jsonl
-val_steps: 10
+val_dataset: /dev/shm/datasets/aime-2024/aime-2024.jsonl
+val_steps: 5
 val_batch_size: 0
 eval:
   enabled: true
   num_samples: 0
+  num_generations: 8
+  temperature: 0.8
+  top_p: 0.7
+  top_k: -1
 
 checkpointing:
   checkpoint_dir: /dev/shm/checkpoints/dsv4-flash/longrun
-  save_steps: 5
+  save_steps: 25
   save_total_limit: 2
   resume: true
 

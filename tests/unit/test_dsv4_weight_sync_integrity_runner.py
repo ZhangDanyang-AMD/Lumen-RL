@@ -1,3 +1,7 @@
+from types import SimpleNamespace
+
+import pytest
+
 from tests.integration import run_dsv4_weight_sync_integrity as integrity
 
 
@@ -22,3 +26,39 @@ def test_summarize_replica_reports_locates_first_bad_worker() -> None:
         summary["first_bad"]["report"]["first_bad"]["name"]
         == "layers.2.weight_scale_inv"
     )
+
+
+def test_configure_diagnostic_supports_resume_and_repeated_syncs(monkeypatch) -> None:
+    config = SimpleNamespace(
+        checkpointing=SimpleNamespace(resume=False),
+        eval=SimpleNamespace(enabled=True),
+        logger=SimpleNamespace(wandb_enabled=True),
+        moe=SimpleNamespace(r3=SimpleNamespace(enabled=True)),
+    )
+    monkeypatch.setenv("LUMENRL_WEIGHT_SYNC_RESUME", "1")
+    monkeypatch.setenv("LUMENRL_WEIGHT_SYNC_REPEAT", "3")
+
+    repeats = integrity.configure_diagnostic(config)
+
+    assert repeats == 3
+    assert config.checkpointing.resume is True
+    assert config.eval.enabled is False
+    assert config.logger.wandb_enabled is False
+    assert config.moe.r3.enabled is False
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "not-an-int"])
+def test_configure_diagnostic_rejects_invalid_repeat_count(
+    monkeypatch,
+    value,
+) -> None:
+    config = SimpleNamespace(
+        checkpointing=SimpleNamespace(resume=False),
+        eval=SimpleNamespace(enabled=True),
+        logger=SimpleNamespace(wandb_enabled=True),
+        moe=SimpleNamespace(r3=SimpleNamespace(enabled=True)),
+    )
+    monkeypatch.setenv("LUMENRL_WEIGHT_SYNC_REPEAT", value)
+
+    with pytest.raises(ValueError, match="LUMENRL_WEIGHT_SYNC_REPEAT"):
+        integrity.configure_diagnostic(config)

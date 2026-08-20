@@ -1,15 +1,18 @@
 import importlib
 import inspect
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
 
 import lumenrl.engine.training.megatron_lumen_dsv4_engine as dsv4_engine
 from lumenrl.engine.training.dsv4_megatron_bridge import DSV4Dims
+from lumenrl.engine.training.megatron_engine import MegatronEngine
 from lumenrl.engine.training.megatron_lumen_dsv4_engine import (
     MegatronLumenDSV4Engine,
     _dsv4_router_kwargs,
+    _lockstep_stream,
     _named_export_tensors,
     _StreamingGatheredParamMapping,
 )
@@ -28,6 +31,23 @@ def test_dsv4_actor_explicitly_disables_fp8_training():
 
     assert "bf16=True" in source
     assert "fp8=None" in source
+
+
+@pytest.mark.parametrize(
+    "method_name",
+    [
+        "_engine_update_policy_rowwise",
+        "_engine_update_policy_packed",
+        "_engine_update_policy_pp",
+    ],
+)
+def test_megatron_grpo_applies_rollout_importance_weights(method_name):
+    source = inspect.getsource(getattr(MegatronEngine, method_name))
+    grpo_branch = source.split(
+        "elif algo_name == AlgorithmName.GRPO.value:", 1
+    )[1].split("\n            else:", 1)[0]
+
+    assert "rollout_is_weights=ris" in grpo_branch
 
 
 def test_dsv4_pp_uses_ordered_dynamic_shape_exchange():
@@ -74,6 +94,19 @@ def _streamed_config(mode="adam", chunk_mib=256, **overrides):
     }
     values.update(overrides)
     return values
+
+
+def test_streamed_optimizer_precision_uses_configured_bf16_moments():
+    kwargs = dsv4_engine._optimizer_precision_kwargs(
+        {
+            "use_precision_aware_optimizer": True,
+            "streamed_optimizer_moment_dtype": "bf16",
+        }
+    )
+
+    assert kwargs["exp_avg_dtype"] is torch.bfloat16
+    assert kwargs["exp_avg_sq_dtype"] is torch.bfloat16
+    assert kwargs["main_params_dtype"] is torch.float32
 
 
 def _patch_streamed_adam_capability(monkeypatch, value=True):
@@ -565,6 +598,225 @@ def test_export_tensors_exclude_frozen_router_buffers():
     exported = dict(_named_export_tensors(module))
 
     assert set(exported) == {"weight"}
+
+
+def test_lockstep_stream_rendezvous_before_requesting_next_item():
+    events = []
+
+    def source():
+        events.append("produce:first")
+        yield "first"
+        events.append("produce:second")
+        yield "second"
+
+    stream = _lockstep_stream(
+        source(),
+        synchronize=lambda: events.append("barrier"),
+    )
+
+    assert next(stream) == "first"
+    assert events == ["produce:first"]
+    assert next(stream) == "second"
+    assert events == ["produce:first", "barrier", "produce:second"]
+    with pytest.raises(StopIteration):
+        next(stream)
+    assert events == ["produce:first", "barrier", "produce:second", "barrier"]
+
+
+def _install_fake_megatron_parallel_state(monkeypatch, *, pp_size):
+    mpu = SimpleNamespace(
+        get_tensor_model_parallel_world_size=lambda: 1,
+        get_expert_tensor_parallel_world_size=lambda: 1,
+        get_pipeline_model_parallel_group=lambda: "pp",
+    )
+    core = ModuleType("megatron.core")
+    core.parallel_state = mpu
+    megatron = ModuleType("megatron")
+    megatron.core = core
+    monkeypatch.setitem(sys.modules, "megatron", megatron)
+    monkeypatch.setitem(sys.modules, "megatron.core", core)
+
+    engine = object.__new__(MegatronLumenDSV4Engine)
+    engine.module = torch.nn.Module()
+    engine._dims = DSV4Dims(num_layers=0, num_experts=0, compress_ratios=[])
+    engine._ep_size = 1
+    engine._pp_size = pp_size
+    engine._pp_rank = 0
+    engine._layers_per_pp_rank = [0] * pp_size
+    return engine
+
+
+def test_get_per_tensor_param_pp_wraps_stream_with_default_barrier(monkeypatch):
+    engine = _install_fake_megatron_parallel_state(monkeypatch, pp_size=2)
+    events = []
+
+    def fake_convert(mapping, *args, **kwargs):
+        tensor = (
+            torch.empty(1, device="meta")
+            if mapping._metadata
+            else torch.ones(1)
+        )
+        yield "tensor", tensor
+
+    def fake_all_gather_object(output, value, *, group):
+        assert group == "pp"
+        output[0] = value
+        output[1] = (1, {})
+
+    def fake_barrier():
+        events.append("barrier")
+
+    original_lockstep_stream = dsv4_engine._lockstep_stream
+    lockstep_calls = []
+
+    def record_lockstep_stream(stream, synchronize):
+        lockstep_calls.append((stream, synchronize))
+        return original_lockstep_stream(stream, synchronize)
+
+    monkeypatch.setattr(dsv4_engine, "dsv4_megatron_to_hf", fake_convert)
+    monkeypatch.setattr(dsv4_engine, "_lockstep_stream", record_lockstep_stream)
+    monkeypatch.setattr(dsv4_engine.dist, "barrier", fake_barrier)
+    monkeypatch.setattr(
+        dsv4_engine.dist,
+        "get_process_group_ranks",
+        lambda group: [0, 1],
+    )
+    monkeypatch.setattr(dsv4_engine.dist, "all_gather_object", fake_all_gather_object)
+    monkeypatch.setattr(
+        dsv4_engine.dist,
+        "broadcast",
+        lambda tensor, *, src, group, async_op: (
+            events.append("broadcast")
+            or SimpleNamespace(wait=lambda: None)
+        ),
+    )
+    monkeypatch.setattr(dsv4_engine.torch.cuda, "synchronize", lambda device=None: None)
+
+    params, metadata = engine.get_per_tensor_param()
+
+    assert metadata is None
+    assert len(lockstep_calls) == 1
+    assert lockstep_calls[0][1] is fake_barrier
+    key, tensor = next(params)
+    assert key == "tensor"
+    torch.testing.assert_close(tensor, torch.ones(1))
+    assert events == ["broadcast"]
+    with pytest.raises(StopIteration):
+        next(params)
+    assert events == ["broadcast", "barrier"]
+
+
+def test_get_per_tensor_param_pp_rejects_source_metadata_mismatch(monkeypatch):
+    engine = _install_fake_megatron_parallel_state(monkeypatch, pp_size=2)
+    broadcast_calls = []
+
+    def fake_convert(mapping, *args, **kwargs):
+        tensor = (
+            torch.empty(1, device="meta")
+            if mapping._metadata
+            else torch.ones(2)
+        )
+        yield "tensor", tensor
+
+    def fake_all_gather_object(output, value, *, group):
+        output[0] = value
+        output[1] = (1, {})
+
+    monkeypatch.setattr(dsv4_engine, "dsv4_megatron_to_hf", fake_convert)
+    monkeypatch.setattr(
+        dsv4_engine.dist,
+        "get_process_group_ranks",
+        lambda group: [0, 1],
+    )
+    monkeypatch.setattr(dsv4_engine.dist, "all_gather_object", fake_all_gather_object)
+    monkeypatch.setattr(
+        dsv4_engine.dist,
+        "broadcast",
+        lambda *args, **kwargs: broadcast_calls.append((args, kwargs)),
+    )
+
+    params, _ = engine.get_per_tensor_param()
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"tensor.*expected shape=\(1,\).*actual shape=\(2,\)",
+    ):
+        next(params)
+    assert broadcast_calls == []
+
+
+def test_get_per_tensor_param_pp_waits_for_broadcast_before_yield(monkeypatch):
+    engine = _install_fake_megatron_parallel_state(monkeypatch, pp_size=2)
+    events = []
+
+    def fake_convert(mapping, *args, **kwargs):
+        tensor = (
+            torch.empty(1, device="meta")
+            if mapping._metadata
+            else torch.ones(1)
+        )
+        yield "tensor", tensor
+
+    def fake_all_gather_object(output, value, *, group):
+        output[0] = value
+        output[1] = (1, {})
+
+    class FakeWork:
+        def wait(self):
+            events.append("wait")
+
+    def fake_broadcast(tensor, *, src, group, async_op=False):
+        events.append(("broadcast", async_op))
+        return FakeWork() if async_op else None
+
+    monkeypatch.setattr(dsv4_engine, "dsv4_megatron_to_hf", fake_convert)
+    monkeypatch.setattr(
+        dsv4_engine.dist,
+        "get_process_group_ranks",
+        lambda group: [0, 1],
+    )
+    monkeypatch.setattr(dsv4_engine.dist, "all_gather_object", fake_all_gather_object)
+    monkeypatch.setattr(dsv4_engine.dist, "broadcast", fake_broadcast)
+    monkeypatch.setattr(
+        dsv4_engine.torch.cuda,
+        "synchronize",
+        lambda device=None: events.append(("synchronize", device)),
+    )
+
+    params, _ = engine.get_per_tensor_param()
+    key, tensor = next(params)
+
+    assert key == "tensor"
+    torch.testing.assert_close(tensor, torch.ones(1))
+    assert events == [
+        ("broadcast", True),
+        "wait",
+        ("synchronize", tensor.device),
+    ]
+
+
+def test_get_per_tensor_param_pp1_leaves_stream_unwrapped(monkeypatch):
+    engine = _install_fake_megatron_parallel_state(monkeypatch, pp_size=1)
+
+    def fake_convert(mapping, *args, **kwargs):
+        yield "tensor", torch.ones(1)
+
+    monkeypatch.setattr(dsv4_engine, "dsv4_megatron_to_hf", fake_convert)
+    monkeypatch.setattr(
+        dsv4_engine,
+        "_lockstep_stream",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("PP=1 must not use the lockstep stream")
+        ),
+    )
+
+    params, metadata = engine.get_per_tensor_param()
+
+    assert metadata is None
+    exported = list(params)
+    assert len(exported) == 1
+    assert exported[0][0] == "tensor"
+    torch.testing.assert_close(exported[0][1], torch.ones(1))
 
 
 def test_streaming_metadata_mapping_expands_tp_shape_without_allocating(monkeypatch):

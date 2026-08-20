@@ -93,6 +93,7 @@ def _parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--rollout-routing")
     parser.add_argument("--sequence-length", type=int, default=128)
     parser.add_argument("--response-length", type=int, default=32)
+    parser.add_argument("--update-policy-smoke", action="store_true")
     return parser.parse_known_args()
 
 
@@ -104,7 +105,9 @@ def _capture(args: argparse.Namespace, config_args: list[str]) -> dict[str, Any]
     if not args.output:
         raise ValueError("--output is required for capture mode")
     sys.argv = [sys.argv[0], *config_args]
-    os.environ["LUMENRL_FORWARD_ONLY_INIT"] = "1"
+    os.environ["LUMENRL_FORWARD_ONLY_INIT"] = (
+        "0" if args.update_policy_smoke else "1"
+    )
     os.environ["LUMENRL_SKIP_ROLLOUT_INIT"] = "1"
     _setup_logging()
     config = LumenRLConfig.from_cli()
@@ -151,6 +154,41 @@ def _capture(args: argparse.Namespace, config_args: list[str]) -> dict[str, Any]
                 attention_mask=attention_mask,
                 rollout_routing=rollout_routing,
             ).detach().float().cpu()
+        update_metrics = None
+        if args.update_policy_smoke:
+            from lumenrl.core.protocol import DataProto
+
+            policy_batch = DataProto(
+                tensors={
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "old_log_probs": log_probs,
+                    "ref_log_probs": torch.zeros_like(log_probs),
+                    "rewards": torch.ones(input_ids.shape[0]),
+                    "response_mask": response_mask,
+                    "advantages": torch.ones(input_ids.shape[0]),
+                },
+                meta={
+                    "algorithm": config.algorithm.name,
+                    "algo_config": trainer._to_plain_dict(config.algorithm),
+                    "temperature": float(
+                        config.policy.generation.vllm_cfg.temperature or 1.0
+                    ),
+                    "max_token_len_per_gpu": int(
+                        config.policy.max_token_len_per_gpu
+                    ),
+                    "batch_num_tokens": int(response_mask.sum().item()),
+                    "dp_size": int(
+                        trainer._actor_dp_size
+                        or (
+                            trainer._actor_wg.num_workers
+                            // max(1, trainer._actor_mp)
+                        )
+                    ),
+                    "global_batch_size": int(input_ids.shape[0]),
+                },
+            )
+            update_metrics = trainer._update_actor_with_ray(policy_batch)
         artifact = {
             "input_ids": input_ids[0].tolist(),
             "attention_mask": attention_mask[0].tolist(),
@@ -165,6 +203,7 @@ def _capture(args: argparse.Namespace, config_args: list[str]) -> dict[str, Any]
             "expert_model_parallel_size": int(
                 config.policy.training.megatron_cfg.expert_model_parallel_size
             ),
+            "update_metrics": update_metrics,
         }
         destination = Path(args.output)
         destination.parent.mkdir(parents=True, exist_ok=True)

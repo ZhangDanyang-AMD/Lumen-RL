@@ -1,3 +1,4 @@
+import inspect
 import sys
 from collections import UserDict
 from contextlib import nullcontext
@@ -18,6 +19,222 @@ except ModuleNotFoundError:
 from lumenrl.engine.training.actor_worker import LumenActorWorker as TrainingActorWorker
 from lumenrl.core.protocol import DataProto
 from lumenrl.workers.actor_worker import LumenActorWorker
+
+
+@pytest.mark.parametrize("worker_type", [LumenActorWorker, TrainingActorWorker])
+def test_rank_local_checkpoint_format_bypasses_dist_checkpoint(
+    worker_type,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    module = torch.nn.Linear(2, 2)
+    dist_save_calls = []
+    engine = SimpleNamespace(
+        module=module,
+        optimizer=None,
+        lr_scheduler=None,
+        save_dist_checkpoint=lambda *args, **kwargs: dist_save_calls.append(
+            (args, kwargs)
+        ),
+    )
+    worker = object.__new__(worker_type)
+    worker._engine = engine
+    worker.rank = 0
+    worker.world_size = 1
+    monkeypatch.setenv("LUMENRL_CHECKPOINT_FORMAT", "rank_local")
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    assert worker.save_checkpoint(str(tmp_path), global_step=3)
+
+    assert dist_save_calls == []
+    assert (tmp_path / "model_world_size_1_rank_0.pt").is_file()
+    extra = torch.load(
+        tmp_path / "extra_state_world_size_1_rank_0.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert extra["global_step"] == 3
+
+
+@pytest.mark.parametrize("worker_type", [LumenActorWorker, TrainingActorWorker])
+def test_rank_local_checkpoint_format_bypasses_dist_checkpoint_load(
+    worker_type,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    module = torch.nn.Linear(2, 2)
+    expected_weight = module.weight.detach().clone()
+    torch.save(module.state_dict(), tmp_path / "model_world_size_1_rank_0.pt")
+    torch.save(
+        {"global_step": 3, "lr_scheduler": None, "rng": {}},
+        tmp_path / "extra_state_world_size_1_rank_0.pt",
+    )
+    dist_load_calls = []
+    engine = SimpleNamespace(
+        module=module,
+        optimizer=None,
+        lr_scheduler=None,
+        load_dist_checkpoint=lambda *args, **kwargs: dist_load_calls.append(
+            (args, kwargs)
+        ),
+    )
+    worker = object.__new__(worker_type)
+    worker._engine = engine
+    worker.rank = 0
+    worker.world_size = 1
+    module.weight.data.zero_()
+    monkeypatch.setenv("LUMENRL_CHECKPOINT_FORMAT", "rank_local")
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+
+    assert worker.load_checkpoint(str(tmp_path)) == 3
+
+    assert dist_load_calls == []
+    assert torch.equal(module.weight, expected_weight)
+
+
+@pytest.mark.parametrize("worker_type", [LumenActorWorker, TrainingActorWorker])
+def test_rank_local_checkpoint_serializes_ranks_with_barriers(
+    worker_type,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    worker = object.__new__(worker_type)
+    worker._engine = SimpleNamespace(
+        module=torch.nn.Linear(2, 2),
+        optimizer=None,
+        lr_scheduler=None,
+    )
+    worker.rank = 1
+    worker.world_size = 2
+    barriers = []
+    monkeypatch.setenv("LUMENRL_CHECKPOINT_FORMAT", "rank_local")
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda output, _: output.__setitem__(slice(None), ["node-a", "node-a"]),
+    )
+    monkeypatch.setattr(torch.distributed, "barrier", lambda: barriers.append(1))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    assert worker.save_checkpoint(str(tmp_path), global_step=3)
+
+    assert len(barriers) == 2
+    assert (tmp_path / "model_world_size_2_rank_1.pt").is_file()
+
+
+@pytest.mark.parametrize("worker_type", [LumenActorWorker, TrainingActorWorker])
+def test_rank_local_checkpoint_saves_one_rank_per_node_in_parallel(
+    worker_type,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    worker = object.__new__(worker_type)
+    worker._engine = SimpleNamespace(
+        module=torch.nn.Linear(2, 2),
+        optimizer=None,
+        lr_scheduler=None,
+    )
+    worker.rank = 1
+    worker.world_size = 4
+    barriers = []
+    monkeypatch.setenv("LUMENRL_CHECKPOINT_FORMAT", "rank_local")
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda output, _: output.__setitem__(slice(None), ["node-a", "node-a", "node-b", "node-b"]),
+    )
+    monkeypatch.setattr(torch.distributed, "barrier", lambda: barriers.append(1))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    assert worker.save_checkpoint(str(tmp_path), global_step=3)
+
+    assert len(barriers) == 2
+    assert (tmp_path / "model_world_size_4_rank_1.pt").is_file()
+
+
+@pytest.mark.parametrize("worker_type", [LumenActorWorker, TrainingActorWorker])
+def test_rank_local_checkpoint_load_preserves_restored_master_params(
+    worker_type,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    class OptimizerStub:
+        def __init__(self):
+            self.reload_calls = 0
+
+        def state_dict(self):
+            return {"step": 1}
+
+        def load_state_dict(self, state):
+            assert state == {"step": 1}
+
+        def load_parameter_state(self, path):
+            assert path.endswith("optim_parameter_state_world_size_1_rank_0.pt")
+
+        def reload_model_params(self):
+            self.reload_calls += 1
+
+    module = torch.nn.Linear(2, 2)
+    optimizer = OptimizerStub()
+    torch.save(module.state_dict(), tmp_path / "model_world_size_1_rank_0.pt")
+    torch.save(optimizer.state_dict(), tmp_path / "optim_world_size_1_rank_0.pt")
+    (tmp_path / "optim_parameter_state_world_size_1_rank_0.pt").touch()
+    torch.save(
+        {"global_step": 3, "lr_scheduler": None, "rng": {}},
+        tmp_path / "extra_state_world_size_1_rank_0.pt",
+    )
+    worker = object.__new__(worker_type)
+    worker._engine = SimpleNamespace(
+        module=module,
+        optimizer=optimizer,
+        lr_scheduler=None,
+    )
+    worker.rank = 0
+    worker.world_size = 1
+    monkeypatch.setenv("LUMENRL_CHECKPOINT_FORMAT", "rank_local")
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+
+    assert worker.load_checkpoint(str(tmp_path)) == 3
+
+    assert optimizer.reload_calls == 0
+
+
+@pytest.mark.parametrize("worker_type", [LumenActorWorker, TrainingActorWorker])
+def test_rank_local_checkpoint_load_serializes_ranks(
+    worker_type,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    module = torch.nn.Linear(2, 2)
+    torch.save(module.state_dict(), tmp_path / "model_world_size_2_rank_1.pt")
+    torch.save(
+        {"global_step": 3, "lr_scheduler": None, "rng": {}},
+        tmp_path / "extra_state_world_size_2_rank_1.pt",
+    )
+    worker = object.__new__(worker_type)
+    worker._engine = SimpleNamespace(
+        module=module,
+        optimizer=None,
+        lr_scheduler=None,
+    )
+    worker.rank = 1
+    worker.world_size = 2
+    barriers = []
+    monkeypatch.setenv("LUMENRL_CHECKPOINT_FORMAT", "rank_local")
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda output, _: output.__setitem__(slice(None), ["node-a", "node-a"]),
+    )
+    monkeypatch.setattr(torch.distributed, "barrier", lambda: barriers.append(1))
+
+    assert worker.load_checkpoint(str(tmp_path)) == 3
+
+    assert len(barriers) == 2
 
 
 def test_dsv4_indexer_launch_tuning_reaches_engine_config() -> None:
@@ -231,6 +448,46 @@ def test_actor_grpo_loss_uses_miles_asymmetric_sequence_mean(worker_type) -> Non
 
     torch.testing.assert_close(loss, torch.tensor((-1.28 + 0.8) / 2))
     assert metrics["loss"] == pytest.approx(float(loss.detach()))
+
+
+@pytest.mark.parametrize("worker_type", [LumenActorWorker, TrainingActorWorker])
+def test_actor_grpo_loss_applies_rollout_importance_weights(worker_type) -> None:
+    worker = object.__new__(worker_type)
+    worker._engine = None
+    worker._pol_meta = {
+        "algorithm": "grpo",
+        "algo_config": {
+            "loss_agg_mode": "seq-mean-token-mean",
+            "clip_ratio_high": 0.28,
+            "grpo": {"clip_ratio": 0.2},
+        },
+        "global_batch_size": 2,
+        "dp_size": 1,
+    }
+    log_probs = torch.tensor([[2.0, 1.0], [0.5, 0.5]]).log().requires_grad_(True)
+    data = {
+        "old_log_probs": torch.zeros_like(log_probs),
+        "advantages": torch.tensor([1.0, -1.0]),
+        "response_mask": torch.tensor([[1, 0], [1, 1]]),
+        "rollout_is_weights": torch.tensor([[0.5, 0.0], [2.0, 2.0]]),
+    }
+
+    loss, metrics = worker._policy_loss_fn({"log_probs": log_probs}, data)
+
+    torch.testing.assert_close(loss, torch.tensor((-1.28 * 0.5 + 0.8 * 2.0) / 2))
+    assert metrics["loss"] == pytest.approx(float(loss.detach()))
+
+
+@pytest.mark.parametrize("worker_type", [LumenActorWorker, TrainingActorWorker])
+def test_actor_legacy_grpo_loss_applies_rollout_importance_weights(
+    worker_type,
+) -> None:
+    source = inspect.getsource(worker_type.train_step)
+    grpo_branch = source.split(
+        "elif algo_name == AlgorithmName.GRPO.value:", 1
+    )[1].split("\n                else:", 1)[0]
+
+    assert "rollout_is_weights=ris" in grpo_branch
 
 
 @pytest.mark.parametrize("worker_type", [LumenActorWorker, TrainingActorWorker])

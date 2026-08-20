@@ -17,7 +17,8 @@ def _expand_block_scales(
     )[: shape[0], : shape[1]]
 
 
-def test_per_block_quantizer_returns_vllm_dequant_scale() -> None:
+def test_per_block_quantizer_returns_vllm_dequant_scale(monkeypatch) -> None:
+    monkeypatch.setattr(quantizer, "_is_rocm", lambda: False)
     weight = torch.tensor(
         [[-4.0, -2.0], [1.0, 3.0]],
         dtype=torch.float32,

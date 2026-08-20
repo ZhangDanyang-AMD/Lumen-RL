@@ -1163,6 +1163,75 @@ def patch_distrib_optimizer_grad_copy(megatron_root: str) -> bool:
     return True
 
 
+def patch_distrib_optimizer_hdo_checkpoint(megatron_root: str) -> bool:
+    """Keep mixed-dtype HDO parameter/state ordering stable for checkpoints.
+
+    DistributedOptimizer first records model parameters in grad-buffer order,
+    then rebuilds each optimizer group with native-FP32 shards before BF16
+    shards.  The old ``model_param_group_index_map`` therefore points at the
+    wrong HDO state whenever a group contains both dtypes.
+    """
+    path = os.path.join(
+        megatron_root, "megatron", "core", "optimizer", "distrib_optimizer.py"
+    )
+    with open(path) as f:
+        content = f.read()
+    marker = "checkpoint order must match optimizer.param_groups"
+    if marker in content:
+        return False
+
+    build_anchor = (
+        "        ) = self._build_model_and_main_param_groups(\n"
+        "            self.gbuf_ranges, self.model_param_gbuf_map, "
+        "self.opt_group_ranges, config\n"
+        "        )"
+    )
+    if build_anchor not in content:
+        raise RuntimeError(
+            "Unable to patch HDO checkpoint order: model/main group anchor missing"
+        )
+    remap = build_anchor + (
+        "\n\n"
+        "        # HDO checkpoint order must match optimizer.param_groups, which\n"
+        "        # groups native-FP32 shards before BF16 shards.\n"
+        "        for group_index, model_groups in enumerate(zip(\n"
+        "            self.model_fp32_groups, self.model_float16_groups\n"
+        "        )):\n"
+        "            ordered_model_params = (*model_groups[0], *model_groups[1])\n"
+        "            for group_order, model_param in enumerate(ordered_model_params):\n"
+        "                self.model_param_group_index_map[model_param] = "
+        "(group_index, group_order)"
+    )
+    content = content.replace(build_anchor, remap, 1)
+
+    load_anchor = (
+        "                for model_param, tensors in recv_tensors.items():\n"
+        "                    self._set_main_param_and_optimizer_states(model_param, tensors)\n"
+        "\n"
+        "    @torch.no_grad()\n"
+        "    def load_parameter_state_from_fully_reshardable"
+    )
+    if load_anchor not in content:
+        raise RuntimeError(
+            "Unable to patch HDO checkpoint load: DP-zero load anchor missing"
+        )
+    load_replacement = (
+        "                for model_param, tensors in recv_tensors.items():\n"
+        "                    self._set_main_param_and_optimizer_states(model_param, tensors)\n"
+        "\n"
+        "        if isinstance(self.optimizer, HybridDeviceOptimizer):\n"
+        "            self.optimizer._sync_hdo_state_to_sub_optimizers()\n"
+        "\n"
+        "    @torch.no_grad()\n"
+        "    def load_parameter_state_from_fully_reshardable"
+    )
+    content = content.replace(load_anchor, load_replacement, 1)
+
+    with open(path, "w") as f:
+        f.write(content)
+    return True
+
+
 def patch_tp_copy_fp32_gradient_reduce(megatron_root: str) -> bool:
     """Support Lumen's FP32 tensor-parallel gradient reduction option."""
     path = os.path.join(
@@ -2418,6 +2487,9 @@ def main(megatron_root: str) -> None:
         ),
         "optimizer/distrib_optimizer.py": patch_distrib_optimizer_fp32_detach(megatron_root),
         "optimizer/distrib_optimizer.py grad copy": patch_distrib_optimizer_grad_copy(megatron_root),
+        "optimizer/distrib_optimizer.py HDO checkpoint": patch_distrib_optimizer_hdo_checkpoint(
+            megatron_root
+        ),
     }
     print(f"Patched ROCm Megatron at {megatron_root}:")
     for name, ok in results.items():

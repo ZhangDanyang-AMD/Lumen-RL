@@ -654,6 +654,10 @@ class EvalConfig:
     interval: int = 1000
     num_samples: int = 256
     micro_batch_size: int = 8
+    num_generations: int = 1
+    temperature: float = 0.0
+    top_p: float = 1.0
+    top_k: int = -1
 
 
 @dataclass

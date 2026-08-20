@@ -48,6 +48,15 @@ def test_vllm_runtime_env_propagates_full_aiter_fallback(monkeypatch):
     assert env_vars["VLLM_ROCM_USE_AITER"] == "0"
 
 
+def test_vllm_runtime_env_propagates_aiter_triton_gemm_fallback(monkeypatch):
+    monkeypatch.setenv("VLLM_ROCM_USE_AITER_TRITON_GEMM", "0")
+    env_vars = {}
+
+    vllm_ray_server._copy_vllm_runtime_env(env_vars)
+
+    assert env_vars["VLLM_ROCM_USE_AITER_TRITON_GEMM"] == "0"
+
+
 def test_vllm_runtime_env_propagates_all_gather_lifecycle_diagnostic(monkeypatch):
     monkeypatch.setenv("LUMENRL_DIAG_ALL_GATHER", "1")
     monkeypatch.setenv("LUMENRL_DIAG_ALL_GATHER_NUMEL", "517120")

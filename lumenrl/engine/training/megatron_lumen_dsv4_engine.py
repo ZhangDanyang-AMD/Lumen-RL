@@ -26,9 +26,9 @@ import math
 import os
 import re
 import sys
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, TypeVar
 
 import torch
 import torch.distributed as dist
@@ -58,6 +58,22 @@ _HYBRID_OPTIMIZER_MODULE = (
     "megatron.core.optimizer.cpu_offloading.hybrid_optimizer"
 )
 _MAX_STREAMED_OPTIMIZER_CHUNK_MIB = 1024
+
+T = TypeVar("T")
+
+
+def _lockstep_stream(
+    stream: Iterable[T],
+    synchronize: Callable[[], None],
+) -> Iterator[T]:
+    """Prevent consumers from requesting the next item before all ranks agree.
+
+    All distributed ranks must consume through ``StopIteration``. Closing early
+    or a consumer failure may leave peers waiting at the final barrier.
+    """
+    for item in stream:
+        yield item
+        synchronize()
 
 
 def _safe_optimizer_attr(optimizer, name):
@@ -342,12 +358,13 @@ def _optimizer_precision_kwargs(ec: Mapping[str, Any]) -> dict[str, Any]:
     enabled = bool(ec.get("use_precision_aware_optimizer", False))
     if not enabled:
         return {"use_precision_aware_optimizer": False}
+    moment_dtype = _streamed_optimizer_moment_dtype(ec)
     return {
         "use_precision_aware_optimizer": True,
         "main_grads_dtype": torch.float32,
         "main_params_dtype": torch.float32,
-        "exp_avg_dtype": torch.float32,
-        "exp_avg_sq_dtype": torch.float32,
+        "exp_avg_dtype": moment_dtype,
+        "exp_avg_sq_dtype": moment_dtype,
     }
 
 
@@ -1113,7 +1130,9 @@ class MegatronLumenDSV4Engine(MegatronEngine):
                 source_iter = None
                 if src_pp == pp_rank:
                     source_iter = iter(convert_for_rollout(actual_mapping))
-                for expected_key, (shape, dtype) in meta.items():
+                for tensor_index, (expected_key, (shape, dtype)) in enumerate(
+                    meta.items()
+                ):
                     if source_iter is not None:
                         actual_key, tensor = next(source_iter)
                         if actual_key != expected_key:
@@ -1121,9 +1140,26 @@ class MegatronLumenDSV4Engine(MegatronEngine):
                                 "DSV4 streaming metadata order mismatch: "
                                 f"expected {expected_key}, got {actual_key}"
                             )
+                        expected_shape = tuple(shape)
+                        actual_shape = tuple(tensor.shape)
+                        if actual_shape != expected_shape or tensor.dtype != dtype:
+                            raise RuntimeError(
+                                "DSV4 streaming metadata mismatch for "
+                                f"{expected_key} at src_pp={src_pp} "
+                                f"tensor_index={tensor_index}: "
+                                f"expected shape={expected_shape} dtype={dtype}, "
+                                f"actual shape={actual_shape} dtype={tensor.dtype}"
+                            )
                     else:
                         tensor = torch.empty(shape, dtype=dtype, device="cuda")
-                    dist.broadcast(tensor, src=src_global, group=pp_group)
+                    work = dist.broadcast(
+                        tensor,
+                        src=src_global,
+                        group=pp_group,
+                        async_op=True,
+                    )
+                    work.wait()
+                    torch.cuda.synchronize(tensor.device)
                     yield expected_key, tensor
                     del tensor
                 if source_iter is not None:
@@ -1136,7 +1172,7 @@ class MegatronLumenDSV4Engine(MegatronEngine):
                             f"DSV4 streaming metadata omitted tensor {extra_key}"
                         )
 
-        return _streaming_pp_gen(), None
+        return _lockstep_stream(_streaming_pp_gen(), dist.barrier), None
 
 
 @EngineRegistry.register(model_type="language_model", backend="megatron_lumen_dsv4")

@@ -4,12 +4,31 @@ from __future__ import annotations
 
 import logging
 import re
+import socket
 from pathlib import Path
 from typing import Any
 
 import torch
 
 logger = logging.getLogger(__name__)
+
+
+def checkpoint_rank_phases(rank: int, world_size: int) -> list[list[int]]:
+    """Group checkpoint ranks into one concurrent writer per physical node."""
+    if not torch.distributed.is_initialized():
+        return [[int(rank)]]
+
+    hostnames: list[str | None] = [None] * int(world_size)
+    torch.distributed.all_gather_object(hostnames, socket.gethostname())
+    ranks_by_host: dict[str, list[int]] = {}
+    for global_rank, hostname in enumerate(hostnames):
+        ranks_by_host.setdefault(str(hostname), []).append(global_rank)
+
+    phase_count = max(len(ranks) for ranks in ranks_by_host.values())
+    return [
+        [ranks[phase] for ranks in ranks_by_host.values() if phase < len(ranks)]
+        for phase in range(phase_count)
+    ]
 
 
 class CheckpointManager:

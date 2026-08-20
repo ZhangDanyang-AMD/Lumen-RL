@@ -50,6 +50,7 @@ class GRPOAlgorithm(BaseAlgorithm):
         old_logp = batch.tensors["old_log_probs"]
         adv = batch.tensors["advantages"]
         mask = _response_mask(batch)
+        rollout_is_weights = batch.tensors.get("rollout_is_weights")
 
         adv_tok = _expand_adv_to_tokens(adv, mask)
         clip_low = self._config.algorithm.grpo.clip_ratio
@@ -80,6 +81,7 @@ class GRPOAlgorithm(BaseAlgorithm):
             dp_size=dp_size,
             loss_agg_mode=loss_agg_mode,
             global_batch_size=global_batch_size,
+            rollout_is_weights=rollout_is_weights,
         )
 
         loss = pg
