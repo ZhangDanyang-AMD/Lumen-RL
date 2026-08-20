@@ -47,14 +47,44 @@ the replica-side exception above it, because two different causes share it:
   it cannot be worked around from the LumenRL side.
 - `IndexError: list index out of range` inside
   `torch/_functorch/_aot_autograd/runtime_wrappers.py`, reached from ATOM's
-  `warmup_model`: **open, root cause not yet identified.** Observed on
-  MI355X/gfx950 with the verified stack (image `v0.23.0`, torch `2.10.0+git8514f05`,
-  ATOM `7173f5b`, aiter `ff1006d03` + PR#4570, Lumen `e6379cb`) and reproduced
-  identically on Lumen-RL `3de3b08`, so it is not specific to newer LumenRL commits.
-  Example 4 passes on the same environment, so it is confined to the pure-BF16 ATOM
-  compile path (`MODE=atombf16` drops `LUMEN_NORM` and the online quantizer while
-  `run_dapo.sh` still forces `enforce_eager=false` + `compilation_config.level=3`).
-  Examples 1-4, 6 and 7 are unaffected.
+  `warmup_model`: **a compile cache left behind by example 4.** Both examples drive
+  ATOM through `enforce_eager=false` + `compilation_config.level=3`, but example 4
+  compiles the FP8 model and example 5 the BF16 one, and torch's inductor cache
+  (`/tmp/torchinductor_root`) is not scoped per run the way
+  `ATOM_ISOLATE_TORCH_COMPILE_CACHE` scopes ATOM's own. Example 5 then loads a graph
+  whose input signature does not match and dies in AOTAutograd.
+
+  Measured, same container and stack each time:
+
+  | Sequence | Example 5 |
+  |---|---|
+  | caches cleared, example 5 alone | passes (twice, cold and warm) |
+  | caches cleared, example 4, then example 5 | fails in 71 s |
+
+  So clear the caches between any two ATOM runs of different precision:
+
+  ```bash
+  sudo docker exec "$CONTAINER" bash -lc \
+    'rm -rf /tmp/aiter_configs /tmp/atom_torch_compile_cache /tmp/torchinductor_root'
+  ```
+
+  `/tmp/aiter_configs` matters on its own account too: aiter otherwise silently
+  reuses a merged tuning config from the previous run.
+
+**Example 5 runs but its `rollout_corr/kl` is ~7x too high.** Distinct from the crash
+above, and it does not trip the pass criteria — exit 0, generation healthy
+(`reward/accuracy` 0.17, `ppo_kl` ~0, `grad_norm` 0.76, no `kept 0/` rounds, no
+`finished with reason max`). Only the train-vs-rollout log-prob gap is off: measured
+0.0074 and 0.0077 on two runs, against 0.00085-0.00111 previously measured for this
+same config and the ~0.001 §4.7 expects. Example 4 on the same stack also ran high
+(0.0051 and 0.0089 against ~0.004).
+
+Since example 5 exists precisely to answer "is the gap FP8 or ATOM alignment", a
+value **above** example 4's says the answer is alignment, not quantization. The
+documented first suspect does not apply at ATOM `7173f5b`, where
+`atom/model_ops/layernorm.py` already passes `use_model_sensitive_rmsnorm=1` at both
+call sites — so if you see this, the misalignment is elsewhere and worth reporting
+upstream rather than re-checking that flag.
 
 **ATOM rollout degradation** (with `MODE=atomfp8` / `atombf16`: `filter_groups: kept 0/96`
 plus `Rollout reward: accuracy=0.0000` plus many `finished with reason max` and no `eos`

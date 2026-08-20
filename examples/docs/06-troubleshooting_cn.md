@@ -38,13 +38,38 @@ during initialization`。这条只是症状，**一定要往上读 replica 侧�
   ATOM 分配的是 5 维 SHUFFLE V-cache，而 aiter 的 triton kernel 在非 flash 布局下要 4 维，
   两者不能靠 `view()` 互转。把这个变量取消掉；LumenRL 侧绕不过去。
 - `torch/_functorch/_aot_autograd/runtime_wrappers.py` 里的
-  `IndexError: list index out of range`，由 ATOM 的 `warmup_model` 触发：**未定位，问题
-  仍开放。** 在 MI355X/gfx950 上以已验证的栈复现（镜像 `v0.23.0`、torch
-  `2.10.0+git8514f05`、ATOM `7173f5b`、aiter `ff1006d03` + PR#4570、Lumen `e6379cb`），
-  在 Lumen-RL `3de3b08` 上同样复现，所以与较新的 LumenRL 提交无关。同一环境下例子 4 能过，
-  说明范围限于纯 BF16 的 ATOM 编译路径（`MODE=atombf16` 会去掉 `LUMEN_NORM` 和在线量化，
-  而 `run_dapo.sh` 仍强制 `enforce_eager=false` + `compilation_config.level=3`）。
-  例子 1-4、6、7 不受影响。
+  `IndexError: list index out of range`，由 ATOM 的 `warmup_model` 触发：**是例子 4
+  留下的编译缓存。** 两个例子都让 ATOM 跑在 `enforce_eager=false` +
+  `compilation_config.level=3` 下，但例子 4 编译的是 FP8 模型、例子 5 编译的是 BF16 模型，
+  而 torch 的 inductor 缓存（`/tmp/torchinductor_root`）**不像 `ATOM_ISOLATE_TORCH_COMPILE_CACHE`
+  那样按运行隔离**。于是例子 5 载入了一份输入签名不匹配的图，死在 AOTAutograd。
+
+  实测，同一容器同一套栈：
+
+  | 顺序 | 例子 5 |
+  |---|---|
+  | 清缓存后单独跑例子 5 | 通过（冷、热各一次） |
+  | 清缓存后先跑例子 4、再跑例子 5 | 71 秒失败 |
+
+  所以两次精度不同的 ATOM 运行之间要清缓存：
+
+  ```bash
+  sudo docker exec "$CONTAINER" bash -lc \
+    'rm -rf /tmp/aiter_configs /tmp/atom_torch_compile_cache /tmp/torchinductor_root'
+  ```
+
+  `/tmp/aiter_configs` 本身也要清：不清的话 aiter 会静默沿用上一次的合并调优配置。
+
+**例子 5 能跑起来但 `rollout_corr/kl` 高了约 7 倍。** 这与上面的崩溃是两件事，而且不触发
+失败判据——exit 0，生成侧健康（`reward/accuracy` 0.17、`ppo_kl` ≈ 0、`grad_norm` 0.76、
+零次 `kept 0/`、零次 `finished with reason max`）。只有训练与 rollout 的 log-prob 差距不对：
+两次分别测到 0.0074 和 0.0077，而此前同一配置实测是 0.00085~0.00111、§4.7 的期望是 ~0.001。
+同一套栈上例子 4 也偏高（0.0051 和 0.0089，期望 ~0.004）。
+
+例子 5 存在的意义正是回答"差距来自 FP8 还是 ATOM 对齐"，而它**高于**例子 4 就说明答案是
+对齐而不是量化。文档点名的首要嫌疑在 ATOM `7173f5b` 上不成立——那里
+`atom/model_ops/layernorm.py` 的两个调用点都已经传了 `use_model_sensitive_rmsnorm=1`。
+所以遇到这个现象不必再去核那个开关，问题在别处，值得向上游反馈。
 
 **ATOM rollout 退化**（`MODE=atomfp8` / `atombf16` 时 `filter_groups: kept 0/96` +
 `Rollout reward: accuracy=0.0000` + 日志大量 `finished with reason max`、无 `eos`）：

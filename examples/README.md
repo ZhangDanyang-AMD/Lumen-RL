@@ -85,6 +85,16 @@ get_gpt_layer_with_transformer_engine_spec as s; print(type(s()).__name__)"'
 #    expect ModuleSpec
 ```
 
+**Running several examples in one session:** clear the compile caches between any two
+ATOM runs of different precision, or example 5 after example 4 dies in AOTAutograd
+(see [Troubleshooting](docs/06-troubleshooting.md)) — torch's inductor cache is not
+scoped per run.
+
+```bash
+sudo docker exec "$CONTAINER" bash -lc \
+  'rm -rf /tmp/aiter_configs /tmp/atom_torch_compile_cache /tmp/torchinductor_root'
+```
+
 Per-example extras that are easy to miss: examples 2, 3 and 4 need the
 [RMSNorm patch](docs/02-dependencies.md#27-vllm-aiter-rmsnorm-patch-required-for-examples-2-3-4)
 reapplied after any `docker rm`; examples 4 and 5 need the

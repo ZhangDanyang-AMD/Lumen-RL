@@ -77,6 +77,15 @@ get_gpt_layer_with_transformer_engine_spec as s; print(type(s()).__name__)"'
 #    期望 ModuleSpec
 ```
 
+**一次会话里连跑多个例子时：** 两次精度不同的 ATOM 运行之间要清编译缓存，否则例子 4
+之后跑例子 5 会死在 AOTAutograd（见[排错](docs/06-troubleshooting_cn.md)）——torch 的
+inductor 缓存不按运行隔离。
+
+```bash
+sudo docker exec "$CONTAINER" bash -lc \
+  'rm -rf /tmp/aiter_configs /tmp/atom_torch_compile_cache /tmp/torchinductor_root'
+```
+
 各例子容易漏掉的追加项：例子 2、3、4 在任何一次 `docker rm` 之后都要重新打
 [RMSNorm patch](docs/02-dependencies_cn.md)；例子 4、5 需要
 [ATOM JIT 预编译](docs/02-dependencies_cn.md)；例子 6、7 要显式指定 `MODEL_PATH`
