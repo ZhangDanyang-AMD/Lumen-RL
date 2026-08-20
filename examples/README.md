@@ -55,6 +55,45 @@ weight sync (9-rank process group). See the
 
 ---
 
+## Preflight
+
+Four checks, each of which has cost someone an hour. Run them after
+[Dependencies](docs/02-dependencies.md) and before the first smoke.
+
+```bash
+# 1. The image must be v0.23.0. A newer vllm/vllm-openai-rocm tag on the machine
+#    is not a substitute, and `:latest` is often an older vLLM.
+sudo docker exec "$CONTAINER" bash -lc \
+  'python3 -c "import vllm, transformers; print(vllm.__version__, transformers.__version__)"'
+#    expect: 0.23.0 5.12.0
+
+# 2. Every card at the ~298 MB idle baseline. Anything higher is a co-tenant or
+#    an orphan from an interrupted run -- see Troubleshooting before launching.
+sudo docker exec "$CONTAINER" bash -lc 'rocm-smi --showmeminfo vram | grep -i used'
+
+# 3. Source installs must win over the image's wheels (PYTHONPATH is required).
+sudo docker exec "$CONTAINER" bash -lc \
+  'export PYTHONPATH="$RL_ROOT/Lumen-RL:$AITER_DIR:$LUMEN_DIR";
+   python3 -c "import aiter, lumenrl, lumen;
+from aiter import flash_attn_varlen_func; print(aiter.__file__)"'
+#    expect a path under $RL_ROOT/aiter/
+
+# 4. Example 7 only: the TE layer spec must build, not just import megatron.core.
+sudo docker exec "$CONTAINER" bash -lc \
+  'python3 -c "from megatron.core.models.gpt.gpt_layer_specs import \
+get_gpt_layer_with_transformer_engine_spec as s; print(type(s()).__name__)"'
+#    expect ModuleSpec
+```
+
+Per-example extras that are easy to miss: examples 2, 3 and 4 need the
+[RMSNorm patch](docs/02-dependencies.md#27-vllm-aiter-rmsnorm-patch-required-for-examples-2-3-4)
+reapplied after any `docker rm`; examples 4 and 5 need the
+[ATOM JIT precompile](docs/02-dependencies.md#28-atom-jit-precompilation-required-for-examples-4-5);
+examples 6 and 7 need `MODEL_PATH` pointed at the MoE model explicitly plus
+`SCRATCH_ROOT` exported, and example 7 needs TransformerEngine built from source.
+
+---
+
 ## Documentation
 
 | Step | Document | What it covers |

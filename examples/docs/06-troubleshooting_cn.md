@@ -22,6 +22,30 @@ ROCm 没有 `expandable_segments`，每步约 7 个打满 22.5k 的 bin 反复�
 异常会列出前 8 个名字；若是 `...experts.w13_weight` / `w2_weight`，说明融合 MoE 路由没生效，
 要么代码没拉到最新，要么 vLLM/transformers 升级后布局假设失效了。
 
+**例子 7 在 `init_model` 死于 `TypeError: 'NoneType' object is not callable`**
+（上一帧是 `get_gpt_layer_with_transformer_engine_spec`）：TransformerEngine 没装。
+没有它 `megatron.core` 也能正常 import，所以 [依赖](02-dependencies_cn.md) §2.5 的导入
+检查会通过，只有 layer spec 那条检查才能抓到。按 §2.3 编译 TE；只 `pip install
+megatron-core` 是不够的。
+
+**例子 5（`MODE=atombf16`）可能死在 ATOM 引擎初始化**，driver 侧报
+`RuntimeError: Engine Core Mgr: Received unexpected SHUTDOWN signal from DP rank 0
+during initialization`。这条只是症状，**一定要往上读 replica 侧的真实异常**，因为有两个
+不同的原因共用这个症状：
+
+- `rope_cache` / `fused_qk_rope_reshape_and_cache` 下的
+  `ValueError: too many values to unpack (expected 4)`：这是 `ATOM_FORCE_ATTN_TRITON=1`。
+  ATOM 分配的是 5 维 SHUFFLE V-cache，而 aiter 的 triton kernel 在非 flash 布局下要 4 维，
+  两者不能靠 `view()` 互转。把这个变量取消掉；LumenRL 侧绕不过去。
+- `torch/_functorch/_aot_autograd/runtime_wrappers.py` 里的
+  `IndexError: list index out of range`，由 ATOM 的 `warmup_model` 触发：**未定位，问题
+  仍开放。** 在 MI355X/gfx950 上以已验证的栈复现（镜像 `v0.23.0`、torch
+  `2.10.0+git8514f05`、ATOM `7173f5b`、aiter `ff1006d03` + PR#4570、Lumen `e6379cb`），
+  在 Lumen-RL `3de3b08` 上同样复现，所以与较新的 LumenRL 提交无关。同一环境下例子 4 能过，
+  说明范围限于纯 BF16 的 ATOM 编译路径（`MODE=atombf16` 会去掉 `LUMEN_NORM` 和在线量化，
+  而 `run_dapo.sh` 仍强制 `enforce_eager=false` + `compilation_config.level=3`）。
+  例子 1-4、6、7 不受影响。
+
 **ATOM rollout 退化**（`MODE=atomfp8` / `atombf16` 时 `filter_groups: kept 0/96` +
 `Rollout reward: accuracy=0.0000` + 日志大量 `finished with reason max`、无 `eos`）：
 rollout 生成崩坏。优先检查 ATOM `atom/model_ops/layernorm.py` 的 plain RMSNorm 有没有传
@@ -45,13 +69,56 @@ cache，触发 Inductor `write_atomic -> rename` 的 `FileNotFoundError`）、
 子进程（及其 inductor compile worker）会变成孤儿继续占显存。手动清理时注意用
 `spawn[_]main` 这类写法，否则 `pkill -f` 会匹配到自己的命令行而自杀：
 
+Ray 的 actor worker 也会以同样方式变孤儿，只杀 launcher 的话它们会继续抱着模型。
+把这些一起覆盖掉：
+
 ```bash
 sudo docker exec "$CONTAINER" bash -lc '
-  pkill -9 -f "compile_[w]orker"   || true
-  pkill -9 -f "spawn[_]main"       || true
-  pkill -9 -f "resource[_]tracker" || true
-  sleep 8; rocm-smi --showmeminfo vram | grep -i used | head -3'
+  ray stop --force >/dev/null 2>&1
+  for p in "[l]umenrl.trainer.main" "[r]ay::LumenActorWorker" "[r]ay::VLLMRayServer" \
+           "[r]ay::ATOMRayServer" "[V]LLMRayServer" "[E]ngineCore" "[r]aylet" \
+           "compile_[w]orker" "spawn[_]main" "resource[_]tracker"; do
+    pkill -9 -f "$p" || true
+  done
+  sleep 10; rocm-smi --showmeminfo vram | grep -i used | head -3'
 ```
+
+> ⚠️ **只按进程名匹配，绝不要按"占了很多显存"来杀。** 这些节点经常是共享的，按显存
+> 大小做 `pkill` 会把别人的作业一起带走。如果上面这些模式跑完显存仍被占着，那剩下的
+> 就不是你的——动手之前先确认归属：
+>
+> ```bash
+> # 只读：卡上到底是什么，属于哪个容器
+> rocm-smi --showpids
+> docker ps --format '{{.Names}}  {{.Status}}'
+> docker top <container>            # 按容器归属某个 PID
+> ```
+>
+> 命令行与 LumenRL 无关的进程（比如本仓库从不启动 `sglang`）属于同租户，别碰它，
+> 见下一条。
+
+**同租户占了卡，而 OOM 报错会掩盖这一点。** 调度器可能把 8 张卡分给你，但节点上已经有
+别人在算。特征是 OOM 里两个数字对不上：
+
+```text
+torch.OutOfMemoryError: HIP out of memory. Tried to allocate 1.50 GiB.
+GPU 0 has a total capacity of 287.98 GiB of which 0 bytes is free.
+Of the allocated memory 47.66 GiB is allocated by PyTorch, ...
+```
+
+PyTorch 只占了 47 GiB 却已经 `0 bytes free`，说明另外约 240 GiB 不是我们的。开跑**前**
+就查基线，别等失败了再回头诊断：
+
+```bash
+sudo docker exec "$CONTAINER" bash -lc \
+  'rocm-smi --showmeminfo vram | grep -i used'
+```
+
+每张卡应该读到约 298 MB。预算要按**剩余量**算而不是按整卡容量算：rollout 引擎预留的是
+`gpu_memory_utilization x 288 GiB`——示例配置用 0.30，即 **86 GiB**——这是整卡的比例而不是
+空闲部分的比例，训练侧还要再占 44 GiB（8B）到 115 GiB（MoE）。同租户占了 230 GiB 就只剩
+58 GiB，什么都放不下。这种情况请等独占节点，不要靠调低 `gpu_memory_utilization` 硬塞：
+那样指标就不能和 [启动](04-launching_cn.md) §4.7 的基线对比了。
 
 **换 `DATA_ROOT` 要无条件覆盖。** 起容器时的 `docker run -e DATA_ROOT=...` 把值烤进了容器环境，
 自建 wrapper 里写 `export DATA_ROOT="${DATA_ROOT:-/new/disk}"` **不会生效**（变量已存在），

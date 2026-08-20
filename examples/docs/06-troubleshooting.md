@@ -28,6 +28,34 @@ parameters. The exception lists the first 8 names; if they look like
 the code is not up to date, or a vLLM/transformers upgrade invalidated the layout
 assumption.
 
+**Example 7 dies in `init_model` with `TypeError: 'NoneType' object is not callable`**
+(the frame above it is `get_gpt_layer_with_transformer_engine_spec`): TransformerEngine
+is not installed. `megatron.core` imports fine without it, so the import check in
+[Dependencies §2.5](02-dependencies.md) passes and only the layer-spec check catches
+it. Build TE per [§2.3](02-dependencies.md); `pip install megatron-core` alone is not
+enough.
+
+**Example 5 (`MODE=atombf16`) can die in ATOM engine init** with
+`RuntimeError: Engine Core Mgr: Received unexpected SHUTDOWN signal from DP rank 0
+during initialization` on the driver. That message is only the symptom — always read
+the replica-side exception above it, because two different causes share it:
+
+- `ValueError: too many values to unpack (expected 4)` under
+  `rope_cache` / `fused_qk_rope_reshape_and_cache`: this is `ATOM_FORCE_ATTN_TRITON=1`.
+  ATOM allocates a 5D SHUFFLE V-cache while aiter's triton kernel wants 4D in the
+  non-flash layout, and the two are not `view()`-convertible. Unset the variable;
+  it cannot be worked around from the LumenRL side.
+- `IndexError: list index out of range` inside
+  `torch/_functorch/_aot_autograd/runtime_wrappers.py`, reached from ATOM's
+  `warmup_model`: **open, root cause not yet identified.** Observed on
+  MI355X/gfx950 with the verified stack (image `v0.23.0`, torch `2.10.0+git8514f05`,
+  ATOM `7173f5b`, aiter `ff1006d03` + PR#4570, Lumen `e6379cb`) and reproduced
+  identically on Lumen-RL `3de3b08`, so it is not specific to newer LumenRL commits.
+  Example 4 passes on the same environment, so it is confined to the pure-BF16 ATOM
+  compile path (`MODE=atombf16` drops `LUMEN_NORM` and the online quantizer while
+  `run_dapo.sh` still forces `enforce_eager=false` + `compilation_config.level=3`).
+  Examples 1-4, 6 and 7 are unaffected.
+
 **ATOM rollout degradation** (with `MODE=atomfp8` / `atombf16`: `filter_groups: kept 0/96`
 plus `Rollout reward: accuracy=0.0000` plus many `finished with reason max` and no `eos`
 in the log): generation has broken down. Check first whether the plain RMSNorm in ATOM's
@@ -58,13 +86,61 @@ compile workers) become orphans still holding memory. When cleaning up manually,
 the patterns as `spawn[_]main` and so on, or `pkill -f` matches its own command line and
 kills itself:
 
+The Ray actor workers orphan the same way, and killing only the launcher leaves
+them holding the model. Cover all of it:
+
 ```bash
 sudo docker exec "$CONTAINER" bash -lc '
-  pkill -9 -f "compile_[w]orker"   || true
-  pkill -9 -f "spawn[_]main"       || true
-  pkill -9 -f "resource[_]tracker" || true
-  sleep 8; rocm-smi --showmeminfo vram | grep -i used | head -3'
+  ray stop --force >/dev/null 2>&1
+  for p in "[l]umenrl.trainer.main" "[r]ay::LumenActorWorker" "[r]ay::VLLMRayServer" \
+           "[r]ay::ATOMRayServer" "[V]LLMRayServer" "[E]ngineCore" "[r]aylet" \
+           "compile_[w]orker" "spawn[_]main" "resource[_]tracker"; do
+    pkill -9 -f "$p" || true
+  done
+  sleep 10; rocm-smi --showmeminfo vram | grep -i used | head -3'
 ```
+
+> ⚠️ **Match on process name, never on "holds a lot of VRAM".** These nodes are
+> often shared, and a `pkill` keyed on memory footprint takes other people's jobs
+> with it. If memory is still held after the patterns above, the remainder is not
+> yours — identify it before touching it:
+>
+> ```bash
+> # read-only: what is actually on the cards, and under whose container
+> rocm-smi --showpids
+> docker ps --format '{{.Names}}  {{.Status}}'
+> docker top <container>            # per container, to attribute a PID
+> ```
+>
+> A process whose command line has nothing to do with LumenRL (this repo never
+> spawns `sglang`, for instance) belongs to a co-tenant. Leave it and see the next
+> entry.
+
+**A co-tenant took the card, and the OOM message hides it.** The scheduler can hand
+you 8 GPUs on a node someone else is already computing on. The tell is an OOM whose
+two numbers do not add up:
+
+```text
+torch.OutOfMemoryError: HIP out of memory. Tried to allocate 1.50 GiB.
+GPU 0 has a total capacity of 287.98 GiB of which 0 bytes is free.
+Of the allocated memory 47.66 GiB is allocated by PyTorch, ...
+```
+
+`0 bytes free` while PyTorch only holds 47 GiB means the other ~240 GiB is not ours.
+Check the baseline **before** launching rather than diagnosing it afterwards:
+
+```bash
+sudo docker exec "$CONTAINER" bash -lc \
+  'rocm-smi --showmeminfo vram | grep -i used'
+```
+
+Every card should read ~298 MB. Budget from what is left, not from the card size:
+the rollout engine reserves `gpu_memory_utilization x 288 GiB` — **86 GiB at the
+0.30 the example configs use** — as a fraction of the *whole* card, not of what is
+free, and training needs another 44 GiB (8B) to 115 GiB (MoE) on top. A co-tenant
+holding 230 GiB leaves 58 GiB and nothing fits, so wait for an exclusive node
+instead of lowering `gpu_memory_utilization` to squeeze in: the metrics stop being
+comparable to the baselines in [Launching](04-launching.md#47-health-criteria).
 
 **Changing `DATA_ROOT` requires an unconditional assignment.** The
 `docker run -e DATA_ROOT=...` in the container setup baked the value into the container
