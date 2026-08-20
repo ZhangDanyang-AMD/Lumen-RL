@@ -268,12 +268,30 @@ def compute_rollout_rejection_mask(
 # IS weight computation
 # ---------------------------------------------------------------------------
 
+def _seq_log_ratio(
+    log_ratio: Tensor, response_mask: Tensor, reduction: str = "sum",
+) -> Tensor:
+    """Reduce a sequence's per-token log-ratios to one value per sequence.
+
+    ``sum`` is the full sequence likelihood ratio; ``mean`` divides by the
+    response length, giving the per-token geometric mean. They differ by
+    orders of magnitude on long responses, so this is a deliberate choice
+    rather than a normalisation detail -- see ``rollout_is_seq_reduction``.
+    """
+    lr_sum = _masked_sum(log_ratio, response_mask, axis=-1).unsqueeze(-1)
+    if reduction == "mean":
+        seq_len = response_mask.sum(dim=-1, keepdim=True).clamp(min=1)
+        return lr_sum / seq_len.to(dtype=lr_sum.dtype)
+    return lr_sum
+
+
 def compute_rollout_correction_weights(
     log_ratio: Tensor,
     response_mask: Tensor,
     rollout_is: str = "token",
     rollout_is_threshold: str | float = 2.0,
     rollout_is_batch_normalize: bool = False,
+    rollout_is_seq_reduction: str = "sum",
 ) -> tuple[Tensor, dict[str, float]]:
     """Compute truncated importance sampling weights.
 
@@ -290,7 +308,7 @@ def compute_rollout_correction_weights(
         log_ratio_safe = torch.clamp(log_ratio, min=-SAFETY_BOUND, max=SAFETY_BOUND)
         raw_weights = torch.exp(log_ratio_safe)
     else:  # sequence
-        lr_sum = _masked_sum(log_ratio, response_mask, axis=-1).unsqueeze(-1)
+        lr_sum = _seq_log_ratio(log_ratio, response_mask, rollout_is_seq_reduction)
         lr_sum_safe = torch.clamp(lr_sum, min=-SAFETY_BOUND, max=SAFETY_BOUND)
         raw_weights = torch.exp(lr_sum_safe).expand_as(log_ratio)
 
@@ -316,7 +334,7 @@ def compute_rollout_correction_weights(
         metrics["rollout_is_max"] = is_weights.masked_fill(~mask_bool, float("-inf")).max().item()
         metrics["rollout_is_min"] = is_weights.masked_fill(~mask_bool, float("inf")).min().item()
     else:
-        lr_sum_raw = _masked_sum(log_ratio, response_mask, axis=-1).unsqueeze(-1)
+        lr_sum_raw = _seq_log_ratio(log_ratio, response_mask, rollout_is_seq_reduction)
         log_th_upper = torch.log(torch.tensor(threshold_upper, device=log_ratio.device))
         th_lower_eff = threshold_lower if threshold_lower is not None else 1.0 / threshold_upper
         log_th_lower = torch.log(torch.tensor(th_lower_eff, device=log_ratio.device))
@@ -431,6 +449,15 @@ def compute_offpolicy_metrics(
 # Unified entry point
 # ---------------------------------------------------------------------------
 
+# legacy ``rollout_correction/<key>`` -> current unprefixed key.
+_LEGACY_METRIC_ALIASES = {
+    "is_weight_mean": "rollout_is_mean",
+    "is_weight_max": "rollout_is_max",
+    "kl": "kl",
+    "k3_kl": "k3_kl",
+}
+
+
 def compute_rollout_correction_and_rejection_mask(
     old_log_prob: Tensor,
     rollout_log_prob: Tensor,
@@ -440,6 +467,7 @@ def compute_rollout_correction_and_rejection_mask(
     rollout_is_batch_normalize: bool = False,
     rollout_rs: Optional[str] = None,
     rollout_rs_threshold: Optional[str | float] = None,
+    rollout_is_seq_reduction: str = "sum",
 ) -> tuple[Optional[Tensor], Tensor, dict[str, float]]:
     """Unified interface: IS weights + rejection mask + off-policy metrics.
 
@@ -455,6 +483,7 @@ def compute_rollout_correction_and_rejection_mask(
             rollout_is=rollout_is,
             rollout_is_threshold=rollout_is_threshold,
             rollout_is_batch_normalize=rollout_is_batch_normalize,
+            rollout_is_seq_reduction=rollout_is_seq_reduction,
         )
         metrics.update(is_m)
 
@@ -476,6 +505,15 @@ def compute_rollout_correction_and_rejection_mask(
     for k, v in metrics.items():
         val = v.item() if isinstance(v, Tensor) else v
         prefixed[f"rollout_corr/{k}"] = val
+
+    # The four keys the pre-move implementation published, kept so that
+    # existing dashboards and alerts do not go blank on the new prefix.
+    for legacy, new in _LEGACY_METRIC_ALIASES.items():
+        if new in metrics:
+            val = metrics[new]
+            prefixed[f"rollout_correction/{legacy}"] = (
+                val.item() if isinstance(val, Tensor) else val
+            )
 
     return is_weights, modified_mask, prefixed
 
@@ -572,6 +610,7 @@ def compute_rollout_correction_and_add_to_batch(
         rollout_is_batch_normalize=rcfg.rollout_is_batch_normalize,
         rollout_rs=r_rs,
         rollout_rs_threshold=r_rs_th,
+        rollout_is_seq_reduction=getattr(rcfg, "rollout_is_seq_reduction", "sum"),
     )
 
     # The width alignment above may have narrowed the mask; splice the result

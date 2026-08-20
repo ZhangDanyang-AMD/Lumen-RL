@@ -583,14 +583,37 @@ class RolloutCorrectionConfig:
     clip: float = 1.5
     # IS weights (verl rollout_corr_helper.py)
     rollout_is: str = ""                # "token" | "sequence" | ""
-    rollout_is_threshold: str = "2.0"   # float or "lower_upper" (IcePop)
+    # Thresholds are strings so that a single field can carry either a number
+    # or an IcePop "lower_upper" pair / a comma-separated list. YAML written
+    # against the older float fields still works: __post_init__ coerces.
+    rollout_is_threshold: str | float = "2.0"
     rollout_is_batch_normalize: bool = False
+    # How the per-token log-ratios of a sequence combine for
+    # ``rollout_is: sequence``. "sum" is the full sequence likelihood ratio;
+    # "mean" divides by the response length for the geometric mean, which is
+    # the only form that stays in a usable range on long responses -- at 4k
+    # tokens the sum saturates the +-20 safety bound and then the threshold
+    # clamp almost always. Runs are not comparable across this setting.
+    rollout_is_seq_reduction: str = "sum"   # "sum" | "mean"
     # Rejection sampling (11 criteria: token_k1/k2/k3, seq_sum/mean/max_k1/k2/k3)
     rollout_rs: str = ""                # comma-separated: "seq_mean_k1", "seq_mean_k3", etc.
-    rollout_rs_threshold: str = ""      # comma-separated thresholds; K1 uses "lower_upper"
+    rollout_rs_threshold: str | float = ""  # comma-separated; K1 uses "lower_upper"
     # Bypass mode: set pi_old = pi_rollout, skip old_log_prob computation
     bypass_mode: bool = False
     loss_type: str = "ppo_clip"         # "ppo_clip" | "reinforce" (bypass mode only)
+
+    def __post_init__(self) -> None:
+        # Numbers from YAML reach the parsers as strings, which is what the
+        # "lower_upper" and comma-separated forms need them to be.
+        if not isinstance(self.rollout_is_threshold, str):
+            self.rollout_is_threshold = str(self.rollout_is_threshold)
+        if not isinstance(self.rollout_rs_threshold, str):
+            self.rollout_rs_threshold = str(self.rollout_rs_threshold)
+        if self.rollout_is_seq_reduction not in ("sum", "mean"):
+            raise ValueError(
+                "rollout_is_seq_reduction must be 'sum' or 'mean', got "
+                f"{self.rollout_is_seq_reduction!r}"
+            )
 
 
 @dataclass
