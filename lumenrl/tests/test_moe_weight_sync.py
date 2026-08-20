@@ -24,26 +24,44 @@ N_LAYERS = 2
 
 
 class _ParallelConfig:
-    def __init__(self, ep_size: int):
+    def __init__(self, ep_size: int, tp_size: int):
         self.ep_size = ep_size
-        self.tp_size = 1
+        self.tp_size = tp_size
 
 
 class _MoEConfig:
-    def __init__(self, ep_size: int, is_act_and_mul: bool):
-        self.moe_parallel_config = _ParallelConfig(ep_size)
+    def __init__(self, ep_size: int, is_act_and_mul: bool, tp_size: int, tp_rank: int):
+        self.moe_parallel_config = _ParallelConfig(ep_size, tp_size)
         self.is_act_and_mul = is_act_and_mul
+        # vLLM reads the rank off moe_config and the sizes off the parallel
+        # config; keep that split so _tp_rank is exercised the way it is used.
+        self.tp_rank = tp_rank
 
 
 class FakeFusedMoE(nn.Module):
-    """Stand-in for vLLM's FusedMoE with its real weight_loader semantics."""
+    """Stand-in for vLLM's FusedMoE with its real weight_loader semantics.
 
-    def __init__(self, ep_size: int = 1, is_act_and_mul: bool = True, local_experts=None):
+    Includes the detail this module has to work around: ``_load_w13`` /
+    ``_load_w2`` narrow ``loaded_weight`` to this TP rank only when
+    ``load_full`` is false, so a 3D tensor is taken to be already sharded.
+    """
+
+    def __init__(
+        self,
+        ep_size: int = 1,
+        is_act_and_mul: bool = True,
+        local_experts=None,
+        tp_size: int = 1,
+        tp_rank: int = 0,
+    ):
         super().__init__()
-        out13 = 2 * I if is_act_and_mul else I
+        inter = I // tp_size
+        out13 = 2 * inter if is_act_and_mul else inter
         self.w13_weight = nn.Parameter(torch.zeros(E, out13, H), requires_grad=False)
-        self.w2_weight = nn.Parameter(torch.zeros(E, H, I), requires_grad=False)
-        self.moe_config = _MoEConfig(ep_size, is_act_and_mul)
+        self.w2_weight = nn.Parameter(torch.zeros(E, H, inter), requires_grad=False)
+        self.moe_config = _MoEConfig(ep_size, is_act_and_mul, tp_size, tp_rank)
+        self.tp_size = tp_size
+        self.tp_rank = tp_rank
         self.local_experts = local_experts
         self.calls: list[tuple[str, tuple[int, ...]]] = []
 
@@ -57,6 +75,12 @@ class FakeFusedMoE(nn.Module):
         full_load = loaded_weight.ndim == 3
         expert_data = param.data if full_load else param.data[expert_id]
         shard_dim = (1 if shard_id == "w2" else 0) + (1 if full_load else 0)
+
+        if not full_load and self.tp_size > 1:
+            per_rank = loaded_weight.shape[shard_dim] // self.tp_size
+            loaded_weight = loaded_weight.narrow(
+                shard_dim, per_rank * self.tp_rank, per_rank
+            )
 
         if shard_id == "w2":
             expert_data.copy_(loaded_weight)
@@ -198,6 +222,80 @@ def test_expert_parallel_falls_back_to_per_expert():
     assert all(len(shape) == 2 for _, shape in experts.calls)
     assert torch.equal(experts.w13_weight.data[:2], gate_up[:2])
     assert torch.equal(experts.w13_weight.data[2:], torch.zeros(E - 2, 2 * I, H))
+
+
+def test_tensor_parallel_takes_the_per_expert_path_and_the_right_slice():
+    """TP>1 must not use the 3D full-load branch: it skips the tp_rank narrowing.
+
+    With tp_size=2 / tp_rank=1 and I=6, this rank owns intermediate rows 3..5 of
+    each logical matrix, so w13's two halves come from gate_up[:, 3:6] and
+    gate_up[:, 9:12], and w2 from down[:, :, 3:6].
+    """
+    torch.manual_seed(3)
+    tp_size, tp_rank = 2, 1
+    inter = I // tp_size
+    model = FakeModel(tp_size=tp_size, tp_rank=tp_rank)
+    gate_up = torch.randn(E, 2 * I, H)
+    down = torch.randn(E, H, I)
+
+    _, loaded = FusedMoEWeightRouter(model).route([
+        ("model.layers.0.mlp.experts.gate_up_proj", gate_up),
+        ("model.layers.0.mlp.experts.down_proj", down),
+    ])
+    assert loaded == {
+        "model.layers.0.mlp.experts.w13_weight",
+        "model.layers.0.mlp.experts.w2_weight",
+    }
+
+    experts = model.model.layers[0].mlp.experts
+    assert all(len(shape) == 2 for _, shape in experts.calls), (
+        "a 3D tensor would be copied without narrowing and corrupt every rank "
+        "but tp_rank 0"
+    )
+    assert len(experts.calls) == 3 * E, "w1 + w3 + w2, once per expert"
+
+    w13 = experts.w13_weight.data
+    assert torch.equal(w13[:, :inter], gate_up[:, inter : 2 * inter])
+    assert torch.equal(w13[:, inter:], gate_up[:, I + inter : I + 2 * inter])
+    assert torch.equal(experts.w2_weight.data, down[:, :, inter : 2 * inter])
+
+
+def test_tensor_parallel_verify_catches_the_wrong_slice():
+    """Verification must follow the same slice, or TP loads go unchecked."""
+    torch.manual_seed(4)
+    os.environ["LUMENRL_WEIGHT_SYNC_VERIFY"] = "1"
+    try:
+        payload = lambda: [  # noqa: E731 - one-liner fixture
+            ("model.layers.0.mlp.experts.gate_up_proj", torch.randn(E, 2 * I, H)),
+            ("model.layers.0.mlp.experts.down_proj", torch.randn(E, H, I)),
+        ]
+        # A correct TP=2 rank-1 load verifies clean.
+        FusedMoEWeightRouter(FakeModel(tp_size=2, tp_rank=1)).route(payload())
+
+        # A loader that writes rank 0's slice while claiming to be rank 1 is
+        # exactly the bug the full-load branch would introduce.
+        class WrongRankMoE(FakeFusedMoE):
+            def weight_loader(self, param, loaded_weight, weight_name, shard_id,
+                              expert_id, return_success=False):
+                saved, self.tp_rank = self.tp_rank, 0
+                try:
+                    return super().weight_loader(
+                        param, loaded_weight, weight_name, shard_id, expert_id,
+                        return_success,
+                    )
+                finally:
+                    self.tp_rank = saved
+
+        model = FakeModel(tp_size=2, tp_rank=1)
+        model.model.layers[0].mlp.experts.__class__ = WrongRankMoE
+        try:
+            FusedMoEWeightRouter(model).route(payload())
+        except RuntimeError as exc:
+            assert "verify failed" in str(exc)
+        else:
+            raise AssertionError("verify accepted another rank's slice")
+    finally:
+        os.environ.pop("LUMENRL_WEIGHT_SYNC_VERIFY", None)
 
 
 def test_non_gated_experts_load_as_one_shard():

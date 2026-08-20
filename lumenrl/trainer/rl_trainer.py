@@ -420,7 +420,9 @@ class RLTrainer:
         from lumenrl.engine.inference.vllm_ray_server import VLLMReplicaManager
 
         seed = self.config.seed if getattr(vcfg, "seed", None) is None else vcfg.seed
-        tp = int(getattr(vcfg, "tensor_parallel_size", 1) or 1)
+        # One engine per TP group of actors; TP=1 is the original layout of one
+        # engine per GPU. See VLLMReplicaManager for the grouping contract.
+        tp = max(1, int(getattr(vcfg, "tensor_parallel_size", 1) or 1))
         engine_kwargs: dict[str, Any] = dict(
             tensor_parallel_size=tp,
             gpu_memory_utilization=float(vcfg.gpu_memory_utilization),
@@ -444,6 +446,17 @@ class RLTrainer:
             engine_kwargs["kv_cache_dtype"] = str(vcfg.kv_cache_dtype)
         if vcfg.quantization:
             engine_kwargs["quantization"] = str(vcfg.quantization)
+        if getattr(vcfg, "moe_backend", ""):
+            engine_kwargs["moe_backend"] = str(vcfg.moe_backend)
+        if tp > 1:
+            # The colocated path needs NCCL_CUMEM_ENABLE=0 for the CUDA-IPC weight
+            # sync, and vLLM's custom all-reduce allocates its shared buffers
+            # through cuMem: with both on, every TP worker dies in
+            # create_shared_buffer ("HIP error: invalid argument", surfacing as
+            # 'CustomAllreduce' object has no attribute '_ptr'). pynccl handles the
+            # intra-node all-reduce instead. TP=1 has no all-reduce, so leave its
+            # engine args untouched.
+            engine_kwargs["disable_custom_all_reduce"] = True
         if self._r3_rollout_replay:
             # makes the engine attach the selected expert ids to every completion
             engine_kwargs["enable_return_routed_experts"] = True
@@ -459,6 +472,7 @@ class RLTrainer:
             start_http=bool(vcfg.ray_http_start_server),
             max_concurrency=max(8, int(vcfg.max_num_seqs)),
             base_seed=(int(seed) if seed is not None else None),
+            tensor_parallel_size=tp,
         )
         mgr.create()
         self._ray_rollout_mgr = mgr
@@ -3914,6 +3928,24 @@ class RLTrainer:
             reward_time = time.time() - reward_t0
             response_mask = self._build_response_mask(sequences, seq_mask, prompt_lengths)
             response_lengths = [int(response_mask[i].sum().item()) for i in range(response_mask.shape[0])]
+
+            # Opt-in diagnostic: dump the two per-token log-prob tensors that
+            # rollout_corr/kl is reduced from, so the trainer/rollout gap can be
+            # examined as a distribution instead of a single mean. A few tokens
+            # with huge errors means the two engines routed to different experts;
+            # a uniform shift across all tokens means a kernel-level numeric gap.
+            _dump = os.environ.get("LUMENRL_DUMP_LOGPROB_GAP")
+            if _dump and rollout_lp is not None and self._rank == 0:
+                torch.save(
+                    {
+                        "old_log_probs": old_log_probs.detach().float().cpu(),
+                        "rollout_log_probs": rollout_lp.detach().float().cpu(),
+                        "response_mask": response_mask.detach().cpu(),
+                        "step": int(step),
+                    },
+                    f"{_dump}/logprob_gap_step{step}.pt",
+                )
+                logger.info("dumped per-token log-prob gap for step %d to %s", step, _dump)
 
             tensors = {
                 "input_ids": sequences,

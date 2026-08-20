@@ -65,14 +65,61 @@ The three verified components and revisions:
 sudo docker exec "$CONTAINER" bash -lc 'pip install --no-deps "megatron-core==0.18.2"'
 ```
 
-Notes for building TE: it must be the **ROCm fork**, all submodules must be fetched
-recursively (~5.1 GiB, including AOTriton / CK JIT / Composable Kernel), any existing
-NVIDIA TE package must be uninstalled first, and the build needs
-`TORCH_DONT_CHECK_COMPILER_ABI=1` — ROCm 7.2.3's `hipcc -v` returns 1 when given no
-input files, and CK-JIT's compiler ABI probe reads that as "compiler unusable".
+> **megatron-core alone is not enough, and the failure does not mention TE.** Without
+> TransformerEngine, `megatron.core`'s TE spec builder returns `None` submodules and
+> example 7 dies during `init_model` with
+>
+> ```text
+> File ".../megatron/core/models/gpt/gpt_layer_specs.py", line 355,
+>   in get_gpt_layer_with_transformer_engine_spec
+> TypeError: 'NoneType' object is not callable
+> ```
+>
+> Apex being absent is only a warning (`Apex is not installed. Falling back to Torch
+> Norm`) and does not stop the run; TE does.
 
-> **Never `pip install transformer_engine`.** That installs the NVIDIA build, which
-> fails on import with an undefined symbol.
+Fetch both at the pinned revisions, then build:
+
+```bash
+sudo docker exec "$CONTAINER" bash -lc '
+set -eux
+APEX_REV=daed85255d51476425080e7e6203f0bee6d7e4cc
+TE_REV=6e541a10419a6e31bdc98b1516db04eb81a463b6
+git config --global --add safe.directory "*"
+[ -d "$DATA_ROOT/apex_src/.git" ] || git clone https://github.com/ROCm/apex.git "$DATA_ROOT/apex_src"
+git -C "$DATA_ROOT/apex_src" checkout "$APEX_REV"
+git -C "$DATA_ROOT/apex_src" submodule update --init --recursive --jobs 16
+[ -d "$DATA_ROOT/te_src/.git" ] || git clone https://github.com/ROCm/TransformerEngine.git "$DATA_ROOT/te_src"
+git -C "$DATA_ROOT/te_src" checkout "$TE_REV"
+git -C "$DATA_ROOT/te_src" submodule update --init --recursive --jobs 16'
+
+# Build TE. Set NVTE_ROCM_ARCH / PYTORCH_ROCM_ARCH to this machine's arch:
+# gfx950 for MI355X, gfx942 for MI325X/MI308X (`rocm-smi --showproductname`).
+sudo docker exec "$CONTAINER" bash -lc '
+set -eux
+python3 -m pip uninstall -y transformer-engine transformer_engine \
+  transformer-engine-torch transformer_engine_torch || true
+cd "$DATA_ROOT/te_src" && rm -rf build dist transformer_engine.egg-info
+mkdir -p "$DATA_ROOT/tmp"
+export TMPDIR="$DATA_ROOT/tmp"
+export NVTE_FRAMEWORK=pytorch NVTE_USE_ROCM=1
+export NVTE_ROCM_ARCH=gfx950 PYTORCH_ROCM_ARCH=gfx950
+export NVTE_FUSED_ATTN=1 NVTE_FUSED_ATTN_CK=1 NVTE_FUSED_ATTN_AOTRITON=1
+export MAX_JOBS=48
+# ROCm 7.2.3 hipcc -v exits 1 when given no input files, which the CK-JIT
+# compiler-ABI probe reads as "compiler unusable". Skipping the probe does not
+# skip actual kernel compilation.
+export TORCH_DONT_CHECK_COMPILER_ABI=1
+python3 -m pip install -v . --no-build-isolation'
+```
+
+> Budget **20-40 minutes and about 20 GB** of disk for this, most of it in AOTriton.
+> The 9 minutes quoted for the `pip install` step alone does not include fetching
+> the ~5.1 GiB of submodules or the AOTriton configure/build. Check `df -h` first;
+> a full `$DATA_ROOT` fails deep in the build.
+
+> **Never `pip install transformer_engine` from PyPI.** That installs the NVIDIA
+> build, which fails on import with an undefined symbol.
 
 > Do not install `megatron-bridge`. The Qwen3 HF <-> Megatron conversion is handled by
 > `lumenrl/engine/training/qwen3_megatron_bridge.py`.
@@ -97,10 +144,18 @@ PY
 ## 2.5 Verify — full import chain (all examples)
 
 Run this to confirm every editable install resolves to the correct source directory
-rather than a stale pip package:
+rather than a stale pip package.
+
+> **`PYTHONPATH` is not optional here.** Without it `import aiter` resolves to the
+> image's bundled `amd-aiter` wheel, which pins `flydsl<0.1.5` and dies on
+> `ImportError: cannot import name 'fly_values' from 'flydsl.compiler.protocol'`
+> after §2.2 upgraded flydsl to 0.1.8. That is the wrong side of the mutual
+> exclusion described there, not a broken install. `run_dapo.sh` exports the same
+> prefix at startup, so this check has to reproduce it to test what actually runs.
 
 ```bash
 sudo docker exec -e HIP_VISIBLE_DEVICES=0 "$CONTAINER" bash -lc '
+export PYTHONPATH="$RL_ROOT/Lumen-RL:$AITER_DIR:$LUMEN_DIR:${PYTHONPATH:-}"
 python3 - <<PY
 import sys
 
@@ -154,6 +209,27 @@ except ImportError:
 PY
 '
 ```
+
+**Also confirm the TE layer spec actually builds.** Importing `megatron.core`
+succeeds without TransformerEngine, so the import check above passes on a machine
+where example 7 cannot run. This is the check that distinguishes them — it must
+print a `ModuleSpec`, not raise:
+
+```bash
+sudo docker exec -e HIP_VISIBLE_DEVICES=0 "$CONTAINER" bash -lc '
+python3 - <<PY
+import transformer_engine
+print("TE", transformer_engine.__version__)          # expect 2.15.0.dev0+6e541a10
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec as spec,
+)
+print("megatron TE layer spec OK:", type(spec()).__name__)
+PY
+'
+```
+
+> `TypeError: NoneType object is not callable` here means TE is missing or was
+> built for the wrong arch — go back to §2.3.
 
 ## 2.6 Verify — flash-attn ROCm ABI (example 7 / source-built flash-attn)
 

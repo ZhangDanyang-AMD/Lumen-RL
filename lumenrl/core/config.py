@@ -53,6 +53,13 @@ class OptimizerConfig:
     total_training_steps: int = 1000
     min_lr_ratio: float = 0.0
     num_cycles: float = 0.5
+    # Mirror of the same three fields on PolicyConfig, which is where configs
+    # set them. ``actor_worker._build_optimizer_config`` forwards them here for
+    # the Megatron engines to read; declaring them keeps the FSDP2 path, which
+    # builds this dataclass from that same dict, from rejecting them.
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.95
+    adam_eps: float = 1e-8
 
 
 @dataclass
@@ -187,10 +194,38 @@ class MegatronConfig:
     # Dynamic-batch packing: concat multiple sequences into one packed TE forward.
     enable_dynamic_batch: bool = False
     max_tokens_per_gpu: int = 0                  # per-forward token budget (0 -> 21504)
-    # Optimizer CPU offload: move Adam states (exp_avg/exp_avg_sq) to CPU memory.
-    # Frees ~2x model-size GPU memory at the cost of slower optimizer steps.
+    # ---- initial weights from a Megatron dist-checkpoint instead of HF ----
+    # Models whose released checkpoint the HF-safetensors bridge cannot read
+    # (DeepSeek-V4 ships block-quantized FP8) are converted offline to torch_dist
+    # and loaded from here; ``dist_checkpointing.load`` reshards on the way in.
+    # ``model_name`` is then read only for config.json.
+    dist_checkpoint_path: Optional[str] = None
+    # Megatron's ``--deterministic-mode`` has no equivalent here because the
+    # engine has no argument parser, so it is a config field. Costs the fused
+    # kernels; buys run-to-run bitwise reproducibility, without which DSv4 flips
+    # ~1.6% of argmaxes between identical forwards -- which is why ``None`` means
+    # "let the model family decide" and DSv4 decides on.
+    deterministic_mode: Optional[bool] = None
+    # Skip the DDP wrapper and the distributed optimizer entirely. For a frozen
+    # reference policy or a forward-only bring-up, that is the FP32 master
+    # weights plus both Adam moments not allocated.
+    build_optimizer: bool = True
+    # ---- optimizer state in host memory (Megatron's HybridDeviceOptimizer) ----
+    # Keeps ``optimizer_offload_fraction`` of the FP32 master weights and Adam
+    # moments in pinned host RAM and runs their Adam step on the CPU. Distinct
+    # from ``is_optimizer_offload_enabled``, which moves the whole optimizer
+    # between host and device around each phase; this one is a permanent split.
+    #
+    # It is what makes a model too big for its GPUs trainable at all: the
+    # optimizer is 12 bytes/param against the weights' 2, and it is sharded over
+    # EP x EDP = world_size, so raising EP does not shrink it. Costs a CPU Adam
+    # step per iteration.
     optimizer_cpu_offload: bool = False
-    optimizer_offload_fraction: float = 1.0      # fraction of states to offload (0.0-1.0)
+    # Fraction moved to the CPU, i.e. 1.0 offloads everything. Megatron's own
+    # dataclass default is 0.0, which would make ``optimizer_cpu_offload`` a
+    # no-op, so this default deliberately differs from it.
+    optimizer_offload_fraction: float = 1.0
+    overlap_cpu_optimizer_d2h_h2d: bool = True
 
 
 @dataclass
@@ -232,6 +267,10 @@ class VLLMConfig:
     trust_remote_code: bool = True
     # Rollout quantization: "" / "fp8" / "fp8_per_block" (vLLM `quantization=`)
     quantization: str = ""
+    # vLLM `moe_backend=`. "" leaves vLLM's own default. DeepSeek-V4 on gfx950 must
+    # pass "triton": the default auto-selects AITER and dies in the first forward at
+    # `moe_sorting_opus_fwd`, and "triton_unfused" is FP4-only and raises ValueError.
+    moe_backend: str = ""
     # When True, vLLM returns per-token rollout log-probs needed for TIS / MIS
     # rollout correction (verl: actor_rollout_ref.rollout.calculate_log_probs).
     calculate_log_probs: bool = False
@@ -551,14 +590,37 @@ class RolloutCorrectionConfig:
     clip: float = 1.5
     # IS weights (verl rollout_corr_helper.py)
     rollout_is: str = ""                # "token" | "sequence" | ""
-    rollout_is_threshold: str = "2.0"   # float or "lower_upper" (IcePop)
+    # Thresholds are strings so that a single field can carry either a number
+    # or an IcePop "lower_upper" pair / a comma-separated list. YAML written
+    # against the older float fields still works: __post_init__ coerces.
+    rollout_is_threshold: str | float = "2.0"
     rollout_is_batch_normalize: bool = False
+    # How the per-token log-ratios of a sequence combine for
+    # ``rollout_is: sequence``. "sum" is the full sequence likelihood ratio;
+    # "mean" divides by the response length for the geometric mean, which is
+    # the only form that stays in a usable range on long responses -- at 4k
+    # tokens the sum saturates the +-20 safety bound and then the threshold
+    # clamp almost always. Runs are not comparable across this setting.
+    rollout_is_seq_reduction: str = "sum"   # "sum" | "mean"
     # Rejection sampling (11 criteria: token_k1/k2/k3, seq_sum/mean/max_k1/k2/k3)
     rollout_rs: str = ""                # comma-separated: "seq_mean_k1", "seq_mean_k3", etc.
-    rollout_rs_threshold: str = ""      # comma-separated thresholds; K1 uses "lower_upper"
+    rollout_rs_threshold: str | float = ""  # comma-separated; K1 uses "lower_upper"
     # Bypass mode: set pi_old = pi_rollout, skip old_log_prob computation
     bypass_mode: bool = False
     loss_type: str = "ppo_clip"         # "ppo_clip" | "reinforce" (bypass mode only)
+
+    def __post_init__(self) -> None:
+        # Numbers from YAML reach the parsers as strings, which is what the
+        # "lower_upper" and comma-separated forms need them to be.
+        if not isinstance(self.rollout_is_threshold, str):
+            self.rollout_is_threshold = str(self.rollout_is_threshold)
+        if not isinstance(self.rollout_rs_threshold, str):
+            self.rollout_rs_threshold = str(self.rollout_rs_threshold)
+        if self.rollout_is_seq_reduction not in ("sum", "mean"):
+            raise ValueError(
+                "rollout_is_seq_reduction must be 'sum' or 'mean', got "
+                f"{self.rollout_is_seq_reduction!r}"
+            )
 
 
 @dataclass

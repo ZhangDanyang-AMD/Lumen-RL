@@ -59,12 +59,58 @@ print(\"flydsl\", flydsl.__version__, \"transformers\", transformers.__version__
 sudo docker exec "$CONTAINER" bash -lc 'pip install --no-deps "megatron-core==0.18.2"'
 ```
 
-TE 编译要点：必须用 **ROCm fork**、必须递归拉全部 submodule（约 5.1 GiB，含 AOTriton /
-CK JIT / Composable Kernel）、编译前先卸掉可能存在的 NVIDIA TE 包，并且要带
-`TORCH_DONT_CHECK_COMPILER_ABI=1` —— ROCm 7.2.3 的 `hipcc -v` 在没有输入文件时返回 1，
-CK-JIT 的编译器 ABI 探测会把它误判成"编译器不可用"。
+> **只装 megatron-core 不够，而且报错里不会提到 TE。** 缺 TransformerEngine 时
+> `megatron.core` 的 TE spec 构造器返回 `None`，例子 7 在 `init_model` 阶段死于：
+>
+> ```text
+> File ".../megatron/core/models/gpt/gpt_layer_specs.py", line 355,
+>   in get_gpt_layer_with_transformer_engine_spec
+> TypeError: 'NoneType' object is not callable
+> ```
+>
+> 缺 Apex 只是一条告警（`Apex is not installed. Falling back to Torch Norm`），不影响
+> 运行；缺 TE 则跑不起来。
 
-> **绝对不要 `pip install transformer_engine`**，那会装成 NVIDIA 版，导入即 undefined symbol。
+按固定 revision 拉源码，然后编译：
+
+```bash
+sudo docker exec "$CONTAINER" bash -lc '
+set -eux
+APEX_REV=daed85255d51476425080e7e6203f0bee6d7e4cc
+TE_REV=6e541a10419a6e31bdc98b1516db04eb81a463b6
+git config --global --add safe.directory "*"
+[ -d "$DATA_ROOT/apex_src/.git" ] || git clone https://github.com/ROCm/apex.git "$DATA_ROOT/apex_src"
+git -C "$DATA_ROOT/apex_src" checkout "$APEX_REV"
+git -C "$DATA_ROOT/apex_src" submodule update --init --recursive --jobs 16
+[ -d "$DATA_ROOT/te_src/.git" ] || git clone https://github.com/ROCm/TransformerEngine.git "$DATA_ROOT/te_src"
+git -C "$DATA_ROOT/te_src" checkout "$TE_REV"
+git -C "$DATA_ROOT/te_src" submodule update --init --recursive --jobs 16'
+
+# 编译 TE。NVTE_ROCM_ARCH / PYTORCH_ROCM_ARCH 要填本机架构：
+# MI355X 是 gfx950，MI325X/MI308X 是 gfx942（用 rocm-smi --showproductname 确认）。
+sudo docker exec "$CONTAINER" bash -lc '
+set -eux
+python3 -m pip uninstall -y transformer-engine transformer_engine \
+  transformer-engine-torch transformer_engine_torch || true
+cd "$DATA_ROOT/te_src" && rm -rf build dist transformer_engine.egg-info
+mkdir -p "$DATA_ROOT/tmp"
+export TMPDIR="$DATA_ROOT/tmp"
+export NVTE_FRAMEWORK=pytorch NVTE_USE_ROCM=1
+export NVTE_ROCM_ARCH=gfx950 PYTORCH_ROCM_ARCH=gfx950
+export NVTE_FUSED_ATTN=1 NVTE_FUSED_ATTN_CK=1 NVTE_FUSED_ATTN_AOTRITON=1
+export MAX_JOBS=48
+# ROCm 7.2.3 的 hipcc -v 在没有输入文件时返回 1，CK-JIT 的编译器 ABI 探测会把它
+# 误判成"编译器不可用"。跳过这个探测不影响真正的 kernel 编译。
+export TORCH_DONT_CHECK_COMPILER_ABI=1
+python3 -m pip install -v . --no-build-isolation'
+```
+
+> 这一步要留出 **20-40 分钟和约 20 GB 磁盘**，大头在 AOTriton。上面写的 9 分钟只是
+> `pip install` 那一步，不含拉取约 5.1 GiB submodule 和 AOTriton 的 configure/build。
+> 开工前先看 `df -h`：`$DATA_ROOT` 满了会在编译中途才失败。
+
+> **绝对不要从 PyPI `pip install transformer_engine`**，那会装成 NVIDIA 版，导入即
+> undefined symbol。
 
 > 不要装 `megatron-bridge`。Qwen3 的 HF <-> Megatron 转换由
 > `lumenrl/engine/training/qwen3_megatron_bridge.py` 负责。
@@ -88,10 +134,17 @@ PY
 
 ## 2.5 验证 — 完整导入链（所有例子）
 
-确认每个 editable install 都指向正确的源码目录，而非残留的 pip 包：
+确认每个 editable install 都指向正确的源码目录，而非残留的 pip 包。
+
+> **这里的 `PYTHONPATH` 不是可选项。** 不设它，`import aiter` 会解析到镜像自带的
+> `amd-aiter` wheel；该 wheel pin 了 `flydsl<0.1.5`，而 §2.2 已把 flydsl 升到 0.1.8，
+> 于是报 `ImportError: cannot import name 'fly_values' from 'flydsl.compiler.protocol'`。
+> 那是§2.2 所说互斥关系里**错误的那一侧**，不是安装坏了。`run_dapo.sh` 启动时会导出
+> 同样的前缀，所以这个检查必须复现它，才是在验证真正跑起来的那份代码。
 
 ```bash
 sudo docker exec -e HIP_VISIBLE_DEVICES=0 "$CONTAINER" bash -lc '
+export PYTHONPATH="$RL_ROOT/Lumen-RL:$AITER_DIR:$LUMEN_DIR:${PYTHONPATH:-}"
 python3 - <<PY
 import sys
 
@@ -145,6 +198,25 @@ except ImportError:
 PY
 '
 ```
+
+**还要确认 TE 的 layer spec 真的能构造出来。** 没有 TransformerEngine 时
+`import megatron.core` 依然成功，所以上面这段导入检查在跑不了例子 7 的机器上也会通过。
+下面这条才能区分两者——它必须打印出 `ModuleSpec` 而不是抛异常：
+
+```bash
+sudo docker exec -e HIP_VISIBLE_DEVICES=0 "$CONTAINER" bash -lc '
+python3 - <<PY
+import transformer_engine
+print("TE", transformer_engine.__version__)          # 期望 2.15.0.dev0+6e541a10
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec as spec,
+)
+print("megatron TE layer spec OK:", type(spec()).__name__)
+PY
+'
+```
+
+> 这里报 `TypeError: NoneType object is not callable` 说明 TE 没装或架构编错了，回 §2.3。
 
 ## 2.6 验证 — flash-attn ROCm ABI（例子 7 / 源码编译的 flash-attn）
 

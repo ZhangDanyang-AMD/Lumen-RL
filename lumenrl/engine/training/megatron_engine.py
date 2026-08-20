@@ -22,7 +22,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -36,10 +35,10 @@ from lumenrl.algorithms.loss_functions import (
 )
 from lumenrl.core.protocol import DataProto
 from lumenrl.core.types import AlgorithmName
-from lumenrl.engine.training.base_engine import BaseEngine, EngineRegistry
+from lumenrl.engine.training.base_engine import EngineRegistry
+from lumenrl.engine.training.megatron_base_engine import MegatronBaseEngine
 from lumenrl.engine.training.qwen3_megatron_bridge import (
     Qwen3Dims,
-    _pp_layer_range,
     hf_to_megatron,
     load_hf_safetensors,
     megatron_to_hf,
@@ -173,71 +172,22 @@ class FlashSelfAttentionCore(torch.nn.Module):
         return out.reshape(out.shape[0], out.shape[1], -1)
 
 
-class _FusedTokenLogProb(torch.autograd.Function):
-    """Memory-efficient per-token log-prob: ``log p(target) = logit_target - logsumexp``.
+class MegatronEngine(MegatronBaseEngine):
+    """Megatron-Core GPTModel engine (Qwen3 dense/MoE, BF16, TP/PP/EP/DP).
 
-    Retains a single ``[L, V]`` softmax buffer for backward instead of the
-    several ``[L, V]`` tensors that ``log_softmax(logits).gather(...)`` keeps
-    alive (the full log_softmax output plus its gradient). Values/gradients are
-    exact. Backward uses ``grad_logits = (onehot(target) - softmax) * grad_lp``.
+    The flash-attn attention core and the R3 routing-replay plumbing are what
+    distinguish this from :class:`MegatronNativeEngine`, which uses the
+    TransformerEngine layer spec. Everything the two share lives in
+    :class:`MegatronBaseEngine`.
     """
 
-    @staticmethod
-    def forward(ctx, logits, target):
-        logits = logits.float()
-        m = logits.max(dim=-1, keepdim=True).values          # [L,1]
-        shifted = logits.sub(m)                               # new [L,V]
-        exp = shifted.exp_()                                  # in-place -> exp
-        Z = exp.sum(dim=-1, keepdim=True)                     # [L,1]
-        softmax = exp.div_(Z)                                 # in-place -> softmax
-        logZ = Z.log_().add_(m)                               # logsumexp [L,1]
-        tgt_logit = logits.gather(-1, target.unsqueeze(-1))   # [L,1]
-        log_prob = (tgt_logit - logZ).squeeze(-1)             # [L]
-        ctx.save_for_backward(softmax, target)
-        return log_prob
-
-    @staticmethod
-    def backward(ctx, grad_lp):
-        softmax, target = ctx.saved_tensors                   # softmax [L,V]
-        grad = softmax.neg_()                                 # -softmax (reuse buffer)
-        grad.scatter_add_(-1, target.unsqueeze(-1), torch.ones_like(grad[:, :1]))
-        grad.mul_(grad_lp.unsqueeze(-1))
-        return grad, None
-
-
-class MegatronEngine(BaseEngine):
-    """Megatron-Core GPTModel engine (Qwen3 dense/MoE, BF16, TP/PP/EP/DP)."""
-
     def __init__(self, model_config, engine_config, optimizer_config, model_name: str = ""):
-        super().__init__()
-        self.model_config = model_config if isinstance(model_config, dict) else vars(model_config)
-        self.engine_config = engine_config if isinstance(engine_config, dict) else vars(engine_config)
-        self.optimizer_config = (
-            optimizer_config if isinstance(optimizer_config, dict) else vars(optimizer_config)
-        )
-        self.model_name = model_name or self.model_config.get("local_path", "")
-        self.module: torch.nn.Module | None = None   # unwrapped GPTModel (eval fwd, save/load)
-        self._ddp: Any = None                          # Megatron DistributedDataParallel wrapper
-        self.optimizer: Any = None                     # Megatron distributed optimizer
-        self.lr_scheduler: Any = None                  # Megatron OptimizerParamScheduler
-        self._dims: Qwen3Dims | None = None
+        super().__init__(model_config, engine_config, optimizer_config, model_name)
         self._step = 0
-        self.mode: str | None = None
-
-    # -- offload (Ray path: never offload) --
-    @property
-    def is_param_offload_enabled(self) -> bool:
-        return False
 
     @property
     def is_optimizer_offload_enabled(self) -> bool:
         return bool(self.engine_config.get("optimizer_cpu_offload", False))
-
-    def train_mode(self, **kwargs):
-        return nullcontext()
-
-    def eval_mode(self, **kwargs):
-        return nullcontext()
 
     # ------------------------------------------------------------------
     def initialize(self) -> None:
@@ -591,35 +541,13 @@ class MegatronEngine(BaseEngine):
             )
 
     # ------------------------------------------------------------------
-    def _rank(self) -> int:
-        return dist.get_rank() if dist.is_initialized() else 0
 
-    def get_data_parallel_size(self) -> int:
-        try:
-            from megatron.core import parallel_state as mpu
-            return mpu.get_data_parallel_world_size()
-        except Exception:
-            return dist.get_world_size() if dist.is_initialized() else 1
 
-    def get_data_parallel_rank(self) -> int:
-        try:
-            from megatron.core import parallel_state as mpu
-            return mpu.get_data_parallel_rank()
-        except Exception:
-            return self._rank()
 
-    def get_data_parallel_group(self):
-        try:
-            from megatron.core import parallel_state as mpu
-            return mpu.get_data_parallel_group()
-        except Exception:
-            return dist.group.WORLD if dist.is_initialized() else None
 
     def is_mp_src_rank_with_outputs(self) -> bool:
         return self._tp_rank == 0 and self._pp_rank == self._pp_size - 1
 
-    def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True) -> None:
-        return
 
     # ------------------------------------------------------------------
     def _forward_logits(self, ids: torch.Tensor, model=None) -> torch.Tensor:
@@ -696,12 +624,6 @@ class MegatronEngine(BaseEngine):
         logits = out.logits if hasattr(out, "logits") else out
         return logits.view(-1, logits.shape[-1])[:total_real].float()
 
-    @staticmethod
-    def _real_block(mask_row: torch.Tensor) -> tuple[int, int]:
-        idx = mask_row.nonzero(as_tuple=False).squeeze(-1)
-        if idx.numel() == 0:
-            return 0, 0
-        return int(idx[0].item()), int(idx.numel())
 
     # ---- MILES R3: rollout top-k expert-id replay ---------------------
     def _r3_routes(self, batch: DataProto) -> torch.Tensor | list[Any] | None:
@@ -894,36 +816,7 @@ class MegatronEngine(BaseEngine):
         }
 
     # ---- memory-efficient log-prob helpers (see FlashSelfAttentionCore/#2) ----
-    def _token_logprob_train(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """Per-token log-prob with grad. Uses the fused single-buffer CE (optionally
-        chunked over the sequence) when ``log_probs_chunk_size>0``; otherwise the
-        original ``log_softmax(...).gather(...)`` path (kept for the smoke config)."""
-        cs = self._logprob_chunk_size
-        if cs and cs > 0:
-            outs = []
-            for s in range(0, logits.shape[0], cs):
-                outs.append(_FusedTokenLogProb.apply(logits[s:s + cs], targets[s:s + cs]))
-            return torch.cat(outs, dim=0)
-        lp = torch.log_softmax(logits, dim=-1)
-        return lp.gather(-1, targets.view(-1, 1)).squeeze(-1)
 
-    def _logprob_entropy_nograd(
-        self, logits: torch.Tensor, targets: torch.Tensor, want_entropy: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """No-grad per-token log-prob (+ optional entropy), chunked over the
-        sequence to bound the ``[chunk, V]`` softmax memory."""
-        cs = self._logprob_chunk_size if (self._logprob_chunk_size and self._logprob_chunk_size > 0) else logits.shape[0]
-        cs = max(1, cs)
-        lps, ents = [], []
-        for s in range(0, logits.shape[0], cs):
-            lg = logits[s:s + cs]
-            lsm = torch.log_softmax(lg, dim=-1)
-            lps.append(lsm.gather(-1, targets[s:s + cs].view(-1, 1)).squeeze(-1))
-            if want_entropy:
-                ents.append(-(lsm.exp() * lsm).sum(-1))
-        lp = torch.cat(lps, dim=0)
-        ent = torch.cat(ents, dim=0) if want_entropy else None
-        return lp, ent
 
     # ---- engine-level compute_log_probs (actor delegates here) ----
     def engine_compute_log_probs(self, batch: DataProto) -> DataProto:
@@ -1810,29 +1703,9 @@ class MegatronEngine(BaseEngine):
             "grad_norm": grad_norm,
         }
 
-    def _optimizer_step(self) -> float:
-        """Reduce grads across DP (+reduce-scatter for the distributed optimizer),
-        then step the Megatron distributed optimizer."""
-        from megatron.core.distributed import finalize_model_grads
-        finalize_model_grads([self._ddp])
-        update_successful, grad_norm, _num_zeros = self.optimizer.step()
-        if not update_successful:
-            logger.warning("optimizer.step reported update_successful=False")
-        return float(grad_norm) if grad_norm is not None else 0.0
 
-    def _cur_lr(self) -> float:
-        try:
-            return float(self.optimizer.param_groups[0]["lr"])
-        except Exception:
-            return 0.0
 
-    def _sched_step(self) -> float:
-        if self.lr_scheduler is not None:
-            self.lr_scheduler.step(increment=1)
-        return self._cur_lr()
 
-    def lr_scheduler_step(self) -> float:
-        return self._cur_lr()
 
     # ---- weight sync: Megatron -> HF named tensors ----
     def get_per_tensor_param(self, **kwargs):

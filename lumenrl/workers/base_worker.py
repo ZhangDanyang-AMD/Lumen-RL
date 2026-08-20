@@ -44,19 +44,28 @@ def _setup_gpu_visibility_early() -> None:
             cuda_val = rocr_val
             _os.environ["CUDA_VISIBLE_DEVICES"] = cuda_val
 
-    # NOSET fallback via Ray API (verl L273-281)
+    # Ray-API fallback (verl L273-281). Reached both when NOSET is active
+    # (rollout co-location asks Ray not to set the variables) and when Ray's
+    # accelerator detection failed and left them unset on its own. The latter
+    # is not hypothetical: every actor then sees all 8 GPUs, lands on card 0,
+    # and the training step dies with "Multiple ranks detected using the same
+    # GPU on this node". Ray's *assignment* is still right, so restore the
+    # invariant every consumer downstream assumes -- ``setup_distributed``'s
+    # ``local_rank=0``, ``init_model``'s ``model.to(local_device)``, FSDP2's
+    # DeviceMesh all take this actor's only device to be ``cuda:0``.
     _NOSET_VARS = (
         "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
         "RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES",
         "RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES",
     )
     is_noset = any(_os.environ.get(v) for v in _NOSET_VARS)
-    if is_noset and not cuda_val:
+    if not cuda_val:
         try:
             import ray  # noqa: E402 — ray does not import torch
             gpu_ids = ray.get_runtime_context().get_accelerator_ids().get("GPU", [])
             if gpu_ids:
-                cuda_val = str(gpu_ids[0])
+                # Join them all: a multi-GPU actor must not be truncated to one.
+                cuda_val = ",".join(str(g) for g in gpu_ids)
                 _os.environ["CUDA_VISIBLE_DEVICES"] = cuda_val
         except Exception:
             pass
@@ -103,48 +112,15 @@ class BaseWorker(ABC):
     class, owns local devices, and exchanges batches via :class:`DataProto`.
     """
 
-    _NOSET_ENV_VARS = (
-        "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
-        "RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES",
-        "RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES",
-    )
-
     def __init__(self, rank: int, world_size: int, config: dict[str, Any] | None = None) -> None:
-        self._setup_gpu_visibility()
+        # GPU visibility is settled at module import (_setup_gpu_visibility_early),
+        # which is the only point early enough: torch caches the device list at its
+        # first CUDA call, and this module initialises the CUDA context on import.
         self.rank = rank
         self.world_size = world_size
         self.config: dict[str, Any] = dict(config or {})
         self._log = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
         self._configure_logging()
-
-    def _setup_gpu_visibility(self) -> None:
-        """Ensure CUDA/HIP/ROCR_VISIBLE_DEVICES are consistent (verl-aligned).
-
-        When ``RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES=1`` is active (e.g.
-        for ATOM rollout), Ray does not set ``HIP_VISIBLE_DEVICES``.  In that
-        case we fall back to ``ray.get_runtime_context().get_accelerator_ids()``
-        to discover the assigned GPU — same approach verl uses.
-        """
-        import os
-
-        is_noset = any(os.environ.get(v) for v in self._NOSET_ENV_VARS)
-        if not is_noset:
-            return
-
-        cuda_vis = os.environ.get("CUDA_VISIBLE_DEVICES")
-        if cuda_vis:
-            return
-
-        try:
-            import ray
-            gpu_ids = ray.get_runtime_context().get_accelerator_ids().get("GPU", [])
-            if gpu_ids:
-                gpu_str = ",".join(str(g) for g in gpu_ids)
-                os.environ["CUDA_VISIBLE_DEVICES"] = gpu_str
-                os.environ["HIP_VISIBLE_DEVICES"] = gpu_str
-                os.environ["ROCR_VISIBLE_DEVICES"] = gpu_str
-        except Exception:
-            pass
 
     def _configure_logging(self) -> None:
         """Ensure worker logs include rank for multi-actor debugging."""
