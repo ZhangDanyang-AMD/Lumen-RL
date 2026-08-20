@@ -96,9 +96,11 @@ if [ "$MODE" = "atomfp8" ] || [ "$MODE" = "atom_fp8" ] || \
     # importing the Lumen/AITER norm patch in actor initialization; the HF
     # Qwen3 RMSNorm is already model-sensitive and this keeps BF16 comparable
     # with MODE=bf16 while retaining the ATOM rollout backend.
+    _KEEP_NORM="${LUMEN_NORM:-}"
     unset LUMEN_NORM LUMEN_FP8 FP8_PARAM_MANAGER LUMEN_FP8_SCALING
     unset LUMEN_FP8_FORMAT LUMEN_FP8_BLOCK_SIZE LUMEN_FP8_ATTN
     unset LUMEN_FP8_QUANT_TYPE LUMEN_ATTN_BACKEND LUMEN_FP8_WGRAD
+    [ -n "$_KEEP_NORM" ] && export LUMEN_NORM="$_KEEP_NORM"
   else
     export LUMEN_NORM=1
   fi
