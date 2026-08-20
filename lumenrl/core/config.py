@@ -122,6 +122,7 @@ class RayControllerConfig:
     fuse_actor_ref: bool = False
     actor: RayWorkerRoleConfig = field(default_factory=RayWorkerRoleConfig)
     ref: RayWorkerRoleConfig = field(default_factory=RayWorkerRoleConfig)
+    rollout: RayWorkerRoleConfig = field(default_factory=RayWorkerRoleConfig)
     # Optional role->pool name mapping for complex topology routing.
     topology_map: dict[str, str] = field(default_factory=dict)
 
@@ -171,11 +172,17 @@ class MegatronConfig:
     moe_permute_fusion: bool = False
     # Distributed optimizer: shard FP32 master + Adam state across DP ranks.
     use_distributed_optimizer: bool = True
+    # MILES numerical-alignment knobs for BF16 training.
+    grad_reduce_in_fp32: bool = True
+    attention_softmax_in_fp32: bool = True
     # Activation recomputation (gradient checkpointing) for long sequences.
     recompute_granularity: Optional[str] = None  # None | "full" | "selective"
     recompute_method: Optional[str] = None       # "uniform" | "block"
     recompute_num_layers: Optional[int] = None
-    # Memory-efficient chunked/fused token log-prob.
+    # Long-sequence memory: flash attention (O(L) vs local O(L^2)) + memory-efficient
+    # chunked/fused token log-prob. Both default off (unchanged smoke behavior).
+    attention_backend: str = "unfused"           # "flash" | "unfused"
+    use_packed_sequences: bool = True            # varlen flash packing; disable for incompatible ROCm kernels
     log_probs_chunk_size: int = 0                # >0 enables fused/chunked log-prob
     # Dynamic-batch packing: concat multiple sequences into one packed TE forward.
     enable_dynamic_batch: bool = False
@@ -347,6 +354,9 @@ class PolicyConfig:
     lr_warmup_steps: int = 10
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.95
+    adam_eps: float = 1e-8
     warmup_ratio: float = 0.0
     min_lr: float = 0.0
     lr_decay_style: str = "cosine"       # constant, linear, cosine, WSD
@@ -542,6 +552,8 @@ class AlgorithmConfig:
     clip_ratio_low: Optional[float] = None
     clip_ratio_high: Optional[float] = None
     clip_ratio_c: float = 3.0
+    # Rollout correction (also available via quantization.rollout_correction)
+    rollout_correction: Optional[RolloutCorrectionConfig] = None
 
 
 @dataclass
@@ -569,12 +581,16 @@ class RolloutCorrectionConfig:
     enabled: bool = False
     method: str = "tis"
     clip: float = 1.5
-    # Extended rollout correction (verl/trainer/ppo/rollout_corr_helper.py)
-    rollout_is: str = ""                # "token" | "sequence" | "" (importance sampling level)
-    rollout_is_threshold: float = 2.0   # upper truncation for IS weights
+    # IS weights (verl rollout_corr_helper.py)
+    rollout_is: str = ""                # "token" | "sequence" | ""
+    rollout_is_threshold: str = "2.0"   # float or "lower_upper" (IcePop)
     rollout_is_batch_normalize: bool = False
-    rollout_rs: str = ""                # rejection sampling mode
-    rollout_rs_threshold: float = 0.0
+    # Rejection sampling (11 criteria: token_k1/k2/k3, seq_sum/mean/max_k1/k2/k3)
+    rollout_rs: str = ""                # comma-separated: "seq_mean_k1", "seq_mean_k3", etc.
+    rollout_rs_threshold: str = ""      # comma-separated thresholds; K1 uses "lower_upper"
+    # Bypass mode: set pi_old = pi_rollout, skip old_log_prob computation
+    bypass_mode: bool = False
+    loss_type: str = "ppo_clip"         # "ppo_clip" | "reinforce" (bypass mode only)
 
 
 @dataclass
@@ -703,6 +719,32 @@ class MooncakeTransferConfig:
 
 
 @dataclass
+class RDMAWeightSyncConfig:
+    """RCCL/RoCE transport settings for cross-node policy weight updates."""
+
+    backend: str = "rccl"
+    require_rdma: bool = True
+    hca: str = "mlx5_0"
+    interface: str = "ens11np0"
+    gid_index: int = 3
+    gdr_mode: str = "auto"  # off | auto | required
+
+
+@dataclass
+class WeightSyncConfig:
+    """Policy weight transport between separated training and rollout nodes."""
+
+    # auto preserves the legacy selection; production choices are
+    # shared_folder and rdma.
+    backend: str = "auto"  # auto | shared_folder | rdma
+    shared_folder: str = "/volumes/oss1/lumenrl_weight_sync"
+    bucket_size_mb: int = 1024
+    timeout_s: int = 600
+    verify_full_load: bool = True
+    rdma: RDMAWeightSyncConfig = field(default_factory=RDMAWeightSyncConfig)
+
+
+@dataclass
 class AsyncTrainingConfig:
     """Configuration for fully-async separated rollout + training."""
     enabled: bool = False
@@ -718,11 +760,28 @@ class AsyncTrainingConfig:
 
 
 @dataclass
+class TorchProfilerScheduleConfig:
+    """Schedule for ``torch.profiler.schedule``.
+
+    The profiler cycles through skip_first -> (wait -> warmup -> active) x repeat.
+    Scheduling is only enabled when ``active > 0``; otherwise the profiler runs
+    in continuous mode.
+    """
+
+    skip_first: int = 0
+    wait: int = 0
+    warmup: int = 1
+    active: int = 3
+    repeat: int = 0
+
+
+@dataclass
 class TorchProfilerToolConfig:
     """Configuration for torch.profiler backend."""
 
     # Supported values: "cpu", "cuda", "memory", "shapes", "stack"
     contents: list[str] = field(default_factory=lambda: ["cpu", "cuda"])
+    schedule: Optional["TorchProfilerScheduleConfig"] = None
 
 
 @dataclass
@@ -809,6 +868,7 @@ class LumenRLConfig:
     checkpointing: CheckpointConfig = field(default_factory=CheckpointConfig)
     logger: LoggerConfig = field(default_factory=LoggerConfig)
     mooncake: MooncakeTransferConfig = field(default_factory=MooncakeTransferConfig)
+    weight_sync: WeightSyncConfig = field(default_factory=WeightSyncConfig)
     async_training: AsyncTrainingConfig = field(default_factory=AsyncTrainingConfig)
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
     controller: ControllerConfig = field(default_factory=ControllerConfig)

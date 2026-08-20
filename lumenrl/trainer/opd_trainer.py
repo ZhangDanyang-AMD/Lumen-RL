@@ -439,7 +439,7 @@ class OPDTrainer:
 
         prompts: list[str] = []
         for s in samples:
-            raw = s.get("prompt") or s.get("question") or s.get("input") or ""
+            raw = s.get("prompt") or s.get("question") or s.get("input") or s.get("problem") or ""
             if isinstance(raw, list):
                 text = "\n".join(
                     m.get("content", "") for m in raw if isinstance(m, dict)
@@ -458,7 +458,7 @@ class OPDTrainer:
             if self._tokenizer is not None and hasattr(
                 self._tokenizer, "apply_chat_template"
             ):
-                orig = s.get("prompt") or s.get("question") or s.get("input") or ""
+                orig = s.get("prompt") or s.get("question") or s.get("input") or s.get("problem") or ""
                 if isinstance(orig, list):
                     try:
                         text = self._tokenizer.apply_chat_template(

@@ -7,13 +7,17 @@ never used. CPU-only. Run: python -m lumenrl.tests.test_rollout_routing
 
 import numpy as np
 import torch
+from types import SimpleNamespace
 
+from lumenrl.core.protocol import DataProto
+from lumenrl.engine.training.megatron_engine import MegatronEngine
 from lumenrl.moe.rollout_routing import (
     RoutingReplayContext,
     apply_replay,
     layer_index_of,
     pack_rollout_routing,
 )
+from lumenrl.trainer.rl_trainer import RLTrainer
 
 N_LAYERS, TOP_K = 3, 2
 
@@ -66,6 +70,57 @@ def test_shape_mismatch_is_loud():
         assert "expected" in str(exc)
     else:
         raise AssertionError("wrong-shaped routing was accepted")
+
+
+def test_megatron_accepts_ragged_routing_contract():
+    routes = _rows([3, 4])
+    batch = DataProto(
+        tensors={"input_ids": torch.zeros(2, 4, dtype=torch.long)},
+        ragged={"rollout_routing": routes},
+    )
+    engine = object.__new__(MegatronEngine)
+    engine._r3_enabled = True
+    assert engine._r3_routes(batch) is routes
+
+
+def test_ray_logprob_handoff_keeps_routing_ragged():
+    class FakeWorkerGroup:
+        request = None
+
+        def dispatch_and_call(self, _method, data, **_kwargs):
+            self.request = data
+            bsz, seq_len = data["input_ids"].shape
+            return DataProto(tensors={
+                "log_probs": torch.zeros(bsz, seq_len - 1),
+                "input_ids": data["input_ids"],
+            })
+
+    trainer = object.__new__(RLTrainer)
+    trainer._device = torch.device("cpu")
+    role_cfg = SimpleNamespace(dispatch_mode="dp_compute_proto", lazy_dispatch_key=None)
+    trainer.config = SimpleNamespace(
+        policy=SimpleNamespace(
+            generation=SimpleNamespace(vllm_cfg=SimpleNamespace(temperature=1.0)),
+            max_token_len_per_gpu=128,
+        ),
+        controller=SimpleNamespace(
+            ray=SimpleNamespace(actor=role_cfg, ref=role_cfg),
+        ),
+    )
+    sequences = torch.zeros(2, 4, dtype=torch.long)
+    routes = _rows([3, 4])
+    wg = FakeWorkerGroup()
+    trainer._compute_log_probs_with_worker_group(
+        wg,
+        sequences,
+        role="actor",
+        attention_mask=torch.ones_like(sequences),
+        rollout_routing=routes,
+    )
+    assert wg.request.ragged["rollout_routing"] == routes
+    chunks = wg.request.split(2)
+    assert chunks[0].ragged["rollout_routing"][0] is routes[0]
+    assert chunks[1].ragged["rollout_routing"][0] is routes[1]
 
 
 def test_replay_swaps_selection_and_regathers_weights():
@@ -145,6 +200,32 @@ def test_layer_lookup_is_order_independent():
         backward = [apply_replay(probs, computed, l)[1][0, 0].item()
                     for l in reversed(range(N_LAYERS))]
     assert forward == [1, 2, 3] and backward == [3, 2, 1]
+
+
+def test_megatron_checkpoint_uses_dp_reshardable_optimizer_state():
+    """The active ``megatron`` backend must not gather DP optimizer state."""
+    model_state = {"model": object()}
+    optimizer_state = {"optimizer": object()}
+
+    class ModuleStub:
+        def sharded_state_dict(self):
+            return model_state
+
+    class OptimizerStub:
+        def sharded_state_dict(self, state, *, is_loading, metadata):
+            assert state is model_state
+            assert is_loading is False
+            assert metadata == {"distrib_optim_sharding_type": "dp_reshardable"}
+            return optimizer_state
+
+    engine = MegatronEngine.__new__(MegatronEngine)
+    engine.module = ModuleStub()
+    engine.optimizer = OptimizerStub()
+
+    assert engine._dist_sharded_state_dict(False) == {
+        "model": model_state,
+        "optimizer": optimizer_state,
+    }
 
 
 if __name__ == "__main__":

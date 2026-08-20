@@ -386,6 +386,35 @@ class ATOMRayServer:
         self.engine = None
         return True
 
+    async def reload_weights_from_path(self, weight_dir: str) -> bool:
+        """Reload weights from a safetensors directory (for multi-GPU TP replicas)."""
+        if self.engine is None:
+            raise RuntimeError("ATOMRayServer.launch() must be called before reload_weights_from_path().")
+
+        import json
+
+        from safetensors.torch import load_file
+
+        from atom.rollout.weight_sync import load_weights_via_shm
+
+        index_path = os.path.join(weight_dir, "model.safetensors.index.json")
+        if os.path.exists(index_path):
+            with open(index_path) as f:
+                index = json.load(f)
+            files = sorted(set(index["weight_map"].values()))
+        else:
+            files = sorted(f for f in os.listdir(weight_dir) if f.endswith(".safetensors"))
+
+        def weight_iter():
+            for fname in files:
+                sd = load_file(os.path.join(weight_dir, fname))
+                for name, tensor in sd.items():
+                    yield name, tensor
+
+        load_weights_via_shm(self.engine.core_mgr, weight_iter(), bucket_size_mb=2048)
+        logger.info("ATOMRayServer[%d]: reloaded weights from %s", self.replica_rank, weight_dir)
+        return True
+
 
 class ATOMReplicaManager:
     """Driver-side controller for colocated ATOM rollout actors."""
@@ -415,23 +444,44 @@ class ATOMReplicaManager:
         infos = self.actor_wg.execute_all_sync("get_colocation_info")
         logger.info("ATOMReplicaManager: colocation infos = %s", infos)
 
+        atom_tp = int(self.engine_kwargs.get("tensor_parallel_size", 1) or 1)
+        num_workers = len(infos)
+        if num_workers % atom_tp != 0:
+            raise ValueError(
+                f"num_workers ({num_workers}) must be divisible by "
+                f"atom tensor_parallel_size ({atom_tp})"
+            )
+        num_replicas = max(1, num_workers // atom_tp)
+        self.num_replicas = num_replicas
+
         true_vocab_size = self._get_true_vocab_size()
         # ATOM's no-eager compilation_config.level>0 rollout needs a live Dynamo, but the
         # FSDP2 training actors must stay on TORCHDYNAMO_DISABLE=1. Scope the opt-in to the
         # rollout actors here instead of letting the launcher export it process-tree wide.
         dynamo_required = self._torch_compile_enabled()
         remote_cls = ray.remote(ATOMRayServer)
-        for i, info in enumerate(infos):
-            node_id = info["node_id"]
-            gpu_ids = ",".join(str(g) for g in info["gpu_ids"])
+
+        for r in range(num_replicas):
+            group = infos[r * atom_tp : (r + 1) * atom_tp]
+            node_id = group[0]["node_id"]
+            all_gpu_ids: list[str] = []
+            for info in group:
+                all_gpu_ids.extend(str(g) for g in info["gpu_ids"])
+            gpu_ids_str = ",".join(all_gpu_ids)
+
+            nccl_port = 29500 + r
+            disable_custom_ar = os.environ.get("LUMENRL_DISABLE_CUSTOM_AR", "1" if atom_tp > 1 else "0")
             env_vars = {
-                "CUDA_VISIBLE_DEVICES": gpu_ids,
-                "HIP_VISIBLE_DEVICES": gpu_ids,
+                "CUDA_VISIBLE_DEVICES": gpu_ids_str,
+                "HIP_VISIBLE_DEVICES": gpu_ids_str,
                 "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
                 "RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES": "1",
                 "RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES": "1",
                 "NCCL_CUMEM_ENABLE": "0",
-                "LUMEN_REPLICA_RANK": str(i),
+                "MASTER_PORT": str(nccl_port),
+                "LUMENRL_DISABLE_CUSTOM_AR": disable_custom_ar,
+                **({"ATOM_USE_CUSTOM_ALL_GATHER": "0"} if disable_custom_ar in ("1", "true", "True") else {}),
+                "LUMEN_REPLICA_RANK": str(r),
                 "LUMEN_RAY_JOB_ID": str(job_id),
             }
             if true_vocab_size is not None:
@@ -449,19 +499,31 @@ class ATOMReplicaManager:
                 if key in os.environ:
                     env_vars[key] = os.environ[key]
 
-            engine_kwargs = self._engine_kwargs_for_replica(i, job_id)
+            engine_kwargs = self._engine_kwargs_for_replica(r, job_id)
+            if disable_custom_ar in ("1", "true", "True"):
+                engine_kwargs.setdefault(
+                    "runner_qualname",
+                    "lumenrl.engine.inference.model_runner_nocustomar.NoCustomARModelRunner",
+                )
+
+            _dbg = os.environ.get("LUMENRL_DEBUG", "0") in ("1", "true", "True")
+            if _dbg:
+                logger.info(
+                    "[DBG] ATOMReplicaManager: replica %d — gpus=%s disable_ca=%s runner=%s",
+                    r, gpu_ids_str, disable_custom_ar, engine_kwargs.get("runner_qualname", "default"),
+                )
 
             server = remote_cls.options(
                 num_gpus=0,
                 num_cpus=1,
-                name=f"lumen-atom-replica-{i}",
+                name=f"lumen-atom-replica-{r}",
                 max_concurrency=self.max_concurrency,
                 scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=False),
                 runtime_env={"env_vars": env_vars},
             ).remote(
                 model_name=self.model_name,
                 engine_kwargs=engine_kwargs,
-                replica_rank=i,
+                replica_rank=r,
                 base_seed=self.base_seed,
             )
             self.servers.append(server)
@@ -471,8 +533,13 @@ class ATOMReplicaManager:
             "0" if dynamo_required else "<inherited>",
             os.environ.get("TORCHDYNAMO_DISABLE", "<unset>"),
         )
-        ray.get([s.launch.remote() for s in self.servers])
-        logger.info("ATOMReplicaManager: launched %d colocated rollout replicas.", len(self.servers))
+        for i, s in enumerate(self.servers):
+            ray.get(s.launch.remote())
+            logger.info("ATOMReplicaManager: replica %d/%d launched.", i + 1, num_replicas)
+        logger.info(
+            "ATOMReplicaManager: launched %d colocated rollout replicas (atom_tp=%d, workers=%d).",
+            num_replicas, atom_tp, num_workers,
+        )
 
     def _torch_compile_enabled(self) -> bool:
         """True when the ATOM engine will run torch.compile (no-eager or level>0)."""
@@ -522,6 +589,10 @@ class ATOMReplicaManager:
     def drain_all(self) -> None:
         import ray
         ray.get([s.wait_for_requests_to_drain.remote() for s in self.servers])
+
+    def reload_weights_from_path(self, weight_dir: str) -> None:
+        import ray
+        ray.get([s.reload_weights_from_path.remote(weight_dir) for s in self.servers])
 
     def shutdown(self) -> None:
         import ray

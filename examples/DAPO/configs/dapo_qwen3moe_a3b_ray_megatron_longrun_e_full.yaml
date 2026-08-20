@@ -52,7 +52,7 @@ policy:
       expert_tensor_parallel_size: 2
       # sequence_parallel is auto-forced on (MoE + TP); packed thd is padded to a
       # multiple of TP for the SP sequence split.
-      moe_grouped_gemm: true
+      moe_grouped_gemm: false             # grouped_gemm (CUTLASS) unavailable on ROCm; use SequentialMLP
       moe_aux_loss_coeff: 0.0
       moe_router_dtype: fp32
       recompute_granularity: full

@@ -118,9 +118,17 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
             metrics[f"critic/advantages/{k}"] = v
 
     # --- Returns ---
-    returns = t.get("returns")
+    # In verl's GRPO path token-level returns are the normalized advantages
+    # (there is no learned value baseline), so its W&B returns and advantages
+    # panels are identical. Mirror that fallback when no explicit GAE returns
+    # tensor exists.
+    returns = t.get("returns", advantages)
     if returns is not None:
-        valid_ret = torch.masked_select(returns, response_mask_bool) if returns.dim() > 1 else returns
+        if returns.dim() == 1 and returns.shape[0] == response_mask_bool.shape[0]:
+            returns_tok = returns.unsqueeze(-1).expand_as(response_mask_bool)
+            valid_ret = torch.masked_select(returns_tok, response_mask_bool)
+        else:
+            valid_ret = torch.masked_select(returns, response_mask_bool) if returns.dim() > 1 else returns
         for k, v in _safe_stats(valid_ret).items():
             metrics[f"critic/returns/{k}"] = v
 
@@ -151,6 +159,10 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["response_length_non_aborted/mean"] = na_resp_len.mean().detach().item()
         metrics["response_length_non_aborted/max"] = na_resp_len.max().detach().item()
         metrics["response_length_non_aborted/min"] = na_resp_len.min().detach().item()
+        if max_resp_len > 0:
+            metrics["response_length_non_aborted/clip_ratio"] = (
+                (na_resp_len == max_resp_len).float().mean().detach().item()
+            )
 
     metrics["response/aborted_ratio"] = aborted_mask.float().mean().detach().item()
 
@@ -158,6 +170,11 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     metrics["prompt_length/mean"] = prompt_length.mean().detach().item()
     metrics["prompt_length/max"] = prompt_length.max().detach().item()
     metrics["prompt_length/min"] = prompt_length.min().detach().item()
+    max_prompt_len = batch.meta.get("max_prompt_length")
+    if max_prompt_len is not None and float(max_prompt_len) > 0:
+        metrics["prompt_length/clip_ratio"] = (
+            (prompt_length == float(max_prompt_len)).float().mean().detach().item()
+        )
 
     return metrics
 

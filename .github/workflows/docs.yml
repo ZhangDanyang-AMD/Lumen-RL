@@ -36,6 +36,9 @@ jobs:
         run: |
           mkdir -p _site
           cp lumenrl-docs/site/index.html _site/index.html
+          if [ -d lumenrl-docs/site/figures ]; then
+            cp -r lumenrl-docs/site/figures _site/figures
+          fi
           if [ -d dashboards ]; then
             cp -r dashboards _site/dashboards
           fi
