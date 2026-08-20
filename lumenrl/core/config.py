@@ -53,6 +53,13 @@ class OptimizerConfig:
     total_training_steps: int = 1000
     min_lr_ratio: float = 0.0
     num_cycles: float = 0.5
+    # Mirror of the same three fields on PolicyConfig, which is where configs
+    # set them. ``actor_worker._build_optimizer_config`` forwards them here for
+    # the Megatron engines to read; declaring them keeps the FSDP2 path, which
+    # builds this dataclass from that same dict, from rejecting them.
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.95
+    adam_eps: float = 1e-8
 
 
 @dataclass
