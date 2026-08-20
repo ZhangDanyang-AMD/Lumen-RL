@@ -555,7 +555,9 @@ class MegatronNativeEngine(MegatronBaseEngine):
         opt_cfg = OptimizerConfig(
             optimizer="adam", lr=float(oc.get("lr", 1e-6)),
             weight_decay=float(oc.get("weight_decay", 0.1)),
-            adam_beta1=0.9, adam_beta2=0.95, adam_eps=1e-8,
+            adam_beta1=float(oc.get("adam_beta1", 0.9)),
+            adam_beta2=float(oc.get("adam_beta2", 0.95)),
+            adam_eps=float(oc.get("adam_eps", 1e-8)),
             clip_grad=self._clip, bf16=True, fp16=False,
             params_dtype=torch.bfloat16, use_distributed_optimizer=True,
             **opt_kwargs,
