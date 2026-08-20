@@ -91,7 +91,8 @@ def _non_expert_hf_to_megatron(hf: dict, d: Qwen3MoEDims) -> dict[str, torch.Ten
     m: dict[str, torch.Tensor] = {}
     m["embedding.word_embeddings.weight"] = hf["model.embed_tokens.weight"]
     m["decoder.final_layernorm.weight"] = hf["model.norm.weight"]
-    m["output_layer.weight"] = hf["lm_head.weight"]
+    # tied-embedding checkpoints may omit lm_head.weight (see dense bridge)
+    m["output_layer.weight"] = hf.get("lm_head.weight", hf["model.embed_tokens.weight"])
     for i in range(d.num_layers):
         hp = f"model.layers.{i}."
         mp = f"decoder.layers.{i}."
