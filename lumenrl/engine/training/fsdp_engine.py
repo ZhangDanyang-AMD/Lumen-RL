@@ -177,7 +177,10 @@ class FSDP2Engine(BaseEngine):
         cfg = self.optimizer_config
         params = [p for p in module.parameters() if p.requires_grad]
         if cfg.optimizer_type == "adamw":
-            return torch.optim.AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
+            return torch.optim.AdamW(
+                params, lr=cfg.lr, weight_decay=cfg.weight_decay,
+                betas=(cfg.adam_beta1, cfg.adam_beta2), eps=cfg.adam_eps,
+            )
         raise NotImplementedError(f"Unsupported optimizer: {cfg.optimizer_type}")
 
     def _build_lr_scheduler(self, optimizer: torch.optim.Optimizer):
