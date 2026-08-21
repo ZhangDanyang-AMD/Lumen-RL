@@ -1,7 +1,9 @@
 # DeepSeek-V4 on LumenRL —— 持续开发文档
 
-> **这份文档是给接手的 agent 用的。** 目标是：**新 agent 在新环境里只读这一份（以及它指向的
-> `docs/agent/`），就能直接接手开发，不需要任何仓库外的文档。**
+> **这份文档是 [`docs/agent/`](README.md) 里的活文档**，记的是**当前开发状态**：
+> 做到哪了、还剩什么、下一步做什么。操作步骤在同目录的 01–06 里。
+>
+> **这个目录是自足的——接手 DSv4 不需要看仓库里其它任何 md。**
 >
 > ## 开发分支
 >
@@ -19,18 +21,18 @@
 > （`run_dapo.sh` 的 `HSA_DISABLE_FRAGMENT_ALLOCATOR`，见 §4.3 第 1 条）
 > 在合并到 main 时被冲掉了，直到重新跑 smoke 才发现。
 >
-> ## 文档结构
+> ## 同目录的其它文档
 >
-> | 文档 | 性质 |
+> | 文档 | 内容 |
 > |---|---|
-> | **本文档** | **活的**。当前状态、已解决、未解决、下一步。有进展就更新 |
-> | [`agent/`](agent/) | **稳定操作手册**（5 篇）：连集群、建环境、备产物、判据、运行期坑。只在配方本身变化时才动 |
-> | [`../scripts/primus/README.md`](../scripts/primus/README.md) | primus 底座八条坑的完整版 + 脚本用法 |
+> | [`01-cluster-access.md`](01-cluster-access.md) | 连集群、进节点、起长任务 |
+> | [`02-environment-setup.md`](02-environment-setup.md) | 建环境（镜像 / 容器 / NFS 树 / RDMA 自检） |
+> | [`03-dsv4-artifacts.md`](03-dsv4-artifacts.md) | 四份权重、三套命名、产物重建 |
+> | [`04-probes-and-criteria.md`](04-probes-and-criteria.md) | 探针目录、判据阈值、**哪些判据是错的** |
+> | [`05-operational-pitfalls.md`](05-operational-pitfalls.md) | 运行期的坑 |
+> | [`06-primus-pitfalls.md`](06-primus-pitfalls.md) | primus 底座八条坑，**按症状索引** |
 >
-> **新 agent 的最短路径**：
-> [`agent/01-cluster-access.md`](agent/01-cluster-access.md) →
-> [`agent/02-environment-setup.md`](agent/02-environment-setup.md) §0 →
-> 本文档 §0（一页现状）→ 从 §9 挑一件事做。
+> **新 agent 的最短路径**：01 → 02 §0 → 本文档 §0 → 从 §9 挑一件事做。
 >
 > **维护约定**（很重要，请遵守）：
 > 1. **有新进展就更新这里**，不要另开文件。
@@ -39,7 +41,7 @@
 > 3. **被推翻的假设要写进 §6**，那一节是这份文档里最省时间的部分——它让后人不必重走死路。
 > 4. 数字要带条件（几个节点、多少层、什么并行度、什么序列长度）。一个没有条件的数字
 >    等于没有数字，§6 里有好几条就是这么栽的。
-> 5. **操作步骤写进 [`agent/`](agent/)，不要写在这里。** 这份只放当前状态和结论指针——
+> 5. **操作步骤写进 [`agent/`](README.md)，不要写在这里。** 这份只放当前状态和结论指针——
 >    两边都写会立刻不同步。
 > 6. 等 §5 清空、§9 的单机与多机两栏都做完，这份文档 + `agent/` 就可以直接压成一份
 >    能跑通的 runbook。
@@ -136,7 +138,7 @@ miles 的 tilelang 反向本质不确定。这把「不放 kernel」从纯成本
 
 ## 2. 环境与底座
 
-**操作步骤全在 [`agent/02-environment-setup.md`](agent/02-environment-setup.md)**，
+**操作步骤全在 [`agent/02-environment-setup.md`](02-environment-setup.md)**，
 这里只留结论和「为什么」。
 
 | 结论 | 一句话理由 |
@@ -158,7 +160,7 @@ $PRIMUS_SITE = /home/<user>/vllm_primus/site                约 2.7 G
 
 ⚠️ **`/mnt/m2m_nobackup` 是节点本地 NVMe，换节点就没**。DSv4 产物全在那里：
 4 层切片约 460 G，全 43 层约 **1.9 TB/节点**。作业结束**不清盘**，拿到新分配先逐台盘点。
-产物的重建见 [`agent/03-dsv4-artifacts.md`](agent/03-dsv4-artifacts.md)。
+产物的重建见 [`agent/03-dsv4-artifacts.md`](03-dsv4-artifacts.md)。
 
 ⚠️ **不在版本控制里的**（§5.7 记着这件事的风险）：`~/dsv4/mhc_probe/`
 （探针、`megatron_dsv4` 补丁树、`vendored/miles_plugins`）、`~/4node/env.sh`（每个作业都变）。
@@ -520,7 +522,7 @@ bf16-native + `quantization: ""` → 能跑但 71 GB/卡放不下。
 ## 7. 当前实测值汇总
 
 **判据本身**（阈值怎么定的、为什么这么定、以及哪些判据是错的）在
-[`agent/04-probes-and-criteria.md`](agent/04-probes-and-criteria.md)。
+[`agent/04-probes-and-criteria.md`](04-probes-and-criteria.md)。
 这里只放**这条线目前测到的数字**——它们会随进展变，所以放在活文档里。
 
 ### 7.1 正确性
@@ -556,7 +558,7 @@ bf16-native + `quantization: ""` → 能跑但 71 GB/卡放不下。
 ### 7.3 DSv4 特有的必设开关
 
 通用的（`NCCL_IB_HCA` / `HSA_DISABLE_FRAGMENT_ALLOCATOR` / `PYTORCH_CUDA_ALLOC_CONF` 等）
-已经在 `ray_env_primus.sh` 里，见 [`agent/02-environment-setup.md`](agent/02-environment-setup.md) §4。
+已经在 `ray_env_primus.sh` 里，见 [`agent/02-environment-setup.md`](02-environment-setup.md) §4。
 下面这几个是 **DSv4 模型本身**要求的：
 
 | 开关 | 为什么 |
@@ -666,44 +668,34 @@ RDMA 完全交给 RCCL 自己的 IB/RoCE transport。判定是否真走了 GPU D
 
 ## 10. 文档索引
 
-**这条线不需要引用任何仓库外的文档。** 下面就是全部。
+**接手这条线不需要看这个目录之外的任何 md。** 下面就是全部。
 
-### 10.1 稳定操作手册 —— [`agent/`](agent/)
-
-配方定下来之后基本不动的那部分。**新 agent 从这里开始。**
+### 10.1 同目录（[`docs/agent/`](README.md)）
 
 | 文档 | 什么时候读 |
 |---|---|
-| [`agent/01-cluster-access.md`](agent/01-cluster-access.md) | 连集群、进节点、起长任务、判存活 |
-| [`agent/02-environment-setup.md`](agent/02-environment-setup.md) | 建环境（镜像 / 容器 / NFS 树 / RDMA 自检），以及已排除的镜像候选 |
-| [`agent/03-dsv4-artifacts.md`](agent/03-dsv4-artifacts.md) | 四份权重、三套命名、切片和全 43 层的重建 |
-| [`agent/04-probes-and-criteria.md`](agent/04-probes-and-criteria.md) | 探针目录、判据阈值、**以及哪些判据是错的** |
-| [`agent/05-operational-pitfalls.md`](agent/05-operational-pitfalls.md) | 运行期的坑。**出问题先翻这份** |
+| **本文档** | 当前状态、已解决、未解决、下一步。**活文档，有进展就更新** |
+| [`01-cluster-access.md`](01-cluster-access.md) | 连集群、进节点、起长任务、判存活 |
+| [`02-environment-setup.md`](02-environment-setup.md) | 建环境，以及已排除的镜像候选 |
+| [`03-dsv4-artifacts.md`](03-dsv4-artifacts.md) | 四份权重、三套命名、切片和全 43 层的重建 |
+| [`04-probes-and-criteria.md`](04-probes-and-criteria.md) | 探针目录、判据阈值、**以及哪些判据是错的** |
+| [`05-operational-pitfalls.md`](05-operational-pitfalls.md) | 运行期的坑。**出问题先翻这份** |
+| [`06-primus-pitfalls.md`](06-primus-pitfalls.md) | primus 底座八条坑，**按症状索引** |
 
-### 10.2 仓库里的其它相关文件
+### 10.2 目录之外（都不是必读）
 
-| 路径 | 内容 |
+本目录已经覆盖了需要的结论，下面这些**只在你要动手改它们的时候**才需要打开：
+
+| 位置 | 什么时候才需要 |
 |---|---|
-| [`../scripts/primus/README.md`](../scripts/primus/README.md) | primus 底座**八条坑的完整版**（症状 / 根因 / 诊断手法）+ 脚本用法 |
-| [`../scripts/primus/`](../scripts/primus/) | 脚本本体。每个环境变量旁边都写了为什么 |
-| [`../examples/DAPO/configs/dapo_dsv4_flash_*.yaml`](../examples/DAPO/configs/) | DSv4 的四个配置：4 层 1node smoke/shortsmoke、全 43 层 4node/4node_shortsmoke。头部注释带实测值和风险标注 |
-| [`../examples/docs/07-disaggregated-rdma.md`](../examples/docs/07-disaggregated-rdma.md) | 训推分离部署全流程（另一条线：Qwen3-30B-A3B / 2 节点 MI308X），§8.2 的来源。有 `_cn` 版 |
-| [`../examples/docs/05-multinode-rdma.md`](../examples/docs/05-multinode-rdma.md) | §8.2 的实测数字在它的 §5.5 |
+| [`../../scripts/primus/`](../../scripts/primus/) | 脚本和探针的**本体**。改配方时看，每个环境变量旁边都写了原因 |
+| [`../../examples/DAPO/configs/dapo_dsv4_flash_*.yaml`](../../examples/DAPO/configs/) | DSv4 的四个配置（4 层 1node smoke/shortsmoke、全 43 层 4node/4node_shortsmoke）。改超参或拓扑时看。头部注释带实测值和风险标注 |
+| [`../../examples/docs/07-disaggregated-rdma.md`](../../examples/docs/07-disaggregated-rdma.md) | **只有真要搭训推分离时**才需要。机制本身 §8.2 已经讲清楚了；那份是另一条线（Qwen3-30B-A3B / 2 节点 MI308X）的部署全流程 |
+| `~/working/amd-rl-runbook/` | 13 份历史 runbook（约 8400 行），本目录的原始素材。⚠️ **在 `.gitignore` 里，不在版本控制内，换机器就没了**——这正是把结论搬进仓库的原因。只有想看某条结论的**完整证据链**，或要做**非 DSv4** 的工作（Qwen3 / ATOM 那几条线）时才回去翻。两边冲突时**以实测日期新的为准** |
 
-⚠️ [`../examples/DeepSeekV4_OPD_MI300/`](../examples/DeepSeekV4_OPD_MI300/) **不要当参考**：
+⚠️ [`../../examples/DeepSeekV4_OPD_MI300/`](../../examples/DeepSeekV4_OPD_MI300/) **不要当参考**：
 它是 OPD（在线策略蒸馏，不是 RL）、单节点、`generation_backend: hf`，README 里**没有任何实测数据**，
 而且配置自相矛盾（注释说 BF16 需要 4+ 节点，交付的却是 `num_nodes: 1`）。疑似未跑过。
-
-### 10.3 历史档案（可选，不是必需）
-
-`~/working/amd-rl-runbook/` 下有 13 份 runbook / handoff（约 8400 行），是这份文档的原始素材。
-**本文档 + `agent/` 已经覆盖了它们的 DSv4 部分，正常开发不需要去翻。**
-
-只有两种情况值得回去查：想看某条结论的**完整证据链**（比如某个 bug 的逐步排查过程），
-或者要做**非 DSv4** 的工作（Qwen3 / MoE / ATOM 那几条线）。
-
-⚠️ 那批文件在 `.gitignore` 里（`*-handoff.md`），不在版本控制内，**换机器就没了**——
-这也是为什么要把结论搬进仓库。两边冲突时**以实测日期新的为准**。
 
 ---
 
@@ -712,4 +704,5 @@ RDMA 完全交给 RCCL 自己的 IB/RoCE transport。判定是否真走了 GPU D
 | 日期 | 内容 |
 |---|---|
 | 2026-08-21 | 建档。汇总 13 份 runbook/handoff 的 DSv4 部分 + 2026-08-20/21 的 primus 迁移 + 训推分离方案调研 |
-| 2026-08-21 | 新增 [`agent/`](agent/) 五篇稳定操作手册，把机器操作和环境构建从仓库外搬进来。**本文档不再引用任何仓库外文档**。§2 / §7 / §10 相应精简，避免与 `agent/` 重复。记录开发分支 `dev/dsv4-dapo` |
+| 2026-08-21 | 新增 [`agent/`](README.md) 稳定操作手册，把机器操作和环境构建从仓库外搬进来。**本文档不再引用任何仓库外文档**。§2 / §7 / §10 相应精简，避免与 `agent/` 重复。记录开发分支 `dev/dsv4-dapo` |
+| 2026-08-21 | 活文档移进 `docs/agent/`，八条坑从 `scripts/primus/README.md` 搬成 [`06`](06-primus-pitfalls.md)（按症状索引）。**目录现在是自足的，接手不需要看目录外的任何 md** |
