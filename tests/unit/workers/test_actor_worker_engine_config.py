@@ -203,6 +203,98 @@ def test_rank_local_checkpoint_load_preserves_restored_master_params(
 
 
 @pytest.mark.parametrize("worker_type", [LumenActorWorker, TrainingActorWorker])
+def test_rank_local_checkpoint_patches_hybrid_optimizer_before_load(
+    worker_type,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    calls = []
+
+    class OptimizerStub:
+        def load_state_dict(self, state):
+            assert state == {"step": 1}
+            calls.append("load_optimizer")
+
+        def load_parameter_state(self, path):
+            assert path.endswith("optim_parameter_state_world_size_1_rank_0.pt")
+
+    module = torch.nn.Linear(2, 2)
+    optimizer = OptimizerStub()
+    torch.save(module.state_dict(), tmp_path / "model_world_size_1_rank_0.pt")
+    torch.save({"step": 1}, tmp_path / "optim_world_size_1_rank_0.pt")
+    (tmp_path / "optim_parameter_state_world_size_1_rank_0.pt").touch()
+    torch.save(
+        {"global_step": 3, "lr_scheduler": None, "rng": {}},
+        tmp_path / "extra_state_world_size_1_rank_0.pt",
+    )
+    worker = object.__new__(worker_type)
+    worker._engine = SimpleNamespace(
+        module=module,
+        optimizer=optimizer,
+        lr_scheduler=None,
+        _patch_hybrid_optimizer_checkpoint_load=lambda: calls.append(
+            "patch_hybrid_optimizer"
+        ),
+    )
+    worker.rank = 0
+    worker.world_size = 1
+    monkeypatch.setenv("LUMENRL_CHECKPOINT_FORMAT", "rank_local")
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+
+    assert worker.load_checkpoint(str(tmp_path)) == 3
+    assert calls == ["patch_hybrid_optimizer", "load_optimizer"]
+
+
+@pytest.mark.parametrize("worker_type", [LumenActorWorker, TrainingActorWorker])
+def test_rank_local_checkpoint_propagates_peer_load_failure(
+    worker_type,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    module = torch.nn.Linear(2, 2)
+    torch.save(module.state_dict(), tmp_path / "model_world_size_2_rank_1.pt")
+    torch.save(
+        {"global_step": 3, "lr_scheduler": None, "rng": {}},
+        tmp_path / "extra_state_world_size_2_rank_1.pt",
+    )
+    worker = object.__new__(worker_type)
+    worker._engine = SimpleNamespace(
+        module=module,
+        optimizer=None,
+        lr_scheduler=None,
+    )
+    worker.rank = 1
+    worker.world_size = 2
+    barriers = []
+
+    def fake_all_gather_object(output, value):
+        if isinstance(value, str):
+            output[:] = ["node-a", "node-a"]
+        else:
+            output[:] = [
+                {"rank": 0, "type": "KeyError", "message": "missing master param"},
+                None,
+            ]
+
+    monkeypatch.setenv("LUMENRL_CHECKPOINT_FORMAT", "rank_local")
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        fake_all_gather_object,
+    )
+    monkeypatch.setattr(torch.distributed, "barrier", lambda: barriers.append(1))
+
+    with pytest.raises(
+        RuntimeError,
+        match="checkpoint phase failed.*rank 0.*KeyError.*missing master param",
+    ):
+        worker.load_checkpoint(str(tmp_path))
+
+    assert barriers == []
+
+
+@pytest.mark.parametrize("worker_type", [LumenActorWorker, TrainingActorWorker])
 def test_rank_local_checkpoint_load_serializes_ranks(
     worker_type,
     monkeypatch,
@@ -223,18 +315,28 @@ def test_rank_local_checkpoint_load_serializes_ranks(
     worker.rank = 1
     worker.world_size = 2
     barriers = []
+    phase_syncs = []
+
+    def fake_all_gather_object(output, value):
+        if isinstance(value, str):
+            output[:] = ["node-a", "node-a"]
+        else:
+            phase_syncs.append(value)
+            output[:] = [None, None]
+
     monkeypatch.setenv("LUMENRL_CHECKPOINT_FORMAT", "rank_local")
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(
         torch.distributed,
         "all_gather_object",
-        lambda output, _: output.__setitem__(slice(None), ["node-a", "node-a"]),
+        fake_all_gather_object,
     )
     monkeypatch.setattr(torch.distributed, "barrier", lambda: barriers.append(1))
 
     assert worker.load_checkpoint(str(tmp_path)) == 3
 
-    assert len(barriers) == 2
+    assert phase_syncs == [None, None]
+    assert barriers == []
 
 
 def test_dsv4_indexer_launch_tuning_reaches_engine_config() -> None:

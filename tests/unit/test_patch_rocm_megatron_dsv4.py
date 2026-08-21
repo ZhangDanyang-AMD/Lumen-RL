@@ -184,15 +184,20 @@ def test_patch_distrib_optimizer_routes_offloaded_grads_without_gpu_fp32_copy(
     assert not patcher.patch_distrib_optimizer_grad_copy(str(tmp_path))
 
 
-def test_patch_distrib_optimizer_checkpoint_matches_reordered_hdo_params(
-    tmp_path,
-) -> None:
-    optimizer = (
-        tmp_path / "megatron" / "core" / "optimizer" / "distrib_optimizer.py"
-    )
-    optimizer.parent.mkdir(parents=True)
-    optimizer.write_text(
+def _write_distrib_optimizer_checkpoint_fixture(path: Path) -> None:
+    """Write the relevant p22 DistributedOptimizer source anchors."""
+    path.parent.mkdir(parents=True)
+    path.write_text(
         """
+import torch
+
+
+class HybridDeviceOptimizer:
+    pass
+
+
+class DistributedOptimizer:
+    def __init__(self):
         (
             self.model_float16_groups,
             self.model_fp32_groups,
@@ -203,15 +208,250 @@ def test_patch_distrib_optimizer_checkpoint_matches_reordered_hdo_params(
             self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges, config
         )
 
+    def _set_main_param_and_optimizer_states(self, model_param, tensors):
+        group_index, group_order = self.model_param_group_index_map[model_param]
+        main_param = self.optimizer.param_groups[group_index]["params"][group_order]
+        main_param.copy_(tensors["param"])
+        self.optimizer.state[main_param]["exp_avg"].copy_(tensors["exp_avg"])
+        self.optimizer.state[main_param]["exp_avg_sq"].copy_(tensors["exp_avg_sq"])
+
+    def _get_main_param_and_optimizer_states(self, model_param):
+        group_index, group_order = self.model_param_group_index_map[model_param]
+        if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            sharded_model_param = self.optimizer.param_groups[group_index]["params"][
+                group_order
+            ]
+            tensors = {
+                key: value
+                for key, value in self.optimizer.state[sharded_model_param].items()
+            }
+            tensors["param"] = tensors.pop("master_param")
+            return tensors
+        main_param = self.optimizer.param_groups[group_index]["params"][group_order]
+        return {"param": main_param, **self.optimizer.state[main_param]}
+
     def load_parameter_state_from_dp_zero(self, state_dict, *, update_legacy_format=False):
+        data_parallel_world_size = self.data_parallel_group_gloo.size()
+        data_parallel_rank = self.data_parallel_group_gloo.rank()
+        data_parallel_group_gloo = self.data_parallel_group_gloo
+        data_parallel_global_ranks = torch.distributed.get_process_group_ranks(
+            self.data_parallel_group_gloo
+        )
+
+        if data_parallel_rank == 0:
+            self.split_state_dict_if_needed(state_dict)
+
+        # Scatter tensors to all DP ranks.
+        for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
+            for dtype, gbuf_range_map_for_all_buckets in gbuf_range_maps.items():
+                if data_parallel_rank == 0:
+                    buffer_numel_unpadded = self.buffers[gbuf_idx].numel_unpadded
+                    checkpoint_numel_unpadded = state_dict[gbuf_idx][dtype]["numel_unpadded"]
+                    assert buffer_numel_unpadded == checkpoint_numel_unpadded, (
+                        "Number of unpadded elements must be same"
+                    )
+                recv_tensors = {}
+                for key in ("param", "exp_avg", "exp_avg_sq"):
+                    offset_in_world_tensors = 0
+                    for bucket_idx, gbuf_range_map in enumerate(
+                        gbuf_range_map_for_all_buckets
+                    ):
+                        gbuf_world_numel = (
+                            self.buffers[gbuf_idx].buckets[bucket_idx].grad_data.numel()
+                        )
+                        gbuf_local_numel = (
+                            gbuf_world_numel // data_parallel_world_size
+                        )
+                        gbuf_world_numel_unpadded = (
+                            self.buffers[gbuf_idx].buckets[bucket_idx].numel_unpadded
+                        )
+                        recv_tensor = torch.zeros(
+                            (gbuf_local_numel,), dtype=torch.float32, device="cpu"
+                        )
+                        if data_parallel_rank == 0:
+                            world_tensors = state_dict[gbuf_idx][dtype][key]
+                            start = offset_in_world_tensors
+                            end = start + gbuf_world_numel_unpadded
+                            world_tensor = torch.nn.functional.pad(
+                                world_tensors[start:end],
+                                (0, gbuf_world_numel - gbuf_world_numel_unpadded),
+                            )
+                            send_tensors = [
+                                world_tensor[i : i + gbuf_local_numel]
+                                for i in range(
+                                    0, gbuf_world_numel, gbuf_local_numel
+                                )
+                            ]
+                            offset_in_world_tensors += gbuf_world_numel_unpadded
+                        else:
+                            send_tensors = None
+                        torch.distributed.scatter(
+                            recv_tensor,
+                            send_tensors,
+                            data_parallel_global_ranks[0],
+                            data_parallel_group_gloo,
+                        )
+                        for model_param, param_range_map in gbuf_range_map[
+                            "param_map"
+                        ].items():
+                            if model_param not in recv_tensors:
+                                recv_tensors[model_param] = {}
+                            local_range = param_range_map["gbuf_local"]
+                            recv_tensors[model_param][key] = recv_tensor[
+                                local_range.start : local_range.end
+                            ]
                 for model_param, tensors in recv_tensors.items():
                     self._set_main_param_and_optimizer_states(model_param, tensors)
 
     @torch.no_grad()
     def load_parameter_state_from_fully_reshardable(self, state_dict: dict):
         pass
+
+    def load_parameter_state(self, filename: str, *, update_legacy_format=False):
+        state_dict = None
+        if self.data_parallel_group.rank() == 0:
+            state_dict = torch.load(filename)
+        self.load_parameter_state_from_dp_zero(
+            state_dict, update_legacy_format=update_legacy_format
+        )
 """
     )
+
+
+def _load_patched_distrib_optimizer(tmp_path, *, optimize: int = 0):
+    optimizer_path = (
+        tmp_path / "megatron" / "core" / "optimizer" / "distrib_optimizer.py"
+    )
+    _write_distrib_optimizer_checkpoint_fixture(optimizer_path)
+    assert patcher.patch_distrib_optimizer_hdo_checkpoint(str(tmp_path))
+    patched = optimizer_path.read_text()
+    namespace: dict[str, object] = {}
+    exec(
+        compile(
+            patched,
+            str(optimizer_path),
+            "exec",
+            optimize=optimize,
+        ),
+        namespace,
+    )
+    return optimizer_path, patched, namespace
+
+
+def _checkpoint_load_instance(namespace, *, world_size: int, rank: int = 0):
+    optimizer_type = namespace["DistributedOptimizer"]
+    hdo_type = namespace["HybridDeviceOptimizer"]
+    instance = optimizer_type.__new__(optimizer_type)
+
+    class DataParallelGroup:
+        def size(self):
+            return world_size
+
+        def rank(self):
+            return rank
+
+    class Range:
+        def __init__(self, start, end):
+            self.start = start
+            self.end = end
+
+    first_model_param = object()
+    second_model_param = object()
+    first_main_param = torch.zeros(2)
+    second_main_param = torch.zeros(3)
+    hdo = hdo_type()
+    hdo.param_groups = [{"params": [first_main_param, second_main_param]}]
+    hdo.state = {
+        first_main_param: {
+            "exp_avg": torch.zeros(2),
+            "exp_avg_sq": torch.zeros(2),
+        },
+        second_main_param: {
+            "exp_avg": torch.zeros(3),
+            "exp_avg_sq": torch.zeros(3),
+        },
+    }
+    sync_observations = []
+
+    def sync_hdo_state():
+        sync_observations.append(
+            (
+                first_main_param.clone(),
+                hdo.state[first_main_param]["exp_avg"].clone(),
+                hdo.state[first_main_param]["exp_avg_sq"].clone(),
+                second_main_param.clone(),
+                hdo.state[second_main_param]["exp_avg"].clone(),
+                hdo.state[second_main_param]["exp_avg_sq"].clone(),
+            )
+        )
+
+    hdo._sync_hdo_state_to_sub_optimizers = sync_hdo_state
+    instance.optimizer = hdo
+    instance.config = SimpleNamespace(
+        use_precision_aware_optimizer_no_fp8_or_ds_fp8=False
+    )
+    instance.data_parallel_group_gloo = DataParallelGroup()
+    instance.split_state_dict_if_needed = lambda _state_dict: None
+    bucket = SimpleNamespace(
+        numel_unpadded=5,
+        grad_data=torch.empty(8),
+    )
+    instance.buffers = [
+        SimpleNamespace(numel_unpadded=5, buckets=[bucket])
+    ]
+    param_map = {
+        first_model_param: {
+            "gbuf_world": Range(0, 2),
+            "gbuf_local": Range(0, 2),
+        },
+        second_model_param: {
+            "gbuf_world": Range(2, 5),
+            "gbuf_local": Range(2, 5),
+        },
+    }
+    instance.gbuf_ranges = [{torch.float32: [{"param_map": param_map}]}]
+    instance.model_param_group_index_map = {
+        first_model_param: (0, 0),
+        second_model_param: (0, 1),
+    }
+    state_dict = {
+        0: {
+            torch.float32: {
+                "numel_unpadded": 5,
+                "param": torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0]),
+                "exp_avg": torch.tensor([11.0, 12.0, 13.0, 14.0, 15.0]),
+                "exp_avg_sq": torch.tensor(
+                    [21.0, 22.0, 23.0, 24.0, 25.0]
+                ),
+            }
+        }
+    }
+    return instance, hdo, state_dict, sync_observations
+
+
+def _configure_dp2_checkpoint_layout(instance, state_dict) -> None:
+    instance.buffers[0].numel_unpadded = 4
+    instance.buffers[0].buckets[0].numel_unpadded = 4
+    instance.buffers[0].buckets[0].grad_data = torch.empty(4)
+    param_map = instance.gbuf_ranges[0][torch.float32][0]["param_map"]
+    first_model_param = next(iter(param_map))
+    instance.gbuf_ranges[0][torch.float32][0]["param_map"] = {
+        first_model_param: param_map[first_model_param]
+    }
+    state_dict[0][torch.float32]["numel_unpadded"] = 4
+    for key in ("param", "exp_avg", "exp_avg_sq"):
+        state_dict[0][torch.float32][key] = state_dict[0][torch.float32][key][
+            :4
+        ]
+
+
+def test_patch_distrib_optimizer_checkpoint_matches_reordered_hdo_params(
+    tmp_path,
+) -> None:
+    optimizer = (
+        tmp_path / "megatron" / "core" / "optimizer" / "distrib_optimizer.py"
+    )
+    _write_distrib_optimizer_checkpoint_fixture(optimizer)
 
     assert hasattr(patcher, "patch_distrib_optimizer_hdo_checkpoint")
     assert patcher.patch_distrib_optimizer_hdo_checkpoint(str(tmp_path))
@@ -222,8 +462,525 @@ def test_patch_distrib_optimizer_checkpoint_matches_reordered_hdo_params(
         "self.model_param_group_index_map[model_param] = "
         "(group_index, group_order)"
     ) in patched
-    assert "self.optimizer._sync_hdo_state_to_sub_optimizers()" in patched
+    first_patch = optimizer.read_bytes()
     assert not patcher.patch_distrib_optimizer_hdo_checkpoint(str(tmp_path))
+    assert optimizer.read_bytes() == first_patch
+
+
+def test_patch_distrib_optimizer_compiles_and_idempotently_patches_p22_source(
+    tmp_path,
+) -> None:
+    optimizer = (
+        tmp_path / "megatron" / "core" / "optimizer" / "distrib_optimizer.py"
+    )
+    _write_distrib_optimizer_checkpoint_fixture(optimizer)
+
+    assert patcher.patch_distrib_optimizer_hdo_checkpoint(str(tmp_path))
+    patched = optimizer.read_text()
+    compile(patched, str(optimizer), "exec", optimize=2)
+    method_start = patched.index(
+        "    def load_parameter_state_from_dp_zero("
+    )
+    method_end = patched.index(
+        "\n    @torch.no_grad()\n"
+        "    def load_parameter_state_from_fully_reshardable",
+        method_start,
+    )
+    method_source = patched[method_start:method_end]
+    fast_start = method_source.index(
+        "        if (\n"
+        "            data_parallel_world_size == 1"
+    )
+    fast_end = method_source.index("            return\n", fast_start)
+    fast_source = method_source[
+        fast_start : fast_end + len("            return\n")
+    ]
+    assert "gbuf_world_in_bucket" in fast_source
+    assert "_get_main_param_and_optimizer_states" in fast_source
+    assert "final offset" in fast_source
+    assert "assert " not in fast_source
+
+    first_patch = optimizer.read_bytes()
+    assert not patcher.patch_distrib_optimizer_hdo_checkpoint(str(tmp_path))
+    assert optimizer.read_bytes() == first_patch
+
+
+def test_patch_distrib_optimizer_checkpoint_uses_backward_compatible_mmap_load(
+    tmp_path, monkeypatch
+) -> None:
+    _, _, namespace = _load_patched_distrib_optimizer(tmp_path)
+
+    load_calls = []
+    loaded_state = object()
+
+    def fake_torch_load(*args, **kwargs):
+        load_calls.append((args, kwargs))
+        return loaded_state
+
+    monkeypatch.setattr(torch, "load", fake_torch_load)
+    optimizer_type = namespace["DistributedOptimizer"]
+    instance = optimizer_type.__new__(optimizer_type)
+    instance.data_parallel_group = SimpleNamespace(rank=lambda: 0)
+    forwarded = []
+    instance.load_parameter_state_from_dp_zero = (
+        lambda state_dict, **kwargs: forwarded.append((state_dict, kwargs))
+    )
+    filename = str(tmp_path / "optimizer.pt")
+
+    instance.load_parameter_state(filename, update_legacy_format=True)
+
+    assert load_calls == [
+        ((filename,), {"mmap": True, "weights_only": False})
+    ]
+    assert forwarded == [
+        (loaded_state, {"update_legacy_format": True})
+    ]
+
+
+def test_patch_distrib_optimizer_checkpoint_real_mmap_load_is_usable(
+    tmp_path,
+) -> None:
+    _, _, namespace = _load_patched_distrib_optimizer(tmp_path)
+    filename = tmp_path / "optimizer.pt"
+    expected = torch.arange(16 * 1024, dtype=torch.float32)
+    torch.save({"state": expected}, filename)
+
+    optimizer_type = namespace["DistributedOptimizer"]
+    instance = optimizer_type.__new__(optimizer_type)
+    instance.data_parallel_group = SimpleNamespace(rank=lambda: 0)
+    forwarded = []
+    instance.load_parameter_state_from_dp_zero = (
+        lambda state_dict, **kwargs: forwarded.append((state_dict, kwargs))
+    )
+
+    instance.load_parameter_state(str(filename))
+
+    assert len(forwarded) == 1
+    loaded, kwargs = forwarded[0]
+    assert kwargs == {"update_legacy_format": False}
+    torch.testing.assert_close(loaded["state"], expected)
+    loaded["state"].add_(1)
+    torch.testing.assert_close(loaded["state"], expected + 1)
+
+
+def test_patch_distrib_optimizer_checkpoint_adds_dp1_hdo_inplace_load(
+    tmp_path, monkeypatch
+) -> None:
+    _, _, namespace = _load_patched_distrib_optimizer(tmp_path)
+
+    def forbidden_collective(*_args, **_kwargs):
+        raise AssertionError("DP=1 HDO path must not pad or scatter")
+
+    monkeypatch.setattr(
+        torch.distributed, "get_process_group_ranks", lambda _group: [0]
+    )
+    monkeypatch.setattr(torch.nn.functional, "pad", forbidden_collective)
+    monkeypatch.setattr(torch.distributed, "scatter", forbidden_collective)
+    instance, hdo, state_dict, sync_observations = _checkpoint_load_instance(
+        namespace, world_size=1
+    )
+    instance.load_parameter_state_from_dp_zero(state_dict)
+
+    expected = (
+        torch.tensor([1.0, 2.0]),
+        torch.tensor([11.0, 12.0]),
+        torch.tensor([21.0, 22.0]),
+        torch.tensor([3.0, 4.0, 5.0]),
+        torch.tensor([13.0, 14.0, 15.0]),
+        torch.tensor([23.0, 24.0, 25.0]),
+    )
+    actual = (
+        hdo.param_groups[0]["params"][0],
+        hdo.state[hdo.param_groups[0]["params"][0]]["exp_avg"],
+        hdo.state[hdo.param_groups[0]["params"][0]]["exp_avg_sq"],
+        hdo.param_groups[0]["params"][1],
+        hdo.state[hdo.param_groups[0]["params"][1]]["exp_avg"],
+        hdo.state[hdo.param_groups[0]["params"][1]]["exp_avg_sq"],
+    )
+    for actual_tensor, expected_tensor in zip(actual, expected):
+        torch.testing.assert_close(actual_tensor, expected_tensor)
+    assert len(sync_observations) == 1
+    for synced_tensor, expected_tensor in zip(sync_observations[0], expected):
+        torch.testing.assert_close(synced_tensor, expected_tensor)
+
+
+def test_patch_distrib_optimizer_dp1_hdo_rejects_mismatched_unpadded_layout_first(
+    tmp_path, monkeypatch
+) -> None:
+    _, _, namespace = _load_patched_distrib_optimizer(tmp_path, optimize=2)
+    instance, hdo, state_dict, sync_observations = _checkpoint_load_instance(
+        namespace, world_size=1
+    )
+    state_dict[0][torch.float32]["numel_unpadded"] = 4
+
+    def forbidden_collective(*_args, **_kwargs):
+        raise AssertionError("layout validation must precede pad or scatter")
+
+    monkeypatch.setattr(
+        torch.distributed, "get_process_group_ranks", lambda _group: [0]
+    )
+    monkeypatch.setattr(torch.nn.functional, "pad", forbidden_collective)
+    monkeypatch.setattr(torch.distributed, "scatter", forbidden_collective)
+
+    with pytest.raises(
+        RuntimeError, match="Number of unpadded elements must be same"
+    ) as exc_info:
+        instance.load_parameter_state_from_dp_zero(state_dict)
+
+    message = str(exc_info.value)
+    for context in (
+        "gbuf=0",
+        "dtype=torch.float32",
+        "bucket=all",
+        "key=numel_unpadded",
+        "param=n/a",
+    ):
+        assert context in message
+    targets = (
+        hdo.param_groups[0]["params"][0],
+        hdo.state[hdo.param_groups[0]["params"][0]]["exp_avg"],
+        hdo.state[hdo.param_groups[0]["params"][0]]["exp_avg_sq"],
+        hdo.param_groups[0]["params"][1],
+        hdo.state[hdo.param_groups[0]["params"][1]]["exp_avg"],
+        hdo.state[hdo.param_groups[0]["params"][1]]["exp_avg_sq"],
+    )
+    assert all(torch.count_nonzero(target).item() == 0 for target in targets)
+    assert sync_observations == []
+
+
+def _multi_buffer_dp1_checkpoint_layout(namespace):
+    optimizer_type = namespace["DistributedOptimizer"]
+    hdo_type = namespace["HybridDeviceOptimizer"]
+    instance = optimizer_type.__new__(optimizer_type)
+
+    class DataParallelGroup:
+        def size(self):
+            return 1
+
+        def rank(self):
+            return 0
+
+    class Range:
+        def __init__(self, start, end):
+            self.start = start
+            self.end = end
+
+    model_params = [object() for _ in range(4)]
+    optimizer_params = [torch.full((2,), -1.0) for _ in model_params]
+    main_params = [torch.zeros(2) for _ in model_params]
+    hdo = hdo_type()
+    hdo.param_groups = [{"params": optimizer_params}]
+    hdo.state = {
+        optimizer_param: {
+            "master_param": main_param,
+            "exp_avg": torch.zeros(2),
+            "exp_avg_sq": torch.zeros(2),
+        }
+        for optimizer_param, main_param in zip(optimizer_params, main_params)
+    }
+    sync_observations = []
+    hdo._sync_hdo_state_to_sub_optimizers = lambda: sync_observations.append(
+        "sync"
+    )
+    instance.optimizer = hdo
+    instance.config = SimpleNamespace(
+        use_precision_aware_optimizer_no_fp8_or_ds_fp8=True
+    )
+    instance.data_parallel_group_gloo = DataParallelGroup()
+    instance.split_state_dict_if_needed = lambda _state_dict: None
+    instance.model_param_group_index_map = {
+        model_param: (0, index)
+        for index, model_param in enumerate(model_params)
+    }
+
+    def param_range(world_start, world_end, bucket_start, bucket_end):
+        return {
+            "gbuf_world": Range(world_start, world_end),
+            "gbuf_world_in_bucket": Range(bucket_start, bucket_end),
+            "gbuf_local": Range(bucket_start, bucket_end),
+        }
+
+    first_bucket = SimpleNamespace(numel_unpadded=3, grad_data=torch.empty(4))
+    second_bucket = SimpleNamespace(numel_unpadded=4, grad_data=torch.empty(4))
+    third_bucket = SimpleNamespace(numel_unpadded=2, grad_data=torch.empty(2))
+    instance.buffers = [
+        SimpleNamespace(
+            numel_unpadded=7,
+            buckets=[first_bucket, second_bucket],
+        ),
+        SimpleNamespace(numel_unpadded=2, buckets=[third_bucket]),
+    ]
+    first_dtype_buckets = [
+        {
+            "param_map": {
+                model_params[0]: param_range(0, 2, 0, 2),
+            }
+        },
+        {
+            "param_map": {
+                # p22's world range includes the prior padded bucket while
+                # gbuf_world_in_bucket addresses the coalesced bucket slice.
+                model_params[1]: param_range(4, 6, 0, 2),
+                model_params[2]: param_range(6, 8, 2, 4),
+            }
+        },
+    ]
+    second_dtype_buckets = [
+        {
+            "param_map": {
+                model_params[3]: param_range(0, 2, 0, 2),
+            }
+        }
+    ]
+    tuple_dtype = (torch.bfloat16, torch.float32)
+    instance.gbuf_ranges = [
+        {torch.float32: first_dtype_buckets},
+        {tuple_dtype: second_dtype_buckets},
+    ]
+
+    def state(numel, base):
+        values = torch.arange(base, base + numel, dtype=torch.float32)
+        return {
+            "numel_unpadded": numel,
+            "param": values,
+            "exp_avg": values + 100,
+            "exp_avg_sq": values + 200,
+        }
+
+    state_dict = {
+        0: {torch.float32: state(7, 1)},
+        1: {tuple_dtype: state(2, 21)},
+    }
+    targets = [
+        tensor
+        for optimizer_param, main_param in zip(optimizer_params, main_params)
+        for tensor in (
+            main_param,
+            hdo.state[optimizer_param]["exp_avg"],
+            hdo.state[optimizer_param]["exp_avg_sq"],
+        )
+    ]
+    return (
+        instance,
+        state_dict,
+        main_params,
+        optimizer_params,
+        model_params,
+        targets,
+        sync_observations,
+    )
+
+
+def test_patch_distrib_optimizer_dp1_hdo_loads_p22_multibucket_multidtype_layout(
+    tmp_path, monkeypatch
+) -> None:
+    _, _, namespace = _load_patched_distrib_optimizer(tmp_path)
+    monkeypatch.setattr(
+        torch.distributed, "get_process_group_ranks", lambda _group: [0]
+    )
+    (
+        instance,
+        state_dict,
+        main_params,
+        optimizer_params,
+        _,
+        _,
+        sync_observations,
+    ) = (
+        _multi_buffer_dp1_checkpoint_layout(namespace)
+    )
+
+    def forbidden_buffer(*_args, **_kwargs):
+        raise AssertionError("DP=1 HDO path must not allocate transfer buffers")
+
+    with monkeypatch.context() as transfer_guard:
+        transfer_guard.setattr(torch, "zeros", forbidden_buffer)
+        transfer_guard.setattr(torch, "empty", forbidden_buffer)
+        transfer_guard.setattr(torch.nn.functional, "pad", forbidden_buffer)
+        transfer_guard.setattr(torch.distributed, "scatter", forbidden_buffer)
+        instance.load_parameter_state_from_dp_zero(state_dict)
+
+    expected_params = (
+        [1.0, 2.0],
+        [4.0, 5.0],
+        [6.0, 7.0],
+        [21.0, 22.0],
+    )
+    for main_param, optimizer_param, expected in zip(
+        main_params, optimizer_params, expected_params
+    ):
+        torch.testing.assert_close(main_param, torch.tensor(expected))
+        torch.testing.assert_close(
+            instance.optimizer.state[optimizer_param]["exp_avg"],
+            torch.tensor(expected) + 100,
+        )
+        torch.testing.assert_close(
+            instance.optimizer.state[optimizer_param]["exp_avg_sq"],
+            torch.tensor(expected) + 200,
+        )
+        torch.testing.assert_close(optimizer_param, torch.full((2,), -1.0))
+    assert sync_observations == ["sync"]
+
+
+@pytest.mark.parametrize(
+    ("malformation", "error"),
+    [
+        ("aggregate_size", "bucket unpadded aggregate size"),
+        ("missing_key", "missing checkpoint state exp_avg_sq"),
+        ("source_length", "checkpoint state exp_avg_sq has 1 elements"),
+        ("source_shape", "checkpoint state exp_avg_sq shape"),
+        ("range", "invalid gbuf_world_in_bucket range"),
+        ("destination_shape", "destination exp_avg_sq shape"),
+    ],
+)
+def test_patch_distrib_optimizer_dp1_hdo_validates_complete_layout_before_copy(
+    tmp_path, monkeypatch, malformation, error
+) -> None:
+    _, _, namespace = _load_patched_distrib_optimizer(tmp_path, optimize=2)
+    monkeypatch.setattr(
+        torch.distributed, "get_process_group_ranks", lambda _group: [0]
+    )
+    (
+        instance,
+        state_dict,
+        main_params,
+        optimizer_params,
+        model_params,
+        targets,
+        sync_observations,
+    ) = _multi_buffer_dp1_checkpoint_layout(namespace)
+    tuple_dtype = (torch.bfloat16, torch.float32)
+    late_state = state_dict[1][tuple_dtype]
+    if malformation == "aggregate_size":
+        instance.buffers[1].buckets[0].numel_unpadded = 1
+    elif malformation == "missing_key":
+        del late_state["exp_avg_sq"]
+    elif malformation == "source_length":
+        late_state["exp_avg_sq"] = late_state["exp_avg_sq"][:1]
+    elif malformation == "source_shape":
+        late_state["exp_avg_sq"] = late_state["exp_avg_sq"].reshape(1, 2)
+    elif malformation == "range":
+        late_range = instance.gbuf_ranges[1][tuple_dtype][0]["param_map"][
+            model_params[-1]
+        ]["gbuf_world_in_bucket"]
+        late_range.end = 3
+    else:
+        instance.optimizer.state[optimizer_params[-1]]["exp_avg_sq"] = torch.zeros(
+            1, 2
+        )
+        targets[-1] = instance.optimizer.state[optimizer_params[-1]][
+            "exp_avg_sq"
+        ]
+
+    with pytest.raises((ValueError, RuntimeError), match=error) as exc_info:
+        instance.load_parameter_state_from_dp_zero(state_dict)
+
+    message = str(exc_info.value)
+    assert "gbuf=1" in message
+    assert f"dtype={tuple_dtype}" in message
+    if malformation == "aggregate_size":
+        expected_key = "metadata"
+    elif malformation == "range":
+        expected_key = "param"
+    else:
+        expected_key = "exp_avg_sq"
+    assert f"key={expected_key}" in message
+    if malformation in ("range", "destination_shape"):
+        assert "bucket=0" in message
+        assert "param=" in message
+        assert "param=n/a" not in message
+    else:
+        assert "bucket=all" in message
+        assert "param=n/a" in message
+    assert all(torch.count_nonzero(target).item() == 0 for target in targets)
+    assert sync_observations == []
+
+
+def test_patch_distrib_optimizer_checkpoint_retains_dp2_collective_fallback(
+    tmp_path, monkeypatch
+) -> None:
+    _, _, namespace = _load_patched_distrib_optimizer(tmp_path)
+
+    scatter_calls = []
+
+    def scatter(recv_tensor, send_tensors, *_args):
+        scatter_calls.append((recv_tensor, send_tensors))
+        recv_tensor.copy_(send_tensors[0])
+
+    monkeypatch.setattr(
+        torch.distributed, "get_process_group_ranks", lambda _group: [0, 1]
+    )
+    monkeypatch.setattr(torch.distributed, "scatter", scatter)
+    instance, hdo, state_dict, sync_observations = _checkpoint_load_instance(
+        namespace, world_size=2
+    )
+    _configure_dp2_checkpoint_layout(instance, state_dict)
+
+    instance.load_parameter_state_from_dp_zero(state_dict)
+
+    assert len(scatter_calls) == 3
+    assert all(send_tensors is not None for _, send_tensors in scatter_calls)
+    expected_partitions = (
+        ([1.0, 2.0], [3.0, 4.0]),
+        ([11.0, 12.0], [13.0, 14.0]),
+        ([21.0, 22.0], [23.0, 24.0]),
+    )
+    for (_, send_tensors), expected in zip(
+        scatter_calls, expected_partitions
+    ):
+        assert [tensor.tolist() for tensor in send_tensors] == list(expected)
+    torch.testing.assert_close(
+        hdo.param_groups[0]["params"][0], torch.tensor([1.0, 2.0])
+    )
+    torch.testing.assert_close(
+        hdo.state[hdo.param_groups[0]["params"][0]]["exp_avg"],
+        torch.tensor([11.0, 12.0]),
+    )
+    torch.testing.assert_close(
+        hdo.state[hdo.param_groups[0]["params"][0]]["exp_avg_sq"],
+        torch.tensor([21.0, 22.0]),
+    )
+    assert len(sync_observations) == 1
+
+
+def test_patch_distrib_optimizer_checkpoint_dp2_nonroot_receives_partition(
+    tmp_path, monkeypatch
+) -> None:
+    _, _, namespace = _load_patched_distrib_optimizer(tmp_path)
+    received_partitions = iter(
+        (
+            torch.tensor([3.0, 4.0]),
+            torch.tensor([13.0, 14.0]),
+            torch.tensor([23.0, 24.0]),
+        )
+    )
+    scatter_calls = []
+
+    def scatter(recv_tensor, send_tensors, *_args):
+        scatter_calls.append(send_tensors)
+        recv_tensor.copy_(next(received_partitions))
+
+    monkeypatch.setattr(
+        torch.distributed, "get_process_group_ranks", lambda _group: [0, 1]
+    )
+    monkeypatch.setattr(torch.distributed, "scatter", scatter)
+    instance, hdo, state_dict, sync_observations = _checkpoint_load_instance(
+        namespace, world_size=2, rank=1
+    )
+    _configure_dp2_checkpoint_layout(instance, state_dict)
+
+    instance.load_parameter_state_from_dp_zero(None)
+
+    assert scatter_calls == [None, None, None]
+    main_param = hdo.param_groups[0]["params"][0]
+    torch.testing.assert_close(main_param, torch.tensor([3.0, 4.0]))
+    torch.testing.assert_close(
+        hdo.state[main_param]["exp_avg"], torch.tensor([13.0, 14.0])
+    )
+    torch.testing.assert_close(
+        hdo.state[main_param]["exp_avg_sq"], torch.tensor([23.0, 24.0])
+    )
+    assert len(sync_observations) == 1
 
 
 def test_patch_hybrid_optimizer_streams_full_offload_sgd(tmp_path) -> None:

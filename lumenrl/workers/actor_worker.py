@@ -29,7 +29,7 @@ from lumenrl.algorithms.loss_functions import (
     policy_gradient_loss,
     sft_loss,
 )
-from lumenrl.utils.checkpoint import checkpoint_rank_phases
+from lumenrl.utils.checkpoint import checkpoint_rank_phases, run_checkpoint_phase
 from lumenrl.core.protocol import DataProto
 from lumenrl.core.types import AlgorithmName, TrainingBackend
 from lumenrl.engine.training.base_engine import BaseEngine, EngineRegistry
@@ -1333,66 +1333,78 @@ class LumenActorWorker(BaseWorker):
         )
         extra_path = path / f"extra_state_world_size_{world}_rank_{rank}.pt"
         global_step = 0
-        distributed = torch.distributed.is_initialized()
-        for active_ranks in checkpoint_rank_phases(rank, world):
-            if rank in active_ranks:
-                if not model_path.is_file():
-                    raise FileNotFoundError(
-                        f"Missing actor checkpoint shard: {model_path}"
-                    )
-                module_state = torch.load(
-                    model_path, map_location="cpu", weights_only=False
+
+        def _load_rank_state() -> None:
+            nonlocal global_step
+            if not model_path.is_file():
+                raise FileNotFoundError(
+                    f"Missing actor checkpoint shard: {model_path}"
                 )
-                module.load_state_dict(module_state)
-                del module_state
-                has_parameter_state = optim_parameter_path.is_file()
-                if optimizer is not None and optim_path.is_file():
-                    optim_state = torch.load(
-                        optim_path, map_location="cpu", weights_only=False
+            module_state = torch.load(
+                model_path, map_location="cpu", weights_only=False
+            )
+            module.load_state_dict(module_state)
+            del module_state
+            has_parameter_state = optim_parameter_path.is_file()
+            if optimizer is not None and optim_path.is_file():
+                optim_state = torch.load(
+                    optim_path, map_location="cpu", weights_only=False
+                )
+                patch_hybrid_load = getattr(
+                    self._engine,
+                    "_patch_hybrid_optimizer_checkpoint_load",
+                    None,
+                )
+                if callable(patch_hybrid_load):
+                    patch_hybrid_load()
+                optimizer.load_state_dict(optim_state)
+                del optim_state
+            if optimizer is not None and hasattr(
+                optimizer, "load_parameter_state"
+            ):
+                if not has_parameter_state:
+                    raise FileNotFoundError(
+                        "Missing distributed optimizer parameter state: "
+                        f"{optim_parameter_path}"
                     )
-                    optimizer.load_state_dict(optim_state)
-                    del optim_state
-                if optimizer is not None and hasattr(
-                    optimizer, "load_parameter_state"
+                optimizer.load_parameter_state(str(optim_parameter_path))
+            elif optimizer is not None and hasattr(
+                optimizer, "reload_model_params"
+            ):
+                optimizer.reload_model_params()
+            if extra_path.is_file():
+                extra = torch.load(
+                    extra_path, map_location="cpu", weights_only=False
+                )
+                global_step = int(extra.get("global_step", 0))
+                sched_state = extra.get("lr_scheduler")
+                if scheduler is not None and sched_state is not None:
+                    scheduler.load_state_dict(sched_state)
+                rng = extra.get("rng") or {}
+                if rng.get("cpu") is not None:
+                    torch.set_rng_state(rng["cpu"])
+                if (
+                    torch.cuda.is_available()
+                    and rng.get("cuda") is not None
                 ):
-                    if not has_parameter_state:
-                        raise FileNotFoundError(
-                            "Missing distributed optimizer parameter state: "
-                            f"{optim_parameter_path}"
-                        )
-                    optimizer.load_parameter_state(str(optim_parameter_path))
-                elif optimizer is not None and hasattr(
-                    optimizer, "reload_model_params"
-                ):
-                    optimizer.reload_model_params()
-                if extra_path.is_file():
-                    extra = torch.load(
-                        extra_path, map_location="cpu", weights_only=False
-                    )
-                    global_step = int(extra.get("global_step", 0))
-                    sched_state = extra.get("lr_scheduler")
-                    if scheduler is not None and sched_state is not None:
-                        scheduler.load_state_dict(sched_state)
-                    rng = extra.get("rng") or {}
-                    if rng.get("cpu") is not None:
-                        torch.set_rng_state(rng["cpu"])
-                    if (
-                        torch.cuda.is_available()
-                        and rng.get("cuda") is not None
-                    ):
-                        torch.cuda.set_rng_state(rng["cuda"])
-                    del extra
-                import gc
+                    torch.cuda.set_rng_state(rng["cuda"])
+                del extra
+            import gc
 
-                gc.collect()
-                try:
-                    import ctypes
+            gc.collect()
+            try:
+                import ctypes
 
-                    ctypes.CDLL("libc.so.6").malloc_trim(0)
-                except (OSError, AttributeError):
-                    pass
-            if distributed:
-                torch.distributed.barrier()
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except (OSError, AttributeError):
+                pass
+
+        for active_ranks in checkpoint_rank_phases(rank, world):
+            run_checkpoint_phase(
+                rank,
+                world,
+                _load_rank_state if rank in active_ranks else None,
+            )
         return global_step
 
     def update_weights_ipc_send(

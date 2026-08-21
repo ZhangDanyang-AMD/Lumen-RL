@@ -1169,40 +1169,369 @@ def patch_distrib_optimizer_hdo_checkpoint(megatron_root: str) -> bool:
     DistributedOptimizer first records model parameters in grad-buffer order,
     then rebuilds each optimizer group with native-FP32 shards before BF16
     shards.  The old ``model_param_group_index_map`` therefore points at the
-    wrong HDO state whenever a group contains both dtypes.
+    wrong HDO state whenever a group contains both dtypes. For DP=1, load
+    coalesced HDO state directly into its existing tensors so the checkpoint
+    does not temporarily allocate padded send and receive buffers.
     """
     path = os.path.join(
         megatron_root, "megatron", "core", "optimizer", "distrib_optimizer.py"
     )
     with open(path) as f:
         content = f.read()
+    original = content
     marker = "checkpoint order must match optimizer.param_groups"
-    if marker in content:
-        return False
-
     build_anchor = (
         "        ) = self._build_model_and_main_param_groups(\n"
         "            self.gbuf_ranges, self.model_param_gbuf_map, "
         "self.opt_group_ranges, config\n"
         "        )"
     )
-    if build_anchor not in content:
-        raise RuntimeError(
-            "Unable to patch HDO checkpoint order: model/main group anchor missing"
+    if marker not in content:
+        if build_anchor not in content:
+            raise RuntimeError(
+                "Unable to patch HDO checkpoint order: model/main group anchor missing"
+            )
+        remap = build_anchor + (
+            "\n\n"
+            "        # HDO checkpoint order must match optimizer.param_groups, which\n"
+            "        # groups native-FP32 shards before BF16 shards.\n"
+            "        for group_index, model_groups in enumerate(zip(\n"
+            "            self.model_fp32_groups, self.model_float16_groups\n"
+            "        )):\n"
+            "            ordered_model_params = (*model_groups[0], *model_groups[1])\n"
+            "            for group_order, model_param in enumerate(ordered_model_params):\n"
+            "                self.model_param_group_index_map[model_param] = "
+            "(group_index, group_order)"
         )
-    remap = build_anchor + (
-        "\n\n"
-        "        # HDO checkpoint order must match optimizer.param_groups, which\n"
-        "        # groups native-FP32 shards before BF16 shards.\n"
-        "        for group_index, model_groups in enumerate(zip(\n"
-        "            self.model_fp32_groups, self.model_float16_groups\n"
-        "        )):\n"
-        "            ordered_model_params = (*model_groups[0], *model_groups[1])\n"
-        "            for group_order, model_param in enumerate(ordered_model_params):\n"
-        "                self.model_param_group_index_map[model_param] = "
-        "(group_index, group_order)"
-    )
-    content = content.replace(build_anchor, remap, 1)
+        content = content.replace(build_anchor, remap, 1)
+
+    fast_path_marker = "DP=1 HDO checkpoint state in place"
+    if fast_path_marker not in content:
+        split_anchor = "            self.split_state_dict_if_needed(state_dict)"
+        if split_anchor not in content:
+            raise RuntimeError(
+                "Unable to patch HDO checkpoint load: state split anchor missing"
+            )
+        fast_path = split_anchor + '''
+
+        if (
+            data_parallel_world_size == 1
+            and isinstance(self.optimizer, HybridDeviceOptimizer)
+        ):
+            def validation_message(
+                reason,
+                *,
+                gbuf,
+                dtype="n/a",
+                bucket="all",
+                key="metadata",
+                param="n/a",
+            ):
+                return (
+                    "DP=1 HDO checkpoint validation failed: "
+                    f"gbuf={gbuf} dtype={dtype} bucket={bucket} "
+                    f"key={key} param={param}: {reason}"
+                )
+
+            # Validate the complete layout before mutating any optimizer state.
+            for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
+                if gbuf_idx not in state_dict:
+                    raise ValueError(
+                        validation_message(
+                            f"missing checkpoint grad buffer {gbuf_idx}",
+                            gbuf=gbuf_idx,
+                        )
+                    )
+                for dtype, gbuf_range_map_for_all_buckets in gbuf_range_maps.items():
+                    if dtype not in state_dict[gbuf_idx]:
+                        raise ValueError(
+                            validation_message(
+                                f"missing checkpoint dtype {dtype}",
+                                gbuf=gbuf_idx,
+                                dtype=dtype,
+                            )
+                        )
+                    checkpoint_state = state_dict[gbuf_idx][dtype]
+                    buffer_numel_unpadded = self.buffers[gbuf_idx].numel_unpadded
+                    if "numel_unpadded" not in checkpoint_state:
+                        raise ValueError(
+                            validation_message(
+                                "missing checkpoint numel_unpadded",
+                                gbuf=gbuf_idx,
+                                dtype=dtype,
+                                key="numel_unpadded",
+                            )
+                        )
+                    checkpoint_numel_unpadded = checkpoint_state["numel_unpadded"]
+                    if buffer_numel_unpadded != checkpoint_numel_unpadded:
+                        raise RuntimeError(
+                            validation_message(
+                                "Number of unpadded elements must be same in "
+                                f"current run ({buffer_numel_unpadded}) and "
+                                f"checkpoint ({checkpoint_numel_unpadded})",
+                                gbuf=gbuf_idx,
+                                dtype=dtype,
+                                key="numel_unpadded",
+                            )
+                        )
+                    buckets = self.buffers[gbuf_idx].buckets
+                    if len(gbuf_range_map_for_all_buckets) != len(buckets):
+                        raise RuntimeError(
+                            validation_message(
+                                f"{len(gbuf_range_map_for_all_buckets)} range "
+                                f"maps do not match {len(buckets)} buckets",
+                                gbuf=gbuf_idx,
+                                dtype=dtype,
+                            )
+                        )
+                    bucket_numel_total = sum(
+                        bucket.numel_unpadded for bucket in buckets
+                    )
+                    if bucket_numel_total != buffer_numel_unpadded:
+                        raise RuntimeError(
+                            validation_message(
+                                f"bucket unpadded aggregate size "
+                                f"{bucket_numel_total} does not match "
+                                f"{buffer_numel_unpadded}",
+                                gbuf=gbuf_idx,
+                                dtype=dtype,
+                            )
+                        )
+                    for key in ("param", "exp_avg", "exp_avg_sq"):
+                        if key not in checkpoint_state:
+                            raise ValueError(
+                                validation_message(
+                                    f"missing checkpoint state {key}",
+                                    gbuf=gbuf_idx,
+                                    dtype=dtype,
+                                    key=key,
+                                )
+                            )
+                        source = checkpoint_state[key]
+                        if not torch.is_tensor(source):
+                            raise ValueError(
+                                validation_message(
+                                    f"checkpoint state {key} is not a tensor",
+                                    gbuf=gbuf_idx,
+                                    dtype=dtype,
+                                    key=key,
+                                )
+                            )
+                        if source.numel() != buffer_numel_unpadded:
+                            raise ValueError(
+                                validation_message(
+                                    f"checkpoint state {key} has "
+                                    f"{source.numel()} elements; expected "
+                                    f"{buffer_numel_unpadded}",
+                                    gbuf=gbuf_idx,
+                                    dtype=dtype,
+                                    key=key,
+                                )
+                            )
+                        if source.shape != (buffer_numel_unpadded,):
+                            raise ValueError(
+                                validation_message(
+                                    f"checkpoint state {key} shape "
+                                    f"{tuple(source.shape)} must be "
+                                    f"({buffer_numel_unpadded},)",
+                                    gbuf=gbuf_idx,
+                                    dtype=dtype,
+                                    key=key,
+                                )
+                            )
+                        bucket_offset = 0
+                        for bucket_idx, gbuf_range_map in enumerate(
+                            gbuf_range_map_for_all_buckets
+                        ):
+                            bucket_numel_unpadded = buckets[
+                                bucket_idx
+                            ].numel_unpadded
+                            if not (
+                                0
+                                <= bucket_numel_unpadded
+                                <= buckets[bucket_idx].grad_data.numel()
+                            ):
+                                raise ValueError(
+                                    validation_message(
+                                        "invalid bucket unpadded size "
+                                        f"{bucket_numel_unpadded}",
+                                        gbuf=gbuf_idx,
+                                        dtype=dtype,
+                                        bucket=bucket_idx,
+                                        key=key,
+                                    )
+                                )
+                            if "param_map" not in gbuf_range_map:
+                                raise ValueError(
+                                    validation_message(
+                                        "missing param_map",
+                                        gbuf=gbuf_idx,
+                                        dtype=dtype,
+                                        bucket=bucket_idx,
+                                        key=key,
+                                    )
+                                )
+                            for model_param, param_range_map in gbuf_range_map[
+                                "param_map"
+                            ].items():
+                                range_name = (
+                                    "gbuf_world_in_bucket"
+                                    if "gbuf_world_in_bucket" in param_range_map
+                                    else "gbuf_world"
+                                )
+                                if range_name not in param_range_map:
+                                    raise ValueError(
+                                        validation_message(
+                                            f"missing {range_name} range",
+                                            gbuf=gbuf_idx,
+                                            dtype=dtype,
+                                            bucket=bucket_idx,
+                                            key=key,
+                                            param=model_param,
+                                        )
+                                    )
+                                source_range = param_range_map[range_name]
+                                if not (
+                                    0
+                                    <= source_range.start
+                                    <= source_range.end
+                                    <= bucket_numel_unpadded
+                                ):
+                                    raise ValueError(
+                                        validation_message(
+                                            f"invalid {range_name} range "
+                                            f"[{source_range.start}, "
+                                            f"{source_range.end}) for "
+                                            f"{bucket_numel_unpadded} "
+                                            "unpadded elements",
+                                            gbuf=gbuf_idx,
+                                            dtype=dtype,
+                                            bucket=bucket_idx,
+                                            key=key,
+                                            param=model_param,
+                                        )
+                                    )
+                                try:
+                                    destination_states = (
+                                        self._get_main_param_and_optimizer_states(
+                                            model_param
+                                        )
+                                    )
+                                    destination = destination_states[key]
+                                except (KeyError, TypeError) as exc:
+                                    raise RuntimeError(
+                                        validation_message(
+                                            "destination state is unavailable",
+                                            gbuf=gbuf_idx,
+                                            dtype=dtype,
+                                            bucket=bucket_idx,
+                                            key=key,
+                                            param=model_param,
+                                        )
+                                    ) from exc
+                                if not torch.is_tensor(destination):
+                                    raise RuntimeError(
+                                        validation_message(
+                                            "destination is not a tensor",
+                                            gbuf=gbuf_idx,
+                                            dtype=dtype,
+                                            bucket=bucket_idx,
+                                            key=key,
+                                            param=model_param,
+                                        )
+                                    )
+                                range_numel = (
+                                    source_range.end - source_range.start
+                                )
+                                if destination.numel() != range_numel:
+                                    raise RuntimeError(
+                                        validation_message(
+                                            f"destination {key} has "
+                                            f"{destination.numel()} elements; "
+                                            f"expected {range_numel}",
+                                            gbuf=gbuf_idx,
+                                            dtype=dtype,
+                                            bucket=bucket_idx,
+                                            key=key,
+                                            param=model_param,
+                                        )
+                                    )
+                                if destination.shape != (range_numel,):
+                                    raise RuntimeError(
+                                        validation_message(
+                                            f"destination {key} shape "
+                                            f"{tuple(destination.shape)} must "
+                                            f"be ({range_numel},)",
+                                            gbuf=gbuf_idx,
+                                            dtype=dtype,
+                                            bucket=bucket_idx,
+                                            key=key,
+                                            param=model_param,
+                                        )
+                                    )
+                            bucket_offset += bucket_numel_unpadded
+                        if bucket_offset != source.numel():
+                            raise RuntimeError(
+                                validation_message(
+                                    f"final offset {bucket_offset} does not "
+                                    f"match source length {source.numel()}",
+                                    gbuf=gbuf_idx,
+                                    dtype=dtype,
+                                    key=key,
+                                )
+                            )
+
+            print(
+                "[LumenRL] loading DP=1 HDO checkpoint state in place",
+                flush=True,
+            )
+            for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
+                for dtype, gbuf_range_map_for_all_buckets in gbuf_range_maps.items():
+                    for key in ("param", "exp_avg", "exp_avg_sq"):
+                        source = state_dict[gbuf_idx][dtype][key]
+                        bucket_offset = 0
+                        for bucket_idx, gbuf_range_map in enumerate(
+                            gbuf_range_map_for_all_buckets
+                        ):
+                            bucket_numel_unpadded = self.buffers[gbuf_idx].buckets[
+                                bucket_idx
+                            ].numel_unpadded
+                            bucket_source = source[
+                                bucket_offset : bucket_offset + bucket_numel_unpadded
+                            ]
+                            for model_param, param_range_map in gbuf_range_map[
+                                "param_map"
+                            ].items():
+                                destination = (
+                                    self._get_main_param_and_optimizer_states(
+                                        model_param
+                                    )[key]
+                                )
+                                source_range = param_range_map.get(
+                                    "gbuf_world_in_bucket",
+                                    param_range_map["gbuf_world"],
+                                )
+                                destination.copy_(
+                                    bucket_source[
+                                        source_range.start : source_range.end
+                                    ]
+                                )
+                            bucket_offset += bucket_numel_unpadded
+                        if bucket_offset != source.numel():
+                            raise RuntimeError(
+                                validation_message(
+                                    f"final offset {bucket_offset} changed "
+                                    f"after preflight for source length "
+                                    f"{source.numel()}",
+                                    gbuf=gbuf_idx,
+                                    dtype=dtype,
+                                    key=key,
+                                )
+                            )
+            self.optimizer._sync_hdo_state_to_sub_optimizers()
+            return
+'''
+        content = content.replace(split_anchor, fast_path, 1)
 
     load_anchor = (
         "                for model_param, tensors in recv_tensors.items():\n"
@@ -1211,22 +1540,43 @@ def patch_distrib_optimizer_hdo_checkpoint(megatron_root: str) -> bool:
         "    @torch.no_grad()\n"
         "    def load_parameter_state_from_fully_reshardable"
     )
-    if load_anchor not in content:
-        raise RuntimeError(
-            "Unable to patch HDO checkpoint load: DP-zero load anchor missing"
-        )
-    load_replacement = (
-        "                for model_param, tensors in recv_tensors.items():\n"
-        "                    self._set_main_param_and_optimizer_states(model_param, tensors)\n"
-        "\n"
+    sync_marker = (
         "        if isinstance(self.optimizer, HybridDeviceOptimizer):\n"
-        "            self.optimizer._sync_hdo_state_to_sub_optimizers()\n"
-        "\n"
+        "            self.optimizer._sync_hdo_state_to_sub_optimizers()\n\n"
         "    @torch.no_grad()\n"
         "    def load_parameter_state_from_fully_reshardable"
     )
-    content = content.replace(load_anchor, load_replacement, 1)
+    if sync_marker not in content:
+        if load_anchor not in content:
+            raise RuntimeError(
+                "Unable to patch HDO checkpoint load: DP-zero load anchor missing"
+            )
+        load_replacement = (
+            "                for model_param, tensors in recv_tensors.items():\n"
+            "                    self._set_main_param_and_optimizer_states(model_param, tensors)\n"
+            "\n"
+            "        if isinstance(self.optimizer, HybridDeviceOptimizer):\n"
+            "            self.optimizer._sync_hdo_state_to_sub_optimizers()\n"
+            "\n"
+            "    @torch.no_grad()\n"
+            "    def load_parameter_state_from_fully_reshardable"
+        )
+        content = content.replace(load_anchor, load_replacement, 1)
 
+    mmap_load = "            state_dict = torch.load(filename)"
+    mmap_load_patched = (
+        "            state_dict = torch.load("
+        "filename, mmap=True, weights_only=False)"
+    )
+    if mmap_load_patched not in content:
+        if mmap_load not in content:
+            raise RuntimeError(
+                "Unable to patch HDO checkpoint load: torch.load anchor missing"
+            )
+        content = content.replace(mmap_load, mmap_load_patched, 1)
+
+    if content == original:
+        return False
     with open(path, "w") as f:
         f.write(content)
     return True

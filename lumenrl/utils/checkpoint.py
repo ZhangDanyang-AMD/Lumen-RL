@@ -6,7 +6,7 @@ import logging
 import re
 import socket
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import torch
 
@@ -29,6 +29,49 @@ def checkpoint_rank_phases(rank: int, world_size: int) -> list[list[int]]:
         [ranks[phase] for ranks in ranks_by_host.values() if phase < len(ranks)]
         for phase in range(phase_count)
     ]
+
+
+def run_checkpoint_phase(
+    rank: int,
+    world_size: int,
+    action: Callable[[], None] | None,
+) -> None:
+    """Run one rank-local checkpoint action and propagate failures to every rank."""
+    local_error: Exception | None = None
+    if action is not None:
+        try:
+            action()
+        except Exception as exc:
+            local_error = exc
+
+    if not torch.distributed.is_initialized():
+        if local_error is not None:
+            raise local_error
+        return
+
+    local_failure = (
+        {
+            "rank": int(rank),
+            "type": type(local_error).__name__,
+            "message": str(local_error),
+        }
+        if local_error is not None
+        else None
+    )
+    failures: list[dict[str, Any] | None] = [None] * int(world_size)
+    torch.distributed.all_gather_object(failures, local_failure)
+    failed = [failure for failure in failures if failure is not None]
+    if not failed:
+        return
+
+    details = "; ".join(
+        f"rank {failure['rank']} {failure['type']}: {failure['message']}"
+        for failure in failed
+    )
+    error = RuntimeError(f"checkpoint phase failed: {details}")
+    if local_error is not None:
+        raise error from local_error
+    raise error
 
 
 class CheckpointManager:
