@@ -6,7 +6,7 @@
 > 报错行往往和真正的原因隔着几十帧，甚至在另一个进程里。
 >
 > 环境搭建期的坑在 [`02-environment-setup.md`](02-environment-setup.md)；
-> primus 底座那八条的完整版在 [`../../scripts/primus/README.md`](../../scripts/primus/README.md)。
+> primus 底座那八条的完整版在 [`../../scripts/primus/README.md`](06-primus-pitfalls.md)。
 
 ---
 

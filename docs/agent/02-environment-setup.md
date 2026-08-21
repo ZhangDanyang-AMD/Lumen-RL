@@ -269,7 +269,7 @@ DSv4 另有一层：`ray_env_dsv4_primus.sh`（AITER=1、patched Megatron、vend
 export PYTORCH_CUDA_ALLOC_CONF= HSA_DISABLE_FRAGMENT_ALLOCATOR=
 ```
 
-八条坑的完整版（症状 / 根因 / 诊断手法）见 [`../../scripts/primus/README.md`](../../scripts/primus/README.md)。
+八条坑的完整版（症状 / 根因 / 诊断手法）见 [`../../scripts/primus/README.md`](06-primus-pitfalls.md)。
 
 ---
 

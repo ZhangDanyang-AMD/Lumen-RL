@@ -75,7 +75,7 @@ docker exec \
 | `dc.load` | `missing=0 / unexpected=0`（忽略 `_extra_state`） | 达成 |
 | 权重同步形状 | `0 missing / 0 extra / 0 SHAPE MISMATCH` + `PASS` | 切片 3176、全模型 34223 |
 | `bf16-native` 索引 | `tensors=34223 native=34217 hf_style=0 mtp=0 -> OK` | 达成 |
-| **`rollout_corr/kl`** | **权重同步内容正确性的判据**（形状对了不代表内容对——gate/up 顺序错了 kl 会差几个数量级）。切片基线 **2.6–3.3e-3** | 见 [`../dsv4_agent.md`](../dsv4_agent.md) §3.4。⚠️ **43 层从来没有实测值** |
+| **`rollout_corr/kl`** | **权重同步内容正确性的判据**（形状对了不代表内容对——gate/up 顺序错了 kl 会差几个数量级）。切片基线 **2.6–3.3e-3** | 见 [`../dsv4_agent.md`](dsv4_agent.md) §3.4。⚠️ **43 层从来没有实测值** |
 | `is_weight_mean` | ≈ 0.9999 | 达成 |
 | fp32 mHC 参数更新 | **全数**（offload 静默 bug 的探测器） | 27/27、261/261 |
 | 全模型唯一的正确性判据 | 真实英文散文困惑度（均匀分布是 129280） | **2.88** |
