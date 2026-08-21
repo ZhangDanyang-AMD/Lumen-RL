@@ -1,7 +1,36 @@
 # DeepSeek-V4 on LumenRL —— 持续开发文档
 
-> **这份文档是给接手的 agent 用的。** 它把分散在 13 份 runbook / handoff（约 8400 行）里的
-> DSv4 相关结论压缩成一份，目标是让任何新 agent 读完这一份就能开工，不必再去翻那 8400 行。
+> **这份文档是给接手的 agent 用的。** 目标是：**新 agent 在新环境里只读这一份（以及它指向的
+> `docs/agent/`），就能直接接手开发，不需要任何仓库外的文档。**
+>
+> ## 开发分支
+>
+> ```
+> dev/dsv4-dapo        （从 main 7545e2b 切出）
+> ```
+>
+> **这条线的所有改动都提交在这个分支上。** 开工先确认：
+>
+> ```bash
+> git -C <repo> rev-parse --abbrev-ref HEAD     # 期望 dev/dsv4-dapo
+> ```
+>
+> ⚠️ **不要在 `main` 上改。** 2026-08-21 已经出过一次事故：一个致命修复
+> （`run_dapo.sh` 的 `HSA_DISABLE_FRAGMENT_ALLOCATOR`，见 §4.3 第 1 条）
+> 在合并到 main 时被冲掉了，直到重新跑 smoke 才发现。
+>
+> ## 文档结构
+>
+> | 文档 | 性质 |
+> |---|---|
+> | **本文档** | **活的**。当前状态、已解决、未解决、下一步。有进展就更新 |
+> | [`agent/`](agent/) | **稳定操作手册**（5 篇）：连集群、建环境、备产物、判据、运行期坑。只在配方本身变化时才动 |
+> | [`../scripts/primus/README.md`](../scripts/primus/README.md) | primus 底座八条坑的完整版 + 脚本用法 |
+>
+> **新 agent 的最短路径**：
+> [`agent/01-cluster-access.md`](agent/01-cluster-access.md) →
+> [`agent/02-environment-setup.md`](agent/02-environment-setup.md) §0 →
+> 本文档 §0（一页现状）→ 从 §9 挑一件事做。
 >
 > **维护约定**（很重要，请遵守）：
 > 1. **有新进展就更新这里**，不要另开文件。
@@ -10,7 +39,10 @@
 > 3. **被推翻的假设要写进 §6**，那一节是这份文档里最省时间的部分——它让后人不必重走死路。
 > 4. 数字要带条件（几个节点、多少层、什么并行度、什么序列长度）。一个没有条件的数字
 >    等于没有数字，§6 里有好几条就是这么栽的。
-> 5. 等 §5 清空、§9 的单机与多机两栏都做完，这份文档就可以直接压成一份能跑通的 runbook。
+> 5. **操作步骤写进 [`agent/`](agent/)，不要写在这里。** 这份只放当前状态和结论指针——
+>    两边都写会立刻不同步。
+> 6. 等 §5 清空、§9 的单机与多机两栏都做完，这份文档 + `agent/` 就可以直接压成一份
+>    能跑通的 runbook。
 >
 > **站点相关**：文中的 `/home/xysheng`、`/mnt/m2m_nobackup`、`crsuse2-m2m-*` 是当前集群的路径和
 > 节点名。换集群时这些要改，但结论不变。
@@ -26,10 +58,10 @@
 - [4. 已解决的 bug](#4-已解决的-bug)
 - [5. 未解决的问题](#5-未解决的问题)
 - [6. 不要重做](#6-不要重做)
-- [7. 判据与阈值速查](#7-判据与阈值速查)
+- [7. 当前实测值汇总](#7-当前实测值汇总)
 - [8. 两条权重同步通路](#8-两条权重同步通路)
 - [9. 下一步](#9-下一步)
-- [10. 参考文档索引](#10-参考文档索引)
+- [10. 文档索引](#10-文档索引)
 
 ---
 
@@ -104,75 +136,32 @@ miles 的 tilelang 反向本质不确定。这把「不放 kernel」从纯成本
 
 ## 2. 环境与底座
 
-### 2.1 为什么是 `rocm/primus:v26.4`
+**操作步骤全在 [`agent/02-environment-setup.md`](agent/02-environment-setup.md)**，
+这里只留结论和「为什么」。
 
-它是**唯一** RDMA 实测跑通的底座。约束比看上去窄：集群的 ANP 插件在 RCCL **2.26.6 和 2.27.7 上都 SIGSEGV**，
-只有 **2.28.9** 能跑。
-
-⚠️ **这条有干净对照**：`rocm/primus:v26.3` 也是 24.04，插件在里面原样 dlopen 通过（不用任何 shim），
-只变 RCCL 这一个变量 → **16 rank 全 SIGSEGV**。所以 **OS 只决定插件能不能加载，真正卡的是 RCCL**。
-**选镜像只看 `strings librccl.so | grep "RCCL version"`，不要看 tag 名**——
-`nightly_cdna4_..._rocm7.14.0a*` 里的 7.14 是 torch 的构建 ROCm，镜像装的是 7.2.3。
-
-规格：Ubuntu 24.04 / glibc 2.39 / GLIBCXX 3.4.33 / py **3.12.3** / torch **2.12.0+rocm7.14** / RCCL **2.28.9**。
-⚠️ **py3.12 是硬约束**：`aiter` 的预编译 `.so` 用了 `_PyThreadState_UncheckedGet`（CPython 3.13 已删）。
-
-代价是 primus **不带 vLLM 也不带 ray**。
-
-### 2.2 NFS 共享树（贵的那部分，换节点不用重装）
-
-```
-/home/xysheng/vllm_primus/site        2.7 G，跨节点共享
-  vLLM        0.26.0+rocm714   源码编译，5 个扩展，3 分 56 秒
-  ray         2.57.0           protobuf 钉 6.33.6 / grpcio 钉 1.78.0
-  megatron-core 0.18.2
-  apex        1.14.0a0         28 个编译扩展，gfx950
-  transformer_engine 2.15.0.dev0+6e541a10
-  datasets    4.0.0            3.6.0 读不了 parquet 的 List 特征类型
-  flydsl      0.1.8            0.1.6 缺 extract_to_ir_values
-  sitecustomize.py             §4.3 第 2 条的修法
-  bin/ray                      pip --target 没生成 console script，手补的
-```
-
-⚠️ **`/mnt/m2m_nobackup` 是节点本地 NVMe，换节点就没**。DSv4 的产物全在那里：
-4 层切片约 460 G，全 43 层约 **1.9 TB/节点**。作业结束**不清盘**，所以拿到新分配先逐台盘点。
-
-### 2.3 脚本清单
-
-版本控制内（`scripts/primus/`，2026-08-21 入库）：
-
-| 脚本 | 用途 |
+| 结论 | 一句话理由 |
 |---|---|
-| `ray_env_primus.sh` | **跑任何东西前先 source 它**。八条坑的修法都在里面，每条旁边写了原因 |
-| `ray_env_dsv4_primus.sh` | DSv4 专用，在上面再加 AITER、patched Megatron、vime、`NCCL_ALGO=Ring` |
-| `rl24_container.sh` | 起容器并挂 ANP 三件套。⚠️ **必须传 `RL24_IMAGE=rocm/primus:v26.4 RL24_CONTAINER=anp-primus`**，默认值是老的 py3.14 镜像 |
-| `ray_start_primus.sh` | 多机 raylet，显式 `--num-gpus=8`。单机 smoke 不需要 |
-| `build/install_{vllm,megatron}_primus.sh` | 编译并装进 NFS 树 |
-| `verify_vllm_primus.py` | 5 个扩展 + 算子真注册 + DSv4 在 registry + RCCL 仍 2.28.9 |
-| `probes/probe_rs_coalesced.py` | §4.3 第 1 条的最小复现 |
-| `probes/probe_devcount.py` | torchrun 下每个 rank 看到几张卡 |
-| `probes/probe_ipc_primus.py` | 跨进程 CUDA IPC handle 能不能开 |
-| `probes/probe_a2a_ens3.py` + `run_a2a_anp.sh` | RDMA 基线探针 |
-| `sitecustomize.py` | 拷进 `$PRIMUS_SITE` |
+| 底座 `rocm/primus:v26.4` | **唯一** RDMA 实测跑通的。约束是 **RCCL 必须 2.28.9**——2.26.6 和 2.27.7 都 SIGSEGV，`primus:v26.3`（同为 24.04，只差 RCCL）是那个干净对照。**选镜像只看 `strings librccl.so`，不看 tag 名** |
+| vLLM / ray / Megatron 装在一棵 NFS 树 | primus 三样都不带。树在 `$PRIMUS_SITE`（约 2.7 G），**换节点不用重装**——这是整套方案里最省事的决定 |
+| vLLM 是**源码编译**不是拷贝 | 「稳定版 + 支持 DSv4 + 不带坏 RCCL」三个条件锁死。⚠️ 而且**编译只要 3 分 56 秒**，「ROCm 上编译要一小时」是错的 |
+| Apex / TE 用固定 revision 源码编译 | ⚠️ **torch 2.12 没有任何 API 漂移**（旧文档说这是最大风险，已证伪） |
+| 跑任何东西前 `source ray_env_primus.sh` | 八条 primus 专属坑里有六条的修法在这个文件里，§4.3 |
 
-⚠️ **不在版本控制里的**（§5.7）：`~/dsv4/mhc_probe/`（探针、`megatron_dsv4` 补丁树、
-`vendored/miles_plugins`）、`~/4node/env.sh`（每个作业都变）。
+**当前树的内容**（版本变了就改这张表）：
 
-### 2.4 拿到新作业先做的四件事
-
-```bash
-# 1. 核环境，不要假设
-squeue -u $(whoami)
-spur exec $JOBID hostname          # head 落在哪台，实测，不要假设编号最小
+```
+$PRIMUS_SITE = /home/<user>/vllm_primus/site                约 2.7 G
+  vLLM 0.26.0+rocm714 · ray 2.57.0 · megatron-core 0.18.2
+  apex 1.14.0a0（28 个扩展）· transformer_engine 2.15.0.dev0+6e541a10
+  datasets 4.0.0 · flydsl 0.1.8 · sitecustomize.py · bin/ray
 ```
 
-2. 改 `~/4node/env.sh` 四个值：`JOBID` / `HEAD_NODE` / `HEAD_IP` / `NODES`
-   （**head 排第一**，它同时是 torchrun 的 `node_rank` 顺序）。历史值在 `env.sh.job*.bak`。
-3. **看 `rocm-smi` 再决定要不要清容器**——卡是不是空的要实测，别人可能占着。
-4. 盘点 `/mnt/m2m_nobackup`，命中哪台就省哪台的重建。
+⚠️ **`/mnt/m2m_nobackup` 是节点本地 NVMe，换节点就没**。DSv4 产物全在那里：
+4 层切片约 460 G，全 43 层约 **1.9 TB/节点**。作业结束**不清盘**，拿到新分配先逐台盘点。
+产物的重建见 [`agent/03-dsv4-artifacts.md`](agent/03-dsv4-artifacts.md)。
 
-⚠️ **每次 run 之前 `docker restart anp-primus`**，然后确认
-`python3 -c "import torch;print(torch.cuda.device_count())"` **是 8**。理由见 §4.5。
+⚠️ **不在版本控制里的**（§5.7 记着这件事的风险）：`~/dsv4/mhc_probe/`
+（探针、`megatron_dsv4` 补丁树、`vendored/miles_plugins`）、`~/4node/env.sh`（每个作业都变）。
 
 ---
 
@@ -528,31 +517,32 @@ bf16-native + `quantization: ""` → 能跑但 71 GB/卡放不下。
 
 ---
 
-## 7. 判据与阈值速查
+## 7. 当前实测值汇总
+
+**判据本身**（阈值怎么定的、为什么这么定、以及哪些判据是错的）在
+[`agent/04-probes-and-criteria.md`](agent/04-probes-and-criteria.md)。
+这里只放**这条线目前测到的数字**——它们会随进展变，所以放在活文档里。
 
 ### 7.1 正确性
 
-| 判据 | 阈值 | 实测 |
+| 指标 | 实测 | 条件 |
 |---|---|---|
-| 权重同步形状（`probe_68`） | `0 missing / 0 extra / 0 SHAPE MISMATCH` + `WEIGHT SYNC SHAPES: PASS` | 切片 3176、全模型 34223 |
-| 流式 gather 生效 | `weight_sync gather` 的 peak **只比进入时高几个 GiB** | 切片 65.8→66.9 GiB；全模型 529.7 GiB 流过、峰值 +0.6 |
-| `rollout_corr/kl` | **切片 2.6–3.3e-3**。⚠️ 多节点上如果明显变大（>1e-2），**第一件事查权重同步的 rank→replica 映射，不是调超参** | 见 §3.4。**43 层未知** |
-| `is_weight_mean` | ≈ 0.9999 | 达成 |
-| 前向数值（`probe_70`） | 第一个发散层 `ulp@max` 约 1–2 + `n_diff` 极小 = ROUNDING；`ulp@max >> 1` 或 `n_diff` 是 hidden 宽度整数倍 = **算错了**。`--ulp-tol 10` | seq 1280: 2.68 / 6.22e-05；seq 6144: 1.88 / 6.59e-05；切片在 primus 上 3.58 / 1.486e-04 |
-| offload 正确性（`probe_65`） | fp32 mHC 参数**全数**更新，**MIN all-reduce 取 worst rank** | 27/27（切片）、261/261（全模型） |
-| 全模型唯一的正确性判据 | 真实英文散文困惑度，均匀分布是 129280 | **2.88** |
-| `bf16-native` 索引 | `tensors=34223 native=34217 hf_style=0 mtp=0 -> OK` | 达成 |
-| 环境未漂（4 层切片，每节点约 3 分钟） | `276 字段 / 27.39 B / KL 1.485e-3 / argmax 96.09% / 41-41 pattern / loss −0.04613 / grad_norm 16.749379 / 70.3 GiB` | 这套数字就是判据 |
-
-⚠️ **`probe_67` 在 4 层切片上输出乱码是正确的，不要去查。** 切片把 layer-3 的残差直接喂给
-`lm_head`。「三题答对」是**全 43 层**的判据。同理 `reward/accuracy=0` 是切片的预期，
-配置里因此关掉了 `filter_groups`——**上全模型时要打开**。
+| 前向 argmax 一致率 vs transformers | **96.09%**（门槛是 91.4%） | 4 层切片 / seq 256 |
+| 反向梯度余弦 | 最差 **0.99675**（31 个参数） | 同上 |
+| `rollout_corr/kl` | 1 节点 2.62/2.97/3.33e-3；2 节点 2.74/3.18/3.32e-3 | 4 层切片 EP=8 端到端 |
+| ↳ 同上 | ❌ **43 层从来没有实测值**（§5.1） | — |
+| 权重同步形状 | `0/0/0` + PASS | 切片 3176、全模型 34223 |
+| 流式 gather | 切片 65.8→**66.9 GiB**；全模型 **529.7 GiB 流过、峰值 +0.6 GiB** | EP=8 / EP=32 |
+| fp32 mHC 参数更新 | 27/27（切片）、**261/261**（全 43 层） | offload 0.75 |
+| `probe_70` `ulp@max` / `n_diff` | 1280: 2.68 / 6.22e-05；6144: 1.88 / 6.59e-05；切片在 primus 上 **3.58 / 1.486e-04** | 全部判为 ROUNDING |
+| 全模型困惑度（真实英文散文） | **2.88** | 43 层 / 4 节点 EP=32 |
+| Qwen3-8B smoke（primus 回归） | `kl=1.044e-03`、`ppo_kl=1.42e-04`、`grad_norm=1.012` | 1 节点 8 卡 |
 
 ### 7.2 显存（MI350X，288 GB/卡）
 
 | 项 | 数字 |
 |---|---|
-| 全模型 gather（修前） | **529 GiB/rank**——永远过不去 |
+| 全模型 gather（修前） | **529 GiB/rank** —— 永远过不去 |
 | 全 43 层一步峰值 | **189.6 GiB**（offload 0）/ allocated 117.6 + **reserved 144.7**（offload 0.75） |
 | 全模型 rollout | FP8 **36 GB/卡** vs bf16 **71 GB/卡**（TP=8） |
 | colocated 合计 | 约 **202 GiB / 288**，放得下 |
@@ -560,32 +550,25 @@ bf16-native + `quantization: ""` → 能跑但 71 GB/卡放不下。
 | 切片累计收益 | `mem/actor_max_allocated_gb` **114.35 →（流式 gather）66.88 →（+offload）41.17 GB** |
 | EP=8 下优化器 | `284B × 12 / 8 = 426 GB/rank` —— **单节点装不下的就是这个** |
 | EP=8 下权重同步 | 只要权重 **83 GB**（实测 init 78.2 GiB）——所以 `build_optimizer=False` 的探针单节点跑得了 |
+| Qwen3-8B（primus） | `mem/actor_allocated_gb` **57.4**。⚠️ 比 FSDP2 基线 11.6 高 5 倍，**别拿它推 DSv4 预算** |
 | 主机内存 | 每节点 2.7 TB，**不是约束** |
 
-### 7.3 必设开关
+### 7.3 DSv4 特有的必设开关
+
+通用的（`NCCL_IB_HCA` / `HSA_DISABLE_FRAGMENT_ALLOCATOR` / `PYTORCH_CUDA_ALLOC_CONF` 等）
+已经在 `ray_env_primus.sh` 里，见 [`agent/02-environment-setup.md`](agent/02-environment-setup.md) §4。
+下面这几个是 **DSv4 模型本身**要求的：
 
 | 开关 | 为什么 |
 |---|---|
+| `VLLM_ROCM_USE_AITER=1` | 稀疏注意力 indexer 在 ROCm 上**只有 AITER 实现，硬 raise 没有回退**。⚠️ 与 Qwen3 那条线冲突（那边要 0），所以 DSv4 单独一份 env |
+| `moe_backend: triton` | ⚠️ **必需项不是优化项**。`triton_unfused` 是 FP4 专用；`aiter` 和 `auto`（会自动挑中 AITER）都死在 API 漂移 |
+| `kv_cache_dtype=fp8_e4m3` | 不设会 `AssertionError: DeepseekV4 FlashMLA fp8 layout only supports fp8 kv-cache` |
 | `--deterministic-mode` + **`NCCL_ALGO=Ring`** | 不开有 1.56% argmax 逐次翻转；不设 ALGO 会在参数校验就 assert |
 | `--no-gradient-accumulation-fusion` | 没有 DDP wrapper 时 `main_grad` 是 None |
 | `--disable-bias-linear` | mHC 的 `layer_post` 断言子层 bias 为 None |
-| **seq 是最大 `compress_ratio` 的整数倍，且 ≥ 2×** | `compressor.forward_raw` 有断言；L4 上 ratio 最大 128，**最小有意义长度是 256** |
-| `VLLM_ROCM_USE_AITER=1` | DSv4 的稀疏注意力 indexer 在 ROCm 上只有 AITER 实现，**硬 raise 没有回退**。⚠️ 与 Qwen3 那条线冲突，所以 DSv4 单独一份 env |
-| `moe_backend: triton` | ⚠️ **必需项不是优化项**。`triton_unfused` 是 FP4 专用；`aiter` 和 `auto`（会自动挑中 AITER）都死在 API 漂移 |
-| `kv_cache_dtype=fp8_e4m3` | DSv4 必需 |
-| `PYTORCH_CUDA_ALLOC_CONF=` **显式空值** | ROCm 没有 `expandable_segments`；⚠️ 而且训练侧封死——权重同步要 CUDA IPC handle，expandable segments 拿不到 |
-| `HSA_DISABLE_FRAGMENT_ALLOCATOR=` **显式空值** | §4.3 第 1 条 |
-| `NCCL_IB_HCA=ionic` + `NCCL_CROSS_NIC=0` | RDMA 的两个 load-bearing 旋钮，**少一个不是变慢是跑不起来** |
-
-### 7.4 存活与退出码
-
-| 判据 | 可用性 |
-|---|---|
-| `run_probe_full43.sh` 退出码 | ❌ 恒为 0 |
-| `run_probe_68_full43.sh` 退出码 | ✅ 是真的（传播 torchrun 的） |
-| `pgrep` / `ps` 跨会话 | ❌ 恒 0 / 假阳性 |
-| 存活信号（按优先级） | 1. **远端日志在增长**（`stat -c %s`）2. 容器内 `docker exec ps` 3. 产物变大 |
-| 「停滞」门槛 | **连续 4 次轮询（8 分钟）无输出**。更紧会误杀（下载和 torch_dist 转换都会安静好几分钟） |
+| **seq 是最大 `compress_ratio` 的整数倍，且 ≥ 2×** | `compressor.forward_raw` 有断言。L4 上 ratio 最大 128，**最小有意义长度是 256**——seq 128 测不到 HCA 层 |
+| `quantization: fp8_per_block` + `-bf16-native` | rollout 的唯一活路，§5.4 |
 
 ---
 
@@ -681,35 +664,46 @@ RDMA 完全交给 RCCL 自己的 IB/RoCE transport。判定是否真走了 GPU D
 
 ---
 
-## 10. 参考文档索引
+## 10. 文档索引
 
-### 10.1 本仓库内
+**这条线不需要引用任何仓库外的文档。** 下面就是全部。
+
+### 10.1 稳定操作手册 —— [`agent/`](agent/)
+
+配方定下来之后基本不动的那部分。**新 agent 从这里开始。**
+
+| 文档 | 什么时候读 |
+|---|---|
+| [`agent/01-cluster-access.md`](agent/01-cluster-access.md) | 连集群、进节点、起长任务、判存活 |
+| [`agent/02-environment-setup.md`](agent/02-environment-setup.md) | 建环境（镜像 / 容器 / NFS 树 / RDMA 自检），以及已排除的镜像候选 |
+| [`agent/03-dsv4-artifacts.md`](agent/03-dsv4-artifacts.md) | 四份权重、三套命名、切片和全 43 层的重建 |
+| [`agent/04-probes-and-criteria.md`](agent/04-probes-and-criteria.md) | 探针目录、判据阈值、**以及哪些判据是错的** |
+| [`agent/05-operational-pitfalls.md`](agent/05-operational-pitfalls.md) | 运行期的坑。**出问题先翻这份** |
+
+### 10.2 仓库里的其它相关文件
 
 | 路径 | 内容 |
 |---|---|
-| `scripts/primus/README.md` | primus 底座的八条坑（§4.3 的展开版）+ 脚本用法 |
-| `examples/docs/07-disaggregated-rdma.md` | 训推分离部署全流程（Qwen3-30B-A3B / 2 节点 MI308X），§8.2 的来源。有 `_cn` 版 |
-| `examples/docs/05-multinode-rdma.md` | §8.2 的实测数字在它的 §5.5 |
-| `examples/DAPO/configs/dapo_dsv4_flash_*.yaml` | DSv4 的 4 个配置：4 层 1node smoke/shortsmoke、全 43 层 4node/4node_shortsmoke |
-| `examples/DeepSeekV4_OPD_MI300/` | ⚠️ **是 OPD（在线策略蒸馏）不是 RL，单节点 HF 后端，README 无任何实测数据，疑似未跑过。不要当训推分离的参考** |
+| [`../scripts/primus/README.md`](../scripts/primus/README.md) | primus 底座**八条坑的完整版**（症状 / 根因 / 诊断手法）+ 脚本用法 |
+| [`../scripts/primus/`](../scripts/primus/) | 脚本本体。每个环境变量旁边都写了为什么 |
+| [`../examples/DAPO/configs/dapo_dsv4_flash_*.yaml`](../examples/DAPO/configs/) | DSv4 的四个配置：4 层 1node smoke/shortsmoke、全 43 层 4node/4node_shortsmoke。头部注释带实测值和风险标注 |
+| [`../examples/docs/07-disaggregated-rdma.md`](../examples/docs/07-disaggregated-rdma.md) | 训推分离部署全流程（另一条线：Qwen3-30B-A3B / 2 节点 MI308X），§8.2 的来源。有 `_cn` 版 |
+| [`../examples/docs/05-multinode-rdma.md`](../examples/docs/05-multinode-rdma.md) | §8.2 的实测数字在它的 §5.5 |
 
-### 10.2 仓库外（`~/working/amd-rl-runbook/`，约 8400 行）
+⚠️ [`../examples/DeepSeekV4_OPD_MI300/`](../examples/DeepSeekV4_OPD_MI300/) **不要当参考**：
+它是 OPD（在线策略蒸馏，不是 RL）、单节点、`generation_backend: hf`，README 里**没有任何实测数据**，
+而且配置自相矛盾（注释说 BF16 需要 4+ 节点，交付的却是 `num_nodes: 1`）。疑似未跑过。
 
-按需要查的顺序：
+### 10.3 历史档案（可选，不是必需）
 
-| 文档 | 什么时候看 |
-|---|---|
-| `primus-24.04-rdma-dsv4-handoff.md` | 底座、RDMA、八条坑的**完整证据链**（§2 / §4.3 的来源） |
-| `deepseek-v4-lumenrl-full43-4node-bringup-handoff.md` | 全 43 层现状、seq 6144 卡死、前向一致性判据的推导（§5.3 / §7.1） |
-| `deepseek-v4-lumenrl-megatron-nokernel-runbook.md` | **最长的一份（1151 行），三者冲突时的准绳**。四个纯 PyTorch 实现、权重链路、判据标定 |
-| `deepseek-v4-lumenrl-memory-topology-handoff.md` | 三个显存修复的完整病历 + PP/CP 的结论（§3.3 / §5.6） |
-| `deepseek-v4-lumenrl-full43-handoff.md` | FP8 rollout 三条死路、offload A/B |
-| `deepseek-v4-miles-megatron-4node-runbook.md` | miles 对照（它跑通了什么、为什么不能抄） |
-| `dapo-lumenrl-4node-32gpu-runbook.md` §6 | RDMA 的完整排查过程 |
-| `dapo-lumenrl-native-vllm-fsdp-runbook.md` §16 | primus 上装 vLLM/Megatron 的全过程 |
+`~/working/amd-rl-runbook/` 下有 13 份 runbook / handoff（约 8400 行），是这份文档的原始素材。
+**本文档 + `agent/` 已经覆盖了它们的 DSv4 部分，正常开发不需要去翻。**
 
-⚠️ 那批 handoff 在 `.gitignore` 里（`*-handoff.md`），**不在版本控制内**。这份文档是它们
-DSv4 部分的压缩版；两边冲突时以实测日期新的为准。
+只有两种情况值得回去查：想看某条结论的**完整证据链**（比如某个 bug 的逐步排查过程），
+或者要做**非 DSv4** 的工作（Qwen3 / MoE / ATOM 那几条线）。
+
+⚠️ 那批文件在 `.gitignore` 里（`*-handoff.md`），不在版本控制内，**换机器就没了**——
+这也是为什么要把结论搬进仓库。两边冲突时**以实测日期新的为准**。
 
 ---
 
@@ -718,3 +712,4 @@ DSv4 部分的压缩版；两边冲突时以实测日期新的为准。
 | 日期 | 内容 |
 |---|---|
 | 2026-08-21 | 建档。汇总 13 份 runbook/handoff 的 DSv4 部分 + 2026-08-20/21 的 primus 迁移 + 训推分离方案调研 |
+| 2026-08-21 | 新增 [`agent/`](agent/) 五篇稳定操作手册，把机器操作和环境构建从仓库外搬进来。**本文档不再引用任何仓库外文档**。§2 / §7 / §10 相应精简，避免与 `agent/` 重复。记录开发分支 `dev/dsv4-dapo` |
