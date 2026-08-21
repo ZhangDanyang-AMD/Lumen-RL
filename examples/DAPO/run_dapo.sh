@@ -43,7 +43,22 @@ if [ -n "$_ALLOC_CONF" ]; then
 else
   unset PYTORCH_CUDA_ALLOC_CONF
 fi
-export HIP_FORCE_DEV_KERNARG=1 HSA_NO_SCRATCH_RECLAIM=1 HSA_DISABLE_FRAGMENT_ALLOCATOR=1 CUDA_DEVICE_MAX_CONNECTIONS=1
+export HIP_FORCE_DEV_KERNARG=1 HSA_NO_SCRATCH_RECLAIM=1 CUDA_DEVICE_MAX_CONNECTIONS=1
+# Same opt-out shape as PYTORCH_CUDA_ALLOC_CONF above, and for a sharper reason.
+# On ROCm 7.14 / RCCL 2.28.9 / torch 2.12 (rocm/primus:v26.4) this knob breaks
+# intra-node reduce-scatter, which is how Megatron's distributed optimizer
+# reduces gradients: the coalesced form hangs and the plain form returns correct
+# numbers while leaving the HIP context in an error state, so the step dies in
+# an unrelated one-element allocation with "CUDA error: invalid argument".
+# Bisected against every other knob on the line above plus NCCL_CUMEM_ENABLE;
+# this one reproduces on its own. all-to-all is unaffected, which is why the
+# RDMA probes never caught it. See scripts/primus/README.md.
+_FRAG_ALLOC="${HSA_DISABLE_FRAGMENT_ALLOCATOR-1}"
+if [ -n "$_FRAG_ALLOC" ]; then
+  export HSA_DISABLE_FRAGMENT_ALLOCATOR="$_FRAG_ALLOC"
+else
+  unset HSA_DISABLE_FRAGMENT_ALLOCATOR
+fi
 export VLLM_USE_V1=1 VLLM_ENABLE_V1_MULTIPROCESSING=1 VLLM_LOGGING_LEVEL=WARN ATOM_DISABLE_VLLM_PLUGIN=1
 export RAY_DEDUP_LOGS=0 RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
 export LUMEN_DISABLE_HF_ATTN_PATCH=1 MODEL_NAME="$MODEL_PATH"
