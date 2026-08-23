@@ -1,4 +1,4 @@
-# verl + LumenRL plugin: Qwen3-8B GRPO with lumenrl_fsdp2 + ATOM FP8 rollout.
+# verl + LumenRL plugin: Qwen3-8B GRPO with lumenrl_fsdp2 training + vLLM BF16 rollout.
 #
 # Inherits verl's full default config via _generated_ppo_trainer,
 # then overrides only the fields needed for the LumenRL plugin.
@@ -7,22 +7,21 @@ defaults:
   - _generated_ppo_trainer
   - _self_
 
-# use_v1 requires transfer_queue which is not on PyPI; use legacy trainer
-
-
 actor_rollout_ref:
   hybrid_engine: true
   model:
     path: ${oc.env:DATA_ROOT}/Qwen3-8B-Base
     enable_gradient_checkpointing: true
-    use_remove_padding: true
+    use_remove_padding: false
 
   actor:
     strategy: lumenrl_fsdp2
-    ppo_mini_batch_size: 128
+    ppo_mini_batch_size: 8
     ppo_micro_batch_size_per_gpu: 1
     grad_clip: 1.0
     use_torch_compile: false
+    calculate_entropy: true
+    use_kl_loss: false
     optim:
       lr: 1.0e-6
       weight_decay: 0.1
@@ -31,36 +30,40 @@ actor_rollout_ref:
     fsdp_config:
       param_offload: false
       optimizer_offload: false
+      dtype: bfloat16
 
   rollout:
-    name: atom
+    name: vllm
     mode: async
     log_prob_micro_batch_size_per_gpu: 1
     gpu_memory_utilization: 0.30
     tensor_model_parallel_size: 1
     dtype: bfloat16
-    max_model_len: 2048
+    max_model_len: 1024
     enable_chunked_prefill: true
     max_num_batched_tokens: 4096
     max_num_seqs: 64
-    quantization: fp8_per_block
+    enforce_eager: true
+    quantization: null
     temperature: 1.0
     top_p: 1.0
     top_k: -1
 
   ref:
+    strategy: lumenrl_fsdp2
     fsdp_config:
-      param_offload: true
+      param_offload: false
 
 data:
   train_files: ${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet
   val_files: ${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/aime-2024.filtered.parquet
-  train_batch_size: 128
-  max_prompt_length: 1024
-  max_response_length: 2048
+  train_batch_size: 8
+  max_prompt_length: 512
+  max_response_length: 512
 
 algorithm:
   adv_estimator: grpo
+  use_kl_in_reward: false
   filter_groups:
     enable: false
   kl_ctrl:
@@ -79,7 +82,7 @@ trainer:
   logger:
     - console
   project_name: lumenrl-plugin-verl
-  experiment_name: qwen3-8b-grpo-fsdp2-atom-fp8
+  experiment_name: qwen3-8b-grpo-lumenrl-fsdp2-vllm-bf16
   n_gpus_per_node: 8
   nnodes: 1
   save_freq: -1

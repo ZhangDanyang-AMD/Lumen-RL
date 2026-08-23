@@ -159,6 +159,289 @@ def _make_engine_classes():
         def is_optimizer_offload_enabled(self) -> bool:
             return self._inner.is_optimizer_offload_enabled
 
+        def get_per_tensor_param(self, **kwargs):
+            """Convert DTensor → plain Tensor for verl weight sync."""
+            import torch
+            items, meta = self._inner.get_per_tensor_param(**kwargs)
+            def _to_plain(it):
+                for name, param in it:
+                    if hasattr(param, "full_tensor"):
+                        yield name, param.full_tensor()
+                    elif hasattr(param, "_local_tensor"):
+                        yield name, param._local_tensor
+                    else:
+                        yield name, param
+            return _to_plain(items), meta
+
+        @staticmethod
+        def _sanitize_verl_data(data):
+            """Convert verl data formats to plain tensors LumenRL expects.
+
+            - NestedTensor → padded dense tensor
+            - Wraps data in a plain dict so LumenRL engine can freely
+              read/write without TensorDict type restrictions
+            """
+            import torch
+
+            # Convert TensorDict to plain dict for LumenRL compatibility
+            # Convert to plain dict — LumenRL engine expects dict, and
+            # we avoid TensorDict's NonTensorData/boolean conversion issues
+            plain = {}
+            has_nested = False
+            for k in list(data.keys()):
+                v = data[k]
+                if isinstance(v, torch.Tensor):
+                    if v.is_nested:
+                        has_nested = True
+                        plain[k] = torch.nested.to_padded_tensor(v, 0)
+                    else:
+                        plain[k] = v
+                elif hasattr(v, "data"):
+                    plain[k] = v.data
+                else:
+                    plain[k] = v
+
+            plain["use_packed_forward"] = False
+
+            # Build meta dict for LumenRL engine
+            meta = {}
+            for flag in ("calculate_entropy", "calculate_sum_pi_squared",
+                         "compute_loss", "use_fused_kernels",
+                         "max_token_len_per_gpu", "micro_batch_size_per_gpu"):
+                if flag in plain:
+                    meta[flag] = plain[flag]
+            if meta:
+                plain["meta"] = meta
+
+            # Ensure ppo_loss required fields
+            import torch.distributed as dist
+            if "dp_size" not in plain:
+                plain["dp_size"] = dist.get_world_size() if dist.is_initialized() else 1
+            if "batch_num_tokens" not in plain:
+                am = plain.get("attention_mask")
+                if am is not None and isinstance(am, torch.Tensor):
+                    plain["batch_num_tokens"] = int(am.sum().item())
+
+            # Reconstruct input_ids from prompts+responses
+            if has_nested:
+                prompts = plain.get("prompts")
+                responses = plain.get("responses")
+                if prompts is not None and responses is not None:
+                    new_ids = torch.cat([prompts, responses], dim=1)
+                    plain["input_ids"] = new_ids
+                    seq_len = new_ids.shape[1]
+                    plain["position_ids"] = torch.arange(
+                        seq_len, device=new_ids.device
+                    ).unsqueeze(0).expand(new_ids.shape[0], -1)
+
+            return plain
+
+        @staticmethod
+        def _restore_standard_attention():
+            """Undo LumenRL's varlen attention monkey-patch if installed."""
+            try:
+                from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+                from lumenrl.engine.training.packing import _original_attn_fn
+                if _original_attn_fn is not None:
+                    ALL_ATTENTION_FUNCTIONS["sdpa"] = _original_attn_fn
+            except (ImportError, AttributeError):
+                pass
+
+        @staticmethod
+        def _flatten_output(output, original_data):
+            """Convert padded [B, S-1] outputs to flat [total_nnz] for verl.
+
+            Uses the original TensorDict (with NestedTensor prompts/responses)
+            to compute per-sequence lengths that match verl's expectations.
+            """
+            import torch
+
+            if not isinstance(output, dict):
+                return output
+            mo = output.get("model_output", {})
+            if not isinstance(mo, dict):
+                return output
+
+            # Compute per-sequence actual lengths from original data
+            import sys
+            prompts = original_data["prompts"]
+            responses = original_data["responses"]
+            # Get total_nnz from original NestedTensor input_ids
+            input_ids_orig = original_data.get("input_ids")
+            if input_ids_orig is not None and input_ids_orig.is_nested:
+                total_nnz = input_ids_orig.values().shape[0]
+                seq_lens = input_ids_orig.offsets().diff()
+            else:
+                am = original_data["attention_mask"]
+                seq_lens = am.sum(dim=1)
+                total_nnz = int(seq_lens.sum().item())
+
+            for key in ("log_probs", "entropy", "sum_pi_squared"):
+                val = mo.get(key)
+                if val is None or not isinstance(val, torch.Tensor):
+                    continue
+                if val.dim() < 2:
+                    continue
+                # val is [B, S-1] padded; pad to [B, S] then extract per-seq
+                padded = torch.nn.functional.pad(val, (0, 1), value=0.0)
+                parts = []
+                for i in range(val.shape[0]):
+                    slen = int(seq_lens[i])
+                    parts.append(padded[i, :slen])
+                result = torch.cat(parts, dim=0)
+                import sys
+                print(f"[FLATTEN] {key}: padded={val.shape} → flat={result.shape}, seq_lens={seq_lens.tolist()}, total_nnz={total_nnz}", file=sys.stderr, flush=True)
+                mo[key] = result
+
+            return output
+
+        def _get_seq_lens(self, original_data):
+            """Get per-sequence actual token lengths from original TensorDict."""
+            import torch
+            input_ids = original_data.get("input_ids")
+            if input_ids is not None and hasattr(input_ids, "is_nested") and input_ids.is_nested:
+                return input_ids.offsets().diff()
+            am = original_data.get("attention_mask")
+            if am is not None:
+                return am.sum(dim=1)
+            return None
+
+        @staticmethod
+        def _pad_to_flat(tensor, seq_lens):
+            """Convert padded [B, S] tensor to flat [total_nnz] using seq_lens."""
+            import torch
+            if tensor is None or not isinstance(tensor, torch.Tensor) or tensor.dim() < 2:
+                return tensor
+            if tensor.shape[0] != len(seq_lens):
+                return tensor
+            parts = []
+            for i in range(tensor.shape[0]):
+                slen = min(int(seq_lens[i]), tensor.shape[1])
+                parts.append(tensor[i, :slen])
+            return torch.cat(parts, dim=0)
+
+        def _wrap_loss_function(self, loss_function, full_seq_lens):
+            """Wrap loss_function so ppo_loss sees flat [total_nnz] tensors."""
+            import torch
+            if loss_function is None:
+                return loss_function
+            pad_to_flat = self._pad_to_flat
+
+            def _wrapped(model_output, data, **kwargs):
+                # Compute seq_lens for this micro-batch from attention_mask
+                am = data.get("attention_mask")
+                if am is not None and isinstance(am, torch.Tensor) and am.dim() == 2:
+                    mb_seq_lens = am.sum(dim=1)
+                else:
+                    return loss_function(model_output=model_output, data=data, **kwargs)
+
+                # Flatten model_output tensors (log_probs, entropy)
+                if isinstance(model_output, dict):
+                    for key in list(model_output.keys()):
+                        model_output[key] = pad_to_flat(model_output[key], mb_seq_lens)
+
+                # Convert plain dict back to TensorDict for ppo_loss
+                # (ppo_loss calls data.select().to_padded_tensor())
+                if isinstance(data, dict) and not hasattr(data, "select"):
+                    from tensordict import TensorDict as TD, NonTensorData as NTD
+                    td_items = {}
+                    B = int(mb_seq_lens.shape[0])
+                    # Use CUDA device — model_output tensors are on GPU
+                    device = torch.device("cuda")
+                    for k, v in data.items():
+                        if isinstance(v, torch.Tensor):
+                            td_items[k] = v.to(device)
+                        else:
+                            td_items[k] = NTD(v)
+                    data = TD(td_items, batch_size=[B], device=device)
+
+                return loss_function(model_output=model_output, data=data, **kwargs)
+
+            return _wrapped
+
+        @staticmethod
+        def _sanitize_metrics(output):
+            """Convert Metric objects to lists of floats for verl compatibility.
+
+            verl's _postprocess_output expects each metric value to be a list
+            (one element per micro-batch) and uses chain.from_iterable to flatten.
+            """
+            if not isinstance(output, dict):
+                return output
+            # Wrap loss values: verl expects list-of-lists for flattening
+            loss = output.get("loss")
+            if isinstance(loss, list) and loss and not isinstance(loss[0], list):
+                output["loss"] = [[x] if isinstance(x, (int, float)) else x for x in loss]
+
+            # Fix all list values in output to be list-of-lists
+            # (verl's train_mini_batch uses chain.from_iterable to flatten)
+            for top_key in list(output.keys()):
+                val = output[top_key]
+                if isinstance(val, list) and val and isinstance(val[0], (int, float)):
+                    output[top_key] = [[x] for x in val]
+
+            metrics = output.get("metrics")
+            if isinstance(metrics, dict):
+                for k, v in list(metrics.items()):
+                    if isinstance(v, list):
+                        # Ensure list-of-lists and convert Metric objects
+                        fixed = []
+                        for item in v:
+                            if isinstance(item, list):
+                                fixed.append(item)
+                            elif isinstance(item, (int, float)):
+                                fixed.append([item])
+                            elif hasattr(item, "value"):
+                                fixed.append([float(item.value)])
+                            elif hasattr(item, "item"):
+                                fixed.append([item.item()])
+                            else:
+                                try:
+                                    fixed.append([float(item)])
+                                except (TypeError, ValueError):
+                                    fixed.append([0.0])
+                        metrics[k] = fixed
+                    elif hasattr(v, "value"):
+                        metrics[k] = [[float(v.value)]]
+                    elif hasattr(v, "item"):
+                        metrics[k] = [[v.item()]]
+                    elif isinstance(v, (int, float)):
+                        metrics[k] = [[v]]
+                    else:
+                        try:
+                            metrics[k] = [[float(v)]]
+                        except (TypeError, ValueError):
+                            metrics[k] = [[0.0]]
+            return output
+
+        def train_batch(self, data, *args, **kwargs):
+            seq_lens = self._get_seq_lens(data)
+            plain = self._sanitize_verl_data(data)
+            self._restore_standard_attention()
+
+            # Wrap loss_function to flatten padded → flat for ppo_loss
+            if args:
+                args = list(args)
+                args[0] = self._wrap_loss_function(args[0], seq_lens)
+            elif "loss_function" in kwargs:
+                kwargs["loss_function"] = self._wrap_loss_function(kwargs["loss_function"], seq_lens)
+
+            output = self._inner.train_batch(plain, *args, **kwargs)
+            output = self._sanitize_metrics(output)
+            return self._flatten_output(output, data)
+
+        def infer_batch(self, data, *args, **kwargs):
+            plain = self._sanitize_verl_data(data)
+            self._restore_standard_attention()
+            output = self._inner.infer_batch(plain, *args, **kwargs)
+            return self._flatten_output(output, data)
+
+        def forward_backward_batch(self, data, *args, **kwargs):
+            plain = self._sanitize_verl_data(data)
+            self._restore_standard_attention()
+            output = self._inner.forward_backward_batch(plain, *args, **kwargs)
+            return self._flatten_output(output, data)
+
     # Dynamically add forwarding methods for all BaseEngine abstract methods
     for _mname in _delegate_methods:
         if _mname not in _LumenRLFSDP2Engine.__dict__:
