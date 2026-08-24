@@ -1,17 +1,22 @@
 # verl + LumenRL Plugin: Qwen3-8B GRPO
 
-Tested: verl 0.9.0 with LumenRL `lumenrl_fsdp2` training engine and vLLM BF16
-rollout, 3-step GRPO training on Qwen3-8B-Base, 8x MI300X GPUs.
+Tested with two rollout backends on verl 0.9.0 + LumenRL `lumenrl_fsdp2`
+training engine, 3-step GRPO on Qwen3-8B-Base, 8x MI300X GPUs:
+
+| Rollout | Config | Time | Docker tag |
+|---|---|---|---|
+| vLLM BF16 | `qwen3_8b_grpo_fp8.yaml` | 1m13s | `verlv0.9.0-lumenrl-plugin-example260820` |
+| ATOM BF16 | `qwen3_8b_grpo_atom.yaml` | 2m57s | `verlv0.9.0-lumenrl-plugin-ATOM-example260824` |
 
 ## What the plugin registers
 
 On `import verl`, verl auto-discovers the LumenRL entry-point and runs
 `lumenrl.plugin.verl.register:register()`, which:
 
-1. **`lumenrl_fsdp2` training engine** in verl's `EngineRegistry` -- wraps
+1. **`lumenrl_fsdp2` training engine** in verl's `EngineRegistry` — wraps
    LumenRL's `FSDP2Engine` as a verl `BaseEngine` subclass.
-2. **`atom` rollout** in verl's `RolloutReplicaRegistry` -- ATOM rollout
-   adapter (future ATOM support; not used in the tested config).
+2. **`atom` rollout** in verl's `RolloutReplicaRegistry` — ATOM rollout
+   adapter backed by `ATOMRayServer` with verl-compatible `generate()`.
 3. **vLLM rollout** works out of the box via verl's native vLLM support
    (`rollout.name: vllm` in the yaml).
 
@@ -94,10 +99,86 @@ Monitor logs:
 docker logs -f lumenrl-verl-test
 ```
 
+### Option A2: ATOM rollout (tested)
+
+Uses ATOM as the inference engine instead of vLLM. Pre-built image:
+
+```
+zhangdanyangamd/lumen-rl:verlv0.9.0-lumenrl-plugin-ATOM-example260824
+```
+
+**Important**: ATOM requires pre-compiled aiter kernels. Run a warmup
+generate in the container before launching the verl flow:
+
+```bash
+git clone https://github.com/ZhangDanyang-AMD/Lumen-RL.git
+cd Lumen-RL
+
+# Start container
+docker run -d \
+  --network=host --ipc=host \
+  --device /dev/kfd --device /dev/dri --group-add video \
+  --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+  --shm-size 64g --tmpfs /tmp/ray:size=1g \
+  -v $DATA_ROOT:/data \
+  -v $(pwd):/workspace/Lumen-RL \
+  -e DATA_ROOT=/data \
+  --name lumenrl-atom-test \
+  --entrypoint bash \
+  zhangdanyangamd/lumen-rl:verlv0.9.0-lumenrl-plugin-ATOM-example260824 \
+  -lc 'sleep infinity'
+
+# Step 1: Pre-compile aiter kernels (one-time, ~5 min)
+docker exec lumenrl-atom-test bash -c '
+  export PYTHONPATH=/app/ATOM CUDA_VISIBLE_DEVICES=0
+  python3 -c "
+from atom.rollout.async_engine import AsyncLLMEngine
+from atom.sampling_params import SamplingParams
+e = AsyncLLMEngine(model=\"/data/Qwen3-8B-Base\", tensor_parallel_size=1,
+    enforce_eager=True, gpu_memory_utilization=0.3, max_model_len=512, max_num_seqs=32)
+e.generate([list(range(100))], SamplingParams(max_tokens=5, temperature=0.0), request_ids=[\"warmup\"])
+print(\"Kernel pre-compilation done\")
+"'
+
+# Step 2: Install verl + LumenRL (backup/restore ROCm torch)
+docker exec lumenrl-atom-test bash -c '
+  cp -a /opt/venv/lib/python3.12/site-packages/torch /tmp/_t
+  pip install -q verl "transformers>=5.5.3,<5.11,!=5.6.0"
+  rm -rf /opt/venv/lib/python3.12/site-packages/torch
+  mv /tmp/_t /opt/venv/lib/python3.12/site-packages/torch
+  rm -rf /opt/venv/lib/python3.12/site-packages/nvidia* /opt/venv/lib/python3.12/site-packages/cuda*
+  pip install -q amdsmi cachetools
+  git config --global --add safe.directory /workspace/Lumen-RL
+  cd /workspace/Lumen-RL && pip install -e ".[test]" --no-deps
+  sed -i "s/assert self\.strategy in \[\"fsdp\", \"fsdp2\"\].*/# removed/" \
+    "$(pip show verl | awk "/^Location:/{print \$2}")/verl/workers/config/engine.py"
+'
+
+# Step 3: Launch ATOM flow
+docker exec -d lumenrl-atom-test bash -lc '
+  export PYTHONPATH=/workspace/Lumen-RL:/app/ATOM PYTHONDONTWRITEBYTECODE=1
+  export DATA_ROOT=/data CONFIG=examples/plugin/verl/qwen3_8b_grpo_atom.yaml STEPS=3
+  export PYTHONUNBUFFERED=1 RAY_DEDUP_LOGS=0 HYDRA_FULL_ERROR=1 RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+  unset CUDA_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES HIP_VISIBLE_DEVICES
+  cd /workspace/Lumen-RL && bash examples/plugin/verl/run.sh
+'
+```
+
+ATOM-specific notes:
+- Kernel pre-compilation is required on first run (cached for subsequent runs)
+- ATOM uses `max_concurrency=1` to avoid shm broadcast deadlock
+- Sleep/wake_up is disabled (ATOM keeps weights resident on its dedicated GPU)
+- Step 1 is slower (~90s) due to JIT; steps 2-3 are ~40s each
+
 **Step 3 (optional) -- Build your own image**
 
 ```bash
+# vLLM base:
 docker build -f examples/plugin/verl/Dockerfile.test -t lumenrl-verl-plugin .
+
+# ATOM base:
+docker build --build-arg BASE_IMAGE=zhangdanyangamd/lumen-rl:qwen3-30b-a3b-308x-actor260805 \
+  -f examples/plugin/verl/Dockerfile.test -t lumenrl-atom-plugin .
 ```
 
 ### Option B: Run without Docker
@@ -123,18 +204,18 @@ DATA_ROOT=/data bash examples/plugin/verl/run.sh
 
 ## Configuration
 
-`examples/plugin/verl/qwen3_8b_grpo_fp8.yaml` inherits verl defaults via
-Hydra (`defaults: [_generated_ppo_trainer, _self_]`) and overrides only what
-the LumenRL plugin needs:
+Both configs inherit verl defaults via Hydra
+(`defaults: [_generated_ppo_trainer, _self_]`):
 
-| Parameter | Value | Notes |
+| Parameter | vLLM config | ATOM config |
 |---|---|---|
-| Training engine | `lumenrl_fsdp2` | `actor.strategy` and `ref.strategy` |
-| Rollout | `vllm` (BF16) | verl-native vLLM, async mode |
-| Batch size | 8 prompts | `train_batch_size: 8` |
-| Learning rate | 1e-6 | Constant schedule, 10-step warmup |
-| Max prompt / response | 512 / 512 | Smoke-test setting |
-| Trainer | v0 legacy | `use_v1: false` (see known issues) |
+| Config file | `qwen3_8b_grpo_fp8.yaml` | `qwen3_8b_grpo_atom.yaml` |
+| Training engine | `lumenrl_fsdp2` | `lumenrl_fsdp2` |
+| Rollout | `vllm` (BF16) | `atom` (BF16) |
+| Batch size | 8 | 8 |
+| Learning rate | 1e-6 | 1e-6 |
+| Max prompt / response | 512 / 512 | 512 / 512 |
+| Trainer | v0 legacy | v0 legacy |
 
 ## Health check
 
