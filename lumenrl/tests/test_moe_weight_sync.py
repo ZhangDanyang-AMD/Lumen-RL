@@ -347,6 +347,39 @@ def test_verify_accepts_a_correct_load_and_rejects_a_corrupt_one():
         os.environ.pop("LUMENRL_WEIGHT_SYNC_VERIFY", None)
 
 
+def test_coverage_credits_the_shortened_container_name():
+    """A fused expert param reported without the ``routed_experts`` segment counts.
+
+    RoutedExperts.load_weights yields names relative to the FusedMoE layer, and
+    AutoWeightsLoader prefixes them with the FusedMoE's path, so vLLM reports
+    ``...experts.w13_weight`` for a parameter that named_parameters() calls
+    ``...experts.routed_experts.w13_weight``.
+    """
+    inner = FakeModel()
+    reported = {n for n, _ in inner.named_parameters()}   # what vLLM hands back
+    assert any(n.endswith("w13_weight") for n in reported)
+
+    class NestedExpertNames(nn.Module):
+        """Exposes the deeper paths real vLLM registers the buffers under."""
+
+        def named_parameters(self, *args, **kwargs):
+            for name, param in inner.named_parameters(*args, **kwargs):
+                yield name.replace(".experts.w", ".experts.routed_experts.w"), param
+
+    model = NestedExpertNames()
+    assert_weight_sync_coverage(model, reported, context="test")
+
+    # Aliasing must not become a blanket amnesty: drop the fused params from the
+    # reported set and they have to come back as missing.
+    withheld = {n for n in reported if n.endswith("w13_weight")}
+    try:
+        assert_weight_sync_coverage(model, reported - withheld, context="test")
+    except RuntimeError as exc:
+        assert "w13_weight" in str(exc)
+    else:
+        raise AssertionError("aliasing must not hide a parameter nobody loaded")
+
+
 def test_coverage_modes_are_configurable():
     model = FakeModel()
     previous = os.environ.get("LUMENRL_WEIGHT_SYNC_CHECK")
