@@ -84,16 +84,30 @@ class CheckpointCallback(Callback):
         if getattr(trainer, "_use_ray_controller", False) and getattr(trainer, "_actor_wg", None) is not None:
             self._save_ray_controller_checkpoint(trainer, global_step, metrics)
             return
-        self.save_now(trainer, step, metrics)
+        self._save_standard_checkpoint(trainer, global_step, metrics)
 
     def save_now(self, trainer: "RLTrainer", step: int, metrics: dict[str, float]) -> None:
-        """Write a checkpoint regardless of ``save_interval``.
+        """Write a one-based checkpoint step regardless of ``save_interval``.
 
         Callers that know a particular moment is worth preserving — the end of a
         batch-alternating round, say — use this so an unlucky step number cannot
         silently skip the save. Must be called on every rank: the state is built
         collectively even though only rank 0 writes it.
         """
+        global_step = int(step)
+        if global_step <= 0:
+            return
+        if getattr(trainer, "_use_ray_controller", False) and getattr(trainer, "_actor_wg", None) is not None:
+            self._save_ray_controller_checkpoint(trainer, global_step, metrics)
+            return
+        self._save_standard_checkpoint(trainer, global_step, metrics)
+
+    def _save_standard_checkpoint(
+        self,
+        trainer: "RLTrainer",
+        global_step: int,
+        metrics: dict[str, float],
+    ) -> None:
         rank = trainer._rank
         ckpt_dir = Path(self.checkpoint_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -106,15 +120,32 @@ class CheckpointCallback(Callback):
         }
 
         model = getattr(trainer, "_actor_model", None) or getattr(trainer, "_draft_model", None)
-
-        if model is not None:
-            state["model_state_dict"] = {
-                k: v.cpu() for k, v in model.state_dict().items()
-            }
-
         opt = trainer._optimizer
+
+        # A plain state_dict() contains only rank 0's shard under fully_shard.
+        # Build the full CPU state collectively on every rank before rank 0 writes.
+        if model is not None:
+            if getattr(trainer, "_is_distributed", False):
+                from torch.distributed.checkpoint.state_dict import (
+                    StateDictOptions,
+                    get_model_state_dict,
+                    get_optimizer_state_dict,
+                )
+
+                options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+                state["model_state_dict"] = get_model_state_dict(model, options=options)
+                if opt is not None:
+                    state["optimizer_state_dict"] = get_optimizer_state_dict(
+                        model, opt, options=options,
+                    )
+            else:
+                state["model_state_dict"] = {
+                    k: v.cpu() for k, v in model.state_dict().items()
+                }
+                if opt is not None:
+                    state["optimizer_state_dict"] = opt.state_dict()
+
         if opt is not None:
-            state["optimizer_state_dict"] = opt.state_dict()
             if hasattr(opt, "fp32_params"):
                 state["fp32_params"] = [p.data.cpu().clone() for p in opt.fp32_params]
             if hasattr(opt, "scheduler"):
@@ -125,15 +156,63 @@ class CheckpointCallback(Callback):
             n_fp32 = len(state.get("fp32_params", []))
             logger.info(
                 "Saving checkpoint step=%d: %d model keys, %d fp32 params, opt=%s, sched_epoch=%s",
-                step, n_model, n_fp32,
+                global_step, n_model, n_fp32,
                 "yes" if "optimizer_state_dict" in state else "no",
                 state.get("scheduler_last_epoch", "N/A"),
             )
-            self._manager.save(state, path, step)
-            self._prune_old_checkpoints(ckpt_dir)
+            self._prune_old_checkpoints(
+                ckpt_dir, keep=self.save_total_limit - 1,
+            )
+            self._manager.save(state, path, global_step)
 
         if trainer._is_distributed:
             torch.distributed.barrier()
+
+    def _save_ray_controller_checkpoint(
+        self,
+        trainer: "RLTrainer",
+        global_step: int,
+        metrics: dict[str, float],
+    ) -> None:
+        ckpt_root = Path(self.checkpoint_dir)
+        step_dir = ckpt_root / f"global_step_{global_step}"
+        actor_dir = step_dir / "actor"
+        ckpt_root.mkdir(parents=True, exist_ok=True)
+        self._prune_old_ray_checkpoints(
+            ckpt_root, keep=self.save_total_limit - 1,
+        )
+        trainer._actor_wg.execute_all_sync(
+            "prune_checkpoints",
+            str(ckpt_root),
+            max(0, self.save_total_limit - 1),
+        )
+        actor_dir.mkdir(parents=True, exist_ok=True)
+        trainer._actor_wg.execute_all_sync(
+            "save_checkpoint", str(actor_dir), global_step=global_step,
+        )
+        meta = {
+            "step": global_step,
+            "metrics": metrics,
+            "algo": trainer.config.algorithm.name,
+            "format": "verl_ray_sharded",
+        }
+        self._manager.save(
+            meta, step_dir / f"checkpoint_{global_step}.pt", global_step,
+        )
+        (ckpt_root / "latest_checkpointed_iteration.txt").write_text(
+            str(global_step), encoding="utf-8",
+        )
+        logger.info(
+            "Saved Ray checkpoint to %s (global_step=%d)",
+            step_dir,
+            global_step,
+        )
+        self._prune_old_ray_checkpoints(ckpt_root)
+        trainer._actor_wg.execute_all_sync(
+            "prune_checkpoints",
+            str(ckpt_root),
+            self.save_total_limit,
+        )
 
     @staticmethod
     def _verify_checkpoint(path: Path, model, opt, step: int) -> None:
@@ -176,7 +255,10 @@ class CheckpointCallback(Callback):
         except Exception as exc:
             logger.warning("CKPT VERIFY ERROR step=%d: %s", step, exc)
 
-    def _prune_old_checkpoints(self, ckpt_dir: Path) -> None:
+    def _prune_old_checkpoints(
+        self, ckpt_dir: Path, keep: int | None = None,
+    ) -> None:
+        keep = self.save_total_limit if keep is None else max(0, keep)
         pattern = re.compile(r"checkpoint_(\d+)\.pt$")
         ckpts: list[tuple[int, Path]] = []
         for p in ckpt_dir.iterdir():

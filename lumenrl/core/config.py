@@ -711,25 +711,6 @@ class RewardConfig:
 
 
 @dataclass
-class DatasetConfig:
-    """Dataset preprocessing configuration for speculative distillation."""
-    chat_template: str = ""
-    last_turn_loss_only: str = "false"    # "true", "false", or "auto"
-    min_loss_tokens: int = 0
-    num_preprocess_workers: int = 16
-    cache_dir: str = "/dev/shm/lumenrl_cache"
-
-
-@dataclass
-class EvalConfig:
-    """Validation / evaluation configuration."""
-    enabled: bool = False
-    interval: int = 1000
-    num_samples: int = 256
-    micro_batch_size: int = 8
-
-
-@dataclass
 class CriticConfig:
     """Configuration for the critic (value) network used by PPO/GAE."""
     enabled: bool = False
@@ -744,8 +725,10 @@ class CriticConfig:
 
 @dataclass
 class DatasetConfig:
+    """Dataset preprocessing configuration for speculative distillation."""
+
     chat_template: str = ""
-    last_turn_loss_only: str = "false"
+    last_turn_loss_only: str = "false"    # "true", "false", or "auto"
     min_loss_tokens: int = 0
     num_preprocess_workers: int = 16
     cache_dir: str = "/dev/shm/lumenrl_cache"
@@ -765,6 +748,8 @@ class DatasetConfig:
 
 @dataclass
 class EvalConfig:
+    """Validation / evaluation configuration."""
+
     enabled: bool = False
     interval: int = 1000
     num_samples: int = 256
