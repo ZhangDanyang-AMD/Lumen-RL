@@ -102,6 +102,11 @@ python3 ~/dsv4/mhc_probe/make_native_bf16.py \
   primus 镜像自带的是 4.55.0。stage 1–4 全过、只有 stage 5 报 `ModuleNotFoundError`，
   很容易误判成转换器的问题。
 
+⚠️⚠️ **两个重建脚本的 `MILES_IMAGE` 默认 tag 都是 `...20260803`，而机器上未必有它。**
+2026-08-21 在 093 上就没有，必须显式传 `...20260730`（下面 §2.2 认证过 stage 3/4 两个文件都在的
+那个）。**这两个脚本都不检查镜像存不存在**，传错了要等到该 stage 才失败。
+开工前先 `docker images | grep sgl-dev` 看一眼实际有哪个 tag。
+
 ### 2.2 ⚠️ miles 镜像认 tag 不认名字
 
 stage 3/4 要在 miles 镜像里跑（只有它有 fork 的转换器）。**但不是所有 miles 镜像都完整**：
@@ -130,7 +135,15 @@ CONTAINER=anp-primus SITE=$PRIMUS_SITE MILES_IMAGE=<完整的那个> STAGE=1 STO
 | 4 | `-bf16-native` | 530 G |
 
 **合计约 1.9 TB / 节点**，两节点并行实测约 **1 小时**（stage 1 已有的话更快）。
-`STAGE=n` 从中间续；`STOP=3` 只产探针要的两份（省 530 G）。
+`STAGE=n` 从中间续。
+
+⚠️ **`STOP=3` 那句「只产探针要的两份」只对 `probe_66/70` 成立**。
+`probe_67` 要 `-bf16-native`、`probe_68` 三份全要，所以做 §9.1 的 43 层探针必须 `STOP=4`。
+
+✅ **stage 1 是和 4 层切片共用的**（同一个 `DeepSeek-V4-Flash-Base` 目录）。
+**先做切片就等于把全模型的 275 G 下载也做了**，之后 `STAGE=2 STOP=4` 实测只要
+**13 分钟**（2026-08-21，job 38218 单节点）——不是头注释估的 50 分钟。
+所以在一台空盘机器上的正确顺序是：先切片（18 分钟拿到可迭代的产物），再全 43 层（+13 分钟）。
 
 **核对判据**（每个节点都要跑，`/mnt/m2m_nobackup` 是节点本地盘）：
 
