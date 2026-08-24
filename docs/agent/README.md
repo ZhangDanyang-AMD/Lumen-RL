@@ -6,6 +6,22 @@
 
 ---
 
+## 一句话：现在卡在哪
+
+**除了「拿到 4 节点」，已知的阻塞项都清掉了。**
+数值正确性、显存、底座、权重同步通路、全 43 层的加载层——五块都已封闭并有实测
+（[`dsv4_agent.md`](dsv4_agent.md) §0 的「已封闭」表）。
+唯一卡住整件事的是**全 43 层端到端从没跑通**，而它的直接后果是 43 层的
+`rollout_corr/kl` 至今未知——那是判断这个模型能不能做 RL 的核心指标。
+
+⚠️ **如果你手上只有一台机器**：能做的都在 §9.1，现在只剩四项（归档、safetensors 补
+version 校验、43 层 AITER=0 的对照、单机 RDMA）。**不要重开 §9.1 顶部那八项已关闭的**。
+
+⚠️ **如果你拿到了 4 节点**：第一件事是 §9.2-1（逐对压那 6 对节点，15 分钟出结果），
+**排在端到端前面**——§5.3 那个 seq 6144 卡死最像「有一对节点在大流量下坏掉」。
+
+---
+
 ## 新 agent 的最短路径
 
 1. [`01-cluster-access.md`](01-cluster-access.md) —— 先能连上机器
@@ -46,7 +62,9 @@
 | 位置 | 什么时候才需要 |
 |---|---|
 | [`../../scripts/primus/`](../../scripts/primus/) | 脚本和探针的**本体**。要改配方时看，每个环境变量旁边都写了原因 |
-| [`../../examples/DAPO/configs/dapo_dsv4_flash_*.yaml`](../../examples/DAPO/configs/) | DSv4 的四个配置。要改超参或拓扑时看 |
+| [`../../examples/DAPO/configs/dapo_dsv4_flash_*.yaml`](../../examples/DAPO/configs/) | DSv4 的五个配置。要改超参或拓扑时看 |
+| [`../../examples/DAPO/configs/dapo_qwen3moe_a3b_dsv4stack_1node_smoke.yaml`](../../examples/DAPO/configs/) | **诊断用**：Qwen3-MoE 跑在 DSv4 的栈上，分离「模型的问题」和「基础设施的问题」。见 [`dsv4_agent.md`](dsv4_agent.md) §3.9 |
+| [`../../scripts/primus/run_dsv4_dapo_1node.sh`](../../scripts/primus/) | 单节点 DSv4 DAPO 的 primus 版启动器。⚠️ `~/4node/07_dsv4_megatron_1node.sh` 是 22.04 时代的，在 primus 上有两行是致命的，别用 |
 | [`../../examples/docs/07-disaggregated-rdma.md`](../../examples/docs/07-disaggregated-rdma.md) | **只有真要搭训推分离时**才需要（那是另一条线的部署全流程）。机制本身 [`dsv4_agent.md`](dsv4_agent.md) §8 已经讲清楚了 |
 | `~/working/amd-rl-runbook/` | 13 份历史 runbook，本目录的原始素材。**不在版本控制内，换机器就没了**。只有想看某条结论的完整证据链，或要做非 DSv4 的工作时才回去翻 |
 

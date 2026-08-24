@@ -32,6 +32,26 @@
 | `probe_65` | offload 下 fp32 参数有没有更新 | **27/27**（切片）/ **261/261**（全模型），**MIN all-reduce 取 worst rank** | 切片或全模型 |
 | **`probe_67`** | vLLM 能不能读 `-bf16-native` | 加载成功 + exit 0 + **记运行期峰值显存**。⚠️ 全 43 层上才看「三题答对」 | `-bf16-native` |
 | **`probe_68`**（`run_probe_68_full43.sh`） | 权重同步**发送侧**的名字和形状 | **`0 missing / 0 extra / 0 SHAPE MISMATCH`** + `WEIGHT SYNC SHAPES: PASS` | `-bf16` + `_torch_dist` + `-bf16-native` |
+
+**2026-08-21 全 43 层在 primus 上的实测**（单节点，job 38218，`build_optimizer: False`
+所以不需要那 426 GB/rank 的优化器）：
+
+| 探针 | 结果 | 耗时 |
+|---|---|---|
+| `probe_68` TP=1 / EP=8 | `0/0/0` + PASS，rc=0 | 约 2 分 18 秒 |
+| `probe_68` TP=2 / EP=4 | `0/0/0` + PASS，rc=0 | 约 2 分 56 秒 |
+| `probe_67` | `exit=0`、45/45 分片、**三题答对**（Paris / 101 / 光谱）、峰值 **57.3–58.6 GiB/卡**（872 个运行期采样点） | 约 9 分钟 |
+
+⚠️ **`probe_67` 的峰值别和「FP8 rollout 36 GB/卡」混淆**：36 是纯权重估算，58.6 是整个引擎
+实测（含 KV cache、激活、`util=0.18` 的预留）。**做显存预算用后者。**
+
+⚠️ **`run_probe_67.sh` 不覆盖 `VLLM_ROCM_USE_AITER`**（`run_dapo.sh` 会覆盖成 0），
+所以那一跑是 AITER=1 + seq 6144 + 43 层。**这不等于 43 层需要 AITER**，AITER=0 的对照没做。
+
+⚠️⚠️ **别在 `spur exec` 的前台跑这两个探针。** 客户端一中断就把它打死，而且会留下
+**占着约 300 GB 显存**的孤儿（[`05`](05-operational-pitfalls.md) 的孤儿进程那条）。
+2026-08-21 真踩了一次，`probe_67` 在加载第 28/45 个分片时被打断。
+用 [`01`](01-cluster-access.md) §11 的「本地 `setsid nohup` 脱离 + 远端保持前台」。
 | `probe_69` | 拓扑正确性（PP / CP） | `max \|Δ log-prob\|` vs **同 EP 同 REPEAT** 的基线逐位为 0 | 切片 |
 | **`probe_70`** | 前向逐层一致性 | 第一个发散层 `ulp@max` 约 1–2、`n_diff` 约 6e-05 → **ROUNDING** | `-bf16` + `_torch_dist` |
 | `probe_66` | 全模型一步 DAPO（无 rollout） | `loss` / `grad_norm` / `261/261` / 困惑度 **2.88** | 全 43 层 |
