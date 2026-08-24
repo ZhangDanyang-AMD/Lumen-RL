@@ -29,7 +29,11 @@ from lumenrl.algorithms.loss_functions import (
     policy_gradient_loss,
     sft_loss,
 )
-from lumenrl.utils.checkpoint import checkpoint_rank_phases, run_checkpoint_phase
+from lumenrl.utils.checkpoint import (
+    checkpoint_rank_phases,
+    create_checkpoint_control_group,
+    run_checkpoint_phase,
+)
 from lumenrl.core.protocol import DataProto
 from lumenrl.core.types import AlgorithmName, TrainingBackend
 from lumenrl.engine.training.base_engine import BaseEngine, EngineRegistry
@@ -1399,12 +1403,22 @@ class LumenActorWorker(BaseWorker):
             except (OSError, AttributeError):
                 pass
 
-        for active_ranks in checkpoint_rank_phases(rank, world):
-            run_checkpoint_phase(
+        checkpoint_group = create_checkpoint_control_group(world)
+        try:
+            for active_ranks in checkpoint_rank_phases(
                 rank,
                 world,
-                _load_rank_state if rank in active_ranks else None,
-            )
+                group=checkpoint_group,
+            ):
+                run_checkpoint_phase(
+                    rank,
+                    world,
+                    _load_rank_state if rank in active_ranks else None,
+                    group=checkpoint_group,
+                )
+        finally:
+            if checkpoint_group is not None:
+                torch.distributed.destroy_process_group(checkpoint_group)
         return global_step
 
     def update_weights_ipc_send(

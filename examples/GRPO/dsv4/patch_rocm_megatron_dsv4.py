@@ -1205,6 +1205,81 @@ def patch_distrib_optimizer_hdo_checkpoint(megatron_root: str) -> bool:
         )
         content = content.replace(build_anchor, remap, 1)
 
+    torch_hdo_step_marker = "Torch-backed HDO checkpoint uses a canonical Adam step"
+    if torch_hdo_step_marker not in content:
+        torch_step_block = (
+            '            steps = list(set([s["step"].item() '
+            'for s in inner_state_dict["state"].values()]))\n'
+            "            assert len(steps) == 1\n"
+            "            step = steps[0]"
+        )
+        if torch_step_block not in content:
+            raise RuntimeError(
+                "Unable to patch Torch-backed HDO checkpoint step: "
+                "extraction anchor missing"
+            )
+        canonical_torch_step_block = (
+            "            # Torch-backed HDO checkpoint uses a canonical Adam step.\n"
+            + torch_step_block.splitlines()[0]
+            + "\n"
+            "            if len(steps) > 1 and isinstance(\n"
+            "                self.optimizer, HybridDeviceOptimizer\n"
+            "            ):\n"
+            "                logger.warning(\n"
+            '                    "canonicalizing divergent HDO Adam steps: "\n'
+            '                    "minimum=%s maximum=%s unique_count=%s",\n'
+            "                    min(steps),\n"
+            "                    max(steps),\n"
+            "                    len(steps),\n"
+            "                )\n"
+            "            else:\n"
+            "                assert len(steps) == 1\n"
+            "            step = max(steps)"
+        )
+        content = content.replace(
+            torch_step_block,
+            canonical_torch_step_block,
+            1,
+        )
+
+    step_marker = "canonicalizing divergent HDO Adam steps"
+    if step_marker not in content:
+        step_prefix = (
+            '                    steps = list(set([s["step"].item() '
+            'for s in optimizer.state.values()]))\n'
+        )
+        step_suffixes = (
+            "                    assert len(steps) == 1\n"
+            "                    step = steps[0]",
+            '                    assert len(steps) == 1, f"steps: '
+            '{optimizer.state}"\n'
+            "                    step = steps[0]",
+        )
+        old_step_block = next(
+            (
+                step_prefix + suffix
+                for suffix in step_suffixes
+                if step_prefix + suffix in content
+            ),
+            None,
+        )
+        if old_step_block is None:
+            raise RuntimeError(
+                "Unable to patch HDO checkpoint step: extraction anchor missing"
+            )
+        canonical_step_block = step_prefix + (
+            "                    if len(steps) > 1:\n"
+            "                        logger.warning(\n"
+            '                            "canonicalizing divergent HDO Adam steps: "\n'
+            '                            "minimum=%s maximum=%s unique_count=%s",\n'
+            "                            min(steps),\n"
+            "                            max(steps),\n"
+            "                            len(steps),\n"
+            "                        )\n"
+            "                    step = max(steps)"
+        )
+        content = content.replace(old_step_block, canonical_step_block, 1)
+
     fast_path_marker = "DP=1 HDO checkpoint state in place"
     if fast_path_marker not in content:
         split_anchor = "            self.split_state_dict_if_needed(state_dict)"
@@ -1231,6 +1306,18 @@ def patch_distrib_optimizer_hdo_checkpoint(megatron_root: str) -> bool:
                     "DP=1 HDO checkpoint validation failed: "
                     f"gbuf={gbuf} dtype={dtype} bucket={bucket} "
                     f"key={key} param={param}: {reason}"
+                )
+
+            moment_dtype = getattr(
+                self.optimizer, "_lumen_streamed_adam_moment_dtype", None
+            )
+            if moment_dtype not in (None, torch.float32, torch.bfloat16):
+                raise ValueError(
+                    validation_message(
+                        "streamed Adam moment dtype must be float32 or bfloat16",
+                        gbuf="all",
+                        key="moment_dtype",
+                    )
                 )
 
             # Validate the complete layout before mutating any optimizer state.
@@ -1507,6 +1594,25 @@ def patch_distrib_optimizer_hdo_checkpoint(megatron_root: str) -> bool:
                                         model_param
                                     )[key]
                                 )
+                                if (
+                                    key in ("exp_avg", "exp_avg_sq")
+                                    and moment_dtype is not None
+                                    and destination.dtype != moment_dtype
+                                ):
+                                    group_index, group_order = (
+                                        self.model_param_group_index_map[model_param]
+                                    )
+                                    optimizer_param = self.optimizer.param_groups[
+                                        group_index
+                                    ]["params"][group_order]
+                                    destination = torch.empty_like(
+                                        destination,
+                                        dtype=moment_dtype,
+                                        device="cpu",
+                                    )
+                                    self.optimizer.state[optimizer_param][key] = (
+                                        destination
+                                    )
                                 source_range = param_range_map.get(
                                     "gbuf_world_in_bucket",
                                     param_range_map["gbuf_world"],
@@ -1532,6 +1638,79 @@ def patch_distrib_optimizer_hdo_checkpoint(megatron_root: str) -> bool:
             return
 '''
         content = content.replace(split_anchor, fast_path, 1)
+
+    moment_setup = '''
+            moment_dtype = getattr(
+                self.optimizer, "_lumen_streamed_adam_moment_dtype", None
+            )
+            if moment_dtype not in (None, torch.float32, torch.bfloat16):
+                raise ValueError(
+                    validation_message(
+                        "streamed Adam moment dtype must be float32 or bfloat16",
+                        gbuf="all",
+                        key="moment_dtype",
+                    )
+                )
+'''
+    if moment_setup not in content:
+        setup_anchor = '''                return (
+                    "DP=1 HDO checkpoint validation failed: "
+                    f"gbuf={gbuf} dtype={dtype} bucket={bucket} "
+                    f"key={key} param={param}: {reason}"
+                )
+'''
+        if setup_anchor not in content:
+            raise RuntimeError(
+                "Unable to upgrade HDO checkpoint load: validation anchor missing"
+            )
+        content = content.replace(
+            setup_anchor,
+            setup_anchor + moment_setup,
+            1,
+        )
+
+    moment_migration = '''
+                                if (
+                                    key in ("exp_avg", "exp_avg_sq")
+                                    and moment_dtype is not None
+                                    and destination.dtype != moment_dtype
+                                ):
+                                    group_index, group_order = (
+                                        self.model_param_group_index_map[model_param]
+                                    )
+                                    optimizer_param = self.optimizer.param_groups[
+                                        group_index
+                                    ]["params"][group_order]
+                                    destination = torch.empty_like(
+                                        destination,
+                                        dtype=moment_dtype,
+                                        device="cpu",
+                                    )
+                                    self.optimizer.state[optimizer_param][key] = (
+                                        destination
+                                    )
+'''
+    if moment_migration not in content:
+        migration_anchor = '''                                destination = (
+                                    self._get_main_param_and_optimizer_states(
+                                        model_param
+                                    )[key]
+                                )
+                                source_range = param_range_map.get(
+'''
+        if content.count(migration_anchor) != 1:
+            raise RuntimeError(
+                "Unable to upgrade HDO checkpoint load: copy anchor missing"
+            )
+        content = content.replace(
+            migration_anchor,
+            migration_anchor.removesuffix(
+                "                                source_range = param_range_map.get(\n"
+            )
+            + moment_migration
+            + "                                source_range = param_range_map.get(\n",
+            1,
+        )
 
     load_anchor = (
         "                for model_param, tensors in recv_tensors.items():\n"

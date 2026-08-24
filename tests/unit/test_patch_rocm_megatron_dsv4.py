@@ -191,9 +191,26 @@ def _write_distrib_optimizer_checkpoint_fixture(path: Path) -> None:
         """
 import torch
 
+HAVE_APEX_OR_TE = True
+USING_TE_OPTIMIZER = False
+USING_APEX_OPTIMIZER = False
+logger = __import__("logging").getLogger(__name__)
+
 
 class HybridDeviceOptimizer:
-    pass
+    def __init__(self, sub_optimizers=None):
+        self.sub_optimizers = sub_optimizers or []
+        self.param_groups = [{"params": []}]
+
+    def state_dict(self):
+        return {
+            "state": (
+                self.sub_optimizers[0].state if self.sub_optimizers else {}
+            ),
+            "param_groups": [
+                {"params": list(range(len(self.param_groups[0]["params"])))}
+            ],
+        }
 
 
 class DistributedOptimizer:
@@ -207,6 +224,50 @@ class DistributedOptimizer:
         ) = self._build_model_and_main_param_groups(
             self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges, config
         )
+
+    def state_dict(self):
+        inner_state_dict = self.optimizer.state_dict()
+        state_dict = {}
+
+        if not HAVE_APEX_OR_TE:
+            steps = list(set([s["step"].item() for s in inner_state_dict["state"].values()]))
+            assert len(steps) == 1
+            step = steps[0]
+        elif isinstance(self.optimizer, HybridDeviceOptimizer):
+            step = None
+            for optimizer in self.optimizer.sub_optimizers:
+                if isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
+                    if len(optimizer.state) == 0:
+                        continue
+                    steps = list(set([s["step"].item() for s in optimizer.state.values()]))
+                    assert len(steps) == 1
+                    step = steps[0]
+                    break
+        elif USING_TE_OPTIMIZER or USING_APEX_OPTIMIZER:
+            steps = list(
+                set(
+                    [
+                        g["step"]
+                        for g in inner_state_dict["param_groups"]
+                        if len(g["params"]) > 0 and "step" in g
+                    ]
+                )
+            )
+            assert len(steps) <= 1
+            step = steps[0] if len(steps) == 1 else None
+
+        state_dict["optimizer"] = {
+            key: value for key, value in inner_state_dict.items() if key != "state"
+        }
+        for param_group in state_dict["optimizer"]["param_groups"]:
+            del param_group["params"]
+            if (
+                USING_TE_OPTIMIZER
+                or USING_APEX_OPTIMIZER
+                or isinstance(self.optimizer, HybridDeviceOptimizer)
+            ) and step is not None:
+                param_group["step"] = int(step)
+        return state_dict
 
     def _set_main_param_and_optimizer_states(self, model_param, tensors):
         group_index, group_order = self.model_param_group_index_map[model_param]
@@ -467,6 +528,67 @@ def test_patch_distrib_optimizer_checkpoint_matches_reordered_hdo_params(
     assert optimizer.read_bytes() == first_patch
 
 
+def test_patch_distrib_optimizer_checkpoint_canonicalizes_divergent_hdo_steps(
+    tmp_path, caplog
+) -> None:
+    _, _, namespace = _load_patched_distrib_optimizer(tmp_path)
+    optimizer_type = namespace["DistributedOptimizer"]
+    hdo_type = namespace["HybridDeviceOptimizer"]
+    parameters = [torch.nn.Parameter(torch.tensor(float(index))) for index in range(3)]
+    adam = torch.optim.Adam(parameters)
+    original_steps = (25.0, 49.0, 50.0)
+    for parameter, step in zip(parameters, original_steps):
+        adam.state[parameter] = {
+            "step": torch.tensor(step),
+            "exp_avg": torch.zeros_like(parameter),
+            "exp_avg_sq": torch.zeros_like(parameter),
+        }
+    hdo = hdo_type([adam])
+    hdo.param_groups[0]["params"] = parameters
+    instance = optimizer_type.__new__(optimizer_type)
+    instance.optimizer = hdo
+    namespace["HAVE_APEX_OR_TE"] = False
+
+    with caplog.at_level("WARNING"):
+        state_dict = instance.state_dict()
+
+    assert state_dict["optimizer"]["param_groups"][0]["step"] == 50
+    assert [adam.state[parameter]["step"].item() for parameter in parameters] == list(
+        original_steps
+    )
+    assert "canonicalizing divergent HDO Adam steps" in caplog.text
+    assert "minimum=25" in caplog.text
+    assert "maximum=50" in caplog.text
+    assert "unique_count=3" in caplog.text
+
+
+def test_patch_distrib_optimizer_checkpoint_preserves_uniform_hdo_step(
+    tmp_path, caplog
+) -> None:
+    _, _, namespace = _load_patched_distrib_optimizer(tmp_path)
+    optimizer_type = namespace["DistributedOptimizer"]
+    hdo_type = namespace["HybridDeviceOptimizer"]
+    parameters = [torch.nn.Parameter(torch.tensor(float(index))) for index in range(2)]
+    adam = torch.optim.Adam(parameters)
+    for parameter in parameters:
+        adam.state[parameter] = {
+            "step": torch.tensor(50.0),
+            "exp_avg": torch.zeros_like(parameter),
+            "exp_avg_sq": torch.zeros_like(parameter),
+        }
+    hdo = hdo_type([adam])
+    hdo.param_groups[0]["params"] = parameters
+    instance = optimizer_type.__new__(optimizer_type)
+    instance.optimizer = hdo
+    namespace["HAVE_APEX_OR_TE"] = False
+
+    with caplog.at_level("WARNING"):
+        state_dict = instance.state_dict()
+
+    assert state_dict["optimizer"]["param_groups"][0]["step"] == 50
+    assert "canonicalizing divergent HDO Adam steps" not in caplog.text
+
+
 def test_patch_distrib_optimizer_compiles_and_idempotently_patches_p22_source(
     tmp_path,
 ) -> None:
@@ -602,6 +724,96 @@ def test_patch_distrib_optimizer_checkpoint_adds_dp1_hdo_inplace_load(
     assert len(sync_observations) == 1
     for synced_tensor, expected_tensor in zip(sync_observations[0], expected):
         torch.testing.assert_close(synced_tensor, expected_tensor)
+
+
+def test_patch_distrib_optimizer_dp1_hdo_converts_restored_moments_to_bf16(
+    tmp_path, monkeypatch
+) -> None:
+    _, _, namespace = _load_patched_distrib_optimizer(tmp_path)
+    monkeypatch.setattr(
+        torch.distributed, "get_process_group_ranks", lambda _group: [0]
+    )
+    instance, hdo, state_dict, sync_observations = _checkpoint_load_instance(
+        namespace, world_size=1
+    )
+    hdo._lumen_streamed_adam_moment_dtype = torch.bfloat16
+
+    instance.load_parameter_state_from_dp_zero(state_dict)
+
+    first_param, second_param = hdo.param_groups[0]["params"]
+    assert first_param.dtype == torch.float32
+    assert second_param.dtype == torch.float32
+    expected_moments = (
+        torch.tensor([11.0, 12.0], dtype=torch.bfloat16),
+        torch.tensor([21.0, 22.0], dtype=torch.bfloat16),
+        torch.tensor([13.0, 14.0, 15.0], dtype=torch.bfloat16),
+        torch.tensor([23.0, 24.0, 25.0], dtype=torch.bfloat16),
+    )
+    actual_moments = (
+        hdo.state[first_param]["exp_avg"],
+        hdo.state[first_param]["exp_avg_sq"],
+        hdo.state[second_param]["exp_avg"],
+        hdo.state[second_param]["exp_avg_sq"],
+    )
+    for actual, expected in zip(actual_moments, expected_moments):
+        assert actual.dtype == torch.bfloat16
+        torch.testing.assert_close(actual, expected)
+    assert len(sync_observations) == 1
+    synced_moments = (
+        sync_observations[0][1],
+        sync_observations[0][2],
+        sync_observations[0][4],
+        sync_observations[0][5],
+    )
+    assert all(moment.dtype == torch.bfloat16 for moment in synced_moments)
+
+
+def test_patch_distrib_optimizer_upgrades_existing_dp1_hdo_moment_restore(
+    tmp_path,
+) -> None:
+    optimizer_path, patched, _ = _load_patched_distrib_optimizer(tmp_path)
+    moment_setup = '''
+            moment_dtype = getattr(
+                self.optimizer, "_lumen_streamed_adam_moment_dtype", None
+            )
+            if moment_dtype not in (None, torch.float32, torch.bfloat16):
+                raise ValueError(
+                    validation_message(
+                        "streamed Adam moment dtype must be float32 or bfloat16",
+                        gbuf="all",
+                        key="moment_dtype",
+                    )
+                )
+'''
+    moment_migration = '''
+                                if (
+                                    key in ("exp_avg", "exp_avg_sq")
+                                    and moment_dtype is not None
+                                    and destination.dtype != moment_dtype
+                                ):
+                                    group_index, group_order = (
+                                        self.model_param_group_index_map[model_param]
+                                    )
+                                    optimizer_param = self.optimizer.param_groups[
+                                        group_index
+                                    ]["params"][group_order]
+                                    destination = torch.empty_like(
+                                        destination,
+                                        dtype=moment_dtype,
+                                        device="cpu",
+                                    )
+                                    self.optimizer.state[optimizer_param][key] = (
+                                        destination
+                                    )
+'''
+    optimizer_path.write_text(
+        patched.replace(moment_setup, "", 1).replace(moment_migration, "\n", 1)
+    )
+
+    assert patcher.patch_distrib_optimizer_hdo_checkpoint(str(tmp_path))
+    upgraded = optimizer_path.read_text()
+    assert moment_setup in upgraded
+    assert moment_migration in upgraded
 
 
 def test_patch_distrib_optimizer_dp1_hdo_rejects_mismatched_unpadded_layout_first(
