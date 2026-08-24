@@ -120,12 +120,30 @@ echo "  Train GPUs:  ${NUM_TRAIN_GPUS} GPUs (FSDP2+aiter)"
 echo "  Transfer:    Mooncake TCP → /dev/shm cache"
 echo "  Config:      ${CONFIG}"
 echo "  Output:      ${OUTPUT_DIR}"
+# Printed because resuming vs starting over is the one setting whose wrong value
+# looks exactly like a healthy run for the first hour.
+echo "  Resume:      ${RESUME:-true} (latest checkpoint_*.pt in ${CKPT_DIR})"
 echo "═══════════════════════════════════════════════════════════════"
 
 OVERRIDES=(
     "policy.model_name=${MODEL_PATH}"
     "algorithm.teacher.model_name=${MODEL_PATH}"
     "checkpointing.checkpoint_dir=${CKPT_DIR}"
+    # /!\ Load-bearing, and it was missing until 2026-08-19. train.yaml ships
+    # resume: false and documented that "run_docker.sh passes
+    # checkpointing.resume=true in EXTRA_OVERRIDES" -- but no script ever did,
+    # so the config default won. Two consequences, one of them silent:
+    #   - run_docker.sh starts the container with --restart=on-failure:40, so any
+    #     crash came back up training from step 0 while the checkpoints it should
+    #     have resumed from sat in CKPT_DIR untouched. A 6-day run survived 330
+    #     steps on nothing but the luck of never crashing.
+    #   - restarting by hand after a deliberate stop silently restarted from 0
+    #     too, which is how this was found.
+    # resume: true is safe on a fresh run: _resume_from_checkpoint globs
+    # checkpoint_*.pt and logs "No checkpoints found ...; starting from scratch"
+    # when the directory is empty. Set RESUME=false to force step 0 on a
+    # directory that does have checkpoints in it.
+    "checkpointing.resume=${RESUME:-true}"
 )
 
 # Space-separated omegaconf dotlist entries, e.g.

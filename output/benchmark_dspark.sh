@@ -156,12 +156,17 @@ for entry in $QUESTION_SETS; do
   fi
   echo
   echo "=== question set: $set_name ($set_path) ==="
+  # CLIENT_EXTRA_ARGS carries protocol knobs the client grew after this script was
+  # written (--concurrency, --temperature, --top-p) without giving each one a
+  # positional slot here. Unquoted on purpose: it has to word-split.
+  # shellcheck disable=SC2086
   python3 "$BENCH_DIR/run_client.py" \
     --base-url "http://127.0.0.1:${SERVER_PORT}" \
     --model Kimi-K3 \
     --questions "$set_path" \
     --num-prompts "$NUM_PROMPTS" \
     --max-tokens "$MAX_TOKENS" \
+    ${CLIENT_EXTRA_ARGS:-} \
     --label "${LABEL}-${set_name}" \
     --out "$RESULT_DIR/bench_${LABEL}-${set_name}.json" || rc=$?
   echo "result -> $RESULT_DIR/bench_${LABEL}-${set_name}.json"

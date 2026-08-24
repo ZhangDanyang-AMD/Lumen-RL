@@ -1596,17 +1596,35 @@ class SpecDistillTrainer:
         all_masks = [c[1] for c in self._eval_cache]
         all_lm = [c[2] for c in self._eval_cache]
 
+        # Nothing below this point runs the draft -- the loop is teacher prefill and
+        # a broadcast -- so it has no reason to be resident, and two separate things
+        # go wrong if it is.
+        #
+        # For generate_mode="generate": every engine start re-profiles free VRAM to
+        # size its KV cache, and the draft plus its optimizer state hold tens of GiB
+        # per GPU -- enough to drive that budget negative and abort the engine with
+        # "No available memory for the cache blocks". Phase A offloads before its own
+        # restarts for exactly this reason.
+        #
+        # For "prefill" there is no restart, but the squeeze is just as real and it
+        # used to be silent. The teacher is already resident here, and at
+        # gpu_memory_utilization 0.9 on a 251.98 GiB card it leaves ~29 GiB. The
+        # draft's own storage is bf16 weights + fp32 master + fp32 grads = 4.45 +
+        # 8.90 + 8.90 = 22.24 GiB of that (Adam's moments are not allocated yet,
+        # which is the only reason it ever fit), leaving too little for the
+        # broadcast buffers below: h + token_embeds + last_hidden are
+        # B x T x (5+1+1) x 7168 x 2 B, i.e. 1.6 GiB at B=2, T=8191. Measured
+        # 2026-08-17 on the full dataset: OOM on 6 of 8 ranks with 320 MiB free,
+        # while the same config survived on the partial set whose eval rows were
+        # half as long (mean 1071 vs 1695). Offloading turns a margin that depends
+        # on the eval slice's row lengths into ~22 GiB of slack.
+        self._offload_draft_to_cpu()
+
         # Same two-sweep shape as Phase A: decode every eval micro-batch first, then
         # extract. Interleaving would swap engines per micro-batch, reloading 1.5 TB
         # of weights each time.
         decoded: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         if generate_mode == "generate":
-            # Every engine start re-profiles free VRAM to size its KV cache, and by
-            # this point the draft plus its optimizer state hold tens of GiB per
-            # GPU -- enough to drive that budget negative and abort the engine with
-            # "No available memory for the cache blocks". Phase A offloads before
-            # its own restarts for exactly this reason.
-            self._offload_draft_to_cpu()
             self._restart_teacher_engine("generate")
             if self._is_distributed:
                 torch.distributed.barrier()
@@ -1670,7 +1688,7 @@ class SpecDistillTrainer:
         batch_alternating = getattr(
             self.config.algorithm.spec_distill, "sequential_mode", None,
         ) == "batch_alternating"
-        if generate_mode == "generate" and not batch_alternating:
+        if not batch_alternating:
             # batch_alternating offloads again before its first round, so this
             # restore would be undone immediately -- and on a resumed run it
             # cannot even be paid for: Adam's moments add ~19 GiB on top of a

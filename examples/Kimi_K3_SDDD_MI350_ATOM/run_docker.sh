@@ -44,10 +44,14 @@ DOCKER_IMAGE="${DOCKER_IMAGE:-kimi_k3_dspark_atom:latest}"
 LUMENRL_DIR="${LUMENRL_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 MODEL_PATH="${MODEL_PATH:-${DATA_ROOT}/models/Kimi-K3}"
 # The cached on-policy set (slippedJim/ATOM_regen_seeklight_kimi_mtp), fetched by
-# selfcheck/fetch_dataset.py. Point these at kimi-mtp-dataset-full to go back to
-# the public source set — the configs name the file, so both have to agree.
-DATASET_SRC="${DATASET_SRC:-${DATA_ROOT}/datasets/atom-regen-kimi-mtp}"
-DATASET_DST="${DATASET_DST:-/dev/shm/atom-regen-kimi-mtp}"
+# selfcheck/fetch_dataset.py, with the image rows stripped by filter_multimodal.py
+# — see reward.dataset in configs/train.yaml for why. The unfiltered download is
+# still at datasets/atom-regen-kimi-mtp; point these there to go back to it, or at
+# kimi-mtp-dataset-full for the public source set. The configs name the file, so
+# both have to agree, and the tokenize cache key covers size and mtime so a swap
+# reprocesses on its own.
+DATASET_SRC="${DATASET_SRC:-${DATA_ROOT}/datasets/atom-regen-kimi-mtp-textonly}"
+DATASET_DST="${DATASET_DST:-/dev/shm/atom-regen-kimi-mtp-textonly}"
 
 # Extra bind mounts, e.g. a shared home or a second data volume:
 #   EXTRA_MOUNTS="-v /nfs/home:/nfs/home -v /scratch:/scratch"

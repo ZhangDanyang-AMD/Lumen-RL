@@ -354,7 +354,7 @@ reward:
   # something other than the real run's data distribution. run_docker.sh stages
   # this path for both modes, so changing one config without the other leaves the
   # run looking for a file nobody staged.
-  dataset: /dev/shm/atom-regen-kimi-mtp/train.jsonl
+  dataset: /dev/shm/atom-regen-kimi-mtp-textonly/train.jsonl
 
 checkpointing:
   checkpoint_dir: /dev/shm/checkpoints/kimi_k3_dspark_atom_smoke

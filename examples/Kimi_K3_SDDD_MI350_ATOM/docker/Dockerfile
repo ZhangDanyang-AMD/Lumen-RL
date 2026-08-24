@@ -15,7 +15,16 @@
 #   docker build -f examples/Kimi_K3_SDDD_MI350_ATOM/docker/Dockerfile \
 #                -t kimi_k3_dspark_atom:latest .
 
-FROM rocm/atom-dev:latest
+# Pinned by digest, not by :latest, which is a rolling tag that has already moved
+# under this recipe: as of 2026-08-17 it resolves to torch 2.10.0+rocm7.2.4 where
+# the numbers in the runbook were all measured on torch 2.13.0+rocm7.14.0. The
+# ATOM hidden-state API happens to be identical in both, so the drift is silent —
+# a build against :latest would succeed and then be a different experiment.
+#
+# This digest is rocm/atom-dev:nightly_202608131526, whose config digest is
+# 1106c668dfbb, the image id the gen-2 runbook records in its measured-version
+# table. To move deliberately, re-run selfcheck against the new image first.
+FROM rocm/atom-dev@sha256:f61ecf0f4686451ad72698e7fa0e99c779ac2373556434ec9a5b889ea2fad0d4
 
 SHELL ["/bin/bash", "-c"]
 

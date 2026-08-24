@@ -454,18 +454,31 @@ reward:
   # this a cached on-policy run: the teacher decoded once, offline, and Phase A1
   # is gone from the loop for good.
   #
-  # /!\ Currently the **partial** release: 107,760 verified rows, 33% of the
-  # source, the rest still generating. Staged as train.jsonl regardless of the
-  # remote name, so dropping the full file over it invalidates the tokenize cache
-  # by itself (the key includes size and mtime) and nothing else has to change.
+  # Full release, with the image rows removed: 450,625 raw rows minus the 122,812
+  # (27.25%) carrying an `image_url` content part, leaving 327,813. The release
+  # inherits multimodal conversations from its source, and their user turns encode
+  # content as a JSON parts list holding a COCO image URL. Nothing in this
+  # pipeline fetches an image, so the draft was being asked to predict K3's answer
+  # to a question whose subject it could not see — a quarter of the tokens
+  # teaching it to guess from the text stub alone.
+  #
+  # The filter keys on an explicit media-type set, not on `type != "text"`:
+  # 115 rows are plain-text answers that happen to parse as JSON lists (a bare
+  # `126`, a task-planning object) and the looser predicate deletes them. Rows
+  # that only discuss a modality in prose are also kept — 1,012 asking about HTML
+  # <img>, 52 embedding base64 CSS textures, 148 using markdown image syntax for
+  # placeholders. Those are text coding data whose answers never depend on seeing
+  # a picture. Regenerate with filter_multimodal.py if the release is refreshed.
   #
   # /!\ Prompts are verbatim from the source dataset and only the last turn is
   # K3's, which is why dataset.last_turn_loss_only must stay true — see there.
   #
   # Pre-shuffling the file is not required: load_and_preprocess_dataset shuffles
   # with seed=42 before tokenizing, so the sequential sampler already walks a
-  # random order. It is also harmless.
-  dataset: /dev/shm/atom-regen-kimi-mtp/train.jsonl
+  # random order. It is also harmless. The shuffle is also why filtering the file
+  # is enough to clean the eval slice: eval is the tail of the shuffled set, so it
+  # is drawn from the same filtered pool rather than held out separately.
+  dataset: /dev/shm/atom-regen-kimi-mtp-textonly/train.jsonl
 
 eval:
   enabled: true
@@ -500,14 +513,22 @@ checkpointing:
   # the first run needed exactly that when a suspicious stretch of the eval
   # curve had to be recomputed and the checkpoint had already been pruned.
   save_total_limit: 12
-  # The default of true will quietly pick up an old checkpoint and continue in
-  # what was meant to be a new run, without complaining. Always set it off
-  # explicitly for a fresh run.
+  # /!\ This line is overridden and is not what the live run uses. Until
+  # 2026-08-19 the comment here claimed run_docker.sh passed
+  # checkpointing.resume=true in EXTRA_OVERRIDES; it did not, and neither did
+  # run_kimi_k3.sh, so this false won every time. The override is real now —
+  # run_kimi_k3.sh passes checkpointing.resume=${RESUME:-true} — and the reason it
+  # has to exist is that run_docker.sh starts the container with
+  # --restart=on-failure:40: without it, a crash comes back up training from step
+  # 0 while the checkpoints it should have resumed from sit in CKPT_DIR untouched,
+  # and nothing in the log says so.
   #
-  # /!\ This line is not what the live run uses: run_docker.sh passes
-  # checkpointing.resume=true in EXTRA_OVERRIDES, and the override wins. That is
-  # deliberate — the container has restart-on-failure, so a crash has to come back
-  # up on the last checkpoint rather than silently restarting training from zero.
+  # Leaving false here is still right as the file-level default: it is what a
+  # bare `python -m lumenrl.trainer.main --config train.yaml` should do, since
+  # resume: true would quietly pick up an old checkpoint and continue in what was
+  # meant to be a new run. The launcher is where "this is a long crash-prone run,
+  # come back where you left off" belongs.
+  #
   # _resume_from_checkpoint takes the highest-numbered checkpoint and restores
   # global_step, optimizer state and the LR schedule; the data offset is derived
   # from global_step, so the sampler continues instead of replaying rows.
@@ -517,33 +538,46 @@ logger:
   wandb_enabled: false
   log_interval: 1
 
-# Measured 2026-08-15 with the fields in this file: 107,760 raw rows -> **106,366**
-# survivors at an 8192 window (98.7%), the 1,394 dropped all for exceeding it.
-# One epoch is floor((106366 - 128) / 128) = 829 steps.
+# Measured 2026-08-19 against the image-filtered full release (327,813 rows, see
+# reward.dataset): **307,278** survivors at an 8192 window, the 20,535 dropped all
+# for exceeding it. One epoch is floor((307278 - 128) / 128) = 2399 steps.
 #
-# **2 epochs = 1658.** The point of this run is an early reading on whether the
-# RoPE, mscale and fp8 corrections actually move 6.01%, not a finished draft; the
-# definitive run waits for the full release (the set is 33% decoded). TorchSpec
-# uses num_epochs: 5, which over a third of the data would be 4145 steps and ~4
-# days — worth it once the answer to "did the fixes work" is known, not before.
+# **1 epoch = 2399**, down from the 3358 the unfiltered release supported: removing
+# 27% of the rows removes 27% of the epoch. At the measured 2.2 min/step that is
+# ~3.7 days. Checkpoints land every 10 steps, so this is a ceiling to stop against
+# rather than a commitment to run to the end.
 #
-# Unlike a single-epoch bound this is NOT limited by the eval slice: the sampler
-# wraps at (step*bs) % ds_len, so training revisits rows deliberately. What must
-# still hold is that it never reaches the final `eval.num_samples` rows, which the
-# sampler cannot do as long as it walks whole batches from 0.
+# 2399 is also the largest count that stays inside one epoch, so the sampler never
+# wraps and P10's eval-slice leak cannot arise at all — it covers rows 0..307071
+# against an eval slice starting at 307150. Going beyond one epoch is allowed (the
+# sampler wraps at (step*bs) % _trainable_len() deliberately) but then correctness
+# depends on _trainable_len() excluding the held-out tail; inside one epoch it
+# does not depend on anything.
+#
+# /!\ warmup_ratio is a fraction of this number, so shortening the run shortens
+# warmup with it: 0.04 x 2399 = 96 steps, against 134 at 3358 and gen-2's 66. That
+# is intended — warmup is being held at a constant share of the schedule — but it
+# means a step-for-step comparison against a differently-sized run is confounded
+# by the LR schedule for the first few hundred steps. Compare by schedule fraction.
+#
+# Filtering moved the length distribution *up*, which is worth knowing because it
+# sets Phase A's transfer cost: mean 1852 / p50 785 / p90 5286 / p99 7752, against
+# the unfiltered mean 1695 / p90 4570. The image rows were short (a URL and a one-
+# line question), so dropping them removed mostly short samples. The padded cached
+# batch did not move (worst 98.0 GiB, same as before) because batches pad to their
+# own longest row and the tail dominates that, not the mean — so cache_batches
+# stays at 10, now one under its ceiling of 11 rather than at it.
 #
 # Recompute after changing the dataset or any field in the tokenize cache key
 # (max_length, max_prompt_tokens, last_turn_loss_only, min_loss_tokens,
 # thinking). The arguments must match this file exactly, or preprocessing builds
-# a second cache and the run pays for it twice. Run it at 16384 first — the
-# largest window under consideration — since survival at any smaller window is
-# then just a count over the reported distribution:
+# a second cache and the run pays for it twice:
 #   python3 examples/Kimi_K3_SDDD_MI350_ATOM/selfcheck/preprocess_dataset.py \
-#       --dataset /dev/shm/atom-regen-kimi-mtp/train.jsonl \
-#       --tokenizer /home/jimguo12/k3-target-official \
+#       --dataset /dev/shm/atom-regen-kimi-mtp-textonly/train.jsonl \
+#       --tokenizer /mnt/nvme1/jimguo12/k3-target-official \
 #       --max-length 8192 --max-prompt-tokens 0 \
-#       --last-turn-loss-only true --min-loss-tokens 14 \
+#       --thinking true --last-turn-loss-only true --min-loss-tokens 14 \
 #       --eval-samples 128 --batch-size 128
-num_training_steps: 1658
+num_training_steps: 2399
 # TorchSpec seed
 seed: 42
