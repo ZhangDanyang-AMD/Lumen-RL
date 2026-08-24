@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from lumenrl.core.protocol import DataProto
@@ -93,6 +94,71 @@ def test_merge_preserves_data() -> None:
 def test_merge_key_mismatch_raises() -> None:
     a = DataProto(tensors={"x": torch.tensor([[1.0]]), "y": torch.tensor([[2.0]])})
     b = DataProto(tensors={"x": torch.tensor([[3.0]])})
-    import pytest
     with pytest.raises(ValueError, match="keys mismatch"):
         DataProto.merge([a, b])
+
+
+def test_select_idxs_with_int_slice_and_list() -> None:
+    p = DataProto(tensors={"x": torch.arange(12).view(6, 2)})
+    one = p.select_idxs(2)
+    sl = p.select_idxs(slice(1, 5, 2))
+    lst = p.select_idxs([0, 5, 3])
+    assert one.batch_size == 1
+    assert torch.equal(one["x"], torch.tensor([[4, 5]]))
+    assert torch.equal(sl["x"], torch.tensor([[2, 3], [6, 7]]))
+    assert torch.equal(lst["x"], torch.tensor([[0, 1], [10, 11], [6, 7]]))
+
+
+def test_getitem_supports_row_selection() -> None:
+    p = DataProto(tensors={"x": torch.arange(10).view(5, 2)})
+    rows = p[1:4]
+    mask = p[torch.tensor([True, False, True, False, False])]
+    assert isinstance(rows, DataProto)
+    assert rows.batch_size == 3
+    assert torch.equal(mask["x"], torch.tensor([[0, 1], [4, 5]]))
+
+
+def test_concat_vs_merge_padding_behavior() -> None:
+    a = DataProto(tensors={"x": torch.tensor([[1, 2, 3]])})
+    b = DataProto(tensors={"x": torch.tensor([[4, 5, 6]])})
+    c = DataProto.concat([a, b])
+    assert c.batch_size == 2
+    assert torch.equal(c["x"], torch.tensor([[1, 2, 3], [4, 5, 6]]))
+
+    p = DataProto(tensors={"x": torch.tensor([[1, 2, 3]])})
+    q = DataProto(tensors={"x": torch.tensor([[4, 5]])})
+    m = DataProto.merge([p, q])
+    assert m["x"].shape == (2, 3)
+    assert torch.equal(m["x"][1], torch.tensor([4, 5, 0]))
+
+
+def test_reorder_in_place() -> None:
+    p = DataProto(tensors={"x": torch.tensor([[1], [2], [3]])})
+    p.reorder([2, 0, 1])
+    assert torch.equal(p["x"], torch.tensor([[3], [1], [2]]))
+
+
+def test_pad_to_divisor_and_unpad() -> None:
+    p = DataProto(tensors={"x": torch.arange(10).view(5, 2)})
+    padded, pad_size = p.pad_to_divisor(4)
+    restored = padded.unpad(pad_size)
+    assert pad_size == 3
+    assert padded.batch_size == 8
+    assert restored.batch_size == p.batch_size
+    assert torch.equal(restored["x"], p["x"])
+
+
+def test_repeat_and_sample_level_repeat() -> None:
+    p = DataProto(tensors={"x": torch.tensor([[1], [2], [3]])})
+    interleave = p.repeat(2, interleave=True)
+    stacked = p.repeat(2, interleave=False)
+    per_sample = p.sample_level_repeat([1, 3, 0])
+    assert torch.equal(interleave["x"], torch.tensor([[1], [1], [2], [2], [3], [3]]))
+    assert torch.equal(stacked["x"], torch.tensor([[1], [2], [3], [1], [2], [3]]))
+    assert torch.equal(per_sample["x"], torch.tensor([[1], [2], [2], [2]]))
+
+
+def test_check_consistency_raises_on_mismatched_dim0() -> None:
+    p = DataProto(tensors={"a": torch.zeros(2, 1), "b": torch.zeros(3, 1)})
+    with pytest.raises(ValueError, match="inconsistent batch dimensions"):
+        p.check_consistency()

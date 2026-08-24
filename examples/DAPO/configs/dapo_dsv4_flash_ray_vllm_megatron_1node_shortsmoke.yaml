@@ -1,0 +1,187 @@
+# Short-sequence DAPO smoke of the 4-LAYER DeepSeek-V4-Flash slice, 1 node.
+#
+# This file exists to answer one question, so it is shaped around that question
+# rather than around being a realistic run.
+#
+# On the full 43-layer model at 4 nodes, a standalone probe (probe_66) and the
+# DAPO trainer disagreed by ~89 GB per GPU on what is nominally the same work:
+# same model, same EP, same <=1280 tokens, one sequence per rank, offload on in
+# both. The probe peaked at 144.7 GiB reserved; the trainer still ran the card
+# out of memory at 288 GB. Fragmentation was ruled out (the probe's
+# reserved-minus-allocated was only 27 GiB), so the trainer is holding, or
+# asking for, something the probe is not.
+#
+# Reproducing that needs the probe/trainer pair, not the full model, so this is
+# the 4-layer slice at 1 node -- a step takes minutes instead of tens of them.
+# The comparison partner is probe_63 (`run_probes.sh train`), and the knobs
+# below are chosen to match it rather than to match the real config:
+#
+#   EP=8, no offload, no recompute        exactly what probe_63 builds
+#   1 sequence per rank                   8 prompts-worth of rows over DP=8,
+#                                         i.e. train_global_batch_size 8
+#   <=1280 tokens                         1024 prompt budget + 256 response
+#
+# Read the run with LUMENRL_MEM_DIAG=1, which prints per-rank microbatch shapes
+# and per-phase peak allocated/reserved from inside the process. The probe's own
+# MEMDIAG lines come from the same two call sites in megatron_native_engine, so
+# the two logs are directly comparable line for line.
+#
+#   LUMENRL_MEM_DIAG=1 RAY=1 DETACH=1 STEPS=2 \
+#   CFG=examples/DAPO/configs/dapo_dsv4_flash_ray_vllm_megatron_1node_shortsmoke.yaml \
+#     bash ~/4node/07_dsv4_megatron_1node.sh
+#
+# Everything not mentioned above is copied from
+# dapo_dsv4_flash_ray_vllm_megatron_1node_smoke.yaml; see that file's header for
+# why enable_dynamic_batch must stay false, why PP and CP are rejected, and why
+# the training weights come from dist_checkpoint_path rather than model_name.
+#
+# ⚠️ filter_groups is OFF, for two independent reasons that each suffice: the
+# slice emits gibberish (it feeds lm_head the layer-3 residual), and a 256-token
+# budget does not finish a DAPO-math solution. Accuracy and reward are therefore
+# meaningless here. The metric to read is the MEMDIAG output.
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    actor:
+      num_workers: 8
+      dispatch_mode: dp_compute_proto
+
+policy:
+  model_name: "/mnt/m2m_nobackup/xysheng/models/dsv4-L4-bf16-native"
+  training_backend: megatron_native
+  generation_backend: vllm
+  max_total_sequence_length: 1280       # 1024 prompt budget + 256 response
+  max_response_length: 256
+  # 2 prompts x 4 generations = 8 sequences over DP=8: one row per rank, which
+  # is the shape probe_63 feeds. If this stops dividing evenly the comparison
+  # is void -- a rank with two rows builds two microbatches.
+  train_global_batch_size: 8
+  gen_batch_size: 2
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 1280
+  learning_rate: 1.0e-6
+  lr_warmup_steps: 0
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  training:
+    optimizer_dtype: bf16
+    megatron_cfg:
+      use_distributed_optimizer: true
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      context_parallel_size: 1
+      expert_model_parallel_size: 8
+      dist_checkpoint_path: "/mnt/m2m_nobackup/xysheng/models/dsv4-L4_torch_dist"
+      # ⚠️ Both off ON PURPOSE, and both differ from the 4-node shortsmoke.
+      # probe_63 builds neither, and an unmatched knob here would be indis-
+      # tinguishable from the ~89 GB being hunted. Turning them on is a
+      # follow-up experiment, not the baseline.
+      #   optimizer_cpu_offload / optimizer_offload_fraction
+      #   recompute_granularity / recompute_method / recompute_num_layers
+      deterministic_mode: true
+      moe_grouped_gemm: true
+      moe_aux_loss_coeff: 0.0
+      log_probs_chunk_size: 1024
+      enable_dynamic_batch: false
+    fsdp_cfg:
+      param_offload: false
+      optimizer_offload: false
+  generation:
+    vllm_cfg:
+      transport: ray_http
+      ray_http_start_server: false
+      tensor_parallel_size: 8
+      kv_cache_dtype: fp8_e4m3
+      moe_backend: triton
+      # The slice is 27.39B, so BF16 at TP=8 is ~7 GB/rank and there is no
+      # reason to reach for the online FP8 path the full model needs.
+      quantization: ""
+      # Deliberately small. The trainer's peak is what is being measured, and
+      # every GB vLLM reserves is a GB the trainer cannot show us before it
+      # dies. At max_model_len 1280 the KV cache needs about 1 GB.
+      gpu_memory_utilization: 0.12
+      max_model_len: 1280
+      dtype: bfloat16
+      enforce_eager: true
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 2048
+      max_num_seqs: 32
+      calculate_log_probs: true
+      enable_sleep_mode: false
+      update_weights_bucket_megabytes: 512
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+
+moe:
+  r3:
+    rollout_replay: false
+
+algorithm:
+  name: dapo
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  loss_agg_mode: token-mean
+  dapo:
+    num_generations: 4
+    kl_coeff: 0.0
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 10.0
+    dynamic_sampling: true
+    token_level_pg: true
+    overlong_reward_shaping: true
+    max_resp_len: 256
+    filter_groups:
+      enable: false
+      metric: acc
+      max_num_gen_batches: 10
+    overlong_buffer:
+      enable: true
+      len: 64
+      penalty_factor: 1.0
+      log: false
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+    rollout_is_batch_normalize: false
+
+reward:
+  type: function
+  function: lumenrl.rewards.math_reward.dapo_math_reward
+  dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet"
+  shuffle: true
+  shuffle_seed: 10086
+
+val_dataset: ""
+val_steps: 0
+val_batch_size: 0
+eval:
+  enabled: false
+  num_samples: 0
+
+checkpointing:
+  checkpoint_dir: ""
+  save_steps: 1000
+  save_total_limit: 0
+  resume: false
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 2
+seed: 10086

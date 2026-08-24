@@ -8,8 +8,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import OmegaConf
 
+from lumenrl.architecture.config.assembly_config import RuntimeAssemblyConfig
 from lumenrl.core.types import (
     AlgorithmName,
     GenerationBackend,
@@ -20,6 +21,75 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class FSDPEngineConfig:
+    """Configuration for the FSDP2 training engine."""
+    strategy: str = "fsdp2"
+    fsdp_size: int = -1
+    param_offload: bool = False
+    optimizer_offload: bool = False
+    grad_offload: bool = False
+    reshard_after_forward: bool = True
+    forward_only: bool = False
+    seed: int = 42
+    model_dtype: str = "bf16"
+    mixed_precision: Optional[dict] = None
+    use_remove_padding: bool = True
+    ulysses_sequence_parallel_size: int = 1
+    forward_prefetch: bool = False
+    use_orig_params: bool = True
+    use_torch_compile: bool = False
+
+
+@dataclass
+class OptimizerConfig:
+    """Optimizer and LR scheduler configuration."""
+    optimizer_type: str = "adamw"
+    lr: float = 1e-6
+    weight_decay: float = 0.01
+    clip_grad: float = 1.0
+    lr_scheduler_type: str = "cosine"
+    lr_warmup_steps: int = 10
+    lr_warmup_steps_ratio: float = 0.0
+    total_training_steps: int = 1000
+    min_lr_ratio: float = 0.0
+    num_cycles: float = 0.5
+    # Mirror of the same three fields on PolicyConfig, which is where configs
+    # set them. ``actor_worker._build_optimizer_config`` forwards them here for
+    # the Megatron engines to read; declaring them keeps the FSDP2 path, which
+    # builds this dataclass from that same dict, from rejecting them.
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.95
+    adam_eps: float = 1e-8
+
+
+@dataclass
+class LoRAConfig:
+    """LoRA / PEFT configuration."""
+    enabled: bool = False
+    rank: int = 0
+    alpha: int = 16
+    target_modules: Optional[list] = None
+    exclude_modules: Optional[list] = None
+    merge: bool = False
+    adapter_path: Optional[str] = None
+
+
+@dataclass
+class HFModelConfig:
+    """HuggingFace model loading configuration."""
+    local_path: str = ""
+    model_type: str = "language_model"
+    trust_remote_code: bool = True
+    use_remove_padding: bool = True
+    enable_gradient_checkpointing: bool = True
+    lora: LoRAConfig = field(default_factory=LoRAConfig)
+    use_liger: bool = False
+    use_fused_kernels: bool = False
+    calculate_entropy: bool = False
+    calculate_sum_pi_squared: bool = False
+
+
+@dataclass
 class ClusterConfig:
     num_nodes: int = 1
     gpus_per_node: int = 1
@@ -27,13 +97,135 @@ class ClusterConfig:
 
 
 @dataclass
+class RayWorkerRoleConfig:
+    """Per-role worker-group orchestration knobs for Ray controller path."""
+
+    # 0 means auto-infer from pool world size.
+    num_workers: int = 0
+    # Supported dispatch modes:
+    # - dp_compute_proto (default)
+    # - dp_compute
+    # - dp_compute_proto_with_func
+    # - dp_compute_metric
+    # - one_to_all
+    # - all_to_all
+    # - rank_zero
+    # - direct_rollout_method (forbidden in controller dispatch path)
+    # Legacy alias accepted at runtime: broadcast -> one_to_all
+    dispatch_mode: str = "dp_compute_proto"
+    mesh_mapping: Optional[list[int]] = None
+    lazy_dispatch_key: Optional[str] = None
+    detached: bool = False
+    process_on_nodes: Optional[list[int]] = None
+    max_colocate_count: int = 1
+    topology_tags: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class RayControllerConfig:
+    """Ray-controller runtime options for the trainer main path."""
+
+    enabled: bool = False
+    fuse_actor_ref: bool = False
+    actor: RayWorkerRoleConfig = field(default_factory=RayWorkerRoleConfig)
+    ref: RayWorkerRoleConfig = field(default_factory=RayWorkerRoleConfig)
+    rollout: RayWorkerRoleConfig = field(default_factory=RayWorkerRoleConfig)
+    # Optional role->pool name mapping for complex topology routing.
+    topology_map: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class ControllerConfig:
+    ray: RayControllerConfig = field(default_factory=RayControllerConfig)
+
+
+@dataclass
 class MegatronConfig:
-    tensor_parallel_size: int = 1
-    expert_parallel_size: int = 1
-    pipeline_parallel_size: int = 1
+    # Parallelism sizes. NOTE: field names match what ``actor_worker`` and the
+    # Megatron engines read (``*_model_parallel_size`` + ``context_parallel_size``).
+    # (Previously named ``tensor_parallel_size`` / ``pipeline_parallel_size`` /
+    # ``expert_parallel_size``, which silently never reached the engine -> TP/PP
+    # config was ignored. See megatron-native-refactor handoff §2.)
+    tensor_model_parallel_size: int = 1
+    pipeline_model_parallel_size: int = 1
+    context_parallel_size: int = 1
+    expert_model_parallel_size: int = 1
+    # Sequence parallelism (TP-only): shards activations along the sequence dim.
+    # Requires seq length divisible by TP, so it is OFF by default for RL's
+    # variable-length forwards (per-sequence / packed thd).
+    sequence_parallel: bool = False
+    # ---- MoE / Expert Parallel ----
+    # ``num_experts`` (a.k.a. num_moe_experts) is auto-detected from the HF config
+    # when None; set it explicitly only to override. All the ``moe_*`` knobs below
+    # are likewise auto-derived from the HF config when left None, and forwarded to
+    # Megatron's TransformerConfig only when the model is MoE (dense path ignores
+    # them). ``expert_model_parallel_size`` shards experts across EP ranks;
+    # ``expert_tensor_parallel_size`` (ETP) additionally TP-shards each expert.
     num_experts: Optional[int] = None
-    moe_grouped_gemm: bool = False
-    moe_use_legacy_grouped_gemm: bool = False
+    moe_grouped_gemm: bool = True
+    expert_tensor_parallel_size: Optional[int] = None
+    moe_router_topk: Optional[int] = None
+    moe_router_load_balancing_type: str = "aux_loss"     # "aux_loss" | "none" | "seq_aux_loss"
+    moe_router_pre_softmax: Optional[bool] = None
+    moe_router_score_function: Optional[str] = None       # "softmax" | "sigmoid"
+    # fp32 router improves expert-selection stability (bf16 top-k flips experts ->
+    # large train/rollout log-prob mismatch). Defaults to fp32 for MoE.
+    moe_router_dtype: Optional[str] = "fp32"              # None | "fp32" | "fp64"
+    moe_router_topk_scaling_factor: Optional[float] = None
+    moe_shared_expert_intermediate_size: Optional[int] = None
+    moe_aux_loss_coeff: float = 0.0                       # 0 keeps RL loss unchanged
+    moe_router_bias_update_rate: Optional[float] = None
+    moe_token_dispatcher_type: str = "alltoall"
+    moe_permute_fusion: bool = False
+    # Distributed optimizer: shard FP32 master + Adam state across DP ranks.
+    use_distributed_optimizer: bool = True
+    # MILES numerical-alignment knobs for BF16 training.
+    grad_reduce_in_fp32: bool = True
+    attention_softmax_in_fp32: bool = True
+    # Activation recomputation (gradient checkpointing) for long sequences.
+    recompute_granularity: Optional[str] = None  # None | "full" | "selective"
+    recompute_method: Optional[str] = None       # "uniform" | "block"
+    recompute_num_layers: Optional[int] = None
+    # Long-sequence memory: flash attention (O(L) vs local O(L^2)) + memory-efficient
+    # chunked/fused token log-prob. Both default off (unchanged smoke behavior).
+    attention_backend: str = "unfused"           # "flash" | "unfused"
+    use_packed_sequences: bool = True            # varlen flash packing; disable for incompatible ROCm kernels
+    log_probs_chunk_size: int = 0                # >0 enables fused/chunked log-prob
+    # Dynamic-batch packing: concat multiple sequences into one packed TE forward.
+    enable_dynamic_batch: bool = False
+    max_tokens_per_gpu: int = 0                  # per-forward token budget (0 -> 21504)
+    # ---- initial weights from a Megatron dist-checkpoint instead of HF ----
+    # Models whose released checkpoint the HF-safetensors bridge cannot read
+    # (DeepSeek-V4 ships block-quantized FP8) are converted offline to torch_dist
+    # and loaded from here; ``dist_checkpointing.load`` reshards on the way in.
+    # ``model_name`` is then read only for config.json.
+    dist_checkpoint_path: Optional[str] = None
+    # Megatron's ``--deterministic-mode`` has no equivalent here because the
+    # engine has no argument parser, so it is a config field. Costs the fused
+    # kernels; buys run-to-run bitwise reproducibility, without which DSv4 flips
+    # ~1.6% of argmaxes between identical forwards -- which is why ``None`` means
+    # "let the model family decide" and DSv4 decides on.
+    deterministic_mode: Optional[bool] = None
+    # Skip the DDP wrapper and the distributed optimizer entirely. For a frozen
+    # reference policy or a forward-only bring-up, that is the FP32 master
+    # weights plus both Adam moments not allocated.
+    build_optimizer: bool = True
+    # ---- optimizer state in host memory (Megatron's HybridDeviceOptimizer) ----
+    # Keeps ``optimizer_offload_fraction`` of the FP32 master weights and Adam
+    # moments in pinned host RAM and runs their Adam step on the CPU. Distinct
+    # from ``is_optimizer_offload_enabled``, which moves the whole optimizer
+    # between host and device around each phase; this one is a permanent split.
+    #
+    # It is what makes a model too big for its GPUs trainable at all: the
+    # optimizer is 12 bytes/param against the weights' 2, and it is sharded over
+    # EP x EDP = world_size, so raising EP does not shrink it. Costs a CPU Adam
+    # step per iteration.
+    optimizer_cpu_offload: bool = False
+    # Fraction moved to the CPU, i.e. 1.0 offloads everything. Megatron's own
+    # dataclass default is 0.0, which would make ``optimizer_cpu_offload`` a
+    # no-op, so this default deliberately differs from it.
+    optimizer_offload_fraction: float = 1.0
+    overlap_cpu_optimizer_d2h_h2d: bool = True
 
 
 @dataclass
@@ -43,17 +235,107 @@ class AtomConfig:
     max_model_len: Optional[int] = None
     gpu_memory_utilization: float = 0.6
     gpu_id: Optional[int] = None
+    # Ray-controller online rollout path. The common rollout knobs (sampling,
+    # sequence limits, IPC bucket size, sleep) are still read from vllm_cfg so the
+    # DAPO vLLM/ATOM configs stay comparable.
+    transport: str = "fifo"
+    data_parallel_size: int = 1
+    expert_parallel_size: int = 1
+    enable_prefix_caching: bool = False
+    online_quant_config: Optional[dict] = None
+    engine_kwargs: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class VLLMConfig:
+    """Native vLLM rollout engine configuration (vanilla upstream vLLM).
+
+    Mirrors the runbook's ``actor_rollout_ref.rollout`` vLLM knobs so a DAPO run
+    can use vLLM for inference + Lumen FSDP for training without verl.
+    """
+    tensor_parallel_size: int = 1
+    kv_cache_dtype: str = "auto"
+    max_model_len: Optional[int] = None
+    gpu_memory_utilization: float = 0.6
+    gpu_id: Optional[int] = None
+    dtype: str = "bfloat16"
+    enforce_eager: bool = True
+    enable_chunked_prefill: bool = True
+    max_num_batched_tokens: int = 8192
+    max_num_seqs: int = 64
+    swap_space: int = 4
+    trust_remote_code: bool = True
+    # Rollout quantization: "" / "fp8" / "fp8_per_block" (vLLM `quantization=`)
+    quantization: str = ""
+    # vLLM `moe_backend=`. "" leaves vLLM's own default. DeepSeek-V4 on gfx950 must
+    # pass "triton": the default auto-selects AITER and dies in the first forward at
+    # `moe_sorting_opus_fwd`, and "triton_unfused" is FP4-only and raises ValueError.
+    moe_backend: str = ""
+    # When True, vLLM returns per-token rollout log-probs needed for TIS / MIS
+    # rollout correction (verl: actor_rollout_ref.rollout.calculate_log_probs).
+    calculate_log_probs: bool = False
+    # verl alignment: verl seeds each vLLM engine with ``replica_rank + data.seed``
+    # so rollout sampling is reproducible and matched across ranks. ``None`` keeps
+    # vLLM's internal default. Set by the trainer from the top-level ``config.seed``;
+    # the engine adds the per-rank offset (local_rank) at worker launch.
+    seed: Optional[int] = None
+    # Keep the vLLM engine resident across steps and update weights in place via
+    # `collective_rpc("reload_weights")` instead of killing + rebuilding the
+    # subprocess each step. Removes the per-step rebuild (~45s) AND the ROCm
+    # rebuild-leak OOM. Memory: one resident engine (gpu_memory_utilization)
+    # coexists with FSDP training.
+    persistent: bool = True
+    # Data-parallel rollout: every rank runs its own vLLM on its local GPU and
+    # generates a shard of the batch (then all-gather), instead of rank-0
+    # generating everything. ~Nx generation throughput on N GPUs.
+    data_parallel_rollout: bool = True
+    # verl-style ONLINE rollout: drive the engine with vLLM v1 ``AsyncLLM`` and
+    # submit every prompt as its own concurrent ``generate(request_id=...)`` call
+    # (continuous batching), matching verl's async server, instead of the offline
+    # ``LLM.generate(list)`` batch call. Weight updates are applied in place via
+    # ``collective_rpc("reload_weights", weights_path=...)`` + ``reset_prefix_cache``
+    # (no engine rebuild). Overridable with env ``LUMEN_VLLM_ASYNC=0/1``.
+    online: bool = True
+    # Rollout transport / orchestration:
+    #   "fifo"    -> per-rank subprocess + named-FIFO JSON (default, VLLMEngine)
+    #   "ray_http"-> verl-style: each rank hosts vLLM AsyncLLM inside a Ray actor
+    #                that also runs a uvicorn HTTP server; the trainer drives it
+    #                via Ray RPC (VLLMHttpEngine). Same 8×TP=1 DP layout as verl's
+    #                rollout replicas (tensor_model_parallel_size=1).
+    transport: str = "fifo"
+    # ray_http-only knobs:
+    ray_http_base_port: int = 8700   # actor i listens on base_port + local_rank
+    ray_http_start_server: bool = True  # also launch uvicorn OpenAI server in actor
+    # cumem sleep/wake (verl alignment). On ROCm (cumem_available=False) the
+    # gpu_worker patch falls back to KV-cache-only sleep with weights resident;
+    # on CUDA with cumem, level 2 offloads weights too.
+    enable_sleep_mode: bool = True
+    sleep_level: int = 2
+    # ZMQ CUDA-IPC bucketed weight transfer (verl BucketedWeightSender/Receiver).
+    update_weights_bucket_megabytes: int = 512
+    use_shm: bool = False  # use shared-memory buffer instead of CUDA IPC (NPU)
+    # Sampling defaults (overridable per-algorithm in the trainer).
+    temperature: float = 1.0
+    top_p: float = 1.0
+    top_k: int = -1
 
 
 @dataclass
 class TrainingConfig:
     megatron_cfg: MegatronConfig = field(default_factory=MegatronConfig)
     fsdp_cfg: Optional[dict] = None
+    # Compute (forward/backward) dtype used by FSDP2 MixedPrecisionPolicy
+    # param_dtype. The optimizer ALWAYS keeps FP32 master weights + Adam
+    # moments regardless of this value, so small updates (lr ~1e-6) are not
+    # lost to bf16 rounding. Use "bf16" for mixed precision (recommended) or
+    # "fp32" for full FP32. Reduce dtype is always FP32 for stability.
+    optimizer_dtype: str = "bf16"
 
 
 @dataclass
 class GenerationConfig:
     atom_cfg: AtomConfig = field(default_factory=AtomConfig)
+    vllm_cfg: VLLMConfig = field(default_factory=VLLMConfig)
 
 
 @dataclass
@@ -66,16 +348,28 @@ class PolicyConfig:
     max_total_sequence_length: int = 4096
     max_response_length: int = 20480
     train_global_batch_size: int = 64
+    # Number of *prompt* sequences sampled per generation round for DAPO dynamic
+    # sampling (verl: data.gen_batch_size). 0 = same as the number of prompts
+    # implied by train_global_batch_size (no over-sampling). When DAPO
+    # filter_groups is enabled this should be a multiple of the train prompt
+    # count (e.g. 3x) so degenerate groups can be filtered out.
+    gen_batch_size: int = 0
     train_micro_batch_size: int = 8
     max_token_len_per_gpu: int = 0
+    ppo_mini_batch_size: int = 0
     learning_rate: float = 1e-6
+    lr_warmup_steps: int = 10
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.95
+    adam_eps: float = 1e-8
     warmup_ratio: float = 0.0
     min_lr: float = 0.0
-    lr_decay_style: str = "cosine"
+    lr_decay_style: str = "cosine"       # constant, linear, cosine, WSD
     wsd_decay_ratio: float = 0.2
     wsd_decay_style: str = "cosine"
+    balance_batch: bool = False         # seqlen-balanced partitioning across DP ranks
 
 
 @dataclass
@@ -85,6 +379,36 @@ class GRPOConfig:
     clip_ratio: float = 0.2
     num_ppo_epochs: int = 1
     num_mini_batches: int = 1
+    discount: float = 1.0
+
+
+@dataclass
+class FilterGroupsConfig:
+    """DAPO dynamic-sampling filter (verl recipe/dapo filter_groups).
+
+    When enabled the trainer over-samples prompts (``policy.gen_batch_size``),
+    drops prompt groups whose per-prompt ``metric`` has zero std (all-correct or
+    all-wrong → zero GRPO advantage), and keeps generating up to
+    ``max_num_gen_batches`` rounds until ``train_batch_size`` valid prompt groups
+    are collected.
+    """
+    enable: bool = False
+    metric: str = "acc"  # acc / score / seq_reward / seq_final_reward
+    max_num_gen_batches: int = 0  # <=0 means unlimited rounds
+
+
+@dataclass
+class OverlongBufferConfig:
+    """DAPO soft overlong-buffer reward shaping (verl reward_manager/dapo).
+
+    penalty = min(-(resp_len - (max_resp_len - len)) / len * penalty_factor, 0)
+    so the penalty ramps linearly from 0 to ``-penalty_factor`` across the last
+    ``len`` tokens before ``max_resp_len``.
+    """
+    enable: bool = False
+    len: int = 0
+    penalty_factor: float = 0.0
+    log: bool = False
 
 
 @dataclass
@@ -97,6 +421,14 @@ class DAPOConfig:
     dynamic_sampling: bool = True
     token_level_pg: bool = True
     overlong_reward_shaping: bool = True
+    loss_mode: str = "token_level"  # "token_level" (standard DAPO) or "gmpo" (geometric mean PO)
+    discount: float = 1.0
+    # verl-faithful dynamic sampling + soft overlong shaping.
+    filter_groups: FilterGroupsConfig = field(default_factory=FilterGroupsConfig)
+    overlong_buffer: OverlongBufferConfig = field(default_factory=OverlongBufferConfig)
+    # Max response length used by the soft overlong buffer (tokens). 0 = use
+    # policy.max_response_length.
+    max_resp_len: int = 0
 
 
 @dataclass
@@ -150,6 +482,7 @@ class SpecDistillConfig:
 class TeacherConfig:
     """Teacher / target model configuration."""
     model_name: str = ""
+    key: str = ""                               # routing key for multi-teacher
     lm_head_key: str = "lm_head.weight"
     norm_key: str = "model.norm.weight"
     load_norm: bool = False
@@ -157,8 +490,8 @@ class TeacherConfig:
     quantization: str = ""                  # "" | "fp8" | "fp4" | "mxfp4"
     tensor_parallel_size: int = 1           # ATOM tensor parallelism
     gpu_ids: Optional[list[int]] = None     # GPUs for ATOM inference
-    transport: str = "mooncake"              # "mooncake" | "mori"
-    atom: Any = None                        # ATOM Config extra args
+    transport: str = "mooncake"             # "mooncake" | "mori"
+    atom: Any = None                        # ATOM config extra args
     # MORI-IO P2P RDMA for GPU-direct hidden state transfer
     mori_io_host: str = "127.0.0.1"         # OOB communication address
     mori_io_port: int = 0                   # 0 = auto-assign
@@ -226,8 +559,21 @@ class DraftModelConfig:
 
 
 @dataclass
+class DistillationConfig:
+    """Multi-teacher distillation configuration."""
+    enabled: bool = False
+    teacher_key: str = "data_source"           # field name in dataset used to route samples
+    teachers: dict = field(default_factory=dict)  # key -> teacher config overrides
+    loss_mode: str = "reverse_kl"               # k1, k3, forward_kl, reverse_kl
+    topk: Optional[int] = None                  # for top-k distillation losses
+    use_task_rewards: bool = False               # combine with task rewards
+    distillation_loss_coef: float = 1.0          # coefficient for distillation loss
+
+
+@dataclass
 class AlgorithmConfig:
     name: str = AlgorithmName.GRPO.value
+    adv_estimator: str = ""  # empty = auto-infer from algorithm.name
     grpo: GRPOConfig = field(default_factory=GRPOConfig)
     dapo: DAPOConfig = field(default_factory=DAPOConfig)
     ppo: PPOConfig = field(default_factory=PPOConfig)
@@ -235,6 +581,23 @@ class AlgorithmConfig:
     spec_distill: SpecDistillConfig = field(default_factory=SpecDistillConfig)
     teacher: TeacherConfig = field(default_factory=TeacherConfig)
     draft: DraftModelConfig = field(default_factory=DraftModelConfig)
+    distillation: DistillationConfig = field(default_factory=DistillationConfig)
+    # KL controller settings (verl/trainer/ppo/core_algos.py L193-212)
+    kl_ctrl_type: str = "fixed"         # "fixed" | "adaptive"
+    kl_penalty: str = "kl"              # kl, abs, mse, k3, k3+, etc.
+    kl_target: float = 0.01             # target KL for adaptive controller
+    kl_horizon: int = 10000             # horizon for adaptive controller
+    use_kl_in_reward: bool = False      # apply KL penalty to token rewards before advantages
+    # Policy loss registry (verl/trainer/ppo/core_algos.py L50-85)
+    loss_mode: str = ""                 # "" = use algorithm default; or "vanilla", "gspo", etc.
+    loss_agg_mode: str = "token-mean"   # token-mean, seq-mean-token-sum, seq-mean-token-sum-norm, seq-mean-token-mean
+    # Unified clip ratios for policy loss registry
+    clip_ratio: float = 0.2
+    clip_ratio_low: Optional[float] = None
+    clip_ratio_high: Optional[float] = None
+    clip_ratio_c: float = 3.0
+    # Rollout correction (also available via quantization.rollout_correction)
+    rollout_correction: Optional[RolloutCorrectionConfig] = None
 
 
 @dataclass
@@ -251,6 +614,8 @@ class TrainingQuantConfig:
     fp8_recipe: str = "blockwise"
     fp8_weight_cache: bool = False
     lumen_norm: bool = False
+    fused_mlp: bool = False
+    fused_rope: bool = False
     lumen_linear: bool = False
     hf_attn_patch: bool = False
 
@@ -260,6 +625,39 @@ class RolloutCorrectionConfig:
     enabled: bool = False
     method: str = "tis"
     clip: float = 1.5
+    # IS weights (verl rollout_corr_helper.py)
+    rollout_is: str = ""                # "token" | "sequence" | ""
+    # Thresholds are strings so that a single field can carry either a number
+    # or an IcePop "lower_upper" pair / a comma-separated list. YAML written
+    # against the older float fields still works: __post_init__ coerces.
+    rollout_is_threshold: str | float = "2.0"
+    rollout_is_batch_normalize: bool = False
+    # How the per-token log-ratios of a sequence combine for
+    # ``rollout_is: sequence``. "sum" is the full sequence likelihood ratio;
+    # "mean" divides by the response length for the geometric mean, which is
+    # the only form that stays in a usable range on long responses -- at 4k
+    # tokens the sum saturates the +-20 safety bound and then the threshold
+    # clamp almost always. Runs are not comparable across this setting.
+    rollout_is_seq_reduction: str = "sum"   # "sum" | "mean"
+    # Rejection sampling (11 criteria: token_k1/k2/k3, seq_sum/mean/max_k1/k2/k3)
+    rollout_rs: str = ""                # comma-separated: "seq_mean_k1", "seq_mean_k3", etc.
+    rollout_rs_threshold: str | float = ""  # comma-separated; K1 uses "lower_upper"
+    # Bypass mode: set pi_old = pi_rollout, skip old_log_prob computation
+    bypass_mode: bool = False
+    loss_type: str = "ppo_clip"         # "ppo_clip" | "reinforce" (bypass mode only)
+
+    def __post_init__(self) -> None:
+        # Numbers from YAML reach the parsers as strings, which is what the
+        # "lower_upper" and comma-separated forms need them to be.
+        if not isinstance(self.rollout_is_threshold, str):
+            self.rollout_is_threshold = str(self.rollout_is_threshold)
+        if not isinstance(self.rollout_rs_threshold, str):
+            self.rollout_rs_threshold = str(self.rollout_rs_threshold)
+        if self.rollout_is_seq_reduction not in ("sum", "mean"):
+            raise ValueError(
+                "rollout_is_seq_reduction must be 'sum' or 'mean', got "
+                f"{self.rollout_is_seq_reduction!r}"
+            )
 
 
 @dataclass
@@ -276,6 +674,18 @@ class R3Config:
     enabled: bool = False
     record_router_logits: bool = True
     replay_mode: str = "distribution"
+    # Rollout Routing Replay (arXiv 2510.11370): take the top-k expert ids the
+    # ROLLOUT engine actually selected and replay them in the training forward
+    # and backward, instead of re-deriving routing from the trainer's own
+    # hidden states. ``enabled`` above is the older trainer-internal replay
+    # (old-logprob forward -> update), which is a different mechanism.
+    #
+    # This is the only thing that removes train/rollout expert-selection flips
+    # rather than making them less likely: on Qwen3-30B-A3B, 6.4% of
+    # (token, layer) decisions change under a mere bf16->fp32 router recompute,
+    # so only ~4% of tokens route identically through all 48 layers, and forcing
+    # the gate to fp32 on both sides measured as no improvement at all.
+    rollout_replay: bool = False
 
 
 @dataclass
@@ -290,6 +700,46 @@ class RewardConfig:
     dataset: str = ""
     dataset_split: str = "train"
     model_name: Optional[str] = None
+    # verl alignment: verl's dataloader shuffles the training prompts with a
+    # torch.Generator seeded by ``data.seed`` (RandomSampler). Lumen historically
+    # read prompts sequentially, which fed a *different* prompt set per step and
+    # diverged from verl on step-1 metrics. Enable a verl-equivalent shuffle so
+    # both frameworks consume the same prompt order. ``shuffle_seed=None`` falls
+    # back to the top-level ``config.seed``.
+    shuffle: bool = True
+    shuffle_seed: Optional[int] = None
+
+
+@dataclass
+class DatasetConfig:
+    """Dataset preprocessing configuration for speculative distillation."""
+    chat_template: str = ""
+    last_turn_loss_only: str = "false"    # "true", "false", or "auto"
+    min_loss_tokens: int = 0
+    num_preprocess_workers: int = 16
+    cache_dir: str = "/dev/shm/lumenrl_cache"
+
+
+@dataclass
+class EvalConfig:
+    """Validation / evaluation configuration."""
+    enabled: bool = False
+    interval: int = 1000
+    num_samples: int = 256
+    micro_batch_size: int = 8
+
+
+@dataclass
+class CriticConfig:
+    """Configuration for the critic (value) network used by PPO/GAE."""
+    enabled: bool = False
+    model_name: str = ""
+    training_backend: str = "fsdp2"
+    learning_rate: float = 1e-5
+    weight_decay: float = 0.01
+    max_grad_norm: float = 1.0
+    value_clip_ratio: float = 0.2
+    num_critic_epochs: int = 1
 
 
 @dataclass
@@ -362,6 +812,30 @@ class MooncakeTransferConfig:
     kv_lease_ttl_s: float = 120.0
     get_retry_wait_seconds: float = 1.0
     get_retry_max_wait_seconds: float = 90.0
+@dataclass
+class RDMAWeightSyncConfig:
+    """RCCL/RoCE transport settings for cross-node policy weight updates."""
+
+    backend: str = "rccl"
+    require_rdma: bool = True
+    hca: str = "mlx5_0"
+    interface: str = "ens11np0"
+    gid_index: int = 3
+    gdr_mode: str = "auto"  # off | auto | required
+
+
+@dataclass
+class WeightSyncConfig:
+    """Policy weight transport between separated training and rollout nodes."""
+
+    # auto preserves the legacy selection; production choices are
+    # shared_folder and rdma.
+    backend: str = "auto"  # auto | shared_folder | rdma
+    shared_folder: str = "/volumes/oss1/lumenrl_weight_sync"
+    bucket_size_mb: int = 1024
+    timeout_s: int = 600
+    verify_full_load: bool = True
+    rdma: RDMAWeightSyncConfig = field(default_factory=RDMAWeightSyncConfig)
 
 
 @dataclass
@@ -380,6 +854,101 @@ class AsyncTrainingConfig:
 
 
 @dataclass
+class TorchProfilerScheduleConfig:
+    """Schedule for ``torch.profiler.schedule``.
+
+    The profiler cycles through skip_first -> (wait -> warmup -> active) x repeat.
+    Scheduling is only enabled when ``active > 0``; otherwise the profiler runs
+    in continuous mode.
+    """
+
+    skip_first: int = 0
+    wait: int = 0
+    warmup: int = 1
+    active: int = 3
+    repeat: int = 0
+
+
+@dataclass
+class TorchProfilerToolConfig:
+    """Configuration for torch.profiler backend."""
+
+    # Supported values: "cpu", "cuda", "memory", "shapes", "stack"
+    contents: list[str] = field(default_factory=lambda: ["cpu", "cuda"])
+    schedule: Optional["TorchProfilerScheduleConfig"] = None
+
+
+@dataclass
+class RocprofToolConfig:
+    """Configuration for ROCm `rocprof` command-line profiling."""
+
+    # Trace toggles.
+    hip_trace: bool = True
+    hsa_trace: bool = True
+    kernel_trace: bool = False
+    memory_copy_trace: bool = False
+    sys_trace: bool = False
+    timestamp_on: bool = True
+
+    # Optional summary/statistics dump.
+    stats: bool = False
+
+    # Output control.
+    output_file: str = "rocprof_trace"
+    output_format: str = "csv"  # csv | json
+
+    # Optional kernel filter (regex), only when kernel tracing is enabled.
+    kernel_regex: Optional[str] = None
+
+    # Extra raw CLI arguments appended at the end.
+    extra_args: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ProfilerConfig:
+    """Global profiler configuration for trainer/controller process.
+
+    Example (rocprof):
+
+    ```yaml
+    profiler:
+      tool: rocprof
+      enable: true
+      all_ranks: false
+      ranks: [0]
+      save_path: outputs/profile
+      steps: [10, 20, 30]
+      profile_continuous_steps: false
+      tool_config:
+        hip_trace: true
+        hsa_trace: true
+        kernel_trace: true
+        memory_copy_trace: true
+        sys_trace: false
+        timestamp_on: true
+        stats: true
+        output_file: rocprof_trace
+        output_format: csv
+        kernel_regex: null
+        extra_args: []
+    ```
+    """
+
+    tool: str = "torch"
+    enable: bool = False
+    all_ranks: bool = False
+    ranks: list[int] = field(default_factory=list)
+    save_path: str = "outputs/profile"
+    steps: Optional[list[int]] = None
+    profile_continuous_steps: bool = False
+    # NOTE: typed ``Any`` (not a Union of dataclasses) because OmegaConf's
+    # structured-config schema does not support unions of containers. The
+    # profiler consumers (utils/profiler.py) re-validate via isinstance and fall
+    # back to the appropriate default tool config, so YAML still works.
+    tool_config: Any = field(default_factory=TorchProfilerToolConfig)
+
+
+@dataclass
 class LumenRLConfig:
     """Top-level configuration for LumenRL."""
 
@@ -389,14 +958,22 @@ class LumenRLConfig:
     reward: RewardConfig = field(default_factory=RewardConfig)
     quantization: QuantizationConfig = field(default_factory=QuantizationConfig)
     moe: MoEConfig = field(default_factory=MoEConfig)
-    eval: EvalConfig = field(default_factory=EvalConfig)
+    critic: CriticConfig = field(default_factory=CriticConfig)
     checkpointing: CheckpointConfig = field(default_factory=CheckpointConfig)
     logger: LoggerConfig = field(default_factory=LoggerConfig)
     mooncake: MooncakeTransferConfig = field(default_factory=MooncakeTransferConfig)
+    weight_sync: WeightSyncConfig = field(default_factory=WeightSyncConfig)
     async_training: AsyncTrainingConfig = field(default_factory=AsyncTrainingConfig)
+    profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
+    controller: ControllerConfig = field(default_factory=ControllerConfig)
+    assembly: RuntimeAssemblyConfig = field(default_factory=RuntimeAssemblyConfig)
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
+    eval: EvalConfig = field(default_factory=EvalConfig)
     num_training_steps: int = 1000
     seed: int = 42
+    val_dataset: str = ""
+    val_steps: int = 0        # validate every N steps; 0 = no validation
+    val_batch_size: int = 16
 
     @classmethod
     def from_yaml(cls, path: str | Path, overrides: list[str] | None = None) -> "LumenRLConfig":

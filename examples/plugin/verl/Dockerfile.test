@@ -1,0 +1,54 @@
+# verl + LumenRL plugin test image (lumenrl_fsdp2 training + vLLM rollout).
+#
+# Two supported base images:
+#   - vllm/vllm-openai-rocm:v0.23.0  (vLLM rollout, tested)
+#   - zhangdanyangamd/lumen-rl:qwen3-30b-a3b-308x-actor260805  (ATOM rollout)
+#
+# Usage:
+#   docker build -f examples/plugin/verl/Dockerfile.test -t lumenrl-verl-plugin .
+#   docker run --rm --network=host --ipc=host \
+#     --device /dev/kfd --device /dev/dri --group-add video \
+#     --shm-size 64g --tmpfs /tmp/ray:size=1g \
+#     -v /path/to/data:/data -v /path/to/Lumen-RL:/workspace/Lumen-RL \
+#     -e DATA_ROOT=/data lumenrl-verl-plugin
+
+ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.23.0
+FROM ${BASE_IMAGE}
+
+WORKDIR /workspace
+
+# ─── Update LumenRL source ──────────────────────────────────────────────────
+COPY . /workspace/Lumen-RL
+RUN git config --global --add safe.directory /workspace/Lumen-RL
+
+# ─── Detect torch install location (varies by base image) ───────────────────
+RUN TORCH_DIR=$(python3 -c "import torch, pathlib; print(pathlib.Path(torch.__file__).parent)") && \
+    cp -a "$TORCH_DIR" /tmp/_torch_rocm_backup
+
+# ─── Install verl + deps (pip will pull CUDA torch; we revert below) ────────
+RUN pip install --no-cache-dir verl 'transformers>=5.5.3,<5.11,!=5.6.0'
+
+# ─── Restore ROCm torch ─────────────────────────────────────────────────────
+RUN SITE=$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib'))") && \
+    rm -rf "$SITE/torch" && \
+    mv /tmp/_torch_rocm_backup "$SITE/torch" && \
+    rm -rf "$SITE"/nvidia* "$SITE"/cuda*
+
+# ─── Remove verl hard-coded strategy assert for plugin extensibility ────────
+RUN VERL_CFG="$(pip show verl 2>/dev/null | awk '/^Location:/{print $2}')/verl/workers/config/engine.py" && \
+    sed -i 's/assert self\.strategy in \["fsdp", "fsdp2"\].*/# assert removed for plugin extensibility/' "$VERL_CFG"
+
+# ─── Install LumenRL (editable, no-deps to keep ROCm torch) + extras ────────
+RUN cd /workspace/Lumen-RL && pip install --no-deps -e ".[test]" && \
+    pip install --no-cache-dir amdsmi cachetools datasets "math_verify[antlr4_13_2]"
+
+# ─── Verify ──────────────────────────────────────────────────────────────────
+RUN python3 -c "import torch; v=torch.__version__; print(f'torch={v}'); assert 'rocm' in v.lower() or 'hip' in v.lower() or 'git' in v, f'Expected ROCm torch, got {v}'"
+
+ENV DATA_ROOT=/data
+ENV PYTHONPATH="/workspace/Lumen-RL:${PYTHONPATH:-}"
+ENV PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /workspace/Lumen-RL
+
+CMD ["bash", "examples/plugin/verl/run.sh"]

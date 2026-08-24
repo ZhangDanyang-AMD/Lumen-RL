@@ -2,21 +2,17 @@
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 import torch
 from torch import Tensor
 
+from lumenrl.algorithms.advantage_estimators import compute_dapo_advantage
 from lumenrl.algorithms.base_algorithm import BaseAlgorithm
-from lumenrl.algorithms.loss_functions import asymmetric_clip_loss, kl_penalty
-from lumenrl.core.config import LumenRLConfig
+from lumenrl.algorithms.loss_functions import asymmetric_clip_loss, gmpo_loss, kl_penalty
 from lumenrl.core.protocol import DataProto
 from lumenrl.core.registry import ALGORITHM_REGISTRY
 from lumenrl.core.types import AlgorithmName
-
-logger = logging.getLogger(__name__)
-
 
 def _response_mask(batch: DataProto) -> Tensor | None:
     if "response_mask" in batch.tensors:
@@ -24,27 +20,6 @@ def _response_mask(batch: DataProto) -> Tensor | None:
     if "attention_mask" in batch.tensors:
         return batch.tensors["attention_mask"].to(dtype=torch.bool)
     return None
-
-
-def _apply_overlong_shaping(
-    rewards: Tensor,
-    batch: DataProto,
-    max_len: int,
-    penalty: float,
-) -> Tensor:
-    """Subtract a linear penalty when sequence length exceeds ``max_len``."""
-    if penalty <= 0.0:
-        return rewards
-    lengths = batch.meta.get("response_lengths")
-    if lengths is None:
-        return rewards
-    lens_t = torch.as_tensor(lengths, device=rewards.device, dtype=torch.float32)
-    if lens_t.shape[0] != rewards.shape[0]:
-        return rewards
-    over = torch.clamp(lens_t - float(max_len), min=0.0)
-    shaped = rewards.to(dtype=torch.float32) - penalty * over
-    return shaped.to(dtype=rewards.dtype)
-
 
 class DAPOAlgorithm(BaseAlgorithm):
     """DAPO-style training: asymmetric clipping, dynamic sampling, token-level PG.
@@ -54,57 +29,8 @@ class DAPOAlgorithm(BaseAlgorithm):
     """
 
     def compute_advantages(self, batch: DataProto) -> DataProto:
-        if "rewards" not in batch.tensors:
-            raise KeyError("DAPO requires tensor key 'rewards' on the batch.")
-        rewards = batch.tensors["rewards"]
-        if rewards.dim() > 1:
-            rewards = rewards.squeeze(-1)
-
-        cfg = self._config.algorithm.dapo
-        g = cfg.num_generations
-        if rewards.shape[0] % g != 0:
-            raise ValueError(
-                f"Batch size {rewards.shape[0]} not divisible by num_generations={g}."
-            )
-
-        if cfg.overlong_reward_shaping:
-            rewards = _apply_overlong_shaping(
-                rewards,
-                batch,
-                max_len=int(self._config.policy.max_total_sequence_length),
-                penalty=float(batch.meta.get("overlong_penalty", 1.0)),
-            )
-
-        grouped = rewards.view(-1, g)
-        std = grouped.std(dim=1, unbiased=False)
-
-        if cfg.dynamic_sampling:
-            keep = std > 1e-6
-            if not torch.any(keep):
-                logger.warning("DAPO dynamic sampling removed all groups; keeping all.")
-                keep = torch.ones_like(keep, dtype=torch.bool)
-            row_mask = keep.unsqueeze(-1).expand(-1, g).reshape(-1)
-        else:
-            row_mask = torch.ones(rewards.shape[0], dtype=torch.bool, device=rewards.device)
-
-        mean = grouped.mean(dim=1, keepdim=True)
-        std_safe = grouped.std(dim=1, unbiased=False, keepdim=True).clamp_min(1e-8)
-        adv = (grouped - mean) / std_safe
-        adv_flat = adv.reshape(-1)
-
-        batch.tensors["advantages"] = adv_flat
-        batch.tensors["dapo_sample_mask"] = row_mask.to(dtype=torch.float32)
-        logger.info(
-            "NaN-DEBUG DAPO advantages: active_frac=%.4f, adv nan=%d inf=%d "
-            "min=%.4f max=%.4f mean=%.4f, rewards min=%.4f max=%.4f mean=%.4f, "
-            "std min=%.6f max=%.6f",
-            float(row_mask.float().mean().cpu()),
-            adv_flat.isnan().sum().item(), adv_flat.isinf().sum().item(),
-            adv_flat.min().item(), adv_flat.max().item(), adv_flat.mean().item(),
-            rewards.min().item(), rewards.max().item(), rewards.mean().item(),
-            std.min().item(), std.max().item(),
-        )
-        return batch
+        """Use the single verl-derived DAPO estimator implementation."""
+        return compute_dapo_advantage(batch, self._config)
 
     def compute_loss(self, batch: DataProto) -> tuple[Tensor, dict[str, Any]]:
         if "log_probs" not in batch.tensors or "old_log_probs" not in batch.tensors:
@@ -119,6 +45,11 @@ class DAPOAlgorithm(BaseAlgorithm):
         sample_mask = batch.tensors.get("dapo_sample_mask")
 
         cfg = self._config.algorithm.dapo
+        batch_num_tokens = batch.meta.get("batch_num_tokens")
+        dp_size = batch.meta.get("dp_size", 1)
+        # Truncated importance sampling weights (rollout policy vs training
+        # policy), aligned per response token. See verl rollout_correction.
+        rollout_is_weights = batch.tensors.get("rollout_is_weights")
 
         # Expand sequence-level advantages [B] -> [B, T] for token-level loss.
         # Multiply by response_mask so prompt tokens get zero advantage
@@ -144,9 +75,28 @@ class DAPOAlgorithm(BaseAlgorithm):
         low = float(cfg.clip_ratio_low)
         high = float(cfg.clip_ratio_high)
         clip_c = float(getattr(cfg, "clip_ratio_c", 0.0))
-        if cfg.token_level_pg:
+        loss_mode = getattr(cfg, "loss_mode", "token_level")
+
+        # Align rollout IS weights to the response mask shape if present.
+        ris = None
+        if rollout_is_weights is not None:
+            ris = rollout_is_weights
+            if ris.dim() == 1:
+                ris = ris.unsqueeze(-1)
+            if ris.shape != logp.shape:
+                try:
+                    ris = ris.expand_as(logp)
+                except RuntimeError:
+                    ris = None
+
+        if loss_mode == "gmpo":
+            # GMPO: token-level log-ratio clip → geometric mean ratio → seq-level advantage
+            pg = gmpo_loss(logp, old_logp, adv, low, high, mask=sm)
+        elif cfg.token_level_pg:
             pg = asymmetric_clip_loss(
                 logp, old_logp, adv, low, high, mask=sm, clip_ratio_c=clip_c,
+                batch_num_tokens=batch_num_tokens, dp_size=dp_size,
+                rollout_is_weights=ris,
             )
         else:
             # Sequence-level: mean logp per row, scalar adv per row

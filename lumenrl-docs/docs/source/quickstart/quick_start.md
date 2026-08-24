@@ -1,6 +1,7 @@
 # Quick start
 
-This guide runs GRPO in three regimes—BF16 baseline, FP8 end-to-end, and MoE with R3—then shows SDDD draft distillation and multi-node SLURM launch.
+This guide runs GRPO in BF16 and FP8 regimes, then shows SDDD draft
+distillation and multi-node SLURM launch.
 
 ## Run GRPO (BF16 baseline)
 
@@ -22,16 +23,6 @@ python examples/run_grpo.py --config configs/grpo_dense_fp8.yaml
 ```
 
 See {doc}`/examples/fp8_training` and {doc}`/advance/fp8_quantization` for how the YAML maps to quantizers and correction math.
-
-## Run GRPO (MoE with R3)
-
-For Qwen3-MoE style models, turn on Megatron training paths, expert parallel, FP8, and R3:
-
-```bash
-python examples/run_grpo.py --config configs/grpo_moe_fp8_r3.yaml
-```
-
-Router tensors are recorded during ATOM rollout and replayed during Lumen training when `moe.r3.enabled=true`. Details: {doc}`/examples/moe_r3_training` and {doc}`/advance/moe_r3`.
 
 ## YAML configuration sketch
 
@@ -64,23 +55,21 @@ quantization:
   rollout_correction:
     enabled: false
 
-moe:
-  r3:
-    enabled: false
-
 num_training_steps: 200
 seed: 42
 ```
 
-Full recipes live under `configs/` in the repository; multi-node variants append `cluster.num_nodes` and Megatron parallelism blocks as needed.
+Full recipes live under `configs/` in the repository; multi-node launches
+override `cluster.num_nodes` and `cluster.gpus_per_node` as needed.
 
 ## Run SDDD (Eagle3 Draft Distillation)
 
 Train an Eagle3 draft model for speculative decoding using teacher hidden-state distillation:
 
 ```bash
-# Kimi K2.5 SDDD smoke test (8 GPUs)
-bash examples/Kimi_K25_SDDD/run_kimi_k25.sh --smoke-test
+# Kimi K2.5 SDDD smoke test
+CUDA_VISIBLE_DEVICES=0 python -m lumenrl.trainer.main \
+  --config examples/Kimi_K25_SDDD_MI350_ATOM/configs/smoke_test_hf.yaml
 
 # Qwen3-8B SDDD on MI350 with vLLM
 bash examples/Qwen3_8B_SDDD_MI350_vLLM/run_vllm_mi350.sh
@@ -93,25 +82,16 @@ See {doc}`/examples/sddd_training` and {doc}`/advance/sddd` for architecture det
 The README pattern parameterizes node count and forwards OmegaConf overrides after the script entrypoint:
 
 ```bash
-NUM_NODES=2
-
-COMMAND="python examples/run_grpo_moe.py \
-    --config configs/grpo_moe_fp8_r3_multinode.yaml \
-    cluster.num_nodes=$NUM_NODES \
-    cluster.gpus_per_node=8 \
-    policy.model_name=Qwen/Qwen3-30B-A3B \
-    quantization.rollout.precision=fp8 \
-    moe.r3.enabled=true \
-    logger.wandb_enabled=true"
-
-sbatch --nodes=$NUM_NODES --gres=gpu:8 scripts/ray.sub
+bash scripts/launch_slurm.sh 2 configs/grpo_dense_fp8.yaml \
+    policy.model_name=Qwen/Qwen3-8B \
+    logger.wandb_enabled=true
 ```
 
 Adapt `scripts/ray.sub` to your site’s partition, account, and module loads. Ray head/worker startup should match `cluster.ray_address` when using an external cluster; see {doc}`/advance/distributed`.
 
 ## Where to go next
 
-- RL walkthroughs: {doc}`/examples/grpo_training`, {doc}`/examples/fp8_training`, {doc}`/examples/moe_r3_training`
+- RL walkthroughs: {doc}`/examples/grpo_training`, {doc}`/examples/fp8_training`
 - SDDD walkthroughs: {doc}`/examples/sddd_training`, {doc}`/advance/sddd`
 - Systems topics: {doc}`/advance/distributed`, {doc}`/advance/algorithms`, {doc}`/architecture`
 - Python APIs: {doc}`/api/config`, {doc}`/api/protocol`, {doc}`/api/algorithms`

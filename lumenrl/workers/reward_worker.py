@@ -6,12 +6,13 @@ import importlib
 import logging
 from typing import Any, Callable
 
+from lumenrl.workers.base_worker import BaseWorker, get_nested_config
+
 import torch
 import torch.nn as nn
 
 from lumenrl.core.protocol import DataProto
 from lumenrl.engine.training.fsdp_backend import FSDP2Backend
-from lumenrl.workers.base_worker import BaseWorker, get_nested_config
 
 logger = logging.getLogger(__name__)
 

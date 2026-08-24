@@ -1,0 +1,168 @@
+# DeepSeek-V4-Flash DAPO smoke: FSDP2 training + vLLM rollout, 4 nodes / 32 GPUs.
+#
+# Ported from dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml. Everything that
+# defines the optimization problem is left alone; the differences are all forced
+# by the model or the hardware:
+#
+#   * cluster 1 -> 4 nodes, actor workers 8 -> 32.
+#   * rollout tensor_parallel_size 1 -> 8. TP=1 is not optional here: it faults
+#     with `Memory access fault` on gfx950 for every MoE backend / AITER
+#     combination tried, and upstream's validation matrix never covered it.
+#   * kv_cache_dtype fp8_e4m3 -- DeepseekV4's FlashMLA fp8 layout asserts on an
+#     auto/bf16 KV cache.
+#   * moe_backend triton -- the default auto-selects AITER and dies in the first
+#     forward at `moe_sorting_opus_fwd`; `triton_unfused` is FP4-only.
+#   * max_num_batched_tokens 8192 -> 2048, the profiling batch the validated
+#     rollout probe used; larger shrinks nothing and the block-FP8 GEMM faults.
+#
+# ⚠️ model_name points at a 4-LAYER slice of DeepSeek-V4-Flash-Base, not the full
+# 43-layer model. This is a plumbing smoke, not a training run. The full model
+# cannot go through this path as written: `_load_hf_model` materializes the whole
+# model on every rank's CPU (fsdp_backend.py, "All ranks load the full model from
+# disk"), and `model_dtype` is hardcoded to fp32, so 284B needs 1137 GB x 8 ranks
+# = 9.1 TB per node against 2.7 TB of RAM. Even bf16 needs 4.55 TB. Loading the
+# full model requires meta-device init plus a sharded checkpoint read.
+#
+# The slice keeps layers 0-3, which covers every per-layer branch the converter
+# and the model have: sliding_attention, compressed_sparse_attention (with the
+# nested indexer), heavily_compressed_attention, and both hash_moe and moe.
+# Build it with ~/dsv4/make_native_subset.py (DSV4_SUBSET_LAYERS=4).
+#
+# Run with ray_env_dsv4.sh, NOT ray_env.sh: VLLM_ROCM_USE_AITER must be 1 here
+# (V4's sparse attention indexer is AITER-only on ROCm) and 0 for Qwen3 BF16.
+
+cluster:
+  num_nodes: 4
+  gpus_per_node: 8
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    actor:
+      num_workers: 32
+      dispatch_mode: dp_compute_proto
+      # One entry per node. Without it Ray decides rank->node itself and the TP=8
+      # rollout dies with "replica i spans 2 nodes: actors 8..15 must be colocated".
+      # RayWorkerGroup turns this into a STRICT_SPREAD placement group, one bundle
+      # per node, so ranks 0-7 land together, 8-15 together, and so on.
+      process_on_nodes: [8, 8, 8, 8]
+
+policy:
+  model_name: "/mnt/m2m_nobackup/xysheng/models/dsv4-native-L4"
+  training_backend: fsdp2
+  generation_backend: vllm
+  max_total_sequence_length: 6144       # 2048 prompt budget + 4096 response
+  max_response_length: 4096
+  train_global_batch_size: 128          # 8 prompts x 16 generations
+  gen_batch_size: 24                    # 8 * 3, verl's train:gen ratio
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 6144
+  learning_rate: 1.0e-6
+  lr_warmup_steps: 0
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  training:
+    optimizer_dtype: bf16
+    fsdp_cfg:
+      param_offload: false
+      optimizer_offload: false
+      reshard_after_forward: true
+  generation:
+    vllm_cfg:
+      transport: ray_http
+      ray_http_start_server: false
+      tensor_parallel_size: 8
+      kv_cache_dtype: fp8_e4m3
+      moe_backend: triton
+      gpu_memory_utilization: 0.30
+      max_model_len: 6144
+      dtype: bfloat16
+      enforce_eager: true
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 2048
+      max_num_seqs: 64
+      quantization: ""
+      calculate_log_probs: true
+      enable_sleep_mode: false
+      update_weights_bucket_megabytes: 512
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+
+moe:
+  r3:
+    rollout_replay: false
+
+algorithm:
+  name: dapo
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  loss_agg_mode: token-mean
+  dapo:
+    num_generations: 16
+    kl_coeff: 0.0
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 10.0
+    dynamic_sampling: true
+    token_level_pg: true
+    overlong_reward_shaping: true
+    max_resp_len: 4096
+    # OFF for the sliced model, and only for it. A 4-layer slice feeds `model.norm`
+    # and `lm_head` the layer-3 residual instead of the layer-42 one, so it emits
+    # gibberish and never solves a math problem. With filtering on, every group is
+    # dropped for acc=0 and the run dies at `filter_groups collected no valid
+    # groups` after 10 regeneration rounds -- a data-difficulty failure that says
+    # nothing about the plumbing this smoke exists to test. Turn it back on for
+    # the full model.
+    filter_groups:
+      enable: false
+      metric: acc
+      max_num_gen_batches: 10
+    overlong_buffer:
+      enable: true
+      len: 512
+      penalty_factor: 1.0
+      log: false
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+    rollout_is_batch_normalize: false
+
+reward:
+  type: function
+  function: lumenrl.rewards.math_reward.dapo_math_reward
+  # Reused as-is. The parquet was filtered with Qwen3-8B-Base's tokenizer, so its
+  # 1024-token cutoff does not transfer to V4's 129280-token vocab; the raw text
+  # is what matters, and `_tokenize_prompts` truncates at 1024 anyway.
+  dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet"
+  shuffle: true
+  shuffle_seed: 10086
+
+val_dataset: ""
+val_steps: 0
+val_batch_size: 0
+eval:
+  enabled: false
+  num_samples: 0
+
+checkpointing:
+  checkpoint_dir: ""
+  save_steps: 1000
+  save_total_limit: 0
+  resume: false
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 3
+seed: 10086

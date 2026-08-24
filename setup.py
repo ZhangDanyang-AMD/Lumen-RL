@@ -27,6 +27,17 @@ setup(
         #   pip install -e third_party/Lumen       (training engine)
         #   pip install -e third_party/aiter        (GPU kernels)
         #   pip install -e third_party/mori         (communication)
+        "megatron": [
+            "megatron-core>=0.9",
+            "megatron-bridge>=0.1",
+        ],
+        "peft": [
+            "peft>=0.10",
+        ],
+        "engine": [
+            "safetensors>=0.4",
+            "peft>=0.10",
+        ],
         "test": [
             "pytest>=8.0",
             "pytest-xdist>=3.5",

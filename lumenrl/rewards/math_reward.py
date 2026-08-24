@@ -1,7 +1,9 @@
-"""DAPO-style math reward: verify boxed answers against ground truth.
+"""DAPO-style math reward: verify answers against ground truth.
 
-Adapted from verl/utils/reward_score/math_dapo.py (Apache-2.0, Bytedance & EleutherAI).
-Optionally uses ``math_verify`` for robust symbolic comparison when installed.
+Ported from verl/utils/reward_score/math_dapo.py (Apache-2.0, Bytedance & EleutherAI)
+to match verl's scoring exactly: the minerva criterion extracts the last ``Answer:``
+line, normalizes both sides, and compares as strings. No ``math_verify`` symbolic
+check is used, so the reward signal stays aligned with the verl baseline.
 """
 
 from __future__ import annotations
@@ -80,43 +82,23 @@ def normalize_final_answer(final_answer: str) -> str:
     return final_answer.strip()
 
 
-def _try_math_verify(solution_str: str, ground_truth: str) -> Optional[bool]:
-    """Attempt to verify using the ``math_verify`` package if available."""
-    try:
-        from math_verify import parse, verify
-
-        answer = parse(solution_str, parsing_timeout=5)
-        gt = parse(ground_truth, parsing_timeout=5)
-        return verify(answer, gt, timeout_seconds=5)
-    except ImportError:
-        return None
-    except Exception:
-        return None
-
-
 def compute_score(solution_str: str, ground_truth: str) -> dict:
     """Compute reward for a single (solution, ground_truth) pair.
 
-    Returns dict with keys: score (float), acc (bool), pred (str|None).
+    Mirrors verl ``math_dapo.compute_score`` with ``strict_box_verify=False``
+    (the minerva criterion): take the last 300 chars, extract the answer after
+    the last ``Answer:`` line, normalize both prediction and ground truth, then
+    compare as strings. No symbolic ``math_verify`` fallback, so scores match
+    the verl baseline bit-for-bit.
+
+    Returns dict with keys: score (float), acc (bool), pred (str).
     """
     solution_str = solution_str[-300:]
 
-    mv_result = _try_math_verify(solution_str, ground_truth)
-    if mv_result is not None:
-        return {"score": 1.0 if mv_result else -1.0, "acc": mv_result, "pred": None}
-
-    boxed = last_boxed_only_string(solution_str)
-    if boxed is not None:
-        pred = normalize_final_answer(remove_boxed(boxed))
-    else:
-        match = re.findall(r"(?i)Answer\s*:\s*([^\n]+)", solution_str)
-        pred = normalize_final_answer(match[-1]) if match else "[INVALID]"
-
-    gt_boxed = last_boxed_only_string(ground_truth)
-    if gt_boxed is not None:
-        gt = normalize_final_answer(remove_boxed(gt_boxed))
-    else:
-        gt = normalize_final_answer(ground_truth)
+    match = re.findall(r"(?i)Answer\s*:\s*([^\n]+)", solution_str)
+    extracted = match[-1] if match else "[INVALID]"
+    pred = normalize_final_answer(extracted)
+    gt = normalize_final_answer(ground_truth)
 
     correct = pred == gt
     return {"score": 1.0 if correct else -1.0, "acc": correct, "pred": pred}
@@ -145,7 +127,30 @@ def compute_math_reward(
     return torch.tensor(rewards, dtype=torch.float32), details
 
 
-def dapo_math_reward(batch: DataProto) -> torch.Tensor:
+def dapo_math_reward(batch=None, data_source=None, solution_str=None,
+                     ground_truth=None, extra_info=None, **kwargs):
+    """Reward function compatible with both LumenRL and verl interfaces.
+
+    LumenRL calls: dapo_math_reward(batch: DataProto) → Tensor
+    verl calls:    dapo_math_reward(data_source, solution_str, ground_truth, ...) → float
+    """
+    if data_source is not None or solution_str is not None:
+        return _verl_compute_score(data_source, solution_str, ground_truth, extra_info, **kwargs)
+    return _lumenrl_batch_reward(batch, **kwargs)
+
+
+def _verl_compute_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs):
+    """verl-compatible per-sample scoring."""
+    try:
+        from math_verify import parse, verify
+        answer = parse(solution_str)
+        expected = parse(ground_truth)
+        return 1.0 if verify(answer, expected) else 0.0
+    except Exception:
+        return 0.0
+
+
+def _lumenrl_batch_reward(batch: DataProto, **kwargs) -> torch.Tensor:
     """Reward function compatible with ``RewardWorker``'s function-based interface.
 
     Expects ``batch.meta`` to contain:

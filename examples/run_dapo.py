@@ -2,7 +2,6 @@
 
 Usage:
     python examples/run_dapo.py --config configs/dapo_dense_fp8.yaml
-    python examples/run_dapo.py --config configs/dapo_moe_fp8_r3.yaml
 """
 
 from __future__ import annotations

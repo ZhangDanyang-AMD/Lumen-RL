@@ -54,12 +54,10 @@ algorithm:
     aux_hidden_state_layer_ids: [1, 17, 32]
   teacher:
     model_name: /dev/shm/gpt-oss-120b
-    inference_backend: atom
+    inference_backend: vllm
     tensor_parallel_size: 4
     gpu_ids: [4, 5, 6, 7]
     quantization: ""
-    atom:
-      kv_cache_dtype: fp8
   draft:
     from_scratch: true
     # ---- Aligned with nvidia/gpt-oss-120b-Eagle3-long-context/config.json ----
@@ -114,7 +112,7 @@ reward:
   dataset_split: train_sft
 
 checkpointing:
-  checkpoint_dir: /dev/shm/checkpoints/gpt_oss_120b_eagle3_v2
+  checkpoint_dir: /dev/shm/checkpoints/gpt_oss_120b_eagle3_vllm
   # 19488 steps / 100 = ~195 saves, capped to last 3 by save_total_limit (~9 GB).
   # MI308 ROCm hits HSA aperture faults on long runs (~once per 500-700 steps
   # with vLLM+aiter teacher); auto-restart wrapper resumes from the latest

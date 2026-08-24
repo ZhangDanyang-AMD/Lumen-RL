@@ -15,7 +15,6 @@ from torch import Tensor
 
 from lumenrl.algorithms.base_algorithm import BaseAlgorithm
 from lumenrl.algorithms.loss_functions import opd_kl_divergence
-from lumenrl.core.config import LumenRLConfig
 from lumenrl.core.protocol import DataProto
 from lumenrl.core.registry import ALGORITHM_REGISTRY
 from lumenrl.core.types import AlgorithmName

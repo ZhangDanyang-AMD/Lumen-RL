@@ -21,7 +21,7 @@ if [ "${SMOKE_TEST}" = true ] && [ "${PHASE2}" = true ]; then
     exit 2
 fi
 
-DOCKER_IMAGE="${DOCKER_IMAGE:-gpt_oss_eagle3_train:latest}"
+DOCKER_IMAGE="${DOCKER_IMAGE:-lumenrl-vllm-mi308:latest}"
 # Distinct container name per phase so phase 2 can launch alongside an
 # accidentally-leftover phase 1 container instead of name-colliding.
 if [ "${PHASE2}" = true ]; then
@@ -29,7 +29,7 @@ if [ "${PHASE2}" = true ]; then
 else
     CONTAINER_NAME="gpt_oss_120b_eagle3_vllm_mi308"
 fi
-LUMENRL_DIR="/home/danyzhan/Lumen-RL"
+LUMENRL_DIR="/home/leiwu/Lumen-RL"
 
 if [ "${SMOKE_TEST}" = true ]; then
     RUN_CMD="bash examples/GPT_OSS_120b_MI308_ATOM/run_gpt_oss_120b.sh --smoke-test"
@@ -65,6 +65,7 @@ docker run --rm \
     --device /dev/kfd \
     --device /dev/dri \
     --group-add video \
+    --group-add render \
     --cap-add SYS_PTRACE \
     --security-opt seccomp=unconfined \
     -e CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
@@ -92,11 +93,6 @@ docker run --rm \
     -v "${LUMENRL_DIR}/examples:/root/lumenrl/examples" \
     -v "${LUMENRL_DIR}/output:/root/lumenrl/output" \
     -v "${LUMENRL_DIR}/third_party/Lumen/lumen:/root/Lumen/lumen" \
-    -v "${LUMENRL_DIR}/third_party/ATOM/atom/rollout/model_runner_ext.py:/app/ATOM/atom/rollout/model_runner_ext.py" \
-    -v "${LUMENRL_DIR}/third_party/ATOM/atom/rollout/async_engine.py:/app/ATOM/atom/rollout/async_engine.py" \
-    -v "${LUMENRL_DIR}/third_party/ATOM/atom/rollout/engine_utility.py:/app/ATOM/atom/rollout/engine_utility.py" \
-    -v "${LUMENRL_DIR}/third_party/ATOM/atom/model_engine/engine_core_mgr.py:/app/ATOM/atom/model_engine/engine_core_mgr.py" \
-    -v "${LUMENRL_DIR}/third_party/ATOM/atom/model_engine/engine_core.py:/app/ATOM/atom/model_engine/engine_core.py" \
     -w /root/lumenrl \
     "${DOCKER_IMAGE}" \
     bash -c "${RUN_CMD}"

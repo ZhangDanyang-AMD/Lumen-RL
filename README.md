@@ -6,6 +6,10 @@ An AMD native **Post-Training Framework for LLMs**, powered by [Lumen](https://g
 
 ## 📢 News
 
+- **[2026/07]** LumenRL now supports **MoE RL training (Qwen3-30B-A3B)** — fused routing + aux loss, R3 router alignment for stable MoE RL training
+- **[2026/07]** LumenRL now supports **Megatron-Core training backend** — TP/EP/DP parallelism with distributed optimizer and sequence parallelism
+- **[2026/07]** LumenRL now supports **training-inference separation** — decoupled training and inference onto independent GPU groups for improved resource utilization
+- **[2026/06]** LumenRL now supports **Qwen3-8B FP8 quantized training** — hybrid E4M3/E5M2 FP8 training and FP8 rollout with blockwise W8A8 quantization via [Lumen](https://github.com/ZhangDanyang-AMD/Lumen) and [ATOM](https://github.com/ROCm/ATOM)
 - **[2026/05]** LumenRL now supports **Speculative Decoding Draft Distillation (SDDD)** — Eagle3 draft distillation for Kimi K2.5 and Qwen3-8B on MI350 with [Mooncake](https://github.com/kvcache-ai/Mooncake)/MORI RDMA transfer
 - **[2026/04]** LumenRL now supports **fully async training** — inspired by [VERL](https://github.com/verl-project/verl), decouples rollout and training for up to 2.7× throughput improvement
 - **[2026/03]** LumenRL now supports **MoE [R3](https://arxiv.org/abs/2510.11370) router alignment** — Rollout Routing Replay for stable MoE RL training
@@ -35,7 +39,8 @@ An AMD native **Post-Training Framework for LLMs**, powered by [Lumen](https://g
 - **AMD-Native**: Built for ROCm with [AITER](https://github.com/ROCm/aiter) kernels (ASM / CK / Triton) and [MORI](https://github.com/ROCm/mori) communication (RDMA + GPU collective ops, MoE expert dispatch)
 - **Quantization End-to-End**: Quantized rollout (FP8, MXFP8, MXFP4) and quantized training with importance-sampling rollout correction (TIS/MIS) — up to 44% throughput gain over BF16
 - **MoE-Stable RL**: Rollout Routing Replay (R3) aligns train/inference routers to prevent MoE training collapse
-- **Speculative Decoding Draft Distillation (SDDD)**: Train Eagle3/DFlash draft models via teacher hidden-state distillation with [Mooncake](https://github.com/kvcache-ai/Mooncake)/MORI RDMA transfer
+- **Speculative Decoding Draft Distillation (SDDD)**: Train Eagle3/DSpark draft models via teacher hidden-state distillation with [Mooncake](https://github.com/kvcache-ai/Mooncake)/MORI RDMA transfer
+- **Training-Inference Separation**: Decoupled training and inference onto independent GPU groups for improved resource utilization and scalability
 - **Flexible Backends**: FSDP2 or Megatron-Core training, ATOM/SGLang/vLLM inference with TP/EP/DP parallelism
 
 ## Architecture
@@ -51,9 +56,9 @@ An AMD native **Post-Training Framework for LLMs**, powered by [Lumen](https://g
 | **Training Backends** | FSDP2, Megatron-Core — with Lumen quantized training and AITER kernels |
 | **Inference Engine** | ATOM / SGLang / vLLM — quantized rollout, MoE expert parallel, speculative decoding, piecewise torch.compile |
 | **RL Algorithms** | GRPO, DAPO, PPO |
-| **SDDD** | Eagle3/DFlash draft distillation, Mooncake/MORI RDMA hidden-state transfer |
+| **SDDD** | Eagle3/DSpark draft distillation, Mooncake/MORI RDMA hidden-state transfer |
 | **Quantization** | FP8 (blockwise W8A8), MXFP8, MXFP4, FP8 KV-cache, FP8 training (hybrid E4M3/E5M2), rollout correction (TIS/MIS) |
-| **MoE** | R3 router alignment, MORI-EP expert parallel, fused routing + aux loss |
+| **MoE** | R3 router alignment, fused routing + aux loss |
 | **Parallelism** | TP, EP, DP, FSDP2, sequence parallelism, context parallelism |
 | **Hardware** | AMD Instinct MI250/MI300/MI350 (ROCm) |
 
@@ -65,10 +70,7 @@ An AMD native **Post-Training Framework for LLMs**, powered by [Lumen](https://g
 |---|---|---|---|---|---|
 | Llama 3.x | `LlamaForCausalLM` | Dense | Yes | Yes | N/A |
 | Qwen3 | `Qwen3ForCausalLM` | Dense | Yes | Yes | N/A |
-| Qwen3-MoE | `Qwen3MoeForCausalLM` | MoE | Yes | Yes | Yes |
-| DeepSeek V2/V3 | `DeepseekV3ForCausalLM` | MoE | Yes | Yes | Yes |
-| Mixtral | `MixtralForCausalLM` | MoE | Yes | Yes | Yes |
-| GLM-4-MoE | `Glm4MoeForCausalLM` | MoE | Yes | Yes | Yes |
+| Qwen3-30B-A3B | `Qwen3MoeForCausalLM` | MoE | Yes | Yes | Yes |
 
 ### SDDD Models
 
@@ -127,25 +129,31 @@ python examples/run_grpo.py --config configs/grpo_dense_fp8.yaml
 # 8 GPUs
 python examples/run_grpo.py --config configs/grpo_dense_fp8_8gpu.yaml
 
-# MoE model with R3 + FP8
-python examples/run_grpo.py --config configs/grpo_moe_fp8_r3.yaml
+# Ray-controller recipe with extended dispatch modes
+python examples/run_grpo.py --config configs/recipes/ray_controller_dispatch_modes_1n8g.yaml
 ```
+
+### Ray Controller Dispatch Modes
+
+When `controller.ray.enabled=true`, role-level dispatch can be configured with:
+
+- `dp_compute_proto` (default)
+- `dp_compute`
+- `dp_compute_proto_with_func`
+- `dp_compute_metric`
+- `one_to_all`
+- `all_to_all`
+- `rank_zero`
+- `direct_rollout_method` (intentionally forbidden in controller dispatch path)
+
+Legacy alias: `broadcast` is accepted and normalized to `one_to_all`.
 
 ### Multi-Node with SLURM
 
 ```bash
-NUM_NODES=2
-
-COMMAND="python examples/run_grpo_moe.py \
-    --config configs/grpo_moe_fp8_r3_multinode.yaml \
-    cluster.num_nodes=$NUM_NODES \
-    cluster.gpus_per_node=8 \
-    policy.model_name=Qwen/Qwen3-30B-A3B \
-    quantization.rollout.precision=fp8 \
-    moe.r3.enabled=true \
-    logger.wandb_enabled=true"
-
-sbatch --nodes=$NUM_NODES --gres=gpu:8 scripts/ray.sub
+bash scripts/launch_slurm.sh 2 configs/grpo_dense_fp8.yaml \
+    policy.model_name=Qwen/Qwen3-8B \
+    logger.wandb_enabled=true
 ```
 
 ## Fully Async Training
@@ -254,12 +262,12 @@ R3 significantly reduces training-inference policy KL divergence and prevents co
 | Feature | FSDP2 | Megatron-Core |
 |---|---|---|
 | Dense FP8 training | Yes | Yes |
-| MoE training | Limited | Yes (EP via MORI) |
+| MoE training | Limited | Yes |
 | FP8 rollout (ATOM) | Yes | Yes |
 | R3 router replay | Yes | Yes |
+| Training-inference separation | Yes | Yes |
 | LoRA | Yes | Yes |
 | Multi-node | Yes | Yes |
-| Expert parallel | No | Yes (MORI-EP) |
 | Sequence parallelism | Yes | Yes |
 
 ## Third-Party Libraries
@@ -320,3 +328,12 @@ LumenRL builds on the work of many open-source projects:
 ## License
 
 Apache License 2.0
+
+## Runtime Assembly Policy
+
+LumenRL validates runtime assembly backends at startup when `assembly.strict_policy=true`:
+
+- Training backend: `fsdp`, `fsdp2`, or `megatron`
+- Inference backend: `atom`
+
+Set `assembly.use_new_assembler=true` to use assembler-driven trainer construction.

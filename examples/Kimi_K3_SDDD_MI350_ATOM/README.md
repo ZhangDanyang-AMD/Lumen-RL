@@ -65,6 +65,34 @@ it must be a real filesystem, since tmpfs is wiped when the allocation ends.
 seconds, and fails on the first problem — the point is to catch ATOM API drift
 and config typos before a 20-minute weight load rather than after.
 
+## Multi-node Ray + SLURM
+
+`run_multinode_slurm.sh` starts one Ray daemon container on every allocated
+node. Ray pins and supervises one 8-GPU launcher actor per node; each actor
+starts its local `torchrun` ranks. Ray is the control plane, while FSDP2 and
+ATOM tensor traffic still uses RCCL/NCCL.
+
+```bash
+# Smoke test first. The listed nodes must be idle/allocated to this job.
+SMOKE_TEST=1 DATA_ROOT=/shared/data \
+sbatch --nodelist=crsuse2-m2m-v2-[034-039] \
+  examples/Kimi_K3_SDDD_MI350_ATOM/run_multinode_slurm.sh
+```
+
+The multi-node path requires `DATA_ROOT` to be mounted at the same path on
+every node. Teacher cache and checkpoints intentionally use that shared
+filesystem; `/dev/shm` is node-local and is not valid for this topology. The
+launcher writes a sentinel and verifies that all Ray actors can read it before
+loading K3.
+
+For six 8-GPU nodes, the launcher defaults `train_global_batch_size` to 48 so
+every rank receives one micro-batch and scales the validated learning rate
+linearly to `5.625e-5`. Override `GLOBAL_BATCH_SIZE` and `LEARNING_RATE`
+together if changing this. The current implementation runs the ATOM TP=8
+teacher on rank 0's node during Phase A, then uses all 48 ranks for Phase B;
+the other five nodes are idle during teacher generation. This is functional
+multi-node training, not yet a disaggregated multi-teacher throughput path.
+
 ## Configuration
 
 ```yaml

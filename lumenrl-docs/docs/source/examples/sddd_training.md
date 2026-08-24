@@ -15,13 +15,14 @@ Train an Eagle3 draft model for Kimi K2.5 on 8 GPUs with SGLang + ATOM inference
 
 ```bash
 # Smoke test
-bash examples/Kimi_K25_SDDD/run_kimi_k25.sh --smoke-test
+CUDA_VISIBLE_DEVICES=0 python -m lumenrl.trainer.main \
+  --config examples/Kimi_K25_SDDD_MI350_ATOM/configs/smoke_test_hf.yaml
 
 # Full two-phase training (Docker)
-bash examples/Kimi_K25_SDDD/run_full_training_docker.sh
+bash examples/Kimi_K25_SDDD_MI350_ATOM/run_full_training_docker.sh
 
-# Custom model path
-MODEL_PATH=/path/to/kimi-k2.5 bash examples/Kimi_K25_SDDD/run_kimi_k25.sh
+# Phase 2 only
+bash examples/Kimi_K25_SDDD_MI350_ATOM/run_full_training_docker.sh --phase2-only
 ```
 
 ### Models
@@ -47,7 +48,7 @@ ls examples/Qwen3_8B_SDDD_MI350_vLLM/
 LumenRL includes MI350-optimized SDDD configurations:
 
 - `examples/Kimi_K25_SDDD_MI350/` — Kimi K2.5 on MI350 with SGLang
-- `examples/Kimi_K25_SDDD_MI350_ATOM/` — Kimi K2.5 on MI350 with vLLM
+- `examples/Kimi_K25_SDDD_MI350_ATOM/` — Kimi K2.5 on MI350 with ATOM
 - `examples/Qwen3_8B_SDDD_MI350_vLLM/` — Qwen3-8B on MI350 with vLLM
 
 ## Monitoring

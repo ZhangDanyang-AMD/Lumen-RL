@@ -1,0 +1,194 @@
+# Short-sequence smoke of the full 43-layer DeepSeek-V4-Flash on 4 nodes.
+#
+# Same recipe as dapo_dsv4_flash_full43_ray_vllm_megatron_4node.yaml, cut down
+# until a step finishes in minutes. That file is the real run; this one exists
+# because at 4096-token responses the generation phase alone ran past 25 minutes
+# with no step boundary, which is too slow a loop to debug the plumbing on.
+#
+# What is deliberately kept identical, because it is what the smoke is for:
+# EP=32, the FP8 rollout at TP=8 x 4 replicas, the weight sync, and the
+# BF16-native checkpoint. What is cut is only size:
+#
+#   responses      4096 -> 256 tokens
+#   sequences      24 prompts x 16 -> 8 x 4, i.e. 384 -> 32
+#   steps          3 -> 2 (two, so there is a second rollout to compare against
+#                  the first -- one step never exercises the weight sync)
+#
+# ⚠️ filter_groups is OFF here and ON in the real config. A 256-token budget
+# does not finish a DAPO-math solution, so accuracy is ~0 by construction,
+# every group gets dropped for zero reward variance, and the run dies at
+# "filter_groups collected no valid groups". That makes reward/accuracy
+# meaningless in this file; the metric to read is rollout_corr/kl.
+#
+#   CFG=examples/DAPO/configs/dapo_dsv4_flash_full43_ray_vllm_megatron_4node_shortsmoke.yaml \
+#   MODEL_PATH=/mnt/m2m_nobackup/xysheng/models/DeepSeek-V4-Flash-Base-bf16-native \
+#   DETACH=1 RAY=1 STEPS=2 bash ~/4node/08_dsv4_megatron_multinode.sh
+
+cluster:
+  num_nodes: 4
+  gpus_per_node: 8
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    actor:
+      num_workers: 32
+      dispatch_mode: dp_compute_proto
+      process_on_nodes: [8, 8, 8, 8]
+
+policy:
+  model_name: "/mnt/m2m_nobackup/xysheng/models/DeepSeek-V4-Flash-Base-bf16-native"
+  training_backend: megatron_native
+  generation_backend: vllm
+  max_total_sequence_length: 1280       # 1024 prompt budget + 256 response
+  max_response_length: 256
+  # 8 prompts x 4 generations, one sequence per rank across the 32 actors.
+  train_global_batch_size: 32
+  gen_batch_size: 8
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 1280
+  learning_rate: 1.0e-6
+  lr_warmup_steps: 0
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  training:
+    optimizer_dtype: bf16
+    megatron_cfg:
+      use_distributed_optimizer: true
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      context_parallel_size: 1
+      expert_model_parallel_size: 32
+      dist_checkpoint_path: "/mnt/m2m_nobackup/xysheng/models/DeepSeek-V4-Flash-Base_torch_dist"
+      recompute_granularity: full
+      recompute_method: uniform
+      recompute_num_layers: 1
+      # ⚠️ ON here, OFF in the real config, and this is the one place the two
+      # disagree on something that matters.
+      #
+      # probe_66 measured a 189.6 GiB step peak and concluded EP=32 needs no
+      # offload -- but it measured that on a 130-token sequence. At 1280 tokens
+      # the backward added 113 GB in one go (175 -> 288 GB/GPU, sampled every
+      # 20 s) and every rank died with "Available Free mem : 0 MB". The trainer
+      # alone wants ~245 GB there, so it does not fit beside any rollout at all,
+      # and the real config's 6144 tokens would want more still.
+      #
+      # 0.75 moves ~80 of the ~107 GB of per-rank optimizer state into host RAM
+      # (2.7 TB free per node, so 8 ranks x 80 GB is comfortable). It is also
+      # what miles runs for this model.
+      #
+      # ⚠️ The cost is known and unfixed: in precision-aware mode only the FP32
+      # parameters that land on the CPU side get updated -- 9 of 27 on the
+      # 4-layer slice (probe_65), silently. Those are the hyper-connection
+      # weights. Acceptable for a plumbing smoke whose verdict is
+      # rollout_corr/kl; NOT acceptable for a real training run.
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 0.75
+      overlap_cpu_optimizer_d2h_h2d: true
+      deterministic_mode: true
+      moe_grouped_gemm: true
+      moe_aux_loss_coeff: 0.0
+      log_probs_chunk_size: 1024
+      enable_dynamic_batch: false
+    fsdp_cfg:
+      param_offload: false
+      optimizer_offload: false
+  generation:
+    vllm_cfg:
+      transport: ray_http
+      ray_http_start_server: false
+      tensor_parallel_size: 8
+      kv_cache_dtype: fp8_e4m3
+      moe_backend: triton
+      quantization: fp8_per_block
+      # 0.15 of 288 GB = 43, against ~36 for the FP8 weights. Lower than the
+      # real config's 0.18 because the trainer's dist_checkpoint load has a
+      # transient well above its 131 GB resting size, and whether that fits
+      # depends on a race: the first attempt survived only because the trainer
+      # finished loading before vLLM claimed its KV cache, and the retry -- with
+      # the checkpoint now in page cache, so vLLM got there first -- died with
+      # "Available Free mem : 0 MB" inside make_tp_sharded_tensor_for_checkpoint.
+      # At max_model_len 1280 the KV cache needs about 1 GB, so the rest of this
+      # budget is headroom rather than something the rollout will miss.
+      gpu_memory_utilization: 0.15
+      max_model_len: 1280
+      dtype: bfloat16
+      enforce_eager: true
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 2048
+      max_num_seqs: 32
+      calculate_log_probs: true
+      enable_sleep_mode: false
+      update_weights_bucket_megabytes: 512
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+
+moe:
+  r3:
+    rollout_replay: false
+
+algorithm:
+  name: dapo
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  loss_agg_mode: token-mean
+  dapo:
+    num_generations: 4
+    kl_coeff: 0.0
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 10.0
+    dynamic_sampling: true
+    token_level_pg: true
+    overlong_reward_shaping: true
+    max_resp_len: 256
+    # See the header: off, or a 256-token budget filters every group away.
+    filter_groups:
+      enable: false
+      metric: acc
+      max_num_gen_batches: 10
+    overlong_buffer:
+      enable: true
+      len: 64
+      penalty_factor: 1.0
+      log: false
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+    rollout_is_batch_normalize: false
+
+reward:
+  type: function
+  function: lumenrl.rewards.math_reward.dapo_math_reward
+  dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet"
+  shuffle: true
+  shuffle_seed: 10086
+
+val_dataset: ""
+val_steps: 0
+val_batch_size: 0
+eval:
+  enabled: false
+  num_samples: 0
+
+checkpointing:
+  checkpoint_dir: ""
+  save_steps: 1000
+  save_total_limit: 0
+  resume: false
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 2
+seed: 10086

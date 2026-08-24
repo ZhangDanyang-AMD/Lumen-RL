@@ -339,7 +339,7 @@ footer .links{margin-top:12px;display:flex;gap:24px;justify-content:center;flex-
   <div class="wrap">
     <p class="stitle">// get started</p>
     <h2 class="htitle">Quick Start</h2>
-    <p class="hsub">Docker or editable install, then launch with BF16, FP8, or MoE R3 configs</p>
+    <p class="hsub">Docker or editable install, then launch with BF16 or FP8 configs</p>
     <div class="qs-grid">
       <div class="cblock">
         <div class="ch"><i style="background:var(--amd-red)"></i> install</div>
@@ -365,11 +365,7 @@ python examples/run_grpo.py \
 
 <span class="c"># FP8 end-to-end</span>
 python examples/run_grpo.py \
-  --config configs/grpo_dense_fp8.yaml
-
-<span class="c"># MoE + R3 + FP8</span>
-python examples/run_grpo.py \
-  --config configs/grpo_moe_fp8_r3.yaml</pre>
+  --config configs/grpo_dense_fp8.yaml</pre>
       </div>
       <div class="cblock">
         <div class="ch"><i style="background:var(--cyan)"></i> fp8 config</div>
@@ -387,16 +383,15 @@ python examples/run_grpo.py \
     clip: <span class="n">1.5</span></pre>
       </div>
       <div class="cblock">
-        <div class="ch"><i style="background:var(--violet)"></i> moe r3 config</div>
-<pre><span class="k">moe</span>:
-  <span class="v">r3</span>:
-    enabled: <span class="n">true</span>
-    record_router_logits: <span class="n">true</span>
-    replay_mode: <span class="s">distribution</span>
+        <div class="ch"><i style="background:var(--violet)"></i> dapo launcher</div>
+<pre><span class="c"># BF16</span>
+MODE=bf16 STEPS=1000 bash examples/DAPO/run_dapo.sh
 
-<span class="c"># DAPO example</span>
-bash examples/DAPO/run_1a_bf16_baseline.sh
-bash examples/DAPO/run_1d_fp8_e2e_blockwise.sh</pre>
+<span class="c"># FP8 rollout</span>
+MODE=fp8 STEPS=1000 bash examples/DAPO/run_dapo.sh
+
+<span class="c"># ATOM FP8 rollout</span>
+MODE=atomfp8 STEPS=1000 bash examples/DAPO/run_dapo.sh</pre>
       </div>
     </div>
   </div>
@@ -464,19 +459,24 @@ bash examples/DAPO/run_1d_fp8_e2e_blockwise.sh</pre>
         <pre><a href="dashboards/SDDD/Kimi_K25_SDDD_MI350/phase2.html" target="_blank" style="color:var(--cyan)">Open Dashboard &rarr;</a></pre>
       </div>
       <div class="ecard">
-        <h3>Qwen3-8B DAPO &mdash; Sync</h3>
-        <p>Synchronous DAPO training with BF16 baseline.</p>
-        <pre><a href="dashboards/DAPO/Qwen3-8B-Base_BF16_DAPO-Sync.html" target="_blank" style="color:var(--cyan)">Open Dashboard &rarr;</a></pre>
+        <h3>Qwen3-30B-A3B MoE &mdash; Training-Inference Separation</h3>
+        <p>MoE DAPO training with training-inference separation on Megatron-Core backend.</p>
+        <img src="figures/Qwen3-30B-A3B-Lumen-RL-Moe-TI-Sep.png" alt="Qwen3-30B-A3B MoE TI-Sep training curves" style="width:100%;border-radius:6px;margin-top:8px;">
       </div>
       <div class="ecard">
-        <h3>Qwen3-8B DAPO &mdash; Async</h3>
-        <p>Fully-async DAPO training with overlapped rollout.</p>
-        <pre><a href="dashboards/DAPO/Qwen3-8B-Base_BF16_DAPO-Async.html" target="_blank" style="color:var(--cyan)">Open Dashboard &rarr;</a></pre>
+        <h3>Qwen3-30B-A3B MoE &mdash; Training-Inference Unified</h3>
+        <p>MoE DAPO training with training-inference unified (co-located) deployment.</p>
+        <img src="figures/Qwen3-30B-A3B-Lumen-RL-Moe-TI-Unified.png" alt="Qwen3-30B-A3B MoE TI-Unified training curves" style="width:100%;border-radius:6px;margin-top:8px;">
       </div>
-      <div class="ecard full">
-        <h3>BF16 Sync Baseline</h3>
-        <p>1a-bf16-sync configuration &mdash; synchronous BF16 training baseline for comparison.</p>
-        <pre><a href="dashboards/1a-bf16-sync/dashboard.html" target="_blank" style="color:var(--cyan)">Open Dashboard &rarr;</a></pre>
+      <div class="ecard">
+        <h3>Qwen3-8B DAPO &mdash; FP8</h3>
+        <p>FP8 quantized DAPO training (LumenRL vs verl), FSDP2 backend.</p>
+        <img src="figures/Qwen3-8B-Lumen-RL-fp8.png" alt="Qwen3-8B FP8 training curves" style="width:100%;border-radius:6px;margin-top:8px;">
+      </div>
+      <div class="ecard">
+        <h3>Qwen3-8B DAPO &mdash; BF16</h3>
+        <p>BF16 baseline DAPO training (LumenRL vs verl), FSDP2 backend.</p>
+        <img src="figures/Qwen3-8B-Lumen-RL-bf16.png" alt="Qwen3-8B BF16 training curves" style="width:100%;border-radius:6px;margin-top:8px;">
       </div>
     </div>
   </div>
@@ -506,7 +506,6 @@ bash examples/DAPO/run_1d_fp8_e2e_blockwise.sh</pre>
     <a class="sidebar-link" data-doc="ex_dapo" onclick="navigateDoc('ex_dapo')">DAPO Training</a>
     <a class="sidebar-link" data-doc="ex_ppo" onclick="navigateDoc('ex_ppo')">PPO Training</a>
     <a class="sidebar-link" data-doc="ex_fp8" onclick="navigateDoc('ex_fp8')">FP8 Training</a>
-    <a class="sidebar-link" data-doc="ex_moe" onclick="navigateDoc('ex_moe')">MoE R3 Training</a>
     <a class="sidebar-link" data-doc="ex_sddd" onclick="navigateDoc('ex_sddd')">SDDD Training</a>
   </div>
   <div class="sidebar-group">
@@ -599,7 +598,7 @@ PY</pre>
 <!-- ─── QUICK START ─── -->
 <div class="doc-section" id="doc-quick_start">
 <h1>Quick Start</h1>
-<p>Run GRPO in three regimes&mdash;BF16 baseline, FP8 end-to-end, and MoE with R3&mdash;then scale with SLURM.</p>
+<p>Run GRPO in BF16 and FP8 regimes, then scale with SLURM.</p>
 
 <h2>Run GRPO (BF16 Baseline)</h2>
 <pre>cd Lumen-RL
@@ -608,9 +607,6 @@ python examples/run_grpo.py --config configs/grpo_dense_bf16.yaml</pre>
 
 <h2>Run GRPO (FP8 End-to-End)</h2>
 <pre>python examples/run_grpo.py --config configs/grpo_dense_fp8.yaml</pre>
-
-<h2>Run GRPO (MoE with R3)</h2>
-<pre>python examples/run_grpo.py --config configs/grpo_moe_fp8_r3.yaml</pre>
 
 <h2>YAML Configuration Sketch</h2>
 <pre>cluster:
@@ -639,25 +635,13 @@ quantization:
   rollout_correction:
     enabled: false
 
-moe:
-  r3:
-    enabled: false
-
 num_training_steps: 200
 seed: 42</pre>
 
 <h2>Multi-Node SLURM Launch</h2>
-<pre>NUM_NODES=2
-
-COMMAND="python examples/run_grpo_moe.py \
-    --config configs/grpo_moe_fp8_r3_multinode.yaml \
-    cluster.num_nodes=$NUM_NODES \
-    cluster.gpus_per_node=8 \
-    policy.model_name=Qwen/Qwen3-30B-A3B \
-    quantization.rollout.precision=fp8 \
-    moe.r3.enabled=true"
-
-sbatch --nodes=$NUM_NODES --gres=gpu:8 scripts/ray.sub</pre>
+<pre>bash scripts/launch_slurm.sh 2 configs/grpo_dense_fp8.yaml \
+    policy.model_name=Qwen/Qwen3-8B \
+    logger.wandb_enabled=true</pre>
 
 <h2>Run SDDD (Eagle3 Draft Distillation)</h2>
 <p>Train an Eagle3 draft model for Qwen3-8B via teacher hidden-state distillation:</p>
@@ -938,73 +922,30 @@ python examples/run_grpo.py --config configs/grpo_dense_fp8.yaml \
 <div class="callout"><strong>Warning:</strong> If you disable <code>rollout_correction</code> while keeping FP8 rollouts, monitor KL and off-policy metrics&mdash;uncorrected FP8 behavior policies can bias advantages.</div>
 </div>
 
-<!-- ─── EXAMPLE: MoE R3 ─── -->
-<div class="doc-section" id="doc-ex_moe">
-<h1>MoE R3 Training Example</h1>
-<p>MoE models amplify throughput but introduce train/inference router mismatch. R3 records router logits during rollout and replays them during training.</p>
-
-<h2>Qwen3-MoE Reference Config</h2>
-<pre>policy:
-  model_name: Qwen/Qwen3-30B-A3B
-  training_backend: megatron
-  generation_backend: atom
-  training:
-    megatron_cfg:
-      tensor_parallel_size: 4
-      expert_parallel_size: 2
-      num_experts: 128
-      moe_grouped_gemm: true
-  generation:
-    atom_cfg:
-      tensor_parallel_size: 4
-      kv_cache_dtype: fp8
-
-moe:
-  r3:
-    enabled: true
-    record_router_logits: true
-    replay_mode: distribution</pre>
-
-<h2>R3 Enabled vs Disabled</h2>
-<pre># R3 on (recommended)
-python examples/run_grpo.py --config configs/grpo_moe_fp8_r3.yaml
-
-# R3 off (diagnostic only)
-python examples/run_grpo.py --config configs/grpo_moe_fp8_r3.yaml moe.r3.enabled=false</pre>
-<p>When R3 is off, watch for sudden spikes in policy&ndash;reference KL and erratic reward variance.</p>
-
-<h2>Monitoring Router Stability</h2>
-<pre>from lumenrl.moe.moe_utils import compute_router_entropy, check_expert_utilization
-
-summary = check_expert_utilization(router_logits, num_experts=128)
-entropy = compute_router_entropy(router_logits)
-print(summary["argmax_expert_mass_mean"], float(entropy))</pre>
-<div class="callout info"><strong>Note:</strong> R3 tensors travel inside <code>DataProto</code> under keys <code>router_dist_layer_{idx}</code>. Preserve them across merge/split boundaries when scaling DP workers.</div>
-</div>
-
 <!-- ─── EXAMPLE: SDDD ─── -->
 <div class="doc-section" id="doc-ex_sddd">
 <h1>SDDD Training Example</h1>
 <p>Train Eagle3 speculative decoding draft models using LumenRL's SDDD pipeline powered by <a href="https://github.com/lightseekorg/TorchSpec">TorchSpec</a>.</p>
 
-<h2>Kimi K2.5 Eagle3 (SGLang + Mooncake)</h2>
-<p>Train an Eagle3 draft model for Kimi K2.5 on 8 GPUs with SGLang + ATOM inference and Mooncake RDMA transfer.</p>
+<h2>Kimi K2.5 Eagle3 (ATOM + Mooncake)</h2>
+<p>Train an Eagle3 draft model for Kimi K2.5 on 8 GPUs with ATOM inference and Mooncake transfer.</p>
 
 <h3>GPU Layout</h3>
 <ul>
 <li><strong>GPUs 0&ndash;3</strong>: FSDP2 Eagle3 draft model training (BF16)</li>
-<li><strong>GPUs 4&ndash;7</strong>: SGLang + ATOM plugin &mdash; Kimi K2.5 teacher (TP=4, BF16 to MXFP4)</li>
+<li><strong>GPUs 4&ndash;7</strong>: ATOM plugin &mdash; Kimi K2.5 teacher (TP=4, BF16 to MXFP4)</li>
 </ul>
 
 <h3>Quick Start</h3>
 <pre><span class="c"># Smoke test</span>
-bash examples/Kimi_K25_SDDD/run_kimi_k25.sh --smoke-test
+CUDA_VISIBLE_DEVICES=0 python -m lumenrl.trainer.main \
+  --config examples/Kimi_K25_SDDD_MI350_ATOM/configs/smoke_test_hf.yaml
 
 <span class="c"># Full two-phase training (Docker)</span>
-bash examples/Kimi_K25_SDDD/run_full_training_docker.sh
+bash examples/Kimi_K25_SDDD_MI350_ATOM/run_full_training_docker.sh
 
-<span class="c"># Custom model path</span>
-MODEL_PATH=/path/to/kimi-k2.5 bash examples/Kimi_K25_SDDD/run_kimi_k25.sh</pre>
+<span class="c"># Phase 2 only</span>
+bash examples/Kimi_K25_SDDD_MI350_ATOM/run_full_training_docker.sh --phase2-only</pre>
 
 <h3>Models</h3>
 <table class="dtbl"><thead><tr><th>Role</th><th>Model</th><th>Notes</th></tr></thead><tbody>
@@ -1020,7 +961,7 @@ ls examples/Qwen3_8B_SDDD_MI350_vLLM/</pre>
 <h2>MI350-Specific Examples</h2>
 <ul>
 <li><code>examples/Kimi_K25_SDDD_MI350/</code> &mdash; Kimi K2.5 on MI350 with SGLang</li>
-<li><code>examples/Kimi_K25_SDDD_MI350_ATOM/</code> &mdash; Kimi K2.5 on MI350 with vLLM</li>
+<li><code>examples/Kimi_K25_SDDD_MI350_ATOM/</code> &mdash; Kimi K2.5 on MI350 with ATOM</li>
 <li><code>examples/Qwen3_8B_SDDD_MI350_vLLM/</code> &mdash; Qwen3-8B on MI350 with vLLM</li>
 </ul>
 
@@ -1185,22 +1126,22 @@ FSDP2 Eagle3/DFlash draft model  &lt;---  Teacher model (ATOM / SGLang / vLLM)
 <!-- ─── ADV: DISTRIBUTED ─── -->
 <div class="doc-section" id="doc-adv_dist">
 <h1>Distributed Training</h1>
-<p>LumenRL scales along two axes: training backend parallelism (FSDP2 vs Megatron-Core) and cluster orchestration (Ray, multi-node SLURM).</p>
+<p>LumenRL scales along two axes: training backend parallelism (FSDP2 vs Megatron-Native) and cluster orchestration (Ray, multi-node SLURM).</p>
 
 <h2>FSDP2 Backend</h2>
-<p><code>policy.training_backend: fsdp2</code> selects PyTorch FSDP2. Default for dense models and smaller MoE runs. Native integration with HF module trees, compatible with Lumen FP8 hooks.</p>
+<p><code>policy.training_backend: fsdp2</code> selects PyTorch FSDP2. It is the default dense-model backend and is compatible with Lumen FP8 hooks.</p>
 
-<h2>Megatron-Core Backend</h2>
-<p><code>policy.training_backend: megatron</code> enables Megatron for large sharded models. MoE RL recipes typically need Megatron for MORI-backed expert parallel and grouped GEMM.</p>
+<h2>Megatron-Native Backend</h2>
+<p><code>policy.training_backend: megatron_native</code> selects the TransformerEngine-based Megatron-Core engine with tensor, pipeline, and context parallelism.</p>
 
 <h2>Backend Support Matrix</h2>
-<table class="dtbl"><thead><tr><th>Capability</th><th>FSDP2</th><th>Megatron-Core</th></tr></thead><tbody>
-<tr><td>Dense FP8 training</td><td>Yes</td><td>Yes</td></tr>
-<tr><td>MoE training</td><td>Limited</td><td>Yes (EP via MORI)</td></tr>
+<table class="dtbl"><thead><tr><th>Capability</th><th>FSDP2</th><th>Megatron-Native</th></tr></thead><tbody>
+<tr><td>Dense BF16 training</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>Dense FP8 training</td><td>Yes</td><td>Not validated</td></tr>
 <tr><td>FP8 rollout (ATOM)</td><td>Yes</td><td>Yes</td></tr>
-<tr><td>R3 router replay</td><td>Yes</td><td>Yes</td></tr>
-<tr><td>Expert parallel</td><td>No</td><td>Yes</td></tr>
-<tr><td>Sequence parallelism</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>FSDP parameter sharding</td><td>Yes</td><td>No</td></tr>
+<tr><td>TP / PP / CP</td><td>No</td><td>Yes</td></tr>
+<tr><td>Megatron dist-checkpoint</td><td>No</td><td>Yes</td></tr>
 </tbody></table>
 
 <h2>Multi-Node Launch</h2>
@@ -1210,12 +1151,8 @@ FSDP2 Eagle3/DFlash draft model  &lt;---  Teacher model (ATOM / SGLang / vLLM)
   ray_address: null    # or "auto"</pre>
 
 <h2>SLURM Integration</h2>
-<pre>NUM_NODES=4
-COMMAND="python examples/run_grpo_moe.py \
-  --config configs/grpo_moe_fp8_r3_multinode.yaml \
-  cluster.num_nodes=$NUM_NODES"
-
-sbatch --nodes=$NUM_NODES --gres=gpu:8 scripts/ray.sub</pre>
+<pre>bash scripts/launch_slurm.sh 4 configs/grpo_dense_fp8.yaml \
+  policy.model_name=Qwen/Qwen3-8B</pre>
 <p>Validate networking (<code>NCCL_SOCKET_IFNAME</code>, RoCE GIDs) independently of LumenRL&mdash;distributed hangs manifest as "stuck rollout" rather than Python tracebacks.</p>
 
 <h2>Ray Cluster Setup</h2>
@@ -1273,7 +1210,7 @@ sbatch --nodes=$NUM_NODES --gres=gpu:8 scripts/ray.sub</pre>
 
 <h2>Quick Start</h2>
 <pre>torchrun --nproc_per_node=8 -m lumenrl.trainer.main \
-  --config configs/1a_bf16_async.yaml</pre>
+  --config /absolute/path/to/async_config.yaml</pre>
 
 <h2>Tuning Recommendations</h2>
 <ul>
@@ -1628,16 +1565,25 @@ new_sd = epm.reshard_for_inference(state_dict, train_ep_size=4, infer_ep_size=2)
 <tr><td>Kimi K2.5 Eagle3</td><td><a href="dashboards/SDDD/Kimi_K25_SDDD_MI350/phase2.html" target="_blank">Phase 2 Dashboard</a></td><td>Phase 2 mixed-domain fine-tuning</td></tr>
 </tbody></table>
 
-<h2>DAPO Dashboards</h2>
-<table class="dtbl"><thead><tr><th>Model</th><th>Dashboard</th><th>Description</th></tr></thead><tbody>
-<tr><td>Qwen3-8B-Base</td><td><a href="dashboards/DAPO/Qwen3-8B-Base_BF16_DAPO-Sync.html" target="_blank">BF16 DAPO Sync</a></td><td>Synchronous DAPO training (BF16 baseline)</td></tr>
-<tr><td>Qwen3-8B-Base</td><td><a href="dashboards/DAPO/Qwen3-8B-Base_BF16_DAPO-Async.html" target="_blank">BF16 DAPO Async</a></td><td>Fully-async DAPO training</td></tr>
+<h2>MoE Training (Qwen3-30B-A3B)</h2>
+<table class="dtbl"><thead><tr><th>Model</th><th>Mode</th><th>Description</th></tr></thead><tbody>
+<tr><td>Qwen3-30B-A3B</td><td>Training-Inference Separation</td><td>MoE DAPO with decoupled training and inference GPU groups (Megatron-Core)</td></tr>
+<tr><td>Qwen3-30B-A3B</td><td>Training-Inference Unified</td><td>MoE DAPO with co-located training and inference</td></tr>
 </tbody></table>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:16px 0;">
+<div><p style="margin:0 0 6px;font-weight:600;">Training-Inference Separation</p><img src="figures/Qwen3-30B-A3B-Lumen-RL-Moe-TI-Sep.png" alt="Qwen3-30B-A3B TI-Sep" style="width:100%;border-radius:6px;"></div>
+<div><p style="margin:0 0 6px;font-weight:600;">Training-Inference Unified</p><img src="figures/Qwen3-30B-A3B-Lumen-RL-Moe-TI-Unified.png" alt="Qwen3-30B-A3B TI-Unified" style="width:100%;border-radius:6px;"></div>
+</div>
 
-<h2>Async Training Dashboards</h2>
-<table class="dtbl"><thead><tr><th>Config</th><th>Dashboard</th><th>Description</th></tr></thead><tbody>
-<tr><td>1a-bf16-sync</td><td><a href="dashboards/1a-bf16-sync/dashboard.html" target="_blank">BF16 Sync Baseline</a></td><td>Synchronous BF16 training baseline</td></tr>
+<h2>Dense Training (Qwen3-8B)</h2>
+<table class="dtbl"><thead><tr><th>Model</th><th>Precision</th><th>Description</th></tr></thead><tbody>
+<tr><td>Qwen3-8B</td><td>FP8</td><td>FP8 quantized DAPO training (LumenRL vs verl comparison, FSDP2)</td></tr>
+<tr><td>Qwen3-8B</td><td>BF16</td><td>BF16 baseline DAPO training (LumenRL vs verl comparison, FSDP2)</td></tr>
 </tbody></table>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:16px 0;">
+<div><p style="margin:0 0 6px;font-weight:600;">FP8 (LumenRL vs verl)</p><img src="figures/Qwen3-8B-Lumen-RL-fp8.png" alt="Qwen3-8B FP8" style="width:100%;border-radius:6px;"></div>
+<div><p style="margin:0 0 6px;font-weight:600;">BF16 (LumenRL vs verl)</p><img src="figures/Qwen3-8B-Lumen-RL-bf16.png" alt="Qwen3-8B BF16" style="width:100%;border-radius:6px;"></div>
+</div>
 </div>
 
 </main>

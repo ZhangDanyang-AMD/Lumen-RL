@@ -6,7 +6,7 @@ draft trained by examples/GPT_OSS_120b_MI308_ATOM:
 - 1-layer Llama-style decoder, GQA 64:8, head_dim=64, ffn=17280
 - llama3 RoPE (theta=500000, factor=8, ctx 8192 -> 65536)
 - no bias anywhere, RMSNorm eps 1e-5
-- Eagle3 aux hidden layer ids: [2, 18, 33, 36]
+- Eagle3 aux hidden layer ids: [1, 17, 32]
 - vocab = gpt-oss vocab (201088, o200k_harmony)
 
 Trained checkpoint has 12 tensors (all bfloat16); lm_head + embed_tokens are
@@ -178,13 +178,7 @@ def main() -> None:
         "use_cache": True,
         "vocab_size": base_cfg["vocab_size"],            # 201088
         "draft_vocab_size": base_cfg["vocab_size"],      # no draft-vocab compression
-        "eagle_config": {
-            "eagle_aux_hidden_state_layer_ids": [2, 18, 33, 36],
-            "use_aux_hidden_state": True,
-            "use_input_layernorm_in_first_layer": True,
-            "use_last_layernorm": True,
-            "use_mtp_layernorm": False,
-        },
+        "eagle_aux_hidden_state_layer_ids": [1, 17, 32],
         "dtype": args.draft_dtype,
     }
     with open(os.path.join(args.out, "config.json"), "w") as f:

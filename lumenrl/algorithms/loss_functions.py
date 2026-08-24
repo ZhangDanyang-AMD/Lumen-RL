@@ -9,7 +9,113 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from lumenrl.utils.torch_functional import masked_sum
+
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "agg_loss",
+    "sft_loss",
+    "policy_gradient_loss",
+    "asymmetric_clip_loss",
+    "gmpo_loss",
+    "value_loss",
+    "kl_penalty",
+    "opd_kl_divergence",
+    "hidden_state_loss",
+    "entropy_bonus",
+]
+
+
+def agg_loss(
+    loss_mat: Tensor,
+    loss_mask: Tensor,
+    loss_agg_mode: str,
+    dp_size: int = 1,
+    batch_num_tokens: Optional[int] = None,
+    global_batch_size: Optional[int] = None,
+) -> Tensor:
+    """Aggregate token losses using verl-compatible reduction modes."""
+    if loss_agg_mode == "token-mean":
+        if batch_num_tokens is None:
+            if dp_size > 1:
+                raise ValueError("batch_num_tokens is required when dp_size > 1")
+            batch_num_tokens = int(loss_mask.sum().item())
+        return masked_sum(loss_mat, loss_mask) / max(batch_num_tokens, 1) * dp_size
+
+    if loss_agg_mode in ("seq-mean-token-sum", "seq-mean-token-sum-norm"):
+        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)
+        seq_mask = (torch.sum(loss_mask, dim=-1) > 0).float()
+        if global_batch_size is None:
+            if dp_size > 1:
+                raise ValueError("global_batch_size is required when dp_size > 1")
+            global_batch_size = int(seq_mask.sum().item())
+        loss = masked_sum(seq_losses, seq_mask) / max(global_batch_size, 1) * dp_size
+        if loss_agg_mode == "seq-mean-token-sum-norm":
+            loss = loss / loss_mask.shape[-1]
+        return loss
+
+    if loss_agg_mode == "seq-mean-token-mean":
+        seq_count = torch.sum(loss_mask, dim=-1)
+        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / (seq_count + 1e-8)
+        seq_mask = (seq_count > 0).float()
+        if global_batch_size is None:
+            if dp_size > 1:
+                raise ValueError("global_batch_size is required when dp_size > 1")
+            global_batch_size = int(seq_mask.sum().item())
+        return masked_sum(seq_losses, seq_mask) / max(global_batch_size, 1) * dp_size
+
+    raise ValueError(f"Invalid loss_agg_mode: {loss_agg_mode!r}")
+
+
+def sft_loss(
+    log_probs: Tensor,
+    loss_mask: Tensor,
+    loss_agg_mode: str = "token-mean",
+    dp_size: int = 1,
+    dp_group=None,
+) -> tuple[Tensor, dict[str, float]]:
+    """Supervised fine-tuning NLL loss over masked tokens.
+
+    Args:
+        log_probs: Per-token log-probabilities ``[B, T]``.
+        loss_mask: Binary mask ``[B, T]`` (1 = supervised token).
+        loss_agg_mode: Aggregation mode forwarded to :func:`agg_loss`.
+        dp_size: Data-parallel world size for global normalization.
+        dp_group: Optional process group for cross-rank token count all-reduce.
+
+    Returns:
+        ``(loss, metrics_dict)`` matching the worker loss_fn contract.
+    """
+    import torch.distributed as dist
+
+    batch_num_tokens: Optional[int] = None
+    global_batch_size: Optional[int] = None
+
+    if loss_agg_mode == "token-mean":
+        num_tokens = loss_mask.sum()
+        if dp_group is not None and dist.is_initialized():
+            dist.all_reduce(num_tokens, group=dp_group)
+        batch_num_tokens = max(int(num_tokens.item()), 1)
+    else:
+        seq_mask = (loss_mask.sum(dim=-1) > 0).float()
+        num_seqs = seq_mask.sum()
+        if dp_group is not None and dist.is_initialized():
+            dist.all_reduce(num_seqs, group=dp_group)
+        global_batch_size = max(int(num_seqs.item()), 1)
+
+    loss = agg_loss(
+        -log_probs,
+        loss_mask,
+        loss_agg_mode,
+        dp_size=dp_size,
+        batch_num_tokens=batch_num_tokens,
+        global_batch_size=global_batch_size,
+    )
+    return loss, {
+        "sft_loss": float(loss.detach()),
+        "num_tokens": float(loss_mask.sum().detach()),
+    }
 
 
 def policy_gradient_loss(
@@ -56,6 +162,9 @@ def asymmetric_clip_loss(
     *,
     mask: Optional[Tensor] = None,
     clip_ratio_c: float = 0.0,
+    batch_num_tokens: Optional[int] = None,
+    dp_size: int = 1,
+    rollout_is_weights: Optional[Tensor] = None,
 ) -> Tensor:
     """Policy-gradient surrogate with asymmetric ratio clipping (DAPO-style).
 
@@ -75,6 +184,14 @@ def asymmetric_clip_loss(
         clip_high: Upper epsilon; ratio upper bound is ``1 + clip_high`` (e.g. 0.28 → 1.28).
         mask: Optional token mask for masked mean reduction.
         clip_ratio_c: Dual-clip bound C (DAPO). 0 disables. Typical value: 3.0.
+        batch_num_tokens: Global token count across all GPUs. When provided,
+            uses Verl-aligned normalization: ``pg.sum() / batch_num_tokens * dp_size``.
+        dp_size: Data-parallel world size (for FSDP all-reduce compensation).
+        rollout_is_weights: Optional per-token truncated importance-sampling
+            weights (TIS/MIS) ``exp(old_logp - rollout_logp)`` between the
+            training policy and the rollout (e.g. FP8 / vLLM) policy. When
+            provided, the per-token PG loss is multiplied by these weights
+            *before* aggregation (verl ``pg_losses * rollout_is_weights``).
 
     Returns:
         Scalar loss tensor to minimize.
@@ -92,12 +209,78 @@ def asymmetric_clip_loss(
         pg_clipped = torch.minimum(pg_losses3, pg)
         pg = torch.where(advantages < 0, pg_clipped, pg)
 
+    if rollout_is_weights is not None:
+        pg = pg * rollout_is_weights.to(dtype=pg.dtype)
+
     if mask is not None:
         w = mask.to(dtype=pg.dtype)
         pg = torch.where(w.bool(), pg, torch.zeros_like(pg))
+        if batch_num_tokens is not None:
+            # Verl-aligned: normalize by global token count, compensate FSDP all-reduce
+            return pg.sum() / max(batch_num_tokens, 1) * dp_size
         denom = torch.clamp(w.sum(), min=1.0)
         return pg.sum() / denom
     return pg.mean()
+
+
+def gmpo_loss(
+    logprobs: Tensor,
+    old_logprobs: Tensor,
+    advantages: Tensor,
+    clip_low: float,
+    clip_high: float,
+    *,
+    mask: Optional[Tensor] = None,
+) -> Tensor:
+    """Geometric-Mean Policy Optimization (GMPO) loss.
+
+    Instead of clipping the importance ratio in probability space, GMPO clips
+    the log-ratio at the token level, computes a geometric mean ratio per
+    sequence, and multiplies by the sequence-level advantage.
+
+    Reference: https://arxiv.org/abs/2507.20673
+    Matches verl's ``compute_policy_loss_geo_mean`` implementation.
+
+    Args:
+        logprobs: Current log-probabilities ``[B, T]``.
+        old_logprobs: Reference log-probabilities ``[B, T]``.
+        advantages: Advantage tensor ``[B, T]`` (token-level, but typically
+            the same scalar broadcast across the sequence).
+        clip_low: Lower clip bound on log-ratio (e.g. 0.4).
+        clip_high: Upper clip bound on log-ratio (e.g. 0.4).
+        mask: Response mask ``[B, T]`` (1 for response tokens, 0 for prompt/pad).
+
+    Returns:
+        Scalar loss tensor to minimize.
+    """
+    neg_approx_kl = logprobs - old_logprobs
+
+    # Token-level clipping in log-space with sign-aware min (GMPO trick):
+    # For positive advantage tokens: keep the smaller of (kl, clipped_kl)
+    # For negative advantage tokens: keep the larger of (kl, clipped_kl)
+    # This is equivalent to: clip toward zero when the update is too large.
+    sgn_adv = torch.sign(advantages)
+    neg_approx_kl_clamped = torch.clamp(neg_approx_kl, -clip_low, clip_high)
+    neg_approx_kl_min = torch.min(
+        sgn_adv * neg_approx_kl, sgn_adv * neg_approx_kl_clamped
+    )
+    neg_approx_kl_min = sgn_adv * neg_approx_kl_min
+
+    if mask is not None:
+        w = mask.to(dtype=neg_approx_kl_min.dtype)
+        mask_sum = w.sum(dim=-1)  # [B]
+        # Geometric mean of token-level ratios → sequence-level ratio
+        ratio = torch.exp(
+            (neg_approx_kl_min * w).sum(dim=-1) / (mask_sum + 1e-8)
+        )
+        # Sequence-level advantage: mean of token advantages
+        seq_adv = (advantages * w).sum(dim=-1) / (mask_sum + 1e-8)
+    else:
+        ratio = torch.exp(neg_approx_kl_min.mean(dim=-1))
+        seq_adv = advantages.mean(dim=-1)
+
+    pg_losses = -seq_adv * ratio
+    return pg_losses.mean()
 
 
 def value_loss(

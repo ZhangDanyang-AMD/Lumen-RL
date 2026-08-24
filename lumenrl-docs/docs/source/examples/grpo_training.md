@@ -72,5 +72,4 @@ If `num_generations` does not divide the batch size built by your dataset and ro
 ## Next steps
 
 - FP8 numerics: {doc}`/examples/fp8_training` and {doc}`/advance/fp8_quantization`
-- MoE stabilization: {doc}`/examples/moe_r3_training`
 - Algorithm details: {doc}`/advance/algorithms` and {doc}`/api/algorithms`

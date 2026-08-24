@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 import torch
@@ -10,13 +9,9 @@ from torch import Tensor
 
 from lumenrl.algorithms.base_algorithm import BaseAlgorithm
 from lumenrl.algorithms.loss_functions import kl_penalty, policy_gradient_loss
-from lumenrl.core.config import LumenRLConfig
 from lumenrl.core.protocol import DataProto
 from lumenrl.core.registry import ALGORITHM_REGISTRY
 from lumenrl.core.types import AlgorithmName
-
-logger = logging.getLogger(__name__)
-
 
 def _response_mask(batch: DataProto) -> Tensor | None:
     if "response_mask" in batch.tensors:
@@ -44,27 +39,6 @@ class GRPOAlgorithm(BaseAlgorithm):
     consecutive rows corresponds to the same prompt. Configure
     ``config.algorithm.grpo.num_generations``.
     """
-
-    def compute_advantages(self, batch: DataProto) -> DataProto:
-        if "rewards" not in batch.tensors:
-            raise KeyError("GRPO requires tensor key 'rewards' on the batch.")
-        rewards = batch.tensors["rewards"]
-        if rewards.dim() > 1:
-            rewards = rewards.squeeze(-1)
-        cfg = self._config.algorithm.grpo
-        g = cfg.num_generations
-        if rewards.shape[0] % g != 0:
-            raise ValueError(
-                f"Batch size {rewards.shape[0]} not divisible by num_generations={g}."
-            )
-        grouped = rewards.view(-1, g)
-        mean = grouped.mean(dim=1, keepdim=True)
-        std = grouped.std(dim=1, unbiased=False, keepdim=True).clamp_min(1e-8)
-        adv = (grouped - mean) / std
-        adv_flat = adv.reshape(-1)
-        batch.tensors["advantages"] = adv_flat
-        logger.debug("GRPO advantages: mean=%.6f std=%.6f", adv_flat.mean().item(), adv_flat.std().item())
-        return batch
 
     def compute_loss(self, batch: DataProto) -> tuple[Tensor, dict[str, Any]]:
         if "log_probs" not in batch.tensors or "old_log_probs" not in batch.tensors:

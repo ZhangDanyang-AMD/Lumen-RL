@@ -33,6 +33,7 @@ from typing import Any, Type
 import torch
 
 import lumenrl.algorithms  # noqa: F401
+from lumenrl.controller import RayCluster
 from lumenrl.core.config import LumenRLConfig
 from lumenrl.core.protocol import DataProto
 from lumenrl.core.registry import ALGORITHM_REGISTRY
@@ -79,6 +80,7 @@ class AsyncRLTrainer:
         self._tokenizer: Any = None
         self._dataset: Any = None
         self._atom_engine: Any = None
+        self._ray_cluster: RayCluster | None = None
         self._use_atom: bool = config.policy.generation_backend.lower() == "atom"
 
         self._is_distributed: bool = torch.distributed.is_initialized()
@@ -118,6 +120,12 @@ class AsyncRLTrainer:
 
         Delegates to the same model-building logic as ``RLTrainer``.
         """
+        if bool(getattr(self.config.controller.ray, "enabled", False)):
+            if RayCluster is None:
+                raise RuntimeError("Ray controller is enabled but RayCluster is unavailable.")
+            self._ray_cluster = RayCluster(self.config.cluster)
+            self._ray_cluster.init()
+
         from lumenrl.trainer.rl_trainer import RLTrainer
 
         model_name = self.config.policy.model_name
@@ -132,6 +140,9 @@ class AsyncRLTrainer:
         if tq.fp8:
             quant["fp8"] = tq.fp8
         quant["fp8_weight_cache"] = tq.fp8_weight_cache
+        quant["lumen_norm"] = tq.lumen_norm
+        quant["fused_mlp"] = tq.fused_mlp
+        quant["fused_rope"] = tq.fused_rope
 
         from lumenrl.engine.training.fsdp_backend import FSDP2Backend
 
@@ -293,7 +304,7 @@ class AsyncRLTrainer:
             return [f"What is {idx} + {idx + 1}?"], [str(2 * idx + 1)]
 
         sample = self._dataset[idx % len(self._dataset)]
-        prompt_raw = sample.get("prompt") or sample.get("question") or sample.get("input") or ""
+        prompt_raw = sample.get("prompt") or sample.get("question") or sample.get("input") or sample.get("problem") or ""
         if isinstance(prompt_raw, list):
             text_parts = [m.get("content", "") for m in prompt_raw if isinstance(m, dict)]
             prompt_text = "\n".join(text_parts)
@@ -312,11 +323,14 @@ class AsyncRLTrainer:
                 rm_raw = _json.loads(rm_raw)
             except (_json.JSONDecodeError, TypeError):
                 rm_raw = {}
-        gt = (rm_raw.get("ground_truth", "") if isinstance(rm_raw, dict)
-              else sample.get("answer") or sample.get("solution") or "")
+        if isinstance(rm_raw, dict) and rm_raw.get("ground_truth", "") != "":
+            gt = rm_raw["ground_truth"]
+        else:
+            gt = (sample.get("answer") or sample.get("solution")
+                  or sample.get("expected_answer") or "")
 
         if self._tokenizer and hasattr(self._tokenizer, "apply_chat_template"):
-            raw = sample.get("prompt") or sample.get("question") or sample.get("input") or ""
+            raw = sample.get("prompt") or sample.get("question") or sample.get("input") or sample.get("problem") or ""
             if isinstance(raw, list):
                 try:
                     prompt_text = self._tokenizer.apply_chat_template(
@@ -764,6 +778,9 @@ class AsyncRLTrainer:
         self._actor_model = None
         self._ref_model = None
         self._optimizer = None
+        if self._ray_cluster is not None:
+            self._ray_cluster.shutdown()
+            self._ray_cluster = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()

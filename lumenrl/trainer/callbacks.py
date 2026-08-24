@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 from abc import ABC
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -42,12 +43,13 @@ class LoggingCallback(Callback):
         self.interval = max(1, int(interval))
 
     def on_step_end(self, trainer: "RLTrainer", step: int, metrics: dict[str, float]) -> None:
-        if step % self.interval != 0:
+        if (step + 1) % self.interval != 0:
             return
         if trainer._rank != 0:
             return
         parts = [f"{k}={v:.6g}" for k, v in sorted(metrics.items())]
-        logger.info("step=%d %s", step, " ".join(parts))
+        # Display 1-based step (aligns with verl's 1-indexed global_steps).
+        logger.info("step=%d %s", step + 1, " ".join(parts))
 
 
 class CheckpointCallback(Callback):
@@ -71,7 +73,16 @@ class CheckpointCallback(Callback):
         self._manager = CheckpointManager()
 
     def on_step_end(self, trainer: "RLTrainer", step: int, metrics: dict[str, float]) -> None:
-        if step % self.save_interval != 0:
+        # Checkpoint names follow verl's 1-based global_step convention. Never
+        # expose or persist the trainer's internal 0-based step as checkpoint_0.
+        global_step = int(step) + 1
+        if global_step <= 0:
+            return
+        if global_step % self.save_interval != 0:
+            return
+
+        if getattr(trainer, "_use_ray_controller", False) and getattr(trainer, "_actor_wg", None) is not None:
+            self._save_ray_controller_checkpoint(trainer, global_step, metrics)
             return
         self.save_now(trainer, step, metrics)
 
@@ -86,10 +97,10 @@ class CheckpointCallback(Callback):
         rank = trainer._rank
         ckpt_dir = Path(self.checkpoint_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
-        path = ckpt_dir / f"checkpoint_{step}.pt"
+        path = ckpt_dir / f"checkpoint_{global_step}.pt"
 
         state: dict[str, Any] = {
-            "step": step,
+            "step": global_step,
             "metrics": metrics,
             "algo": trainer.config.algorithm.name,
         }
@@ -173,13 +184,29 @@ class CheckpointCallback(Callback):
             if m:
                 ckpts.append((int(m.group(1)), p))
         ckpts.sort(key=lambda x: x[0])
-        while len(ckpts) > self.save_total_limit:
+        while len(ckpts) > keep:
             _, old = ckpts.pop(0)
             try:
                 old.unlink()
                 logger.info("Pruned old checkpoint: %s", old)
             except OSError:
                 pass
+
+    def _prune_old_ray_checkpoints(self, ckpt_root: Path, keep: int | None = None) -> None:
+        keep = self.save_total_limit if keep is None else max(0, keep)
+        pattern = re.compile(r"global_step_(\d+)$")
+        ckpts: list[tuple[int, Path]] = []
+        for p in ckpt_root.iterdir():
+            if not p.is_dir():
+                continue
+            m = pattern.match(p.name)
+            if m:
+                ckpts.append((int(m.group(1)), p))
+        ckpts.sort(key=lambda x: x[0])
+        while len(ckpts) > keep:
+            _, old = ckpts.pop(0)
+            shutil.rmtree(old, ignore_errors=True)
+            logger.info("Pruned old Ray checkpoint: %s", old)
 
 
 class EvalCallback(Callback):
@@ -230,14 +257,85 @@ class WandbCallback(Callback):
             allow_val_change=True,
         )
 
+    # Curated "core" training-effect metrics (means only, no max/min) shown in a
+    # dedicated wandb `core/` panel group.
+    _CORE_MAP = {
+        "reward/mean": "core/reward_mean",
+        "seq/mean_response_len": "core/response_len_mean",
+        "response_length/mean": "core/response_len_mean",
+        "timing/step_s": "core/step_time_s",
+        "timing/gen_s": "core/gen_time_s",
+        "timing/train_s": "core/train_time_s",
+        "rollout_correction/kl": "core/kl",
+        "rollout_corr/kl": "core/kl",
+        "mismatch_kl": "core/mismatch_kl",
+        # core/kl is SIGNED, so symmetric train/rollout disagreement cancels in it.
+        # These two do not cancel and are what actually track the gap.
+        "mismatch/abs_diff": "core/mismatch_abs_diff",
+        "mismatch/k3_kl": "core/mismatch_k3_kl",
+        "moe/r3_enabled": "core/r3_enabled",
+        "moe/r3_route_coverage": "core/r3_route_coverage",
+        "moe/r3_route_tokens": "core/r3_route_tokens",
+        "entropy": "core/entropy",
+        "grad_norm": "core/grad_norm",
+        "loss": "core/loss",
+        "mem/actor_max_reserved_gb": "core/max_reserved_mem_gb",
+    }
+    _VERL_ALIAS_MAP = {
+        "loss": ("actor/loss", "actor/pg_loss"),
+        "lr": ("actor/lr",),
+        "grad_norm": ("actor/grad_norm",),
+        "entropy": ("actor/entropy",),
+        "ppo_kl": ("actor/ppo_kl",),
+        "mem/actor_max_allocated_gb": ("actor/perf/max_memory_allocated_gb",),
+        "mem/actor_max_reserved_gb": (
+            "actor/perf/max_memory_reserved_gb",
+            "actor/perf/micro_batch_max_reserved_gb",
+        ),
+    }
+
     def on_step_end(self, trainer: "RLTrainer", step: int, metrics: dict[str, float]) -> None:
         if not self._enabled or self._wandb is None:
             return
         if trainer._rank != 0:
             return
-        payload = {f"train/{k}": v for k, v in metrics.items()}
-        payload["train/global_step"] = step
-        self._wandb.log(payload, step=step)
+        # Log verl-compatible names at the root so the AMD-BF16-VERL workspace
+        # panels can be recreated verbatim. Keep the historical train/* aliases
+        # for existing LumenRL dashboards.
+        payload = dict(metrics)
+        payload.update(
+            {
+                f"train/{k}": v
+                for k, v in metrics.items()
+                if not k.startswith(("train/", "val-", "val/"))
+            }
+        )
+        for src, destinations in self._VERL_ALIAS_MAP.items():
+            if src in metrics:
+                for dst in destinations:
+                    payload.setdefault(dst, metrics[src])
+        for src, dst in self._CORE_MAP.items():
+            if src in metrics and dst not in payload:
+                payload[dst] = metrics[src]
+
+        val_generations = getattr(trainer, "_last_val_generations", None)
+        if val_generations and any(k.startswith("val-") for k in metrics):
+            payload["val/generations"] = self._wandb.Table(
+                columns=["response", "score", "accuracy", "response_length"],
+                data=[
+                    [
+                        row["response"],
+                        row["score"],
+                        row["accuracy"],
+                        row["response_length"],
+                    ]
+                    for row in val_generations
+                ],
+            )
+        # 1-based step to align the wandb x-axis with verl (global_steps).
+        wstep = step + 1
+        payload["train/global_step"] = wstep
+        self._wandb.log(payload, step=wstep)
 
     def on_train_end(self, trainer: "RLTrainer") -> None:
         if self._enabled and self._wandb is not None:

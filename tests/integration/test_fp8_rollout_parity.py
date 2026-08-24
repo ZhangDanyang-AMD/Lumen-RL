@@ -11,8 +11,8 @@ from lumenrl.core.config import LumenRLConfig, QuantizationConfig, RolloutCorrec
 from lumenrl.core.protocol import DataProto
 from lumenrl.engine.training.fsdp_backend import FSDP2Backend
 from lumenrl.quantization.fp8_config import FP8Config
+from lumenrl.quantization.rollout_correction import apply_rollout_correction
 from lumenrl.quantization.weight_quantizer import WeightQuantizer
-from lumenrl.trainer.rl_trainer import RLTrainer
 
 
 pytestmark = pytest.mark.fp8
@@ -59,7 +59,6 @@ def test_tis_reduces_gap() -> None:
     rc = RolloutCorrectionConfig(enabled=True, method="tis", clip=1.5)
     quant = QuantizationConfig(rollout_correction=rc)
     cfg = LumenRLConfig(quantization=quant)
-    trainer = RLTrainer(cfg)
 
     b, t = 2, 8
     old_lp = torch.zeros(b, t)
@@ -77,8 +76,8 @@ def test_tis_reduces_gap() -> None:
     uncapped_weights = torch.exp(uncapped_ratio)
     adv_uncapped = adv * uncapped_weights
 
-    trainer._apply_rollout_correction(batch)
-    adv_tis = batch.tensors["advantages"]
+    corrected = apply_rollout_correction(batch, cfg)
+    adv_tis = corrected.tensors["advantages"]
 
     assert adv_tis.abs().max() <= adv_uncapped.abs().max() + 1e-6
     assert float(adv_tis.abs().max()) <= float(adv.abs().max() * math.exp(math.log(rc.clip)) + 1e-5)

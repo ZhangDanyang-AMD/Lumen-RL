@@ -5,8 +5,8 @@
 #   bash scripts/launch_slurm.sh <num_nodes> <config.yaml> [overrides...]
 #
 # Example:
-#   bash scripts/launch_slurm.sh 2 configs/grpo_moe_fp8_r3_multinode.yaml \
-#       policy.model_name=Qwen/Qwen3-30B-A3B
+#   bash scripts/launch_slurm.sh 2 configs/grpo_dense_fp8.yaml \
+#       policy.model_name=Qwen/Qwen3-8B
 
 set -euo pipefail
 

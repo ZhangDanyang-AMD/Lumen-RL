@@ -56,7 +56,7 @@ if [ "${SMOKE_TEST}" = true ]; then
 elif [ "${PHASE2}" = true ]; then
     CKPT_DIR="${CKPT_DIR:-/dev/shm/checkpoints/gpt_oss_120b_eagle3_vllm_phase2}"
 else
-    CKPT_DIR="${CKPT_DIR:-/dev/shm/checkpoints/gpt_oss_120b_eagle3_v2}"
+    CKPT_DIR="${CKPT_DIR:-/dev/shm/checkpoints/gpt_oss_120b_eagle3_vllm}"
 fi
 
 # Config selection

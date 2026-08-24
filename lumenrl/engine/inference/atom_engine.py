@@ -65,6 +65,9 @@ logging.basicConfig(stream=sys.stderr, level=logging.INFO)
 import torch
 from atom import LLMEngine, SamplingParams
 
+# Suppress ATOM's DEBUG spam ("Engine Core Mgr: callback=NOT FOUND" etc.)
+logging.getLogger("atom").setLevel(logging.WARNING)
+
 cmd_fifo = sys.argv[1]
 resp_fifo = sys.argv[2]
 model_path = sys.argv[3]

@@ -5,9 +5,46 @@ from __future__ import annotations
 import logging
 from typing import Any, Type
 
-import ray
-
 logger = logging.getLogger(__name__)
+
+
+def create_fused_worker_cls(
+    worker_map: dict[str, Type],
+    name: str = "FusedWorker",
+) -> Type:
+    """Create a worker that fuses multiple worker roles into one actor.
+
+    Exposed methods are prefixed as ``{prefix}_{method}``, e.g.
+    ``actor_train_step`` / ``rollout_generate``.
+    """
+    if not worker_map:
+        raise ValueError("worker_map must not be empty for fused workers.")
+
+    class _FusedWorker:
+        def __init__(self, rank: int, world_size: int, **kwargs: Any) -> None:
+            self._workers = {
+                prefix: worker_cls(rank=rank, world_size=world_size, **kwargs)
+                for prefix, worker_cls in worker_map.items()
+            }
+
+        def __getattr__(self, attr: str) -> Any:
+            if "_" not in attr:
+                raise AttributeError(attr)
+            prefix, method = attr.split("_", 1)
+            worker = self._workers.get(prefix)
+            if worker is None:
+                raise AttributeError(attr)
+            target = getattr(worker, method, None)
+            if target is None:
+                raise AttributeError(attr)
+            return target
+
+        def health_check(self) -> dict[str, bool]:
+            return {prefix: True for prefix in self._workers}
+
+    _FusedWorker.__name__ = name
+    _FusedWorker.__qualname__ = name
+    return _FusedWorker
 
 
 def create_colocated_worker_cls(
@@ -21,17 +58,4 @@ def create_colocated_worker_cls(
     and inference (rollout) workers on the same GPU set.
     """
 
-    class _ColocatedWorker:
-        def __init__(self, rank: int, world_size: int, **kwargs: Any) -> None:
-            self.worker_a = cls_a(rank=rank, world_size=world_size, **kwargs)
-            self.worker_b = cls_b(rank=rank, world_size=world_size, **kwargs)
-
-        def call_a(self, method: str, *args: Any, **kwargs: Any) -> Any:
-            return getattr(self.worker_a, method)(*args, **kwargs)
-
-        def call_b(self, method: str, *args: Any, **kwargs: Any) -> Any:
-            return getattr(self.worker_b, method)(*args, **kwargs)
-
-    _ColocatedWorker.__name__ = name
-    _ColocatedWorker.__qualname__ = name
-    return _ColocatedWorker
+    return create_fused_worker_cls({"a": cls_a, "b": cls_b}, name=name)

@@ -78,4 +78,3 @@ Watch for these metrics in the training logs:
 
 - See {doc}`/advance/algorithms` for the full DAPO algorithm specification
 - See {doc}`/advance/fp8_quantization` for FP8 configuration details
-- See {doc}`/examples/moe_r3_training` for MoE models with R3

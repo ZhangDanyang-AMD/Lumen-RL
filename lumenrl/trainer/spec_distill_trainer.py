@@ -647,7 +647,7 @@ class SpecDistillTrainer:
             else:
                 from lumenrl.engine.training.fsdp_backend import FSDP2Backend
                 self._draft_model = FSDP2Backend.apply_fsdp2(
-                    self._draft_model, {"enabled": True}
+                    self._draft_model, {"enabled": True, "strategy": "replicate"}
                 )
 
         from lumenrl.trainer.bf16_optimizer import BF16Optimizer

@@ -95,7 +95,7 @@ while [ "${attempt}" -lt "${MAX_ATTEMPTS}" ]; do
     # container to delete them. Several crashes in a row otherwise fill the
     # host disk quickly.
     if ls "${REPO_ROOT}"/gpucore.*.gpu >/dev/null 2>&1; then
-        docker run --rm -v "${REPO_ROOT}":/host gpt_oss_eagle3_train:latest \
+        docker run --rm -v "${REPO_ROOT}":/host lumenrl-vllm-mi308:latest \
             bash -c 'rm -f /host/gpucore.*.gpu' >/dev/null 2>&1 || true
         echo "[retry-wrapper] reaped GPU coredump files in ${REPO_ROOT}"
     fi

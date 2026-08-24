@@ -13,11 +13,12 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
+from lumenrl.workers.base_worker import BaseWorker, get_nested_config
+
 import torch
 
 from lumenrl.core.protocol import DataProto
 from lumenrl.engine.training.fsdp_backend import FSDP2Backend
-from lumenrl.workers.base_worker import BaseWorker, get_nested_config
 
 logger = logging.getLogger(__name__)
 

@@ -6,5 +6,6 @@ from lumenrl.engine.inference.atom_engine import AtomEngine
 from lumenrl.engine.inference.atom_teacher_engine import AtomTeacherEngine
 from lumenrl.engine.inference.generation import GenerationInterface
 from lumenrl.engine.inference.hf_engine import HFEngine
+from lumenrl.engine.inference.vllm_engine import VLLMEngine
 
-__all__ = ["AtomEngine", "AtomTeacherEngine", "GenerationInterface", "HFEngine"]
+__all__ = ["AtomEngine", "AtomTeacherEngine", "GenerationInterface", "HFEngine", "VLLMEngine"]

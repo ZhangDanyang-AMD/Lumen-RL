@@ -3,11 +3,21 @@ from __future__ import annotations
 import torch
 
 from lumenrl.algorithms.loss_functions import (
+    agg_loss,
     asymmetric_clip_loss,
     entropy_bonus,
     kl_penalty,
     policy_gradient_loss,
 )
+
+
+def test_agg_loss_token_mean_matches_masked_reference() -> None:
+    loss_mat = torch.tensor([[1.0, 2.0, 9.0], [3.0, 7.0, 8.0]])
+    mask = torch.tensor([[1.0, 1.0, 0.0], [1.0, 0.0, 0.0]])
+
+    actual = agg_loss(loss_mat, mask, "token-mean")
+
+    assert torch.allclose(actual, torch.tensor(2.0))
 
 
 def test_policy_gradient_loss_gradient_flows() -> None:
