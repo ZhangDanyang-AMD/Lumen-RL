@@ -50,14 +50,20 @@ _FUSED_GATE_UP = "gate_up_proj"
 _FUSED_DOWN = "down_proj"
 _FUSED_LEAVES = (_FUSED_GATE_UP, _FUSED_DOWN)
 
-# vLLM submodules that hold the expert buffers *below* the layer the HF name
+# vLLM submodules that hold the expert buffers *below* the layer everyone else
 # addresses: vLLM >=0.22 splits FusedMoE so the weights live in a nested
 # RoutedExperts registered as "routed_experts", making the parameter path
-# ``...mlp.experts.routed_experts.w13_weight`` while the trainer still sends
-# ``...mlp.experts.gate_up_proj``. Routing keys off the trainer's prefix, so a
-# discovered module also has to be reachable under the shortened name. Without
-# this every fused tensor misses the router and the coverage assertion reports
-# "left 96/435 rollout parameters untouched" (Qwen3-30B-A3B, 48 layers x 2).
+# ``...mlp.experts.routed_experts.w13_weight`` while both the trainer and vLLM's
+# own loader talk about ``...mlp.experts.<leaf>``.
+#
+# That one extra segment breaks two different things, so it is consulted twice:
+#   _lookup_keys      routing -- a discovered module must also be reachable
+#                     under the shortened name the trainer addresses it by
+#   _coverage_aliases accounting -- a parameter reported loaded under the
+#                     shortened name must not be counted as untouched
+# Skipping either one produces the same message, "left 96/435 rollout parameters
+# untouched" (Qwen3-30B-A3B, 48 layers x 2), which is why fixing only the first
+# did not make it go away.
 _CONTAINER_SEGMENTS = ("routed_experts",)
 
 # Parameters that a BF16 trainer legitimately never sends: quantization
@@ -76,6 +82,31 @@ _COVERAGE_IGNORE_SUFFIXES = (
 def _split_name(name: str) -> tuple[str, str]:
     prefix, _, leaf = name.rpartition(".")
     return prefix, leaf
+
+
+def _coverage_aliases(name: str) -> tuple[str, ...]:
+    """Every name a loader might report back for this parameter.
+
+    The same nesting asymmetry ``_lookup_keys`` handles on the routing side, seen
+    from the other end. ``RoutedExperts.load_weights`` yields names relative to
+    the *FusedMoE* layer (``w13_weight``, because it strips ``layer_name``), and
+    ``AutoWeightsLoader`` prefixes them with the module it walked to -- the
+    FusedMoE. So a loaded expert buffer is reported as
+    ``...mlp.experts.w13_weight`` while ``named_parameters()`` calls it
+    ``...mlp.experts.routed_experts.w13_weight``.
+
+    Differencing the two sets literally therefore flags every fused expert
+    parameter as untouched. Observed as "left 96/435 rollout parameters
+    untouched" on Qwen3-30B-A3B (48 layers x 2) while the weights were
+    demonstrably live -- kl stayed at 1.6e-3 and accuracy doubled across the
+    sync (dsv4_agent.md 3.9).
+    """
+    aliases = [name]
+    for segment in _CONTAINER_SEGMENTS:
+        needle = f".{segment}."
+        if needle in name:
+            aliases.append(name.replace(needle, ".", 1))
+    return tuple(aliases)
 
 
 class FusedMoEWeightRouter:
@@ -346,7 +377,11 @@ def assert_weight_sync_coverage(
         for name in dict(model.named_parameters())
         if not name.endswith(_COVERAGE_IGNORE_SUFFIXES)
     }
-    missing = sorted(expected - loaded)
+    missing = sorted(
+        name
+        for name in expected
+        if loaded.isdisjoint(_coverage_aliases(name))
+    )
     if not missing:
         logger.info("weight sync coverage (%s): %d/%d params", context, len(expected), len(expected))
         return
