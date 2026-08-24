@@ -77,6 +77,26 @@ async def ensure_async_iterator(iterable):
             yield item
 
 
+def check_bucket_version(metadata: dict, expected_version: int | None) -> None:
+    """Reject buckets that do not belong to the sync the receiver was told to expect.
+
+    Equality, not monotonicity: ``_sync_weights_ipc`` runs more than once per
+    ``global_step`` (main loop, the pre-rollout refresh when the engine was
+    sleeping, and the first sync after resume), so the same version
+    legitimately repeats. This mirrors the RDMA path's per-header check.
+
+    ``expected_version=None`` disables the check, which is what keeps senders
+    that predate the version field working.
+    """
+    if expected_version is None:
+        return
+    version = metadata.get("version")
+    if version is None or int(version) != int(expected_version):
+        raise RuntimeError(
+            f"IPC weight version mismatch: expected {expected_version}, got {version!r}"
+        )
+
+
 class TensorMetadata(TypedDict):
     name: str
     shape: torch.Size
@@ -115,16 +135,37 @@ def rebuild_shared_memory(name: str, size: int, dtype=torch.uint8):
 class BucketedWeightSender:
     """Send model weights via bucketed IPC transfer over ZMQ (REQ side)."""
 
-    def __init__(self, zmq_handle: str, bucket_size_mb: int = 512, use_shm: bool = False):
+    def __init__(
+        self,
+        zmq_handle: str,
+        bucket_size_mb: int = 512,
+        use_shm: bool = False,
+        version: int | None = None,
+    ):
         self.zmq_handle = zmq_handle
         self.bucket_size_mb = bucket_size_mb
         self.bucket_size = int(bucket_size_mb) << 20
         self.use_shm = use_shm
+        self.version = version
 
         self.zmq_context = zmq.Context.instance()
         self.socket = None
         self.buffer = None
         self.shm = None
+
+    def _control(self, bucket_meta: dict, is_last: bool) -> dict:
+        """Build a per-bucket control message.
+
+        ``version`` rides on every bucket rather than on the ``_init_buffer``
+        handshake because that handshake is not a dict on the CUDA-IPC path --
+        it is the bare tuple ``reduce_tensor()`` returns, which the receiver
+        feeds straight to ``rebuild_ipc``. Per-bucket also matches the RDMA
+        path, where every header carries the version.
+        """
+        message = {"bucket_meta": bucket_meta, "is_last": is_last}
+        if self.version is not None:
+            message["version"] = int(self.version)
+        return message
 
     async def async_send_weights(self, weights: Iterable) -> None:
         """Stream ``(name, tensor)`` pairs to the receiver bucket-by-bucket."""
@@ -138,7 +179,7 @@ class BucketedWeightSender:
                 weight = weight.contiguous()
                 if offset + weight.nbytes > self.bucket_size and len(bucket_meta) > 0:
                     _sync()
-                    self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": False})
+                    self.socket.send_pyobj(self._control(bucket_meta, False))
                     self.socket.recv()
                     bucket_meta = {}
                     offset = 0
@@ -165,7 +206,7 @@ class BucketedWeightSender:
                 offset += weight.nbytes
 
             _sync()
-            self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": True})
+            self.socket.send_pyobj(self._control(bucket_meta, True))
             self.socket.recv()
         finally:
             self._cleanup()
@@ -233,17 +274,24 @@ class BucketedWeightSender:
                 "handle": handle,
             }
         }
-        self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": False})
+        self.socket.send_pyobj(self._control(bucket_meta, False))
         self.socket.recv()
 
 
 class BucketedWeightReceiver:
     """Receive model weights via bucketed IPC transfer over ZMQ (REP side)."""
 
-    def __init__(self, zmq_handle: str, device: torch.device, use_shm: bool = False):
+    def __init__(
+        self,
+        zmq_handle: str,
+        device: torch.device,
+        use_shm: bool = False,
+        expected_version: int | None = None,
+    ):
         self.zmq_handle = zmq_handle
         self.device = device
         self.use_shm = use_shm
+        self.expected_version = expected_version
 
         self.zmq_context = zmq.Context.instance()
         self.socket = None
@@ -257,6 +305,7 @@ class BucketedWeightReceiver:
 
             while True:
                 metadata = self.socket.recv_pyobj()
+                check_bucket_version(metadata, self.expected_version)
                 weights, tensor = [], None
                 for name, meta in metadata["bucket_meta"].items():
                     shape, dtype, offset, handle = (
