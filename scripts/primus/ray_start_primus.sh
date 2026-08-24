@@ -21,6 +21,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${LUMEN_CLUSTER_ENV:-/home/xysheng/4node/env.sh}"
 ROLE="${1:?usage: ray_start_primus.sh head|worker}"
 CONTAINER=${RL24_CONTAINER:-anp-primus}
+# The raylet's environment is what every actor inherits, so a model that needs
+# more than the primus base (DSv4 wants the patched Megatron on PYTHONPATH,
+# AITER, and NCCL_ALGO=Ring) has to start the raylet with its own env, not just
+# the driver.
+RAY_ENV_SCRIPT=${RAY_ENV_SCRIPT:-$HERE/ray_env_primus.sh}
 MY_IP="$(ip -o -4 addr show "$NET_IF" | awk '{print $4}' | cut -d/ -f1)"
 
 if [ "$ROLE" = head ]; then
@@ -34,7 +39,8 @@ fi
 docker exec "$CONTAINER" bash -lc "
 set -e
 export RL_ROOT=$RL_ROOT DATA_ROOT=$DATA_ROOT SCRATCH_ROOT=$SCRATCH_ROOT
-source $HERE/ray_env_primus.sh
+source $RAY_ENV_SCRIPT
+${RAY_EXTRA_EXPORTS:-}
 ray stop --force >/dev/null 2>&1 || true
 # ray stop reaps its own actors, but vLLM's EngineCore and its multiproc_executor
 # workers are plain children and outlive it, holding GPU memory and the weight-sync
