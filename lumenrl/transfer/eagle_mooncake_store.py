@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import os
 import threading
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -662,3 +663,247 @@ class EagleMooncakeStore:
         self._initialized = False
         self._init_event.clear()
         self._gpu_direct_available = False
+
+
+class SegmentedEagleMooncakeStore(EagleMooncakeStore):
+    """Producer pool of independently registered Mooncake segments.
+
+    This is intentionally producer-only: Mooncake metadata makes physical keys
+    globally discoverable, so a normal :class:`EagleMooncakeStore` can consume
+    values written by any member of the pool.
+    """
+
+    def __init__(
+        self,
+        config,
+        *args,
+        _store_factory=EagleMooncakeStore,
+        _sleep=time.sleep,
+        **kwargs,
+    ):
+        self._pool_size = min(
+            128,
+            max(
+                1,
+                int(
+                    os.environ.get(
+                        "LUMENRL_TEACHER_MOONCAKE_SEGMENT_POOL_SIZE",
+                        "128",
+                    )
+                ),
+            ),
+        )
+        segment_size = os.environ.get(
+            "LUMENRL_TEACHER_MOONCAKE_SEGMENT_SIZE",
+            "2GB",
+        )
+        self._segment_size = (
+            config.parse_size(segment_size)
+            if isinstance(segment_size, str)
+            else int(segment_size)
+        )
+        local_buffer_size = os.environ.get(
+            "MOONCAKE_LOCAL_BUFFER_SIZE",
+            str(config.local_buffer_size),
+        )
+        self._local_buffer_size = (
+            config.parse_size(local_buffer_size)
+            if isinstance(local_buffer_size, str)
+            else int(local_buffer_size)
+        )
+        self._devices = [
+            item.strip()
+            for item in os.environ.get(
+                "MOONCAKE_DEVICE_NAME",
+                config.device_name,
+            ).split(",")
+            if item.strip()
+        ] or [config.device_name]
+        self._base_config = config
+        self._store_factory = _store_factory
+        self._sleep = _sleep
+        self._pool_wait_seconds = float(
+            os.environ.get(
+                "LUMENRL_TEACHER_MOONCAKE_POOL_WAIT_SECONDS",
+                "300",
+            )
+        )
+        self._stores: list[EagleMooncakeStore | None] = [None] * self._pool_size
+        self._next_store = 0
+        self._pool_lock = threading.Lock()
+        self._closed = False
+        self._setup_device = None
+
+        if self._pool_size == 1:
+            config = replace(
+                config,
+                global_segment_size=self._segment_size,
+                local_buffer_size=self._local_buffer_size,
+            )
+            super().__init__(config, *args, **kwargs)
+        else:
+            self._initialized = False
+
+    def setup(self, device=None) -> None:
+        if self._pool_size == 1:
+            return super().setup(device)
+        if device is not None and not isinstance(device, torch.device):
+            device = torch.device(device)
+        self._setup_device = device
+
+    def _current_device(self) -> torch.device | None:
+        if self._setup_device is not None:
+            return self._setup_device
+        if torch.cuda.is_available():
+            return torch.device(f"cuda:{torch.cuda.current_device()}")
+        return None
+
+    def _create_store(self, index: int) -> EagleMooncakeStore:
+        device_name = self._devices[index % len(self._devices)]
+        store_config = replace(
+            self._base_config,
+            device_name=device_name,
+            global_segment_size=self._segment_size,
+            local_buffer_size=self._local_buffer_size,
+            async_put_pool_size=1,
+        )
+        store = self._store_factory(store_config)
+        store.setup(self._current_device())
+        # Mooncake otherwise balances writes across every segment registered
+        # with the master. Multiple same-process RDMA clients must write to
+        # their own mounted segment; cross-client QPs on one host are neither
+        # needed nor reliably supported by the Ionic provider.
+        if hasattr(store, "_store") and store._store is not None:
+            try:
+                from mooncake.store import ReplicateConfig
+
+                replicate_config = store._replicate_config or ReplicateConfig()
+                segment_name = store._store.get_hostname()
+                replicate_config.preferred_segment = segment_name
+                replicate_config.preferred_segments = [segment_name]
+                store._replicate_config = replicate_config
+                if store._async_put_manager is not None:
+                    store._async_put_manager._replicate_config = replicate_config
+            except (AttributeError, ImportError):
+                logger.warning(
+                    "Mooncake client does not expose preferred-segment "
+                    "placement; segmented writes may be load-balanced"
+                )
+        logger.info(
+            "Initialized segmented Mooncake producer store %d/%d on %s",
+            index + 1,
+            self._pool_size,
+            device_name,
+        )
+        self._initialized = True
+        return store
+
+    def _get_store(self, index: int) -> EagleMooncakeStore:
+        store = self._stores[index]
+        if store is None:
+            store = self._create_store(index)
+            self._stores[index] = store
+        return store
+
+    @staticmethod
+    def _is_capacity_error(exc: BaseException) -> bool:
+        message = str(exc).lower()
+        if (
+            "transfer_fail" in message
+            or "code=-800" in message
+            or "code=-600" in message
+        ):
+            return False
+        return any(
+            marker in message
+            for marker in (
+                "batch_put_from failed",
+                "no space",
+                "out of space",
+                "store full",
+                "segment full",
+                "capacity",
+            )
+        )
+
+    def put(self, key, *args, **kwargs):
+        if self._pool_size == 1:
+            if not self._initialized:
+                self.setup(self._current_device())
+            return super().put(key, *args, **kwargs)
+        if self._closed:
+            raise RuntimeError("Segmented Mooncake producer is closed")
+
+        deadline = time.monotonic() + self._pool_wait_seconds
+        last_error: BaseException | None = None
+        with self._pool_lock:
+            while True:
+                start = self._next_store
+                for offset in range(self._pool_size):
+                    index = (start + offset) % self._pool_size
+                    store = self._get_store(index)
+                    try:
+                        result = store.put(key, *args, **kwargs)
+                        # A manifest must not precede the physical write. Flush
+                        # also turns async capacity errors into sync failover.
+                        store.flush()
+                        self._next_store = (index + 1) % self._pool_size
+                        return result
+                    except BaseException as exc:
+                        if not self._is_capacity_error(exc):
+                            raise
+                        last_error = exc
+                        logger.warning(
+                            "Mooncake producer store %d/%d is full; trying "
+                            "another segment: %s",
+                            index + 1,
+                            self._pool_size,
+                            exc,
+                        )
+
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        "All segmented Mooncake producer stores remained full "
+                        f"for {self._pool_wait_seconds:.1f}s"
+                    ) from last_error
+                self._sleep(0.05)
+
+    def flush(self) -> None:
+        if self._pool_size == 1:
+            return super().flush()
+        with self._pool_lock:
+            for store in self._stores:
+                if store is not None:
+                    store.flush()
+
+    def get(self, *args, **kwargs):
+        if self._pool_size == 1:
+            return super().get(*args, **kwargs)
+        with self._pool_lock:
+            return self._get_store(0).get(*args, **kwargs)
+
+    def remove_eagle3_tensors(self, *args, **kwargs):
+        if self._pool_size == 1:
+            return super().remove_eagle3_tensors(*args, **kwargs)
+        with self._pool_lock:
+            return self._get_store(0).remove_eagle3_tensors(*args, **kwargs)
+
+    def close(self) -> None:
+        if self._pool_size == 1:
+            return super().close()
+        with self._pool_lock:
+            if self._closed:
+                return
+            self._closed = True
+            errors: list[BaseException] = []
+            for store in self._stores:
+                if store is not None:
+                    try:
+                        store.close()
+                    except BaseException as exc:
+                        errors.append(exc)
+            self._stores = [None] * self._pool_size
+            if errors:
+                raise RuntimeError(
+                    f"Failed to close {len(errors)} Mooncake producer stores"
+                ) from errors[0]

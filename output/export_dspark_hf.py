@@ -5,6 +5,13 @@ Architecture aligned with Inferact/Kimi-K3-DSpark:
 - 5 dense layers, VanillaMarkov head (rank=256), confidence head
 - embed_tokens + lm_head frozen from K3 base model (bfloat16)
 - Trained weights in bfloat16
+
+The emitted config.json is what ATOM reads back to decide the draft's rotation
+convention, softmax scale and which target layers to feed it. Every field below
+that also exists in the training YAML is therefore cross-checked against it
+(`--train-config`), because a silent disagreement here is invisible until the
+draft benchmarks badly: the first run shipped at 6% acceptance against a
+reference draft's 26% for exactly that class of mismatch.
 """
 import argparse
 import json
@@ -15,11 +22,157 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 
+def _draft_cfg_from_yaml(path: str) -> dict:
+    """Read the training YAML's draft/spec_distill blocks, flattened."""
+    import yaml
+
+    with open(path) as f:
+        y = yaml.safe_load(f)
+    algo = (y.get("algorithm") or {})
+    return {
+        "draft": (algo.get("draft") or {}),
+        "spec_distill": (algo.get("spec_distill") or {}),
+    }
+
+
+def _check_against_training_config(config: dict, train_cfg: dict) -> list[str]:
+    """Return a list of fields the exported config and the YAML disagree on."""
+    draft = train_cfg["draft"]
+    spec = train_cfg["spec_distill"]
+    rope = config["rope_parameters"]
+
+    # (label, exported value, YAML value) for every field that exists on both
+    # sides. Anything the YAML does not carry is left to the export's own
+    # defaults, which is why the architecture dims are absent here.
+    pairs = [
+        ("num_hidden_layers", config["num_hidden_layers"], draft.get("num_layers")),
+        ("num_attention_heads", config["num_attention_heads"], draft.get("num_heads")),
+        ("num_key_value_heads", config["num_key_value_heads"], draft.get("num_kv_heads")),
+        ("intermediate_size", config["intermediate_size"], draft.get("ffn_dim")),
+        ("q_lora_rank", config["q_lora_rank"], draft.get("q_lora_rank")),
+        ("kv_lora_rank", config["kv_lora_rank"], draft.get("kv_lora_rank")),
+        ("qk_nope_head_dim", config["qk_nope_head_dim"], draft.get("qk_nope_head_dim")),
+        ("qk_rope_head_dim", config["qk_rope_head_dim"], draft.get("qk_rope_head_dim")),
+        ("v_head_dim", config["v_head_dim"], draft.get("v_head_dim")),
+        ("rms_norm_eps", config["rms_norm_eps"], draft.get("rms_norm_eps")),
+        ("markov_rank", config["markov_rank"], draft.get("markov_rank")),
+        ("markov_head_type", config["markov_head_type"], draft.get("markov_head_type")),
+        ("mask_token_id", config["mask_token_id"], draft.get("mask_token_id")),
+        ("enable_confidence_head", config["enable_confidence_head"],
+         draft.get("enable_confidence_head")),
+        ("confidence_head_with_markov", config["confidence_head_with_markov"],
+         draft.get("confidence_head_with_markov")),
+        ("rope_theta", config["rope_theta"], draft.get("rope_theta")),
+        ("rope_parameters.rope_theta", rope["rope_theta"], draft.get("rope_theta")),
+        ("rope_parameters.rope_type", rope["rope_type"], draft.get("rope_scaling_type")),
+        ("rope_parameters.factor", rope["factor"], draft.get("rope_scaling_factor")),
+        ("rope_parameters.original_max_position_embeddings",
+         rope["original_max_position_embeddings"], draft.get("rope_original_max_pos")),
+        ("rope_parameters.beta_fast", rope["beta_fast"], draft.get("rope_beta_fast")),
+        ("rope_parameters.beta_slow", rope["beta_slow"], draft.get("rope_beta_slow")),
+        ("rope_parameters.mscale", rope["mscale"], draft.get("rope_mscale")),
+        ("rope_parameters.mscale_all_dim", rope["mscale_all_dim"],
+         draft.get("rope_mscale_all_dim")),
+        ("num_target_layers", config["num_target_layers"], spec.get("num_target_layers")),
+        ("target_layer_ids", config["target_layer_ids"],
+         spec.get("aux_hidden_state_layer_ids")),
+    ]
+
+    problems = []
+    for label, exported, trained in pairs:
+        if trained is None:
+            continue
+        if isinstance(exported, float) or isinstance(trained, float):
+            same = abs(float(exported) - float(trained)) < 1e-12
+        else:
+            same = list(exported) == list(trained) if isinstance(exported, list) else exported == trained
+        if not same:
+            problems.append(f"  {label}: exporting {exported!r} but trained with {trained!r}")
+
+    # rope_interleave has no YAML counterpart because the trainer has exactly one
+    # rotation convention. Emitting the key at all would tell ATOM to use the
+    # other one.
+    if "rope_interleave" in config:
+        problems.append(
+            "  rope_interleave: must not be emitted -- ATOM maps it to "
+            "is_neox_style, i.e. the half-split rotation the trainer does not use"
+        )
+    return problems
+
+
+def _expected_atom_keys() -> set[str]:
+    """The exact tensor names ATOM's k3_dspark loader reads.
+
+    Taken from Inferact/Kimi-K3-DSpark, the draft that benchmarks at 26.13% on
+    this stack, so it is what ATOM demonstrably loads rather than what any
+    docstring claims.
+    """
+    keys = {
+        "embed_tokens.weight",
+        "context_proj.weight",   # LumenRL: fc
+        "context_norm.weight",   # LumenRL: hidden_norm
+        "final_norm.weight",     # LumenRL: norm / out_norm
+        "markov_head.markov_w1.weight",
+        "markov_head.markov_w2.weight",
+        "confidence_head.proj.weight",
+        "confidence_head.proj.bias",
+    }
+    for i in range(5):
+        for suffix in (
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+            "self_attn.q_a_proj.weight",
+            "self_attn.q_a_layernorm.weight",
+            "self_attn.q_b_proj.weight",
+            "self_attn.kv_a_proj_with_mqa.weight",
+            "self_attn.kv_a_layernorm.weight",
+            "self_attn.kv_b_proj.weight",
+            "self_attn.o_proj.weight",
+            "mlp.gate_proj.weight",
+            "mlp.up_proj.weight",
+            "mlp.down_proj.weight",
+        ):
+            keys.add(f"layers.{i}.{suffix}")
+    return keys
+
+
+def _check_atom_key_contract(hf_sd: dict) -> None:
+    """Fail the export if the emitted tensor names are not the ones ATOM reads.
+
+    ATOM ignores tensors it does not recognise without warning, so a renamed
+    weight is not a load error -- it is a draft served with that weight left at
+    its initial value. The step-640 export shipped `fc` / `hidden_norm` / `norm`
+    where ATOM wanted `context_proj` / `context_norm` / `final_norm`, which meant
+    the whole 5-layer hidden-state fusion was silently discarded, and the draft
+    benchmarked at 0.00% acceptance across 3060 forward steps while every log
+    line looked healthy.
+    """
+    expected = _expected_atom_keys()
+    got = set(hf_sd)
+    missing, extra = sorted(expected - got), sorted(got - expected)
+    if missing or extra:
+        lines = ["exported tensor names do not match ATOM's k3_dspark contract:"]
+        lines += [f"  MISSING (ATOM reads this, export does not emit it): {k}"
+                  for k in missing]
+        lines += [f"  EXTRA   (ATOM will silently ignore this): {k}" for k in extra]
+        lines.append(
+            "\nATOM does not error on unknown tensor names, so shipping this would "
+            "serve a draft with those weights uninitialised."
+        )
+        raise SystemExit("\n".join(lines))
+    print(f"ATOM key contract: OK ({len(got)} tensors)")
+
+
 def find_safetensor_shard(model_dir: str, key: str) -> str:
     idx_path = os.path.join(model_dir, "model.safetensors.index.json")
     with open(idx_path) as f:
         weight_map = json.load(f)["weight_map"]
-    for candidate in [key, f"model.{key}", f"language_model.model.{key}"]:
+    # `language_model.` without `model.` covers lm_head: in the HF layout it is a
+    # sibling of `model`, not a child of it, so the multimodal K3 checkpoint names
+    # it `language_model.lm_head.weight` while the embeddings sit one level deeper
+    # under `language_model.model.embed_tokens.weight`.
+    for candidate in [key, f"model.{key}", f"language_model.model.{key}",
+                      f"language_model.{key}"]:
         if candidate in weight_map:
             return os.path.join(model_dir, weight_map[candidate]), candidate
     raise KeyError(f"{key} not found in {idx_path}")
@@ -39,6 +192,11 @@ def main():
                         help="Path to Kimi-K3 base model (for frozen embed_tokens/lm_head)")
     parser.add_argument("--output", default="/home/danyzhan/Lumen-RL/output/Kimi_K3_DSpark_HF",
                         help="Output directory for HF model")
+    parser.add_argument("--train-config",
+                        default="examples/Kimi_K3_SDDD_MI350_ATOM/configs/train.yaml",
+                        help="Training YAML to cross-check the emitted config.json against")
+    parser.add_argument("--skip-config-check", action="store_true",
+                        help="Export even if config.json disagrees with the training YAML")
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -54,23 +212,24 @@ def main():
 
     print(f"\nLoading frozen weights from base model: {args.base_model}")
     embed_tokens = load_base_weight(args.base_model, "embed_tokens.weight")
-    lm_head = load_base_weight(args.base_model, "lm_head.weight")
     print(f"  embed_tokens: {list(embed_tokens.shape)} {embed_tokens.dtype}")
-    print(f"  lm_head: {list(lm_head.shape)} {lm_head.dtype}")
 
     # --- Map LumenRL keys to HF keys ---
     hf_sd = {}
 
-    # Frozen weights from K3 (keep bfloat16)
+    # Frozen from K3 (keep bfloat16). No lm_head: the draft's vocab projection is
+    # the Markov head, and Inferact/Kimi-K3-DSpark ships none either. Emitting one
+    # only adds 2.35 GB that ATOM does not read.
     hf_sd["embed_tokens.weight"] = embed_tokens.to(torch.bfloat16)
-    hf_sd["lm_head.weight"] = lm_head.to(torch.bfloat16)
 
-    # fc: hidden state fusion [7168, 5*7168] → [7168, 35840]
-    hf_sd["fc.weight"] = msd["fc.weight"].to(torch.bfloat16)
+    # Hidden-state fusion [7168, 5*7168] -> [7168, 35840]. ATOM calls it
+    # context_proj; LumenRL calls it fc. See ATOM_KEYS below for why the rename
+    # matters more than any other line in this file.
+    hf_sd["context_proj.weight"] = msd["fc.weight"].to(torch.bfloat16)
 
-    # hidden_norm (post-fusion RMSNorm)
+    # Post-fusion RMSNorm (LumenRL: hidden_norm).
     if "hidden_norm.weight" in msd:
-        hf_sd["hidden_norm.weight"] = msd["hidden_norm.weight"].to(torch.bfloat16)
+        hf_sd["context_norm.weight"] = msd["hidden_norm.weight"].to(torch.bfloat16)
 
     # 5 transformer layers with MLA attention
     for i in range(5):
@@ -107,10 +266,10 @@ def main():
             if src_key in msd:
                 hf_sd[prefix_dst + suffix] = msd[src_key].to(torch.bfloat16)
 
-    # Final norm
+    # Final norm (LumenRL: norm / out_norm).
     for key in ["norm.weight", "out_norm.weight"]:
         if key in msd:
-            hf_sd["norm.weight"] = msd[key].to(torch.bfloat16)
+            hf_sd["final_norm.weight"] = msd[key].to(torch.bfloat16)
             break
 
     # Markov head
@@ -131,16 +290,16 @@ def main():
     for k in sorted(hf_sd.keys()):
         print(f"  {k}: {list(hf_sd[k].shape)} {hf_sd[k].dtype}")
 
-    # --- Split into shards (embed+lm_head are large) ---
-    large_keys = {"embed_tokens.weight", "lm_head.weight"}
+    _check_atom_key_contract(hf_sd)
+
+    # --- Split into shards (embed_tokens is large) ---
+    large_keys = {"embed_tokens.weight"}
     shard1_keys = [k for k in sorted(hf_sd.keys()) if k not in large_keys]
     shard2_keys = ["embed_tokens.weight"]
-    shard3_keys = ["lm_head.weight"]
 
     shards = [
-        ("model-00001-of-00003.safetensors", {k: hf_sd[k] for k in shard1_keys}),
-        ("model-00002-of-00003.safetensors", {k: hf_sd[k] for k in shard2_keys}),
-        ("model-00003-of-00003.safetensors", {k: hf_sd[k] for k in shard3_keys}),
+        ("model-00001-of-00002.safetensors", {k: hf_sd[k] for k in shard1_keys}),
+        ("model-00002-of-00002.safetensors", {k: hf_sd[k] for k in shard2_keys}),
     ]
 
     weight_map = {}
@@ -210,6 +369,25 @@ def main():
             "mscale_all_dim": 1.0,
         },
     }
+
+    if not args.skip_config_check:
+        if not os.path.exists(args.train_config):
+            raise SystemExit(
+                f"--train-config {args.train_config} not found. Point it at the YAML "
+                f"this checkpoint was trained with, or pass --skip-config-check."
+            )
+        problems = _check_against_training_config(
+            config, _draft_cfg_from_yaml(args.train_config),
+        )
+        if problems:
+            raise SystemExit(
+                "config.json disagrees with " + args.train_config + ":\n"
+                + "\n".join(problems)
+                + "\n\nATOM reads these back at serving time, so a mismatch here is a "
+                  "draft served under different attention than it was trained with."
+            )
+        print(f"config.json cross-checked against {args.train_config}: OK")
+
     with open(os.path.join(args.output, "config.json"), "w") as f:
         json.dump(config, f, indent=2)
 

@@ -20,6 +20,7 @@ import logging
 import mmap
 import os
 import queue
+import socket
 import threading
 import time
 from typing import Any
@@ -313,6 +314,9 @@ class SpecDistillTrainer:
         # Measured on the first successful engine start; later restarts wait
         # for at least this much VRAM instead of failing deep inside ATOM.
         self._teacher_gpu_bytes: int | None = None
+        # The configured value, kept because the effective one is recomputed per
+        # start from what this process still holds.
+        self._teacher_base_gpu_util: float | None = None
         self._mooncake_master: Any | None = None
         self._draft_model: torch.nn.Module | None = None
         self._lm_head_weight: torch.Tensor | None = None
@@ -388,7 +392,13 @@ class SpecDistillTrainer:
             )
 
         # ---- Teacher model (frozen) ----
-        if teacher_cfg.inference_backend == "sglang":
+        disaggregated = (
+            teacher_cfg.inference_backend == "atom"
+            and getattr(spec_cfg, "sequential_mode", None) == "streaming_disaggregated"
+        )
+        if disaggregated:
+            self._setup_teacher_atom_disaggregated(teacher_cfg, teacher_name)
+        elif teacher_cfg.inference_backend == "sglang":
             self._setup_teacher_sglang(teacher_cfg, teacher_name)
         elif teacher_cfg.inference_backend == "vllm":
             self._setup_teacher_vllm(teacher_cfg, teacher_name)
@@ -692,6 +702,11 @@ class SpecDistillTrainer:
 
         eval_cfg = self.config.eval
         if eval_cfg.enabled:
+            if disaggregated:
+                raise NotImplementedError(
+                    "streaming_disaggregated evaluation is not implemented yet; "
+                    "set eval.enabled=false for the initial 5-node bring-up"
+                )
             self._build_eval_cache(num_samples=eval_cfg.num_samples)
             self._build_eval_teacher_cache()
 
@@ -709,6 +724,133 @@ class SpecDistillTrainer:
             teacher_name,
             draft_type,
         )
+
+    def _setup_teacher_atom_disaggregated(
+        self,
+        teacher_cfg: Any,
+        teacher_name: str,
+    ) -> None:
+        """Connect draft ranks to Ray teachers and the shared Mooncake store."""
+        del teacher_name
+        spec_cfg = self.config.algorithm.spec_distill
+        replica_count = int(getattr(spec_cfg, "teacher_replicas", 0))
+        if replica_count <= 0:
+            raise ValueError("spec_distill.teacher_replicas must be positive")
+        generate_mode = getattr(teacher_cfg, "generate_mode", "prefill")
+        if generate_mode not in ("generate", "prefill"):
+            raise ValueError(
+                "streaming_disaggregated requires teacher.generate_mode to be "
+                "'generate' or 'prefill'"
+            )
+        if getattr(teacher_cfg, "transport", "mooncake") != "mooncake":
+            raise ValueError("streaming_disaggregated requires teacher.transport=mooncake")
+        if self.config.mooncake.enable_gpu_direct:
+            raise ValueError(
+                "MI350 disaggregated mode requires pinned-host Mooncake RDMA; "
+                "set mooncake.enable_gpu_direct=false"
+            )
+        if self.config.mooncake.protocol != "rdma":
+            raise ValueError("streaming_disaggregated requires mooncake.protocol=rdma")
+        if not self.config.mooncake.master_server_address:
+            raise ValueError(
+                "The Ray launcher must provide mooncake.master_server_address"
+            )
+
+        weights_path = getattr(spec_cfg, "teacher_weights_path", "")
+        if not weights_path or not os.path.isfile(weights_path):
+            raise FileNotFoundError(
+                f"Shared teacher static weights not found: {weights_path!r}. "
+                "The Ray launcher must export them before starting draft torchrun."
+            )
+        weights = torch.load(weights_path, map_location="cpu", weights_only=True)
+        self._lm_head_weight = weights["lm_head_weight"]
+        self._embed_weight = weights["embed_weight"]
+        self._norm_weight = weights["norm_weight"]
+        self._norm_eps = float(weights["norm_eps"])
+        del weights
+
+        try:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            probe.connect((self.config.mooncake.master_server_address.split(":")[0], 1))
+            self.config.mooncake.local_hostname = probe.getsockname()[0]
+            probe.close()
+        except Exception:
+            self.config.mooncake.local_hostname = socket.gethostbyname(
+                socket.gethostname()
+            )
+        from lumenrl.transfer.eagle_mooncake_store import EagleMooncakeStore
+        from lumenrl.transfer.mooncake_config import MooncakeConfig
+
+        mooncake_values = dict(vars(self.config.mooncake))
+        rdma_devices = [
+            item.strip()
+            for item in str(mooncake_values.get("device_name", "")).split(",")
+            if item.strip()
+        ]
+        local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
+        if local_rank >= 0 and len(rdma_devices) > 1:
+            selected_device = rdma_devices[local_rank % len(rdma_devices)]
+            mooncake_values["device_name"] = selected_device
+            logger.info(
+                "[rank %d] Mooncake LOCAL_RANK=%d uses RDMA device %s",
+                self._rank,
+                local_rank,
+                selected_device,
+            )
+        # Teacher actors need the large configured segment for whole streamed
+        # batches. Each draft rank consumes only rows rank::world_size; giving
+        # all eight ranks the teacher's 512 GiB segment consumes nearly all
+        # host RAM and triggers Ray's 95% OOM killer.
+        draft_segment_size = os.environ.get(
+            "LUMENRL_DRAFT_MOONCAKE_SEGMENT_SIZE", "2GB"
+        )
+        mooncake_values["global_segment_size"] = draft_segment_size
+        logger.info(
+            "[rank %d] draft Mooncake segment size=%s",
+            self._rank,
+            draft_segment_size,
+        )
+        mooncake_values.update(
+            {
+                "max_seq_len": int(self.config.policy.max_total_sequence_length),
+                "hidden_dim": int(self._lm_head_weight.shape[1]),
+            }
+        )
+        consumer_config = MooncakeConfig(**mooncake_values)
+        self._disagg_mooncake_store = EagleMooncakeStore(consumer_config)
+        self._disagg_mooncake_store.setup()
+
+        self._teacher_ray_actors = []
+        self._ray = None
+        if self._rank == 0:
+            import ray
+
+            ray.init(
+                address=self.config.cluster.ray_address or "auto",
+                namespace="lumenrl-sddd",
+                ignore_reinit_error=True,
+            )
+            prefix = getattr(
+                spec_cfg, "teacher_actor_prefix", "kimi-k3-sddd-teacher"
+            )
+            self._teacher_ray_actors = [
+                ray.get_actor(f"{prefix}-{index}")
+                for index in range(replica_count)
+            ]
+            identities = ray.get(
+                [actor.identity.remote() for actor in self._teacher_ray_actors]
+            )
+            logger.info(
+                "Connected to %d Ray teacher replicas: %s",
+                replica_count,
+                identities,
+            )
+            self._ray = ray
+
+        self._teacher_model = None
+        self._teacher_engine = None
+        self._mooncake_master = None
+        self._capture_mode = getattr(spec_cfg, "capture_mode", "postnorm")
 
     def _check_generate_mode_prerequisites(self) -> None:
         """Fail fast on settings that only break in generate_mode.
@@ -1260,21 +1402,43 @@ class SpecDistillTrainer:
                 if os.path.isdir(teacher_path):
                     tokenizer_path = teacher_path
             dataset_split = getattr(self.config.reward, "dataset_split", "train")
-            self._preprocessed = load_and_preprocess_dataset(
-                dataset_path=dataset_path,
-                tokenizer_path=tokenizer_path,
-                max_length=self.config.policy.max_total_sequence_length,
-                chat_template=ds_cfg.chat_template,
-                seed=self.config.seed,
-                last_turn_loss_only=ds_cfg.last_turn_loss_only,
-                min_loss_tokens=ds_cfg.min_loss_tokens,
-                num_workers=ds_cfg.num_preprocess_workers,
-                cache_dir=ds_cfg.cache_dir,
-                dataset_split=dataset_split,
-                drop_overlong=getattr(ds_cfg, "drop_overlong", False),
-                max_prompt_tokens=getattr(ds_cfg, "max_prompt_tokens", 0),
-                thinking=getattr(ds_cfg, "thinking", True),
-            )
+
+            def _load_preprocessed_dataset():
+                return load_and_preprocess_dataset(
+                    dataset_path=dataset_path,
+                    tokenizer_path=tokenizer_path,
+                    max_length=self.config.policy.max_total_sequence_length,
+                    chat_template=ds_cfg.chat_template,
+                    seed=self.config.seed,
+                    last_turn_loss_only=ds_cfg.last_turn_loss_only,
+                    min_loss_tokens=ds_cfg.min_loss_tokens,
+                    num_workers=ds_cfg.num_preprocess_workers,
+                    cache_dir=ds_cfg.cache_dir,
+                    dataset_split=dataset_split,
+                    drop_overlong=getattr(ds_cfg, "drop_overlong", False),
+                    max_prompt_tokens=getattr(ds_cfg, "max_prompt_tokens", 0),
+                    thinking=getattr(ds_cfg, "thinking", True),
+                )
+
+            if self._is_distributed:
+                error = None
+                if self._rank == 0:
+                    try:
+                        self._preprocessed = _load_preprocessed_dataset()
+                    except Exception as exc:
+                        error = f"{type(exc).__name__}: {exc}"
+                error_payload = [error]
+                torch.distributed.broadcast_object_list(error_payload, src=0)
+                if error_payload[0] is not None:
+                    raise RuntimeError(
+                        "rank 0 dataset preprocessing failed: "
+                        f"{error_payload[0]}"
+                    )
+                torch.distributed.barrier()
+                if self._rank != 0:
+                    self._preprocessed = _load_preprocessed_dataset()
+            else:
+                self._preprocessed = _load_preprocessed_dataset()
             self._dataset = None
             logger.info(
                 "Preprocessed dataset: %d samples with chat_template=%s from %s",
@@ -1837,6 +2001,21 @@ class SpecDistillTrainer:
     # Data loading helpers
     # ------------------------------------------------------------------
 
+    def _trainable_len(self, ds_len: int) -> int:
+        """Number of leading rows the training sampler is allowed to touch.
+
+        ``_build_eval_cache`` holds out the *tail* of the shuffled dataset, and the
+        sampler wraps at ``(step * bs) % len``. Taking that modulus over the full
+        length is only safe for a single epoch: the moment a run wraps, it walks
+        straight through the eval slice and trains on it. Excluding the tail here
+        makes the wrap land back at row 0 instead, which is what multi-epoch
+        training needs to keep eval meaningful.
+        """
+        if not self.config.eval.enabled:
+            return ds_len
+        held = min(int(self.config.eval.num_samples), ds_len)
+        return max(1, ds_len - held)
+
     def _get_batch_sequences(
         self, step: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1852,7 +2031,7 @@ class SpecDistillTrainer:
         if self._preprocessed is not None:
             from lumenrl.data.kimi_k25_parser import unpack_loss_mask
 
-            ds_len = len(self._preprocessed)
+            ds_len = self._trainable_len(len(self._preprocessed))
             start = (step * bs) % ds_len
             indices = [(start + i) % ds_len for i in range(bs)]
             max_len = self.config.policy.max_total_sequence_length
@@ -1899,11 +2078,13 @@ class SpecDistillTrainer:
             for ids, lm in zip(batch_ids, batch_loss_masks):
                 ids = ids[:max_seq]
                 lm = lm[:max_seq]
-                pad_len = max_seq - len(ids)
+                valid_len = len(ids)
+                pad_len = max_seq - valid_len
                 if pad_len > 0:
                     ids = torch.cat([ids, torch.full((pad_len,), pad_id, dtype=torch.long)])
                     lm = torch.cat([lm, torch.zeros(pad_len, dtype=torch.long)])
-                attn = (ids != pad_id).long()
+                attn = torch.zeros(max_seq, dtype=torch.long)
+                attn[:valid_len] = 1
                 padded_ids.append(ids.unsqueeze(0))
                 padded_masks.append(attn.unsqueeze(0))
                 padded_loss_masks.append(lm.unsqueeze(0))
@@ -1920,7 +2101,7 @@ class SpecDistillTrainer:
                 for i in range(bs)
             ]
         else:
-            dataset_len = len(self._dataset)
+            dataset_len = self._trainable_len(len(self._dataset))
             start = (step * bs) % dataset_len
             indices = [(start + i) % dataset_len for i in range(bs)]
             samples = [self._dataset[idx] for idx in indices]
@@ -2017,7 +2198,7 @@ class SpecDistillTrainer:
             )
 
         bs = max(1, self.config.policy.train_global_batch_size)
-        ds_len = len(self._preprocessed)
+        ds_len = self._trainable_len(len(self._preprocessed))
         start = (step * bs) % ds_len
         indices = [(start + i) % ds_len for i in range(bs)]
 
@@ -2098,6 +2279,7 @@ class SpecDistillTrainer:
         free_before = (
             torch.cuda.mem_get_info()[0] if torch.cuda.is_available() else 0
         )
+        self._compensate_teacher_utilization()
         self._teacher_engine.start(mode=mode)
         if torch.cuda.is_available() and self._teacher_gpu_bytes is None:
             self._teacher_gpu_bytes = max(
@@ -2107,6 +2289,61 @@ class SpecDistillTrainer:
                 "[rank %d] Teacher engine footprint measured at %.1f GiB; "
                 "later restarts will wait for that much to be free",
                 self._rank, self._teacher_gpu_bytes / 1024 ** 3,
+            )
+
+    def _compensate_teacher_utilization(self) -> None:
+        """Raise the teacher's memory fraction by whatever this process still holds.
+
+        ATOM sizes its KV pool as::
+
+            non_torch  = (total - free) - its_own_reserved
+            available  = min(total * utilization - weights - non_torch
+                             - safety_margin, free)
+
+        ``total - free`` is device-wide, so everything the trainer still holds
+        lands in ``non_torch`` and is charged against a budget that is a fixed
+        fraction of the *whole* device. The teacher's affordable footprint
+        therefore shrinks one-for-one with the trainer's residual, even though
+        that residual is exactly what the fraction was supposed to leave room for.
+
+        Measured on this node (252 GiB cards, weights ~217.6 GiB, ~13.6 GiB held
+        after Phase B and the draft offload), the two starts want opposite things
+        and no single value satisfies both:
+
+            first start, 0.94  -> KV 14.3 GiB, leaves the trainer 20 GiB  (ok)
+            first start, 0.96  -> KV 19.3 GiB, leaves the trainer 15 GiB  (OOMs)
+            restart,     0.94  -> KV  0.7 GiB                            (dies)
+            restart,     0.96  -> KV  5.7 GiB                            (ok)
+
+        Adding ``residual / total`` cancels the charge exactly, so the teacher
+        gets the same absolute footprint at every start and the configured value
+        keeps meaning what it says on a quiet device. Over-allocation is not a
+        risk: ATOM clamps ``available_for_kv`` to physically free memory.
+        """
+        if not torch.cuda.is_available():
+            return
+        atom_cfg = getattr(self._teacher_engine, "_atom_config", None)
+        if not isinstance(atom_cfg, dict):
+            return
+        base = self._teacher_base_gpu_util
+        if base is None:
+            base = float(atom_cfg.get("gpu_memory_utilization", 0.9))
+            self._teacher_base_gpu_util = base
+        free, total = torch.cuda.mem_get_info()
+        if total <= 0:
+            return
+        resident = max(0, total - free)
+        # 0.995 rather than 1.0: ATOM's own 2% safety margin is inside the
+        # budget, and leaving nothing at all has no upside once the physical
+        # clamp is doing the real work.
+        util = min(0.995, base + resident / total)
+        atom_cfg["gpu_memory_utilization"] = util
+        if abs(util - base) > 1e-6:
+            logger.info(
+                "Teacher gpu_memory_utilization %.3f -> %.3f: this process still "
+                "holds %.1f GiB, which ATOM would otherwise charge against its "
+                "own KV budget",
+                base, util, resident / 1024 ** 3,
             )
 
     # A killed worker's pages come back asynchronously -- observed at up to
@@ -2273,6 +2510,56 @@ class SpecDistillTrainer:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    def _log_gpu_memory_all_ranks(self, when: str) -> None:
+        """Log free VRAM on every rank's device, not just this one.
+
+        The teacher comes back as eight tensor-parallel model runners, one per GPU,
+        and each sizes its pools from the free memory it finds on its own device.
+        A single training rank holding more than the others is therefore enough to
+        fail the restart, and is invisible to the rank-0-only snapshot: it surfaces
+        only as ``ModelRunner<k> proc died unexpectedly (exitcode=1)``, with the
+        actual reason in a worker log.
+
+        /!\\ Collective. Every rank must reach it, so it belongs next to a barrier,
+        not inside a rank-0 branch.
+        """
+        if not (
+            torch.cuda.is_available()
+            and self._is_distributed
+            and self._world_size > 1
+        ):
+            self._log_gpu_memory(when)
+            return
+        free, total = torch.cuda.mem_get_info()
+        local = torch.tensor(
+            [float(free), float(total), float(torch.cuda.memory_reserved())],
+            device=self._device,
+            dtype=torch.float64,
+        )
+        gathered = [torch.zeros_like(local) for _ in range(self._world_size)]
+        torch.distributed.all_gather(gathered, local)
+        if self._rank != 0:
+            return
+        gib = 1024 ** 3
+        frees = [g[0].item() / gib for g in gathered]
+        resv = [g[2].item() / gib for g in gathered]
+        logger.info(
+            "GPU memory %s, all ranks (GiB free): %s",
+            when,
+            "  ".join(f"r{i}={f:.1f}" for i, f in enumerate(frees)),
+        )
+        logger.info(
+            "GPU memory %s, all ranks (GiB torch-reserved): %s",
+            when,
+            "  ".join(f"r{i}={v:.1f}" for i, v in enumerate(resv)),
+        )
+        logger.info(
+            "GPU memory %s: tightest device is rank %d with %.1f GiB free "
+            "(spread %.1f GiB); the teacher sizes its pools per device, so this "
+            "is the number its restart has to fit into",
+            when, frees.index(min(frees)), min(frees), max(frees) - min(frees),
+        )
+
     def _log_gpu_memory(self, when: str) -> None:
         """Record what this rank is still holding, and what the device has left.
 
@@ -2301,8 +2588,18 @@ class SpecDistillTrainer:
             try:
                 if not torch.is_tensor(obj) or not obj.is_cuda:
                     continue
+                # torch.compile leaves FakeTensors reachable from dynamo's
+                # caches, and their sizes are SymInts, not ints. Summing and
+                # sorting those forces a guard on a shape env that is no longer
+                # active, which raises "vr must not be None for symbol s18" and
+                # takes the run down -- from a logging helper. They also occupy
+                # no memory, which is the only thing this function measures.
+                if obj.is_meta or isinstance(obj, torch._subclasses.FakeTensor):
+                    continue
                 nbytes = obj.untyped_storage().nbytes()
             except Exception:
+                continue
+            if not isinstance(nbytes, int):
                 continue
             key = f"{tuple(obj.shape)}x{obj.dtype}"
             sizes.setdefault(key, []).append(nbytes)
@@ -2812,10 +3109,35 @@ class SpecDistillTrainer:
             nbytes = 2
             for d in shape:
                 nbytes *= d
-            with open(f"{batch_dir}/{key}.bin", "rb") as f:
-                raw = f.read(nbytes)
-            t = torch.frombuffer(bytearray(raw), dtype=torch.uint8).clone()
-            result[key] = t.view(torch.bfloat16).reshape(shape)
+            # Map the file instead of reading it. The previous form,
+            #   torch.frombuffer(bytearray(f.read(n)), ...).clone()
+            # made three full copies of every tensor: read() allocated a bytes
+            # object, bytearray() copied it to get something mutable, and clone()
+            # copied again to own the memory. aux_hidden_states alone is
+            # [16, 8165, 35840] bf16 = 9.4 GB, so that was ~28 GB of
+            # single-threaded memcpy per step, and this function was measured at
+            # 70-104 s of a 90-140 s optimizer step -- 80-92% of it.
+            #
+            # The cache lives on tmpfs, so mapping it is not merely fewer copies,
+            # it is none: the pages already exist and the per-micro-batch H2D
+            # reads them where they are. This is the same thing _load_from_shm
+            # does with the same data.
+            path = f"{batch_dir}/{key}.bin"
+            # from_file *extends* a file that is shorter than nbytes rather than
+            # failing, so a truncated write would silently become zero-padded
+            # hidden states. Only a size check catches that.
+            actual = os.path.getsize(path)
+            if actual < nbytes:
+                raise RuntimeError(
+                    f"cache file {path} is {actual} bytes, expected {nbytes}; "
+                    f"the Phase A write for this batch did not complete"
+                )
+            storage = torch.UntypedStorage.from_file(
+                path, shared=True, nbytes=nbytes,
+            )
+            result[key] = (
+                torch.empty(0, dtype=torch.bfloat16).set_(storage).reshape(shape)
+            )
         for name in ("input_ids", "attention_mask", "loss_mask"):
             if name not in meta:
                 continue
@@ -3135,6 +3457,13 @@ class SpecDistillTrainer:
             metrics_accum: dict[str, float] = {}
             accum_count = 0
             opt_step_idx = 0
+            # Where the step actually goes. Added after an optimisation that made
+            # the model's own forward+backward ~26x cheaper moved the step time
+            # not at all: profiled in isolation a micro-batch is 262 ms, so 16 of
+            # them are 4.2 s against a measured 110 s step, and the rest was
+            # being attributed by guesswork. The sync costs one barrier per
+            # micro-batch and is what makes the split meaningful.
+            t_load = t_h2d = t_compute = t_opt = 0.0
 
             for batch_idx in range(round_num_batches):
                 group_start = (batch_idx // grad_accum) * grad_accum
@@ -3153,8 +3482,11 @@ class SpecDistillTrainer:
                         for cb in self.callbacks:
                             cb.on_step_begin(self, step)
                     step_start = time.time()
+                    t_load = t_h2d = t_compute = t_opt = 0.0
 
+                _t0 = time.time()
                 loaded = self._load_batch_from_disk(cache_dir, round_idx, batch_idx)
+                t_load += time.time() - _t0
 
                 cpu_data = {k: loaded[k] for k in self._TEACHER_KEYS}
                 input_ids = loaded["input_ids"]
@@ -3166,17 +3498,25 @@ class SpecDistillTrainer:
                     self._grad_accum_steps *= actual_group_size
                 mb_metrics: dict[str, float] = {}
                 for lo, hi in mbs:
+                    _t0 = time.time()
                     mb_teacher = {k: v[lo:hi].to(self._device) for k, v in cpu_data.items()}
                     mb_teacher["input_ids"] = input_ids[lo:hi].to(self._device)
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    t_h2d += time.time() - _t0
                     mb_mask = attention_mask[lo:hi]
                     mb_loss_mask = loss_mask[lo:hi]
 
+                    _t0 = time.time()
                     if draft_type == "dspark":
                         m = self._train_step_dspark(mb_teacher, mb_mask, mb_loss_mask)
                     elif draft_type == "eagle3":
                         m = self._train_step_eagle3(mb_teacher, mb_mask, mb_loss_mask)
                     else:
                         m = self._train_step_dflash(mb_teacher, mb_mask, mb_loss_mask)
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    t_compute += time.time() - _t0
 
                     for k, v in m.items():
                         if isinstance(v, float) and v == v:
@@ -3190,13 +3530,25 @@ class SpecDistillTrainer:
                 accum_count += 1
 
                 if is_last_in_accum:
+                    _t0 = time.time()
                     grad_norm = self._optimizer.step()
                     self._optimizer.zero_grad(set_to_none=True)
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    t_opt += time.time() - _t0
 
                     metrics = {k: v / accum_count for k, v in metrics_accum.items()}
                     metrics["grad_norm"] = float(grad_norm)
                     metrics["lr"] = self._optimizer.get_learning_rate()
-                    metrics["timing/step_s"] = time.time() - step_start
+                    step_s = time.time() - step_start
+                    metrics["timing/step_s"] = step_s
+                    metrics["timing/cache_load_s"] = t_load
+                    metrics["timing/h2d_s"] = t_h2d
+                    metrics["timing/fwd_bwd_s"] = t_compute
+                    metrics["timing/optimizer_s"] = t_opt
+                    metrics["timing/other_s"] = (
+                        step_s - t_load - t_h2d - t_compute - t_opt
+                    )
                     metrics["seq/max_len"] = int(input_ids.shape[1])
 
                     if self._is_distributed:
@@ -3239,6 +3591,10 @@ class SpecDistillTrainer:
             if self._is_distributed:
                 torch.distributed.barrier()
 
+            # Every rank's device, immediately before rank 0 tries to fit the
+            # teacher back onto all eight of them.
+            self._log_gpu_memory_all_ranks(f"before round {round_idx + 1} teacher restart")
+
             # Restart vLLM engine for next round's Phase A, in the mode that phase
             # actually opens with. Starting an extraction engine here would be
             # thrown away immediately by the A1 decode sweep -- a wasted 1.5 TB
@@ -3277,6 +3633,237 @@ class SpecDistillTrainer:
     # Main training loop
     # ------------------------------------------------------------------
 
+    def _submit_disaggregated_teacher_batch(self, step: int):
+        actor = self._teacher_ray_actors[
+            step % len(self._teacher_ray_actors)
+        ]
+        generate_mode = getattr(
+            self.config.algorithm.teacher, "generate_mode", "prefill"
+        )
+        if generate_mode == "prefill":
+            input_ids, attention_mask, loss_mask = self._get_batch_sequences(step)
+            return actor.process_prefill_batch.remote(
+                step,
+                input_ids.cpu(),
+                attention_mask.cpu(),
+                loss_mask.cpu(),
+            )
+        prompt_ids, prompt_mask, _ = self._get_batch_prompts(step)
+        return actor.process_on_policy_batch.remote(
+            step, prompt_ids.cpu(), prompt_mask.cpu(),
+        )
+
+    def _receive_disaggregated_manifest(self, ref: Any | None) -> dict[str, Any]:
+        payload: dict[str, Any] | None = None
+        if self._rank == 0:
+            try:
+                payload = {"manifest": self._ray.get(ref)}
+            except Exception as exc:
+                payload = {"error": f"{type(exc).__name__}: {exc}"}
+        obj = [payload]
+        if self._is_distributed:
+            torch.distributed.broadcast_object_list(obj, src=0)
+        payload = obj[0]
+        if payload is None:
+            raise RuntimeError("rank 0 did not broadcast a teacher manifest")
+        if "error" in payload:
+            raise RuntimeError(f"remote ATOM teacher failed: {payload['error']}")
+        return payload["manifest"]
+
+    def _load_disaggregated_rank_batch(
+        self,
+        manifest: dict[str, Any],
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
+        """RDMA-fetch this draft rank's disjoint rows from one teacher batch."""
+        keys = manifest["mooncake_keys"]
+        seq_lens = manifest["sequence_lengths"]
+        full_ids = manifest["input_ids"]
+        attention_mask = manifest["attention_mask"]
+        loss_mask = manifest["loss_mask"]
+        batch_size = len(keys)
+        if batch_size % self._world_size != 0:
+            raise ValueError(
+                f"disaggregated global batch {batch_size} must be divisible by "
+                f"draft world size {self._world_size}"
+            )
+        rows = list(range(self._rank, batch_size, self._world_size))
+        total_len = int(full_ids.shape[1])
+        hidden_dim = int(manifest["hidden_dim"])
+        hidden_width = int(manifest["num_aux_layers"]) * hidden_dim
+
+        hidden_rows = []
+        id_rows = []
+        last_rows = []
+        for row in rows:
+            seq_len = int(seq_lens[row])
+            output = self._disagg_mooncake_store.get(
+                keys[row],
+                {
+                    "hidden_states": (seq_len, hidden_width),
+                    "input_ids": (seq_len,),
+                    "last_hidden_states": (seq_len, hidden_dim),
+                },
+                {
+                    "hidden_states": torch.bfloat16,
+                    "input_ids": torch.int64,
+                    "last_hidden_states": torch.bfloat16,
+                },
+                device=torch.device("cpu"),
+            )
+            hidden_rows.append(F.pad(output.hidden_states, (0, 0, 0, total_len - seq_len)))
+            id_rows.append(F.pad(output.input_ids, (0, total_len - seq_len)))
+            last_rows.append(
+                F.pad(output.last_hidden_states, (0, 0, 0, total_len - seq_len))
+            )
+            self._disagg_mooncake_store.remove_eagle3_tensors(
+                keys[row], has_last_hidden_states=True, has_target=False,
+            )
+
+        hidden_states = torch.stack(hidden_rows)
+        input_ids = torch.stack(id_rows)
+        teacher_data = {
+            "hidden_states": hidden_states,
+            "token_embeds": hidden_states[:, :, :hidden_dim].clone(),
+            "input_ids": input_ids,
+            "last_hidden_states": torch.stack(last_rows),
+        }
+        return teacher_data, attention_mask[rows].contiguous(), loss_mask[rows].contiguous()
+
+    def _streaming_disaggregated_train(self) -> None:
+        """Continuously overlap four remote on-policy teachers with draft FSDP."""
+        if self.config.eval.enabled:
+            raise NotImplementedError(
+                "streaming_disaggregated evaluation is not implemented yet; "
+                "set eval.enabled=false for the initial 5-node bring-up"
+            )
+        if self._rank == 0:
+            for cb in self.callbacks:
+                cb.on_train_begin(self)
+
+        total_steps = int(self.config.num_training_steps)
+        start_step = self.global_step
+        spec_cfg = self.config.algorithm.spec_distill
+        draft_type = spec_cfg.draft_type.lower()
+        depth = max(
+            len(self._teacher_ray_actors) if self._rank == 0 else 1,
+            int(getattr(spec_cfg, "stream_prefetch_batches", 8)),
+        )
+        pending: dict[int, Any] = {}
+        if self._rank == 0:
+            for step in range(start_step, min(total_steps, start_step + depth)):
+                pending[step] = self._submit_disaggregated_teacher_batch(step)
+        next_submit_step = min(total_steps, start_step + depth)
+
+        for step in range(start_step, total_steps):
+            self.global_step = step
+            if self._rank == 0:
+                for cb in self.callbacks:
+                    cb.on_step_begin(self, step)
+            step_start = time.time()
+
+            ready_ref = None
+            if self._rank == 0:
+                # Consume in dataset order. Pairing whichever teacher finishes
+                # first with this optimizer step would train on the wrong rows.
+                ready_ref = pending.pop(step)
+            manifest = self._receive_disaggregated_manifest(ready_ref)
+
+            teacher_data, attention_mask, loss_mask = (
+                self._load_disaggregated_rank_batch(manifest)
+            )
+            if self._is_distributed:
+                # Every rank owns different keys. Do not let the teacher write a
+                # third batch into a segment until all ranks removed the oldest.
+                torch.distributed.barrier()
+            if self._rank == 0 and next_submit_step < total_steps:
+                pending[next_submit_step] = self._submit_disaggregated_teacher_batch(
+                    next_submit_step
+                )
+                next_submit_step += 1
+            teacher_time = time.time() - step_start
+            local_batch = int(attention_mask.shape[0])
+            configured_mb = int(
+                getattr(self.config.policy, "train_micro_batch_size", 1) or 1
+            )
+            micro_batch = min(configured_mb, local_batch)
+            chunks = [
+                (lo, min(lo + micro_batch, local_batch))
+                for lo in range(0, local_batch, micro_batch)
+            ]
+            self._grad_accum_steps = len(chunks)
+            self._optimizer.zero_grad(set_to_none=True)
+            self._draft_model.train()
+            metrics_accum: dict[str, float] = {}
+            use_grad_sync = (
+                self._is_distributed
+                and self._world_size > 1
+                and len(chunks) > 1
+                and hasattr(self._draft_model, "set_requires_gradient_sync")
+            )
+            train_start = time.time()
+            for index, (lo, hi) in enumerate(chunks):
+                if use_grad_sync:
+                    self._draft_model.set_requires_gradient_sync(index == len(chunks) - 1)
+                mb_teacher = {key: value[lo:hi] for key, value in teacher_data.items()}
+                mb_mask = attention_mask[lo:hi]
+                mb_loss_mask = loss_mask[lo:hi]
+                actual_len = max(1, int(mb_mask.sum(dim=-1).max().item()))
+                mb_teacher = {
+                    key: value[:, :actual_len].contiguous()
+                    if value.dim() >= 2 else value
+                    for key, value in mb_teacher.items()
+                }
+                mb_mask = mb_mask[:, :actual_len].contiguous()
+                mb_loss_mask = mb_loss_mask[:, :actual_len].contiguous()
+                if draft_type == "dspark":
+                    result = self._train_step_dspark(
+                        mb_teacher, mb_mask, mb_loss_mask,
+                    )
+                elif draft_type == "eagle3":
+                    result = self._train_step_eagle3(
+                        mb_teacher, mb_mask, mb_loss_mask,
+                    )
+                else:
+                    result = self._train_step_dflash(
+                        mb_teacher, mb_mask, mb_loss_mask,
+                    )
+                for key, value in result.items():
+                    if isinstance(value, float) and value == value:
+                        metrics_accum[key] = metrics_accum.get(key, 0.0) + value
+
+            metrics = {
+                key: value / max(len(chunks), 1)
+                for key, value in metrics_accum.items()
+            }
+            grad_norm = self._optimizer.step()
+            metrics.update(
+                {
+                    "grad_norm": float(grad_norm),
+                    "lr": self._optimizer.get_learning_rate(),
+                    "timing/step_s": time.time() - step_start,
+                    "timing/teacher_s": teacher_time,
+                    "timing/train_s": time.time() - train_start,
+                    "seq/max_len": int(attention_mask.shape[1]),
+                    "teacher/replica": float(manifest["replica_index"]),
+                }
+            )
+            if self._is_distributed:
+                for key in list(metrics):
+                    value = torch.tensor(
+                        metrics[key], dtype=torch.float64, device=self._device,
+                    )
+                    torch.distributed.all_reduce(
+                        value, op=torch.distributed.ReduceOp.AVG,
+                    )
+                    metrics[key] = float(value.item())
+            self.last_metrics = metrics
+            for cb in self.callbacks:
+                cb.on_step_end(self, step, metrics)
+
+        if self._rank == 0:
+            for cb in self.callbacks:
+                cb.on_train_end(self)
+
     def train(self) -> None:
         """Spec Distill loop: teacher forward on dataset -> draft model train."""
         if self._draft_model is None and self._teacher_model is None and self._teacher_engine is None:
@@ -3285,6 +3872,8 @@ class SpecDistillTrainer:
         spec_cfg = self.config.algorithm.spec_distill
         if getattr(spec_cfg, "sequential_mode", None) == "batch_alternating":
             return self._batch_alternating_train()
+        if getattr(spec_cfg, "sequential_mode", None) == "streaming_disaggregated":
+            return self._streaming_disaggregated_train()
 
         if self._rank == 0:
             for cb in self.callbacks:
@@ -3666,6 +4255,17 @@ class SpecDistillTrainer:
                     self._rank, e,
                 )
             self._mooncake_master = None
+        store = getattr(self, "_disagg_mooncake_store", None)
+        if store is not None:
+            try:
+                store.close()
+            except Exception as exc:
+                logger.warning(
+                    "[rank %d] disaggregated Mooncake close failed: %s",
+                    self._rank,
+                    exc,
+                )
+            self._disagg_mooncake_store = None
         del self._teacher_model, self._draft_model
         self._teacher_model = None
         self._draft_model = None

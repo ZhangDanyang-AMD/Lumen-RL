@@ -472,6 +472,12 @@ class SpecDistillConfig:
     cache_batches: int = 200
     cache_dir: str = "/tmp/teacher_cache"
     grad_accum_steps: int = 1
+    # Disaggregated streaming mode. Ray assigns one whole batch to each TP
+    # teacher replica in round-robin order; tensors travel through Mooncake.
+    teacher_replicas: int = 1
+    teacher_actor_prefix: str = "kimi-k3-sddd-teacher"
+    stream_prefetch_batches: int = 8
+    teacher_weights_path: str = "/tmp/lumenrl_teacher_static_weights.pt"
     # DSpark loss weights
     ce_loss_alpha: float = 0.1
     l1_loss_alpha: float = 0.9

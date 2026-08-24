@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Launch the K3 SDDD torch ranks through one Ray actor per node.
-
-Ray is the control plane (placement, process launch, health, and exit
-propagation).  FSDP2 and ATOM tensor communication still use NCCL/RCCL.
-"""
+"""Launch four TP=8 ATOM teachers and one 8-rank draft training node."""
 
 from __future__ import annotations
 
@@ -12,7 +8,6 @@ import shlex
 import socket
 import subprocess
 import sys
-import uuid
 from pathlib import Path
 
 import ray
@@ -119,7 +114,7 @@ def _eligible_nodes(gpus_per_node: int) -> list[dict]:
 
 
 def main() -> int:
-    num_nodes = _env_int("LUMENRL_NUM_NODES", 6)
+    num_nodes = _env_int("LUMENRL_NUM_NODES", 5)
     gpus_per_node = _env_int("LUMENRL_GPUS_PER_NODE", 8)
     master_port = _env_int("LUMENRL_TORCH_MASTER_PORT", 29500)
     repo_root = os.environ.get("LUMENRL_REPO_ROOT", "/root/lumenrl")
@@ -130,8 +125,22 @@ def main() -> int:
     log_dir = os.environ["LUMENRL_LOG_DIR"]
     shared_dir = Path(os.environ["LUMENRL_SHARED_CACHE_DIR"])
     overrides = shlex.split(os.environ.get("LUMENRL_OVERRIDES", ""))
+    mooncake_devices = os.environ.get("MOONCAKE_DEVICE_NAME", "").strip()
+    if not mooncake_devices:
+        raise ValueError(
+            "MOONCAKE_DEVICE_NAME is required for the RDMA topology"
+        )
 
-    ray.init(address="auto", ignore_reinit_error=True)
+    if num_nodes != 5:
+        raise ValueError(
+            f"K3 disaggregated topology requires exactly 5 nodes, got {num_nodes}"
+        )
+
+    ray.init(
+        address="auto",
+        namespace="lumenrl-sddd",
+        ignore_reinit_error=True,
+    )
     nodes = _eligible_nodes(gpus_per_node)
     if len(nodes) != num_nodes:
         details = [
@@ -143,52 +152,121 @@ def main() -> int:
             f"found {len(nodes)}: {details}"
         )
 
-    actor_cls = ray.remote(NodeLauncher)
-    actors = []
-    for index, node in enumerate(nodes):
-        ip = node["NodeManagerAddress"]
-        actor = actor_cls.options(
+    shared_dir.mkdir(parents=True, exist_ok=True)
+    from lumenrl.transfer.mooncake_master import MooncakeMaster
+
+    mooncake_master = MooncakeMaster()
+    mooncake_lease_ttl = float(
+        os.environ.get("MOONCAKE_KV_LEASE_TTL_S", "3600")
+    )
+    master_info = mooncake_master.start(
+        kv_lease_ttl_s=mooncake_lease_ttl
+    )
+    # MooncakeMaster resolves the local hostname, which can point at a
+    # container-only address. Ray's node IP is routable from all five nodes.
+    master_host = ray.util.get_node_ip_address()
+    master_port_value = master_info["master_addr"].rsplit(":", 1)[1]
+    master_info["master_addr"] = f"{master_host}:{master_port_value}"
+    master_info["metadata_server"] = (
+        f"http://{master_host}:{master_info['http_port']}/metadata"
+    )
+    actor_prefix = os.environ.get(
+        "LUMENRL_TEACHER_ACTOR_PREFIX", "kimi-k3-sddd-teacher"
+    )
+    weights_path = str(shared_dir / "teacher-static-weights.pt")
+    runtime_overrides = [
+        *overrides,
+        "cluster.num_nodes=1",
+        f"cluster.gpus_per_node={gpus_per_node}",
+        "algorithm.spec_distill.sequential_mode=streaming_disaggregated",
+        "algorithm.spec_distill.teacher_replicas=4",
+        f"algorithm.spec_distill.teacher_actor_prefix={actor_prefix}",
+        f"algorithm.spec_distill.teacher_weights_path={weights_path}",
+        f"mooncake.master_server_address={master_info['master_addr']}",
+        f"mooncake.metadata_server={master_info['metadata_server']}",
+        "mooncake.protocol=rdma",
+        f"mooncake.device_name={mooncake_devices}",
+        f"mooncake.global_segment_size={os.environ.get('MOONCAKE_GLOBAL_SEGMENT_SIZE', '512GB')}",
+        f"mooncake.local_buffer_size={os.environ.get('MOONCAKE_LOCAL_BUFFER_SIZE', '1GB')}",
+        "mooncake.enable_gpu_direct=false",
+        "mooncake.enable_hard_pin=true",
+        f"mooncake.kv_lease_ttl_s={mooncake_lease_ttl}",
+        "eval.enabled=false",
+    ]
+
+    from lumenrl.engine.inference.atom_teacher_ray import AtomTeacherRayActor
+
+    teacher_cls = ray.remote(AtomTeacherRayActor)
+    teacher_actors = []
+    draft_actor = None
+    try:
+        for index, node in enumerate(nodes[:4]):
+            ip = node["NodeManagerAddress"]
+            actor = teacher_cls.options(
+                num_gpus=gpus_per_node,
+                num_cpus=1,
+                max_concurrency=1,
+                resources={f"node:{ip}": 0.001},
+                name=f"{actor_prefix}-{index}",
+            ).remote(config, runtime_overrides, index)
+            teacher_actors.append(actor)
+
+        identities = ray.get([actor.identity.remote() for actor in teacher_actors])
+        for identity in identities:
+            print(f"Teacher replica: {identity}", flush=True)
+
+        exported = ray.get(
+            teacher_actors[0].export_static_weights.remote(weights_path)
+        )
+        print(f"Teacher static weights exported: {exported}", flush=True)
+
+        draft_node = nodes[4]
+        draft_ip = draft_node["NodeManagerAddress"]
+        launcher_cls = ray.remote(NodeLauncher)
+        draft_actor = launcher_cls.options(
             num_gpus=gpus_per_node,
             num_cpus=1,
-            resources={f"node:{ip}": 0.001},
-            name=f"kimi-k3-sddd-node-{index}",
+            resources={f"node:{draft_ip}": 0.001},
+            name="kimi-k3-sddd-draft",
         ).remote()
-        actors.append(actor)
+        identity = ray.get(draft_actor.identity.remote())
+        print(f"Draft node: {identity}", flush=True)
 
-    identities = ray.get([actor.identity.remote() for actor in actors])
-    for index, identity in enumerate(identities):
-        print(f"Ray node {index}: {identity}", flush=True)
-
-    shared_dir.mkdir(parents=True, exist_ok=True)
-    token = uuid.uuid4().hex
-    probe = shared_dir / ".ray-shared-filesystem-probe"
-    probe.write_text(token)
-    ray.get([actor.check_shared_file.remote(str(probe), token) for actor in actors])
-    probe.unlink(missing_ok=True)
-    print(f"Shared filesystem verified on {num_nodes} nodes: {shared_dir}", flush=True)
-
-    master_addr = str(identities[0]["ip"])
-    refs = [
-        actor.run.remote(
-            node_rank=index,
-            num_nodes=num_nodes,
-            gpus_per_node=gpus_per_node,
-            master_addr=master_addr,
-            master_port=master_port,
-            config=config,
-            overrides=overrides,
-            repo_root=repo_root,
-            log_dir=log_dir,
+        exit_code = ray.get(
+            draft_actor.run.remote(
+                node_rank=0,
+                num_nodes=1,
+                gpus_per_node=gpus_per_node,
+                master_addr=str(identity["ip"]),
+                master_port=master_port,
+                config=config,
+                overrides=runtime_overrides,
+                repo_root=repo_root,
+                log_dir=log_dir,
+            )
         )
-        for index, actor in enumerate(actors)
-    ]
-    exit_codes = ray.get(refs)
-    failures = [index for index, code in enumerate(exit_codes) if code != 0]
-    if failures:
-        print(f"torchrun failed on node ranks {failures}: {exit_codes}", file=sys.stderr)
-        return 1
-    print(f"K3 SDDD completed on {num_nodes} nodes: {exit_codes}", flush=True)
-    return 0
+        if exit_code != 0:
+            print(f"draft torchrun failed: exit={exit_code}", file=sys.stderr)
+            return 1
+        print("K3 SDDD 4-teacher + 1-draft job completed", flush=True)
+        return 0
+    finally:
+        shutdown_refs = [actor.shutdown.remote() for actor in teacher_actors]
+        if shutdown_refs:
+            try:
+                ray.get(shutdown_refs, timeout=60)
+            except Exception as exc:
+                print(f"teacher shutdown warning: {exc}", file=sys.stderr)
+                # A failed draft may leave long A1/A2 calls ahead of shutdown
+                # in each actor's single-threaded mailbox. Kill the actor
+                # processes (their ATOM children use PDEATHSIG) before stopping
+                # Mooncake so producer clients cannot outlive the master.
+                for actor in teacher_actors:
+                    try:
+                        ray.kill(actor, no_restart=True)
+                    except Exception:
+                        pass
+        mooncake_master.shutdown()
 
 
 if __name__ == "__main__":

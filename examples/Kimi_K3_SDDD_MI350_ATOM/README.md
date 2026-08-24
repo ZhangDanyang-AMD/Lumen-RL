@@ -1,36 +1,33 @@
 # Kimi K3 DSpark Draft Distillation (ATOM + FSDP2) — MI350
 
-On-policy speculative distillation of the DSpark draft against a Kimi K3
-teacher, on 8× MI350. Same recipe as the sibling `Kimi_K3_SDDD_MI350_vllm`
-example; the teacher inference backend is ATOM instead of vLLM.
+Off-policy speculative distillation of the DSpark draft against a Kimi K3
+teacher. Responses come from `slippedJim/ATOM_regen_seeklight_kimi_mtp`;
+ATOM only prefills those sequences and extracts hidden states.
 
 ## Why ATOM
 
-On-policy training needs two passes over every batch: the teacher decodes its
-own continuation (A1), then the prompt and that continuation are prefilled
-together so the aux hidden states can be captured (A2).
-
-ATOM captures through forward hooks, so capture does not depend on how the
-model decodes and one loaded engine serves both passes. Which pass a request
-belongs to is decided per request: the generate sweep withholds the external
-request id, the extract sweep supplies it, and ATOM only writes to Mooncake
-when an id is present. On vLLM the two passes need different engine configs,
-so every switch reloads K3's 1.5 TB of weights.
+The regenerated dataset caches Kimi-K3 responses once, removing the expensive
+A1 teacher decode from every training round. ATOM captures auxiliary states
+through forward hooks during the remaining prefill pass.
 
 ## Architecture
 
-```
-Round = Phase A (all 8 GPUs)  ──────────────>  Phase B (all 8 GPUs)
+The production topology is five nodes: four resident ATOM TP=8 replicas and
+one 8-rank FSDP2 draft node. Whole batches are assigned round-robin
+(`batch_id % 4`). Each teacher actor prefills complete dataset sequences before
+publishing per-sequence keys. Ray carries only tokens, masks, and keys;
+hidden states move through pinned-host Mooncake RDMA.
 
-  A1  ATOM TP=8, decode 50 batches            teacher released,
-      no external id -> no capture            draft trained on the 50
-        |                                     cached batches
-  A2  same engine, prefill prompt+response      ^
-      external id -> hooks fire at             |
-      layers [2,23,47,71,89]                   |
-        |                                      |
-      Mooncake TCP ─> /dev/shm/teacher_cache_atom
 ```
+teacher0 TP=8 ─┐
+teacher1 TP=8 ─┼─ Mooncake RDMA ─> draft ranks 0..7 (FSDP2 replicate)
+teacher2 TP=8 ─┤                     each rank fetches 8/64 sequence keys
+teacher3 TP=8 ─┘
+```
+
+The bounded prefetch window keeps two batches queued per teacher. There is no
+round cache and the draft starts as soon as the oldest complete batch is
+available.
 
 `separate_last_hidden: false` — this is the one config line that is not a
 verbatim copy of the vLLM variant. ATOM's `hidden_states` already holds all
@@ -45,15 +42,10 @@ concatenate once more, so `fc` receives 6 × 7168 and RMSNorm is applied twice.
 docker build -f examples/Kimi_K3_SDDD_MI350_ATOM/docker/Dockerfile \
     -t kimi_k3_dspark_atom:latest .
 
-# 2. Smoke test (5 cached batches, exercises both sweeps end to end).
+# 2. Smoke test (5 batches, exercises prefill extraction end to end).
 DATA_ROOT=/your/data bash examples/Kimi_K3_SDDD_MI350_ATOM/run_docker.sh --smoke-test
 
-# 3. Full run, detached so it survives the launching shell.
-DATA_ROOT=/your/data DETACH=1 bash examples/Kimi_K3_SDDD_MI350_ATOM/run_docker.sh
-
-# Resume after a crash or a lost node:
-DATA_ROOT=/your/data DETACH=1 EXTRA_OVERRIDES="checkpointing.resume=true" \
-    bash examples/Kimi_K3_SDDD_MI350_ATOM/run_docker.sh
+# 3. Full runs use the five-node SLURM launcher below.
 ```
 
 `DATA_ROOT` is where the ~1.5 TB of teacher weights and the checkpoints live;
@@ -67,72 +59,67 @@ and config typos before a 20-minute weight load rather than after.
 
 ## Multi-node Ray + SLURM
 
-`run_multinode_slurm.sh` starts one Ray daemon container on every allocated
-node. Ray pins and supervises one 8-GPU launcher actor per node; each actor
-starts its local `torchrun` ranks. Ray is the control plane, while FSDP2 and
-ATOM tensor traffic still uses RCCL/NCCL.
+`run_multinode_slurm.sh` starts one Ray daemon container on each of five
+allocated nodes. The launcher pins four named ATOM actors to the first four
+GPU nodes, starts Mooncake master on the head node, and runs one local
+`torchrun --nproc-per-node=8` on the final node. Ray is the control plane,
+Mooncake RDMA is the hidden-state data plane, and draft gradient synchronization
+uses RCCL within the draft node.
 
 ```bash
 # Smoke test first. The listed nodes must be idle/allocated to this job.
-SMOKE_TEST=1 DATA_ROOT=/shared/data \
-sbatch --nodelist=crsuse2-m2m-v2-[034-039] \
+SMOKE_TEST=1 \
+sbatch --nodelist=crsuse2-m2m-v2-[030,035,037-039] \
   examples/Kimi_K3_SDDD_MI350_ATOM/run_multinode_slurm.sh
 ```
 
-The multi-node path requires `DATA_ROOT` to be mounted at the same path on
-every node. Teacher cache and checkpoints intentionally use that shared
-filesystem; `/dev/shm` is node-local and is not valid for this topology. The
-launcher writes a sentinel and verifies that all Ray actors can read it before
-loading K3.
+Use exactly five hosts. Model and dataset files live under each node's local
+`/mnt/m2m_nobackup/danyzhan`; checkpoints, logs, and the one-time static
+teacher-weight export use `SHARED_ROOT` (default `/shared_nfs/danyzhan/lumenrl`).
 
-For six 8-GPU nodes, the launcher defaults `train_global_batch_size` to 48 so
-every rank receives one micro-batch and scales the validated learning rate
-linearly to `5.625e-5`. Override `GLOBAL_BATCH_SIZE` and `LEARNING_RATE`
-together if changing this. The current implementation runs the ATOM TP=8
-teacher on rank 0's node during Phase A, then uses all 48 ranks for Phase B;
-the other five nodes are idle during teacher generation. This is functional
-multi-node training, not yet a disaggregated multi-teacher throughput path.
+Set `MOONCAKE_DEVICE_NAME` to the RoCE HCA list visible in the container.
+The recipe now follows Jim's TorchSpec-aligned cache-on-policy branch: batch
+128, lr `5e-5`, an 8192-token window, and final-assistant-turn supervision.
 
 ## Configuration
 
 ```yaml
 algorithm:
   spec_distill:
-    sequential_mode: batch_alternating
-    cache_batches: 50                        # 11.3 GB each at bs=64
+    sequential_mode: streaming_disaggregated
+    teacher_replicas: 4
+    stream_prefetch_batches: 8
     aux_hidden_state_layer_ids: [2, 23, 47, 71, 89]
     separate_last_hidden: false              # inverse of the vLLM variant
     anchor_num: 512
   teacher:
     inference_backend: atom
     tensor_parallel_size: 8
-    generate_mode: generate                  # on-policy
-    generate_max_tokens: 992
+    generate_mode: prefill                   # response comes from the dataset
     transport: mooncake
     atom:
-      max_model_len: 2048
-      max_num_seqs: 256
+      max_model_len: 8192
+      max_num_seqs: 32
+      max_num_batched_tokens: 8192
       gpu_memory_utilization: 0.90
-      kv_cache_dtype: bf16
-      enforce_eager: false
+      kv_cache_dtype: fp8
+      index_cache_dtype: fp8
+      enforce_eager: true
 
-training:
-  train_global_batch_size: 64
-  learning_rate: 7.5e-5
-num_training_steps: 5413
+policy:
+  max_total_sequence_length: 8192
+  train_global_batch_size: 128
+  learning_rate: 5.0e-5
+num_training_steps: 1658
 ```
 
-Four of these will bite if copied carelessly, and `configs/train.yaml` carries
+Three of these will bite if copied carelessly, and `configs/train.yaml` carries
 the full reasoning inline:
 
-- **`generate_max_tokens: 992`, not 1024.** A row whose length lands exactly on
-  `max_model_len` asks the block table for `ceil(2049/16) = 129` blocks when it
-  was allocated `2048/16 = 128`.
-- **`gpu_memory_utilization: 0.90`, not 0.85.** The trainer still holds ~23 GB
-  when the teacher restarts for the next round, and 0.85 leaves the teacher
-  short from round 2 onward.
-- **`kv_cache_dtype: bf16`, not fp8.** Quantization noise would propagate into
-  the aux-layer labels the draft is trained against.
+- **`kv_cache_dtype/index_cache_dtype: fp8`.** This matches the ATOM serving
+  path, avoiding a train/serve context-feature mismatch.
+- **Batch 128, lr `5e-5`, max grad norm 1.0.** These are the TorchSpec reference
+  optimizer settings and should be changed as a unit.
 - **`max_num_batched_tokens >= max_model_len`, chunked prefill and prefix
   caching both off.** ATOM rewrites the same Mooncake key every scheduler step
   without checking `is_final_chunk`, so anything that splits a prefill silently
@@ -143,7 +130,7 @@ the full reasoning inline:
 ```
 configs/
   train.yaml            # full run; every non-obvious value is explained inline
-  smoke_test.yaml       # 5 cached batches
+  smoke_test.yaml       # 5 streamed optimizer steps
 docker/
   Dockerfile            # rocm/atom-dev + LumenRL + Lumen + torchspec shim
   torchspec/            # shim mapping ATOM's torchspec imports to lumenrl.transfer
@@ -163,9 +150,9 @@ both sides of the transfer agree on the format without patching ATOM.
 
 | Path | Contents |
 |---|---|
-| `$DATA_ROOT/checkpoints/kimi_k3_dspark_atom/` | Checkpoints (not tmpfs, which is wiped when the allocation ends) |
-| `/dev/shm/teacher_cache_atom/round_N/` | One round of cached hidden states |
-| `/dev/shm/lumenrl_teacher_hidden/atom_teacher_worker.log` | Teacher worker log |
+| `$SHARED_ROOT/checkpoints/...` | Checkpoints |
+| `$SHARED_ROOT/cache/.../teacher-static-weights.pt` | One-time static teacher weights shared with draft ranks |
+| `/dev/shm/lumenrl_teacher_hidden/atom_teacher_worker.log` | Per-teacher ATOM worker log |
 | `output/Kimi_K3_SDDD/LumenRL/` | Training log |
 
 ## Reference
@@ -173,4 +160,4 @@ both sides of the transfer agree on the format without patching ATOM.
 - [Inferact/Kimi-K3-DSpark](https://huggingface.co/Inferact/Kimi-K3-DSpark) — draft model config
 - [moonshotai/Kimi-K3](https://huggingface.co/moonshotai/Kimi-K3) — target model
 - [DSpark paper (arXiv:2607.05147)](https://arxiv.org/abs/2607.05147)
-- [lightseekorg/kimi-mtp-dataset](https://huggingface.co/datasets/lightseekorg/kimi-mtp-dataset)
+- [slippedJim/ATOM_regen_seeklight_kimi_mtp](https://huggingface.co/datasets/slippedJim/ATOM_regen_seeklight_kimi_mtp)

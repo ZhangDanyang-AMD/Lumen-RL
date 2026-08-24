@@ -390,7 +390,8 @@ for line in cmd_f:
             n = max(1, min(n, T))
             rows.append(input_ids_batch[i][:n].tolist())
 
-        data_ids = [f"atom_{os.getpid()}_x{req_counter}_{i}" for i in range(B)]
+        key_prefix = os.environ.get("LUMENRL_ATOM_KEY_PREFIX", f"atom_{os.getpid()}")
+        data_ids = [f"{key_prefix}_x{req_counter}_{i}" for i in range(B)]
 
         t0 = time.monotonic()
         engine.generate_hidden_states(rows, data_ids)
@@ -556,11 +557,21 @@ class AtomTeacherEngine:
         local_device: torch.device | None = None,
         capture_mode: str = "postnorm",
         aux_layer_ids: list[int] | None = None,
+        key_prefix: str | None = None,
+        consume_hidden_states: bool = True,
     ) -> None:
         self._model_name = model_name
         self._tp_size = tensor_parallel_size
         self._gpu_ids = gpu_ids or list(range(tensor_parallel_size))
         self._hidden_dir = _HIDDEN_XFER_DIR
+        self._start_seq = 0
+        # Distinguishes one trainer process's worker logs from the next one's. The
+        # pid cannot do it: inside the container the worker's pid is deterministic
+        # (418 every time), so after a container restart the new process reuses
+        # both the pid and the sequence counter and overwrites the logs of the run
+        # that crashed -- which is exactly the evidence needed at that point.
+        self._run_stamp = time.strftime("%m%d-%H%M%S")
+        self._worker_log_path: str | None = None
         self._mooncake_config = mooncake_config
         self._transport = transport
         self._quantization = quantization
@@ -570,6 +581,8 @@ class AtomTeacherEngine:
         self._local_device = local_device or torch.device("cuda:0")
         self._capture_mode = capture_mode
         self._configured_aux_layer_ids = list(aux_layer_ids or [])
+        self._key_prefix = key_prefix
+        self._consume_hidden_states = consume_hidden_states
         self._mode = "extract"
 
         self._proc: subprocess.Popen | None = None
@@ -643,12 +656,12 @@ class AtomTeacherEngine:
 
         The worker's stdout and stderr go only to this file, never to the
         trainer log, so a worker that stops responding leaves no trace in the
-        place anyone looks first. Callers should pull the tail *before*
-        restarting: ``start`` reopens the file in write mode and truncates it.
+        place anyone looks first. ``start`` writes a new file per attempt, so the
+        crashed worker's log stays on disk after a restart.
         """
         try:
-            path = os.path.join(self._hidden_dir, "atom_teacher_worker.log")
-            if not os.path.exists(path):
+            path = self._worker_log_path
+            if not path or not os.path.exists(path):
                 return ""
             with open(path) as f:
                 return "".join(f.readlines()[-num_lines:])
@@ -872,6 +885,8 @@ class AtomTeacherEngine:
 
         env["GLOG_minloglevel"] = "3"
         env["GLOG_v"] = "0"
+        if self._key_prefix:
+            env["LUMENRL_ATOM_KEY_PREFIX"] = self._key_prefix
         env["MOONCAKE_LOG_LEVEL"] = "FATAL"
         env["AITER_LOG_LEVEL"] = "WARNING"
         if "AITER_CONFIG_GEMM_BF16" not in env:
@@ -893,36 +908,51 @@ class AtomTeacherEngine:
         # Set Mooncake env vars for worker subprocess
         if self._transport == "mooncake" and self._mooncake_config is not None:
             mc = self._mooncake_config
+            master_addr = getattr(mc, "master_server_address", "") or ""
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.connect(("8.8.8.8", 80))
+                master_host = master_addr.rsplit(":", 1)[0]
+                s.connect((master_host, 1))
                 local_ip = s.getsockname()[0]
                 s.close()
             except Exception:
                 local_ip = socket.gethostbyname(socket.gethostname())
 
-            master_addr = getattr(mc, "master_server_address", "") or ""
             metadata_server = getattr(mc, "metadata_server", "") or ""
             protocol = getattr(mc, "protocol", "tcp") or "tcp"
             device_name = getattr(mc, "device_name", "") or ""
+            if protocol == "rdma" and not device_name:
+                raise ValueError(
+                    "Mooncake RDMA requires a non-empty device_name"
+                )
 
             env["MOONCAKE_LOCAL_HOSTNAME"] = local_ip
             env["MOONCAKE_MASTER_SERVER"] = master_addr
             env["MOONCAKE_METADATA_SERVER"] = metadata_server
             env["MOONCAKE_PROTOCOL"] = protocol
             env["MOONCAKE_DEVICE_NAME"] = device_name
+            from lumenrl.transfer.mooncake_config import MooncakeConfig
+
+            global_segment_size = getattr(
+                mc, "global_segment_size", 16 * 1024**3
+            )
+            local_buffer_size = getattr(
+                mc, "local_buffer_size", 4 * 1024**3
+            )
             env["MOONCAKE_GLOBAL_SEGMENT_SIZE"] = str(
-                mc.global_segment_size_bytes
-                if hasattr(mc, "global_segment_size_bytes")
-                else 17179869184
+                MooncakeConfig.parse_size(global_segment_size)
+                if isinstance(global_segment_size, str)
+                else int(global_segment_size)
             )
             env["MOONCAKE_LOCAL_BUFFER_SIZE"] = str(
-                mc.local_buffer_size_bytes
-                if hasattr(mc, "local_buffer_size_bytes")
-                else 4294967296
+                MooncakeConfig.parse_size(local_buffer_size)
+                if isinstance(local_buffer_size, str)
+                else int(local_buffer_size)
             )
             env["MOONCAKE_ENABLE_GPU_DIRECT"] = "0"
-            env["MOONCAKE_ENABLE_HARD_PIN"] = "0"
+            env["MOONCAKE_ENABLE_HARD_PIN"] = (
+                "1" if getattr(mc, "enable_hard_pin", False) else "0"
+            )
 
             try:
                 from transformers import AutoConfig as _AC
@@ -955,7 +985,23 @@ class AtomTeacherEngine:
 
         atom_args_json = json.dumps(self._atom_config)
 
-        worker_log_path = os.path.join(self._hidden_dir, "atom_teacher_worker.log")
+        # One file per start, not one per run. The teacher is restarted every
+        # round, and a single reused path meant that a crash was overwritten by
+        # the next attempt's log before anyone could read it — including by the
+        # automatic container restart, which is how the round-1 startup failure
+        # lost its own traceback. The tail dumped on failure is only 50 lines and
+        # is usually all NCCL teardown noise.
+        # /!\ The counter alone is not enough: the container restarts on failure and
+        # the new process starts counting at 1 again. Neither is the pid, which is
+        # deterministic inside the container -- see _run_stamp, which is what
+        # actually separates one process's logs from its successor's.
+        self._start_seq += 1
+        worker_log_path = os.path.join(
+            self._hidden_dir,
+            f"atom_teacher_worker.{self._run_stamp}.{os.getpid()}"
+            f".{self._start_seq:03d}.{self._mode}.log",
+        )
+        self._worker_log_path = worker_log_path
         self._worker_log_f = open(worker_log_path, "w")
         logger.info("AtomTeacherEngine: worker log -> %s", worker_log_path)
 
@@ -1005,7 +1051,11 @@ class AtomTeacherEngine:
         self._aux_layer_indices = resp.get("aux_layer_indices", [])
 
         # Set up training-side Mooncake store
-        if self._transport == "mooncake" and self._mooncake_config is not None:
+        if (
+            self._consume_hidden_states
+            and self._transport == "mooncake"
+            and self._mooncake_config is not None
+        ):
             try:
                 from lumenrl.transfer.eagle_mooncake_store import EagleMooncakeStore
                 from lumenrl.transfer.mooncake_config import MooncakeConfig
@@ -1013,7 +1063,10 @@ class AtomTeacherEngine:
                 mc = self._mooncake_config
                 try:
                     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    s.connect(("8.8.8.8", 80))
+                    master_host = (
+                        getattr(mc, "master_server_address", "") or ""
+                    ).rsplit(":", 1)[0]
+                    s.connect((master_host, 1))
                     local_ip = s.getsockname()[0]
                     s.close()
                 except Exception:
@@ -1072,20 +1125,25 @@ class AtomTeacherEngine:
         timeout_s: float = _DEFAULT_COMMAND_TIMEOUT_SECONDS,
     ) -> dict:
         """Send a JSON command and read the response (caller holds _cmd_lock)."""
-        if not self.is_alive:
-            raise RuntimeError("Teacher worker is not running")
         try:
+            if not self.is_alive:
+                raise RuntimeError("Teacher worker is not running")
             self._cmd_f.write(json.dumps(cmd) + "\n")
             self._cmd_f.flush()
-        except BrokenPipeError as exc:
+            resp_line = self._read_response_line(
+                timeout_s=timeout_s,
+                context=f"response to cmd={cmd.get('cmd', 'unknown')}",
+            )
+            return json.loads(resp_line)
+        except Exception as exc:
+            worker_log_tail = self.worker_log_tail()
             raise RuntimeError(
-                "Teacher worker command FIFO is broken; worker likely crashed",
+                "ATOM teacher command "
+                f"{cmd.get('cmd', 'unknown')!r} failed: {exc}\n"
+                "--- worker log (last 50 lines) ---\n"
+                f"{worker_log_tail}"
+                "--- end worker log ---"
             ) from exc
-        resp_line = self._read_response_line(
-            timeout_s=timeout_s,
-            context=f"response to cmd={cmd.get('cmd', 'unknown')}",
-        )
-        return json.loads(resp_line)
 
     def _send_cmd(
         self,
@@ -1117,44 +1175,15 @@ class AtomTeacherEngine:
             and ``input_ids``.
             All tensors on ``recv_device`` or ``self._local_device``.
         """
-        if not self.is_alive:
-            self.start(mode="extract")
-        else:
-            self.switch_mode("extract")
-
-        if self._transport != "mooncake":
-            raise AssertionError(
-                "AtomTeacherEngine only implements the Mooncake transport",
-            )
-
-        lengths = attention_mask.sum(dim=1).to(torch.int64).cpu()
-
-        with self._cmd_lock:
-            self._req_counter += 1
-            tag = f"req_{self._req_counter}"
-            input_path = os.path.join(self._hidden_dir, f"{tag}_input.pt")
-
-            torch.save(
-                {"input_ids": input_ids.cpu(), "lengths": lengths},
-                input_path,
-            )
-
-            resp = self._send_cmd_unlocked({
-                "cmd": "extract_hidden",
-                "input_path": input_path,
-            })
-
-        if resp.get("status") != "ok":
-            raise RuntimeError(f"extract_hidden failed: {resp}")
-
-        T = resp["T"]
-        D = resp["D"]
+        manifest = self.extract_hidden_state_manifest(input_ids, attention_mask)
+        T = manifest["sequence_width"]
+        D = manifest["hidden_dim"]
 
         if recv_device is None:
             recv_device = self._local_device
 
-        mooncake_keys = resp["mooncake_keys"]
-        seq_lens = resp.get("seq_lens", {})
+        mooncake_keys = manifest["mooncake_keys"]
+        seq_lens = manifest["sequence_lengths"]
         num_aux = len(self._aux_layer_indices)
         training_hidden_size = num_aux * D
 
@@ -1165,8 +1194,8 @@ class AtomTeacherEngine:
         all_ids = []
         all_last_hs = []
 
-        for key in mooncake_keys:
-            T_i = int(seq_lens.get(key, T))
+        for key, sequence_length in zip(mooncake_keys, seq_lens, strict=True):
+            T_i = int(sequence_length)
             shapes = {
                 "hidden_states": (T_i, training_hidden_size),
                 "input_ids": (T_i,),
@@ -1202,6 +1231,60 @@ class AtomTeacherEngine:
             "token_embeds": token_embeds,
             "input_ids": ret_ids,
             "last_hidden_states": last_hidden_states,
+        }
+
+    def extract_hidden_state_manifest(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> dict[str, Any]:
+        """Run extraction but leave tensors in Mooncake for a remote consumer.
+
+        The returned object contains only keys and tensor-shape metadata.  This
+        is the disaggregated teacher API: Ray carries the small manifest while
+        hidden states stay in Mooncake and cross nodes through its data plane.
+        """
+        if not self.is_alive:
+            self.start(mode="extract")
+        else:
+            self.switch_mode("extract")
+
+        if self._transport != "mooncake":
+            raise AssertionError(
+                "AtomTeacherEngine only implements the Mooncake transport",
+            )
+
+        lengths = attention_mask.sum(dim=1).to(torch.int64).cpu()
+        with self._cmd_lock:
+            self._req_counter += 1
+            tag = f"req_{self._req_counter}"
+            input_path = os.path.join(self._hidden_dir, f"{tag}_input.pt")
+            torch.save(
+                {"input_ids": input_ids.cpu(), "lengths": lengths},
+                input_path,
+            )
+            try:
+                resp = self._send_cmd_unlocked({
+                    "cmd": "extract_hidden",
+                    "input_path": input_path,
+                })
+            finally:
+                try:
+                    os.remove(input_path)
+                except FileNotFoundError:
+                    pass
+
+        if resp.get("status") != "ok":
+            raise RuntimeError(f"extract_hidden failed: {resp}")
+
+        keys = list(resp["mooncake_keys"])
+        by_key = resp.get("seq_lens", {})
+        return {
+            "mooncake_keys": keys,
+            "sequence_lengths": [int(by_key.get(key, resp["T"])) for key in keys],
+            "sequence_width": int(resp["T"]),
+            "hidden_dim": int(resp["D"]),
+            "num_aux_layers": len(self._aux_layer_indices),
         }
 
     def generate_tokens(

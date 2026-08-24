@@ -41,10 +41,16 @@ RUN TORCH_BEFORE=$(python3 -c "import torch; print(torch.__version__)") && \
         pyzmq && \
     # antlr4 is pinned to 4.9 because omegaconf 2.3's generated parser fails to
     # deserialize its grammar against 4.13. jsonschema is what `import ray` trips
-    # on. Both are pure Python and cannot disturb torch.
+    # on. opentelemetry is what `import wandb` trips on from 0.28 onward, where
+    # wandb.analytics grew a hard dependency on it -- it is not optional and not
+    # gated on WANDB_MODE, so it fails at import even though this recipe never
+    # logs to wandb. All pure Python, so none of them can disturb torch, and the
+    # guard below fails the build loudly if that stops being true.
     python3 -m pip install --no-cache-dir \
         "antlr4-python3-runtime==4.9.3" \
-        jsonschema && \
+        jsonschema \
+        opentelemetry-api \
+        opentelemetry-sdk && \
     TORCH_AFTER=$(python3 -c "import torch; print(torch.__version__)") && \
     NUMPY_AFTER=$(python3 -c "import numpy; print(numpy.__version__)") && \
     if [ "$TORCH_BEFORE" != "$TORCH_AFTER" ] || [ "$NUMPY_BEFORE" != "$NUMPY_AFTER" ]; then \

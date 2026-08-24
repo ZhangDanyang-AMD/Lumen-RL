@@ -29,10 +29,41 @@ from torch import Tensor
 from lumenrl.models.eagle3 import (
     RMSNorm,
     RotaryEmbedding,
-    _rotate_half,
+    _yarn_get_mscale,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _rotate_half_interleaved(x: Tensor) -> Tensor:
+    """Interleaved-pair rotation: pairs dims (0,1), (2,3), ..."""
+    x1 = x[..., ::2]
+    x2 = x[..., 1::2]
+    return torch.stack((-x2, x1), dim=-1).flatten(-2)
+
+
+try:
+    from torch.nn.attention.flex_attention import (
+        create_block_mask as _create_block_mask,
+        flex_attention as _flex_attention,
+    )
+    # flex_attention only fuses under torch.compile. Called eagerly it warns and
+    # materialises the score matrix anyway -- measured at 33.7 GiB against masked
+    # SDPA's 24.6 GiB on the shapes this model runs, i.e. strictly worse than what
+    # it replaces. There is no useful eager path, so if compilation is unavailable
+    # we fall back to SDPA instead.
+    #
+    # dynamic is left at its default (automatic) on purpose, as TorchSpec does.
+    # Batches are padded to their own longest sequence, so KV_LEN changes almost
+    # every step; dynamic=False recompiles per shape, blows the dynamo cache
+    # limit, and then permanently degrades to the eager path this is meant to
+    # avoid. Automatic mode specialises once, then recompiles dynamic and reuses.
+    _flex_attention_compiled = torch.compile(_flex_attention)
+    _HAS_FLEX = True
+except ImportError:  # torch too old
+    _create_block_mask = None
+    _flex_attention_compiled = None
+    _HAS_FLEX = False
 
 
 class DSparkMLAAttention(nn.Module):
@@ -112,7 +143,20 @@ class DSparkMLAAttention(nn.Module):
             rope_type=rope_cfg.get("rope_type", "yarn"),
         )
 
-        self._scale = math.sqrt(self.qk_head_dim)
+        # YaRN widens the softmax scale by mscale^2, and both consumers of this
+        # checkpoint do it: TorchSpec's _compute_softmax_scale and ATOM's
+        # kimi_k3_dspark (`self.scaling * mscale * mscale`). Omitting it trains
+        # the draft 1.81x colder than it is served at factor=32 /
+        # mscale_all_dim=1.0, which no serving flag can undo without also
+        # disabling the term everywhere else.
+        softmax_scale = 1.0 / math.sqrt(self.qk_head_dim)
+        if rope_cfg.get("rope_type", "yarn") == "yarn":
+            ms = _yarn_get_mscale(
+                float(rope_cfg.get("factor", 1.0)),
+                float(rope_cfg.get("mscale_all_dim", 1.0)),
+            )
+            softmax_scale *= ms * ms
+        self._softmax_scale = softmax_scale
 
     def _project_kv(
         self, hidden: Tensor,
@@ -158,7 +202,15 @@ class DSparkMLAAttention(nn.Module):
         sin = self.rotary_emb._sin_cached.squeeze(0).squeeze(0).to(x.dtype)
         cos_pos = cos[position_ids].unsqueeze(1)
         sin_pos = sin[position_ids].unsqueeze(1)
-        return (x * cos_pos) + (_rotate_half(x) * sin_pos)
+        # DeepSeek/Kimi MLA rotates consecutive pairs (0,1), (2,3), ..., not
+        # NeoX's first-half/second-half. The cache is built neox-layout
+        # ([θ0..θ31, θ0..θ31]), so take one half and duplicate each entry to get
+        # the interleaved layout [θ0,θ0, θ1,θ1, ...]. Serving this checkpoint
+        # under the other convention costs ~20 points of acceptance rate.
+        half = cos_pos.shape[-1] // 2
+        cos_pos = cos_pos[..., :half].repeat_interleave(2, dim=-1)
+        sin_pos = sin_pos[..., :half].repeat_interleave(2, dim=-1)
+        return (x * cos_pos) + (_rotate_half_interleaved(x) * sin_pos)
 
     def forward(
         self,
@@ -167,6 +219,8 @@ class DSparkMLAAttention(nn.Module):
         draft_position_ids: Tensor,
         context_position_ids: Tensor,
         attn_mask: Optional[Tensor] = None,
+        block_mask=None,
+        keep_rows: Optional[Tensor] = None,
     ) -> Tensor:
         """Dual-source KV attention (aligned with TorchSpec DFlashAttention).
 
@@ -180,6 +234,11 @@ class DSparkMLAAttention(nn.Module):
             draft_position_ids: [B, draft_len] — position IDs for draft
             context_position_ids: [B, ctx_len] — position IDs for context
             attn_mask: [B, 1, draft_len, ctx_len+draft_len] — bool True=attend
+            block_mask: the same visibility as a flex_attention BlockMask. When
+                given it takes precedence and attn_mask is unused.
+            keep_rows: [B, 1, draft_len, 1] bool, paired with block_mask. Rows of
+                dropped blocks are zeroed after attention, since block_keep_mask
+                is left out of the BlockMask to avoid empty rows.
         """
         B, draft_len, _ = draft_hidden.shape
         ctx_len = context_hidden.shape[1]
@@ -222,16 +281,38 @@ class DSparkMLAAttention(nn.Module):
         q_full = torch.cat([q_nope, q_rope_emb], dim=-1)
         k_full = torch.cat([k_nope, k_rope_emb], dim=-1)
 
-        # Use SDPA with boolean mask for memory-efficient attention.
-        # Falls back to chunked per-block computation to avoid OOM from the
-        # full [B, H, draft_len, kv_len] attention matrix (~10GB).
+        # The block mask is the fast path: flex_attention evaluates visibility
+        # per block and never forms the [B, H, draft_len, kv_len] score matrix.
+        # Measured at anchor_num=512 / ctx=8165 on gfx950: 3.7 ms and 0.72 GiB
+        # against masked SDPA's 2379 ms and 24.58 GiB, agreeing to rel L2 2e-03.
+        # The dense path below stays for the no-flex case and is what the
+        # equivalence test checks against.
+        if block_mask is not None:
+            attn_output = _flex_attention_compiled(
+                q_full, k_full, v.contiguous(),
+                block_mask=block_mask,
+                scale=self._softmax_scale,
+            )
+            if keep_rows is not None:
+                # Reproduces the 0.0 that masked SDPA returns for a block whose
+                # block_keep_mask is False. o_proj has no bias, so zeroing here
+                # or after the projection is the same thing.
+                attn_output = attn_output * keep_rows
+            attn_output = attn_output.transpose(1, 2).reshape(
+                B, draft_len, self.num_heads * self.v_head_dim,
+            )
+            return self.o_proj(attn_output)
+
+        # Dense fallback: SDPA with a boolean mask, which forces the math
+        # backend and materialises the full score matrix. Falls back again to
+        # chunked per-block computation when that does not fit.
         try:
             attn_output = F.scaled_dot_product_attention(
                 q_full, k_full, v,
                 attn_mask=attn_mask,
                 dropout_p=0.0,
                 is_causal=False,
-                scale=1.0 / self._scale,
+                scale=self._softmax_scale,
             )
         except RuntimeError:
             chunk_size = 64
@@ -240,7 +321,7 @@ class DSparkMLAAttention(nn.Module):
                 end = min(start + chunk_size, draft_len)
                 q_slice = q_full[:, :, start:end, :]
                 mask_slice = attn_mask[:, :, start:end, :] if attn_mask is not None else None
-                w = torch.matmul(q_slice, k_full.transpose(2, 3)) / self._scale
+                w = torch.matmul(q_slice, k_full.transpose(2, 3)) * self._softmax_scale
                 if mask_slice is not None:
                     w = w.masked_fill(~mask_slice, torch.finfo(w.dtype).min)
                 w = F.softmax(w, dim=-1, dtype=torch.float32).to(q_full.dtype)
@@ -306,6 +387,8 @@ class DSparkDecoderLayer(nn.Module):
         draft_position_ids: Tensor,
         context_position_ids: Tensor,
         attn_mask: Optional[Tensor] = None,
+        block_mask=None,
+        keep_rows: Optional[Tensor] = None,
     ) -> Tensor:
         residual = draft_hidden
         draft_hidden = self.input_layernorm(draft_hidden)
@@ -315,6 +398,8 @@ class DSparkDecoderLayer(nn.Module):
             draft_position_ids=draft_position_ids,
             context_position_ids=context_position_ids,
             attn_mask=attn_mask,
+            block_mask=block_mask,
+            keep_rows=keep_rows,
         )
         draft_hidden = residual + draft_hidden
 
@@ -543,6 +628,64 @@ class DSparkModel(nn.Module):
 
         return torch.stack(masks).unsqueeze(1)
 
+    def _build_dual_source_block_mask(
+        self,
+        anchor_positions: Tensor,
+        block_keep_mask: Tensor,
+        ctx_len: int,
+    ):
+        """The same visibility as _build_dual_source_mask, as a BlockMask.
+
+        Returns (block_mask, keep_rows) or (None, None) when flex is unavailable.
+
+        NOTE: block_keep_mask is deliberately NOT folded into mask_mod, even though
+        _build_dual_source_mask folds it in. An invalid block has anchor 0, so it
+        sees no context, and masking its own block too would leave the row
+        completely empty. Measured on this build, SDPA answers a fully masked row
+        with 0.0 rather than NaN, and the rest of the model is written around
+        that; a fused softmax over an empty row is not obliged to agree, and a
+        NaN here would survive multiplication by the loss mask and poison the
+        gradients.
+
+        So the kernel sees a mask under which every row has at least its own
+        block, and the invalid rows are zeroed afterwards instead. That is
+        exactly equivalent: block_keep_mask only ever zeroes whole q-blocks, and
+        no valid block attends to an invalid one (draft visibility is
+        same-block only), so invalid rows cannot influence valid ones either way.
+        """
+        if not _HAS_FLEX:
+            return None, None
+
+        block_size = self.block_size
+        # Captured by the closure and lifted into the compiled kernel's inputs.
+        anchors = anchor_positions
+
+        def mask_mod(b, h, q_idx, kv_idx):
+            q_block = q_idx // block_size
+            anchor_pos = anchors[b, q_block]
+            context_visible = (kv_idx < ctx_len) & (kv_idx < anchor_pos)
+            kv_block = (kv_idx - ctx_len) // block_size
+            draft_visible = (kv_idx >= ctx_len) & (q_block == kv_block)
+            return context_visible | draft_visible
+
+        B, num_anchors = anchor_positions.shape
+        draft_len = num_anchors * block_size
+
+        block_mask = _create_block_mask(
+            mask_mod,
+            B=B,
+            H=None,
+            Q_LEN=draft_len,
+            KV_LEN=ctx_len + draft_len,
+            device=anchor_positions.device,
+        )
+        # [B, 1, draft_len, 1], broadcasting over heads and the value dim.
+        keep_rows = (
+            block_keep_mask.repeat_interleave(block_size, dim=1)
+            .view(B, 1, draft_len, 1)
+        )
+        return block_mask, keep_rows
+
     def forward(
         self,
         input_ids: Tensor,
@@ -617,10 +760,18 @@ class DSparkModel(nn.Module):
         draft_position_ids = (anchors.unsqueeze(-1) + offsets).reshape(B, -1)
         context_position_ids = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
 
-        # 5. Dual-source KV attention mask (boolean: True = attend)
-        attn_mask = self._build_dual_source_mask(
+        # 5. Dual-source KV attention mask. Built once and shared by all five
+        # layers. The BlockMask is preferred; attn_mask is only materialised
+        # when flex_attention cannot serve this batch, because at anchor_num=512
+        # and an 8192 context it is a ~10 GiB fp32 tensor.
+        block_mask, keep_rows = self._build_dual_source_block_mask(
             anchors, block_keep_mask, T,
         )
+        attn_mask = None
+        if block_mask is None:
+            attn_mask = self._build_dual_source_mask(
+                anchors, block_keep_mask, T,
+            )
 
         # 6. Transformer backbone with dual-source KV
         for layer in self.layers:
@@ -630,6 +781,8 @@ class DSparkModel(nn.Module):
                 draft_position_ids=draft_position_ids,
                 context_position_ids=context_position_ids,
                 attn_mask=attn_mask,
+                block_mask=block_mask,
+                keep_rows=keep_rows,
             )
         draft_hidden = self.norm(draft_hidden)
         hidden_4d = draft_hidden.reshape(B, num_anchors, self.block_size, H)

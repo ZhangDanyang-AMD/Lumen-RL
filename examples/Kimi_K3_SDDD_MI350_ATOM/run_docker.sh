@@ -7,7 +7,7 @@
 #   - Teacher weights are ~1.5 TB, so they belong on a real filesystem, not on
 #     tmpfs. DATA_ROOT points at one; MODEL_PATH and CKPT_DIR default under it.
 #   - Hidden-state cache stays on /dev/shm, and cache_batches is sized so one
-#     round fits (~11.3 GB per batch at B=64).
+#     round fits (~103 GB per batch at B=128, T=8192).
 #   - Checkpoints go to DATA_ROOT, not /dev/shm, which is wiped when the job
 #     ends on most schedulers.
 #   - The dataset is read by 96 preprocessing workers, so it is staged onto
@@ -43,8 +43,11 @@ DATA_ROOT="${DATA_ROOT:-/data}"
 DOCKER_IMAGE="${DOCKER_IMAGE:-kimi_k3_dspark_atom:latest}"
 LUMENRL_DIR="${LUMENRL_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 MODEL_PATH="${MODEL_PATH:-${DATA_ROOT}/models/Kimi-K3}"
-DATASET_SRC="${DATASET_SRC:-${DATA_ROOT}/datasets/kimi-mtp-dataset-full}"
-DATASET_DST="${DATASET_DST:-/dev/shm/kimi-mtp-dataset-full}"
+# The cached on-policy set (slippedJim/ATOM_regen_seeklight_kimi_mtp), fetched by
+# selfcheck/fetch_dataset.py. Point these at kimi-mtp-dataset-full to go back to
+# the public source set — the configs name the file, so both have to agree.
+DATASET_SRC="${DATASET_SRC:-${DATA_ROOT}/datasets/atom-regen-kimi-mtp}"
+DATASET_DST="${DATASET_DST:-/dev/shm/atom-regen-kimi-mtp}"
 
 # Extra bind mounts, e.g. a shared home or a second data volume:
 #   EXTRA_MOUNTS="-v /nfs/home:/nfs/home -v /scratch:/scratch"
@@ -60,9 +63,12 @@ else
     CONTAINER_NAME="${CONTAINER_NAME:-kimi_k3_dspark_atom}"
     CKPT_DIR="${CKPT_DIR:-${DATA_ROOT}/checkpoints/kimi_k3_dspark_atom}"
     CACHE_DIR="${CACHE_DIR:-/dev/shm/teacher_cache_atom}"
-    # At bs=64 a cached batch is 11.3 GB, so 50 rounds needs ~565 GB of tmpfs.
-    # Override only after redoing that arithmetic.
-    CACHE_BATCHES="${CACHE_BATCHES:-50}"
+    # /!\ This is passed as an override and therefore *wins over train.yaml*, so
+    # it has to track it. At bs=128/T=8192 a cached batch is 103 GB, and tmpfs
+    # has ~1.2 TB usable once the mooncake segment is accounted for, so the
+    # ceiling is 11. The old value here was 50, from the bs=64/T=2048 run where a
+    # batch was 11.3 GB. Override only after redoing that arithmetic.
+    CACHE_BATCHES="${CACHE_BATCHES:-10}"
     RUN_CMD="bash examples/Kimi_K3_SDDD_MI350_ATOM/run_kimi_k3.sh"
 fi
 
@@ -121,8 +127,12 @@ fi
 # Exit 0 (training reached num_training_steps) does not trigger a restart, and a
 # manual `docker stop` suspends the policy until the container starts again.
 DETACH="${DETACH:-0}"
+# Unconditionally, not just on the detached path: --rm only removes a container
+# that ran, so an earlier attempt that died before starting (or was stopped)
+# leaves the name taken and the next launch fails with a bare docker name
+# conflict, after the dataset staging has already run.
+docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
 if [ "${DETACH}" = "1" ]; then
-    docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
     # Sized to cover genuinely rare crashes (~1 per 830 steps). A low cap also
     # stops a systematic failure from spinning hundreds of times unnoticed.
     RUN_MODE_ARGS="-d --restart=on-failure:${MAX_RESTARTS:-40}"
