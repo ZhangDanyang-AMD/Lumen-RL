@@ -141,10 +141,14 @@ class ATOMRolloutReplica(RolloutReplica):
         ATOMRolloutReplica._server_ready.set()
 
     async def wake_up(self):
-        await asyncio.gather(*[s.wake_up.remote() for s in self.servers])
+        # ATOM manages its own weight lifecycle; skip verl's wake/sleep
+        # to avoid weight corruption in Ray actor environment.
+        pass
 
     async def sleep(self):
-        await asyncio.gather(*[s.sleep.remote() for s in self.servers])
+        # Skip sleep — ATOM server runs on a dedicated GPU and doesn't
+        # need to release memory for the training engine.
+        pass
 
     async def abort_all_requests(self):
         await asyncio.gather(*[s.wait_for_requests_to_drain.remote() for s in self.servers])
