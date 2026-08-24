@@ -203,13 +203,15 @@ class ATOMRayServer:
             })
         return results
 
-    async def update_weights_from_ipc(self, use_shm: bool = False) -> bool:
+    async def update_weights_from_ipc(
+        self, use_shm: bool = False, version: int | None = None
+    ) -> bool:
         if self.engine is None:
             raise RuntimeError("ATOMRayServer.launch() must be called before weight sync.")
         if use_shm:
-            self._update_weights_from_shm_sync()
+            self._update_weights_from_shm_sync(version)
         else:
-            self._update_weights_from_ipc_sync()
+            self._update_weights_from_ipc_sync(version)
         return True
 
     def _get_zmq_handle(self) -> str:
@@ -235,10 +237,12 @@ class ATOMRayServer:
             used_bytes = max(used_bytes, offset + nbytes)
         return bucket_meta, used_bytes
 
-    def _update_weights_from_ipc_sync(self) -> None:
+    def _update_weights_from_ipc_sync(self, version: int | None = None) -> None:
         from torch.multiprocessing.reductions import reduce_tensor
 
         from atom.rollout.weight_sync import rebuild_ipc_handle
+
+        from lumenrl.engine.inference.bucketed_weight_transfer import check_bucket_version
 
         ctx = zmq.Context()
         socket = ctx.socket(zmq.REP)
@@ -265,6 +269,7 @@ class ATOMRayServer:
 
             while True:
                 metadata = socket.recv_pyobj()
+                check_bucket_version(metadata, version)
                 raw_bucket_meta = metadata["bucket_meta"]
                 is_last = bool(metadata["is_last"])
                 bucket_meta, used_bytes = self._bucket_meta(raw_bucket_meta)
@@ -327,7 +332,9 @@ class ATOMRayServer:
             torch.cuda.ipc_collect()
             torch.cuda.empty_cache()
 
-    def _update_weights_from_shm_sync(self) -> None:
+    def _update_weights_from_shm_sync(self, version: int | None = None) -> None:
+        from lumenrl.engine.inference.bucketed_weight_transfer import check_bucket_version
+
         ctx = zmq.Context()
         socket = ctx.socket(zmq.REP)
         socket.setsockopt(zmq.LINGER, 0)
@@ -339,6 +346,7 @@ class ATOMRayServer:
             shm = shared_memory.SharedMemory(name=comm_metadata["name"])
             while True:
                 metadata = socket.recv_pyobj()
+                check_bucket_version(metadata, version)
                 bucket_meta, _used_bytes = self._bucket_meta(metadata["bucket_meta"])
                 self.engine.core_mgr.broadcast_utility_command_sync(
                     "update_weights_shm",

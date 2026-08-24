@@ -726,6 +726,29 @@ class RLTrainer:
             "top_k": -1,
         }
 
+    def _ipc_endpoints_match_actors(self, mgr) -> bool:
+        """Can every actor find an IPC peer sitting on its own GPU?
+
+        The sender addresses ``replica rank//TP, tp-rank rank%TP``
+        (``actor_worker.update_weights_ipc_send``), so what matters is whether
+        the rollout side publishes a socket per TP worker:
+
+        * vLLM's ``vLLMColocateWorkerExtension._get_zmq_handle`` keys on
+          ``self.local_rank``, so a TP=N replica exposes N endpoints and any
+          ``replicas * TP == actors`` layout pairs up one-to-one.
+        * ATOM's ``ATOMRayServer._get_zmq_handle`` is hardcoded to ``rank-0``,
+          i.e. one endpoint per replica whatever TP is, so only TP=1 works
+          there. That single-backend limitation used to gate both engines,
+          which silently sent every TP>1 vLLM run down the safetensors path --
+          54.8 GB through /dev/shm per step on the 4-layer DSv4 slice.
+        """
+        workers = int(self._actor_wg.num_workers)
+        replicas = int(getattr(mgr, "num_replicas", 0) or 0)
+        if replicas == workers:
+            return True
+        tp = int(getattr(mgr, "tensor_parallel_size", 1) or 1)
+        return bool(getattr(self, "_ray_use_vllm", False)) and replicas * tp == workers
+
     def _sync_weights_ipc(self) -> None:
         """verl-aligned weight sync: wake weights -> ZMQ IPC -> wake KV cache.
 
@@ -733,8 +756,9 @@ class RLTrainer:
         concurrently: each actor all-gathers its full BF16 weights and streams
         them over CUDA IPC to its own replica's socket.
 
-        When ATOM TP > 1 (fewer replicas than actors), falls back to a
-        safetensors-on-disk path: actors export HF weights, ATOM reloads.
+        When the rollout engine cannot expose one IPC endpoint per actor, falls
+        back to a safetensors-on-disk path: actors export HF weights, the engine
+        reloads. See ``_ipc_endpoints_match_actors`` for when that applies.
         """
         import ray
 
@@ -756,7 +780,7 @@ class RLTrainer:
             )
 
         separated = getattr(self, "_rollout_wg", None) is not None
-        if separated or mgr.num_replicas < self._actor_wg.num_workers:
+        if separated or not self._ipc_endpoints_match_actors(mgr):
             if LUMENRL_DEBUG:
                 logger.info("[DBG] _sync_weights_ipc: separated=%s replicas=%d workers=%d, using safetensors",
                             separated, mgr.num_replicas, self._actor_wg.num_workers)
@@ -770,13 +794,20 @@ class RLTrainer:
 
         rollout_engine = self._ray_vllm_engine
 
+        # Same numbering as the RDMA path, so a mismatch between the two ends is
+        # an error here instead of a slow train/rollout divergence later.
+        version = int(self.global_step) + 1
+
         # 1) wake weight memory before loading (only when sleep is in use).
         if sleeping:
             rollout_engine.wake(tags=["weights"])
         # 2) start receivers + senders concurrently, then join both.
-        recv = [s.update_weights_from_ipc.remote(use_shm) for s in mgr.servers]
+        recv = [
+            s.update_weights_from_ipc.remote(use_shm, version) for s in mgr.servers
+        ]
         send = self._actor_wg.execute_all_async(
-            "update_weights_ipc_send", bucket_size_mb=bmb, use_shm=use_shm
+            "update_weights_ipc_send", bucket_size_mb=bmb, use_shm=use_shm,
+            version=version,
         )
         ray.get(send)
         ray.get(recv)

@@ -1167,6 +1167,7 @@ class LumenActorWorker(BaseWorker):
 
     def update_weights_ipc_send(
         self, bucket_size_mb: int = 512, use_shm: bool = False,
+        version: int | None = None,
     ) -> bool:
         """Stream full (all-gathered) BF16 weights to the colocated vLLM replica.
 
@@ -1218,7 +1219,8 @@ class LumenActorWorker(BaseWorker):
                 yield name, full
 
         sender = BucketedWeightSender(
-            zmq_handle=handle, bucket_size_mb=int(bucket_size_mb), use_shm=bool(use_shm)
+            zmq_handle=handle, bucket_size_mb=int(bucket_size_mb), use_shm=bool(use_shm),
+            version=version,
         )
         asyncio.run(sender.async_send_weights(_gen()))
         return True

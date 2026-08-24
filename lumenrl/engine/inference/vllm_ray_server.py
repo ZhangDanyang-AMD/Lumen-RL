@@ -210,10 +210,12 @@ class VLLMRayServer:
     ) -> Any:
         return await self.engine.collective_rpc(method, args=args, kwargs=kwargs or {})
 
-    async def update_weights_from_ipc(self, use_shm: bool = False) -> bool:
+    async def update_weights_from_ipc(
+        self, use_shm: bool = False, version: int | None = None
+    ) -> bool:
         """Start the in-worker IPC receiver; blocks until the sender completes."""
         await self.engine.collective_rpc(
-            "update_weights_from_ipc", kwargs={"use_shm": use_shm}
+            "update_weights_from_ipc", kwargs={"use_shm": use_shm, "version": version}
         )
         await self.engine.reset_prefix_cache()
         return True

@@ -181,7 +181,9 @@ class vLLMColocateWorkerExtension:
             dist.destroy_process_group(group)
         return True
 
-    def update_weights_from_ipc(self, use_shm: bool = False) -> None:
+    def update_weights_from_ipc(
+        self, use_shm: bool = False, version: int | None = None
+    ) -> None:
         """Receive bucketed weights over ZMQ IPC and load them into the model."""
         from vllm.platforms import current_platform
 
@@ -224,6 +226,7 @@ class vLLMColocateWorkerExtension:
                 zmq_handle=self._get_zmq_handle(),
                 device=self.device,
                 use_shm=use_shm,
+                expected_version=version,
             )
             _stats = {"buckets": 0, "weights": 0}
             online_loaded: set[str] = set()
@@ -264,6 +267,7 @@ class vLLMColocateWorkerExtension:
             zmq_handle=self._get_zmq_handle(),
             device=self.device,
             use_shm=use_shm,
+            expected_version=version,
         )
         # transformers 5.x sends MoE experts as fused 3D tensors, whose names
         # match none of vLLM's per-expert mappings; the router loads those and
