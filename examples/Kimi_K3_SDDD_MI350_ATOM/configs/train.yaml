@@ -14,7 +14,7 @@ cluster:
   num_nodes: 1
 
 policy:
-  model_name: /mnt/m2m_nobackup/danyzhan/models/Kimi-K3
+  model_name: /mnt/m2m_nobackup/jimguo12/models/Kimi-K3
   training_backend: fsdp2
   generation_backend: hf
   # Aligned with Jim's TorchSpec-derived cached-on-policy recipe. 8192 retains
@@ -27,7 +27,13 @@ policy:
   learning_rate: 5.0e-5
   weight_decay: 0.0
   max_grad_norm: 1.0
-  min_lr: 0.0
+  # /!\ Not 0. gen-3 ran a single epoch with min_lr 0, so cosine took the lr to
+  # 7.6e-10 and eval AL flattened at 1.613-1.617 from step 3300 on -- a schedule
+  # artefact, not data exhaustion, and it is why a second epoch cannot simply be
+  # appended. This run decays only as far as a three-epoch cosine would have by
+  # the end of its first epoch: decay_ratio = (1 - 0.04*3) / (3 - 0.04*3)
+  # = 0.3056, coeff = 0.5*(1 + cos(0.3056*pi)) = 0.7868, so 0.7868 * 5e-5.
+  min_lr: 3.93e-5
   warmup_ratio: 0.04
   lr_decay_style: cosine
 
@@ -77,7 +83,7 @@ algorithm:
     l1_loss_alpha: 0.9
     confidence_loss_alpha: 1.0
   teacher:
-    model_name: /mnt/m2m_nobackup/danyzhan/models/Kimi-K3
+    model_name: /mnt/m2m_nobackup/jimguo12/models/Kimi-K3
     inference_backend: atom
     tensor_parallel_size: 8
     gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
@@ -107,7 +113,15 @@ algorithm:
       index_cache_dtype: fp8
       enforce_eager: true
   draft:
-    from_scratch: true
+    # Continuing gen-3 (step 3358, 1 epoch on the regenerated kimi-mtp set,
+    # eval AL 1.617), not starting over. The directory holds the ATOM-format
+    # export; the trainer maps context_proj/context_norm/final_norm back to
+    # fc/hidden_norm/norm and refuses to start if any draft parameter would be
+    # left at its random initialisation. The 33 GB training_checkpoint/ in the
+    # same repo carries optimizer state too, but eight ranks reading it is
+    # 267 GB for weights that the 7.1 GB export already holds losslessly.
+    from_scratch: false
+    resume_from: /shared_nfs/jimguo12/lumenrl/drafts/off_policy_k3_draft
     # ---- Aligned with Inferact/Kimi-K3-DSpark/config.json ----
     num_layers: 5
     num_heads: 64
@@ -145,20 +159,31 @@ algorithm:
     block_size: 7
 
 mooncake:
-  protocol: rdma
-  # Set MOONCAKE_DEVICE_NAME to the cluster's RoCE HCAs, for example
-  # "mlx5_0,mlx5_1". The launcher forwards it into this field.
+  # /!\ TCP, not RDMA. Ionic allows one RDMA client per HCA per process: the
+  # second registration on a device fails with EINVAL (reproduced with
+  # selfcheck/time_mooncake_pool.py --devices ionic_0 --stores 3). With seven
+  # HCAs a teacher's producer pool therefore tops out at 7 x 2 GiB = 14 GiB,
+  # while one batch of 128 sequences publishes about 24 GiB at this dataset's
+  # mean length, so the producer can never place a whole batch and the request
+  # never completes -- observed as extract_hidden timing out at 600 s with zero
+  # steps done on 2026-08-24. TCP has no memory-region limit and measured
+  # 2.0 GiB/s put plus 4.44 GiB/s cross-node get with eight fetchers, roughly
+  # 5 s per batch against a ~44 s draft step.
+  protocol: tcp
+  # Empty under TCP. Only NCCL (draft gradients, intra-node) uses the HCAs, and
+  # the hosts expose ionic_0..6 -- there is no ionic_7.
   device_name: ""
   enable_gpu_direct: false
   enable_hard_pin: true
-  # Ionic rejects a single MR above 2 GiB. The ATOM producer override lazily
-  # creates 128 independent 2 GiB stores (256 GiB aggregate per teacher) and
-  # round-robins sequences across them. Prefetch keeps at most two payloads per
-  # store, each no larger than about 704 MiB.
-  global_segment_size: 2GB
-  # Largest per-sequence payload is about 704 MiB. Ionic rejects a single 16 GiB
-  # MR with EINVAL; 1 GiB was validated through Mooncake's real RDMA setup.
-  local_buffer_size: 1GB
+  # One teacher segment holds every batch that teacher has in flight: about
+  # 24 GiB per batch, 88 GiB in the 8192-token worst case, two batches per
+  # replica at stream_prefetch_batches=8. Host RAM is 2.8 TB and the segment is
+  # only touched lazily. The launcher overrides this per role; draft ranks get a
+  # small segment because they only read.
+  global_segment_size: 128GB
+  # Staging buffer for the largest per-sequence payload, about 672 MiB at 8192
+  # tokens x (5 aux + 1 final) x 7168 x bf16.
+  local_buffer_size: 8GB
   # The default was 90 seconds. Widening it to 300 is pure fault tolerance and
   # does not affect the normal path.
   get_retry_max_wait_seconds: 300.0
@@ -208,48 +233,49 @@ dataset:
 reward:
   type: function
   function: math_reward
-  dataset: /mnt/m2m_nobackup/danyzhan/datasets/ATOM_regen_seeklight_kimi_mtp/data/train.jsonl
+  # ATOM-regenerated nine-category pool: 364,767 rows, single-turn, image turns
+  # filtered at generation time. 345,476 survive the 8192 window (5.3% dropped
+  # for exceeding it, which is the intended filter -- max_prompt_tokens 0 with
+  # drop_overlong makes an overlong row a drop, not a truncation).
+  dataset: /shared_nfs/jimguo12/lumenrl/datasets/nine_category/train.jsonl
 
 eval:
-  # Initial disaggregated bring-up does not yet stream eval manifests.
-  enabled: false
-  # /!\ To be changed (fold it into the next restart that happens for another
-  # reason; do not restart just for this): as they stand, these two values leave
-  # eval noise larger than the signal. Measured AL at steps 1700/1800/1900 was
-  # 1.149 / 1.048 / 1.084, a spread of 0.10, while the expected true gain over
-  # 200 steps at that stage is on the order of 0.02 — noise five times the
-  # signal, from which no trend can be read. Two amplifiers:
-  #   1. 32 samples is simply a noisy sample size;
-  #   2. AL is the sum of the cumulative products of seven positions' acceptance
-  #      rates, roughly p0 x 1.76, which magnifies p0's relative movement about
-  #      2x (p0 moving 4.5% moves AL 8.8%).
-  # The plan is interval: 50 (once per round; a single eval costs only about 77
-  # seconds, so this doubles the points and is the best noise reduction per unit
-  # of compute). num_samples should go to 64/96 as well, but each sample costs
-  # about 1.2 GB of CPU memory (all 8 ranks keep a full copy), so the headroom
-  # has to be measured first.
-  #
-  # The long train (6135 steps) uses 100, giving 61 points, enough to watch a
-  # trend. For a short validation run (1000 steps), set it back to 25 to line up
-  # point for point with train1000_v4/v5.
-  interval: 100
-  # 256 samples would take about 1.2 TB of RAM (all 8 ranks keep a full CPU
-  # copy), so running the full set is a guaranteed OOM.
-  num_samples: 32
+  enabled: true
+  # 10 matches gen-3, whose curve is the one this run is measured against. In the
+  # disaggregated topology each rank holds only num_samples/world_size rows, so
+  # an eval point costs about a tenth of the 77 s it did when all eight ranks
+  # evaluated the whole slice.
+  interval: 10
+  # 128, same as gen-3. In this topology the slice is sharded across the eight
+  # draft ranks instead of replicated, so the old "each sample costs 1.2 GB on
+  # every rank" ceiling no longer binds; 128 is kept for comparability, not
+  # because of memory. Must stay a multiple of world_size * micro_batch_size.
+  num_samples: 128
   micro_batch_size: 2
+  # /!\ The slice above is the tail of *this* run's training set, so its AL is
+  # not comparable with gen-3's 1.617 -- that was measured on the tail of the
+  # regenerated kimi-mtp set. Carry those exact 128 rows along as a second,
+  # fixed yardstick. Built by selfcheck/build_eval_slice.py with gen-3's
+  # dataset, seed and preprocessing parameters; the file records a fingerprint
+  # of the rows so a silent drift is detectable.
+  #   eval/*     -> nine-category tail, the new distribution
+  #   eval_old/* -> gen-3's slice, directly comparable to 1.617
+  extra_slices:
+    - path: /shared_nfs/jimguo12/lumenrl/eval/gen3_old_128.pt
+      prefix: eval_old
 
 checkpointing:
   # The multinode launcher overrides this onto shared persistent storage.
   checkpoint_dir: /dev/shm/checkpoints/kimi_k3_dspark_atom
-  # Streaming mode has no cache round boundary; checkpoint every 50 optimizer
-  # steps to avoid putting 31 GiB checkpoints on the critical path too often.
-  save_steps: 50
-  # A checkpoint is 31 GB and the volume has 22 TB free, so keeping 12 costs only
-  # ~370 GB. Keeping 3 (150 steps) meant that when a suspicious stretch of the
-  # eval curve needed recomputing from step 2400, that checkpoint had long since
-  # been pruned by the round-end saves, leaving only the last 150 steps to fall
-  # back to. 12 is ~600 steps ~= 10 hours of rollback room.
-  save_total_limit: 12
+  # Each save is a 33 GB write to shared NFS on the critical path, and the
+  # measured step time here is about 12 s, so every 50 steps would spend a large
+  # fraction of the run writing. 100 steps is ~20 min of granularity.
+  save_steps: 100
+  # Keep every checkpoint of the run: 2698 steps / 100 = 27 saves x 33 GB is
+  # under 900 GB against 29 TB free. The eval curve decides which one to export,
+  # and pruning has already cost this project a recomputation once -- a
+  # suspicious stretch of curve needed step 2400 and it had been deleted.
+  save_total_limit: 30
   # The default of true will quietly pick up an old checkpoint and continue in
   # what was meant to be a new run, without complaining. Always set it off
   # explicitly for a fresh run.
@@ -259,9 +285,10 @@ logger:
   wandb_enabled: false
   log_interval: 1
 
-# Jim's partial 107,760-row release yields 106,366 survivors at this 8192-token
-# recipe. 1658 steps is two passes at global batch size 128. Recompute with
-# selfcheck/preprocess_dataset.py when the staged dataset is replaced by a newer
-# release.
-num_training_steps: 1658
+# One epoch. selfcheck/preprocess_dataset.py measured 345,476 survivors of the
+# 364,767-row nine-category set at this 8192-token recipe; minus the 128 eval
+# rows that is floor((345476 - 128) / 128) = 2698 steps at global batch 128.
+# Recompute with that script whenever the staged dataset changes -- the number
+# also bounds the sampler away from the eval tail (_trainable_len).
+num_training_steps: 2698
 seed: 42

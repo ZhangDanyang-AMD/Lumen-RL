@@ -1,13 +1,14 @@
 # Kimi K3 five-node disaggregated smoke test.
 # Five optimizer steps exercise all four whole-batch teacher replicas, the
-# prefill-only actor API, Mooncake RDMA, and draft-rank key sharding.
+# prefill-only actor API, Mooncake TCP, draft-rank key sharding, the draft
+# weight import from the released export, and both eval suites.
 
 cluster:
   gpus_per_node: 8
   num_nodes: 1
 
 policy:
-  model_name: /mnt/m2m_nobackup/danyzhan/models/Kimi-K3
+  model_name: /mnt/m2m_nobackup/jimguo12/models/Kimi-K3
   training_backend: fsdp2
   generation_backend: hf
   # Keep the smoke shape identical to the TorchSpec-aligned training recipe.
@@ -15,7 +16,8 @@ policy:
   train_global_batch_size: 128
   train_micro_batch_size: 1
   learning_rate: 5.0e-5
-  min_lr: 0.0
+  # Same as train.yaml so the smoke exercises the real schedule.
+  min_lr: 3.93e-5
   lr_decay_style: cosine
   weight_decay: 0.0
   max_grad_norm: 1.0
@@ -51,7 +53,7 @@ algorithm:
     l1_loss_alpha: 0.9
     confidence_loss_alpha: 1.0
   teacher:
-    model_name: /mnt/m2m_nobackup/danyzhan/models/Kimi-K3
+    model_name: /mnt/m2m_nobackup/jimguo12/models/Kimi-K3
     inference_backend: atom
     tensor_parallel_size: 8
     gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
@@ -73,7 +75,10 @@ algorithm:
       index_cache_dtype: fp8
       enforce_eager: true
   draft:
-    from_scratch: true
+    # Same import path as train.yaml: the smoke run is where a broken tensor
+    # mapping should surface, not a 37-hour training run.
+    from_scratch: false
+    resume_from: /shared_nfs/jimguo12/lumenrl/drafts/off_policy_k3_draft
     num_layers: 5
     num_heads: 64
     num_kv_heads: 64
@@ -108,12 +113,13 @@ algorithm:
     block_size: 7
 
 mooncake:
-  protocol: rdma
+  # See train.yaml: RDMA is unusable here (one client per Ionic HCA per process).
+  protocol: tcp
   device_name: ""
   enable_gpu_direct: false
   enable_hard_pin: true
-  global_segment_size: 512GB
-  local_buffer_size: 1GB
+  global_segment_size: 128GB
+  local_buffer_size: 8GB
   get_retry_max_wait_seconds: 300.0
 
 quantization:
@@ -129,8 +135,9 @@ dataset:
   chat_template: kimi-k3
   last_turn_loss_only: "true"
   min_loss_tokens: 14
-  # Only rank 0 builds the shared cache; keep smoke setup modest.
-  num_preprocess_workers: 16
+  # Must equal train.yaml: the worker count is part of the token cache key, so a
+  # different value makes the smoke run build a cache the real run then ignores.
+  num_preprocess_workers: 96
   cache_dir: /dev/shm/lumenrl_cache
   # These fields must match train.yaml so smoke validates the same token cache.
   drop_overlong: true
@@ -143,15 +150,22 @@ dataset:
   thinking: true
 
 eval:
-  enabled: false
+  # Enabled on purpose: eval in this topology is new code (the teacher lives on
+  # another node, so the eval cache is filled through a Ray actor), and five
+  # steps is the cheapest place to find out whether it works.
+  enabled: true
   interval: 1
-  num_samples: 8
+  # Must be a multiple of world_size * micro_batch_size = 16.
+  num_samples: 16
   micro_batch_size: 2
+  extra_slices:
+    - path: /shared_nfs/jimguo12/lumenrl/eval/gen3_old_128.pt
+      prefix: eval_old
 
 reward:
   type: function
   function: math_reward
-  dataset: /mnt/m2m_nobackup/danyzhan/datasets/ATOM_regen_seeklight_kimi_mtp/data/train.jsonl
+  dataset: /shared_nfs/jimguo12/lumenrl/datasets/nine_category/train.jsonl
 
 checkpointing:
   checkpoint_dir: /dev/shm/checkpoints/kimi_k3_dspark_atom_smoke

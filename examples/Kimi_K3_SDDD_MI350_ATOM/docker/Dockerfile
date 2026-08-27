@@ -6,18 +6,66 @@
 # reliably and reaches hidden states through forward hooks, so generation and
 # extraction share one engine instead of restarting between sweeps.
 #
-# rocm/atom-dev:latest already ships torch 2.10/ROCm 7.2.4, aiter, mooncake,
-# transformers, datasets, safetensors and triton_kernels, so this image only
-# adds the LumenRL side. Notably it ships no vLLM — every vLLM import in
-# lumenrl sits behind a backend branch and must stay that way.
+# The base ships aiter, mooncake, transformers, datasets, safetensors and
+# triton_kernels, so this image only adds the LumenRL side. Notably it ships no
+# vLLM — every vLLM import in lumenrl sits behind a backend branch and must stay
+# that way.
+#
+# /!\ Pinned by digest, not `latest`. `latest` is a rolling tag and it has moved
+# twice already in ways that broke this recipe. The image built from `latest` on
+# 2026-08-24 landed on atom 0.1.6rc1.dev323 with torch 2.10.0+rocm7.2.4 — 48
+# commits newer than the validated ATOM on an *older* torch/ROCm — and on that
+# stack the teacher deadlocks: all eight TP ranks hang forever in a 2-element
+# NCCL BROADCAST on the second extract_hidden request, which surfaces as
+# "timed out waiting for response to cmd=extract_hidden after 600.0s" with zero
+# training steps completed. The digest below is the combination the K3
+# regeneration runbook validated over 60+ hours of continuous ATOM inference.
+#
+#   atom  0.1.6rc1.dev275+g83e71001e   torch 2.13.0+rocm7.14.0   HIP 7.14.60850
 #
 # Build from the repository root:
 #   docker build -f examples/Kimi_K3_SDDD_MI350_ATOM/docker/Dockerfile \
 #                -t kimi_k3_dspark_atom:latest .
 
-FROM rocm/atom-dev:latest
+FROM rocm/atom-dev@sha256:2f8bd4206ad15d014ae48115eae1ee9f1db83781848a8542de7177cfbd4ac914
 
 SHELL ["/bin/bash", "-c"]
+
+# Fail the build, not the run, if the base ever stops being that stack. A
+# mismatch here is not cosmetic: see the deadlock described above.
+RUN python3 - <<'PY'
+import subprocess, torch
+from importlib.metadata import version
+import atom
+
+expected = {
+    "atom": "0.1.6rc1.dev275+g83e71001e",
+    "torch": "2.13.0+rocm7.14.0",
+    "hip": "7.14.60850",
+    "commit": "83e71001e94602ee8e1d04581809bded49c3f08b",
+}
+# atom.__version__ raises AttributeError on this build; importlib.metadata is the
+# only way to read it.
+observed = {
+    "atom": version("atom"),
+    "torch": torch.__version__,
+    "hip": torch.version.hip,
+    "commit": subprocess.run(
+        ["git", "-C", "/app/ATOM", "rev-parse", "HEAD"],
+        capture_output=True, text=True,
+    ).stdout.strip(),
+}
+bad = {k: (v, observed[k]) for k, v in expected.items() if observed[k] != v}
+if bad:
+    raise SystemExit(
+        "base image is not the validated stack: "
+        + ", ".join(f"{k}: expected {e}, got {g}" for k, (e, g) in bad.items())
+    )
+# third_party/ATOM is deliberately kept off PYTHONPATH; if it leaks in it
+# shadows /app/ATOM and the run uses an ATOM nobody validated.
+assert atom.__file__.startswith("/app/ATOM/"), atom.__file__
+print("base stack OK:", observed)
+PY
 
 # ---- LumenRL's runtime dependencies -----------------------------------------
 # Installed with --no-deps on purpose. Letting pip resolve these freely pulls

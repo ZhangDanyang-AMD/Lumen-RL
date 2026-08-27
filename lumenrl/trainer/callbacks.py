@@ -135,8 +135,8 @@ class CheckpointCallback(Callback):
                 options = StateDictOptions(full_state_dict=True, cpu_offload=True)
                 state["model_state_dict"] = get_model_state_dict(model, options=options)
                 if opt is not None:
-                    state["optimizer_state_dict"] = get_optimizer_state_dict(
-                        model, opt, options=options,
+                    state["optimizer_state_dict"] = self._optimizer_state_dict(
+                        model, opt, options,
                     )
             else:
                 state["model_state_dict"] = {
@@ -167,6 +167,45 @@ class CheckpointCallback(Callback):
 
         if trainer._is_distributed:
             torch.distributed.barrier()
+
+    @staticmethod
+    def _optimizer_state_dict(model: Any, opt: Any, options: Any) -> dict[str, Any]:
+        """Optimizer state for the checkpoint, whatever the optimizer is.
+
+        ``get_optimizer_state_dict`` accepts only ``torch.optim.Optimizer``: hand
+        it a wrapper and it falls through to ``tuple(optimizers)`` and dies with
+        "'BF16Optimizer' object is not iterable" -- at the first save, which is
+        long after the run looked healthy.
+
+        BF16Optimizer's own ``state_dict()`` is the inner AdamW's, which is
+        exactly what ``_resume_from_checkpoint`` feeds back through its
+        ``load_state_dict``. That is already complete on every rank whenever the
+        model is replicated rather than sharded, which is this recipe's case: the
+        draft is about 31 GB against the trainer's 80 GB sharding threshold, so
+        it goes down the composable-replicate path. Under real sharding the same
+        call would produce a per-rank fragment and write a silently partial
+        checkpoint, so refuse rather than guess.
+        """
+        if isinstance(opt, torch.optim.Optimizer):
+            from torch.distributed.checkpoint.state_dict import (
+                get_optimizer_state_dict,
+            )
+
+            return get_optimizer_state_dict(model, opt, options=options)
+
+        try:
+            from torch.distributed.tensor import DTensor
+        except ImportError:
+            DTensor = ()
+        if DTensor and any(
+            isinstance(p, DTensor) for p in model.parameters()
+        ):
+            raise RuntimeError(
+                f"{type(opt).__name__} is not a torch.optim.Optimizer and the "
+                "model is sharded, so no complete optimizer state can be built. "
+                "Unwrap the optimizer or checkpoint through DCP."
+            )
+        return opt.state_dict()
 
     def _save_ray_controller_checkpoint(
         self,

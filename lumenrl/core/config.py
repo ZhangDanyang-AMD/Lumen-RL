@@ -760,6 +760,12 @@ class EvalConfig:
     interval: int = 1000
     num_samples: int = 256
     micro_batch_size: int = 8
+    # Fixed eval slices, each an entry of {path, prefix}, built offline by
+    # selfcheck/build_eval_slice.py. The slice implied by ``num_samples`` is the
+    # tail of whatever dataset this run trains on, so it moves with the training
+    # set: an AL measured on it is not comparable to a previous run's AL. Carry
+    # the previous run's slice here to keep one yardstick fixed across runs.
+    extra_slices: list = field(default_factory=list)
 
 
 @dataclass

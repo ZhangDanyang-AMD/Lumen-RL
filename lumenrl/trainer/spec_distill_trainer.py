@@ -396,6 +396,7 @@ class SpecDistillTrainer:
             teacher_cfg.inference_backend == "atom"
             and getattr(spec_cfg, "sequential_mode", None) == "streaming_disaggregated"
         )
+        self._disaggregated = disaggregated
         if disaggregated:
             self._setup_teacher_atom_disaggregated(teacher_cfg, teacher_name)
         elif teacher_cfg.inference_backend == "sglang":
@@ -559,14 +560,38 @@ class SpecDistillTrainer:
                     payload = payload["state_dict"]
                 sd = payload.get("model_state_dict", payload)
                 info = self._draft_model.load_state_dict(sd, strict=False)
-                if info.missing_keys or info.unexpected_keys:
+                unfilled = sorted(
+                    {name for name, _ in self._draft_model.named_parameters()} - set(sd)
+                )
+                if unfilled:
+                    # A warning is not enough here. Weights left at their random
+                    # initialisation produce a run that trains and logs normally
+                    # but is not the continuation anyone asked for -- the same
+                    # class of silent failure as P14 on the export side.
+                    raise RuntimeError(
+                        f"resume_from={ckpt_path} leaves {len(unfilled)} draft "
+                        f"parameters at their initial value: {unfilled[:8]}"
+                    )
+                if info.unexpected_keys:
                     logger.warning(
-                        "[rank %d] resume_from load_state_dict mismatch: missing=%d, unexpected=%d (first missing: %s)",
-                        self._rank, len(info.missing_keys), len(info.unexpected_keys),
-                        info.missing_keys[:3],
+                        "[rank %d] resume_from ignored %d unexpected keys (first: %s)",
+                        self._rank, len(info.unexpected_keys),
+                        info.unexpected_keys[:3],
                     )
                 else:
                     logger.info("[rank %d] resume_from: loaded %d tensors cleanly", self._rank, len(sd))
+            elif safetensor_files and draft_type == "dspark":
+                # The generic branch below is Eagle3's layout (midlayer -> layers.0,
+                # norm -> out_norm). Applied to a DSpark export every tensor
+                # becomes an unexpected key, strict=False keeps the random init,
+                # and nothing raises -- so a "continue from the released draft"
+                # run would quietly start from scratch.
+                from lumenrl.models.dspark_hf_import import load_dspark_from_hf
+                logger.info(
+                    "[rank %d] Loading DSpark draft from ATOM-format export: %s",
+                    self._rank, resume_from,
+                )
+                load_dspark_from_hf(self._draft_model, resume_from)
             elif safetensor_files:
                 from safetensors.torch import load_file as _load_safetensors
                 logger.info("[rank %d] Loading draft weights from HF safetensors: %s", self._rank, resume_from)
@@ -701,14 +726,19 @@ class SpecDistillTrainer:
         self._check_generate_mode_prerequisites()
 
         eval_cfg = self.config.eval
+        self._eval_extra_suites: list[tuple[str, list[dict[str, torch.Tensor]]]] = []
         if eval_cfg.enabled:
-            if disaggregated:
-                raise NotImplementedError(
-                    "streaming_disaggregated evaluation is not implemented yet; "
-                    "set eval.enabled=false for the initial 5-node bring-up"
-                )
             self._build_eval_cache(num_samples=eval_cfg.num_samples)
-            self._build_eval_teacher_cache()
+            self._eval_teacher_cache = self._build_eval_teacher_cache()
+            for spec in (getattr(eval_cfg, "extra_slices", None) or []):
+                path = spec["path"] if isinstance(spec, dict) else spec
+                prefix = spec.get("prefix", "eval_extra") if isinstance(spec, dict) \
+                    else "eval_extra"
+                self._eval_extra_suites.append(
+                    (prefix, self._build_eval_teacher_cache(
+                        self._load_eval_slice(path)
+                    ))
+                )
 
         if not self.callbacks:
             self.callbacks.append(
@@ -749,8 +779,17 @@ class SpecDistillTrainer:
                 "MI350 disaggregated mode requires pinned-host Mooncake RDMA; "
                 "set mooncake.enable_gpu_direct=false"
             )
-        if self.config.mooncake.protocol != "rdma":
-            raise ValueError("streaming_disaggregated requires mooncake.protocol=rdma")
+        # RDMA is unusable on this cluster's Ionic HCAs: a process can hold one
+        # RDMA client per HCA, and the second registration on the same device
+        # fails with EINVAL. With seven HCAs the producer pool tops out at
+        # 7 x 2 GiB = 14 GiB, while one batch of 128 sequences publishes about
+        # 24 GiB, so the producer stalls until extract_hidden times out at 600 s.
+        # Measured TCP instead: 2.0 GiB/s put, 4.44 GiB/s cross-node get with
+        # eight fetchers -- about 5 s per batch against a ~44 s draft step.
+        if self.config.mooncake.protocol not in ("rdma", "tcp"):
+            raise ValueError(
+                "streaming_disaggregated requires mooncake.protocol=tcp or rdma"
+            )
         if not self.config.mooncake.master_server_address:
             raise ValueError(
                 "The Ray launcher must provide mooncake.master_server_address"
@@ -1738,24 +1777,48 @@ class SpecDistillTrainer:
             torch.cat(padded_lm, dim=0),
         )
 
-    def _build_eval_teacher_cache(self) -> None:
+    def _load_eval_slice(self, path: str) -> list[tuple[torch.Tensor, ...]]:
+        """Read a fixed eval slice written by selfcheck/build_eval_slice.py."""
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        rows = payload["rows"]
+        max_len = self.config.policy.max_total_sequence_length
+        cache: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        for row in rows:
+            ids = row["input_ids"][: max_len - 1]
+            lm = row["loss_mask"][: len(ids)]
+            attn = torch.ones(len(ids), dtype=torch.long)
+            cache.append((ids.unsqueeze(0), attn.unsqueeze(0), lm.unsqueeze(0)))
+        meta = payload.get("meta", {})
+        logger.info(
+            "[rank %d] Eval slice %s: %d rows (source=%s, params=%s)",
+            self._rank, path, len(cache),
+            meta.get("dataset", "?"), meta.get("params", "?"),
+        )
+        return cache
+
+    def _build_eval_teacher_cache(
+        self, eval_cache: list[tuple[torch.Tensor, ...]] | None = None,
+    ) -> list[dict[str, torch.Tensor]]:
         """Pre-compute teacher outputs for all eval micro-batches at startup.
 
         Stores results on CPU so ``run_validation`` never touches the teacher
         engine — avoiding the concurrent-request crash with the async prefetcher.
         """
-        if not hasattr(self, "_eval_cache") or not self._eval_cache:
-            self._eval_teacher_cache: list[dict[str, torch.Tensor]] = []
-            return
+        if eval_cache is None:
+            eval_cache = getattr(self, "_eval_cache", None)
+        if not eval_cache:
+            return []
+        if self._disaggregated:
+            return self._build_eval_teacher_cache_disaggregated(eval_cache)
 
         eval_cfg = self.config.eval
         mb_size = eval_cfg.micro_batch_size
         generate_mode = getattr(
             self.config.algorithm.teacher, "generate_mode", "prefill"
         )
-        all_ids = [c[0] for c in self._eval_cache]
-        all_masks = [c[1] for c in self._eval_cache]
-        all_lm = [c[2] for c in self._eval_cache]
+        all_ids = [c[0] for c in eval_cache]
+        all_masks = [c[1] for c in eval_cache]
+        all_lm = [c[2] for c in eval_cache]
 
         # Same two-sweep shape as Phase A: decode every eval micro-batch first, then
         # extract. Interleaving would swap engines per micro-batch, reloading 1.5 TB
@@ -1840,19 +1903,107 @@ class SpecDistillTrainer:
             # the first optimizer step.
             self._load_draft_to_gpu()
 
-        self._eval_teacher_cache = cache
         logger.info(
             "[rank %d] Eval teacher cache built: %d micro-batches pre-computed on CPU",
             self._rank, len(cache),
         )
+        return cache
+
+    def _build_eval_teacher_cache_disaggregated(
+        self, eval_cache: list[tuple[torch.Tensor, ...]],
+    ) -> list[dict[str, torch.Tensor]]:
+        """Fill the eval teacher cache through one remote Ray teacher.
+
+        The local path calls ``_teacher_forward`` on a resident teacher, which a
+        draft node in this topology does not have -- that is why eval used to
+        raise NotImplementedError here. The teachers are already reachable as Ray
+        actors and already publish per-sequence hidden states into Mooncake, so
+        eval submits its rows down that same path once, at startup, and keeps the
+        result on CPU for the rest of the run.
+
+        Rows are handed out in contiguous blocks rather than the ``rank::world``
+        stride the training path uses. That keeps each rank's micro-batches equal
+        to consecutive slice rows, which is how the single-node trainer grouped
+        them -- necessary for an AL that is comparable with a previous run's.
+        """
+        mb_size = int(self.config.eval.micro_batch_size)
+        group = self._world_size * mb_size
+        if len(eval_cache) % group:
+            raise ValueError(
+                f"eval slice of {len(eval_cache)} rows must be a multiple of "
+                f"world_size * micro_batch_size = {group}"
+            )
+        all_ids = [c[0] for c in eval_cache]
+        all_masks = [c[1] for c in eval_cache]
+        all_lm = [c[2] for c in eval_cache]
+
+        cache: list[dict[str, torch.Tensor]] = []
+        for start in range(0, len(eval_cache), group):
+            end = start + group
+            ids, attn, lm = self._pad_eval_micro_batch(
+                all_ids[start:end], all_masks[start:end], all_lm[start:end],
+            )
+            ref = None
+            if self._rank == 0:
+                actor = self._teacher_ray_actors[0]
+                # Negative ids keep eval batches out of the training batch_id
+                # space, which the teacher uses to build Mooncake keys.
+                ref = actor.process_prefill_batch.remote(
+                    -1 - (start // group), ids.cpu(), attn.cpu(), lm.cpu(),
+                )
+            manifest = self._receive_disaggregated_manifest(ref)
+            rows = list(range(self._rank * mb_size, (self._rank + 1) * mb_size))
+            teacher_data, attention_mask, loss_mask = (
+                self._load_disaggregated_rank_batch(manifest, rows=rows)
+            )
+            cache.append({
+                "hidden_states": teacher_data["hidden_states"],
+                "input_ids": teacher_data["input_ids"],
+                "last_hidden_states": teacher_data["last_hidden_states"],
+                "attention_mask": attention_mask,
+                "loss_mask": loss_mask,
+            })
+            if self._is_distributed:
+                # The teacher must not overwrite a segment before every rank has
+                # taken its rows out of it.
+                torch.distributed.barrier()
+
+        logger.info(
+            "[rank %d] Eval teacher cache built through Ray teacher 0: "
+            "%d micro-batches of %d rows, %.1f GiB on CPU",
+            self._rank, len(cache), mb_size,
+            sum(
+                entry["hidden_states"].numel() * 2
+                + entry["last_hidden_states"].numel() * 2
+                for entry in cache
+            ) / 2**30,
+        )
+        return cache
 
     def run_validation(self) -> dict[str, float]:
-        """Run eval on cached samples. Returns eval/* metrics.
+        """Run every configured eval suite. Returns their merged metrics.
 
         Uses pre-cached teacher outputs (built at startup) so this never
         touches the teacher engine — safe to run during async prefetch.
+
+        There is more than one suite because the ``num_samples`` slice is the
+        tail of the training set and therefore moves whenever the training set
+        does. Carrying a previous run's slice alongside it under its own prefix
+        is what makes two runs' acceptance lengths comparable at all.
         """
-        if not hasattr(self, "_eval_teacher_cache") or not self._eval_teacher_cache:
+        metrics = self._validate_suite(
+            getattr(self, "_eval_teacher_cache", None), "eval",
+        )
+        for prefix, cache in getattr(self, "_eval_extra_suites", []):
+            metrics.update(self._validate_suite(cache, prefix))
+        return metrics
+
+    def _validate_suite(
+        self,
+        teacher_cache: list[dict[str, torch.Tensor]] | None,
+        prefix: str,
+    ) -> dict[str, float]:
+        if not teacher_cache:
             return {}
 
         spec_cfg = self.config.algorithm.spec_distill
@@ -1863,7 +2014,7 @@ class SpecDistillTrainer:
         all_losses: list[list[float]] = []
         all_accs: list[list[float]] = []
 
-        for cached in self._eval_teacher_cache:
+        for cached in teacher_cache:
             with torch.no_grad():
                 aux_hidden = cached["hidden_states"].to(device=self._device, dtype=draft_dtype)
                 t_ids = cached["input_ids"].to(self._device)
@@ -1988,12 +2139,12 @@ class SpecDistillTrainer:
             simulated_acc_len += cum_prod
 
         metrics: dict[str, float] = {
-            "eval/loss": total_loss / total_weight if total_weight > 0 else 0.0,
-            "eval/simulated_acc_len": simulated_acc_len,
+            f"{prefix}/loss": total_loss / total_weight if total_weight > 0 else 0.0,
+            f"{prefix}/simulated_acc_len": simulated_acc_len,
         }
         for i, (l, a) in enumerate(zip(avg_loss_per_pos, avg_acc_per_pos)):
-            metrics[f"eval/step_{i}_loss"] = l
-            metrics[f"eval/step_{i}_acc"] = a
+            metrics[f"{prefix}/step_{i}_loss"] = l
+            metrics[f"{prefix}/step_{i}_acc"] = a
 
         return metrics
 
@@ -3673,8 +3824,14 @@ class SpecDistillTrainer:
     def _load_disaggregated_rank_batch(
         self,
         manifest: dict[str, Any],
+        rows: list[int] | None = None,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
-        """RDMA-fetch this draft rank's disjoint rows from one teacher batch."""
+        """Fetch this draft rank's disjoint rows from one teacher batch.
+
+        ``rows`` defaults to the ``rank::world_size`` stride. Eval passes
+        contiguous blocks instead so that a rank's micro-batches are consecutive
+        slice rows, matching how the single-node trainer grouped them.
+        """
         keys = manifest["mooncake_keys"]
         seq_lens = manifest["sequence_lengths"]
         full_ids = manifest["input_ids"]
@@ -3686,7 +3843,8 @@ class SpecDistillTrainer:
                 f"disaggregated global batch {batch_size} must be divisible by "
                 f"draft world size {self._world_size}"
             )
-        rows = list(range(self._rank, batch_size, self._world_size))
+        if rows is None:
+            rows = list(range(self._rank, batch_size, self._world_size))
         total_len = int(full_ids.shape[1])
         hidden_dim = int(manifest["hidden_dim"])
         hidden_width = int(manifest["num_aux_layers"]) * hidden_dim
@@ -3731,11 +3889,6 @@ class SpecDistillTrainer:
 
     def _streaming_disaggregated_train(self) -> None:
         """Continuously overlap four remote on-policy teachers with draft FSDP."""
-        if self.config.eval.enabled:
-            raise NotImplementedError(
-                "streaming_disaggregated evaluation is not implemented yet; "
-                "set eval.enabled=false for the initial 5-node bring-up"
-            )
         if self._rank == 0:
             for cb in self.callbacks:
                 cb.on_train_begin(self)

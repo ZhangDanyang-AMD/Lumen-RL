@@ -27,19 +27,47 @@ LOG_DIR="${LOG_DIR:-${SHARED_ROOT}/logs/kimi_k3_dspark_atom_${RUN_ID}}"
 COORD_DIR="${SHARED_ROOT}/coord/kimi_k3_dspark_atom_${RUN_ID}"
 DOCKER_IMAGE="${DOCKER_IMAGE:-kimi_k3_dspark_atom:latest}"
 CONTAINER_NAME="kimi-k3-sddd-${RUN_ID}"
-RAY_PORT="${RAY_PORT:-6379}"
+RAY_PORT="${RAY_PORT:-26379}"
+# Containers run with --network host, so Ray's default auxiliary ports are shared
+# with everything else on the node. 10001 (the Ray client server) was already
+# taken by another tenant on one of these hosts, and `ray start --head` then
+# fails with "Failed to bind to address 127.0.0.1:10001" and exits, which shows
+# up only as "Ray cluster has 0/5 active nodes". Nothing here uses a ray:// client
+# or the dashboard, so move one and switch the other off.
+RAY_CLIENT_PORT="${RAY_CLIENT_PORT:-26380}"
 SMOKE_TEST="${SMOKE_TEST:-0}"
 
-export MOONCAKE_DEVICE_NAME="${MOONCAKE_DEVICE_NAME:-ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7}"
-export NCCL_IB_HCA="${NCCL_IB_HCA:-${MOONCAKE_DEVICE_NAME}}"
+# Hidden states move over Mooncake TCP, not RDMA. On this cluster's Ionic HCAs a
+# process can register one RDMA client per HCA; the second client on a device
+# fails with EINVAL (measured with selfcheck/time_mooncake_pool.py). Seven HCAs
+# therefore cap a teacher's producer pool at 7 x 2 GiB = 14 GiB, while one batch
+# of 128 sequences publishes about 24 GiB, so the producer stalls until
+# extract_hidden times out at 600 s -- which is exactly how the 2026-08-24 runs
+# died, zero steps completed. TCP has no memory-region limit and measured
+# 2.0 GiB/s put plus 4.44 GiB/s cross-node get with eight fetchers, i.e. about
+# 5 s per batch against a ~44 s draft step. Set MOONCAKE_PROTOCOL=rdma only if
+# the HCA limitation is lifted, and then keep the pool at or below the HCA count.
+export MOONCAKE_PROTOCOL="${MOONCAKE_PROTOCOL:-tcp}"
+export MOONCAKE_DEVICE_NAME="${MOONCAKE_DEVICE_NAME:-}"
+# NCCL only carries draft gradients inside the draft node, so it keeps using the
+# RDMA fabric. ionic_7 does not exist on these hosts; the HCAs are ionic_0..6.
+export NCCL_IB_HCA="${NCCL_IB_HCA:-ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6}"
 export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-1}"
 export NCCL_DMABUF_ENABLE="${NCCL_DMABUF_ENABLE:-1}"
 export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-spur0}"
-export MOONCAKE_GLOBAL_SEGMENT_SIZE="${MOONCAKE_GLOBAL_SEGMENT_SIZE:-2GB}"
-export MOONCAKE_LOCAL_BUFFER_SIZE="${MOONCAKE_LOCAL_BUFFER_SIZE:-1GB}"
-export LUMENRL_DRAFT_MOONCAKE_SEGMENT_SIZE="${LUMENRL_DRAFT_MOONCAKE_SEGMENT_SIZE:-2GB}"
-export LUMENRL_TEACHER_MOONCAKE_SEGMENT_POOL_SIZE="${LUMENRL_TEACHER_MOONCAKE_SEGMENT_POOL_SIZE:-128}"
-export LUMENRL_TEACHER_MOONCAKE_SEGMENT_SIZE="${LUMENRL_TEACHER_MOONCAKE_SEGMENT_SIZE:-2GB}"
+# One teacher segment must hold every batch it has in flight. At batch 128 and
+# the nine-category set's mean length that is about 24 GiB per batch, 88 GiB in
+# the 8192-token worst case, and stream_prefetch_batches=8 leaves two batches per
+# replica. 128 GB is host RAM on a 2.8 TB node and is only touched lazily.
+export MOONCAKE_GLOBAL_SEGMENT_SIZE="${MOONCAKE_GLOBAL_SEGMENT_SIZE:-128GB}"
+export MOONCAKE_LOCAL_BUFFER_SIZE="${MOONCAKE_LOCAL_BUFFER_SIZE:-8GB}"
+# Draft ranks only read, and all eight of them register a segment on one node.
+export LUMENRL_DRAFT_MOONCAKE_SEGMENT_SIZE="${LUMENRL_DRAFT_MOONCAKE_SEGMENT_SIZE:-4GB}"
+# The segmented producer pool exists to work around the per-MR size limit on
+# RDMA. Over TCP a single store takes an arbitrarily large segment, so the pool
+# collapses to one store and the whole failure mode above disappears.
+export LUMENRL_TEACHER_MOONCAKE_SEGMENT_POOL_SIZE="${LUMENRL_TEACHER_MOONCAKE_SEGMENT_POOL_SIZE:-1}"
+export LUMENRL_TEACHER_MOONCAKE_SEGMENT_SIZE="${LUMENRL_TEACHER_MOONCAKE_SEGMENT_SIZE:-128GB}"
 export LUMENRL_TEACHER_MOONCAKE_POOL_WAIT_SECONDS="${LUMENRL_TEACHER_MOONCAKE_POOL_WAIT_SECONDS:-300}"
 
 CONFIG="${REPO_ROOT}/examples/Kimi_K3_SDDD_MI350_ATOM/configs/train.yaml"
@@ -71,7 +99,12 @@ on_exit() {
 trap on_exit EXIT
 cleanup
 
-for _ in {1..120}; do
+# 600, not 120. Under srun the five tasks start together, but when the ranks are
+# started through five `spur exec` calls (five separate single-node jobs rather
+# than one -N5 allocation) each call can take about 100 s to return, so the node
+# files can be minutes apart. Waiting longer costs nothing; timing out here costs
+# a full restart.
+for _ in {1..600}; do
     shopt -s nullglob
     node_files=("${COORD_DIR}"/node-*)
     (( ${#node_files[@]} == 5 )) && break
@@ -107,6 +140,11 @@ COMMON_DOCKER_ARGS=(
     -e PYTHONUNBUFFERED=1
     -e NCCL_TIMEOUT=7200
     -e RAY_DEDUP_LOGS=0
+    # Without a flight recorder a hung collective reports only "Stack trace of
+    # the failed collective not found", which is what the first teacher deadlock
+    # here left behind. It costs a small ring buffer per rank and only produces
+    # output when a collective actually times out.
+    -e TORCH_NCCL_TRACE_BUFFER_SIZE=2048
     -e "NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME}"
     -e "NCCL_IB_HCA=${NCCL_IB_HCA}"
     -e "NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX}"
@@ -128,6 +166,7 @@ done
 if (( RANK == 0 )); then
     docker run -d "${COMMON_DOCKER_ARGS[@]}" "${DOCKER_IMAGE}" \
         ray start --head --node-ip-address="${HOST_IP}" --port="${RAY_PORT}" \
+        --ray-client-server-port="${RAY_CLIENT_PORT}" --include-dashboard=false \
         --num-gpus=8 --block
 else
     docker run -d "${COMMON_DOCKER_ARGS[@]}" "${DOCKER_IMAGE}" \
@@ -160,6 +199,13 @@ if (( RANK == 0 )); then
     done
     if [[ "${active_nodes}" != "5" ]]; then
         echo "Ray cluster has ${active_nodes}/5 active nodes." >&2
+        # The probe above hides stderr, so on its own this message says nothing
+        # about why. A head container that died during `ray start` is the usual
+        # cause and its log names the reason outright.
+        echo "--- head container state and log ---" >&2
+        docker inspect -f 'running={{.State.Running}} exit={{.State.ExitCode}}' \
+            "${CONTAINER_NAME}" >&2 2>/dev/null || true
+        docker logs --tail 40 "${CONTAINER_NAME}" >&2 2>&1 || true
         echo 1 >"${COORD_DIR}/exit-code"
         exit 1
     fi

@@ -125,8 +125,9 @@ def main() -> int:
     log_dir = os.environ["LUMENRL_LOG_DIR"]
     shared_dir = Path(os.environ["LUMENRL_SHARED_CACHE_DIR"])
     overrides = shlex.split(os.environ.get("LUMENRL_OVERRIDES", ""))
+    mooncake_protocol = os.environ.get("MOONCAKE_PROTOCOL", "tcp").strip()
     mooncake_devices = os.environ.get("MOONCAKE_DEVICE_NAME", "").strip()
-    if not mooncake_devices:
+    if mooncake_protocol == "rdma" and not mooncake_devices:
         raise ValueError(
             "MOONCAKE_DEVICE_NAME is required for the RDMA topology"
         )
@@ -184,15 +185,19 @@ def main() -> int:
         f"algorithm.spec_distill.teacher_weights_path={weights_path}",
         f"mooncake.master_server_address={master_info['master_addr']}",
         f"mooncake.metadata_server={master_info['metadata_server']}",
-        "mooncake.protocol=rdma",
-        f"mooncake.device_name={mooncake_devices}",
-        f"mooncake.global_segment_size={os.environ.get('MOONCAKE_GLOBAL_SEGMENT_SIZE', '512GB')}",
-        f"mooncake.local_buffer_size={os.environ.get('MOONCAKE_LOCAL_BUFFER_SIZE', '1GB')}",
+        f"mooncake.protocol={mooncake_protocol}",
+        f"mooncake.global_segment_size={os.environ.get('MOONCAKE_GLOBAL_SEGMENT_SIZE', '128GB')}",
+        f"mooncake.local_buffer_size={os.environ.get('MOONCAKE_LOCAL_BUFFER_SIZE', '8GB')}",
         "mooncake.enable_gpu_direct=false",
         "mooncake.enable_hard_pin=true",
         f"mooncake.kv_lease_ttl_s={mooncake_lease_ttl}",
-        "eval.enabled=false",
     ]
+    # Only when non-empty: `mooncake.device_name=` with nothing after the equals
+    # sign is parsed as None, and the field is typed str, so the actor dies in
+    # config validation before it ever touches a GPU. Under TCP the device list
+    # is empty, which is the normal case here.
+    if mooncake_devices:
+        runtime_overrides.append(f"mooncake.device_name={mooncake_devices}")
 
     from lumenrl.engine.inference.atom_teacher_ray import AtomTeacherRayActor
 
