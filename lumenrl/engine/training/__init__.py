@@ -1,4 +1,4 @@
-"""Training backends, engine abstractions, and weight synchronization."""
+"""Training backends and engine abstractions."""
 
 from __future__ import annotations
 
@@ -16,11 +16,6 @@ from lumenrl.engine.training.megatron_native_engine import (
     MegatronNativeEngineWithValueHead,
 )
 
-try:
-    from lumenrl.engine.training.weight_sync import WeightSyncManager
-except ModuleNotFoundError:
-    WeightSyncManager = None
-
 __all__ = [
     "BaseEngine",
     "BaseEngineCtx",
@@ -34,5 +29,4 @@ __all__ = [
     "MegatronNativeEngine",
     "MegatronNativeEngineWithLMHead",
     "MegatronNativeEngineWithValueHead",
-    "WeightSyncManager",
 ]
