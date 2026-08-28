@@ -806,14 +806,16 @@ class LumenActorWorker(BaseWorker):
         params, _ = self._engine.get_per_tensor_param()
         out: dict[str, torch.Tensor] = {}
         for name, param in params:
-            # Megatron collectives inside get_per_tensor_param() must run on
-            # every rank, but returning a complete CPU state from every Ray
-            # actor multiplies host/object-store usage by world size.  The
-            # controller only consumes states[0], so nonzero ranks participate
-            # in the generator collectives and discard the resulting tensors.
-            if self.rank != 0:
-                continue
+            # DTensor.full_tensor() is an all-gather: EVERY rank must enter it
+            # or rank 0 deadlocks until the NCCL watchdog aborts the process.
+            # Returning a complete CPU state from every Ray actor would
+            # multiply host/object-store usage by world size, and the
+            # controller only consumes states[0] — so all ranks gather but
+            # only rank 0 keeps the CPU copy.
             full = param.full_tensor() if isinstance(param, DTensor) else param
+            if self.rank != 0:
+                del full
+                continue
             out[name] = full.detach().cpu()
         return out
 
