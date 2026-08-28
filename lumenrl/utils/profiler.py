@@ -21,7 +21,7 @@ from typing import Any
 
 import torch
 
-from lumenrl.core.config import ProfilerConfig, RocprofToolConfig, TorchProfilerToolConfig
+from lumenrl.core.config import ProfilerConfig, RocprofToolConfig, TorchProfilerScheduleConfig, TorchProfilerToolConfig
 
 logger = logging.getLogger(__name__)
 
@@ -30,19 +30,66 @@ class _NoOpProfiler:
     def start(self, **kwargs: Any) -> None:
         return
 
+    def step(self) -> None:
+        return
+
     def stop(self) -> None:
         return
 
 
 class _TorchStepProfiler:
+    """Torch profiler backend with optional ``torch.profiler.schedule`` support.
+
+    The profiler context is created once in ``start()`` and destroyed in
+    ``stop()``.  Callers drive the schedule by calling ``step()`` once per
+    mini-batch.  Traces are exported automatically via ``on_trace_ready``.
+    """
+
     def __init__(self, rank: int, config: ProfilerConfig) -> None:
         self.rank = rank
         self.config = config
         self._ctx: torch.profiler.profile | None = None
-        self._step: int | None = None
+        self._step_tag: int | None = None
+
+    def _resolve_schedule(self) -> dict[str, int] | None:
+        tool_cfg = self.config.tool_config
+        if not isinstance(tool_cfg, TorchProfilerToolConfig):
+            return None
+        sched = getattr(tool_cfg, "schedule", None)
+        if sched is None or getattr(sched, "active", 0) <= 0:
+            return None
+        return {
+            "skip_first": sched.skip_first,
+            "wait": sched.wait,
+            "warmup": sched.warmup,
+            "active": sched.active,
+            "repeat": sched.repeat,
+        }
+
+    def _make_trace_handler(self) -> Any:
+        out_dir = Path(self.config.save_path)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        state: dict[str, int] = {"count": 0}
+        rank = self.rank
+
+        def handler(prof: torch.profiler.profile) -> None:
+            idx = state["count"]
+            state["count"] += 1
+            suffix = f"_cycle{idx}" if idx > 0 else ""
+            tag = f"step{self._step_tag}" if self._step_tag is not None else "trace"
+            path = out_dir / f"{tag}_rank{rank}{suffix}_torch.json"
+            try:
+                prof.export_chrome_trace(str(path))
+                logger.info("Profiler trace exported: %s", path)
+            except Exception as exc:
+                logger.warning("Failed to export profiler trace to %s: %s", path, exc)
+
+        return handler
 
     def start(self, **kwargs: Any) -> None:
-        profile_step = kwargs.get("profile_step")
+        if self._ctx is not None:
+            return
+        self._step_tag = kwargs.get("profile_step")
         tool_cfg = self.config.tool_config
         if not isinstance(tool_cfg, TorchProfilerToolConfig):
             tool_cfg = TorchProfilerToolConfig()
@@ -55,33 +102,32 @@ class _TorchStepProfiler:
         if not activities:
             activities.append(torch.profiler.ProfilerActivity.CPU)
 
-        self._ctx = torch.profiler.profile(
+        profile_kwargs: dict[str, Any] = dict(
             activities=activities,
             record_shapes="shapes" in contents,
             profile_memory="memory" in contents,
             with_stack="stack" in contents,
+            on_trace_ready=self._make_trace_handler(),
         )
-        self._ctx.__enter__()
-        self._step = int(profile_step) if profile_step is not None else None
+        sched = self._resolve_schedule()
+        if sched:
+            profile_kwargs["schedule"] = torch.profiler.schedule(**sched)
+
+        self._ctx = torch.profiler.profile(**profile_kwargs)
+        self._ctx.start()
+        logger.info("Profiler started for rank %d", self.rank)
+
+    def step(self) -> None:
+        if self._ctx is not None:
+            self._ctx.step()
 
     def stop(self) -> None:
         if self._ctx is None:
             return
-        # Advance once so profiler has a finalized step to export.
-        self._ctx.step()
-        self._ctx.__exit__(None, None, None)
-        out_dir = Path(self.config.save_path)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        step_str = f"step{self._step}" if self._step is not None else "step_unknown"
-        trace_path = out_dir / f"{step_str}_rank{self.rank}_torch.json"
-        try:
-            self._ctx.export_chrome_trace(str(trace_path))
-            logger.info("Profiler trace exported: %s", trace_path)
-        except Exception as exc:  # pragma: no cover - best effort only
-            logger.warning("Failed to export profiler trace to %s: %s", trace_path, exc)
-        finally:
-            self._ctx = None
-            self._step = None
+        self._ctx.stop()
+        logger.info("Profiler stopped for rank %d", self.rank)
+        self._ctx = None
+        self._step_tag = None
 
 
 class _RocprofParamProfiler:
@@ -166,6 +212,9 @@ class _RocprofParamProfiler:
         logger.info("rocprof launch hints written under %s", out_dir)
         self._wrote_hints = True
 
+    def step(self) -> None:
+        return
+
     def start(self, **kwargs: Any) -> None:
         self._write_launch_hints()
         profile_step = kwargs.get("profile_step")
@@ -229,6 +278,12 @@ class DistProfiler:
             return
         self._this_step = True
         self._impl.start(**kwargs)
+
+    def step(self) -> None:
+        """Advance the profiler schedule by one step (per mini-batch)."""
+        if not (self.check_enable() and self.check_this_rank()):
+            return
+        self._impl.step()
 
     def stop(self) -> None:
         if not (self.check_enable() and self.check_this_rank()):

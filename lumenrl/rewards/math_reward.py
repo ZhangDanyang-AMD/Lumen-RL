@@ -127,7 +127,30 @@ def compute_math_reward(
     return torch.tensor(rewards, dtype=torch.float32), details
 
 
-def dapo_math_reward(batch: DataProto) -> torch.Tensor:
+def dapo_math_reward(batch=None, data_source=None, solution_str=None,
+                     ground_truth=None, extra_info=None, **kwargs):
+    """Reward function compatible with both LumenRL and verl interfaces.
+
+    LumenRL calls: dapo_math_reward(batch: DataProto) → Tensor
+    verl calls:    dapo_math_reward(data_source, solution_str, ground_truth, ...) → float
+    """
+    if data_source is not None or solution_str is not None:
+        return _verl_compute_score(data_source, solution_str, ground_truth, extra_info, **kwargs)
+    return _lumenrl_batch_reward(batch, **kwargs)
+
+
+def _verl_compute_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs):
+    """verl-compatible per-sample scoring."""
+    try:
+        from math_verify import parse, verify
+        answer = parse(solution_str)
+        expected = parse(ground_truth)
+        return 1.0 if verify(answer, expected) else 0.0
+    except Exception:
+        return 0.0
+
+
+def _lumenrl_batch_reward(batch: DataProto, **kwargs) -> torch.Tensor:
     """Reward function compatible with ``RewardWorker``'s function-based interface.
 
     Expects ``batch.meta`` to contain:

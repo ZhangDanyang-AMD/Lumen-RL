@@ -82,10 +82,10 @@ Escalation order for R3:
 
 | Symptom | Check |
 |---------|-------|
-| Rollout ignores training updates | Verify `weight_sync.transfer()` is called after `train_step()` |
-| Model outputs differ after sync | Compare state_dict checksums before send and after receive |
-| OOM during sync | Check if FP8 on-the-fly conversion is enabled (avoids double-copy) |
-| MoE experts scrambled after sync | Check EP layout resharding between Megatron and ATOM |
+| Rollout ignores training updates | Verify `RLTrainer._sync_weights_ipc()` runs after actor update, or `AsyncRLTrainer._trigger_param_sync()` advances the version |
+| Model outputs differ after sync | Check sender/receiver completion and weight coverage; compare actor and rollout parameter checksums |
+| OOM during sync | Check IPC bucket size, rollout sleep mode, and whether safetensors fallback creates an extra full copy |
+| MoE experts scrambled after sync | Check `FusedMoEWeightRouter` coverage and EP layout resharding |
 
 ## Rationalizations to Reject
 

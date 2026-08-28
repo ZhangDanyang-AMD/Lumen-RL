@@ -323,6 +323,16 @@ class LumenActorWorker(BaseWorker):
                 "v4_indexer_num_stages": meg_cfg.get("v4_indexer_num_stages"),
                 "num_layers_in_first_pipeline_stage": meg_cfg.get("num_layers_in_first_pipeline_stage"),
                 "num_layers_in_last_pipeline_stage": meg_cfg.get("num_layers_in_last_pipeline_stage"),
+                # Initial weights from an offline-converted Megatron
+                # dist-checkpoint rather than HF safetensors.
+                "dist_checkpoint_path": meg_cfg.get("dist_checkpoint_path", None),
+                "deterministic_mode": meg_cfg.get("deterministic_mode", None),
+                "build_optimizer": meg_cfg.get("build_optimizer", True),
+                # Adam step for the offloaded fraction runs on the CPU; see
+                # optimizer_cpu_offload above.
+                "overlap_cpu_optimizer_d2h_h2d": meg_cfg.get(
+                    "overlap_cpu_optimizer_d2h_h2d", True
+                ),
             }
         return {}
 
@@ -1428,11 +1438,15 @@ class LumenActorWorker(BaseWorker):
 
         verl-aligned ZMQ CUDA-IPC weight sync. ``full_tensor()`` is an FSDP
         all-gather COLLECTIVE, so every actor must call this concurrently (the
-        trainer dispatches it to all actors at once). Each actor sends to its
-        own replica's socket keyed by ``{job_id, replica_rank=self.rank,
-        local_rank=0}`` -- matching the receiver's ``_get_zmq_handle``. The
-        receiver is started separately (server.update_weights_from_ipc) and
-        both run concurrently.
+        trainer dispatches it to all actors at once).
+
+        Socket keys must match the receiver's ``_get_zmq_handle``, i.e.
+        ``{job_id, replica_rank, local_rank}``. With a TP=N rollout engine per N
+        actors, actor ``rank`` owns TP rank ``rank % N`` of replica ``rank // N``
+        -- the same order VLLMReplicaManager used to build the engine's
+        ``CUDA_VISIBLE_DEVICES``, so each actor talks to the worker sitting on
+        its own GPU. Every worker receives the full tensors; vLLM's weight
+        loaders take their own slice.
         """
         if self._engine is None:
             raise RuntimeError("init_model() must be called before update_weights_ipc_send().")
@@ -1445,7 +1459,16 @@ class LumenActorWorker(BaseWorker):
         from lumenrl.engine.inference.bucketed_weight_transfer import BucketedWeightSender
 
         job_id = ray.get_runtime_context().get_job_id()
-        handle = f"ipc:///tmp/lumen-colocate-zmq-{job_id}-replica-{self.rank}-rank-0.sock"
+        rollout_tp = max(1, int(get_nested_config(
+            self.config, "policy", "generation", "vllm_cfg",
+            "tensor_parallel_size", default=1,
+        ) or 1))
+        replica_rank = self.rank // rollout_tp
+        local_rank = self.rank % rollout_tp
+        handle = (
+            f"ipc:///tmp/lumen-colocate-zmq-{job_id}"
+            f"-replica-{replica_rank}-rank-{local_rank}.sock"
+        )
         keep_fp32 = os.environ.get("LUMENRL_SYNC_FP32") == "1"
 
         params, _ = self._engine.get_per_tensor_param()

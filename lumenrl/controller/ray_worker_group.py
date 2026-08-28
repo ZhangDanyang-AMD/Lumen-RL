@@ -117,6 +117,17 @@ class RayWorkerGroup:
 
     def _start_simple(self, gpus_per_worker: float) -> None:
         """Original start path — no placement groups."""
+        if len([n for n in (self.pool.process_on_nodes or []) if int(n) > 0]) > 1:
+            # Ray then picks rank->node on its own, which a TP>1 rollout cannot
+            # use: VLLMReplicaManager requires ranks i*tp..i*tp+tp-1 to share a
+            # node. Only _start_with_placement_groups pins that.
+            logger.warning(
+                "pool '%s' declares a multi-node layout %s but placement groups are "
+                "off, so rank->node is left to Ray. A TP>1 rollout will fail with "
+                "'replica spans N nodes'.",
+                self.pool.name, self.pool.process_on_nodes,
+            )
+
         RemoteWorker = ray.remote(
             num_gpus=gpus_per_worker,
             num_cpus=1,
@@ -139,7 +150,14 @@ class RayWorkerGroup:
                 self._worker_names.append(actor_name)
 
     def _start_with_placement_groups(self, gpus_per_worker: float) -> None:
-        """verl-style start: create per-node placement groups with STRICT_PACK."""
+        """verl-style start: create per-node placement groups with STRICT_PACK.
+
+        One placement group per ``process_on_nodes`` entry, filled with
+        consecutive ranks, so rank -> node is deterministic. A TP>1 rollout
+        depends on that: ``VLLMReplicaManager.create`` requires ranks
+        ``i*tp .. i*tp+tp-1`` to share a node and raises "replica i spans N
+        nodes" otherwise.
+        """
         from ray.util.placement_group import placement_group
         from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 

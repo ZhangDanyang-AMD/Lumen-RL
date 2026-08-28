@@ -53,6 +53,13 @@ class OptimizerConfig:
     total_training_steps: int = 1000
     min_lr_ratio: float = 0.0
     num_cycles: float = 0.5
+    # Mirror of the same three fields on PolicyConfig, which is where configs
+    # set them. ``actor_worker._build_optimizer_config`` forwards them here for
+    # the Megatron engines to read; declaring them keeps the FSDP2 path, which
+    # builds this dataclass from that same dict, from rejecting them.
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.95
+    adam_eps: float = 1e-8
 
 
 @dataclass
@@ -191,12 +198,18 @@ class MegatronConfig:
     # Dynamic-batch packing: concat multiple sequences into one packed TE forward.
     enable_dynamic_batch: bool = False
     max_tokens_per_gpu: int = 0                  # per-forward token budget (0 -> 21504)
+    # Main's native-Megatron initialization controls. Keep these available
+    # without replacing the DSV4 engine's scheduling/offload controls below.
+    dist_checkpoint_path: Optional[str] = None
+    deterministic_mode: Optional[bool] = None
+    build_optimizer: bool = True
     # Bind each Ray actor to CPUs on the NUMA node local to its assigned GPU.
     numa_affinity: bool = False
     # Optimizer CPU offload: move Adam states (exp_avg/exp_avg_sq) to CPU memory.
     # Frees ~2x model-size GPU memory at the cost of slower optimizer steps.
     optimizer_cpu_offload: bool = False
     optimizer_offload_fraction: float = 1.0      # fraction of states to offload (0.0-1.0)
+    overlap_cpu_optimizer_d2h_h2d: bool = True
     # Streaming mode: off | sgd | adam.
     streamed_optimizer_mode: str = "off"
     # Positive MiB; validated at DSV4 startup.
@@ -256,6 +269,10 @@ class VLLMConfig:
     trust_remote_code: bool = True
     # Rollout quantization: "" / "fp8" / "fp8_per_block" (vLLM `quantization=`)
     quantization: str = ""
+    # vLLM `moe_backend=`. "" leaves vLLM's own default. DeepSeek-V4 on gfx950 must
+    # pass "triton": the default auto-selects AITER and dies in the first forward at
+    # `moe_sorting_opus_fwd`, and "triton_unfused" is FP4-only and raises ValueError.
+    moe_backend: str = ""
     # When True, vLLM returns per-token rollout log-probs needed for TIS / MIS
     # rollout correction (verl: actor_rollout_ref.rollout.calculate_log_probs).
     calculate_log_probs: bool = False
@@ -577,14 +594,37 @@ class RolloutCorrectionConfig:
     clip: float = 1.5
     # IS weights (verl rollout_corr_helper.py)
     rollout_is: Optional[str] = ""      # "token" | "sequence" | "" | None
-    rollout_is_threshold: str = "2.0"   # float or "lower_upper" (IcePop)
+    # Thresholds are strings so that a single field can carry either a number
+    # or an IcePop "lower_upper" pair / a comma-separated list. YAML written
+    # against the older float fields still works: __post_init__ coerces.
+    rollout_is_threshold: str | float = "2.0"
     rollout_is_batch_normalize: bool = False
+    # How the per-token log-ratios of a sequence combine for
+    # ``rollout_is: sequence``. "sum" is the full sequence likelihood ratio;
+    # "mean" divides by the response length for the geometric mean, which is
+    # the only form that stays in a usable range on long responses -- at 4k
+    # tokens the sum saturates the +-20 safety bound and then the threshold
+    # clamp almost always. Runs are not comparable across this setting.
+    rollout_is_seq_reduction: str = "sum"   # "sum" | "mean"
     # Rejection sampling (11 criteria: token_k1/k2/k3, seq_sum/mean/max_k1/k2/k3)
     rollout_rs: str = ""                # comma-separated: "seq_mean_k1", "seq_mean_k3", etc.
-    rollout_rs_threshold: str = ""      # comma-separated thresholds; K1 uses "lower_upper"
+    rollout_rs_threshold: str | float = ""  # comma-separated; K1 uses "lower_upper"
     # Bypass mode: set pi_old = pi_rollout, skip old_log_prob computation
     bypass_mode: bool = False
     loss_type: str = "ppo_clip"         # "ppo_clip" | "reinforce" (bypass mode only)
+
+    def __post_init__(self) -> None:
+        # Numbers from YAML reach the parsers as strings, which is what the
+        # "lower_upper" and comma-separated forms need them to be.
+        if not isinstance(self.rollout_is_threshold, str):
+            self.rollout_is_threshold = str(self.rollout_is_threshold)
+        if not isinstance(self.rollout_rs_threshold, str):
+            self.rollout_rs_threshold = str(self.rollout_rs_threshold)
+        if self.rollout_is_seq_reduction not in ("sum", "mean"):
+            raise ValueError(
+                "rollout_is_seq_reduction must be 'sum' or 'mean', got "
+                f"{self.rollout_is_seq_reduction!r}"
+            )
 
 
 @dataclass
@@ -798,11 +838,28 @@ class AsyncTrainingConfig:
 
 
 @dataclass
+class TorchProfilerScheduleConfig:
+    """Schedule for ``torch.profiler.schedule``.
+
+    The profiler cycles through skip_first -> (wait -> warmup -> active) x repeat.
+    Scheduling is only enabled when ``active > 0``; otherwise the profiler runs
+    in continuous mode.
+    """
+
+    skip_first: int = 0
+    wait: int = 0
+    warmup: int = 1
+    active: int = 3
+    repeat: int = 0
+
+
+@dataclass
 class TorchProfilerToolConfig:
     """Configuration for torch.profiler backend."""
 
     # Supported values: "cpu", "cuda", "memory", "shapes", "stack"
     contents: list[str] = field(default_factory=lambda: ["cpu", "cuda"])
+    schedule: Optional["TorchProfilerScheduleConfig"] = None
 
 
 @dataclass

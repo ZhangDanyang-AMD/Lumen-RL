@@ -45,6 +45,22 @@ def _response_mask_is_token_indexed(tensors: dict[str, torch.Tensor]) -> bool:
     )
 
 
+# Scratch buffer used by the merged native-engine log-prob gap diagnostic.
+_GAP_ROWS: list = []
+_GAP_SENTINEL = "/tmp/lumenrl_gap_dump_dir"
+
+
+def _gap_dump_dir() -> str | None:
+    directory = os.environ.get("LUMENRL_DUMP_LOGPROB_GAP")
+    if directory:
+        return directory
+    try:
+        with open(_GAP_SENTINEL) as sentinel:
+            return sentinel.read().strip() or None
+    except OSError:
+        return None
+
+
 class _FusedTokenLogProb(torch.autograd.Function):
     """Memory-efficient per-token log-prob: ``log p(target) = logit_target - logsumexp``.
 

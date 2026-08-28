@@ -66,6 +66,114 @@ def _install_packing_attention() -> None:
         logger.warning("Packing attention patch failed: %s", exc)
 
 
+# Architectures transformers ships as eager-only. DeepSeek-V4 sets
+# `_supports_sdpa = False` (head_dim 512 exceeds FlashAttention's 256 cap, and
+# torch SDPA carries no per-head learnable sink term), so the hardcoded
+# `attn_implementation="sdpa"` below would raise before any weight is read.
+_EAGER_ONLY_MODEL_TYPES = frozenset({"deepseek_v4"})
+
+
+def _patch_deepseek_v4_grouped_linear() -> None:
+    """Replace `DeepseekV4GroupedLinear`'s batched GEMM with one plain GEMM per group.
+
+    Stock `forward` hands `torch.bmm` two non-contiguous views. On gfx950 / ROCm 7.0
+    the `x` one -- whose batch stride is smaller than the matrix extent, so the
+    groups interleave in memory -- is read out of bounds once the token count
+    reaches ~2040: a hard memory fault in isolation, silent inf/NaN in the model.
+    See rocm-gfx950-strided-bmm-oob-issue.md.
+
+    The obvious fix, `.contiguous()` on both operands, trades one bug for another:
+    it fixes the forward, but making `w` contiguous makes the *backward* produce
+    NaN in 85 of 102 gradients (measured at 1024 tokens, where the forward bug is
+    not even in play; `.contiguous()` on `x` alone is harmless). Rather than rely
+    on which strides happen to dodge both, drop the batched GEMM: 8 separate 2D
+    GEMMs were clean in every direction and at every length tested, and match the
+    stock gradients bit-for-bit where stock is correct (max grad norm 18.5 either
+    way at 1024 tokens). Cost is 8 kernel launches per call instead of 1.
+
+    Must run before `from_pretrained`: under a device_map, accelerate stores the
+    hooked forward as an instance attribute that shadows the class method, so a
+    later class-level patch is silently inert.
+    """
+    try:
+        from transformers.models.deepseek_v4 import modeling_deepseek_v4 as m
+    except ImportError:
+        return
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_shape = x.shape[:-2]
+        hidden_dim = x.shape[-1]
+        w = self.weight.view(self.n_groups, -1, hidden_dim)      # (groups, out, in)
+        xs = x.reshape(-1, self.n_groups, hidden_dim)            # (tokens, groups, in)
+        outs = [torch.nn.functional.linear(xs[:, g].contiguous(), w[g])
+                for g in range(self.n_groups)]
+        return torch.stack(outs, dim=1).reshape(*input_shape, self.n_groups, -1)
+
+    m.DeepseekV4GroupedLinear.forward = forward
+    logger.info("Patched DeepseekV4GroupedLinear.forward (per-group GEMM)")
+
+
+def _unify_param_dtype(model: nn.Module, torch_dtype: torch.dtype, rank: int) -> None:
+    """Force one floating dtype across the model, because FSDP2 requires it.
+
+    ``_init_mp_dtypes`` asserts every parameter in an FSDP unit shares a dtype
+    ("FSDP expects uniform original parameter dtype"). Two things break that for
+    DeepSeek-V4: its ``_keep_in_fp32_modules_strict`` pins the hyper-connection
+    params, attention sinks, position biases and norms to fp32, and the FP8
+    dequantize path emits the config's bf16 for everything else, ignoring the
+    ``torch_dtype`` asked for here. The result is a bf16/fp32 mix in the same
+    decoder layer.
+
+    Casting up to the requested dtype (fp32 for the master weights) is the
+    direction that loses nothing. Models that already load uniform -- Qwen3 and
+    everything else on this path -- skip the cast entirely.
+    """
+    dtypes = {p.dtype for p in model.parameters() if p.is_floating_point()}
+    if len(dtypes) <= 1 and dtypes <= {torch_dtype}:
+        return
+    logger.info("[rank %d] Mixed parameter dtypes %s; casting to %s for FSDP2.",
+                rank, sorted(str(d) for d in dtypes), torch_dtype)
+    model.to(torch_dtype)
+
+
+def _hf_load_overrides(model_name: str) -> dict[str, Any]:
+    """Per-architecture `from_pretrained` kwargs, derived from the checkpoint config.
+
+    Two cases so far, both DeepSeek-V4:
+      * eager-only architectures, which reject the default `sdpa`;
+      * natively FP8 block-quantized checkpoints. transformers would otherwise
+        load them as FP8 parameters, and `FineGrainedFP8HfQuantizer.is_trainable`
+        is False -- the actor would come up untrainable. `dequantize=True` folds
+        the per-block scales in at load time and yields ordinary dense weights.
+    """
+    from transformers import AutoConfig
+
+    overrides: dict[str, Any] = {}
+    try:
+        cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    except Exception as exc:
+        logger.warning("Could not read HF config for %s (%s); using defaults.", model_name, exc)
+        return overrides
+
+    model_type = getattr(cfg, "model_type", "")
+    if model_type in _EAGER_ONLY_MODEL_TYPES:
+        overrides["attn_implementation"] = "eager"
+    if model_type == "deepseek_v4":
+        _patch_deepseek_v4_grouped_linear()
+
+    qcfg = getattr(cfg, "quantization_config", None)
+    if isinstance(qcfg, dict) and qcfg.get("quant_method") == "fp8":
+        from transformers import FineGrainedFP8Config
+
+        kwargs = {k: v for k, v in qcfg.items() if k not in ("quant_method", "fmt")}
+        overrides["quantization_config"] = FineGrainedFP8Config(dequantize=True, **kwargs)
+
+    if overrides:
+        logger.info("HF load overrides for %s (%s): %s", model_name, model_type,
+                    sorted(overrides))
+    return overrides
+
+
 _DTYPE_ALIASES = {
     "fp32": torch.float32,
     "float32": torch.float32,
@@ -117,12 +225,14 @@ def _load_hf_model(model_name: str, torch_dtype: torch.dtype = torch.bfloat16) -
     _install_packing_attention()
 
     logger.info("[rank %d] Loading HF model: %s (dtype=%s)", rank, model_name, torch_dtype)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch_dtype,
-        attn_implementation="sdpa",
-        trust_remote_code=True,
-    )
+    load_kwargs: dict[str, Any] = {
+        "torch_dtype": torch_dtype,
+        "attn_implementation": "sdpa",
+        "trust_remote_code": True,
+    }
+    load_kwargs.update(_hf_load_overrides(model_name))
+    model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+    _unify_param_dtype(model, torch_dtype, rank)
 
     model.gradient_checkpointing_enable(
         gradient_checkpointing_kwargs={"use_reentrant": False},
@@ -269,13 +379,16 @@ def _apply_fsdp2_sharding(
     """
     import torch.distributed as dist
 
-    if not dist.is_initialized():
-        logger.warning("torch.distributed not initialized; returning unsharded model.")
-        return model
-
-    rank = dist.get_rank()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     local_device = torch.device(f"cuda:{local_rank}")
+
+    if not dist.is_initialized():
+        # No process group: no sharding, but the model still has to live on the
+        # device the rest of the trainer uses.
+        logger.warning("torch.distributed not initialized; returning unsharded model.")
+        return model.to(local_device) if torch.cuda.is_available() else model
+
+    rank = dist.get_rank()
 
     model.to(local_device)
 
@@ -292,6 +405,10 @@ def _apply_fsdp2_sharding(
         return model
 
     from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+
+    from lumenrl.engine.training.fsdp_chunk_cat_fallback import install_chunk_cat_fallback
+
+    install_chunk_cat_fallback()
 
     param_dtype = _resolve_dtype(fsdp_config.get("param_dtype"), torch.bfloat16)
     reduce_dtype = _resolve_dtype(fsdp_config.get("reduce_dtype"), torch.float32)

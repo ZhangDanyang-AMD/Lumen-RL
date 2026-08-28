@@ -3,17 +3,23 @@
 This is LumenRL's port of verl's online rollout replica stack:
 
 * ``VLLMRayServer``  ~ verl ``vLLMHttpServer`` -- a Ray actor that owns one
-  vLLM ``AsyncLLM`` engine (TP=1) pinned to a single GPU, optionally serves a
-  uvicorn OpenAI-compatible HTTP app, and exposes token-in/token-out
+  vLLM ``AsyncLLM`` engine pinned to an explicit set of GPUs, optionally serves
+  a uvicorn OpenAI-compatible HTTP app, and exposes token-in/token-out
   ``generate`` + ``collective_rpc`` + ``sleep``/``wake_up`` +
   ``update_weights_from_ipc`` over Ray RPC.
 * ``VLLMReplicaManager`` ~ verl ``vLLMReplica`` + ``LLMServerManager`` +
   ``CheckpointEngineManager`` -- driver-side helper that colocates one server
-  actor on the same GPU as each training ``LumenActorWorker`` (NodeAffinity +
-  explicit ``CUDA_VISIBLE_DEVICES``), then fans out generate / sleep / wake /
-  weight-update across the replicas.
+  actor on the same GPUs as a group of training ``LumenActorWorker``s
+  (NodeAffinity + explicit ``CUDA_VISIBLE_DEVICES``), then fans out generate /
+  sleep / wake / weight-update across the replicas.
 
 8 GPUs => 8 replicas, each TP=1 (verl's default DP=8 rollout layout).
+
+With ``tensor_parallel_size=N`` the layout becomes one engine per N actors:
+32 GPUs and TP=8 give 4 replicas, each spanning one node. Models whose kernels
+have no TP=1 path need this -- DeepSeek-V4 on gfx950 faults at TP=1 and runs at
+TP=8 -- and it also cuts the per-GPU engine footprint by N, which is what makes
+a colocated engine affordable for a very large policy.
 """
 
 from __future__ import annotations
@@ -435,6 +441,7 @@ class VLLMReplicaManager:
         start_http: bool = False,
         max_concurrency: int = 64,
         base_seed: Optional[int] = None,
+        tensor_parallel_size: int = 1,
     ) -> None:
         self.actor_wg = actor_wg
         self.model_name = model_name
@@ -443,10 +450,23 @@ class VLLMReplicaManager:
         self.start_http = bool(start_http)
         self.max_concurrency = int(max_concurrency)
         self.base_seed = base_seed
-        self.num_replicas = actor_wg.num_workers
-        self.tensor_parallel_size = int(
-            self.engine_kwargs.get("tensor_parallel_size", 1) or 1
-        )
+        # One engine per TP group of training actors: 32 actors with TP=8 give 4
+        # replicas of 8 GPUs each. TP=1 keeps the original one-engine-per-GPU
+        # layout. The weight sync depends on this exact grouping -- actor
+        # ``rank`` feeds replica ``rank // tp`` on TP rank ``rank % tp``.
+        tp = int(tensor_parallel_size or 1)
+        if tp <= 1:
+            # Callers that only fill engine_kwargs rather than passing it here.
+            tp = int(self.engine_kwargs.get("tensor_parallel_size", 1) or 1)
+        self.tensor_parallel_size = max(1, tp)
+        # Resolved here rather than in create() so that num_replicas is never
+        # tp-times too large for anything reading it in between.
+        if actor_wg.num_workers % self.tensor_parallel_size:
+            raise ValueError(
+                f"rollout tensor_parallel_size={self.tensor_parallel_size} must divide "
+                f"the actor count {actor_wg.num_workers}"
+            )
+        self.num_replicas = actor_wg.num_workers // self.tensor_parallel_size
         self.servers: list = []
         self.rdma_group_name: str | None = None
         self._rdma_capabilities_group: str | None = None
@@ -466,7 +486,7 @@ class VLLMReplicaManager:
         infos = self.actor_wg.execute_all_sync("get_colocation_info")
         logger.info("VLLMReplicaManager: colocation infos = %s", infos)
 
-        tp = int(self.engine_kwargs.get("tensor_parallel_size", 1) or 1)
+        tp = self.tensor_parallel_size
         num_workers = len(infos)
         if num_workers % tp != 0:
             raise ValueError(
@@ -479,12 +499,22 @@ class VLLMReplicaManager:
         remote_cls = ray.remote(VLLMRayServer)
         for r in range(num_replicas):
             group = infos[r * tp : (r + 1) * tp]
+            node_ids = {g["node_id"] for g in group}
+            if len(node_ids) != 1:
+                raise RuntimeError(
+                    f"replica {r} spans {len(node_ids)} nodes: actors "
+                    f"{r * tp}..{r * tp + tp - 1} must be colocated for a TP={tp} "
+                    "engine, but Ray placed them apart"
+                )
             node_id = group[0]["node_id"]
-            all_gpu_ids: list[str] = []
-            for info in group:
-                all_gpu_ids.extend(str(g) for g in info["gpu_ids"])
-            gpu_ids_str = ",".join(all_gpu_ids)
-
+            # Visible device j of the engine is actor (r*tp + j)'s physical GPU,
+            # which is what makes the sender's rank % tp the receiver's local_rank.
+            gpu_ids_str = ",".join(str(g) for info in group for g in info["gpu_ids"])
+            # ROCm device pinning: select the physical GPU via CUDA/HIP visible
+            # devices ONLY. Do NOT also set ROCR_VISIBLE_DEVICES to the physical
+            # index -- ROCR filters at a lower level, so ROCR=<phys>+HIP=<phys>
+            # double-filters ("No HIP GPUs available"). We still set the NOSET
+            # flags (incl. ROCR) so Ray (num_gpus=0) doesn't clear visibility.
             env_vars = {
                 "CUDA_VISIBLE_DEVICES": gpu_ids_str,
                 "HIP_VISIBLE_DEVICES": gpu_ids_str,
@@ -505,8 +535,8 @@ class VLLMReplicaManager:
             }
             _copy_vllm_runtime_env(env_vars)
             server = remote_cls.options(
-                num_gpus=0,
-                num_cpus=1,
+                num_gpus=0,  # pinned manually via CUDA_VISIBLE_DEVICES; no Ray GPU slot
+                num_cpus=tp,  # the mp executor forks one worker process per TP rank
                 name=f"lumen-vllm-replica-{r}",
                 max_concurrency=self.max_concurrency,
                 scheduling_strategy=NodeAffinitySchedulingStrategy(

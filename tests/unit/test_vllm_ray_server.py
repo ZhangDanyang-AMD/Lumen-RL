@@ -101,7 +101,7 @@ def install_fake_ray(monkeypatch):
 
 def make_manager(capabilities):
     manager = VLLMReplicaManager(
-        SimpleNamespace(num_workers=1),
+        SimpleNamespace(num_workers=len(capabilities)),
         "model",
         {"tensor_parallel_size": len(capabilities)},
     )

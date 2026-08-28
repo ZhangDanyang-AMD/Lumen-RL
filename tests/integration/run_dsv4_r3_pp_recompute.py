@@ -101,16 +101,24 @@ def main() -> None:
     layer_offset = sum(layers_per_rank[:rank])
     for local_layer, layer_events in enumerate(observed):
         global_layer = layer_offset + local_layer
+        filler = (
+            torch.div(
+                torch.arange(topk, dtype=torch.int64) * num_experts,
+                topk,
+                rounding_mode="floor",
+            )
+            + global_layer * topk
+        ).remainder(num_experts)
         expected0 = torch.tensor(
-            [[global_layer + choice for choice in range(topk)]] * 3
-            + [list(range(topk))],
+            [[global_layer + choice for choice in range(topk)]] * 3,
             dtype=torch.int64,
         ).remainder(num_experts)
+        expected0 = torch.cat((expected0, filler.unsqueeze(0)), dim=0)
         expected1 = torch.tensor(
-            [[global_layer + 7 + choice for choice in range(topk)]] * 3
-            + [list(range(topk))],
+            [[global_layer + 7 + choice for choice in range(topk)]] * 3,
             dtype=torch.int64,
         ).remainder(num_experts)
+        expected1 = torch.cat((expected1, filler.unsqueeze(0)), dim=0)
         assert len(layer_events) == 4
         torch.testing.assert_close(layer_events[0], expected0)
         torch.testing.assert_close(layer_events[1], expected1)

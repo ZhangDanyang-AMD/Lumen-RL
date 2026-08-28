@@ -1,0 +1,212 @@
+# DeepSeek-V4-Flash DAPO smoke: Megatron-Native training + vLLM rollout, 1 node.
+#
+# The megatron_native twin of dapo_dsv4_flash_ray_vllm_4k_smoke.yaml (FSDP2).
+# Everything that defines the optimization problem is copied from it unchanged;
+# the differences are forced by the training backend or by fitting on one node.
+#
+#   * training_backend fsdp2 -> megatron_native, with EP=8. The 4-layer slice is
+#     27.39B parameters, whose FP32 master weights and Adam moments are ~330 GB,
+#     so the optimizer only fits at all with the experts sharded.
+#   * enable_dynamic_batch MUST stay false. DeepseekV4Attention derives token
+#     positions from the tensor length and never reads packed_seq_params, so
+#     bin-packing several sequences into one microbatch has them read as one
+#     long sequence -- no error, wrong attention. The engine forces it off and
+#     logs a warning; it is spelled out here so the reason travels with the run.
+#   * PP and CP are unavailable, and the engine rejects them: CP because the
+#     zigzag slicing and DSv4's own CP bookkeeping have never been reconciled,
+#     PP because mHC's layer_post returns a view and a synthetic PP=2 probe
+#     silently changed the loss. See _dsv4_check_topology.
+# Despite the name this is also the multi-node recipe: nothing here depends on
+# the node count, so ~/4node/08_dsv4_megatron_multinode.sh reuses the file as-is
+# and injects cluster.num_nodes, controller.ray.actor.num_workers and
+# controller.ray.actor.process_on_nodes on the command line, all derived from its
+# node list. Validated at 2 nodes / 16 GPUs (EP=8, DP=2): 3 steps, exit 0,
+# rollout_corr/kl 2.74-3.32e-3 against the single-node 2.62-3.33e-3.
+#
+# process_on_nodes is the one that is not optional -- without it Ray picks
+# rank->node itself and a TP=8 rollout replica can straddle two nodes, which
+# VLLMReplicaManager.create rejects.
+#
+# ⚠️ model_name is a 4-LAYER slice, not the full 43-layer model. This is a
+# plumbing smoke. Build it with ~/dsv4/make_native_subset.py
+# (DSV4_SUBSET_LAYERS=4); layers 0-3 cover every structural branch the model has:
+# sliding, sliding, compressed+indexed, heavily-compressed, and both hash_moe
+# and gated moe.
+#
+# ⚠️ The training weights do NOT come from model_name. DSv4 ships block-quantized
+# FP8 that the HF-safetensors bridge cannot read, so they are converted offline
+# to torch_dist and pulled in through dist_checkpoint_path. model_name is read
+# only for config.json (and by the rollout). See
+# ~/dsv4/mhc_probe/rebuild_l4_artifacts.sh.
+#
+# ⚠️ UNVERIFIED at the time of writing: rollout weight sync. The mcore -> DSv4
+# checkpoint name mapping exists and covers every vLLM parameter
+# (probe_64_dsv4_rollout_names.py), but no sync has actually run, and the FP8
+# question below is open.
+#
+# Run with ray_env_dsv4.sh, NOT ray_env.sh: VLLM_ROCM_USE_AITER must be 1 here
+# (V4's sparse attention indexer is AITER-only on ROCm) and 0 for Qwen3 BF16.
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    actor:
+      num_workers: 8
+      dispatch_mode: dp_compute_proto
+
+policy:
+  # BF16 weights under the CHECKPOINT's own tensor names, built by
+  # ~/dsv4/mhc_probe/make_native_bf16.py. Neither of the obvious candidates
+  # works: the released FP8 dir leaves vLLM holding FP8 parameters that the
+  # trainer's BF16 weight sync cannot write ("'Parameter' object has no
+  # attribute 'load_merged_column_weight'"), and the `fp8_cast_bf16` output is
+  # BF16 but renamed into DeepSeek-HF form, which vLLM's DSv4 loader rejects
+  # ("KeyError: 'layers.0.input_layernorm.weight'"). The trainer reads only
+  # config.json from here and takes its weights from dist_checkpoint_path.
+  model_name: "/mnt/m2m_nobackup/xysheng/models/dsv4-L4-bf16-native"
+  training_backend: megatron_native
+  generation_backend: vllm
+  max_total_sequence_length: 6144       # 2048 prompt budget + 4096 response
+  max_response_length: 4096
+  train_global_batch_size: 128          # 8 prompts x 16 generations
+  gen_batch_size: 24                    # 8 * 3, verl's train:gen ratio
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 6144
+  learning_rate: 1.0e-6
+  lr_warmup_steps: 0
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  training:
+    optimizer_dtype: bf16
+    megatron_cfg:
+      use_distributed_optimizer: true
+      # ---- Expert Parallel: 256 experts across all 8 GPUs ----
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      context_parallel_size: 1
+      expert_model_parallel_size: 8
+      # Offline-converted weights; dist_checkpointing.load reshards them to this
+      # topology on the way in.
+      dist_checkpoint_path: "/mnt/m2m_nobackup/xysheng/models/dsv4-L4_torch_dist"
+      # Bitwise reproducibility. Without it ~1.6% of argmaxes flip run to run,
+      # which is larger than the train/rollout gap DAPO is trying to measure.
+      # Needs NCCL_ALGO=Ring in the environment, which ray_env_dsv4.sh sets.
+      deterministic_mode: true
+      # DSv4 has its own routing (sqrtsoftplus + expert bias + hash layers); the
+      # rest of the MoE shape comes from the HF config.
+      moe_grouped_gemm: true
+      moe_aux_loss_coeff: 0.0
+      log_probs_chunk_size: 1024
+      # See the header. Not a tuning choice.
+      enable_dynamic_batch: false
+    fsdp_cfg:
+      param_offload: false
+      optimizer_offload: false
+  generation:
+    vllm_cfg:
+      transport: ray_http
+      ray_http_start_server: false
+      # TP=1 is not optional: it faults with `Memory access fault` on gfx950 for
+      # every MoE backend / AITER combination tried.
+      tensor_parallel_size: 8
+      kv_cache_dtype: fp8_e4m3
+      # The default auto-selects AITER and dies in the first forward at
+      # `moe_sorting_opus_fwd`; `triton_unfused` is FP4-only.
+      moe_backend: triton
+      # Training holds ~60 GB/rank of weights, grads and optimizer state.
+      gpu_memory_utilization: 0.25
+      max_model_len: 6144
+      dtype: bfloat16
+      enforce_eager: true
+      enable_chunked_prefill: true
+      # The profiling batch the validated rollout probe used; larger shrinks
+      # nothing and the block-FP8 GEMM faults.
+      max_num_batched_tokens: 2048
+      max_num_seqs: 64
+      quantization: ""
+      calculate_log_probs: true
+      enable_sleep_mode: false
+      update_weights_bucket_megabytes: 512
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+
+moe:
+  r3:
+    rollout_replay: false
+
+algorithm:
+  name: dapo
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  loss_agg_mode: token-mean
+  dapo:
+    num_generations: 16
+    kl_coeff: 0.0
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 10.0
+    dynamic_sampling: true
+    token_level_pg: true
+    overlong_reward_shaping: true
+    max_resp_len: 4096
+    # OFF for the sliced model, and only for it. A 4-layer slice feeds
+    # `model.norm` and `lm_head` the layer-3 residual instead of the layer-42
+    # one, so it emits gibberish and never solves a math problem. With filtering
+    # on, every group is dropped for acc=0 and the run dies at `filter_groups
+    # collected no valid groups`. Turn it back on for the full model.
+    filter_groups:
+      enable: false
+      metric: acc
+      max_num_gen_batches: 10
+    overlong_buffer:
+      enable: true
+      len: 512
+      penalty_factor: 1.0
+      log: false
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+    rollout_is_batch_normalize: false
+
+reward:
+  type: function
+  function: lumenrl.rewards.math_reward.dapo_math_reward
+  # Reused as-is. The parquet was filtered with Qwen3-8B-Base's tokenizer, so its
+  # 1024-token cutoff does not transfer to V4's 129280-token vocab; the raw text
+  # is what matters, and `_tokenize_prompts` truncates at 1024 anyway.
+  dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet"
+  shuffle: true
+  shuffle_seed: 10086
+
+val_dataset: ""
+val_steps: 0
+val_batch_size: 0
+eval:
+  enabled: false
+  num_samples: 0
+
+checkpointing:
+  checkpoint_dir: ""
+  save_steps: 1000
+  save_total_limit: 0
+  resume: false
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 3
+seed: 10086

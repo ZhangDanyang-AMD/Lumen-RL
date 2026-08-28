@@ -29,7 +29,11 @@ from torch.utils.data.distributed import DistributedSampler
 from lumenrl.algorithms.loss_functions import sft_loss
 from lumenrl.data.sft_dataset import SFTDataset
 from lumenrl.engine.training.base_engine import EngineRegistry
-from lumenrl.core.config import HFModelConfig, FSDPEngineConfig, OptimizerConfig
+from lumenrl.core.config import (
+    HFModelConfig, FSDPEngineConfig, OptimizerConfig,
+    ProfilerConfig, TorchProfilerToolConfig, TorchProfilerScheduleConfig,
+)
+from lumenrl.utils.profiler import DistProfiler
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +53,7 @@ class SFTTrainer:
 
         self._build_dataset()
         self._build_engine()
+        self._init_profiler()
         self.global_step = 0
 
     def _build_dataset(self) -> None:
@@ -104,6 +109,28 @@ class SFTTrainer:
         )
         self.engine.initialize()
 
+    def _init_profiler(self) -> None:
+        sched_cfg = None
+        if self.args.profiler_schedule_active > 0:
+            sched_cfg = TorchProfilerScheduleConfig(
+                skip_first=self.args.profiler_schedule_skip_first,
+                wait=self.args.profiler_schedule_wait,
+                warmup=self.args.profiler_schedule_warmup,
+                active=self.args.profiler_schedule_active,
+                repeat=self.args.profiler_schedule_repeat,
+            )
+        tool_cfg = TorchProfilerToolConfig(schedule=sched_cfg)
+        profiler_cfg = ProfilerConfig(
+            tool=self.args.profiler_tool,
+            enable=self.args.profiler_enable,
+            all_ranks=self.args.profiler_all_ranks,
+            save_path=self.args.profiler_save_path,
+            tool_config=tool_cfg,
+        )
+        self._profiler = DistProfiler(rank=self.rank, config=profiler_cfg)
+        self._profile_start = self.args.profiler_start_step
+        self._profile_end = self.args.profiler_end_step
+
     def _sft_loss_fn(self, model_output, data):
         log_probs = model_output["log_probs"]
         L = log_probs.shape[-1]
@@ -128,6 +155,10 @@ class SFTTrainer:
             t0 = time.time()
 
             for batch in self.dataloader:
+                self.global_step += 1
+                if self.global_step == self._profile_start:
+                    self._profiler.start(profile_step=self.global_step)
+
                 data = {k: v.cuda() for k, v in batch.items()}
                 data["use_packed_forward"] = True
 
@@ -135,7 +166,11 @@ class SFTTrainer:
                     output = self.engine.train_batch(data, self._sft_loss_fn)
 
                 self.engine.lr_scheduler_step()
-                self.global_step += 1
+
+                self._profiler.step()
+
+                if self.global_step == self._profile_end:
+                    self._profiler.stop()
                 step_count += 1
 
                 metrics = output.get("metrics", {})
@@ -173,6 +208,9 @@ class SFTTrainer:
                     epoch, epoch_loss / max(step_count, 1), epoch_tokens,
                 )
 
+        if self._profiler is not None:
+            self._profiler.stop()
+
         self._save_checkpoint()
 
     def _save_checkpoint(self) -> None:
@@ -201,6 +239,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save_steps", type=int, default=0)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--seed", type=int, default=42)
+    # Profiler arguments
+    p.add_argument("--profiler_enable", action="store_true", help="Enable profiling")
+    p.add_argument("--profiler_tool", type=str, default="torch", choices=["torch", "rocprof"])
+    p.add_argument("--profiler_start_step", type=int, default=-1,
+                   help="Step to start profiling (negative = disabled)")
+    p.add_argument("--profiler_end_step", type=int, default=-1,
+                   help="Step to stop profiling (negative = disabled)")
+    p.add_argument("--profiler_save_path", type=str, default="./profiler_output")
+    p.add_argument("--profiler_all_ranks", action="store_true", help="Profile all ranks")
+    # Schedule arguments (torch.profiler.schedule)
+    p.add_argument("--profiler_schedule_skip_first", type=int, default=0)
+    p.add_argument("--profiler_schedule_wait", type=int, default=0)
+    p.add_argument("--profiler_schedule_warmup", type=int, default=1)
+    p.add_argument("--profiler_schedule_active", type=int, default=3)
+    p.add_argument("--profiler_schedule_repeat", type=int, default=0)
     return p.parse_args()
 
 

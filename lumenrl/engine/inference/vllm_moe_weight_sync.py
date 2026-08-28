@@ -14,6 +14,10 @@ mapping and falls through ``Qwen3MoeForCausalLM.load_weights``'s silent
 ``if is_expert_weight: continue`` branch: no exception, no loaded param, and
 93% of the policy's parameters never reach the rollout engine.
 
+vLLM >=0.22 adds a wrinkle: the expert buffers moved into a nested
+``RoutedExperts`` submodule, so their path gains a ``routed_experts`` segment
+while the trainer keeps sending the shorter HF name. See ``_CONTAINER_SEGMENTS``.
+
 This module closes that gap on the receiving side. ``FusedMoEWeightRouter``
 intercepts the fused tensors and feeds them to vLLM's own
 ``FusedMoE.weight_loader`` through its 3D "full load" path (one call per
@@ -45,6 +49,16 @@ logger.setLevel(os.getenv("LUMENRL_LOGGING_LEVEL", "WARN"))
 _FUSED_GATE_UP = "gate_up_proj"
 _FUSED_DOWN = "down_proj"
 _FUSED_LEAVES = (_FUSED_GATE_UP, _FUSED_DOWN)
+
+# vLLM submodules that hold the expert buffers *below* the layer the HF name
+# addresses: vLLM >=0.22 splits FusedMoE so the weights live in a nested
+# RoutedExperts registered as "routed_experts", making the parameter path
+# ``...mlp.experts.routed_experts.w13_weight`` while the trainer still sends
+# ``...mlp.experts.gate_up_proj``. Routing keys off the trainer's prefix, so a
+# discovered module also has to be reachable under the shortened name. Without
+# this every fused tensor misses the router and the coverage assertion reports
+# "left 96/435 rollout parameters untouched" (Qwen3-30B-A3B, 48 layers x 2).
+_CONTAINER_SEGMENTS = ("routed_experts",)
 
 # Parameters that a BF16 trainer legitimately never sends: quantization
 # artifacts that vLLM derives locally in process_weights_after_loading.
@@ -87,7 +101,11 @@ class FusedMoEWeightRouter:
             w2 = next((n for n in owned if n.endswith("w2_weight")), None)
             if w13 is None or w2 is None:
                 continue
-            self._experts[mod_name] = (module, f"{mod_name}.{w13}", f"{mod_name}.{w2}")
+            entry = (module, f"{mod_name}.{w13}", f"{mod_name}.{w2}")
+            for key in self._lookup_keys(mod_name):
+                # First writer wins: the exact module name is registered before any
+                # shortened alias, so a real FusedMoE can never be shadowed by one.
+                self._experts.setdefault(key, entry)
 
         if self._experts:
             logger.info(
@@ -95,6 +113,15 @@ class FusedMoEWeightRouter:
                 len(self._experts),
                 next(iter(self._experts)),
             )
+
+    @staticmethod
+    def _lookup_keys(mod_name: str) -> list[str]:
+        """The module's own name plus the prefix the trainer addresses it by."""
+        keys = [mod_name]
+        prefix, _, leaf = mod_name.rpartition(".")
+        if prefix and leaf in _CONTAINER_SEGMENTS:
+            keys.append(prefix)
+        return keys
 
     @property
     def active(self) -> bool:
@@ -158,14 +185,36 @@ class FusedMoEWeightRouter:
     ) -> None:
         """Read back what vLLM stored and require it to equal what was sent.
 
-        Only meaningful without TP/EP sharding, where the destination holds the
-        whole tensor; that is the colocated TP=1 replica layout this path uses.
+        Under tensor parallelism the destination holds one slice of the
+        intermediate dim, so compare against the same slice the loader takes:
+        ``per_rank * tp_rank`` along the sharded dim (w1/w3 shard dim 0, w2 dim 1,
+        both shifted by one for the leading expert dim). Expert parallelism is
+        still skipped -- there the parameter holds a subset of experts and the
+        global-to-local expert map lives inside vLLM.
+
+        Any shape disagreement downgrades to a skip rather than a failure, so a
+        mistake here can only cost coverage, never invent a false alarm.
         """
-        if self._ep_size(module) != 1 or self._tp_size(module) != 1:
-            logger.warning("weight sync verify skipped for %s: sharded layer", param_name)
+        if self._ep_size(module) != 1:
+            logger.warning(
+                "weight sync verify skipped for %s: expert-parallel layer", param_name
+            )
             return
+        tp_size = self._tp_size(module)
+        tp_rank = self._tp_rank(module)
         offset = 0
         for shard_id, shard in shards:
+            if tp_size > 1:
+                dim = 2 if shard_id == "w2" else 1
+                per_rank = shard.shape[dim] // tp_size
+                if per_rank == 0 or per_rank * tp_size != shard.shape[dim]:
+                    logger.warning(
+                        "weight sync verify skipped for %s shard %s: dim %d of %s "
+                        "does not divide by tp_size=%d",
+                        param_name, shard_id, dim, tuple(shard.shape), tp_size,
+                    )
+                    return
+                shard = shard.narrow(dim, per_rank * tp_rank, per_rank)
             dest = param.data.narrow(1, offset, shard.shape[1])
             offset += shard.shape[1]
             if dest.shape != shard.shape:
@@ -191,12 +240,20 @@ class FusedMoEWeightRouter:
         """Hand one logical shard to vLLM's loader, whole or expert by expert.
 
         A 3D ``loaded_weight`` puts ``FusedMoE.weight_loader`` on its ``full_load``
-        branch, which writes all experts in one ``copy_``. That branch assumes the
-        parameter holds every expert, so under expert parallelism -- where the
-        parameter only holds this rank's slice -- fall back to per-expert calls
-        and let the loader map global expert ids to local ones.
+        branch, which writes all experts in one ``copy_``. Two things make that
+        branch wrong unless the layer is entirely unsharded:
+
+        * under expert parallelism the parameter only holds this rank's experts,
+          so global expert ids have to be mapped to local ones;
+        * under tensor parallelism the parameter only holds this rank's slice of
+          the intermediate dim, and ``_load_w13`` / ``_load_w2`` guard their
+          ``tp_rank`` narrowing with ``if not load_full`` -- a full 3D tensor is
+          taken to be pre-sharded and is copied as is.
+
+        So for either kind of sharding, send 2D per-expert tensors and let the
+        loader do the narrowing it already knows how to do.
         """
-        if self._ep_size(module) == 1:
+        if self._ep_size(module) == 1 and self._tp_size(module) == 1:
             ok = module.weight_loader(
                 param, shard, param_name, shard_id=shard_id, expert_id=0,
                 return_success=True,
@@ -221,8 +278,8 @@ class FusedMoEWeightRouter:
             )
         if not loaded_any:
             raise RuntimeError(
-                f"no expert of the {shard_id} shard of {param_name} was local to "
-                "this rank; the expert-parallel map and the sent tensor disagree"
+                f"no expert of the {shard_id} shard of {param_name} was accepted "
+                "by this rank; the parallel map and the sent tensor disagree"
             )
 
     @staticmethod
@@ -239,6 +296,21 @@ class FusedMoEWeightRouter:
         return FusedMoEWeightRouter._parallel_size(module, "tp_size")
 
     @staticmethod
+    def _tp_rank(module: torch.nn.Module) -> int:
+        """This rank's index inside the layer's TP group.
+
+        vLLM reads it as ``moe_config.tp_rank`` while the sizes live on
+        ``moe_config.moe_parallel_config``, so check both holders.
+        """
+        moe_config = getattr(module, "moe_config", None)
+        parallel = getattr(moe_config, "moe_parallel_config", None)
+        for holder in (parallel, moe_config):
+            value = getattr(holder, "tp_rank", None)
+            if value is not None:
+                return int(value)
+        return 0
+
+    @staticmethod
     def _parallel_size(module: torch.nn.Module, attr: str) -> int:
         moe_config = getattr(module, "moe_config", None)
         parallel = getattr(moe_config, "moe_parallel_config", None)
@@ -246,7 +318,11 @@ class FusedMoEWeightRouter:
 
 
 def assert_weight_sync_coverage(
-    model: torch.nn.Module, loaded: Iterable[str], *, context: str = "ipc"
+    model: torch.nn.Module,
+    loaded: Iterable[str],
+    *,
+    context: str = "ipc",
+    default_mode: str = "error",
 ) -> None:
     """Fail loudly when a weight sync left parameters at their previous values.
 
@@ -256,9 +332,11 @@ def assert_weight_sync_coverage(
     train/rollout divergence, not a crash. Comparing the loaded set against
     ``named_parameters`` turns that into an immediate error.
 
-    ``LUMENRL_WEIGHT_SYNC_CHECK`` selects ``error`` (default), ``warn`` or ``off``.
+    ``LUMENRL_WEIGHT_SYNC_CHECK`` selects ``error``, ``warn`` or ``off``, and
+    overrides ``default_mode``. Callers whose loaded-name set is not known to be
+    directly comparable to ``named_parameters`` pass ``default_mode="warn"``.
     """
-    mode = os.environ.get("LUMENRL_WEIGHT_SYNC_CHECK", "error").lower()
+    mode = os.environ.get("LUMENRL_WEIGHT_SYNC_CHECK", default_mode).lower()
     if mode == "off":
         return
 
