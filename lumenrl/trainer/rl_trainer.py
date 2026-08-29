@@ -38,17 +38,6 @@ from lumenrl.workers import LumenActorWorker, RefPolicyWorker
 logger = logging.getLogger(__name__)
 LUMENRL_DEBUG = os.environ.get("LUMENRL_DEBUG", "0") in ("1", "true", "True")
 
-# verl's DAPO math prompt. ``lumenrl.rewards.math_reward.compute_score`` is a
-# port of verl's ``math_dapo`` scorer, which grades only the last ``Answer:``
-# line — it is paired with this template upstream, so datasets that ship a bare
-# question (``problem``, ``question``) must be wrapped in it to be gradeable.
-_MATH_ANSWER_FORMAT_PROMPT = (
-    "Solve the following math problem step by step. The last line of your "
-    "response should be of the form Answer: $ANSWER (without quotes) where "
-    "$ANSWER is the answer to the problem.\n\n{question}\n\n"
-    'Remember to put your answer on its own line after "Answer:".'
-)
-
 
 def _algo_num_generations(config: LumenRLConfig) -> int:
     name = config.algorithm.name.lower()
@@ -57,6 +46,43 @@ def _algo_num_generations(config: LumenRLConfig) -> int:
     if name == "dapo":
         return int(config.algorithm.dapo.num_generations)
     return int(config.algorithm.grpo.num_generations)
+
+
+def _response_token_ids(
+    sequence: torch.Tensor,
+    attention_mask: torch.Tensor,
+    prompt_length: int,
+) -> torch.Tensor:
+    """Return response IDs from a left- or right-padded rollout row."""
+    real_positions = attention_mask.nonzero(as_tuple=True)[0]
+    if real_positions.numel() == 0:
+        return sequence[:0]
+    response_start = int(real_positions[0].item()) + int(prompt_length)
+    real_end = int(real_positions[-1].item()) + 1
+    return sequence[min(response_start, real_end):real_end]
+
+
+def _format_chat_prompt(tokenizer: Any, messages: list[dict[str, Any]]) -> str:
+    """Format chat messages without silently dropping model turn markers."""
+    if getattr(tokenizer, "chat_template", None):
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+
+    convert_token = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if callable(convert_token):
+        user_id = convert_token("<｜User｜>")
+        assistant_id = convert_token("<｜Assistant｜>")
+        if user_id is not None and assistant_id is not None:
+            # DeepSeek-V4 intentionally ships a Python encoder rather than a
+            # Jinja chat template. vLLM carries the model's reference encoder.
+            from vllm.tokenizers.deepseek_v4_encoding import encode_messages
+
+            return encode_messages(messages, thinking_mode="thinking")
+
+    return tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True,
+    )
 
 
 class RLTrainer:
@@ -140,24 +166,6 @@ class RLTrainer:
         if self._use_ray_controller:
             self._setup_ray_controller()
             return
-
-        # Single-process launch (`python examples/run_grpo.py`, no torchrun):
-        # FSDP2 needs a process group to wrap the model, and without the wrapper
-        # its MixedPrecisionPolicy never casts params, leaving an fp32 forward
-        # that the fused attention kernels reject. Bootstrap a 1-rank group so
-        # this path matches `torchrun --nproc_per_node=1`.
-        if not torch.distributed.is_initialized() and torch.cuda.is_available():
-            os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-            os.environ.setdefault("MASTER_PORT", "29500")
-            os.environ.setdefault("RANK", "0")
-            os.environ.setdefault("WORLD_SIZE", "1")
-            os.environ.setdefault("LOCAL_RANK", "0")
-            torch.cuda.set_device(self._device)
-            torch.distributed.init_process_group(backend="nccl")
-            self._is_distributed = True
-            self._rank = torch.distributed.get_rank()
-            self._world_size = torch.distributed.get_world_size()
-            logger.info("Bootstrapped single-rank process group (non-torchrun launch).")
 
         quant = {}
         tq = self.config.quantization.training
@@ -395,15 +403,19 @@ class RLTrainer:
         )
 
     def _compute_actor_mp(self) -> int:
-        """Total model-parallel size (TP x PP x CP) of the actor engine (Megatron
-        native path only).
+        """Total model-parallel size (TP x PP x CP) of a Megatron actor.
 
-        FSDP is pure DP (mp=1). The Megatron-Native engine consumes
+        FSDP is pure DP (mp=1). Megatron actor engines consume
         ``megatron_cfg.tensor_model_parallel_size`` /
         ``pipeline_model_parallel_size`` / ``context_parallel_size``.
         """
         backend = str(getattr(self.config.policy, "training_backend", "")).lower()
-        if backend not in ("megatron_native", "megatron-native", "megatron"):
+        if backend not in (
+            "megatron_native",
+            "megatron-native",
+            "megatron",
+            "megatron_lumen_dsv4",
+        ):
             return 1
         try:
             meg = self.config.policy.training.megatron_cfg
@@ -419,22 +431,29 @@ class RLTrainer:
         from lumenrl.engine.inference.vllm_http_engine import VLLMHttpEngine
         from lumenrl.engine.inference.vllm_ray_server import VLLMReplicaManager
 
+        self.config.weight_sync.validate_fp8_quantization_location(
+            getattr(vcfg, "quantization", None),
+        )
         seed = self.config.seed if getattr(vcfg, "seed", None) is None else vcfg.seed
-        # One engine per TP group of actors; TP=1 is the original layout of one
-        # engine per GPU. See VLLMReplicaManager for the grouping contract.
-        tp = max(1, int(getattr(vcfg, "tensor_parallel_size", 1) or 1))
+        tp = int(getattr(vcfg, "tensor_parallel_size", 1) or 1)
         engine_kwargs: dict[str, Any] = dict(
             tensor_parallel_size=tp,
             gpu_memory_utilization=float(vcfg.gpu_memory_utilization),
             dtype=str(vcfg.dtype),
             enforce_eager=bool(vcfg.enforce_eager),
+            disable_custom_all_reduce=bool(vcfg.disable_custom_all_reduce),
             enable_chunked_prefill=bool(vcfg.enable_chunked_prefill),
+            enable_prefix_caching=bool(vcfg.enable_prefix_caching),
             max_num_batched_tokens=int(vcfg.max_num_batched_tokens),
             max_num_seqs=int(vcfg.max_num_seqs),
             trust_remote_code=bool(vcfg.trust_remote_code),
             enable_sleep_mode=bool(vcfg.enable_sleep_mode),
             disable_log_stats=True,
         )
+        if str(vcfg.moe_backend) != "auto":
+            engine_kwargs["moe_backend"] = str(vcfg.moe_backend)
+        if str(vcfg.linear_backend) != "auto":
+            engine_kwargs["linear_backend"] = str(vcfg.linear_backend)
         if bool(getattr(self.config.moe.r3, "enabled", False)):
             # Patched vLLM/MILES captures [seq_len-1, num_layers, top_k]
             # expert ids on the rollout engine. Fail-fast validation happens
@@ -446,17 +465,6 @@ class RLTrainer:
             engine_kwargs["kv_cache_dtype"] = str(vcfg.kv_cache_dtype)
         if vcfg.quantization:
             engine_kwargs["quantization"] = str(vcfg.quantization)
-        if getattr(vcfg, "moe_backend", ""):
-            engine_kwargs["moe_backend"] = str(vcfg.moe_backend)
-        if tp > 1:
-            # The colocated path needs NCCL_CUMEM_ENABLE=0 for the CUDA-IPC weight
-            # sync, and vLLM's custom all-reduce allocates its shared buffers
-            # through cuMem: with both on, every TP worker dies in
-            # create_shared_buffer ("HIP error: invalid argument", surfacing as
-            # 'CustomAllreduce' object has no attribute '_ptr'). pynccl handles the
-            # intra-node all-reduce instead. TP=1 has no all-reduce, so leave its
-            # engine args untouched.
-            engine_kwargs["disable_custom_all_reduce"] = True
         if self._r3_rollout_replay:
             # makes the engine attach the selected expert ids to every completion
             engine_kwargs["enable_return_routed_experts"] = True
@@ -472,7 +480,6 @@ class RLTrainer:
             start_http=bool(vcfg.ray_http_start_server),
             max_concurrency=max(8, int(vcfg.max_num_seqs)),
             base_seed=(int(seed) if seed is not None else None),
-            tensor_parallel_size=tp,
         )
         mgr.create()
         self._ray_rollout_mgr = mgr
@@ -712,18 +719,15 @@ class RLTrainer:
         return sp
 
     def _ray_eval_sampling_params(self) -> dict[str, Any]:
-        """verl-aligned validation sampling params.
-
-        Matches verl rollout.val_kwargs defaults: do_sample=false,
-        temperature=0, top_p=1.0, top_k=-1, n=1.
-        """
+        """Validation sampling params, independently configurable from rollout."""
+        ecfg = self.config.eval
         max_resp = int(getattr(self.config.policy, "max_response_length", 0) or 0)
         max_total = int(getattr(self.config.policy, "max_total_sequence_length", 0) or 0)
         return {
             "max_tokens": max_resp if max_resp > 0 else max(128, max_total // 2),
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "top_k": -1,
+            "temperature": float(getattr(ecfg, "temperature", 0.0)),
+            "top_p": float(getattr(ecfg, "top_p", 1.0)),
+            "top_k": int(getattr(ecfg, "top_k", -1)),
         }
 
     def _sync_weights_ipc(self) -> None:
@@ -799,20 +803,31 @@ class RLTrainer:
 
         version = int(self.global_step) + 1
         cfg = self.config.weight_sync
+        fp8_sync = cfg.resolve_fp8_quantize()
         started = time.perf_counter()
         recv_refs = mgr.start_receive_weights_rdma(
             version=version,
             verify_full_load=bool(cfg.verify_full_load),
+            prequantized_fp8=fp8_sync,
         )
         send_refs = self._actor_wg.execute_all_async(
             "send_weights_rdma",
             version=version,
             bucket_size_mb=int(cfg.bucket_size_mb),
+            fp8_quantize=fp8_sync,
+            integrity_check=(
+                os.environ.get("LUMENRL_WEIGHT_SYNC_INTEGRITY", "0") == "1"
+            ),
         )
         results = ray.get(
             send_refs + recv_refs,
             timeout=float(cfg.timeout_s),
         )
+        self._last_weight_sync_integrity = [
+            result.get("integrity")
+            for result in results[len(send_refs):]
+            if isinstance(result, dict)
+        ]
         sender = next(
             (x for x in results[: len(send_refs)] if x.get("writer")),
             None,
@@ -827,16 +842,18 @@ class RLTrainer:
             "weight_sync/buckets": float(sender.get("buckets", 0.0)),
             "weight_sync/version": float(version),
             "weight_sync/backend_rdma": 1.0,
+            "weight_sync/fp8_trainer_quantized": float(fp8_sync),
         }
         logger.info(
             "RDMA weight sync committed: version=%d buckets=%d bytes=%.1fGB "
-            "broadcast=%.2fs effective=%.2fGb/s total=%.2fs",
+            "broadcast=%.2fs effective=%.2fGb/s total=%.2fs fp8_location=%s",
             version,
             int(sender.get("buckets", 0)),
             float(sender.get("bytes", 0)) / 1e9,
             float(sender.get("seconds", 0)),
             float(sender.get("gbps", 0)),
             total_s,
+            "trainer" if fp8_sync else "inference",
         )
         if sleeping:
             rollout_engine.wake(tags=["kv_cache"])
@@ -866,7 +883,7 @@ class RLTrainer:
         )
         export_meta = export_results[0]
 
-        orig = self._resolve_model_dir()
+        orig = Path(self.config.policy.model_name)
         for fname in ["config.json", "tokenizer_config.json", "tokenizer.json",
                       "special_tokens_map.json", "generation_config.json"]:
             src = orig / fname
@@ -1021,7 +1038,12 @@ class RLTrainer:
             spawned = fused_wg.spawn(["actor", "ref"])
             self._actor_wg = spawned["actor"]
             self._ref_wg = spawned["ref"]
-            self._actor_wg.call_all("init_model")
+            self._actor_wg.call_all(
+                "init_model",
+                forward_only=(
+                    os.environ.get("LUMENRL_FORWARD_ONLY_INIT", "0") == "1"
+                ),
+            )
             self._ref_wg.call_all("init_model")
             self._actor_wg.setup_dispatch_collect_info()
             self._ref_wg.setup_dispatch_collect_info()
@@ -1036,7 +1058,12 @@ class RLTrainer:
             )
             self._actor_wg.start()
             self._rendezvous_ray_group(self._actor_wg)
-            self._actor_wg.call_all("init_model")
+            self._actor_wg.call_all(
+                "init_model",
+                forward_only=(
+                    os.environ.get("LUMENRL_FORWARD_ONLY_INIT", "0") == "1"
+                ),
+            )
             self._actor_wg.setup_dispatch_collect_info()
 
         # Megatron model-parallel (TP/PP/CP): the actor world is a
@@ -1079,6 +1106,18 @@ class RLTrainer:
             self._ref_wg.call_all("init_model")
             self._ref_wg.setup_dispatch_collect_info()
 
+        if os.environ.get("LUMENRL_SKIP_ROLLOUT_INIT", "0") == "1":
+            self._ray_use_vllm = False
+            self._ray_use_atom = False
+            self._ray_rollout_mgr = None
+            self._ray_vllm_engine = None
+            self._atom_engine = None
+            logger.info(
+                "Actor-only diagnostic setup: skipped tokenizer, rollout "
+                "engine, and datasets"
+            )
+            return
+
         from transformers import AutoTokenizer
         self._tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         if self._tokenizer.pad_token is None:
@@ -1100,6 +1139,9 @@ class RLTrainer:
         else:
             from lumenrl.engine.inference.atom_engine import AtomEngine
             self._atom_engine = AtomEngine(config=atom_cfg, model_name=model_name)
+        if os.environ.get("LUMENRL_SKIP_DATASET_INIT", "0") == "1":
+            logger.info("Diagnostic setup: skipped train and validation datasets")
+            return
         self._load_dataset()
 
         # ---- Validation dataset ----
@@ -1408,7 +1450,12 @@ class RLTrainer:
             gts.append(gt)
         return prompts, gts
 
-    def _extract_prompt_gt(self, s: dict) -> tuple[str, str]:
+    def _extract_prompt_gt(
+        self,
+        s: dict,
+        *,
+        ensure_answer_format: bool = False,
+    ) -> tuple[str, str]:
         """Extract (prompt_text, ground_truth) from a dataset row.
 
         Shared by training (`_get_prompts_range`) and validation so the chat
@@ -1417,27 +1464,20 @@ class RLTrainer:
         """
         import json as _json
 
-        prompt_raw = s.get("prompt") or s.get("question") or s.get("input") or s.get("problem") or ""
+        prompt_raw = s.get("prompt") or s.get("question") or s.get("input") or ""
+        prompt_messages = None
         if isinstance(prompt_raw, list):
+            prompt_messages = prompt_raw
             prompt_text = "\n".join(m.get("content", "") for m in prompt_raw if isinstance(m, dict))
         elif isinstance(prompt_raw, str) and prompt_raw.startswith("["):
             try:
                 msgs = _json.loads(prompt_raw)
+                prompt_messages = msgs if isinstance(msgs, list) else None
                 prompt_text = "\n".join(m.get("content", "") for m in msgs if isinstance(m, dict))
             except (_json.JSONDecodeError, TypeError):
                 prompt_text = prompt_raw
         else:
             prompt_text = str(prompt_raw)
-
-        # Validate here, before the instruction template is injected below —
-        # afterwards every prompt is non-empty regardless of the dataset, so a
-        # later check would never fire.
-        if not prompt_text.strip():
-            raise ValueError(
-                "Dataset row produced an empty prompt: no recognized prompt "
-                f"column in {list(s.keys())}. Expected one of "
-                "'prompt'/'question'/'input'/'problem'."
-            )
 
         rm_raw = s.get("reward_model", {})
         if isinstance(rm_raw, str):
@@ -1448,30 +1488,32 @@ class RLTrainer:
         if isinstance(rm_raw, dict) and rm_raw.get("ground_truth", "") != "":
             gt = rm_raw.get("ground_truth", "")
         else:
-            gt = s.get("answer") or s.get("solution") or s.get("target") or s.get("expected_answer") or ""
+            gt = (
+                s.get("answer")
+                or s.get("solution")
+                or s.get("target")
+                or s.get("label")
+                or ""
+            )
 
-        if self._tokenizer is not None and hasattr(self._tokenizer, "apply_chat_template"):
-            if isinstance(prompt_raw, list):
-                try:
-                    prompt_text = self._tokenizer.apply_chat_template(
-                        prompt_raw, tokenize=False, add_generation_prompt=True,
-                    )
-                except Exception:
-                    pass
-            else:
-                # Bare question text (e.g. OpenMathInstruct-2's ``problem``): the
-                # scorer only accepts an ``Answer:`` line, so the prompt has to
-                # ask for one. Wrap in the verl DAPO instruction and render it
-                # through the chat template, which also gives the model a stop
-                # token instead of rambling to the length cap.
-                prompt_text = _MATH_ANSWER_FORMAT_PROMPT.format(question=prompt_text)
-                try:
-                    prompt_text = self._tokenizer.apply_chat_template(
-                        [{"role": "user", "content": prompt_text}],
-                        tokenize=False, add_generation_prompt=True,
-                    )
-                except Exception:
-                    pass
+        if ensure_answer_format and prompt_messages is not None:
+            prompt_messages = [
+                dict(message) if isinstance(message, dict) else message
+                for message in prompt_messages
+            ]
+            for message in reversed(prompt_messages):
+                if isinstance(message, dict) and message.get("role") == "user":
+                    content = str(message.get("content", ""))
+                    if "Answer:" not in content:
+                        message["content"] = (
+                            content
+                            + "\n\nPut the final answer on its own line as: "
+                            + r"Answer: \boxed{answer}."
+                        )
+                    break
+
+        if self._tokenizer is not None and prompt_messages is not None:
+            prompt_text = _format_chat_prompt(self._tokenizer, prompt_messages)
 
         return prompt_text, str(gt)
 
@@ -1534,23 +1576,6 @@ class RLTrainer:
             for k, v in state.items():
                 if isinstance(v, torch.Tensor) and v.device.type == "cpu":
                     state[k] = v.to(self._device, non_blocking=True)
-
-    def _resolve_model_dir(self) -> Path:
-        """Local directory holding the base model's config/tokenizer files.
-
-        ``policy.model_name`` is often a hub ID (``Qwen/Qwen3-0.6B``) rather than
-        a path, in which case those files live in the HF cache snapshot. The
-        weights are already downloaded by this point, so this resolves offline.
-        """
-        path = Path(self.config.policy.model_name)
-        if path.is_dir():
-            return path
-        from huggingface_hub import snapshot_download
-
-        return Path(snapshot_download(
-            self.config.policy.model_name,
-            allow_patterns=["*.json", "*.txt", "*.model"],
-        ))
 
     def _sync_weights_to_atom(self) -> None:
         """Push updated FSDP2 weights to ATOM engine for next rollout.
@@ -1621,18 +1646,13 @@ class RLTrainer:
                 json.dumps(index, indent=2)
             )
 
-            orig = self._resolve_model_dir()
+            orig = Path(self.config.policy.model_name)
             for fname in ["config.json", "tokenizer_config.json", "tokenizer.json",
                           "special_tokens_map.json", "generation_config.json",
                           "vocab.json", "merges.txt"]:
                 src = orig / fname
                 if src.exists():
                     shutil.copy2(str(src), str(sync_dir / fname))
-            if not (sync_dir / "config.json").exists():
-                raise FileNotFoundError(
-                    f"Weight sync: no config.json found in {orig}; the rollout "
-                    f"engine cannot load {sync_dir}."
-                )
 
             save_time = time.time() - t0
             logger.info(
@@ -1833,9 +1853,7 @@ class RLTrainer:
         max_tok = max_resp if max_resp > 0 else max(128, max_total // 2)
 
         if eval_mode:
-            # Validation sampling aligned with verl val_kwargs
-            # (temperature=0.6, top_p=1.0, top_k=-1, n=1); no rollout log-probs.
-            sp: dict[str, Any] = {"max_tokens": max_tok, "temperature": 0.6, "top_p": 1.0, "top_k": -1}
+            sp = self._ray_eval_sampling_params()
         else:
             sp = {
                 "max_tokens": max_tok,
@@ -2042,6 +2060,7 @@ class RLTrainer:
     def _compute_rewards_full(
         self,
         sequences: torch.Tensor,
+        attention_mask: torch.Tensor,
         prompt_lengths: list[int],
         gts_expanded: list[str],
     ) -> tuple[torch.Tensor, list[str], list[float]]:
@@ -2055,11 +2074,15 @@ class RLTrainer:
 
         N = int(sequences.shape[0])
         responses: list[str] = []
+        response_lengths: list[int] = []
         if self._rank == 0:
             seq_cpu = sequences.cpu()
+            mask_cpu = attention_mask.cpu()
             for i in range(N):
                 plen = int(prompt_lengths[i]) if i < len(prompt_lengths) else 0
-                text = self._tokenizer.decode(seq_cpu[i, plen:], skip_special_tokens=True)
+                response_ids = _response_token_ids(seq_cpu[i], mask_cpu[i], plen)
+                response_lengths.append(int(response_ids.numel()))
+                text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
                 responses.append(text)
             rewards_t, details = compute_math_reward(responses, gts_expanded)
             rewards = rewards_t.to(self._device)
@@ -2069,6 +2092,39 @@ class RLTrainer:
             )
             acc_frac = float(accs.mean().item()) if N else 0.0
             logger.info("Rollout reward: N=%d accuracy=%.4f mean=%.4f", N, acc_frac, float(rewards.mean().item()))
+            max_response_length = int(
+                getattr(self.config.policy, "max_response_length", 0) or 0
+            )
+            cap_hits = sum(
+                length >= max_response_length
+                for length in response_lengths
+            ) if max_response_length > 0 else 0
+            invalid = sum(
+                detail.get("pred") == "[INVALID]" for detail in details
+            )
+            mean_length = (
+                sum(response_lengths) / len(response_lengths)
+                if response_lengths else 0.0
+            )
+            logger.info(
+                "Rollout response diagnostics: tokens_mean=%.1f tokens_max=%d "
+                "cap_hits=%d/%d invalid_format=%d/%d",
+                mean_length,
+                max(response_lengths, default=0),
+                cap_hits,
+                N,
+                invalid,
+                N,
+            )
+            for idx in range(min(2, len(responses), len(details))):
+                logger.info(
+                    "Rollout sample[%d]: tokens=%d pred=%r gt=%r tail=%r",
+                    idx,
+                    response_lengths[idx],
+                    details[idx].get("pred", "N/A"),
+                    gts_expanded[idx] if idx < len(gts_expanded) else "?",
+                    responses[idx][-400:],
+                )
         else:
             rewards = torch.zeros(N, dtype=torch.float32, device=self._device)
             accs = torch.zeros(N, dtype=torch.float32, device=self._device)
@@ -2136,7 +2192,7 @@ class RLTrainer:
                             list(seqs.shape), list(mask.shape), list(plen.shape) if hasattr(plen, 'shape') else len(plen),
                             list(lp.shape) if lp is not None else None)
             gts_exp = [gt for gt in gts for _ in range(g)]
-            rewards, responses, _accs = self._compute_rewards_full(seqs, plen, gts_exp)
+            rewards, responses, _accs = self._compute_rewards_full(seqs, mask, plen, gts_exp)
             if LUMENRL_DEBUG:
                 _acc_mean = float(torch.tensor(_accs).float().mean()) if _accs is not None and len(_accs) > 0 else -1.0
                 logger.info("[DBG] _collect_rollout: rewards=%s  acc_mean=%.4f  nonzero_reward=%d/%d",
@@ -2166,7 +2222,7 @@ class RLTrainer:
             self._prompt_cursor += gen_prompts
             seqs, mask, plen, lp, rag = _one_round(prompts)
             gts_exp = [gt for gt in gts for _ in range(g)]
-            rewards, _responses, accs = self._compute_rewards_full(seqs, plen, gts_exp)
+            rewards, _responses, accs = self._compute_rewards_full(seqs, mask, plen, gts_exp)
 
             uids = [i // g for i in range(seqs.shape[0])]
             keep_mask, kept_uids = filter_groups_keep_mask(accs, uids)
@@ -2222,9 +2278,11 @@ class RLTrainer:
         responses: list[str] = []
         if self._rank == 0:
             seq_cpu = sequences.cpu()
+            mask_cpu = seq_mask.cpu()
             for i in range(sequences.shape[0]):
                 plen = prompt_lengths[i] if i < len(prompt_lengths) else 0
-                responses.append(self._tokenizer.decode(seq_cpu[i, plen:], skip_special_tokens=True))
+                response_ids = _response_token_ids(seq_cpu[i], mask_cpu[i], plen)
+                responses.append(self._tokenizer.decode(response_ids, skip_special_tokens=True))
 
         return sequences, seq_mask, prompt_lengths, rewards, responses, gts_exp, rollout_lp, ragged
 
@@ -2522,6 +2580,7 @@ class RLTrainer:
     def _compute_rewards(
         self,
         sequences: torch.Tensor,
+        attention_mask: torch.Tensor,
         prompt_lengths: list[int],
         ground_truths: list[str],
         num_generations: int,
@@ -2531,10 +2590,15 @@ class RLTrainer:
         Returns rewards on ``self._device`` to avoid a CPU round-trip.
         """
         seq_cpu = sequences.cpu() if sequences.device.type != "cpu" else sequences
+        mask_cpu = (
+            attention_mask.cpu()
+            if attention_mask.device.type != "cpu"
+            else attention_mask
+        )
         responses = []
         for i in range(seq_cpu.shape[0]):
             plen = prompt_lengths[i]
-            response_ids = seq_cpu[i, plen:]
+            response_ids = _response_token_ids(seq_cpu[i], mask_cpu[i], plen)
             text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
             responses.append(text)
 
@@ -3364,7 +3428,6 @@ class RLTrainer:
                                     self._optimizer.step()
                             grad_norm += _gn  # mean over optimizer steps (verl-aligned)
                             optimizer_steps += 1
-                        self._profiler.step()
                         continue
                     _nan_cnt = 0
                     _total_cnt = 0
@@ -3397,7 +3460,6 @@ class RLTrainer:
                         if v == v:
                             metrics_accum[k] = metrics_accum.get(k, 0.0) + v
                     step_count += 1
-                    self._profiler.step()
 
             if _do_engine_step:
                 self._engine.optimizer_zero_grad()
@@ -3651,11 +3713,41 @@ class RLTrainer:
         if seq_sum is not None and n_seq:
             metrics["mismatch/chi2_seq"] = seq_sum / max(n_seq, 1e-6)
 
+    @staticmethod
+    def _mismatch_by_response_position(
+        old_log_probs: torch.Tensor,
+        rollout_log_probs: torch.Tensor,
+        response_mask: torch.Tensor,
+        *,
+        bucket_edges: tuple[int, ...] = (128, 512, 1024, 2048, 4096),
+    ) -> dict[str, float]:
+        """Measure rollout/train drift in response-relative position buckets."""
+        mask = response_mask.bool()
+        positions = response_mask.long().cumsum(dim=-1) - 1
+        delta = rollout_log_probs.float() - old_log_probs.float()
+        metrics: dict[str, float] = {}
+        start = 0
+        for end in bucket_edges:
+            selected = mask & (positions >= start) & (positions < end)
+            tokens = int(selected.sum().item())
+            if tokens:
+                values = delta[selected]
+                log_ratio = -values
+                k3 = torch.exp(log_ratio.clamp(-10.0, 10.0)) - log_ratio - 1.0
+                prefix = f"rollout_corr/pos_{start}_{end - 1}"
+                metrics[f"{prefix}/tokens"] = float(tokens)
+                metrics[f"{prefix}/kl"] = float(values.mean())
+                metrics[f"{prefix}/abs_diff"] = float(values.abs().mean())
+                metrics[f"{prefix}/k3_kl"] = float(k3.mean())
+            start = end
+        return metrics
+
     def _update_actor_with_ray(self, batch: DataProto) -> dict[str, float]:
         if self._actor_wg is None:
             raise RuntimeError("Ray actor worker group is not initialized.")
         actor_role_cfg = self.config.controller.ray.actor
         n = self._actor_wg.num_workers
+        batch.meta.setdefault("global_batch_size", batch.batch_size)
         self._balance_rows_across_workers(batch, n)
 
         import ray
@@ -3923,29 +4015,11 @@ class RLTrainer:
             reward_t0 = time.time()
             if rewards is None:
                 rewards, responses = self._compute_rewards(
-                    sequences, prompt_lengths, ground_truths, num_generations,
+                    sequences, seq_mask, prompt_lengths, ground_truths, num_generations,
                 )
             reward_time = time.time() - reward_t0
             response_mask = self._build_response_mask(sequences, seq_mask, prompt_lengths)
             response_lengths = [int(response_mask[i].sum().item()) for i in range(response_mask.shape[0])]
-
-            # Opt-in diagnostic: dump the two per-token log-prob tensors that
-            # rollout_corr/kl is reduced from, so the trainer/rollout gap can be
-            # examined as a distribution instead of a single mean. A few tokens
-            # with huge errors means the two engines routed to different experts;
-            # a uniform shift across all tokens means a kernel-level numeric gap.
-            _dump = os.environ.get("LUMENRL_DUMP_LOGPROB_GAP")
-            if _dump and rollout_lp is not None and self._rank == 0:
-                torch.save(
-                    {
-                        "old_log_probs": old_log_probs.detach().float().cpu(),
-                        "rollout_log_probs": rollout_lp.detach().float().cpu(),
-                        "response_mask": response_mask.detach().cpu(),
-                        "step": int(step),
-                    },
-                    f"{_dump}/logprob_gap_step{step}.pt",
-                )
-                logger.info("dumped per-token log-prob gap for step %d to %s", step, _dump)
 
             tensors = {
                 "input_ids": sequences,
@@ -3990,11 +4064,17 @@ class RLTrainer:
 
             # --- Extended rollout correction: IS weights + RS (Ray path) ---
             _rc_metrics_ray = {}
+            _position_mismatch_metrics = {}
             _rlp_ray = batch.tensors.get("rollout_log_probs", batch.tensors.get("fp8_logprobs"))
             _rc_want_ray = (_rc_cfg_ray.rollout_is or _rc_cfg_ray.rollout_rs or _bypass_ray) and "old_log_probs" in batch.tensors and _rlp_ray is not None
             if _rc_want_ray:
                 from lumenrl.algorithms.rollout_correction import compute_rollout_correction_and_add_to_batch
                 batch, _rc_metrics_ray = compute_rollout_correction_and_add_to_batch(batch, _rc_cfg_ray)
+                _position_mismatch_metrics = self._mismatch_by_response_position(
+                    old_log_probs,
+                    _rlp_ray,
+                    response_mask,
+                )
             adv_time = time.time() - adv_t0
 
             if use_ray_rollout:
@@ -4031,6 +4111,8 @@ class RLTrainer:
 
             if _rc_metrics_ray:
                 metrics.update(_rc_metrics_ray)
+            if _position_mismatch_metrics:
+                metrics.update(_position_mismatch_metrics)
 
             total_tok = int(seq_mask.sum().item())
             prompt_tok = int(sum(prompt_lengths))
@@ -4064,10 +4146,11 @@ class RLTrainer:
 
             # ---- weight sync to rollout engine ----
             t_sync = time.time()
-            if use_ray_rollout:
-                self._sync_weights_ipc()   # wake weights -> ZMQ IPC -> wake KV
-            else:
-                self._sync_rollout_weights()
+            if getattr(self.config.weight_sync, "enabled", True):
+                if use_ray_rollout:
+                    self._sync_weights_ipc()   # wake weights -> ZMQ IPC -> wake KV
+                else:
+                    self._sync_rollout_weights()
             sync_time = time.time() - t_sync
             if sync_time > 1.0:
                 metrics["timing/weight_sync_s"] = sync_time
@@ -4123,9 +4206,9 @@ class RLTrainer:
             self._sync_weights_to_atom()
 
     def run_validation(self) -> dict[str, float]:
-        """Evaluate on the validation set with greedy decoding.
+        """Evaluate on the validation set with configured sampling.
 
-        Reports verl-style ``val-core/acc/mean@1`` (fraction correct) plus mean
+        Reports ``val-core/acc/mean@N`` (fraction correct) plus mean
         reward and response length. Generation is colocated (rank 0 generates via
         the inference engine, broadcast to all ranks) so every rank computes
         identical metrics. ``eval.num_samples <= 0`` evaluates the full val set,
@@ -4142,6 +4225,8 @@ class RLTrainer:
             num_samples = min(num_samples, cap)
         val_bs_cfg = int(getattr(self.config, "val_batch_size", 16) or 0)
         val_bs = num_samples if val_bs_cfg <= 0 else max(1, val_bs_cfg)
+        eval_n = max(1, int(getattr(self.config.eval, "num_generations", 1) or 1))
+        eval_sp = self._ray_eval_sampling_params()
 
         all_scores: list[float] = []
         all_acc: list[float] = []
@@ -4150,8 +4235,10 @@ class RLTrainer:
 
         if self._rank == 0:
             logger.info(
-                "[eval] step=%d: evaluating %d val samples (greedy, batch_size=%d)",
-                self.global_step + 1, num_samples, val_bs,
+                "[eval] step=%d: evaluating %d prompts x %d samples "
+                "(temperature=%.3g, top_p=%.3g, batch_size=%d)",
+                self.global_step + 1, num_samples, eval_n,
+                eval_sp["temperature"], eval_sp["top_p"], val_bs,
             )
 
         size_divisor = 1
@@ -4163,7 +4250,7 @@ class RLTrainer:
             samples = [self._val_dataset[idx] for idx in range(start, end)]
             prompts, ground_truths = [], []
             for s in samples:
-                p, gt = self._extract_prompt_gt(s)
+                p, gt = self._extract_prompt_gt(s, ensure_answer_format=True)
                 prompts.append(p)
                 ground_truths.append(gt)
             real_batch = len(prompts)
@@ -4185,29 +4272,37 @@ class RLTrainer:
             # the torchrun _rollout_phase fallback would crash).
             if getattr(self, "_ray_vllm_engine", None) is not None:
                 sequences, seq_mask, prompt_lengths, _, _ = self._rollout_with_ray_vllm(
-                    prompts, num_generations=1, sampling_params=self._ray_eval_sampling_params(),
+                    prompts, num_generations=eval_n, sampling_params=eval_sp,
                 )
             elif self._use_vllm and self._atom_engine is not None:
                 sequences, seq_mask, prompt_lengths, _ = self._rollout_with_vllm(
-                    prompts, num_generations=1, eval_mode=True,
+                    prompts, num_generations=eval_n, eval_mode=True,
                 )
             elif self._use_atom and self._atom_engine is not None:
-                sequences, seq_mask, prompt_lengths = self._rollout_with_atom(prompts, num_generations=1)
+                sequences, seq_mask, prompt_lengths = self._rollout_with_atom(
+                    prompts, num_generations=eval_n
+                )
             else:
                 input_ids, attention_mask = self._tokenize_prompts(prompts)
-                sequences, seq_mask, prompt_lengths = self._rollout_phase(input_ids, attention_mask, num_generations=1)
+                sequences, seq_mask, prompt_lengths = self._rollout_phase(
+                    input_ids, attention_mask, num_generations=eval_n
+                )
 
             # Decode + score (identical on every rank — sequences are broadcast).
             seq_cpu = sequences.cpu()
+            mask_cpu = seq_mask.cpu()
             responses = []
-            keep = max(0, seq_cpu.shape[0] - pad_size)
+            keep = max(0, seq_cpu.shape[0] - pad_size * eval_n)
             seq_cpu = seq_cpu[:keep]
             prompt_lengths = prompt_lengths[:keep]
             seq_mask = seq_mask[:keep]
-            ground_truths = ground_truths[:keep]
+            ground_truths = [
+                ground_truth for ground_truth in ground_truths for _ in range(eval_n)
+            ][:keep]
             for i in range(seq_cpu.shape[0]):
                 plen = int(prompt_lengths[i]) if i < len(prompt_lengths) else 0
-                responses.append(self._tokenizer.decode(seq_cpu[i, plen:], skip_special_tokens=True))
+                response_ids = _response_token_ids(seq_cpu[i], mask_cpu[i], plen)
+                responses.append(self._tokenizer.decode(response_ids, skip_special_tokens=True))
             rewards_t, details = compute_math_reward(responses, ground_truths)
 
             all_scores.extend(rewards_t.tolist())
@@ -4247,10 +4342,10 @@ class RLTrainer:
         lengths_t = torch.tensor(all_response_lengths, dtype=torch.float32)
 
         metrics: dict[str, float] = {
-            "val-core/acc/mean@1": float(acc_t.mean()),
-            "val-core/math_dapo/acc/mean@1": float(acc_t.mean()),
-            "val-aux/math_dapo/reward/mean@1": float(scores_t.mean()),
-            "val-aux/math_dapo/score/mean@1": float(scores_t.mean()),
+            f"val-core/acc/mean@{eval_n}": float(acc_t.mean()),
+            f"val-core/math_dapo/acc/mean@{eval_n}": float(acc_t.mean()),
+            f"val-aux/math_dapo/reward/mean@{eval_n}": float(scores_t.mean()),
+            f"val-aux/math_dapo/score/mean@{eval_n}": float(scores_t.mean()),
             "val-aux/num_turns/max": 1.0,
             "val-aux/num_turns/mean": 1.0,
             "val-aux/num_turns/min": 1.0,
@@ -4272,7 +4367,8 @@ class RLTrainer:
         if self._rank == 0:
             logger.info(
                 "[eval] step=%d acc=%.4f score_mean=%.4f resp_len=%.1f n=%d",
-                self.global_step + 1, metrics["val-core/acc/mean@1"], metrics["val/score_mean"],
+                self.global_step + 1, metrics[f"val-core/acc/mean@{eval_n}"],
+                metrics["val/score_mean"],
                 metrics["val/response_length_mean"], len(all_scores),
             )
             num_print = min(getattr(self.config.logger, "num_val_samples_to_print", 3), len(all_responses))

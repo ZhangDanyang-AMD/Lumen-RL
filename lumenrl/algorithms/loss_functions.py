@@ -165,6 +165,8 @@ def asymmetric_clip_loss(
     batch_num_tokens: Optional[int] = None,
     dp_size: int = 1,
     rollout_is_weights: Optional[Tensor] = None,
+    loss_agg_mode: str = "token-mean",
+    global_batch_size: Optional[int] = None,
 ) -> Tensor:
     """Policy-gradient surrogate with asymmetric ratio clipping (DAPO-style).
 
@@ -192,6 +194,8 @@ def asymmetric_clip_loss(
             training policy and the rollout (e.g. FP8 / vLLM) policy. When
             provided, the per-token PG loss is multiplied by these weights
             *before* aggregation (verl ``pg_losses * rollout_is_weights``).
+        loss_agg_mode: Aggregation mode forwarded to :func:`agg_loss`.
+        global_batch_size: Global sequence count used by sequence-mean modes.
 
     Returns:
         Scalar loss tensor to minimize.
@@ -212,15 +216,22 @@ def asymmetric_clip_loss(
     if rollout_is_weights is not None:
         pg = pg * rollout_is_weights.to(dtype=pg.dtype)
 
-    if mask is not None:
-        w = mask.to(dtype=pg.dtype)
-        pg = torch.where(w.bool(), pg, torch.zeros_like(pg))
-        if batch_num_tokens is not None:
-            # Verl-aligned: normalize by global token count, compensate FSDP all-reduce
-            return pg.sum() / max(batch_num_tokens, 1) * dp_size
-        denom = torch.clamp(w.sum(), min=1.0)
-        return pg.sum() / denom
-    return pg.mean()
+    if mask is None and loss_agg_mode == "token-mean" and batch_num_tokens is None:
+        return pg.mean()
+
+    loss_mask = (
+        mask.to(dtype=pg.dtype)
+        if mask is not None
+        else torch.ones_like(pg, dtype=pg.dtype)
+    )
+    return agg_loss(
+        pg,
+        loss_mask,
+        loss_agg_mode,
+        dp_size=dp_size,
+        batch_num_tokens=batch_num_tokens,
+        global_batch_size=global_batch_size,
+    )
 
 
 def gmpo_loss(

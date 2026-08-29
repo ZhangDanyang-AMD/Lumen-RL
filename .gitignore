@@ -5,7 +5,7 @@ __pycache__/
 *.egg
 dist/
 build/
-.docs/superpowers/
+docs/superpowers/
 .eggs/
 *.so
 .pytest_cache/

@@ -154,6 +154,10 @@ class MegatronConfig:
     # Requires seq length divisible by TP, so it is OFF by default for RL's
     # variable-length forwards (per-sequence / packed thd).
     sequence_parallel: bool = False
+    # DSV4 TileLang indexer launch tuning. MI300X requires block_n=64 and
+    # num_stages=1 to stay within its 64 KiB LDS limit.
+    v4_indexer_block_n: Optional[int] = None
+    v4_indexer_num_stages: Optional[int] = None
     # ---- MoE / Expert Parallel ----
     # ``num_experts`` (a.k.a. num_moe_experts) is auto-detected from the HF config
     # when None; set it explicitly only to override. All the ``moe_*`` knobs below
@@ -194,38 +198,32 @@ class MegatronConfig:
     # Dynamic-batch packing: concat multiple sequences into one packed TE forward.
     enable_dynamic_batch: bool = False
     max_tokens_per_gpu: int = 0                  # per-forward token budget (0 -> 21504)
-    # ---- initial weights from a Megatron dist-checkpoint instead of HF ----
-    # Models whose released checkpoint the HF-safetensors bridge cannot read
-    # (DeepSeek-V4 ships block-quantized FP8) are converted offline to torch_dist
-    # and loaded from here; ``dist_checkpointing.load`` reshards on the way in.
-    # ``model_name`` is then read only for config.json.
+    # Main's native-Megatron initialization controls. Keep these available
+    # without replacing the DSV4 engine's scheduling/offload controls below.
     dist_checkpoint_path: Optional[str] = None
-    # Megatron's ``--deterministic-mode`` has no equivalent here because the
-    # engine has no argument parser, so it is a config field. Costs the fused
-    # kernels; buys run-to-run bitwise reproducibility, without which DSv4 flips
-    # ~1.6% of argmaxes between identical forwards -- which is why ``None`` means
-    # "let the model family decide" and DSv4 decides on.
     deterministic_mode: Optional[bool] = None
-    # Skip the DDP wrapper and the distributed optimizer entirely. For a frozen
-    # reference policy or a forward-only bring-up, that is the FP32 master
-    # weights plus both Adam moments not allocated.
     build_optimizer: bool = True
-    # ---- optimizer state in host memory (Megatron's HybridDeviceOptimizer) ----
-    # Keeps ``optimizer_offload_fraction`` of the FP32 master weights and Adam
-    # moments in pinned host RAM and runs their Adam step on the CPU. Distinct
-    # from ``is_optimizer_offload_enabled``, which moves the whole optimizer
-    # between host and device around each phase; this one is a permanent split.
-    #
-    # It is what makes a model too big for its GPUs trainable at all: the
-    # optimizer is 12 bytes/param against the weights' 2, and it is sharded over
-    # EP x EDP = world_size, so raising EP does not shrink it. Costs a CPU Adam
-    # step per iteration.
+    # Bind each Ray actor to CPUs on the NUMA node local to its assigned GPU.
+    numa_affinity: bool = False
+    # Optimizer CPU offload: move Adam states (exp_avg/exp_avg_sq) to CPU memory.
+    # Frees ~2x model-size GPU memory at the cost of slower optimizer steps.
     optimizer_cpu_offload: bool = False
-    # Fraction moved to the CPU, i.e. 1.0 offloads everything. Megatron's own
-    # dataclass default is 0.0, which would make ``optimizer_cpu_offload`` a
-    # no-op, so this default deliberately differs from it.
-    optimizer_offload_fraction: float = 1.0
+    optimizer_offload_fraction: float = 1.0      # fraction of states to offload (0.0-1.0)
     overlap_cpu_optimizer_d2h_h2d: bool = True
+    # Streaming mode: off | sgd | adam.
+    streamed_optimizer_mode: str = "off"
+    # Positive MiB; validated at DSV4 startup.
+    streamed_optimizer_chunk_size_mib: int = 256
+    # Persistent Adam moment storage; bf16 halves host-memory residency.
+    streamed_optimizer_moment_dtype: str = "fp32"
+    # Let Megatron's optimizer own the FP32 master directly. With full CPU
+    # offload this avoids first materializing another FP32 master on GPU.
+    use_precision_aware_optimizer: bool = False
+    # PP layer distribution: override uniform layer-per-stage split.
+    num_layers_in_first_pipeline_stage: Optional[int] = None
+    num_layers_in_last_pipeline_stage: Optional[int] = None
+    # R3 routing replay (MoE only)
+    moe_enable_routing_replay: bool = False
 
 
 @dataclass
@@ -260,7 +258,11 @@ class VLLMConfig:
     gpu_id: Optional[int] = None
     dtype: str = "bfloat16"
     enforce_eager: bool = True
+    disable_custom_all_reduce: bool = False
+    moe_backend: str = "auto"
+    linear_backend: str = "auto"
     enable_chunked_prefill: bool = True
+    enable_prefix_caching: bool = False
     max_num_batched_tokens: int = 8192
     max_num_seqs: int = 64
     swap_space: int = 4
@@ -357,10 +359,12 @@ class PolicyConfig:
     train_micro_batch_size: int = 8
     max_token_len_per_gpu: int = 0
     ppo_mini_batch_size: int = 0
+    optimizer_type: str = "adamw"
     learning_rate: float = 1e-6
     lr_warmup_steps: int = 10
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
+    sgd_momentum: float = 0.0
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95
     adam_eps: float = 1e-8
@@ -589,7 +593,7 @@ class RolloutCorrectionConfig:
     method: str = "tis"
     clip: float = 1.5
     # IS weights (verl rollout_corr_helper.py)
-    rollout_is: str = ""                # "token" | "sequence" | ""
+    rollout_is: Optional[str] = ""      # "token" | "sequence" | "" | None
     # Thresholds are strings so that a single field can carry either a number
     # or an IcePop "lower_upper" pair / a comma-separated list. YAML written
     # against the older float fields still works: __post_init__ coerces.
@@ -690,6 +694,10 @@ class EvalConfig:
     interval: int = 1000
     num_samples: int = 256
     micro_batch_size: int = 8
+    num_generations: int = 1
+    temperature: float = 0.0
+    top_p: float = 1.0
+    top_k: int = -1
 
 
 @dataclass
@@ -764,6 +772,7 @@ class RDMAWeightSyncConfig:
 class WeightSyncConfig:
     """Policy weight transport between separated training and rollout nodes."""
 
+    enabled: bool = True
     # auto preserves the legacy selection; production choices are
     # shared_folder and rdma.
     backend: str = "auto"  # auto | shared_folder | rdma
@@ -771,7 +780,46 @@ class WeightSyncConfig:
     bucket_size_mb: int = 1024
     timeout_s: int = 600
     verify_full_load: bool = True
+    fp8_quantize: bool = False  # Quantize BF16 weights to FP8 per-block before sync (halves transfer size)
+    fp8_quantization_location: str | None = None  # trainer | inference; None uses legacy fp8_quantize
     rdma: RDMAWeightSyncConfig = field(default_factory=RDMAWeightSyncConfig)
+
+    def resolve_fp8_quantize(self) -> bool:
+        """Return whether weight-sync copies are quantized on the trainer."""
+        location = self.fp8_quantization_location
+        if location is None:
+            return bool(self.fp8_quantize)
+        if location not in {"trainer", "inference"}:
+            raise ValueError(
+                "weight_sync.fp8_quantization_location must be "
+                f"'trainer' or 'inference', got {location!r}"
+            )
+        if self.fp8_quantize and location != "trainer":
+            raise ValueError(
+                "weight_sync.fp8_quantization_location='inference' conflicts "
+                "with legacy weight_sync.fp8_quantize=true"
+            )
+        return location == "trainer"
+
+    def validate_fp8_quantization_location(
+        self,
+        rollout_quantization: str | None,
+    ) -> None:
+        """Validate cross-component requirements for an explicit FP8 location."""
+        location = self.fp8_quantization_location
+        if location is None and not self.fp8_quantize:
+            return
+        self.resolve_fp8_quantize()
+        if self.backend != "rdma":
+            raise ValueError(
+                "weight_sync.fp8_quantization_location requires "
+                "weight_sync.backend='rdma'"
+            )
+        if rollout_quantization != "fp8_per_block":
+            raise ValueError(
+                "weight_sync.fp8_quantization_location requires "
+                "policy.generation.vllm_cfg.quantization='fp8_per_block'"
+            )
 
 
 @dataclass

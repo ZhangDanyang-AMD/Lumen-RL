@@ -8,7 +8,7 @@ import torch
 from torch import Tensor
 
 from lumenrl.algorithms.base_algorithm import BaseAlgorithm
-from lumenrl.algorithms.loss_functions import kl_penalty, policy_gradient_loss
+from lumenrl.algorithms.loss_functions import asymmetric_clip_loss, kl_penalty
 from lumenrl.core.protocol import DataProto
 from lumenrl.core.registry import ALGORITHM_REGISTRY
 from lumenrl.core.types import AlgorithmName
@@ -50,10 +50,39 @@ class GRPOAlgorithm(BaseAlgorithm):
         old_logp = batch.tensors["old_log_probs"]
         adv = batch.tensors["advantages"]
         mask = _response_mask(batch)
+        rollout_is_weights = batch.tensors.get("rollout_is_weights")
 
         adv_tok = _expand_adv_to_tokens(adv, mask)
-        clip = self._config.algorithm.grpo.clip_ratio
-        pg = policy_gradient_loss(logp, old_logp, adv_tok, clip, mask=mask)
+        clip_low = self._config.algorithm.grpo.clip_ratio
+        clip_high = self._config.algorithm.clip_ratio_high
+        if clip_high is None:
+            clip_high = 0.28
+        loss_agg_mode = self._config.algorithm.loss_agg_mode
+        dp_size = int(batch.meta.get("dp_size", 1) or 1)
+        global_batch_size = int(
+            batch.meta.get("global_batch_size") or batch.batch_size * dp_size
+        )
+        batch_num_tokens = batch.meta.get("batch_num_tokens")
+        if (
+            loss_agg_mode == "token-mean"
+            and batch_num_tokens is None
+            and dp_size > 1
+        ):
+            token_mask = mask if mask is not None else torch.ones_like(logp)
+            batch_num_tokens = int(token_mask.sum().item()) * dp_size
+        pg = asymmetric_clip_loss(
+            logp,
+            old_logp,
+            adv_tok,
+            float(clip_low),
+            float(clip_high),
+            mask=mask,
+            batch_num_tokens=batch_num_tokens,
+            dp_size=dp_size,
+            loss_agg_mode=loss_agg_mode,
+            global_batch_size=global_batch_size,
+            rollout_is_weights=rollout_is_weights,
+        )
 
         loss = pg
         metrics: dict[str, Any] = {"loss_pg": float(pg.detach().cpu())}

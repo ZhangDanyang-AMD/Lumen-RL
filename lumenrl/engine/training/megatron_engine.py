@@ -19,9 +19,15 @@ Supports:
 
 from __future__ import annotations
 
+import hashlib
+import importlib
 import json
 import logging
 import os
+import re
+from collections.abc import Mapping
+from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -35,10 +41,13 @@ from lumenrl.algorithms.loss_functions import (
 )
 from lumenrl.core.protocol import DataProto
 from lumenrl.core.types import AlgorithmName
-from lumenrl.engine.training.base_engine import EngineRegistry
-from lumenrl.engine.training.megatron_base_engine import MegatronBaseEngine
+from lumenrl.engine.training.base_engine import BaseEngine, EngineRegistry
+from lumenrl.engine.training.megatron_base_engine import (
+    _response_mask_is_token_indexed,
+)
 from lumenrl.engine.training.qwen3_megatron_bridge import (
     Qwen3Dims,
+    _pp_layer_range,
     hf_to_megatron,
     load_hf_safetensors,
     megatron_to_hf,
@@ -50,6 +59,326 @@ logger.setLevel(os.getenv("LUMENRL_LOGGING_LEVEL", "INFO"))
 LUMENRL_DEBUG = os.environ.get("LUMENRL_DEBUG", "0") in ("1", "true", "True")
 
 import math  # noqa: E402
+
+
+def _checkpoint_tensor_fingerprints(
+    state: Any,
+    *,
+    chunk_bytes: int = 64 * 1024 * 1024,
+) -> dict[str, dict[str, Any]]:
+    """Hash every persistent tensor without materializing full-sized copies."""
+    fingerprints: dict[str, dict[str, Any]] = {}
+
+    def update_digest(digest: Any, tensor: torch.Tensor) -> None:
+        """Hash a tensor in logical row-major order with bounded staging memory."""
+        tensor = tensor.detach()
+        if tensor.numel() == 0:
+            return
+        if tensor.is_contiguous():
+            byte_view = tensor.view(torch.uint8).reshape(-1)
+            for start in range(0, byte_view.numel(), chunk_bytes):
+                chunk = byte_view[start : start + chunk_bytes]
+                if chunk.device.type != "cpu":
+                    chunk = chunk.cpu()
+                digest.update(memoryview(chunk.numpy()))
+            return
+
+        max_elements = max(1, chunk_bytes // tensor.element_size())
+        if tensor.numel() <= max_elements or tensor.ndim == 0:
+            update_digest(digest, tensor.contiguous())
+            return
+
+        elements_per_row = tensor[0].numel()
+        if elements_per_row <= max_elements:
+            rows_per_chunk = max(1, max_elements // elements_per_row)
+            for start in range(0, tensor.shape[0], rows_per_chunk):
+                update_digest(
+                    digest,
+                    tensor[start : start + rows_per_chunk].contiguous(),
+                )
+            return
+
+        for row in tensor.unbind(0):
+            update_digest(digest, row)
+
+    def visit(value: Any, path: str) -> None:
+        if isinstance(value, torch.Tensor):
+            tensor = value.detach()
+            digest = hashlib.sha256()
+            update_digest(digest, tensor)
+            fingerprints[path] = {
+                "shape": list(tensor.shape),
+                "dtype": str(tensor.dtype),
+                "numel": tensor.numel(),
+                "sha256": digest.hexdigest(),
+            }
+            return
+        if isinstance(value, Mapping):
+            for key in sorted(value, key=str):
+                child_path = f"{path}.{key}" if path else str(key)
+                visit(value[key], child_path)
+            return
+        if isinstance(value, (list, tuple)):
+            for index, child in enumerate(value):
+                child_path = f"{path}.{index}" if path else str(index)
+                visit(child, child_path)
+            return
+        if type(value).__name__ == "LocalNonpersistentObject":
+            return
+        wrapped = getattr(value, "data", None)
+        if wrapped is not None and wrapped is not value:
+            visit(wrapped, path)
+
+    visit(state, "")
+    return fingerprints
+
+
+def _verify_checkpoint_tensor_fingerprints(
+    expected: Mapping[str, Mapping[str, Any]],
+    actual: Mapping[str, Mapping[str, Any]],
+    *,
+    stage: str,
+) -> None:
+    """Require exact tensor metadata and byte hashes at a checkpoint boundary."""
+    expected_keys = set(expected)
+    actual_keys = set(actual)
+    if expected_keys != actual_keys:
+        missing = sorted(expected_keys - actual_keys)
+        unexpected = sorted(actual_keys - expected_keys)
+        raise RuntimeError(
+            f"Checkpoint fingerprint mismatch during {stage}: "
+            f"missing={missing[:8]} unexpected={unexpected[:8]}"
+        )
+    for path in sorted(expected_keys):
+        if dict(expected[path]) != dict(actual[path]):
+            raise RuntimeError(
+                f"Checkpoint tensor mismatch during {stage}: {path}; "
+                f"saved={dict(expected[path])} loaded={dict(actual[path])}"
+            )
+
+
+def _checkpoint_fingerprint_manifest_path(
+    local_path: str | os.PathLike[str],
+    rank: int,
+) -> Path:
+    return Path(local_path) / f"tensor_fingerprints_rank_{rank:05d}.json"
+
+
+def _save_checkpoint_fingerprint_manifest(
+    local_path: str | os.PathLike[str],
+    state: Any,
+    *,
+    rank: int,
+) -> Path:
+    fingerprints = _checkpoint_tensor_fingerprints(state)
+    manifest_path = _checkpoint_fingerprint_manifest_path(local_path, rank)
+    payload = {
+        "version": 1,
+        "rank": rank,
+        "tensor_count": len(fingerprints),
+        "fingerprints": fingerprints,
+    }
+    manifest_path.write_text(
+        json.dumps(payload, sort_keys=True),
+        encoding="utf-8",
+    )
+    return manifest_path
+
+
+def _verify_checkpoint_fingerprint_manifest(
+    local_path: str | os.PathLike[str],
+    state: Any,
+    *,
+    rank: int,
+    stage: str,
+) -> None:
+    manifest_path = _checkpoint_fingerprint_manifest_path(local_path, rank)
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    expected = payload["fingerprints"]
+    actual = _checkpoint_tensor_fingerprints(state)
+    _verify_checkpoint_tensor_fingerprints(expected, actual, stage=stage)
+
+
+_DSV4_R3_RUNTIME_CAPABILITIES = (
+    (
+        "megatron.core.tensor_parallel.random",
+        "LUMENRL_R3_CAPABILITY_CHECKPOINT_REPLAY_BACKWARD",
+    ),
+    (
+        "megatron.core.transformer.moe.router_replay",
+        "LUMENRL_R3_CAPABILITY_ROUTER_REPLAY_FIFO",
+    ),
+    (
+        "megatron.core.transformer.moe.router_replay",
+        "LUMENRL_R3_CAPABILITY_REPLAY_DIAGNOSTICS",
+    ),
+)
+
+
+def _validate_dsv4_r3_runtime_capabilities(
+    *,
+    dsv4_enabled: bool,
+    r3_enabled: bool,
+) -> None:
+    """Collectively reject Megatron runtimes missing required DSV4 R3 patches."""
+    if not (dsv4_enabled and r3_enabled):
+        return
+
+    distributed = dist.is_initialized()
+    rank = dist.get_rank() if distributed else 0
+    missing = []
+    module_paths = {}
+    modules = {}
+    for module_name, marker in _DSV4_R3_RUNTIME_CAPABILITIES:
+        if module_name not in modules:
+            try:
+                modules[module_name] = importlib.import_module(module_name)
+            except Exception as exc:
+                modules[module_name] = None
+                module_paths[module_name] = f"<import failed: {exc}>"
+        module = modules[module_name]
+        if module is not None:
+            module_paths[module_name] = str(
+                getattr(module, "__file__", "<unknown>")
+            )
+        if module is None or getattr(module, marker, None) is not True:
+            missing.append(marker)
+
+    local_report = {
+        "rank": rank,
+        "missing": missing,
+        "module_paths": module_paths,
+    }
+    reports = [local_report]
+    if distributed and dist.get_world_size() > 1:
+        reports = [None] * dist.get_world_size()
+        dist.all_gather_object(reports, local_report)
+
+    failures = [report for report in reports if report["missing"]]
+    if not failures:
+        return
+
+    marker_modules = {
+        marker: module_name
+        for module_name, marker in _DSV4_R3_RUNTIME_CAPABILITIES
+    }
+    details = []
+    for report in failures:
+        for marker in report["missing"]:
+            module_name = marker_modules[marker]
+            module_path = report["module_paths"].get(
+                module_name, "<unknown>"
+            )
+            details.append(
+                f"rank={report['rank']} missing={marker} "
+                f"module={module_name} path={module_path}"
+            )
+    raise RuntimeError(
+        "DSV4 R3 requires a patched Megatron runtime; " + "; ".join(details)
+    )
+
+
+def _pad_token_ids_for_sequence_parallel(
+    token_ids: torch.Tensor, tensor_parallel_size: int
+) -> torch.Tensor:
+    """Pad a token row so sequence-parallel reduce-scatter can shard it."""
+    alignment = max(1, int(tensor_parallel_size))
+    padding = (-token_ids.numel()) % alignment
+    if padding == 0:
+        return token_ids
+    return F.pad(token_ids, (0, padding), value=0)
+
+
+def _pad_token_ids_to_pipeline_length(
+    token_ids: torch.Tensor, pipeline_sequence_length: int
+) -> torch.Tensor:
+    """Right-pad one PP microbatch to the schedule's fixed activation length."""
+    target = int(pipeline_sequence_length)
+    if token_ids.numel() > target:
+        raise ValueError(
+            f"token row length {token_ids.numel()} exceeds PP schedule length {target}"
+        )
+    return F.pad(token_ids, (0, target - token_ids.numel()), value=0)
+
+
+@contextmanager
+def _fixed_pipeline_shapes(config):
+    """Disable Megatron's dynamic shape exchange for uniformly padded PP rows."""
+    had_value = hasattr(config, "variable_seq_lengths")
+    saved_value = getattr(config, "variable_seq_lengths", None)
+    config.variable_seq_lengths = False
+    try:
+        yield
+    finally:
+        if had_value:
+            config.variable_seq_lengths = saved_value
+        else:
+            delattr(config, "variable_seq_lengths")
+
+
+def _pipeline_shape_adjuster(config):
+    """Preserve DSV4 mHC residual streams across fixed-shape PP boundaries."""
+    if not getattr(config, "dsv4_mode", False):
+        return None
+    hc_mult = int(getattr(config, "dsv4_hc_mult", 1) or 1)
+    if hc_mult <= 1:
+        return None
+
+    def adjust(recv_shapes, send_shapes):
+        def expand(shapes):
+            expanded = []
+            for shape in shapes:
+                if len(shape) != 3:
+                    raise RuntimeError(
+                        f"expected PP activation shape [s,b,d], got {tuple(shape)}"
+                    )
+                sequence, batch, hidden = shape
+                expanded.append((sequence, batch, hc_mult, hidden))
+            return expanded
+
+        return expand(recv_shapes), expand(send_shapes)
+
+    return adjust
+
+
+def _flatten_pipeline_logits(
+    output_tensor: torch.Tensor, unpadded_length: int
+) -> torch.Tensor:
+    """Flatten a batch-one pipeline output and remove TP alignment padding."""
+    return output_tensor.reshape(-1, output_tensor.shape[-1])[:unpadded_length]
+
+
+def _pipeline_schedule_loss(
+    loss: torch.Tensor, num_microbatches: int
+) -> torch.Tensor:
+    """Cancel Megatron's microbatch averaging for globally normalized losses."""
+    return loss * max(1, int(num_microbatches))
+
+
+def _clear_stale_router_replay_instances(
+    r3_enabled: bool,
+    *,
+    dsv4_enabled: bool = False,
+) -> None:
+    """Reset native replay registration before constructing an R3 model."""
+    if not r3_enabled:
+        return
+    _validate_dsv4_r3_runtime_capabilities(
+        dsv4_enabled=dsv4_enabled,
+        r3_enabled=r3_enabled,
+    )
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
+    clear_instances = getattr(
+        RouterReplay, "clear_global_router_replay_instances", None
+    )
+    if not callable(clear_instances):
+        raise RuntimeError(
+            "MILES R3 requires a Megatron fork exposing "
+            "RouterReplay.clear_global_router_replay_instances()."
+        )
+    clear_instances()
+
 
 try:
     from flash_attn import (
@@ -172,22 +501,79 @@ class FlashSelfAttentionCore(torch.nn.Module):
         return out.reshape(out.shape[0], out.shape[1], -1)
 
 
-class MegatronEngine(MegatronBaseEngine):
-    """Megatron-Core GPTModel engine (Qwen3 dense/MoE, BF16, TP/PP/EP/DP).
+class _FusedTokenLogProb(torch.autograd.Function):
+    """Memory-efficient per-token log-prob: ``log p(target) = logit_target - logsumexp``.
 
-    The flash-attn attention core and the R3 routing-replay plumbing are what
-    distinguish this from :class:`MegatronNativeEngine`, which uses the
-    TransformerEngine layer spec. Everything the two share lives in
-    :class:`MegatronBaseEngine`.
+    Retains a single ``[L, V]`` softmax buffer for backward instead of the
+    several ``[L, V]`` tensors that ``log_softmax(logits).gather(...)`` keeps
+    alive (the full log_softmax output plus its gradient). Values/gradients are
+    exact. Backward uses ``grad_logits = (onehot(target) - softmax) * grad_lp``.
     """
 
+    @staticmethod
+    def forward(ctx, logits, target):
+        logits = logits.float()
+        m = logits.max(dim=-1, keepdim=True).values          # [L,1]
+        shifted = logits.sub(m)                               # new [L,V]
+        exp = shifted.exp_()                                  # in-place -> exp
+        Z = exp.sum(dim=-1, keepdim=True)                     # [L,1]
+        softmax = exp.div_(Z)                                 # in-place -> softmax
+        logZ = Z.log_().add_(m)                               # logsumexp [L,1]
+        tgt_logit = logits.gather(-1, target.unsqueeze(-1))   # [L,1]
+        log_prob = (tgt_logit - logZ).squeeze(-1)             # [L]
+        ctx.save_for_backward(softmax, target)
+        return log_prob
+
+    @staticmethod
+    def backward(ctx, grad_lp):
+        softmax, target = ctx.saved_tensors                   # softmax [L,V]
+        grad = softmax.neg_()                                 # -softmax (reuse buffer)
+        grad.scatter_add_(-1, target.unsqueeze(-1), torch.ones_like(grad[:, :1]))
+        grad.mul_(grad_lp.unsqueeze(-1))
+        return grad, None
+
+
+class MegatronEngine(BaseEngine):
+    """Megatron-Core GPTModel engine (Qwen3 dense/MoE, BF16, TP/PP/EP/DP)."""
+
     def __init__(self, model_config, engine_config, optimizer_config, model_name: str = ""):
-        super().__init__(model_config, engine_config, optimizer_config, model_name)
+        super().__init__()
+        self.model_config = model_config if isinstance(model_config, dict) else vars(model_config)
+        self.engine_config = engine_config if isinstance(engine_config, dict) else vars(engine_config)
+        self.optimizer_config = (
+            optimizer_config if isinstance(optimizer_config, dict) else vars(optimizer_config)
+        )
+        self.model_name = model_name or self.model_config.get("local_path", "")
+        self.module: torch.nn.Module | None = None   # unwrapped GPTModel (eval fwd, save/load)
+        self._ddp: Any = None                          # Megatron DistributedDataParallel wrapper
+        self.optimizer: Any = None                     # Megatron distributed optimizer
+        self.lr_scheduler: Any = None                  # Megatron OptimizerParamScheduler
+        self._dims: Qwen3Dims | None = None
         self._step = 0
+        self.mode: str | None = None
+
+    # -- offload (Ray path: never offload) --
+    @property
+    def is_param_offload_enabled(self) -> bool:
+        return False
 
     @property
     def is_optimizer_offload_enabled(self) -> bool:
         return bool(self.engine_config.get("optimizer_cpu_offload", False))
+
+    def train_mode(self, **kwargs):
+        return nullcontext()
+
+    def eval_mode(self, **kwargs):
+        return nullcontext()
+
+    def _validate_r3_runtime_capabilities(self) -> None:
+        _validate_dsv4_r3_runtime_capabilities(
+            dsv4_enabled=bool(
+                getattr(getattr(self, "_tfcfg", None), "dsv4_mode", False)
+            ),
+            r3_enabled=bool(getattr(self, "_r3_enabled", False)),
+        )
 
     # ------------------------------------------------------------------
     def initialize(self) -> None:
@@ -390,6 +776,7 @@ class MegatronEngine(MegatronBaseEngine):
             else:
                 per_stage = total // pp_size
                 self._layers_per_pp_rank = [per_stage] * pp_size
+        _clear_stale_router_replay_instances(self._r3_enabled)
         model = GPTModel(
             config=tfcfg, transformer_layer_spec=spec, vocab_size=hf["vocab_size"],
             max_sequence_length=hf.get("max_position_embeddings", 32768),
@@ -541,13 +928,35 @@ class MegatronEngine(MegatronBaseEngine):
             )
 
     # ------------------------------------------------------------------
+    def _rank(self) -> int:
+        return dist.get_rank() if dist.is_initialized() else 0
 
+    def get_data_parallel_size(self) -> int:
+        try:
+            from megatron.core import parallel_state as mpu
+            return mpu.get_data_parallel_world_size()
+        except Exception:
+            return dist.get_world_size() if dist.is_initialized() else 1
 
+    def get_data_parallel_rank(self) -> int:
+        try:
+            from megatron.core import parallel_state as mpu
+            return mpu.get_data_parallel_rank()
+        except Exception:
+            return self._rank()
 
+    def get_data_parallel_group(self):
+        try:
+            from megatron.core import parallel_state as mpu
+            return mpu.get_data_parallel_group()
+        except Exception:
+            return dist.group.WORLD if dist.is_initialized() else None
 
     def is_mp_src_rank_with_outputs(self) -> bool:
         return self._tp_rank == 0 and self._pp_rank == self._pp_size - 1
 
+    def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True) -> None:
+        return
 
     # ------------------------------------------------------------------
     def _forward_logits(self, ids: torch.Tensor, model=None) -> torch.Tensor:
@@ -559,6 +968,7 @@ class MegatronEngine(MegatronBaseEngine):
         Sequence-parallel reduce_scatter requires the sequence length to be
         divisible by TP.  We right-pad to the next multiple and trim after.
         """
+        self._validate_r3_runtime_capabilities()
         m = model if model is not None else self.module
         L = ids.numel()
         tp = self._tp_size
@@ -585,6 +995,7 @@ class MegatronEngine(MegatronBaseEngine):
         Requires ``attention_backend='flash'`` (FlashSelfAttentionCore with
         varlen support).
         """
+        self._validate_r3_runtime_capabilities()
         from megatron.core.packed_seq_params import PackedSeqParams
 
         m = model if model is not None else self.module
@@ -624,6 +1035,12 @@ class MegatronEngine(MegatronBaseEngine):
         logits = out.logits if hasattr(out, "logits") else out
         return logits.view(-1, logits.shape[-1])[:total_real].float()
 
+    @staticmethod
+    def _real_block(mask_row: torch.Tensor) -> tuple[int, int]:
+        idx = mask_row.nonzero(as_tuple=False).squeeze(-1)
+        if idx.numel() == 0:
+            return 0, 0
+        return int(idx[0].item()), int(idx.numel())
 
     # ---- MILES R3: rollout top-k expert-id replay ---------------------
     def _r3_routes(self, batch: DataProto) -> torch.Tensor | list[Any] | None:
@@ -654,6 +1071,183 @@ class MegatronEngine(MegatronBaseEngine):
                 f"num_layers, top_k], got {tuple(routes.shape)}"
             )
         return routes
+
+    def _r3_local_layer_bounds(self) -> tuple[int, int]:
+        """Return this PP rank's half-open global transformer-layer range."""
+        layers_per_rank = self._layers_per_pp_rank
+        if not layers_per_rank:
+            total_layers = int(self._dims.num_layers)
+            return 0, total_layers
+        if len(layers_per_rank) != self._pp_size:
+            raise ValueError(
+                "R3 pipeline layer metadata mismatch: "
+                f"got {len(layers_per_rank)} stage counts for PP={self._pp_size}"
+            )
+        start = sum(int(count) for count in layers_per_rank[:self._pp_rank])
+        return start, start + int(layers_per_rank[self._pp_rank])
+
+    def _r3_extract_row_routes(
+        self,
+        routes: torch.Tensor | list[Any],
+        row: int,
+        start: int,
+        length: int,
+    ) -> torch.Tensor:
+        """Extract the ``length - 1`` rollout routes for one real token row."""
+        expected_tokens = length - 1
+        if isinstance(routes, torch.Tensor):
+            if routes.ndim != 4:
+                raise ValueError(
+                    "rollout_routed_experts must have shape "
+                    "[batch, seq_len-1, num_layers, top_k]"
+                )
+            if row < 0 or row >= routes.shape[0]:
+                raise IndexError(f"R3 route row {row} is out of range")
+            extracted = routes[row, start:start + expected_tokens]
+        else:
+            if row < 0 or row >= len(routes):
+                raise IndexError(f"R3 route row {row} is out of range")
+            extracted = torch.as_tensor(routes[row])
+        if extracted.ndim != 3:
+            raise ValueError(
+                "one-row R3 routes must have shape [tokens, layers, top_k], "
+                f"got {tuple(extracted.shape)}"
+            )
+        if extracted.shape[0] != expected_tokens:
+            raise ValueError(
+                f"R3 route length mismatch for row {row}: "
+                f"got {extracted.shape[0]}, expected {expected_tokens}"
+            )
+        return extracted
+
+    def _r3_validate_expert_ids(self, routes: torch.Tensor) -> None:
+        """Reject rollout ids outside the model's global expert namespace."""
+        num_experts = int(self._dims.num_experts)
+        if num_experts <= 0:
+            raise ValueError("R3 requires a positive global expert count")
+        # Avoid casting the complete route tensor just for validation. PyTorch
+        # wraps an out-of-range scalar bound to the tensor dtype (uint8(256)=0),
+        # so omit comparisons that the dtype's representable range guarantees.
+        if routes.dtype == torch.bool:
+            invalid = routes if num_experts <= 1 else torch.zeros_like(routes)
+        elif routes.dtype.is_floating_point:
+            invalid = (routes < 0) | (routes >= num_experts)
+        else:
+            dtype_info = torch.iinfo(routes.dtype)
+            invalid = (
+                routes < 0
+                if dtype_info.min < 0
+                else torch.zeros_like(routes, dtype=torch.bool)
+            )
+            if num_experts <= dtype_info.max:
+                invalid = invalid | (routes >= num_experts)
+        if invalid.any():
+            bad_id = int(routes[invalid][0].item())
+            raise ValueError(
+                f"R3 expert id {bad_id} is outside global range "
+                f"[0, {num_experts})"
+            )
+
+    def _r3_set_microbatch_routes(
+        self,
+        routes: torch.Tensor | list[Any],
+        *,
+        row: int,
+        start: int,
+        length: int,
+        padded_length: int,
+    ) -> None:
+        """Append one PP microbatch's local routes to native replay FIFOs."""
+        from megatron.core.transformer.moe.router_replay import (
+            RouterReplay,
+            RouterReplayAction,
+        )
+
+        if length < 2:
+            return
+        replay = self._r3_extract_row_routes(routes, row, start, length)
+        self._r3_validate_expert_ids(replay)
+
+        layer_start, layer_end = self._r3_local_layer_bounds()
+        if replay.shape[1] < layer_end:
+            raise ValueError(
+                f"R3 rollout has {replay.shape[1]} global layers, "
+                f"but PP rank {self._pp_rank} requires layers "
+                f"[{layer_start}, {layer_end})"
+            )
+        replay = replay[:, layer_start:layer_end, :]
+        local_layers = layer_end - layer_start
+        instances = list(RouterReplay.global_router_replay_instances)
+        if not instances:
+            raise RuntimeError(
+                "MILES R3 is enabled but this PP stage has no RouterReplay "
+                "instances; check moe_enable_routing_replay and the Megatron fork."
+            )
+        if len(instances) != local_layers:
+            raise ValueError(
+                f"PP rank {self._pp_rank} has {len(instances)} RouterReplay "
+                f"instances, expected {local_layers} for global layers "
+                f"[{layer_start}, {layer_end})"
+            )
+
+        filler_count = padded_length - replay.shape[0]
+        if filler_count < 1:
+            raise ValueError(
+                f"R3 padded length {padded_length} cannot hold "
+                f"{replay.shape[0]} routed positions plus the final token"
+            )
+        topk = replay.shape[2]
+        num_experts = int(self._dims.num_experts)
+        choice_offsets = torch.div(
+            torch.arange(topk, dtype=replay.dtype, device=replay.device)
+            * num_experts,
+            topk,
+            rounding_mode="floor",
+        )
+        token_offsets = torch.arange(
+            filler_count, dtype=replay.dtype, device=replay.device
+        ).view(-1, 1, 1)
+        layer_offsets = torch.arange(
+            layer_start,
+            layer_end,
+            dtype=replay.dtype,
+            device=replay.device,
+        ).view(1, -1, 1)
+        filler = (
+            choice_offsets.view(1, 1, topk)
+            + (token_offsets + layer_offsets) * topk
+        ).remainder(num_experts)
+        replay = torch.cat(
+            [
+                replay,
+                filler,
+            ],
+            dim=0,
+        )
+
+        if bool(getattr(self._tfcfg, "sequence_parallel", False)):
+            if replay.shape[0] % self._tp_size:
+                raise ValueError(
+                    f"R3 token count {replay.shape[0]} is not divisible "
+                    f"by TP={self._tp_size}"
+                )
+            shard_size = replay.shape[0] // self._tp_size
+            shard_start = self._tp_rank * shard_size
+            replay = replay[shard_start:shard_start + shard_size]
+
+        replay_device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else replay.device
+        )
+        replay = replay.to(
+            device=replay_device, dtype=torch.int64
+        ).contiguous()
+        for layer, instance in enumerate(instances):
+            instance.set_target_indices(replay[:, layer, :])
+        RouterReplay.set_global_router_replay_action(
+            RouterReplayAction.REPLAY_FORWARD
+        )
 
     def _r3_set_packed_routes(
         self,
@@ -776,20 +1370,207 @@ class MegatronEngine(MegatronBaseEngine):
         )
 
     @staticmethod
-    def _r3_set_backward() -> None:
-        from megatron.core.transformer.moe.router_replay import (
-            RouterReplay,
-            RouterReplayAction,
-        )
-        RouterReplay.set_global_router_replay_action(
-            RouterReplayAction.REPLAY_BACKWARD
-        )
-
-    @staticmethod
     def _r3_clear() -> None:
         from megatron.core.transformer.moe.router_replay import RouterReplay
         RouterReplay.clear_global_router_replay_action()
         RouterReplay.clear_global_indices()
+
+    @staticmethod
+    def _r3_reset_native_diagnostics() -> None:
+        """Reset comparison state without mutating the backward replay FIFO."""
+        from megatron.core.transformer.moe.router_replay import RouterReplay
+
+        for instance in RouterReplay.global_router_replay_instances:
+            reset = getattr(instance, "reset_recompute_diagnostics", None)
+            if not callable(reset):
+                raise RuntimeError(
+                    "MILES R3 acceptance requires patched RouterReplay "
+                    "recompute diagnostics."
+                )
+            reset()
+
+    def _r3_native_recompute_metrics(self) -> dict[str, float]:
+        """Aggregate native forward/recompute ID comparisons over one PP group."""
+        from megatron.core import parallel_state as mpu
+        from megatron.core.transformer.moe.router_replay import RouterReplay
+
+        compared = 0
+        flips = 0
+        for instance in RouterReplay.global_router_replay_instances:
+            get_diagnostics = getattr(
+                instance, "get_recompute_diagnostics", None
+            )
+            if not callable(get_diagnostics):
+                raise RuntimeError(
+                    "MILES R3 acceptance requires patched RouterReplay "
+                    "recompute diagnostics."
+                )
+            local_compared, local_flips = get_diagnostics()
+            compared += int(local_compared)
+            flips += int(local_flips)
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
+        totals = torch.tensor([compared, flips], dtype=torch.int64, device=device)
+        if dist.is_initialized():
+            dist.all_reduce(
+                totals,
+                group=mpu.get_pipeline_model_parallel_group(),
+            )
+        compared, flips = (int(value) for value in totals.cpu().tolist())
+        return {
+            "moe/r3_recompute_ids": float(compared),
+            "moe/r3_recompute_flips": float(flips),
+            "moe/r3_recompute_flip_rate": flips / max(1, compared),
+        }
+
+    def _r3_pp_coverage_metrics(self) -> dict[str, float]:
+        """Require every global DSV4 layer exactly once in this PP group."""
+        from megatron.core import parallel_state as mpu
+
+        total_layers = int(self._dims.num_layers)
+        dsv4_enabled = bool(getattr(self._tfcfg, "dsv4_mode", False))
+        if dsv4_enabled and total_layers != 43:
+            raise RuntimeError(
+                "DSV4 R3 acceptance requires exactly 43 global layers, "
+                f"got {total_layers}."
+            )
+        layer_start, layer_end = self._r3_local_layer_bounds()
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
+        coverage = torch.zeros(total_layers, dtype=torch.int64, device=device)
+        coverage[layer_start:layer_end] = 1
+        if dist.is_initialized():
+            dist.all_reduce(
+                coverage,
+                group=mpu.get_pipeline_model_parallel_group(),
+            )
+        missing = int((coverage == 0).sum().item())
+        duplicates = int((coverage > 1).sum().item())
+        metrics = {
+            "moe/r3_pp_missing_layers": float(missing),
+            "moe/r3_pp_duplicate_layers": float(duplicates),
+        }
+        if dsv4_enabled and (missing or duplicates):
+            raise RuntimeError(
+                "DSV4 R3 pipeline coverage failed: "
+                f"missing={missing}, duplicate={duplicates}, "
+                f"coverage={coverage.cpu().tolist()}"
+            )
+        return metrics
+
+    def _r3_hash_tables(self) -> dict[int, torch.Tensor]:
+        """Find local DSV4 hash tables in parameters or buffers by suffix."""
+        tables: dict[int, torch.Tensor] = {}
+        named = dict(self.module.named_parameters())
+        named.update(
+            (name, tensor)
+            for name, tensor in self.module.named_buffers()
+            if name not in named
+        )
+        pattern = re.compile(
+            r"(?:^|\.)decoder\.layers\.(?P<layer>\d+)\."
+            r"(?:mlp|ffn)\.(?:router|gate|topk)\.tid2eid$"
+        )
+        for name, tensor in named.items():
+            match = pattern.search(name)
+            if match is not None:
+                tables[int(match.group("layer"))] = tensor
+        return tables
+
+    def _r3_hash_metrics(
+        self,
+        routes: torch.Tensor | list[Any],
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> dict[str, float]:
+        """Collect PP0 hash-ID comparisons on every pipeline rank."""
+        compared = 0
+        flips = 0
+        if self._pp_rank == 0:
+            tables = self._r3_hash_tables()
+            missing_tables = sorted(set(range(3)) - set(tables))
+            if missing_tables:
+                raise RuntimeError(
+                    "DSV4 R3 hash acceptance could not find resident tid2eid "
+                    f"tables for layers {missing_tables}."
+                )
+
+            for row in range(attention_mask.shape[0]):
+                start, length = self._real_block(attention_mask[row])
+                if length < 2:
+                    continue
+                row_routes = self._r3_extract_row_routes(
+                    routes, row, start, length
+                )
+                tokens = input_ids[row, start:start + length - 1].long()
+                for layer in range(3):
+                    table = tables[layer]
+                    if tokens.numel() and (
+                        int(tokens.min()) < 0
+                        or int(tokens.max()) >= table.shape[0]
+                    ):
+                        raise ValueError(
+                            f"input token id is outside layer {layer} "
+                            "tid2eid table"
+                        )
+                    expected = table[tokens.to(table.device)].to(
+                        device=row_routes.device,
+                        dtype=row_routes.dtype,
+                    )
+                    supplied = row_routes[:, layer, :]
+                    expected_flat = expected.reshape(-1)
+                    supplied_flat = supplied.reshape(-1)
+                    overlap = min(
+                        expected_flat.numel(), supplied_flat.numel()
+                    )
+                    compared += max(
+                        expected_flat.numel(), supplied_flat.numel()
+                    )
+                    flips += abs(
+                        expected_flat.numel() - supplied_flat.numel()
+                    )
+                    if overlap:
+                        flips += int(
+                            (
+                                expected_flat[:overlap]
+                                != supplied_flat[:overlap]
+                            ).sum().item()
+                        )
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
+        totals = torch.tensor(
+            [compared, flips],
+            dtype=torch.int64,
+            device=device,
+        )
+        if dist.is_initialized():
+            from megatron.core import parallel_state as mpu
+
+            dist.all_reduce(
+                totals,
+                group=mpu.get_pipeline_model_parallel_group(),
+            )
+        compared, flips = (int(value) for value in totals.cpu().tolist())
+        metrics = {
+            "moe/r3_hash_ids": float(compared),
+            "moe/r3_hash_flips": float(flips),
+            "moe/r3_hash_flip_rate": flips / max(1, compared),
+        }
+        if flips:
+            raise RuntimeError(
+                "DSV4 R3 hash router acceptance detected expert-ID flips: "
+                f"{flips}/{compared}."
+            )
+        return metrics
 
     @staticmethod
     def _r3_metrics(
@@ -816,7 +1597,36 @@ class MegatronEngine(MegatronBaseEngine):
         }
 
     # ---- memory-efficient log-prob helpers (see FlashSelfAttentionCore/#2) ----
+    def _token_logprob_train(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Per-token log-prob with grad. Uses the fused single-buffer CE (optionally
+        chunked over the sequence) when ``log_probs_chunk_size>0``; otherwise the
+        original ``log_softmax(...).gather(...)`` path (kept for the smoke config)."""
+        cs = self._logprob_chunk_size
+        if cs and cs > 0:
+            outs = []
+            for s in range(0, logits.shape[0], cs):
+                outs.append(_FusedTokenLogProb.apply(logits[s:s + cs], targets[s:s + cs]))
+            return torch.cat(outs, dim=0)
+        lp = torch.log_softmax(logits, dim=-1)
+        return lp.gather(-1, targets.view(-1, 1)).squeeze(-1)
 
+    def _logprob_entropy_nograd(
+        self, logits: torch.Tensor, targets: torch.Tensor, want_entropy: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """No-grad per-token log-prob (+ optional entropy), chunked over the
+        sequence to bound the ``[chunk, V]`` softmax memory."""
+        cs = self._logprob_chunk_size if (self._logprob_chunk_size and self._logprob_chunk_size > 0) else logits.shape[0]
+        cs = max(1, cs)
+        lps, ents = [], []
+        for s in range(0, logits.shape[0], cs):
+            lg = logits[s:s + cs]
+            lsm = torch.log_softmax(lg, dim=-1)
+            lps.append(lsm.gather(-1, targets[s:s + cs].view(-1, 1)).squeeze(-1))
+            if want_entropy:
+                ents.append(-(lsm.exp() * lsm).sum(-1))
+        lp = torch.cat(lps, dim=0)
+        ent = torch.cat(ents, dim=0) if want_entropy else None
+        return lp, ent
 
     # ---- engine-level compute_log_probs (actor delegates here) ----
     def engine_compute_log_probs(self, batch: DataProto) -> DataProto:
@@ -1011,6 +1821,7 @@ class MegatronEngine(MegatronBaseEngine):
         self, seqs, am, S, want_ent, temperature, batch,
     ) -> DataProto:
         """PP>1 log-prob computation via Megatron's pipeline schedule."""
+        self._validate_r3_runtime_capabilities()
         from functools import partial as _partial
 
         from megatron.core import parallel_state as mpu
@@ -1018,6 +1829,7 @@ class MegatronEngine(MegatronBaseEngine):
 
         B = seqs.shape[0]
         is_last_pp = mpu.is_pipeline_last_stage()
+        r3_routes = self._r3_routes(batch)
 
         micro_batches = []
         for r in range(B):
@@ -1034,20 +1846,44 @@ class MegatronEngine(MegatronBaseEngine):
             if L < 2:
                 results.append((row_idx, start, L, None, None))
                 return torch.tensor(0.0, device="cuda"), {}
-            logits = output_tensor.view(L, -1).float() / temperature_local
+            logits = _flatten_pipeline_logits(output_tensor, L).float() / temperature_local
             tok_lp, ent = self._logprob_entropy_nograd(logits[:-1], ids_local[1:], want_ent_local)
             results.append((row_idx, start, L, tok_lp.cpu(), ent.cpu() if ent is not None else None))
             return torch.tensor(0.0, device="cuda"), {}
 
         mb_iter = iter(micro_batches)
+        input_alignment = max(
+            1, int(getattr(self, "_input_sequence_alignment", self._tp_size))
+        )
+        schedule_sequence_length = (
+            (S + input_alignment - 1) // input_alignment
+        ) * input_alignment
 
         def _forward_step(data_iterator, model):
             r, start, L, ids = next(data_iterator)
             if L < 2:
-                dummy = torch.zeros(1, 1, self._dims.hidden, device="cuda", dtype=torch.bfloat16)
+                dummy = torch.zeros(
+                    schedule_sequence_length,
+                    1,
+                    self._dims.hidden,
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                )
                 return dummy, _partial(_logprob_loss_func, r, start, L, None, temperature, want_ent)
-            inp = ids.view(1, L)
-            pos = torch.arange(L, device=ids.device).view(1, L)
+            padded_ids = _pad_token_ids_to_pipeline_length(
+                ids, schedule_sequence_length
+            )
+            padded_length = padded_ids.numel()
+            inp = padded_ids.view(1, padded_length)
+            pos = torch.arange(padded_length, device=ids.device).view(1, padded_length)
+            if r3_routes is not None:
+                self._r3_set_microbatch_routes(
+                    r3_routes,
+                    row=r,
+                    start=start,
+                    length=L,
+                    padded_length=padded_length,
+                )
             out = model(input_ids=inp, position_ids=pos, attention_mask=None)
             return out, _partial(_logprob_loss_func, r, start, L, ids, temperature, want_ent)
 
@@ -1056,18 +1892,26 @@ class MegatronEngine(MegatronBaseEngine):
         config = self._tfcfg
         saved_timers = config.timers
         config.timers = None
-        with torch.no_grad():
-            forward_backward_func(
-                forward_step_func=_forward_step,
-                data_iterator=mb_iter,
-                model=[self.module],
-                num_microbatches=B,
-                seq_length=S,
-                micro_batch_size=1,
-                forward_only=True,
-                collect_non_loss_data=False,
-            )
-        config.timers = saved_timers
+        if r3_routes is not None:
+            self._r3_clear()
+        try:
+            with _fixed_pipeline_shapes(config):
+                with torch.no_grad():
+                    forward_backward_func(
+                        forward_step_func=_forward_step,
+                        data_iterator=mb_iter,
+                        model=[self.module],
+                        num_microbatches=B,
+                        seq_length=schedule_sequence_length,
+                        micro_batch_size=1,
+                        forward_only=True,
+                        collect_non_loss_data=False,
+                        adjust_tensor_shapes_fn=_pipeline_shape_adjuster(config),
+                    )
+        finally:
+            config.timers = saved_timers
+            if r3_routes is not None:
+                self._r3_clear()
 
         lp_out = torch.zeros(B, S - 1, dtype=torch.float32)
         ent_out = torch.zeros(B, S - 1, dtype=torch.float32) if want_ent else None
@@ -1109,6 +1953,8 @@ class MegatronEngine(MegatronBaseEngine):
         if am is None:
             am = torch.ones_like(seqs)
         B, S = seqs.shape
+        loss_agg_mode = str(_cfg("loss_agg_mode", "token-mean"))
+        global_batch_size = int(meta.get("global_batch_size") or B * dp)
 
         if LUMENRL_DEBUG:
             logger.info("[DBG] engine_update_policy: B=%d S=%d algo=%s temp=%.2f pp=%d tp=%d",
@@ -1117,7 +1963,7 @@ class MegatronEngine(MegatronBaseEngine):
         if self._pp_size > 1:
             return self._engine_update_policy_pp(
                 batch, seqs, am, B, S, algo_name, temperature,
-                bnt, dp, _cfg, t,
+                bnt, dp, _cfg, t, loss_agg_mode, global_batch_size,
             )
 
         can_pack = (
@@ -1133,7 +1979,8 @@ class MegatronEngine(MegatronBaseEngine):
 
         if can_pack:
             metrics = self._engine_update_policy_packed(
-                batch, seqs, am, B, S, algo_name, temperature, bnt, dp, _cfg, t, meta,
+                batch, seqs, am, B, S, algo_name, temperature, bnt, dp,
+                _cfg, t, meta, loss_agg_mode, global_batch_size,
             )
         else:
             if self._r3_enabled:
@@ -1146,6 +1993,7 @@ class MegatronEngine(MegatronBaseEngine):
                             self._attention_backend)
             metrics = self._engine_update_policy_rowwise(
                 seqs, am, B, S, algo_name, temperature, bnt, dp, _cfg, t,
+                loss_agg_mode, global_batch_size,
             )
 
         grad_norm = self._optimizer_step()
@@ -1159,6 +2007,7 @@ class MegatronEngine(MegatronBaseEngine):
 
     def _engine_update_policy_rowwise(
         self, seqs, am, B, S, algo_name, temperature, bnt, dp, _cfg, t,
+        loss_agg_mode, global_batch_size,
     ) -> dict[str, float]:
         """Row-by-row forward+backward (fallback for unfused attention)."""
         n_iters = B
@@ -1200,14 +2049,17 @@ class MegatronEngine(MegatronBaseEngine):
             old_lp = _col("old_log_probs", shift=False)
             if old_lp is None:
                 continue
-            resp_mask = _col("response_mask", shift=True)
+            resp_mask = _col(
+                "response_mask",
+                shift=_response_mask_is_token_indexed(t),
+            )
             adv_t = t.get("advantages")
             if adv_t is None:
                 continue
             if adv_t.dim() == 1:
                 adv = adv_t[r].to(dev).view(1, 1).expand(1, Lm).float()
             else:
-                adv = adv_t[r].to(dev)[start + 1:].reshape(1, -1).float()
+                adv = adv_t[r].to(dev)[start:].reshape(1, -1).float()
             ris = _col("rollout_is_weights", shift=False)
             ref_lp0 = _col("ref_log_probs", shift=False)
             rlp0 = _col("rollout_log_probs", shift=False)
@@ -1232,6 +2084,20 @@ class MegatronEngine(MegatronBaseEngine):
                     mask=mask, clip_ratio_c=float(_cfg("clip_ratio_c", 0.0)),
                     batch_num_tokens=bnt, dp_size=dp, rollout_is_weights=ris,
                 )
+            elif algo_name == AlgorithmName.GRPO.value:
+                loss = asymmetric_clip_loss(
+                    token_lp,
+                    old_lp,
+                    adv,
+                    float(_cfg("clip_ratio", 0.2)),
+                    float(_cfg("clip_ratio_high", 0.28)),
+                    mask=mask,
+                    batch_num_tokens=bnt,
+                    dp_size=dp,
+                    loss_agg_mode=loss_agg_mode,
+                    global_batch_size=global_batch_size,
+                    rollout_is_weights=ris,
+                )
             else:
                 loss = policy_gradient_loss(
                     token_lp, old_lp, adv, float(_cfg("clip_ratio", 0.2)), mask=mask,
@@ -1255,7 +2121,11 @@ class MegatronEngine(MegatronBaseEngine):
 
         torch.cuda.empty_cache()
         metrics: dict[str, float] = {
-            "loss": loss_accum / max(1, n_rows),
+            "loss": (
+                loss_accum
+                if algo_name == AlgorithmName.GRPO.value
+                else loss_accum / max(1, n_rows)
+            ),
         }
         if ppo_kl_tok > 0:
             metrics["ppo_kl_sum"] = ppo_kl_sum
@@ -1266,7 +2136,8 @@ class MegatronEngine(MegatronBaseEngine):
         return metrics
 
     def _engine_update_policy_packed(
-        self, batch, seqs, am, B, S, algo_name, temperature, bnt, dp, _cfg, t, meta,
+        self, batch, seqs, am, B, S, algo_name, temperature, bnt, dp, _cfg, t,
+        meta, loss_agg_mode, global_batch_size,
     ) -> dict[str, float]:
         """Packed (varlen) forward + per-row loss + backward."""
         from lumenrl.engine.training.packing import (
@@ -1306,6 +2177,18 @@ class MegatronEngine(MegatronBaseEngine):
         rc_kl_sum = 0.0
         rc_kl_tok = 0.0
         n_rows = 0
+        r3_acceptance: dict[str, float] = {}
+        recompute_ids = 0.0
+        recompute_flips = 0.0
+        dsv4_acceptance = bool(
+            r3_routes is not None
+            and getattr(self._tfcfg, "dsv4_mode", False)
+        )
+        if dsv4_acceptance:
+            r3_acceptance.update(self._r3_pp_coverage_metrics())
+            r3_acceptance.update(
+                self._r3_hash_metrics(r3_routes, seqs, am)
+            )
 
         for ci, (cs, ce) in enumerate(chunks):
             is_dummy = ci >= real_chunk_count
@@ -1314,6 +2197,9 @@ class MegatronEngine(MegatronBaseEngine):
             mask_chunk = am[cs:ce].to("cuda")
             packed = pack_sequences(ids_chunk, mask_chunk, tp_align=self._tp_size)
             if r3_routes is not None:
+                self._r3_clear()
+                if dsv4_acceptance:
+                    self._r3_reset_native_diagnostics()
                 self._r3_set_packed_routes(
                     r3_routes[cs:ce], am[cs:ce], packed,
                 )
@@ -1326,10 +2212,12 @@ class MegatronEngine(MegatronBaseEngine):
                 # on while another is still in MoE backward, deadlocking RCCL.
                 logits = self._forward_logits_packed(packed, model=self._ddp)
                 dummy_loss = logits.sum() * 0.0
-                if r3_routes is not None:
-                    self._r3_set_backward()
                 dummy_loss.backward()
                 if r3_routes is not None:
+                    if dsv4_acceptance:
+                        native = self._r3_native_recompute_metrics()
+                        recompute_ids += native["moe/r3_recompute_ids"]
+                        recompute_flips += native["moe/r3_recompute_flips"]
                     self._r3_clear()
                 del logits, dummy_loss, packed, ids_chunk, mask_chunk
                 torch.cuda.synchronize()
@@ -1370,7 +2258,10 @@ class MegatronEngine(MegatronBaseEngine):
                 old_lp = _col("old_log_probs", shift=False)
                 if old_lp is None:
                     continue
-                resp_mask = _col("response_mask", shift=True)
+                resp_mask = _col(
+                    "response_mask",
+                    shift=_response_mask_is_token_indexed(t),
+                )
                 adv_t_full = t.get("advantages")
                 if adv_t_full is None:
                     continue
@@ -1379,7 +2270,7 @@ class MegatronEngine(MegatronBaseEngine):
                 if adv_t_full.dim() == 1:
                     adv = adv_t_full[r_global].to(dev).view(1, 1).expand(1, Lm).float()
                 else:
-                    adv = adv_t_full[r_global].to(dev)[real_start + 1:].reshape(1, -1).float()
+                    adv = adv_t_full[r_global].to(dev)[real_start:].reshape(1, -1).float()
                 ris = _col("rollout_is_weights", shift=False)
                 ref_lp0 = _col("ref_log_probs", shift=False)
                 rlp0 = _col("rollout_log_probs", shift=False)
@@ -1404,6 +2295,20 @@ class MegatronEngine(MegatronBaseEngine):
                         mask=mask, clip_ratio_c=float(_cfg("clip_ratio_c", 0.0)),
                         batch_num_tokens=bnt, dp_size=dp, rollout_is_weights=ris,
                     )
+                elif algo_name == AlgorithmName.GRPO.value:
+                    row_loss = asymmetric_clip_loss(
+                        row_lp_t,
+                        old_lp,
+                        adv,
+                        float(_cfg("clip_ratio", 0.2)),
+                        float(_cfg("clip_ratio_high", 0.28)),
+                        mask=mask,
+                        batch_num_tokens=bnt,
+                        dp_size=dp,
+                        loss_agg_mode=loss_agg_mode,
+                        global_batch_size=global_batch_size,
+                        rollout_is_weights=ris,
+                    )
                 else:
                     row_loss = policy_gradient_loss(
                         row_lp_t, old_lp, adv, float(_cfg("clip_ratio", 0.2)), mask=mask,
@@ -1422,7 +2327,14 @@ class MegatronEngine(MegatronBaseEngine):
                         ppo_kl_tok += tok
                         neg_kl = torch.clamp(row_lp_t - old_lp, min=-20.0, max=20.0)
                         ratio = torch.exp(neg_kl)
-                        clip_low = float(_cfg("clip_ratio_low", 0.2))
+                        clip_low = float(
+                            _cfg(
+                                "clip_ratio_low",
+                                _cfg("clip_ratio", 0.2)
+                                if algo_name == AlgorithmName.GRPO.value
+                                else 0.2,
+                            )
+                        )
                         clip_high = float(_cfg("clip_ratio_high", 0.28))
                         pg1 = -adv * ratio
                         pg2 = -adv * torch.clamp(
@@ -1445,10 +2357,12 @@ class MegatronEngine(MegatronBaseEngine):
                             rc_kl_tok += tok
 
             if chunk_loss.requires_grad:
-                if r3_routes is not None:
-                    self._r3_set_backward()
                 chunk_loss.backward()
             if r3_routes is not None:
+                if dsv4_acceptance:
+                    native = self._r3_native_recompute_metrics()
+                    recompute_ids += native["moe/r3_recompute_ids"]
+                    recompute_flips += native["moe/r3_recompute_flips"]
                 self._r3_clear()
             del logits, flat_lp, token_log_probs, packed, chunk_loss
             # Retire each chunk's HIP work before reusing allocator blocks.
@@ -1460,10 +2374,25 @@ class MegatronEngine(MegatronBaseEngine):
 
         torch.cuda.synchronize()
         metrics: dict[str, float] = {
-            "loss": loss_accum / max(1, n_rows),
+            "loss": (
+                loss_accum
+                if algo_name == AlgorithmName.GRPO.value
+                else loss_accum / max(1, n_rows)
+            ),
         }
         if r3_routes is not None:
             metrics.update(self._r3_metrics(r3_routes, am))
+            if dsv4_acceptance:
+                r3_acceptance.update(
+                    {
+                        "moe/r3_recompute_ids": recompute_ids,
+                        "moe/r3_recompute_flips": recompute_flips,
+                        "moe/r3_recompute_flip_rate": (
+                            recompute_flips / max(1.0, recompute_ids)
+                        ),
+                    }
+                )
+                metrics.update(r3_acceptance)
         if ppo_kl_tok > 0:
             metrics["ppo_kl_sum"] = ppo_kl_sum
             metrics["ppo_kl_tok"] = ppo_kl_tok
@@ -1476,14 +2405,17 @@ class MegatronEngine(MegatronBaseEngine):
 
     def _engine_update_policy_pp(
         self, batch, seqs, am, B, S, algo_name, temperature, bnt, dp, _cfg, t,
+        loss_agg_mode, global_batch_size,
     ) -> dict[str, float]:
         """PP>1 training step via Megatron's pipeline schedule."""
+        self._validate_r3_runtime_capabilities()
         from functools import partial as _partial
 
         from megatron.core import parallel_state as mpu
         from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 
         is_last_pp = mpu.is_pipeline_last_stage()
+        r3_routes = self._r3_routes(batch)
 
         micro_batches = []
         for r in range(B):
@@ -1509,7 +2441,7 @@ class MegatronEngine(MegatronBaseEngine):
                 dummy = torch.tensor(0.0, device="cuda", requires_grad=True)
                 return dummy, {}
 
-            logits = output_tensor.view(L, -1).float() / temperature
+            logits = _flatten_pipeline_logits(output_tensor, L).float() / temperature
             token_lp = self._token_logprob_train(logits[:-1], ids[1:]).view(1, -1)
             Lm = token_lp.shape[-1]
             dev = token_lp.device
@@ -1527,7 +2459,10 @@ class MegatronEngine(MegatronBaseEngine):
                 dummy = torch.tensor(0.0, device="cuda", requires_grad=True)
                 return dummy, {}
 
-            resp_mask = _col("response_mask", shift=True)
+            resp_mask = _col(
+                "response_mask",
+                shift=_response_mask_is_token_indexed(t),
+            )
             adv_t_full = t.get("advantages")
             if adv_t_full is None:
                 dummy = torch.tensor(0.0, device="cuda", requires_grad=True)
@@ -1535,7 +2470,7 @@ class MegatronEngine(MegatronBaseEngine):
             if adv_t_full.dim() == 1:
                 adv = adv_t_full[r].to(dev).view(1, 1).expand(1, Lm).float()
             else:
-                adv = adv_t_full[r].to(dev)[start + 1:].reshape(1, -1).float()
+                adv = adv_t_full[r].to(dev)[start:].reshape(1, -1).float()
             ris = _col("rollout_is_weights", shift=False)
             ref_lp0 = _col("ref_log_probs", shift=False)
             rlp0 = _col("rollout_log_probs", shift=False)
@@ -1560,6 +2495,20 @@ class MegatronEngine(MegatronBaseEngine):
                     mask=mask, clip_ratio_c=float(_cfg("clip_ratio_c", 0.0)),
                     batch_num_tokens=bnt, dp_size=dp, rollout_is_weights=ris,
                 )
+            elif algo_name == AlgorithmName.GRPO.value:
+                loss = asymmetric_clip_loss(
+                    token_lp,
+                    old_lp,
+                    adv,
+                    float(_cfg("clip_ratio", 0.2)),
+                    float(_cfg("clip_ratio_high", 0.28)),
+                    mask=mask,
+                    batch_num_tokens=bnt,
+                    dp_size=dp,
+                    loss_agg_mode=loss_agg_mode,
+                    global_batch_size=global_batch_size,
+                    rollout_is_weights=ris,
+                )
             else:
                 loss = policy_gradient_loss(
                     token_lp, old_lp, adv, float(_cfg("clip_ratio", 0.2)), mask=mask,
@@ -1581,22 +2530,46 @@ class MegatronEngine(MegatronBaseEngine):
 
             # Megatron schedule divides loss by num_microbatches; pre-multiply
             # to keep gradient magnitude consistent with PP=1.
-            return loss * B, {"loss": float(loss.detach())}
+            return _pipeline_schedule_loss(loss, B), {
+                "loss": float(loss.detach())
+            }
 
         mb_iter = iter(micro_batches)
+        input_alignment = max(
+            1, int(getattr(self, "_input_sequence_alignment", self._tp_size))
+        )
+        schedule_sequence_length = (
+            (S + input_alignment - 1) // input_alignment
+        ) * input_alignment
 
         def _forward_step(data_iterator, model):
             mb = next(data_iterator)
             if mb["L"] < 2:
                 dummy = torch.zeros(
-                    1, 1, self._dims.hidden, device="cuda", dtype=torch.bfloat16,
+                    schedule_sequence_length,
+                    1,
+                    self._dims.hidden,
+                    device="cuda",
+                    dtype=torch.bfloat16,
                     requires_grad=True,
                 )
                 return dummy, _partial(_train_loss_func, mb)
             ids = mb["ids"]
             L = mb["L"]
-            inp = ids.view(1, L)
-            pos = torch.arange(L, device=ids.device).view(1, L)
+            padded_ids = _pad_token_ids_to_pipeline_length(
+                ids, schedule_sequence_length
+            )
+            padded_length = padded_ids.numel()
+            inp = padded_ids.view(1, padded_length)
+            pos = torch.arange(padded_length, device=ids.device).view(1, padded_length)
+            if r3_routes is not None:
+                self._r3_set_microbatch_routes(
+                    r3_routes,
+                    row=mb["row"],
+                    start=mb["start"],
+                    length=L,
+                    padded_length=padded_length,
+                )
             out = model(input_ids=inp, position_ids=pos, attention_mask=None)
             return out, _partial(_train_loss_func, mb)
 
@@ -1608,24 +2581,55 @@ class MegatronEngine(MegatronBaseEngine):
         config = self._tfcfg
         saved_timers = config.timers
         config.timers = None
-        forward_backward_func(
-            forward_step_func=_forward_step,
-            data_iterator=mb_iter,
-            model=[self._ddp],
-            num_microbatches=B,
-            seq_length=S,
-            micro_batch_size=1,
-            forward_only=False,
+        r3_acceptance: dict[str, float] = {}
+        dsv4_acceptance = bool(
+            r3_routes is not None
+            and getattr(self._tfcfg, "dsv4_mode", False)
         )
-        config.timers = saved_timers
+        if r3_routes is not None:
+            self._r3_clear()
+            if dsv4_acceptance:
+                self._r3_reset_native_diagnostics()
+                r3_acceptance.update(self._r3_pp_coverage_metrics())
+                r3_acceptance.update(
+                    self._r3_hash_metrics(r3_routes, seqs, am)
+                )
+        try:
+            with _fixed_pipeline_shapes(config):
+                forward_backward_func(
+                    forward_step_func=_forward_step,
+                    data_iterator=mb_iter,
+                    model=[self._ddp],
+                    num_microbatches=B,
+                    seq_length=schedule_sequence_length,
+                    micro_batch_size=1,
+                    forward_only=False,
+                    adjust_tensor_shapes_fn=_pipeline_shape_adjuster(config),
+                )
+            if dsv4_acceptance:
+                # Capture before clear_indices() destroys native replay state.
+                r3_acceptance.update(
+                    self._r3_native_recompute_metrics()
+                )
+        finally:
+            config.timers = saved_timers
+            if r3_routes is not None:
+                self._r3_clear()
 
         grad_norm = self._optimizer_step()
         lr = self._sched_step()
         metrics = {
-            "loss": loss_accum[0] / max(1, n_rows[0]),
+            "loss": (
+                loss_accum[0]
+                if algo_name == AlgorithmName.GRPO.value
+                else loss_accum[0] / max(1, n_rows[0])
+            ),
             "lr": lr,
             "grad_norm": grad_norm,
         }
+        if r3_routes is not None:
+            metrics.update(self._r3_metrics(r3_routes, am))
+            metrics.update(r3_acceptance)
         if ppo_kl[1] > 0:
             metrics["ppo_kl_sum"] = ppo_kl[0]
             metrics["ppo_kl_tok"] = ppo_kl[1]
@@ -1703,9 +2707,29 @@ class MegatronEngine(MegatronBaseEngine):
             "grad_norm": grad_norm,
         }
 
+    def _optimizer_step(self) -> float:
+        """Reduce grads across DP (+reduce-scatter for the distributed optimizer),
+        then step the Megatron distributed optimizer."""
+        from megatron.core.distributed import finalize_model_grads
+        finalize_model_grads([self._ddp])
+        update_successful, grad_norm, _num_zeros = self.optimizer.step()
+        if not update_successful:
+            logger.warning("optimizer.step reported update_successful=False")
+        return float(grad_norm) if grad_norm is not None else 0.0
 
+    def _cur_lr(self) -> float:
+        try:
+            return float(self.optimizer.param_groups[0]["lr"])
+        except Exception:
+            return 0.0
 
+    def _sched_step(self) -> float:
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step(increment=1)
+        return self._cur_lr()
 
+    def lr_scheduler_step(self) -> float:
+        return self._cur_lr()
 
     # ---- weight sync: Megatron -> HF named tensors ----
     def get_per_tensor_param(self, **kwargs):
@@ -1840,21 +2864,27 @@ class MegatronEngine(MegatronBaseEngine):
         return gen, None
 
     def _dist_sharded_state_dict(self, is_loading: bool):
-        """Build a low-memory, DP-reshardable model and optimizer state."""
+        """Build model and HDO-compatible distributed optimizer state.
+
+        ``dp_reshardable`` assumes optimizer parameter ordering matches the
+        grad-buffer layout. Precision-aware CPU offload reorders native-FP32
+        and BF16 shards, so use the gather/scatter representation that
+        canonicalizes those shards before saving.
+        """
         model_state = self.module.sharded_state_dict()
         optimizer_state = self.optimizer.sharded_state_dict(
             model_state,
             is_loading=is_loading,
-            metadata={"distrib_optim_sharding_type": "dp_reshardable"},
+            metadata={"distrib_optim_sharding_type": "dp_zero_gather_scatter"},
         )
         return {"model": model_state, "optimizer": optimizer_state}
 
     def save_dist_checkpoint(self, local_path: str, global_step: int = 0) -> bool:
         """Save directly from each rank's owned optimizer buffers.
 
-        ``dp_reshardable`` avoids the DP-zero gather used by the legacy actor
-        checkpoint path, so saving does not materialize full optimizer copies
-        on every worker.
+        The optimizer state uses DP-zero gather/scatter because the
+        precision-aware HybridDeviceOptimizer stores param-shaped CPU state
+        rather than bucket-shaped state.
         """
         import megatron.core.dist_checkpointing as dc
 
@@ -1863,6 +2893,27 @@ class MegatronEngine(MegatronBaseEngine):
         if self.lr_scheduler is not None:
             state["lr_scheduler"] = self.lr_scheduler.state_dict()
         os.makedirs(local_path, exist_ok=True)
+        if os.environ.get("LUMENRL_VERIFY_CHECKPOINT_ROUNDTRIP") == "1":
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
+            manifest_path = None
+            # HDO already occupies most host RAM. Hash ranks one at a time so
+            # checkpoint inspection cannot OOM all workers simultaneously.
+            for active_rank in range(world_size):
+                if rank == active_rank:
+                    manifest_path = _save_checkpoint_fingerprint_manifest(
+                        local_path,
+                        state,
+                        rank=rank,
+                    )
+                if dist.is_initialized():
+                    dist.barrier()
+            assert manifest_path is not None
+            logger.info(
+                "Saved pre-checkpoint tensor fingerprints: rank=%d path=%s",
+                rank,
+                manifest_path,
+            )
         dc.save(state, str(local_path))
         if dist.is_initialized():
             dist.barrier()
@@ -1901,13 +2952,46 @@ class MegatronEngine(MegatronBaseEngine):
         import megatron.core.dist_checkpointing as dc
 
         self._patch_hybrid_optimizer_checkpoint_load()
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        manifest_path = _checkpoint_fingerprint_manifest_path(local_path, rank)
+        verify_round_trip = (
+            os.environ.get("LUMENRL_VERIFY_CHECKPOINT_ROUNDTRIP") == "1"
+            or manifest_path.is_file()
+        )
+        if verify_round_trip and not manifest_path.is_file():
+            raise FileNotFoundError(
+                f"Missing checkpoint fingerprint manifest: {manifest_path}"
+            )
         state = self._dist_sharded_state_dict(is_loading=True)
         state["global_step"] = 0
         loaded = dc.load(state, str(local_path))
+        if verify_round_trip:
+            _verify_checkpoint_fingerprint_manifest(
+                local_path,
+                loaded,
+                rank=rank,
+                stage="serialized checkpoint load",
+            )
         self.module.load_state_dict(loaded["model"])
         self.optimizer.load_state_dict(loaded["optimizer"])
         if self.lr_scheduler is not None and loaded.get("lr_scheduler") is not None:
             self.lr_scheduler.load_state_dict(loaded["lr_scheduler"])
+        if verify_round_trip:
+            restored = self._dist_sharded_state_dict(is_loading=False)
+            restored["global_step"] = int(loaded.get("global_step", 0))
+            if self.lr_scheduler is not None:
+                restored["lr_scheduler"] = self.lr_scheduler.state_dict()
+            _verify_checkpoint_fingerprint_manifest(
+                local_path,
+                restored,
+                rank=rank,
+                stage="restored live model and optimizer",
+            )
+            logger.info(
+                "Checkpoint tensor fingerprints match exactly: rank=%d path=%s",
+                rank,
+                local_path,
+            )
         if dist.is_initialized():
             dist.barrier()
         return int(loaded.get("global_step", 0))

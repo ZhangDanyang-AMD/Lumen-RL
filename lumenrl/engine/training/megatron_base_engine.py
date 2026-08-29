@@ -33,22 +33,30 @@ from lumenrl.engine.training.qwen3_megatron_bridge import Qwen3Dims
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LUMENRL_LOGGING_LEVEL", "INFO"))
 
-# Scratch buffer for the log-prob gap diagnostic: per-row slices of the three
-# tensors that ppo_kl and rollout_corr/kl are reduced from.
+
+def _response_mask_is_token_indexed(tensors: dict[str, torch.Tensor]) -> bool:
+    """Whether response_mask uses token columns [S], rather than log-prob columns [S-1]."""
+    response_mask = tensors.get("response_mask")
+    input_ids = tensors.get("input_ids")
+    return bool(
+        response_mask is not None
+        and input_ids is not None
+        and response_mask.shape[-1] >= input_ids.shape[-1]
+    )
+
+
+# Scratch buffer used by the merged native-engine log-prob gap diagnostic.
 _GAP_ROWS: list = []
-# Ray actors are created without a runtime_env, so an env var exported next to
-# the driver does not reach them. Fall back to a sentinel file holding the
-# output directory, which every process in the container can see.
 _GAP_SENTINEL = "/tmp/lumenrl_gap_dump_dir"
 
 
 def _gap_dump_dir() -> str | None:
-    d = os.environ.get("LUMENRL_DUMP_LOGPROB_GAP")
-    if d:
-        return d
+    directory = os.environ.get("LUMENRL_DUMP_LOGPROB_GAP")
+    if directory:
+        return directory
     try:
-        with open(_GAP_SENTINEL) as fh:
-            return fh.read().strip() or None
+        with open(_GAP_SENTINEL) as sentinel:
+            return sentinel.read().strip() or None
     except OSError:
         return None
 
@@ -251,7 +259,19 @@ class MegatronBaseEngine(BaseEngine):
         ent = torch.cat(ents, dim=0) if want_entropy else None
         return lp, ent
 
-    def _row_policy_loss(self, t, r, start, token_lp, algo_name, cfg_fn, bnt, dp):
+    def _row_policy_loss(
+        self,
+        t,
+        r,
+        start,
+        token_lp,
+        algo_name,
+        cfg_fn,
+        bnt,
+        dp,
+        loss_agg_mode,
+        global_batch_size,
+    ):
         """DAPO/PG loss + PPO-KL metrics for one sequence, given its (grad-carrying)
         per-token log-prob ``token_lp`` [1, Lm]. Returns ``(loss_tensor|None, stats|None)``.
         Shared by the packed and per-row training paths."""
@@ -269,22 +289,12 @@ class MegatronBaseEngine(BaseEngine):
         old_lp = _col("old_log_probs", shift=False)
         if old_lp is None:
             return None, None
-        # ``token_lp[j]`` scores token ``start+1+j``, and so does entry ``start+j``
-        # of every per-token tensor the trainer produces: ``old_log_probs`` is
-        # written that way by ``engine_compute_log_probs``, and the width-(S-1)
-        # tensors (``response_mask``, ``rollout_log_probs``, the IS weights) are
-        # already ``[:, 1:]``-shifted into the same frame. None of them may be
-        # shifted a second time. The mask used to be, which slid the loss window
-        # one token early: it covered the last PROMPT position and dropped the
-        # final response token -- the EOS, the one position that governs response
-        # length. That off-by-one is also where the one-per-sequence
-        # ``rollout_log_probs == 0.0`` artifact came from (a prompt column the
-        # rollout engine never reported), which alone accounted for 97% of the
-        # reported rollout_corr/kl. A mask that is still token-indexed (width S,
-        # entry i about token i) does need the +1.
-        _rm = t.get("response_mask")
-        _rm_shift = _rm is not None and _rm.shape[-1] >= t["input_ids"].shape[-1]
-        resp_mask = _col("response_mask", shift=_rm_shift)
+        # Trainer masks are normally width S-1 and already aligned to log-prob
+        # columns. Preserve compatibility with token-indexed width-S masks.
+        resp_mask = _col(
+            "response_mask",
+            shift=_response_mask_is_token_indexed(t),
+        )
         adv_t = t.get("advantages")
         if adv_t is None:
             return None, None
@@ -316,9 +326,27 @@ class MegatronBaseEngine(BaseEngine):
                 mask=mask, clip_ratio_c=float(cfg_fn("clip_ratio_c", 0.0)),
                 batch_num_tokens=bnt, dp_size=dp, rollout_is_weights=ris,
             )
+        elif algo_name == AlgorithmName.GRPO.value:
+            loss = asymmetric_clip_loss(
+                token_lp,
+                old_lp,
+                adv,
+                float(cfg_fn("clip_ratio", 0.2)),
+                float(cfg_fn("clip_ratio_high", 0.28)),
+                mask=mask,
+                batch_num_tokens=bnt,
+                dp_size=dp,
+                loss_agg_mode=loss_agg_mode,
+                global_batch_size=global_batch_size,
+                rollout_is_weights=ris,
+            )
         else:
             loss = policy_gradient_loss(
-                token_lp, old_lp, adv, float(cfg_fn("clip_ratio", 0.2)), mask=mask,
+                token_lp,
+                old_lp,
+                adv,
+                float(cfg_fn("clip_ratio", 0.2)),
+                mask=mask,
             )
         kl_c = float(cfg_fn("kl_coeff", 0.0))
         if kl_c > 0.0 and ref_lp is not None:
@@ -334,16 +362,6 @@ class MegatronBaseEngine(BaseEngine):
                 if rlp is not None:
                     stats["rc_kl_sum"] = float(((rlp - token_lp) * mask).sum())
                     stats["rc_kl_tok"] = tok
-                if _gap_dump_dir():
-                    # Keep the three log-probs the two KL metrics are built from,
-                    # already aligned and masked the way the metrics see them.
-                    m = mask.detach().bool().reshape(-1)
-                    _GAP_ROWS.append({
-                        "train_lp": token_lp.detach().float().reshape(-1)[m].cpu(),
-                        "old_lp": old_lp.detach().float().reshape(-1)[m].cpu(),
-                        "rollout_lp": rlp.detach().float().reshape(-1)[m].cpu()
-                        if rlp is not None else None,
-                    })
         return loss, stats
 
     # ---- engine-level compute_log_probs (actor delegates here) ----
@@ -417,6 +435,8 @@ class MegatronBaseEngine(BaseEngine):
         if am is None:
             am = torch.ones_like(seqs)
         B, S = seqs.shape
+        loss_agg_mode = str(_cfg("loss_agg_mode", "token-mean"))
+        global_batch_size = int(meta.get("global_batch_size") or B * dp)
 
         self.module.train()
         self._ddp.zero_grad_buffer()
@@ -458,7 +478,10 @@ class MegatronBaseEngine(BaseEngine):
                     r, start, _L = rows[j]
                     seg = logits_packed[offsets[k]:offsets[k + 1]]           # [L,V]
                     token_lp = self._token_logprob_train(seg[:-1], ids_list[k][1:]).view(1, -1)
-                    loss, stats = self._row_policy_loss(t, r, start, token_lp, algo_name, _cfg, bnt, dp)
+                    loss, stats = self._row_policy_loss(
+                        t, r, start, token_lp, algo_name, _cfg, bnt, dp,
+                        loss_agg_mode, global_batch_size,
+                    )
                     if loss is None:
                         continue
                     bin_loss = loss if bin_loss is None else bin_loss + loss
@@ -471,7 +494,10 @@ class MegatronBaseEngine(BaseEngine):
                 ids = seqs[r, start:start + L].to("cuda")
                 logits = self._forward_logits(ids, model=self._ddp) / temperature  # [L,V] (grad)
                 token_lp = self._token_logprob_train(logits[:-1], ids[1:]).view(1, -1)  # [1,L-1]
-                loss, stats = self._row_policy_loss(t, r, start, token_lp, algo_name, _cfg, bnt, dp)
+                loss, stats = self._row_policy_loss(
+                    t, r, start, token_lp, algo_name, _cfg, bnt, dp,
+                    loss_agg_mode, global_batch_size,
+                )
                 if loss is None:
                     continue
                 loss.backward()
@@ -480,7 +506,11 @@ class MegatronBaseEngine(BaseEngine):
         grad_norm = self._optimizer_step()
         lr = self._sched_step()
         metrics = {
-            "loss": loss_accum / max(1, n_rows),
+            "loss": (
+                loss_accum
+                if algo_name == AlgorithmName.GRPO.value
+                else loss_accum / max(1, n_rows)
+            ),
             "lr": lr,
             "grad_norm": grad_norm,
         }
@@ -490,25 +520,6 @@ class MegatronBaseEngine(BaseEngine):
         if rc_kl_tok > 0:
             metrics["rollout_corr_kl_sum"] = rc_kl_sum
             metrics["rollout_corr_kl_tok"] = rc_kl_tok
-
-        _dump = _gap_dump_dir()
-        if _dump and _GAP_ROWS:
-            rank = dist.get_rank() if dist.is_initialized() else 0
-            rows = [r for r in _GAP_ROWS if r["rollout_lp"] is not None]
-            if rows:
-                torch.save(
-                    {
-                        "train_lp": torch.cat([r["train_lp"] for r in rows]),
-                        "old_lp": torch.cat([r["old_lp"] for r in rows]),
-                        "rollout_lp": torch.cat([r["rollout_lp"] for r in rows]),
-                        # The exact scalars this rank reported, so the metric
-                        # arithmetic can be reproduced from the raw tensors.
-                        "rc_kl_sum": rc_kl_sum, "rc_kl_tok": rc_kl_tok,
-                        "ppo_kl_sum": ppo_kl_sum, "ppo_kl_tok": ppo_kl_tok,
-                    },
-                    f"{_dump}/engine_gap_rank{rank}.pt",
-                )
-            _GAP_ROWS.clear()
         return metrics
 
     def _engine_update_sft(self, batch: DataProto) -> dict[str, float]:
