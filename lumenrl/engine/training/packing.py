@@ -225,7 +225,7 @@ def packed_token_log_probs(
     not_last = torch.ones(total_tokens, dtype=torch.bool, device=device)
     not_last[cu_seqlens[1:].long() - 1] = False
 
-    if _FUSED_CROSS_ENTROPY is not None:
+    if _FUSED_CROSS_ENTROPY is not None and logits.is_cuda:
         # Fused path: one Triton kernel over the full (total_tokens, V) buffer,
         # with the backward writing dlogits in place. Never materializes a
         # log_softmax tensor, and the boundary rows are dropped *after* the

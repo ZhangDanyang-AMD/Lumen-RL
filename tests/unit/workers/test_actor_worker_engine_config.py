@@ -21,6 +21,21 @@ from lumenrl.core.protocol import DataProto
 from lumenrl.workers.actor_worker import LumenActorWorker
 
 
+def _mock_checkpoint_control_group(monkeypatch) -> object:
+    control_group = object()
+    monkeypatch.setattr(
+        torch.distributed,
+        "new_group",
+        lambda *, ranks, backend: control_group,
+    )
+    monkeypatch.setattr(
+        torch.distributed,
+        "destroy_process_group",
+        lambda group: None,
+    )
+    return control_group
+
+
 @pytest.mark.parametrize("worker_type", [LumenActorWorker, TrainingActorWorker])
 def test_rank_local_checkpoint_format_bypasses_dist_checkpoint(
     worker_type,
@@ -113,7 +128,10 @@ def test_rank_local_checkpoint_serializes_ranks_with_barriers(
     monkeypatch.setattr(
         torch.distributed,
         "all_gather_object",
-        lambda output, _: output.__setitem__(slice(None), ["node-a", "node-a"]),
+        lambda output, _, *, group=None: output.__setitem__(
+            slice(None),
+            ["node-a", "node-a"],
+        ),
     )
     monkeypatch.setattr(torch.distributed, "barrier", lambda: barriers.append(1))
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
@@ -144,7 +162,10 @@ def test_rank_local_checkpoint_saves_one_rank_per_node_in_parallel(
     monkeypatch.setattr(
         torch.distributed,
         "all_gather_object",
-        lambda output, _: output.__setitem__(slice(None), ["node-a", "node-a", "node-b", "node-b"]),
+        lambda output, _, *, group=None: output.__setitem__(
+            slice(None),
+            ["node-a", "node-a", "node-b", "node-b"],
+        ),
     )
     monkeypatch.setattr(torch.distributed, "barrier", lambda: barriers.append(1))
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
@@ -267,7 +288,7 @@ def test_rank_local_checkpoint_propagates_peer_load_failure(
     worker.world_size = 2
     barriers = []
 
-    def fake_all_gather_object(output, value):
+    def fake_all_gather_object(output, value, *, group=None):
         if isinstance(value, str):
             output[:] = ["node-a", "node-a"]
         else:
@@ -278,6 +299,7 @@ def test_rank_local_checkpoint_propagates_peer_load_failure(
 
     monkeypatch.setenv("LUMENRL_CHECKPOINT_FORMAT", "rank_local")
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    _mock_checkpoint_control_group(monkeypatch)
     monkeypatch.setattr(
         torch.distributed,
         "all_gather_object",
@@ -317,7 +339,7 @@ def test_rank_local_checkpoint_load_serializes_ranks(
     barriers = []
     phase_syncs = []
 
-    def fake_all_gather_object(output, value):
+    def fake_all_gather_object(output, value, *, group=None):
         if isinstance(value, str):
             output[:] = ["node-a", "node-a"]
         else:
@@ -326,6 +348,7 @@ def test_rank_local_checkpoint_load_serializes_ranks(
 
     monkeypatch.setenv("LUMENRL_CHECKPOINT_FORMAT", "rank_local")
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    _mock_checkpoint_control_group(monkeypatch)
     monkeypatch.setattr(
         torch.distributed,
         "all_gather_object",

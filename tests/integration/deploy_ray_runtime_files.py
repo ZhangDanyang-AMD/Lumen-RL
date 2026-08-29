@@ -11,11 +11,15 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 ROOT = Path("/workspace/Lumen-RL")
 FILES = (
     "lumenrl/core/config.py",
+    "lumenrl/controller/ray_worker_group.py",
     "lumenrl/trainer/rl_trainer.py",
     "lumenrl/engine/inference/fp8_weight_quantizer.py",
+    "lumenrl/engine/inference/rdma_protocol.py",
     "lumenrl/engine/inference/rdma_weight_transfer.py",
     "lumenrl/engine/inference/vllm_colocate_worker_ext.py",
     "lumenrl/engine/inference/vllm_fp8_utils.py",
+    "lumenrl/engine/inference/weight_integrity.py",
+    "tests/integration/run_dsv4_weight_sync_integrity.py",
 )
 
 

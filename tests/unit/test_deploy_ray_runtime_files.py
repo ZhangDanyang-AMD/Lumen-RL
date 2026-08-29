@@ -1,4 +1,4 @@
-from deploy_ray_runtime_files import FILES
+from tests.integration.deploy_ray_runtime_files import FILES
 
 
 def test_rdma_protocol_is_deployed_with_runtime_files() -> None:
