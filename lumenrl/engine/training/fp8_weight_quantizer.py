@@ -53,6 +53,8 @@ _FP8_SKIP_SUFFIXES = (
     # quant_config=None in vLLM and must remain BF16.
     "compressor.wkv.weight",
     "compressor.wgate.weight",
+    # DSV4 indexer score projection is also explicitly unquantized in vLLM.
+    "indexer.weights_proj.weight",
 )
 
 # Parameters that SHOULD be quantized (linear weights in attention + MLP + experts)

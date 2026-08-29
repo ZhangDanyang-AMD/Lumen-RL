@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from lumenrl.engine.inference import fp8_weight_quantizer as quantizer
+from lumenrl.engine.training import fp8_weight_quantizer as training_quantizer
 
 
 def _expand_block_scales(
@@ -86,3 +87,8 @@ def test_quantizer_replaces_only_terminal_weight_suffix() -> None:
 )
 def test_quantizer_skips_redhat_non_fp8_weights(name: str) -> None:
     assert quantizer._should_quantize(name) is False
+
+
+def test_training_quantizer_skips_dsv4_indexer_score_projection() -> None:
+    name = "model.layers.2.self_attn.indexer.weights_proj.weight"
+    assert training_quantizer._should_quantize(name) is False
