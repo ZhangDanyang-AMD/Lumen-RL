@@ -46,6 +46,8 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from lumenrl.engine.training.megatron_base_engine import moe_dispatcher_kwargs
+
 MODEL_TYPE = "deepseek_v4"
 
 # YaRN + MLA defaults that DSv4 does not spell out in its HF config. miles'
@@ -224,7 +226,10 @@ def build_dsv4_config(
         # so this changes no existing run.
         moe_router_dtype=(str(ec["moe_router_dtype"])
                           if ec.get("moe_router_dtype") else None),
-        moe_token_dispatcher_type="alltoall",
+        **moe_dispatcher_kwargs(
+            ec, tp=tp, cp=cp, sp=sp,
+            max_tokens_per_gpu=int(ec.get("max_tokens_per_gpu") or 0),
+        ),
         moe_grouped_gemm=bool(ec.get("moe_grouped_gemm", True)),
         moe_permute_fusion=bool(ec.get("moe_permute_fusion", False)),
         # ---- DSv4: hyper-connections, compressed attention, hash routing ----

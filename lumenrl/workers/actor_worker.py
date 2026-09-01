@@ -214,6 +214,9 @@ class LumenActorWorker(BaseWorker):
                 "moe_aux_loss_coeff": meg_cfg.get("moe_aux_loss_coeff", 0.0),
                 "moe_router_bias_update_rate": meg_cfg.get("moe_router_bias_update_rate", None),
                 "moe_token_dispatcher_type": meg_cfg.get("moe_token_dispatcher_type", "alltoall"),
+                "moe_flex_dispatcher_backend": meg_cfg.get("moe_flex_dispatcher_backend"),
+                "moe_mori_max_tokens_per_rank": meg_cfg.get("moe_mori_max_tokens_per_rank"),
+                "moe_mori_kernel_type": meg_cfg.get("moe_mori_kernel_type"),
                 "moe_permute_fusion": meg_cfg.get("moe_permute_fusion", False),
                 "r3_enabled": bool(
                     get_nested_config(self.config, "moe", "r3", "enabled", default=False)

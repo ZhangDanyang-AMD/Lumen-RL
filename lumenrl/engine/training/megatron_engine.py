@@ -36,7 +36,10 @@ from lumenrl.algorithms.loss_functions import (
 from lumenrl.core.protocol import DataProto
 from lumenrl.core.types import AlgorithmName
 from lumenrl.engine.training.base_engine import EngineRegistry
-from lumenrl.engine.training.megatron_base_engine import MegatronBaseEngine
+from lumenrl.engine.training.megatron_base_engine import (
+    MegatronBaseEngine,
+    moe_dispatcher_kwargs,
+)
 from lumenrl.engine.training.qwen3_megatron_bridge import (
     Qwen3Dims,
     hf_to_megatron,
@@ -304,14 +307,6 @@ class MegatronEngine(MegatronBaseEngine):
                 moe_ffn_hidden_size=moe_ffn if moe_ffn > 0 else hf["intermediate_size"],
                 moe_router_topk=int(hf.get("num_experts_per_tok", 8)),
                 moe_grouped_gemm=bool(ec.get("moe_grouped_gemm", False)),
-                # MCore defaults to allgather, which requires every dense-DP
-                # rank to contribute the same token count. RL batches contain
-                # variable-length responses, so EP ranks can otherwise enter
-                # different collectives and deadlock. All-to-all supports the
-                # variable token splits used by packed GRPO batches.
-                moe_token_dispatcher_type=str(
-                    ec.get("moe_token_dispatcher_type", "alltoall")
-                ),
                 expert_model_parallel_size=ep,
                 moe_enable_routing_replay=self._r3_enabled,
             )
@@ -335,6 +330,13 @@ class MegatronEngine(MegatronBaseEngine):
             tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp,
             sequence_parallel=bool(ec.get("sequence_parallel", False)),
             use_cpu_initialization=True,
+            **moe_dispatcher_kwargs(
+                ec,
+                tp=tp,
+                cp=cp,
+                sp=bool(ec.get("sequence_parallel", False)),
+                max_tokens_per_gpu=int(ec.get("max_tokens_per_gpu") or 0),
+            ),
             **recompute_kwargs,
             **moe_kwargs,
             **pp_kwargs,

@@ -33,6 +33,48 @@ from lumenrl.engine.training.qwen3_megatron_bridge import Qwen3Dims
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LUMENRL_LOGGING_LEVEL", "INFO"))
 
+
+def moe_dispatcher_kwargs(
+    engine_config: dict[str, Any],
+    *,
+    tp: int,
+    cp: int,
+    sp: bool,
+    max_tokens_per_gpu: int = 0,
+) -> dict[str, Any]:
+    """Map ``megatron_cfg`` dispatcher fields onto ``TransformerConfig``.
+
+    Megatron-LM's pretrain script derives ``moe_mori_max_tokens_per_rank`` in
+    ``validate_args``. LumenRL constructs ``TransformerConfig`` directly, so a
+    MORI flex dispatcher must set that heap size here. Packed RL forwards use
+    ``max_tokens_per_gpu`` as the per-rank token ceiling (then CP / SP).
+    """
+    dispatcher = str(engine_config.get("moe_token_dispatcher_type", "alltoall"))
+    out: dict[str, Any] = {"moe_token_dispatcher_type": dispatcher}
+    if dispatcher != "flex":
+        return out
+    backend = str(engine_config.get("moe_flex_dispatcher_backend") or "mori")
+    out["moe_flex_dispatcher_backend"] = backend
+    if backend != "mori":
+        return out
+    mori_max = engine_config.get("moe_mori_max_tokens_per_rank")
+    if mori_max is None:
+        budget = int(max_tokens_per_gpu or 0) or 21504
+        if cp > 1:
+            budget = (budget + cp - 1) // cp
+        if sp and tp > 1:
+            budget = (budget + tp - 1) // tp
+        mori_max = budget
+    out["moe_mori_max_tokens_per_rank"] = int(mori_max)
+    kernel = engine_config.get("moe_mori_kernel_type")
+    if kernel:
+        out["moe_mori_kernel_type"] = str(kernel)
+    logger.info(
+        "MoE flex dispatcher: backend=mori moe_mori_max_tokens_per_rank=%s",
+        out["moe_mori_max_tokens_per_rank"],
+    )
+    return out
+
 # Scratch buffer for the log-prob gap diagnostic: per-row slices of the three
 # tensors that ppo_kl and rollout_corr/kl are reduced from.
 _GAP_ROWS: list = []

@@ -73,6 +73,10 @@ policy:
       sequence_parallel: false
       moe_grouped_gemm: true
       moe_permute_fusion: true
+      moe_token_dispatcher_type: alltoall
+      moe_flex_dispatcher_backend: mori
+      moe_mori_max_tokens_per_rank: null
+      moe_mori_kernel_type: null
       moe_aux_loss_coeff: 0.0
       moe_router_dtype: fp32
       # Full activation recomputation. Not needed to fit a 4k response on its
