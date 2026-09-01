@@ -1,11 +1,23 @@
 from __future__ import annotations
 
-import torch
+import sys
+from types import SimpleNamespace
+
 import pytest
+import torch
+
+try:
+    import resource  # noqa: F401
+except ModuleNotFoundError:
+    sys.modules["resource"] = SimpleNamespace(
+        RUSAGE_SELF=0,
+        getrusage=lambda _: SimpleNamespace(ru_maxrss=0),
+    )
 
 from lumenrl.controller.dispatch import DISPATCH_MODE_FN_REGISTRY, DispatchMode, collect_proto, dispatch_proto
 from lumenrl.controller.worker_group_factory import resolve_worker_class
 from lumenrl.core.protocol import DataProto
+from lumenrl.trainer.rl_trainer import RLTrainer
 
 
 def test_dispatch_even_split() -> None:
@@ -95,3 +107,42 @@ def test_direct_rollout_mode_is_forbidden() -> None:
 def test_resolve_worker_class_from_role_key() -> None:
     cls = resolve_worker_class("actor.default")
     assert cls.__name__ == "LumenActorWorker"
+
+
+def test_ray_actor_dispatch_preserves_full_global_batch_size(monkeypatch) -> None:
+    received = []
+
+    class FakeActorGroup:
+        num_workers = 2
+        _dp_rank_mapping = [0, 1]
+        _collect_mask = None
+
+        @staticmethod
+        def call_single_async(rank, method, batch):
+            assert method == "update_policy"
+            received.append((rank, batch))
+            return {"loss": float(rank)}
+
+    fake_ray = SimpleNamespace(put=lambda value: value, get=lambda refs: refs)
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    trainer = RLTrainer.__new__(RLTrainer)
+    trainer._actor_wg = FakeActorGroup()
+    trainer._ray_dispatch_state = {}
+    trainer.config = SimpleNamespace(
+        controller=SimpleNamespace(
+            ray=SimpleNamespace(
+                actor=SimpleNamespace(
+                    dispatch_mode="dp_compute_proto",
+                    lazy_dispatch_key=None,
+                )
+            )
+        )
+    )
+    batch = DataProto(tensors={"x": torch.arange(8).view(4, 2)})
+
+    trainer._update_actor_with_ray(batch)
+
+    assert batch.meta["global_batch_size"] == 4
+    assert len(received) == 2
+    assert all(shard.batch_size == 2 for _, shard in received)
+    assert all(shard.meta["global_batch_size"] == 4 for _, shard in received)

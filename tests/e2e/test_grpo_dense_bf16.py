@@ -9,36 +9,35 @@ import pytest
 import torch
 
 from lumenrl.core.config import LumenRLConfig
-from lumenrl.core.protocol import DataProto
-from lumenrl.trainer import rl_trainer as rl_trainer_mod
 from lumenrl.trainer.rl_trainer import RLTrainer
 
 
 pytestmark = [pytest.mark.multigpu, pytest.mark.slow]
 
 
-class _RisingRewardStub(rl_trainer_mod.StubRewardWorker):
-    """Deterministic rising mean reward so convergence-style assertions are stable."""
+_RISING_REWARD_HISTORY: list[float] = []
 
-    history: list[float] = []
 
-    def __init__(self, rank: int, world_size: int, **kwargs: object) -> None:
-        super().__init__(rank, world_size, **kwargs)
-        self._local = 0
-
-    def compute_rewards(self, batch: DataProto) -> DataProto:
-        self._local += 1
-        b = batch.batch_size
-        device = batch.tensors["old_log_probs"].device
-        batch.tensors["rewards"] = torch.linspace(0.1, 0.2, b, device=device, dtype=torch.float32) + 0.05 * float(
-            self._local
-        )
-        batch.meta.setdefault(
-            "response_lengths",
-            [int(batch.tensors["attention_mask"][i].sum().item()) for i in range(b)],
-        )
-        type(self).history.append(float(batch.tensors["rewards"].mean().item()))
-        return batch
+def _compute_rising_rewards(
+    self,
+    sequences: torch.Tensor,
+    attention_mask: torch.Tensor,
+    prompt_lengths: list[int],
+    gts_expanded: list[str],
+) -> tuple[torch.Tensor, list[str], list[float]]:
+    """Return deterministic rising rewards through the current trainer API."""
+    del self, attention_mask, prompt_lengths, gts_expanded
+    batch_size = int(sequences.shape[0])
+    step = len(_RISING_REWARD_HISTORY) + 1
+    rewards = torch.linspace(
+        0.1,
+        0.2,
+        batch_size,
+        device=sequences.device,
+        dtype=torch.float32,
+    ) + 0.05 * float(step)
+    _RISING_REWARD_HISTORY.append(float(rewards.mean().item()))
+    return rewards, [""] * batch_size, [0.0] * batch_size
 
 
 def test_grpo_dense_bf16_convergence(
@@ -52,8 +51,8 @@ def test_grpo_dense_bf16_convergence(
     yaml_path = e2e_config_dir / "grpo_dense_bf16.yaml"
     assert yaml_path.is_file()
 
-    _RisingRewardStub.history.clear()
-    monkeypatch.setattr(rl_trainer_mod, "StubRewardWorker", _RisingRewardStub)
+    _RISING_REWARD_HISTORY.clear()
+    monkeypatch.setattr(RLTrainer, "_compute_rewards_full", _compute_rising_rewards)
 
     cfg = LumenRLConfig.from_yaml(
         yaml_path,
@@ -77,7 +76,7 @@ def test_grpo_dense_bf16_convergence(
         if trainer._cluster is not None:
             trainer._cluster.shutdown()
 
-    h = _RisingRewardStub.history
+    h = _RISING_REWARD_HISTORY
     assert len(h) >= 8, "expected multiple reward-worker invocations"
     k = min(4, len(h) // 2)
     assert sum(h[-k:]) / k > sum(h[:k]) / k + 1e-6

@@ -10,26 +10,29 @@ import pytest
 import torch
 
 from lumenrl.core.config import LumenRLConfig
-from lumenrl.core.protocol import DataProto
-from lumenrl.trainer import rl_trainer as rl_trainer_mod
 from lumenrl.trainer.rl_trainer import RLTrainer
 
 
 pytestmark = [pytest.mark.multigpu, pytest.mark.fp8, pytest.mark.slow]
 
 
-class _FlatRewardStub(rl_trainer_mod.StubRewardWorker):
-    """Stable reward mean so loss trajectories dominate cross-precision comparison."""
-
-    def compute_rewards(self, batch: DataProto) -> DataProto:
-        b = batch.batch_size
-        device = batch.tensors["old_log_probs"].device
-        batch.tensors["rewards"] = torch.ones(b, device=device, dtype=torch.float32) * 0.25
-        batch.meta.setdefault(
-            "response_lengths",
-            [int(batch.tensors["attention_mask"][i].sum().item()) for i in range(b)],
-        )
-        return batch
+def _compute_flat_rewards(
+    self,
+    sequences: torch.Tensor,
+    attention_mask: torch.Tensor,
+    prompt_lengths: list[int],
+    gts_expanded: list[str],
+) -> tuple[torch.Tensor, list[str], list[float]]:
+    """Return stable rewards through the current trainer API."""
+    del self, attention_mask, prompt_lengths, gts_expanded
+    batch_size = int(sequences.shape[0])
+    rewards = torch.full(
+        (batch_size,),
+        0.25,
+        device=sequences.device,
+        dtype=torch.float32,
+    )
+    return rewards, [""] * batch_size, [0.0] * batch_size
 
 
 def _run_trainer(cfg: LumenRLConfig) -> tuple[RLTrainer, float]:
@@ -60,7 +63,7 @@ def test_grpo_dense_fp8_convergence(
     if os.environ.get("LUMENRL_E2E_SMOKE", "") != "1":
         pytest.skip("Set LUMENRL_E2E_SMOKE=1 to run multi-GPU Ray trainer smoke.")
 
-    monkeypatch.setattr(rl_trainer_mod, "StubRewardWorker", _FlatRewardStub)
+    monkeypatch.setattr(RLTrainer, "_compute_rewards_full", _compute_flat_rewards)
 
     overrides = [
         "num_training_steps=10",
@@ -91,7 +94,7 @@ def test_fp8_throughput_improvement(
     if os.environ.get("LUMENRL_E2E_SMOKE", "") != "1":
         pytest.skip("Set LUMENRL_E2E_SMOKE=1 to run multi-GPU Ray trainer smoke.")
 
-    monkeypatch.setattr(rl_trainer_mod, "StubRewardWorker", _FlatRewardStub)
+    monkeypatch.setattr(RLTrainer, "_compute_rewards_full", _compute_flat_rewards)
 
     overrides = [
         "num_training_steps=16",

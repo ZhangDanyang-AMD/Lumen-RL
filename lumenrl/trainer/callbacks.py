@@ -305,6 +305,8 @@ class WandbCallback(Callback):
             },
             allow_val_change=True,
         )
+        wandb.define_metric("train/global_step")
+        wandb.define_metric("*", step_metric="train/global_step")
 
     # Curated "core" training-effect metrics (means only, no max/min) shown in a
     # dedicated wandb `core/` panel group.
@@ -384,7 +386,7 @@ class WandbCallback(Callback):
         # 1-based step to align the wandb x-axis with verl (global_steps).
         wstep = step + 1
         payload["train/global_step"] = wstep
-        self._wandb.log(payload, step=wstep)
+        self._wandb.log(payload, step=wstep, commit=True)
 
     def on_train_end(self, trainer: "RLTrainer") -> None:
         if self._enabled and self._wandb is not None:

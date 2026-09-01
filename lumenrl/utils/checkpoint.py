@@ -4,12 +4,99 @@ from __future__ import annotations
 
 import logging
 import re
+import socket
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import torch
 
 logger = logging.getLogger(__name__)
+
+
+def create_checkpoint_control_group(world_size: int) -> Any | None:
+    """Create a CPU control group isolated from model RCCL collectives."""
+    if not torch.distributed.is_initialized():
+        return None
+    return torch.distributed.new_group(
+        ranks=list(range(int(world_size))),
+        backend="gloo",
+    )
+
+
+def checkpoint_rank_phases(
+    rank: int,
+    world_size: int,
+    *,
+    group: Any | None = None,
+) -> list[list[int]]:
+    """Group checkpoint ranks into one concurrent writer per physical node."""
+    if not torch.distributed.is_initialized():
+        return [[int(rank)]]
+
+    hostnames: list[str | None] = [None] * int(world_size)
+    torch.distributed.all_gather_object(
+        hostnames,
+        socket.gethostname(),
+        group=group,
+    )
+    ranks_by_host: dict[str, list[int]] = {}
+    for global_rank, hostname in enumerate(hostnames):
+        ranks_by_host.setdefault(str(hostname), []).append(global_rank)
+
+    phase_count = max(len(ranks) for ranks in ranks_by_host.values())
+    return [
+        [ranks[phase] for ranks in ranks_by_host.values() if phase < len(ranks)]
+        for phase in range(phase_count)
+    ]
+
+
+def run_checkpoint_phase(
+    rank: int,
+    world_size: int,
+    action: Callable[[], None] | None,
+    *,
+    group: Any | None = None,
+) -> None:
+    """Run one rank-local checkpoint action and propagate failures to every rank."""
+    local_error: Exception | None = None
+    if action is not None:
+        try:
+            action()
+        except Exception as exc:
+            local_error = exc
+
+    if not torch.distributed.is_initialized():
+        if local_error is not None:
+            raise local_error
+        return
+
+    local_failure = (
+        {
+            "rank": int(rank),
+            "type": type(local_error).__name__,
+            "message": str(local_error),
+        }
+        if local_error is not None
+        else None
+    )
+    failures: list[dict[str, Any] | None] = [None] * int(world_size)
+    torch.distributed.all_gather_object(
+        failures,
+        local_failure,
+        group=group,
+    )
+    failed = [failure for failure in failures if failure is not None]
+    if not failed:
+        return
+
+    details = "; ".join(
+        f"rank {failure['rank']} {failure['type']}: {failure['message']}"
+        for failure in failed
+    )
+    error = RuntimeError(f"checkpoint phase failed: {details}")
+    if local_error is not None:
+        raise error from local_error
+    raise error
 
 
 class CheckpointManager:

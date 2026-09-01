@@ -29,7 +29,9 @@ Never copy patterns, classes, or utilities from VERL or NeMo-RL into LumenRL.
 - Workers communicate only via `DataProto`; no shared global state across processes
 - Quantization goes through `lumenrl/quantization/`; never call `lumen.quantize` directly from worker code
 - MoE R3 hooks are installed/removed by `R3Manager`; never manually register forward hooks on MoE layers
-- Weight sync always goes through `WeightSyncManager`; never copy `state_dict` between workers directly
+- Weight sync uses the trainer-owned production paths: Ray rollout goes through
+  `RLTrainer._sync_weights_ipc()` (IPC, RDMA, or safetensors fallback), while
+  `AsyncRLTrainer` uses `FilesystemWeightSync`; never carry model weights in `DataProto`
 - ATOM engine lifecycle (init, sleep, wake, shutdown) is managed by `AtomRolloutWorker`; no raw `LLMEngine` usage elsewhere
 
 ## Import Boundaries

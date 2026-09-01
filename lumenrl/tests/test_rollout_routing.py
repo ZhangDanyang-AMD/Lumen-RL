@@ -202,8 +202,8 @@ def test_layer_lookup_is_order_independent():
     assert forward == [1, 2, 3] and backward == [3, 2, 1]
 
 
-def test_megatron_checkpoint_uses_dp_reshardable_optimizer_state():
-    """The active ``megatron`` backend must not gather DP optimizer state."""
+def test_megatron_checkpoint_uses_dp_zero_optimizer_state():
+    """CPU-offloaded optimizer state must use the HDO-compatible format."""
     model_state = {"model": object()}
     optimizer_state = {"optimizer": object()}
 
@@ -215,7 +215,9 @@ def test_megatron_checkpoint_uses_dp_reshardable_optimizer_state():
         def sharded_state_dict(self, state, *, is_loading, metadata):
             assert state is model_state
             assert is_loading is False
-            assert metadata == {"distrib_optim_sharding_type": "dp_reshardable"}
+            assert metadata == {
+                "distrib_optim_sharding_type": "dp_zero_gather_scatter"
+            }
             return optimizer_state
 
     engine = MegatronEngine.__new__(MegatronEngine)

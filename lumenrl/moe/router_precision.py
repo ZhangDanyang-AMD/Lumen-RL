@@ -47,8 +47,8 @@ def fp32_router_enabled() -> bool:
 
 
 def _is_router(name: str, mod: torch.nn.Module) -> bool:
-    # HF Qwen3Moe and vLLM Qwen3MoeSparseMoeBlock both name the router ".mlp.gate".
-    if not name.endswith(".mlp.gate"):
+    # Qwen names the router ".mlp.gate"; DSV4 also uses ".ffn.gate".
+    if not name.endswith((".mlp.gate", ".ffn.gate")):
         return False
     w = getattr(mod, "weight", None)
     return isinstance(w, torch.Tensor) and w.dim() == 2

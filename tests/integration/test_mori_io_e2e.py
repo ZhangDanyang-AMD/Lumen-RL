@@ -4,7 +4,7 @@ Tests correctness (data integrity) and speed (latency + throughput).
 Runs producer on GPU 4, consumer on GPU 0, matching the Eagle3 SDDD layout.
 
 Usage (inside docker with GPU access):
-    python tests/test_mori_io_e2e.py
+    python tests/integration/test_mori_io_e2e.py
 """
 
 import multiprocessing as mp
@@ -15,7 +15,7 @@ import time
 
 import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from lumenrl.transfer.eagle_mooncake_store import (
     HIDDEN_STATES_STORAGE_DTYPE,
