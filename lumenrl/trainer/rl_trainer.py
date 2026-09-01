@@ -383,6 +383,12 @@ class RLTrainer:
             return
         master_addr = wg.call_single(0, "get_node_ip")
         master_port = wg.call_single(0, "find_free_port")
+        # Default Ray pinning: one GPU per actor, remapped to cuda:0 → local_rank=0.
+        # MORI (and other intra-node peer-access paths) need every actor to see
+        # all node GPUs (CUDA_VISIBLE_DEVICES=0..N-1) and bind cuda:rank instead.
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        n_visible = len([x for x in visible.split(",") if x.strip()]) if visible else 0
+        bind_by_rank = n_visible >= n
         refs = [
             wg.call_single_async(
                 i,
@@ -391,7 +397,7 @@ class RLTrainer:
                 world_size=n,
                 master_addr=master_addr,
                 master_port=master_port,
-                local_rank=0,
+                local_rank=i if bind_by_rank else 0,
                 timeout_s=timeout_s,
             )
             for i in range(n)
@@ -3722,6 +3728,17 @@ class RLTrainer:
         bucket_edges: tuple[int, ...] = (128, 512, 1024, 2048, 4096),
     ) -> dict[str, float]:
         """Measure rollout/train drift in response-relative position buckets."""
+        # Megatron old_log_probs is width S (last col unused). Rollout log-probs
+        # and response_mask are the shifted [B, S-1] layout. Crop like
+        # ``_clean_batch_logprobs`` so TIS diagnostics do not require equal widths.
+        width = min(
+            old_log_probs.shape[-1],
+            rollout_log_probs.shape[-1],
+            response_mask.shape[-1],
+        )
+        old_log_probs = old_log_probs[..., :width]
+        rollout_log_probs = rollout_log_probs[..., :width]
+        response_mask = response_mask[..., :width]
         mask = response_mask.bool()
         positions = response_mask.long().cumsum(dim=-1) - 1
         delta = rollout_log_probs.float() - old_log_probs.float()
