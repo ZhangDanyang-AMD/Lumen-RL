@@ -36,6 +36,15 @@ from lumenrl.engine.training.qwen3_megatron_bridge import (
 DSV4_FLASH_COMPRESS_RATIOS: list[int] = [0, 0] + [4, 128] * 20 + [0]  # 43 values
 
 
+def is_dsv4(hf: dict) -> bool:
+    """True when ``config.json`` is a DeepSeek-V4 family (MLA + hyper-connections)."""
+    model_type = str(hf.get("model_type") or "").lower()
+    if "deepseek_v4" in model_type or "dsv4" in model_type:
+        return True
+    architectures = hf.get("architectures") or []
+    return any("deepseekv4" in str(name).lower() for name in architectures)
+
+
 @dataclass
 class DSV4Dims(Qwen3Dims):
     """Qwen3Dims extended with DSV4-specific MLA / HC / compressor fields."""

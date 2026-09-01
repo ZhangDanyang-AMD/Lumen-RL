@@ -61,6 +61,10 @@ policy:
       pipeline_model_parallel_size: 1
       context_parallel_size: 1
       expert_model_parallel_size: 32
+      moe_token_dispatcher_type: alltoall
+      moe_flex_dispatcher_backend: mori
+      moe_mori_max_tokens_per_rank: null
+      moe_mori_kernel_type: null
       dist_checkpoint_path: "/mnt/m2m_nobackup/xysheng/models/DeepSeek-V4-Flash-Base_torch_dist"
       recompute_granularity: full
       recompute_method: uniform

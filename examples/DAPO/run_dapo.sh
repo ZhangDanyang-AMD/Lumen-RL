@@ -48,7 +48,12 @@ export VLLM_USE_V1=1 VLLM_ENABLE_V1_MULTIPROCESSING=1 VLLM_LOGGING_LEVEL=WARN AT
 export RAY_DEDUP_LOGS=0 RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
 export LUMEN_DISABLE_HF_ATTN_PATCH=1 MODEL_NAME="$MODEL_PATH"
 export HF_HOME="$DATA_ROOT/hf_home" WANDB_DIR="$DATA_ROOT/wandb" LUMENRL_LOG_LEVEL=INFO
-export PYTHONPATH="$RL_ROOT/Lumen-RL:$AITER_DIR:$LUMEN_DIR:$ATOM_DIR:${PYTHONPATH:-}"
+# MEGATRON_PATH first so Ray actors import this tree instead of a pip megatron-core.
+_PP="$RL_ROOT/Lumen-RL:$AITER_DIR:$LUMEN_DIR:$ATOM_DIR:${PYTHONPATH:-}"
+if [ -n "${MEGATRON_PATH:-}" ]; then
+  _PP="$MEGATRON_PATH:$_PP"
+fi
+export PYTHONPATH="$_PP"
 for _wandb_key in "$RL_ROOT/wandb.key" "$RL_ROOT/../wandb.key"; do
   if [ -z "${WANDB_API_KEY:-}" ] && [ -f "$_wandb_key" ]; then
     export WANDB_API_KEY="$(cut -d= -f2- "$_wandb_key" | tr -d '[:space:]')"
@@ -69,7 +74,11 @@ if [ "$MODE" = "atomfp8" ] || [ "$MODE" = "atom_fp8" ] || \
   fi
   unset ATOM_DISABLE_VLLM_PLUGIN
   export LUMENRL_ATOM_AITER_SRC="${LUMENRL_ATOM_AITER_SRC:-$AITER_DIR}"
-  export PYTHONPATH="$RL_ROOT/Lumen-RL/examples/DAPO/atom_aiter_shim:$RL_ROOT/Lumen-RL:$AITER_DIR:$LUMEN_DIR:$ATOM_DIR:$USER_PYTHONPATH"
+  _PP="$RL_ROOT/Lumen-RL/examples/DAPO/atom_aiter_shim:$RL_ROOT/Lumen-RL:$AITER_DIR:$LUMEN_DIR:$ATOM_DIR:$USER_PYTHONPATH"
+  if [ -n "${MEGATRON_PATH:-}" ]; then
+    _PP="$MEGATRON_PATH:$_PP"
+  fi
+  export PYTHONPATH="$_PP"
   # ATOM FP8 正式方案：no-eager + compilation level=3。dynamo 只有 ATOM rollout 需要，
   # 由 ATOMReplicaManager 通过 Ray runtime_env 注入 TORCHDYNAMO_DISABLE=0，这里保持全局
   # TORCHDYNAMO_DISABLE=1，避免训练 actor 被动继承。每个 colocated replica 仍用独立
@@ -139,6 +148,17 @@ else
   export VLLM_ROCM_USE_AITER=0 VLLM_ROCM_USE_AITER_MHA=0 VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=0 VLLM_ROCM_USE_AITER_LINEAR=0
 fi
 CONFIG="${CONFIG_OVERRIDE:-$CONFIG}"
+
+# Same flags as Megatron-LM examples/qwen3/train_qwen3.sh ENABLE_MORI=true.
+if [ "${ENABLE_MORI:-false}" = "true" ] || [ "${ENABLE_MORI:-0}" = "1" ]; then
+  export MORI_SHMEM_LOG_LEVEL="${MORI_SHMEM_LOG_LEVEL:-INFO}"
+  echo "[INFO] MORI EP: MORI_SHMEM_MODE=${MORI_SHMEM_MODE:-}"
+  echo "[INFO] MORI EP: MORI_SHMEM_LOG_LEVEL=${MORI_SHMEM_LOG_LEVEL}"
+  EXTRA_ARGS+=(
+    policy.training.megatron_cfg.moe_token_dispatcher_type=flex
+    policy.training.megatron_cfg.moe_flex_dispatcher_backend=mori
+  )
+fi
 
 echo "$LOG" > /tmp/run_dapo_log.txt
 echo "=== MODE=$MODE TRAIN_FP8=$TRAIN_FP8 STEPS=$STEPS  CONFIG=$CONFIG  LOG=$LOG ==="

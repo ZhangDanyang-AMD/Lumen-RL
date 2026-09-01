@@ -254,8 +254,10 @@ def test_extract_prompt_gt_adds_validation_answer_format() -> None:
     assert ground_truth == "2"
 
 
-def test_response_position_metrics_isolate_late_token_drift() -> None:
-    old_logp = torch.zeros(2, 6)
+@pytest.mark.parametrize("old_seq_len", [6, 7])
+def test_response_position_metrics_isolate_late_token_drift(old_seq_len: int) -> None:
+    """Rollout/mask are [B, S-1]; Megatron old_log_probs may be width S (7 here)."""
+    old_logp = torch.zeros(2, old_seq_len)
     rollout_logp = torch.tensor([
         [0.0, 0.1, 0.2, 0.3, 0.4, 0.0],
         [0.0, 0.0, 0.5, 0.6, 0.0, 0.0],
