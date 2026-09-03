@@ -24,6 +24,9 @@ CFG_DIR="examples/DAPO/configs"
 # other tenants' bookkeeping without hiding a leaked 90 GB engine.
 IDLE_VRAM_BYTES=2147483648
 
+# Seconds without a new log line before the foreground follower gives up.
+STALL_LIMIT_DEFAULT=2400
+
 # ---------------------------------------------------------------------------
 # Example table
 # ---------------------------------------------------------------------------
@@ -126,6 +129,10 @@ ENVIRONMENT
   DATA_ROOT   required. Host directory holding models/, data_cached/, logs/.
   IMAGE       default $IMAGE
   CONTAINER   default $CONTAINER
+  DOCKER      docker CLI to use, e.g. DOCKER="sudo docker" if your user is not
+              in the docker group. Default $DOCKER_CLI
+  STALL_LIMIT seconds without a new log line before declaring a hang.
+              Default $STALL_LIMIT_DEFAULT
   WANDB_API_KEY  only needed with --longrun.
   EXTRA_OVERRIDE  extra Hydra overrides, space separated, appended verbatim,
                   e.g. EXTRA_OVERRIDE='logger.wandb_enabled=false policy.learning_rate=1e-6'
@@ -336,14 +343,18 @@ INNER="bash $RUN_DAPO > $(printf '%q' "$OUTER_LOG") 2>&1; \
 echo \"$DONE_MARK\$? ===\" | tee -a $(printf '%q' "$OUTER_LOG") >> $(printf '%q' "$LOG")"
 
 if [ "$DRY_RUN" = 1 ]; then
+  # Print the literal string $DATA_ROOT rather than its value, so the emitted
+  # command is copy-pasteable under any DATA_ROOT and stays identical to the
+  # blocks in appendix A of the README. The host shell expands it on paste.
+  unexpand_data_root() { printf '%s' "${1//"$DATA_ROOT"/\$DATA_ROOT}"; }
   cat <<EOF
 # ---------------------------------------------------------------------------
 # example $N — $TITLE
 #   config          : $CONFIG
 #   steps           : $STEPS
 #   response length : $RESP_LEN
-#   model           : $MODEL_PATH
-#   log             : $LOG
+#   model           : $(unexpand_data_root "$MODEL_PATH")
+#   log             : $(unexpand_data_root "$LOG")
 # ---------------------------------------------------------------------------
 
 # 1. the container, created once and reused (restart it between runs):
@@ -351,7 +362,7 @@ $DOCKER_CLI run -d --name $CONTAINER \\
   --network=host --ipc=host \\
   --device=/dev/kfd --device=/dev/dri --group-add=video \\
   --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --shm-size 64G \\
-  -v $DATA_ROOT:$DATA_ROOT -e DATA_ROOT=$DATA_ROOT \\
+  -v \$DATA_ROOT:\$DATA_ROOT -e DATA_ROOT=\$DATA_ROOT \\
   $IMAGE sleep infinity
 
 # 2. the example. Every variable below is required: MODE alone does NOT pick
@@ -361,7 +372,7 @@ $DOCKER_CLI exec \\
 EOF
   for e in "${DOCKER_ENV[@]}"; do
     [ "$e" = "-e" ] && continue
-    echo "  -e $e \\"
+    echo "  -e $(unexpand_data_root "$e") \\"
   done
   echo "  $CONTAINER bash -lc 'bash $RUN_DAPO'"
   cat <<EOF
@@ -537,7 +548,7 @@ HIGHLIGHT='RLTrainer\.setup|filter_groups round|^ *step=|Traceback|OutOfMemory|C
 
 "${DOCKER[@]}" exec -d "${DOCKER_ENV[@]}" "$CONTAINER" bash -lc "$INNER"
 
-STALL_LIMIT="${STALL_LIMIT:-2400}"   # seconds without a new log line before we give up
+STALL_LIMIT="${STALL_LIMIT:-$STALL_LIMIT_DEFAULT}"
 printed=0
 last_change=$(date +%s)
 while :; do

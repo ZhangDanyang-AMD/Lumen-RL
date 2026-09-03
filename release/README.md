@@ -148,6 +148,13 @@ its KV cache budget as a fraction of the whole card.
 | of which shared with `vllm/vllm-openai-rocm:v0.23.0` | 46.69 GB | `SHARED SIZE` column |
 | unique to this image | 603.4 MB | `UNIQUE SIZE` column |
 
+> **Find that row in `docker system df -v` by IMAGE ID, not by REPOSITORY/TAG.**
+> The same image may carry a different local tag (on the machine that built this
+> release it shows up as `lumenrl release-20260902`, not as the
+> `zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260902` you pulled).
+> Match on the ID: `docker image inspect <tag> --format '{{.Id}}'`, which agrees
+> with the digest `docker pull` echoes back.
+
 **Recommended budget:**
 
 - Only the seven smokes in §2: **60 GB for the image** (47.3 GB unpacked plus the
@@ -199,10 +206,31 @@ TAG=lumenrl:release-$(date +%Y%m%d) bash release/precompile_kernels.sh
 
 `precompile_kernels.sh` needs a GPU: aiter kernels are compiled on first use and
 `docker build` has no devices. Baking them in saves real time — example 4's smoke
-takes **447 s** on a fully warmed image versus **1256 s** on a cold one, and almost
-all of the gap is in large kernels like
+takes **447 s** on an image with all **16** kernel objects baked in versus
+**1256 s** on one with only **5**, and almost all of the gap is in large kernels like
 `module_gemm_a8w8_blockscale_bpreshuffle_cktile`. A synthetic warmup only covers
 5 of the 16 kernels; see the header of that script for full coverage.
+
+> **Those two numbers are not the same measurement as the 557–602 s given for
+> example 4 in §6.1; do not subtract one from the other.**
+> 447 / 1256 s come from `release/validate_image.sh`, which runs **`STEPS=1`** and
+> times only the single `docker exec` of `run_dapo.sh` — it excludes creating the
+> container, probing the idle baseline and checking the software stack.
+> The 557–602 s in §6.1 is `run_example.sh`'s end-to-end figure at **`STEPS=3`**,
+> including the container restart and preflight. The difference is exactly the two
+> extra steps (example 4 measured `perf/time_per_step` at 51.7–83.1 s) plus about
+> 15 s of restart.
+>
+> **This release image is the one with all 16 objects baked in**, so 447 s is the
+> figure that applies to it. The 1256 s image is the output of
+> `precompile_kernels.sh`'s synthetic warmup (`<tag>-kernels`, 5 objects only) and
+> is **not** an image with nothing baked in at all. Count them yourself:
+
+```bash
+docker run --rm --entrypoint /bin/bash \
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260902 \
+  -lc 'ls /opt/lumenrl/aiter-jit/*.so | wc -l'     # measured: 16
+```
 
 ### 4.2 Prepare the data (self-check against this table before running)
 
@@ -315,9 +343,9 @@ That is all three commands. The third prints:
   CUDA error     0
   HSA_STATUS     0
   step-1 metrics:
-  rollout_corr/k3_kl     0.00110719   -0.3%_vs_0.00111_(tol_30%)         PASS
-  entropy                0.605645     -1.8%_vs_0.617_(tol_15%)           PASS
-  rollout_corr/kl        0.000748721  |x|in[9.3e-05,0.0093]              PASS
+  rollout_corr/k3_kl     0.00110719   +1.6%_vs_0.00109_(tol_30%)         PASS
+  entropy                0.605645     -0.6%_vs_0.609_(tol_25%)           PASS
+  rollout_corr/kl        0.000748721  |x|in[9.4e-05,0.0094]              PASS
   rollout_corr/ppl_ratio 1.00106      (informational, not checked)       INFO
 RESULT: PASS
 ```
@@ -344,6 +372,18 @@ docker ps -a                                                    # is someone els
 docker exec lumenrl-release bash -lc 'rocm-smi --showmeminfo vram | grep -i used'
 ```
 
+The second command needs the container to exist. **Once you have removed it, query
+the host directly** — `rocm-smi` works on the host and reads the same devices, and
+this is the form you need to confirm the VRAM came back after a `docker rm`:
+
+```bash
+rocm-smi --showmeminfo vram | grep -i used
+```
+
+> On the host this may also print
+> `WARNING: AMD GPU device(s) is/are in a low-power state. Check power control/runtime_status`.
+> Idle cards dropping into a low-power state is normal and does not affect the reading.
+
 All eight cards should sit at the **idle baseline of about 298 MB** (297766912–297832448 B
 measured on MI355X). Anything above that means a co-tenant, or an orphan process
 from the previous run. The launcher makes this a hard gate: it refuses to start if
@@ -364,7 +404,7 @@ docker run -d --name lumenrl-release \
 Do not name the container `lumenrl`; it collides too easily. The launcher defaults
 to `lumenrl-release` and honours `CONTAINER=...`. **If the container already exists
 the launcher runs `docker restart`**, because after a finished run each card may
-still be holding about 85 GB (§7 item 1) and without a restart the next run gets a
+still be holding about 90.9 GB (§7 item 1) and without a restart the next run gets a
 smaller KV cache budget.
 
 The container prints four fixed SHAs at startup. To verify the software stack:
@@ -540,10 +580,23 @@ MI355X). See §4.4 step 1.
 **2. The source installs win over the wheels in the image.** `import aiter` must
 resolve under `/opt/lumenrl/aiter/`, not site-packages.
 
-**3. During the run:** the log contains `RLTrainer.setup ... complete`,
-`filter_groups round N` and per-step metrics, and contains no `Traceback`,
-`OutOfMemory`, `CUDA error` or `HSA_STATUS`. `--check` counts exactly those four
-words.
+**3. During the run:** the log contains `RLTrainer.setup ... complete` and per-step
+metrics, and contains no `Traceback`, `OutOfMemory`, `CUDA error` or `HSA_STATUS`.
+`--check` counts exactly those four words.
+
+> ⚠️ **`filter_groups round N` is not present in every example; do not treat it as
+> a required marker.** That line is only emitted by configs with dynamic sampling
+> enabled — when the trainer's `use_filter = bool(fg is not None and fg.enable)` is
+> false it takes the single-round "no dynamic sampling" branch, which never logs it.
+> **Examples 2 and 3 are in that category**: the
+> `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` they share explicitly sets
+> `dynamic_sampling: false` and `filter_groups.enable: false`, and the comment in
+> that file gives the reason — at `max_response_length: 512` a base model rarely
+> finishes a DAPO math problem, so dynamic sampling would filter out every group
+> (the longrun configs at 20480 response keep it on).
+> Measured, `grep -c filter_groups` is **0** for examples 2 and 3, yet both complete
+> all 3 steps with a full metric line and `--check` PASS. Examples 1, 4, 5, 6 and 7
+> have it enabled, so they do log the line.
 
 **4. The numbers line up.** See the reference table and the criteria below.
 
@@ -555,8 +608,9 @@ one of them and the table no longer applies):
 - 8x MI355X (gfx950), image `zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260902`
 - the command is exactly `bash release/run_example.sh <N>`, i.e. the full row from
   the §2.2 table
-- `seed=10086` (hardcoded in `run_dapo.sh`); `STEPS` and `max_response_length` are
-  columns in the table below
+- **`seed=10086`** (hardcoded in `run_dapo.sh`; identical for all seven examples,
+  which is why it does not get its own column); `STEPS` and `max_response_length`
+  are columns in the table below
 - metrics are read at **step 1** (`step=1`, 1-based)
 - measured 2026-09-03 on node `crsuse2-m2m-v2-035`
 
@@ -575,6 +629,16 @@ reference is the **mean** over the number of runs in the `runs` column, and the
 tolerances are derived in §6.2. `rollout_corr/kl` is checked by order of magnitude
 only, so it carries no percentage tolerance. "End-to-end wall clock" includes the
 container restart and preflight, i.e. it is what `run_example.sh` reports.
+**That column carries no tolerance and does not affect PASS/FAIL**: it is dominated
+by how warm the aiter kernel and torch inductor caches are, and on the same node
+with the same image it has been measured up to **±15%** off, systematically on the
+fast side (one independent repeat of all seven measured, in example order,
+185 / 145 / 155 / 601 / 426 / 546 / 516 s: examples 1 and 4 landed inside the ranges
+above, the other five came in 1–13% lower). Read it as a rough "how long will this take", not as a
+criterion. Examples 1, 4, 6 and 7 give a range because they were measured several
+times; 2 and 3 show a single value because they were measured once (see the `runs`
+column); example 5 was measured twice but both runs reported the same 472 s, so the
+table still shows one value.
 Across all 17 runs the **exit code was 0 every time**, the counts of
 `Traceback` / `OutOfMemory` / `CUDA error` / `HSA_STATUS` were **all zero**, and
 `--check` with the tolerances above is **17/17 PASS**.
@@ -649,7 +713,8 @@ so switching the training backend introduces no extra train/rollout drift.
 ## 7. Known issues
 
 **1. VRAM is not released when a run finishes.** After a clean smoke each card may
-still hold about 85 GB: the Ray workers have exited, the memory has not been
+still hold about 90.9 GB (measured on MI355X immediately after example 4:
+89960382464–90905997312 B): the Ray workers have exited, the memory has not been
 returned, and no matching process is visible from inside the container. Restart the
 container between runs, otherwise the next run gets a smaller KV cache budget.
 
@@ -778,13 +843,20 @@ example, **sharing no variables**: each carries its own complete `MODE` /
 Passing environment variables via `docker exec -e` is deliberate: it removes the
 need to nest quotes inside `bash -lc "..."`, and nested quoting is the main way
 `CONFIG_OVERRIDE` gets swallowed or a script path gets torn apart (inside
-`spur exec bash -lc '…'` you would be escaping three levels deep).
+`spur exec bash -lc '…'` you would be escaping three levels deep — **appendix B
+item 6 gives a form that has been measured to work there**, do not improvise the
+quoting).
 
-Start the container as in §4.4 step 2 (called `lumenrl-release` below), and
+Start the container as in §4.4 step 2 (called `lumenrl-release` below), then export
+the data directory — **the `$DATA_ROOT` in the seven blocks below expands from this
+one line, so there are no paths to substitute per block**:
 
 ```bash
 export DATA_ROOT=/path/to/data
 ```
+
+(`docker exec -e DATA_ROOT=$DATA_ROOT` is expanded by your host shell, so what
+reaches the container is the resolved absolute path. That is intended.)
 
 The log does not go to stdout; `run_dapo.sh` writes straight to `$LOG`. Follow it
 with `tail -f "$LOG"` and extract metrics with
@@ -797,15 +869,15 @@ with `tail -f "$LOG"` and extract metrics with
 ```bash
 docker exec \
   -e RL_ROOT=/opt/lumenrl \
-  -e DATA_ROOT=/path/to/data \
-  -e SCRATCH_ROOT=/path/to/data \
+  -e DATA_ROOT=$DATA_ROOT \
+  -e SCRATCH_ROOT=$DATA_ROOT \
   -e PYTORCH_CUDA_ALLOC_CONF= \
   -e MODE=bf16 \
   -e TRAIN_FP8=0 \
   -e STEPS=3 \
   -e CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3_8b_ray_vllm_smoke.yaml \
-  -e MODEL_PATH=/path/to/data/models/Qwen3-8B-Base \
-  -e LOG=/path/to/data/logs/example-1.log \
+  -e MODEL_PATH=$DATA_ROOT/models/Qwen3-8B-Base \
+  -e LOG=$DATA_ROOT/logs/example-1.log \
   lumenrl-release bash -lc 'bash /opt/lumenrl/Lumen-RL/examples/DAPO/run_dapo.sh'
 ```
 
@@ -814,15 +886,15 @@ docker exec \
 ```bash
 docker exec \
   -e RL_ROOT=/opt/lumenrl \
-  -e DATA_ROOT=/path/to/data \
-  -e SCRATCH_ROOT=/path/to/data \
+  -e DATA_ROOT=$DATA_ROOT \
+  -e SCRATCH_ROOT=$DATA_ROOT \
   -e PYTORCH_CUDA_ALLOC_CONF= \
   -e MODE=fp8 \
   -e TRAIN_FP8=0 \
   -e STEPS=3 \
   -e CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml \
-  -e MODEL_PATH=/path/to/data/models/Qwen3-8B-Base \
-  -e LOG=/path/to/data/logs/example-2.log \
+  -e MODEL_PATH=$DATA_ROOT/models/Qwen3-8B-Base \
+  -e LOG=$DATA_ROOT/logs/example-2.log \
   lumenrl-release bash -lc 'bash /opt/lumenrl/Lumen-RL/examples/DAPO/run_dapo.sh'
 ```
 
@@ -831,15 +903,15 @@ docker exec \
 ```bash
 docker exec \
   -e RL_ROOT=/opt/lumenrl \
-  -e DATA_ROOT=/path/to/data \
-  -e SCRATCH_ROOT=/path/to/data \
+  -e DATA_ROOT=$DATA_ROOT \
+  -e SCRATCH_ROOT=$DATA_ROOT \
   -e PYTORCH_CUDA_ALLOC_CONF= \
   -e MODE=fp8 \
   -e TRAIN_FP8=1 \
   -e STEPS=3 \
   -e CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml \
-  -e MODEL_PATH=/path/to/data/models/Qwen3-8B-Base \
-  -e LOG=/path/to/data/logs/example-3.log \
+  -e MODEL_PATH=$DATA_ROOT/models/Qwen3-8B-Base \
+  -e LOG=$DATA_ROOT/logs/example-3.log \
   lumenrl-release bash -lc 'bash /opt/lumenrl/Lumen-RL/examples/DAPO/run_dapo.sh'
 ```
 
@@ -852,15 +924,15 @@ docker exec \
 ```bash
 docker exec \
   -e RL_ROOT=/opt/lumenrl \
-  -e DATA_ROOT=/path/to/data \
-  -e SCRATCH_ROOT=/path/to/data \
+  -e DATA_ROOT=$DATA_ROOT \
+  -e SCRATCH_ROOT=$DATA_ROOT \
   -e PYTORCH_CUDA_ALLOC_CONF= \
   -e MODE=atomfp8 \
   -e TRAIN_FP8=1 \
   -e STEPS=3 \
   -e CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml \
-  -e MODEL_PATH=/path/to/data/models/Qwen3-8B-Base \
-  -e LOG=/path/to/data/logs/example-4.log \
+  -e MODEL_PATH=$DATA_ROOT/models/Qwen3-8B-Base \
+  -e LOG=$DATA_ROOT/logs/example-4.log \
   lumenrl-release bash -lc 'bash /opt/lumenrl/Lumen-RL/examples/DAPO/run_dapo.sh'
 ```
 
@@ -872,15 +944,15 @@ docker exec \
 ```bash
 docker exec \
   -e RL_ROOT=/opt/lumenrl \
-  -e DATA_ROOT=/path/to/data \
-  -e SCRATCH_ROOT=/path/to/data \
+  -e DATA_ROOT=$DATA_ROOT \
+  -e SCRATCH_ROOT=$DATA_ROOT \
   -e PYTORCH_CUDA_ALLOC_CONF= \
   -e MODE=atombf16 \
   -e TRAIN_FP8=0 \
   -e STEPS=1 \
   -e CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml \
-  -e MODEL_PATH=/path/to/data/models/Qwen3-8B-Base \
-  -e LOG=/path/to/data/logs/example-5.log \
+  -e MODEL_PATH=$DATA_ROOT/models/Qwen3-8B-Base \
+  -e LOG=$DATA_ROOT/logs/example-5.log \
   lumenrl-release bash -lc 'bash /opt/lumenrl/Lumen-RL/examples/DAPO/run_dapo.sh'
 ```
 
@@ -897,15 +969,15 @@ docker exec \
 ```bash
 docker exec \
   -e RL_ROOT=/opt/lumenrl \
-  -e DATA_ROOT=/path/to/data \
-  -e SCRATCH_ROOT=/path/to/data \
+  -e DATA_ROOT=$DATA_ROOT \
+  -e SCRATCH_ROOT=$DATA_ROOT \
   -e PYTORCH_CUDA_ALLOC_CONF= \
   -e MODE=bf16 \
   -e TRAIN_FP8=0 \
   -e STEPS=3 \
   -e CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml \
-  -e MODEL_PATH=/path/to/data/models/Qwen3-30B-A3B-Base \
-  -e LOG=/path/to/data/logs/example-6.log \
+  -e MODEL_PATH=$DATA_ROOT/models/Qwen3-30B-A3B-Base \
+  -e LOG=$DATA_ROOT/logs/example-6.log \
   -e LUMENRL_FP32_MOE_ROUTER=0 \
   lumenrl-release bash -lc 'bash /opt/lumenrl/Lumen-RL/examples/DAPO/run_dapo.sh'
 ```
@@ -923,15 +995,15 @@ docker exec \
 ```bash
 docker exec \
   -e RL_ROOT=/opt/lumenrl \
-  -e DATA_ROOT=/path/to/data \
-  -e SCRATCH_ROOT=/path/to/data \
+  -e DATA_ROOT=$DATA_ROOT \
+  -e SCRATCH_ROOT=$DATA_ROOT \
   -e PYTORCH_CUDA_ALLOC_CONF= \
   -e MODE=bf16 \
   -e TRAIN_FP8=0 \
   -e STEPS=3 \
   -e CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml \
-  -e MODEL_PATH=/path/to/data/models/Qwen3-30B-A3B-Base \
-  -e LOG=/path/to/data/logs/example-7.log \
+  -e MODEL_PATH=$DATA_ROOT/models/Qwen3-30B-A3B-Base \
+  -e LOG=$DATA_ROOT/logs/example-7.log \
   -e LUMENRL_FP32_MOE_ROUTER=0 \
   lumenrl-release bash -lc 'bash /opt/lumenrl/Lumen-RL/examples/DAPO/run_dapo.sh'
 ```
@@ -997,3 +1069,47 @@ background on the node with `setsid nohup ... &`.
 **5. The conflict between `docker restart` and `--detach`** is §7 item 4: the
 launcher probes whether the previous log is still growing before deciding to refuse
 or restart.
+
+**6. Running appendix A's manual commands inside `spur exec`.** Every block in
+appendix A ends with `bash -lc 'bash /opt/lumenrl/…/run_dapo.sh'`, in single quotes,
+while item 1 above wants the whole thing wrapped in
+`spur exec <JobID> bash -lc '…'`, also in single quotes. **Nesting two layers of
+single quotes breaks at the first `'`.** The form that works is to make the **outer**
+layer double-quoted and leave appendix A's inner single quotes untouched:
+
+```bash
+spur exec <JobID> bash -lc "
+  mkdir -p /tmp/.docker; export DOCKER_CONFIG=/tmp/.docker
+  export DATA_ROOT=/path/to/data
+  docker restart lumenrl-release >/dev/null
+  docker exec \
+    -e RL_ROOT=/opt/lumenrl \
+    -e DATA_ROOT=\$DATA_ROOT \
+    -e SCRATCH_ROOT=\$DATA_ROOT \
+    -e PYTORCH_CUDA_ALLOC_CONF= \
+    -e MODE=bf16 -e TRAIN_FP8=0 -e STEPS=3 \
+    -e CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3_8b_ray_vllm_smoke.yaml \
+    -e MODEL_PATH=\$DATA_ROOT/models/Qwen3-8B-Base \
+    -e LOG=\$DATA_ROOT/logs/example-1.log \
+    lumenrl-release bash -lc 'bash /opt/lumenrl/Lumen-RL/examples/DAPO/run_dapo.sh'"
+```
+
+Compared with appendix A there is **exactly one thing to change**: inside the outer
+double quotes, `$DATA_ROOT` must be written `\$DATA_ROOT`, or it expands **on your
+machine** and injects a local path instead of expanding on the node. The other two
+points are "leave it alone":
+
+- keep the inner pair of single quotes exactly as it is;
+- keep the line-continuation backslashes as single `\` too. Your local shell folds
+  them away, so the command arrives on the node as one line — harmless, and keeping
+  them is purely for readability.
+
+This block was measured on `crsuse2-m2m-v2-035` with `exit=0` (example 1):
+**3m18s for the whole block including the leading `docker restart`, and 2m31s if you
+time only the `docker exec` part.** Both are correct and the difference is the
+restart — the same trap as the 447 s in §4.1, so state what a duration covers when
+you quote one.
+
+**If you would rather not deal with the quoting at all**, do not hand-write it:
+`spur exec <JobID> bash -lc '… bash release/run_example.sh 1 --check'` (the form in
+item 1 above) has no nesting problem at all, and is the recommended path.

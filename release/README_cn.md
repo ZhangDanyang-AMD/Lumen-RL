@@ -131,6 +131,11 @@ overlong 奖励缓冲、TIS rollout 修正。
 | 其中与 `vllm/vllm-openai-rocm:v0.23.0` 共享 | 46.69 GB | 同上 `SHARED SIZE` 列 |
 | 本镜像独有 | 603.4 MB | 同上 `UNIQUE SIZE` 列 |
 
+> **在 `docker system df -v` 里按 IMAGE ID 找这一行，不要按 REPOSITORY/TAG 找。**
+> 同一个镜像本地可能挂着别的 tag（构建这一版的机器上它显示为 `lumenrl release-20260902`，
+> 而不是你 `docker pull` 用的 `zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260902`）。
+> 认 ID：`docker image inspect <tag> --format '{{.Id}}'`，与 `docker pull` 回显的 digest 一致。
+
 **建议预留**：
 
 - 只跑 §2 七个 smoke：**镜像 60 GB**（47.3 GB 解包 + 11.8 GB 压缩层留在 content store）
@@ -174,10 +179,27 @@ TAG=lumenrl:release-$(date +%Y%m%d) bash release/precompile_kernels.sh
 ```
 
 `precompile_kernels.sh` 需要 GPU：aiter 的 kernel 是首次使用时才编译的，而 `docker build`
-没有设备可用。预先烘进镜像能省下实打实的时间——例子 4 的 smoke 在完全预热的镜像上是
-**447 秒**，冷镜像上是 **1256 秒**，差距几乎全在
+没有设备可用。预先烘进镜像能省下实打实的时间——例子 4 的 smoke 在烘满 **16 个** kernel
+对象的镜像上是 **447 秒**，只烘了 **5 个**的镜像上是 **1256 秒**，差距几乎全在
 `module_gemm_a8w8_blockscale_bpreshuffle_cktile` 这一类大 kernel 上。合成 warmup 只能覆盖
 16 个 kernel 里的 5 个，想全部覆盖见该脚本头部的说明。
+
+> **上面这两个数和 §6.1 表里例子 4 的「557–602 秒」不是一个口径，不要直接相减。**
+> 447 / 1256 秒来自 `release/validate_image.sh`：它跑 **`STEPS=1`**，
+> 且只给 `run_dapo.sh` 那一次 `docker exec` 计时，不含建容器、空闲基线探测和软件栈检查。
+> §6.1 的 557–602 秒是 `run_example.sh` 的 **`STEPS=3`** 端到端口径，含容器重启与预检。
+> 两者相差的量级正是多出的 2 步（例子 4 实测 `perf/time_per_step` 为 51.7–83.1 秒）
+> 加上约 15 秒的重启。
+>
+> **本发布镜像就是烘满 16 个对象的那一版**，所以 447 秒是适用于它的那个数；
+> 1256 秒对应的是 `precompile_kernels.sh` 合成 warmup 的产物（`<tag>-kernels`，只有 5 个对象），
+> **不是「完全没烘过的冷镜像」**。自己数一下：
+
+```bash
+docker run --rm --entrypoint /bin/bash \
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260902 \
+  -lc 'ls /opt/lumenrl/aiter-jit/*.so | wc -l'     # 实测 16
+```
 
 ### 4.2 准备数据（跑之前请照这张表自查）
 
@@ -286,9 +308,9 @@ bash release/run_example.sh 1 --check
   CUDA error     0
   HSA_STATUS     0
   step-1 metrics:
-  rollout_corr/k3_kl     0.00110719   -0.3%_vs_0.00111_(tol_30%)         PASS
-  entropy                0.605645     -1.8%_vs_0.617_(tol_15%)           PASS
-  rollout_corr/kl        0.000748721  |x|in[9.3e-05,0.0093]              PASS
+  rollout_corr/k3_kl     0.00110719   +1.6%_vs_0.00109_(tol_30%)         PASS
+  entropy                0.605645     -0.6%_vs_0.609_(tol_25%)           PASS
+  rollout_corr/kl        0.000748721  |x|in[9.4e-05,0.0094]              PASS
   rollout_corr/ppl_ratio 1.00106      (informational, not checked)       INFO
 RESULT: PASS
 ```
@@ -312,6 +334,17 @@ docker ps -a                                                    # 别人的容�
 docker exec lumenrl-release bash -lc 'rocm-smi --showmeminfo vram | grep -i used'
 ```
 
+上面第二条要容器存在。**容器已经删掉时，直接在宿主机上查**——`rocm-smi` 在宿主机上就能用，
+读的是同一批设备，用完 `docker rm` 之后核对显存靠的就是这一条：
+
+```bash
+rocm-smi --showmeminfo vram | grep -i used
+```
+
+> 宿主机上这条可能顺带打印一句
+> `WARNING: AMD GPU device(s) is/are in a low-power state. Check power control/runtime_status`。
+> 卡空闲时进低功耗态是正常的，不影响读数。
+
 八张卡都应该在**空闲基线约 298 MB**（MI355X 实测 297766912–297832448 B）。
 高于此值说明有同租户，或上一次运行留下了孤儿进程。启动器把这一步做成了硬门槛：
 任何一张卡超过 2 GB 就拒绝启动，并打印三种可能原因和对应命令；
@@ -330,7 +363,7 @@ docker run -d --name lumenrl-release \
 
 容器名不要用 `lumenrl`，太容易和别人撞；启动器默认 `lumenrl-release`，
 可以用 `CONTAINER=... ` 换掉。容器**已存在时启动器会 `docker restart`**，
-因为上一次运行结束后每张卡仍可能占着约 85 GB（§7 第 1 条），不重启下一次的 KV cache
+因为上一次运行结束后每张卡仍可能占着约 90.9 GB（§7 第 1 条），不重启下一次的 KV cache
 预算会被压低。
 
 容器启动时会打印固定的四个 SHA。验证软件栈：
@@ -496,9 +529,21 @@ AttributeError: module 'aiter.jit.module_aiter_core' has no attribute 'MlaVersio
 **2. 源码安装压过镜像自带的 wheel。** `import aiter` 必须解析到 `/opt/lumenrl/aiter/`，
 而不是 site-packages。
 
-**3. 运行中：** 日志里有 `RLTrainer.setup ... complete`、`filter_groups round N` 和逐步指标；
+**3. 运行中：** 日志里有 `RLTrainer.setup ... complete` 和逐步指标；
 且没有 `Traceback`、`OutOfMemory`、`CUDA error`、`HSA_STATUS`。
 `--check` 就是数这四个词的出现次数。
+
+> ⚠️ **`filter_groups round N` 不是每个例子都有的，别拿它当必备标记。**
+> 这一行只在启用了动态采样的 config 上出现（trainer 里
+> `use_filter = bool(fg is not None and fg.enable)` 为假时走的是单轮的
+> "no dynamic sampling" 分支，根本不打这一行）。
+> **例子 2、3 就属于这一类**：它们共用的
+> `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` 显式设了
+> `dynamic_sampling: false` + `filter_groups.enable: false`，
+> 理由写在该文件的注释里——`max_response_length: 512` 下 base 模型很少做完一道 DAPO 数学题，
+> 开着动态采样会把所有 group 都筛掉（longrun 的 20480 response 才开）。
+> 实测例子 2、3 的 `grep -c filter_groups` 为 **0**，但两者都跑完 3 步、指标齐全、`--check` PASS。
+> 例子 1、4、5、6、7 的 config 开着它，所以会打这一行。
 
 **4. 数值对齐。** 见下面的参考值表和判据。
 
@@ -508,7 +553,8 @@ AttributeError: module 'aiter.jit.module_aiter_core' has no attribute 'MlaVersio
 
 - 硬件 8x MI355X（gfx950），镜像 `zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260902`
 - 命令就是 `bash release/run_example.sh <N>`，即 §2.2 那张表的整行参数
-- `seed=10086`（`run_dapo.sh` 硬编码），`STEPS` 与 `max_response_length` 见表内列
+- **`seed=10086`**（`run_dapo.sh` 硬编码，七个例子都一样，所以没有单独占一列），
+  `STEPS` 与 `max_response_length` 见表内列
 - 取的是**第 1 步**（`step=1`，1-based）的指标
 - 测量日期 2026-09-03，节点 `crsuse2-m2m-v2-035`
 
@@ -525,6 +571,13 @@ AttributeError: module 'aiter.jit.module_aiter_core' has no attribute 'MlaVersio
 粗体两列带容差的就是 `--check` 判 PASS/FAIL 的两项，参考值是「实测次数」列那么多遍的**均值**，
 容差的来历见 §6.2。`rollout_corr/kl` 一列只做数量级判据，不给百分比容差。
 「端到端墙钟」含容器重启和预检，即 `run_example.sh` 自己报的耗时。
+**这一列不参与 PASS/FAIL，也不设容差**：它主要受 aiter kernel 缓存和 torch inductor
+缓存的冷热影响，同一节点同一镜像上实测偏差可达 **±15%**，而且方向系统性偏快
+（七个例子的一次独立复现按例子顺序测到 185 / 145 / 155 / 601 / 426 / 546 / 516 s：
+例子 1 和 4 落在上表区间内，其余五个比上表低 1–13%）。
+把它当"这个例子大概要跑多久"的量级参考，不要当判据。
+给出区间的例子（1、4、6、7）是多次实测的范围；例子 2、3 只测了一遍（见「实测次数」列）；
+例子 5 测了两遍，但两遍的端到端墙钟都是 472 s，所以表里仍只记一个值。
 一共 17 次运行，**退出码全部为 0**，`Traceback` / `OutOfMemory` / `CUDA error` / `HSA_STATUS`
 计数**全部为 0**，用上表容差 `--check` **17/17 全部 PASS**。
 每一次运行的完整原始记录在 [`VALIDATION-20260903.md`](VALIDATION-20260903.md)。
@@ -587,7 +640,8 @@ AttributeError: module 'aiter.jit.module_aiter_core' has no attribute 'MlaVersio
 
 ## 7. 已知问题
 
-**1. 跑完之后显存不会自动释放。** smoke 干净结束后每张卡仍可能占着约 85 GB：Ray worker 已经
+**1. 跑完之后显存不会自动释放。** smoke 干净结束后每张卡仍可能占着约 90.9 GB
+（例子 4 结束后立刻测量，MI355X 实测 89960382464–90905997312 B）：Ray worker 已经
 退出，但显存留在那里，而且从容器内部看不到对应进程。两次运行之间重启容器，否则下一次
 运行的 KV cache 预算会被压低。
 
@@ -698,13 +752,18 @@ ImportError: Unsupported `flydsl` version: expected >=`0.2.4`, got `0.1.8`.
 每段都自带全部 `MODE` / `TRAIN_FP8` / `CONFIG_OVERRIDE` / `STEPS` / `MODEL_PATH` / `LOG`。
 用 `docker exec -e` 传环境变量是有意的：这样就不需要在 `bash -lc "..."` 里嵌套引号，
 而嵌套引号是 `CONFIG_OVERRIDE` 被吃掉、脚本路径被拆碎的主要来源
-（在 `spur exec bash -lc '…'` 里手写要转义三层）。
+（在 `spur exec bash -lc '…'` 里手写要转义三层——**这种环境下怎么写见附录 B 第 6 条**，
+那里给了一段实测能跑的形式，别自己现场试引号）。
 
-先照 §4.4 第 2 步把容器起好（下面统一叫 `lumenrl-release`），并且
+先照 §4.4 第 2 步把容器起好（下面统一叫 `lumenrl-release`），然后导出数据目录——
+**下面七段里的 `$DATA_ROOT` 就靠这一句展开，你不需要逐段替换路径**：
 
 ```bash
 export DATA_ROOT=/path/to/data
 ```
+
+（`docker exec -e DATA_ROOT=$DATA_ROOT` 是由你的宿主机 shell 展开的，
+所以传进容器的是展开后的绝对路径，语义正确。）
 
 日志不会走 stdout，`run_dapo.sh` 直接写到 `$LOG`；跟踪用
 `tail -f "$LOG"`，抠指标用
@@ -717,15 +776,15 @@ export DATA_ROOT=/path/to/data
 ```bash
 docker exec \
   -e RL_ROOT=/opt/lumenrl \
-  -e DATA_ROOT=/path/to/data \
-  -e SCRATCH_ROOT=/path/to/data \
+  -e DATA_ROOT=$DATA_ROOT \
+  -e SCRATCH_ROOT=$DATA_ROOT \
   -e PYTORCH_CUDA_ALLOC_CONF= \
   -e MODE=bf16 \
   -e TRAIN_FP8=0 \
   -e STEPS=3 \
   -e CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3_8b_ray_vllm_smoke.yaml \
-  -e MODEL_PATH=/path/to/data/models/Qwen3-8B-Base \
-  -e LOG=/path/to/data/logs/example-1.log \
+  -e MODEL_PATH=$DATA_ROOT/models/Qwen3-8B-Base \
+  -e LOG=$DATA_ROOT/logs/example-1.log \
   lumenrl-release bash -lc 'bash /opt/lumenrl/Lumen-RL/examples/DAPO/run_dapo.sh'
 ```
 
@@ -734,15 +793,15 @@ docker exec \
 ```bash
 docker exec \
   -e RL_ROOT=/opt/lumenrl \
-  -e DATA_ROOT=/path/to/data \
-  -e SCRATCH_ROOT=/path/to/data \
+  -e DATA_ROOT=$DATA_ROOT \
+  -e SCRATCH_ROOT=$DATA_ROOT \
   -e PYTORCH_CUDA_ALLOC_CONF= \
   -e MODE=fp8 \
   -e TRAIN_FP8=0 \
   -e STEPS=3 \
   -e CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml \
-  -e MODEL_PATH=/path/to/data/models/Qwen3-8B-Base \
-  -e LOG=/path/to/data/logs/example-2.log \
+  -e MODEL_PATH=$DATA_ROOT/models/Qwen3-8B-Base \
+  -e LOG=$DATA_ROOT/logs/example-2.log \
   lumenrl-release bash -lc 'bash /opt/lumenrl/Lumen-RL/examples/DAPO/run_dapo.sh'
 ```
 
@@ -751,15 +810,15 @@ docker exec \
 ```bash
 docker exec \
   -e RL_ROOT=/opt/lumenrl \
-  -e DATA_ROOT=/path/to/data \
-  -e SCRATCH_ROOT=/path/to/data \
+  -e DATA_ROOT=$DATA_ROOT \
+  -e SCRATCH_ROOT=$DATA_ROOT \
   -e PYTORCH_CUDA_ALLOC_CONF= \
   -e MODE=fp8 \
   -e TRAIN_FP8=1 \
   -e STEPS=3 \
   -e CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml \
-  -e MODEL_PATH=/path/to/data/models/Qwen3-8B-Base \
-  -e LOG=/path/to/data/logs/example-3.log \
+  -e MODEL_PATH=$DATA_ROOT/models/Qwen3-8B-Base \
+  -e LOG=$DATA_ROOT/logs/example-3.log \
   lumenrl-release bash -lc 'bash /opt/lumenrl/Lumen-RL/examples/DAPO/run_dapo.sh'
 ```
 
@@ -771,15 +830,15 @@ docker exec \
 ```bash
 docker exec \
   -e RL_ROOT=/opt/lumenrl \
-  -e DATA_ROOT=/path/to/data \
-  -e SCRATCH_ROOT=/path/to/data \
+  -e DATA_ROOT=$DATA_ROOT \
+  -e SCRATCH_ROOT=$DATA_ROOT \
   -e PYTORCH_CUDA_ALLOC_CONF= \
   -e MODE=atomfp8 \
   -e TRAIN_FP8=1 \
   -e STEPS=3 \
   -e CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml \
-  -e MODEL_PATH=/path/to/data/models/Qwen3-8B-Base \
-  -e LOG=/path/to/data/logs/example-4.log \
+  -e MODEL_PATH=$DATA_ROOT/models/Qwen3-8B-Base \
+  -e LOG=$DATA_ROOT/logs/example-4.log \
   lumenrl-release bash -lc 'bash /opt/lumenrl/Lumen-RL/examples/DAPO/run_dapo.sh'
 ```
 
@@ -791,15 +850,15 @@ docker exec \
 ```bash
 docker exec \
   -e RL_ROOT=/opt/lumenrl \
-  -e DATA_ROOT=/path/to/data \
-  -e SCRATCH_ROOT=/path/to/data \
+  -e DATA_ROOT=$DATA_ROOT \
+  -e SCRATCH_ROOT=$DATA_ROOT \
   -e PYTORCH_CUDA_ALLOC_CONF= \
   -e MODE=atombf16 \
   -e TRAIN_FP8=0 \
   -e STEPS=1 \
   -e CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml \
-  -e MODEL_PATH=/path/to/data/models/Qwen3-8B-Base \
-  -e LOG=/path/to/data/logs/example-5.log \
+  -e MODEL_PATH=$DATA_ROOT/models/Qwen3-8B-Base \
+  -e LOG=$DATA_ROOT/logs/example-5.log \
   lumenrl-release bash -lc 'bash /opt/lumenrl/Lumen-RL/examples/DAPO/run_dapo.sh'
 ```
 
@@ -814,15 +873,15 @@ docker exec \
 ```bash
 docker exec \
   -e RL_ROOT=/opt/lumenrl \
-  -e DATA_ROOT=/path/to/data \
-  -e SCRATCH_ROOT=/path/to/data \
+  -e DATA_ROOT=$DATA_ROOT \
+  -e SCRATCH_ROOT=$DATA_ROOT \
   -e PYTORCH_CUDA_ALLOC_CONF= \
   -e MODE=bf16 \
   -e TRAIN_FP8=0 \
   -e STEPS=3 \
   -e CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml \
-  -e MODEL_PATH=/path/to/data/models/Qwen3-30B-A3B-Base \
-  -e LOG=/path/to/data/logs/example-6.log \
+  -e MODEL_PATH=$DATA_ROOT/models/Qwen3-30B-A3B-Base \
+  -e LOG=$DATA_ROOT/logs/example-6.log \
   -e LUMENRL_FP32_MOE_ROUTER=0 \
   lumenrl-release bash -lc 'bash /opt/lumenrl/Lumen-RL/examples/DAPO/run_dapo.sh'
 ```
@@ -838,15 +897,15 @@ docker exec \
 ```bash
 docker exec \
   -e RL_ROOT=/opt/lumenrl \
-  -e DATA_ROOT=/path/to/data \
-  -e SCRATCH_ROOT=/path/to/data \
+  -e DATA_ROOT=$DATA_ROOT \
+  -e SCRATCH_ROOT=$DATA_ROOT \
   -e PYTORCH_CUDA_ALLOC_CONF= \
   -e MODE=bf16 \
   -e TRAIN_FP8=0 \
   -e STEPS=3 \
   -e CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml \
-  -e MODEL_PATH=/path/to/data/models/Qwen3-30B-A3B-Base \
-  -e LOG=/path/to/data/logs/example-7.log \
+  -e MODEL_PATH=$DATA_ROOT/models/Qwen3-30B-A3B-Base \
+  -e LOG=$DATA_ROOT/logs/example-7.log \
   -e LUMENRL_FP32_MOE_ROUTER=0 \
   lumenrl-release bash -lc 'bash /opt/lumenrl/Lumen-RL/examples/DAPO/run_dapo.sh'
 ```
@@ -907,3 +966,39 @@ spur exec <JobID> bash -lc 'ls -l /path/to/data/logs/example-1-*.log'
 
 **5. `docker restart` 与 `--detach` 的冲突**见 §7 第 4 条：启动器会先探测上一次的日志
 是否还在增长，再决定是拒绝还是重启。
+
+**6. 在 `spur exec` 里跑附录 A 的手工命令。** 附录 A 每段以
+`bash -lc 'bash /opt/lumenrl/…/run_dapo.sh'` 结尾，用的是单引号；而本附录第 1 条又要求把命令
+包进 `spur exec <JobID> bash -lc '…'`，也是单引号。**两层单引号直接嵌套会在第一个 `'` 处断开。**
+可用的写法是**外层换成双引号、内层保留附录 A 原样的单引号**：
+
+```bash
+spur exec <JobID> bash -lc "
+  mkdir -p /tmp/.docker; export DOCKER_CONFIG=/tmp/.docker
+  export DATA_ROOT=/path/to/data
+  docker restart lumenrl-release >/dev/null
+  docker exec \
+    -e RL_ROOT=/opt/lumenrl \
+    -e DATA_ROOT=\$DATA_ROOT \
+    -e SCRATCH_ROOT=\$DATA_ROOT \
+    -e PYTORCH_CUDA_ALLOC_CONF= \
+    -e MODE=bf16 -e TRAIN_FP8=0 -e STEPS=3 \
+    -e CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3_8b_ray_vllm_smoke.yaml \
+    -e MODEL_PATH=\$DATA_ROOT/models/Qwen3-8B-Base \
+    -e LOG=\$DATA_ROOT/logs/example-1.log \
+    lumenrl-release bash -lc 'bash /opt/lumenrl/Lumen-RL/examples/DAPO/run_dapo.sh'"
+```
+
+相对附录 A **只有一处要改**：外层双引号里的 `$DATA_ROOT` 必须写成 `\$DATA_ROOT`，
+否则它会在**你本地**展开、把本地路径塞进去，而不是在节点上展开。另外两点是"别动"：
+
+- 内层那对单引号**原样保留**；
+- 续行的反斜杠也**原样保留**（单个 `\`）。它们会被你本地的 shell 吃掉，
+  于是命令以单行形式到达节点——这没有副作用，保留只是为了可读。
+
+这一段实测在 `crsuse2-m2m-v2-035` 上 `exit=0` 跑通（例子 1）：
+**整段含开头那条 `docker restart` 是 3m18s；只给 `docker exec` 那一段计时是 2m31s。**
+两个数都对，差的就是重启——和 §4.1 那个 447 秒是同一类陷阱，报耗时记得说清算到哪里。
+
+**如果你不想碰这些引号细节**，就别手写：`spur exec <JobID> bash -lc '… bash release/run_example.sh 1 --check'`
+（本附录第 1 条那种形式）没有任何嵌套问题，这也是推荐路径。
