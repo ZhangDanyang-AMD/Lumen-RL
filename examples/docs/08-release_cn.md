@@ -1,14 +1,26 @@
-# LumenRL —— AMD Instinct 上的 DAPO 数学强化学习
+> [Examples README](../README_cn.md) > 用发布镜像跑
 
-LumenRL 强化学习栈在 AMD GPU 上的可复现发布版本：**训练与推理共用同一组 8 张卡**，
-训练后端可选 FSDP2 或 Megatron，rollout 引擎可选 vLLM 或 ATOM，精度可选 BF16 或 FP8。
+# 8. 用发布镜像跑七个例子
 
-> English version: [README.md](README.md)
+> English version: [08-release.md](08-release.md)
 
-本文所有内容都在 [`versions.env`](versions.env) 固定的版本上端到端跑过，没有一条是"预期如此"。
-§6 参考值表里的每个数字都标注了它是用哪条命令、哪条 config、几步测出来的。
+**这一章是本目录里的另一条入口。** 第 [1](01-env-setup_cn.md)–[4](04-launching_cn.md) 章
+是**从源码搭环境**：装依赖、打 vLLM patch、预编译 ATOM JIT、再自己拼启动命令。
+这一章用**已发布的容器镜像**：软件栈已经固定并烘好 kernel，七个例子每个一条命令，
+不需要装任何东西，也不需要打开 config 或读 `run_dapo.sh`。
 
-**最短路径**（细节见 §4）：
+两条路跑的是同一批例子——本章 §8.2 的 1–7 就是
+[Examples README](../README_cn.md) 「已跑通的例子」表里的 1–7，指标可以互相对照。
+用这一章：验收一台新机器、复现发布数字、给客户做交付。
+回到第 1–4 章：要改源码、换模型，或者上双节点（例子 8，见
+[7. 训推分离双节点 RDMA](07-disaggregated-rdma_cn.md)）。
+
+LumenRL 在 AMD GPU 上的这一版：**训练与推理共用同一组 8 张卡**，训练后端可选 FSDP2 或
+Megatron，rollout 引擎可选 vLLM 或 ATOM，精度可选 BF16 或 FP8。本章所有内容都在
+[`versions.env`](../../release/versions.env) 固定的版本上端到端跑过，没有一条是"预期如此"；
+§8.6 参考值表里的每个数字都标注了它是用哪条命令、哪条 config、几步测出来的。
+
+**最短路径**（细节见 §8.4）：
 
 ```bash
 export DATA_ROOT=/path/to/data
@@ -21,7 +33,7 @@ bash release/run_example.sh 1 --check
 
 ---
 
-## 1. 这个版本包含什么
+## 8.1 这个版本包含什么
 
 | | |
 |---|---|
@@ -38,12 +50,12 @@ overlong 奖励缓冲、TIS rollout 修正。
 
 ---
 
-## 2. 七个已验证的例子
+## 8.2 七个已验证的例子
 
 七个例子的训练和推理**都跑在同一组 8 张卡上**。实测环境：8x MI355X（gfx950）、ROCm 7.2、
-镜像 `dapo-gfx950-rocm7.2.3-260902`，版本按 [`versions.env`](versions.env)。
+镜像 `dapo-gfx950-rocm7.2.3-260902`，版本按 [`versions.env`](../../release/versions.env)。
 
-### 2.1 概览
+### 8.2.1 概览
 
 | # | 例子 | 训练 | Rollout | 跑它 |
 |---|------|------|---------|------|
@@ -55,9 +67,9 @@ overlong 奖励缓冲、TIS rollout 修正。
 | 6 | MoE FSDP2 | FSDP2 BF16 | vLLM BF16 | `bash release/run_example.sh 6 --check` |
 | 7 | MoE Megatron EP=8 | **Megatron** TP=PP=CP=1，EP=8，DP=8 | vLLM BF16 | `bash release/run_example.sh 7 --check` |
 
-### 2.2 每个例子的完整参数
+### 8.2.2 每个例子的完整参数
 
-启动器内部就是这张表。手工跑（附录 A）时**这一行的每一列都要给全**。
+启动器内部就是这张表。手工跑（§8.10）时**这一行的每一列都要给全**。
 
 | # | `MODE` | `TRAIN_FP8` | `CONFIG_OVERRIDE`（相对 `$RL_ROOT/Lumen-RL`，都在 `examples/DAPO/configs/` 下） | `STEPS` | `max_response_length` | 模型 | 额外 env |
 |---|---|---|---|---|---|---|---|
@@ -70,7 +82,7 @@ overlong 奖励缓冲、TIS rollout 修正。
 | 7 | `bf16` | `0` | `dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml` | 3 | 4096 | Qwen3-30B-A3B-Base | `LUMENRL_FP32_MOE_ROUTER=0` |
 
 这 6 条 config（例子 2 和 3 共用一条）都是 `logger.wandb_enabled: false`，
-**不需要 wandb 账号**（见 §4.6）。
+**不需要 wandb 账号**（见 §8.4.6）。
 `STEPS` 列是命令行 `num_training_steps` 覆盖值，不是 yaml 里的默认值。
 
 > ⚠️ **`MODE` 和 `CONFIG_OVERRIDE` 必须成对给，不能只改一个。**
@@ -78,9 +90,9 @@ overlong 奖励缓冲、TIS rollout 修正。
 > 两者不匹配时最典型的表现就是例子 4：`MODE=atomfp8` 无条件追加
 > `compilation_config.level=3`，配上一条 vLLM 的 smoke yaml 就得到
 > `RuntimeError: aot_compile is not supported by the current configuration`。
-> 详见 §4.5 的 `CONFIG_OVERRIDE` 语义说明。
+> 详见 §8.4.5 的 `CONFIG_OVERRIDE` 语义说明。
 
-### 2.3 几个例子之间的关系
+### 8.2.3 几个例子之间的关系
 
 - **例子 2 / 3 共用同一条 yaml**，只差 `TRAIN_FP8`：`0` 是「只有 rollout 量化」，
   `1` 追加 `LUMEN_FP8=1 LUMEN_FP8_SCALING=blockwise2d`，训练前向也走 FP8。
@@ -109,20 +121,20 @@ overlong 奖励缓冲、TIS rollout 修正。
 | 7 | `""`（不落盘） | `$SCRATCH_ROOT/ckpts/lumenrl-dapo/verlref-moe-a3b-megatron-ep8-4k` |
 
 例子 6 和 7 的 smoke 都不落盘，longrun 的两个目录也互不相同，所以**例子 6 之后可以直接跑
-例子 7**（实测连续跑过，见 §6 的记录）。只有在你自己把两个后端指到同一个
+例子 7**（实测连续跑过，见 §8.6 的记录）。只有在你自己把两个后端指到同一个
 `checkpoint_dir` 时才会出问题：两种格式互不兼容，而且引擎按"占整卡比例"算 KV cache 预算。
 
 ---
 
-## 3. 环境要求
+## 8.3 环境要求
 
 - 8x gfx950（MI350X 或 MI355X），所有卡处于空闲
 - 宿主机 ROCm 7.2，`/dev/kfd` 与 `/dev/dri` 可访问
-- Docker（`docker` 命令要能用；需要 sudo 的话见 §4.4 的 `DOCKER` 变量）
+- Docker（`docker` 命令要能用；需要 sudo 的话见 §8.4.4 的 `DOCKER` 变量）
 - 磁盘：见下
-- 模型与数据：约 **74 GB**，清单见 §4.2
+- 模型与数据：约 **74 GB**，清单见 §8.4.2
 
-### 3.1 磁盘（实测于 035 节点）
+### 8.3.1 磁盘（实测于 035 节点）
 
 | 项目 | 实测值 | 怎么量的 |
 |---|---|---|
@@ -138,7 +150,7 @@ overlong 奖励缓冲、TIS rollout 修正。
 
 **建议预留**：
 
-- 只跑 §2 七个 smoke：**镜像 60 GB**（47.3 GB 解包 + 11.8 GB 压缩层留在 content store）
+- 只跑 §8.2 七个 smoke：**镜像 60 GB**（47.3 GB 解包 + 11.8 GB 压缩层留在 content store）
   **+ 模型与数据 74 GB** ≈ 134 GB。七个例子一共用到 6 条 smoke config（例子 2 和 3 共用一条），
   其中 4 条 `checkpoint_dir: ""`，另外 2 条虽然给了目录但 `save_steps: 1000` 而只跑 3 步，
   所以 smoke **一份 checkpoint 都不写**。
@@ -152,7 +164,7 @@ overlong 奖励缓冲、TIS rollout 修正。
 > 千兆网约 2 分钟起，看你的仓库带宽。已有镜像时 `docker pull` 是秒级——
 > 那是「已预热」的表现，不要当成冷机的预期。
 
-### 3.2 只能跑 gfx950
+### 8.3.2 只能跑 gfx950
 
 > **这个镜像只能跑 gfx950。** TransformerEngine 和 Apex 是用
 > `NVTE_ROCM_ARCH=gfx950` / `PYTORCH_ROCM_ARCH=gfx950` 编译的，烘入的 16 个 aiter
@@ -162,9 +174,9 @@ overlong 奖励缓冲、TIS rollout 修正。
 
 ---
 
-## 4. 快速开始
+## 8.4 快速开始
 
-### 4.1 获取镜像
+### 8.4.1 获取镜像
 
 ```bash
 docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260902
@@ -184,10 +196,10 @@ TAG=lumenrl:release-$(date +%Y%m%d) bash release/precompile_kernels.sh
 `module_gemm_a8w8_blockscale_bpreshuffle_cktile` 这一类大 kernel 上。合成 warmup 只能覆盖
 16 个 kernel 里的 5 个，想全部覆盖见该脚本头部的说明。
 
-> **上面这两个数和 §6.1 表里例子 4 的「557–602 秒」不是一个口径，不要直接相减。**
+> **上面这两个数和 §8.6.1 表里例子 4 的「557–602 秒」不是一个口径，不要直接相减。**
 > 447 / 1256 秒来自 `release/validate_image.sh`：它跑 **`STEPS=1`**，
 > 且只给 `run_dapo.sh` 那一次 `docker exec` 计时，不含建容器、空闲基线探测和软件栈检查。
-> §6.1 的 557–602 秒是 `run_example.sh` 的 **`STEPS=3`** 端到端口径，含容器重启与预检。
+> §8.6.1 的 557–602 秒是 `run_example.sh` 的 **`STEPS=3`** 端到端口径，含容器重启与预检。
 > 两者相差的量级正是多出的 2 步（例子 4 实测 `perf/time_per_step` 为 51.7–83.1 秒）
 > 加上约 15 秒的重启。
 >
@@ -201,7 +213,7 @@ docker run --rm --entrypoint /bin/bash \
   -lc 'ls /opt/lumenrl/aiter-jit/*.so | wc -l'     # 实测 16
 ```
 
-### 4.2 准备数据（跑之前请照这张表自查）
+### 8.4.2 准备数据（跑之前请照这张表自查）
 
 ```bash
 export DATA_ROOT=/path/to/data
@@ -227,7 +239,7 @@ du -sh "$DATA_ROOT/models"/*
 
 #### 从零下载（两步，都在容器里跑）
 
-先按 §4.4 把容器起起来，然后：
+先按 §8.4.4 把容器起起来，然后：
 
 ```bash
 # 1) 模型与原始数据集
@@ -281,9 +293,9 @@ PY'
 > 连续 10 轮 kept 0，直接抛 `RuntimeError: filter_groups collected no valid groups`。
 >
 > 国内网络可换 ModelScope，repo ID 与本地路径都不变，见
-> [`../examples/docs/03-data_cn.md`](../examples/docs/03-data_cn.md)。
+> [`03-data_cn.md`](03-data_cn.md)。
 
-### 4.3 跑第一个例子
+### 8.4.3 跑第一个例子
 
 ```bash
 export DATA_ROOT=/path/to/data
@@ -317,9 +329,9 @@ RESULT: PASS
 
 换例子只要换那个数字：`bash release/run_example.sh 4 --check`。
 **不要去改 `MODE` / `TRAIN_FP8`**——那两个变量和 config 必须成套，启动器已经替你配好了
-（§2.2 的表就是它的内部表；`--dry-run` 可以把它展开成完整命令）。
+（§8.2.2 的表就是它的内部表；`--dry-run` 可以把它展开成完整命令）。
 
-### 4.4 这三条命令背后发生了什么
+### 8.4.4 这三条命令背后发生了什么
 
 顺序是**清场 → 起容器 → 跑 → 判健康**。启动器全都做了，这里给出手工等价物，
 因为出问题时你需要单独执行其中某一步。
@@ -363,7 +375,7 @@ docker run -d --name lumenrl-release \
 
 容器名不要用 `lumenrl`，太容易和别人撞；启动器默认 `lumenrl-release`，
 可以用 `CONTAINER=... ` 换掉。容器**已存在时启动器会 `docker restart`**，
-因为上一次运行结束后每张卡仍可能占着约 90.9 GB（§7 第 1 条），不重启下一次的 KV cache
+因为上一次运行结束后每张卡仍可能占着约 90.9 GB（§8.7 第 1 条），不重启下一次的 KV cache
 预算会被压低。
 
 容器启动时会打印固定的四个 SHA。验证软件栈：
@@ -391,7 +403,7 @@ $DATA_ROOT/logs/example-<N>-<时间戳>.log          # 训练日志（run_dapo.s
 $DATA_ROOT/logs/example-<N>-<时间戳>.launcher.log  # 包装层 stdout + 退出码
 ```
 
-`--log PATH` 可以自己指定。手工等价命令见**附录 A**（七段各自完整），
+`--log PATH` 可以自己指定。手工等价命令见 **§8.10**（七段各自完整），
 或者直接让启动器生成：
 
 ```bash
@@ -406,9 +418,9 @@ bash release/run_example.sh 4 --check-only --log $DATA_ROOT/logs/example-4-xxx.l
 
 `--check` / `--check-only` 做四件事：抠出 step 1 的
 `rollout_corr/k3_kl` / `entropy` / `rollout_corr/kl` / `rollout_corr/ppl_ratio`，
-与内置参考值（§6 的表）逐项比对，统计
+与内置参考值（§8.6 的表）逐项比对，统计
 `Traceback` / `OutOfMemory` / `CUDA error` / `HSA_STATUS` 的出现次数，
-然后打 `PASS` / `FAIL`。人工判读见 §6。
+然后打 `PASS` / `FAIL`。人工判读见 §8.6。
 
 #### 启动器的全部选项
 
@@ -421,12 +433,12 @@ bash release/run_example.sh --help
 | `--check` | 跑完自动比对指标并打 PASS/FAIL |
 | `--check-only --log PATH` | 不跑，只校验一份已有日志 |
 | `--steps N` | 覆盖训练步数 |
-| `--longrun` | 换成该例子的 longrun config（见 §4.6） |
-| `--detach` | `docker exec -d` 起完就返回；受限集群上推荐（附录 B） |
+| `--longrun` | 换成该例子的 longrun config（见 §8.4.6） |
+| `--detach` | `docker exec -d` 起完就返回；受限集群上推荐（§8.11） |
 | `--dry-run` | 只打印将要执行的 `docker run` / `docker exec` |
 | `--force` | 节点不干净时自动清理而不是报错退出 |
 | `--no-restart` | 不重启容器（想复用编译缓存时用） |
-| `--keep-cache` | 例子 4 ↔ 5 切换时不清编译缓存（默认会清，见 §7） |
+| `--keep-cache` | 例子 4 ↔ 5 切换时不清编译缓存（默认会清，见 §8.7） |
 | `--verbose` | 前台把整份日志刷出来，而不是只刷关键行 |
 | `DATA_ROOT` | **必填**。宿主机数据目录 |
 | `IMAGE` / `CONTAINER` | 换镜像 tag / 容器名 |
@@ -435,7 +447,7 @@ bash release/run_example.sh --help
 | `WANDB_API_KEY` | 只有 `--longrun` 需要 |
 | `STALL_LIMIT` | 日志多少秒没长就判定卡死并退出，默认 2400 |
 
-### 4.5 `CONFIG_OVERRIDE` 的两条语义（手工跑时必读）
+### 8.4.5 `CONFIG_OVERRIDE` 的两条语义（手工跑时必读）
 
 `run_dapo.sh` 第 156 行是 `CONFIG="${CONFIG_OVERRIDE:-$CONFIG}"`，所以：
 
@@ -456,21 +468,21 @@ bash release/run_example.sh --help
 
 - **`MODE` 不给 config 时选的是 longrun，不是 smoke。** `MODE=atomfp8` 默认
   `dapo_qwen3_8b_ray_atom_fp8_longrun.yaml`（`wandb_enabled: true`、
-  `max_response_length: 20480`）。这是"照 §2 的表只改 `MODE`"会失败的第二个原因。
+  `max_response_length: 20480`）。这是"照 §8.2 的表只改 `MODE`"会失败的第二个原因。
 - **`MODEL_PATH` 默认是 8B。** 例子 6、7 不显式给就静默跑错模型。
 
 `PYTORCH_CUDA_ALLOC_CONF=` 后面那个空值不是笔误：脚本用 `${VAR-default}` 取值，
 只有显式传一个空串才能关掉 `expandable_segments`。
 
-### 4.6 wandb
+### 8.4.6 wandb
 
-| | smoke config（§2.2 那 6 条） | longrun config（`--longrun`） |
+| | smoke config（§8.2.2 那 6 条） | longrun config（`--longrun`） |
 |---|---|---|
 | `logger.wandb_enabled` | `false` | `true` |
 | 需要账号 | **不需要** | 需要 `WANDB_API_KEY` |
 | `max_response_length` | 512 / 4096 | 20480（例子 7 是 4096） |
 
-所以 §2 的七个例子**不需要 wandb 账号**。只有 `--longrun` 才会碰到它：
+所以 §8.2 的七个例子**不需要 wandb 账号**。只有 `--longrun` 才会碰到它：
 
 ```bash
 # 有 key
@@ -493,7 +505,7 @@ EXTRA_OVERRIDE=logger.wandb_enabled=false bash release/run_example.sh 1 --longru
 
 ---
 
-## 5. 基于镜像做开发
+## 8.5 基于镜像做开发
 
 镜像提供的是环境，你的代码不必待在里面。把四棵源码树里的任意一棵 bind-mount 覆盖上去
 即刻生效——四个都是 editable 安装。
@@ -520,11 +532,11 @@ AttributeError: module 'aiter.jit.module_aiter_core' has no attribute 'MlaVersio
 
 ---
 
-## 6. 怎么判断跑得健康
+## 8.6 怎么判断跑得健康
 
 按顺序看这四条。每一条都有人在上面耗掉过一小时。
 
-**1. 开跑前每张卡都在空闲基线**（MI355X 实测约 298 MB）。见 §4.4 第 1 步。
+**1. 开跑前每张卡都在空闲基线**（MI355X 实测约 298 MB）。见 §8.4.4 第 1 步。
 
 **2. 源码安装压过镜像自带的 wheel。** `import aiter` 必须解析到 `/opt/lumenrl/aiter/`，
 而不是 site-packages。
@@ -547,12 +559,12 @@ AttributeError: module 'aiter.jit.module_aiter_core' has no attribute 'MlaVersio
 
 **4. 数值对齐。** 见下面的参考值表和判据。
 
-### 6.1 参考值表
+### 8.6.1 参考值表
 
 **测量条件**（表里每个数字都是在这套条件下测的，换任何一条都不适用）：
 
 - 硬件 8x MI355X（gfx950），镜像 `zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260902`
-- 命令就是 `bash release/run_example.sh <N>`，即 §2.2 那张表的整行参数
+- 命令就是 `bash release/run_example.sh <N>`，即 §8.2.2 那张表的整行参数
 - **`seed=10086`**（`run_dapo.sh` 硬编码，七个例子都一样，所以没有单独占一列），
   `STEPS` 与 `max_response_length` 见表内列
 - 取的是**第 1 步**（`step=1`，1-based）的指标
@@ -569,7 +581,7 @@ AttributeError: module 'aiter.jit.module_aiter_core' has no attribute 'MlaVersio
 | 7 | `dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml` | 3 | 4096 | 526–532 s | **0.00157** ±50% | **0.655** ±60% | 0.00166 | 2 |
 
 粗体两列带容差的就是 `--check` 判 PASS/FAIL 的两项，参考值是「实测次数」列那么多遍的**均值**，
-容差的来历见 §6.2。`rollout_corr/kl` 一列只做数量级判据，不给百分比容差。
+容差的来历见 §8.6.2。`rollout_corr/kl` 一列只做数量级判据，不给百分比容差。
 「端到端墙钟」含容器重启和预检，即 `run_example.sh` 自己报的耗时。
 **这一列不参与 PASS/FAIL，也不设容差**：它主要受 aiter kernel 缓存和 torch inductor
 缓存的冷热影响，同一节点同一镜像上实测偏差可达 **±15%**，而且方向系统性偏快
@@ -580,9 +592,9 @@ AttributeError: module 'aiter.jit.module_aiter_core' has no attribute 'MlaVersio
 例子 5 测了两遍，但两遍的端到端墙钟都是 472 s，所以表里仍只记一个值。
 一共 17 次运行，**退出码全部为 0**，`Traceback` / `OutOfMemory` / `CUDA error` / `HSA_STATUS`
 计数**全部为 0**，用上表容差 `--check` **17/17 全部 PASS**。
-每一次运行的完整原始记录在 [`VALIDATION-20260903.md`](VALIDATION-20260903.md)。
+每一次运行的完整原始记录在 [`VALIDATION-20260903.md`](../../release/VALIDATION-20260903.md)。
 
-### 6.2 怎么用这张表（重要）
+### 8.6.2 怎么用这张表（重要）
 
 **`rollout_corr/kl` 不能当复现判据。** 它是 `(rollout_logp - train_logp)` 的
 **有符号** token 均值，对称的分歧在里面会互相抵消，剩下的基本是噪声。
@@ -638,7 +650,7 @@ AttributeError: module 'aiter.jit.module_aiter_core' has no attribute 'MlaVersio
 
 ---
 
-## 7. 已知问题
+## 8.7 已知问题
 
 **1. 跑完之后显存不会自动释放。** smoke 干净结束后每张卡仍可能占着约 90.9 GB
 （例子 4 结束后立刻测量，MI355X 实测 89960382464–90905997312 B）：Ray worker 已经
@@ -669,7 +681,7 @@ docker exec lumenrl-release bash -lc \
 watch -n 30 'ls -l $DATA_ROOT/logs/example-4-xxx.log'
 ```
 
-**4. `docker restart` 会杀掉 `--detach` 起的任务。** 这两条建议是冲突的（§7 第 1 条要重启，
+**4. `docker restart` 会杀掉 `--detach` 起的任务。** 这两条建议是冲突的（§8.7 第 1 条要重启，
 `--detach` 要求别动容器）。启动器的处理是：重启前先检查上一次的日志还在不在增长，
 在增长就拒绝启动并告诉你怎么办；`--force` 表示"就是要杀掉它"。
 
@@ -679,7 +691,7 @@ kernel，靠 baton 锁串行。如果跳过了 `precompile_kernels.sh`，那约 
 
 **6. `RUN_ID` 里硬编码了 `-ray-vllm-8b-`。** 不显式给 `LOG` 的话，MoE / ATOM 例子的日志
 文件名也会带这一段，很容易找错文件。启动器总是显式传 `LOG`，所以只有手工跑时才会遇到；
-附录 A 的每段命令都带了 `LOG`。
+§8.10 的每段命令都带了 `LOG`。
 
 **7. `HSA_DISABLE_FRAGMENT_ALLOCATOR` 在本镜像上保持默认值 1 是安全的。**
 `run_dapo.sh` 默认导出 `HSA_DISABLE_FRAGMENT_ALLOCATOR=1`，而脚本自己的注释记录了：
@@ -693,7 +705,7 @@ kernel，靠 baton 锁串行。如果跳过了 `precompile_kernels.sh`，那约 
 
 ---
 
-## 8. 版本固定
+## 8.8 版本固定
 
 复现一个结果意味着四个仓库要一起复现。它们**不能各自独立升级**，原因见下面关于 aiter 的说明。
 
@@ -739,23 +751,33 @@ ImportError: Unsupported `flydsl` version: expected >=`0.2.4`, got `0.1.8`.
 
 ---
 
-## 9. 延伸阅读
+## 8.9 延伸阅读
 
-完整的运维手册——装依赖、准备数据、启动、排障，以及双节点训推分离部署——在
-[`../examples/`](../examples/README_cn.md)。
+本章之外，本目录的其余部分讲的是**从源码搭一套**，以及镜像覆盖不到的场景：
+
+| 什么时候需要 | 去哪 |
+|---|---|
+| 要改源码 / 换模型 / 不用镜像 | [1. 环境搭建](01-env-setup_cn.md) → [2. 装依赖](02-dependencies_cn.md) → [4. 启动](04-launching_cn.md) |
+| 只想重做数据（本章 §8.4.2 是它的精简版） | [3. 模型与数据](03-data_cn.md) |
+| 遇到本章 §8.7 没列到的故障 | [6. 排障](06-troubleshooting_cn.md) |
+| 要跑双节点训推分离（例子 8，镜像不覆盖） | [5. 多节点 RDMA](05-multinode-rdma_cn.md)、[7. 训推分离双节点 RDMA](07-disaggregated-rdma_cn.md) |
+
+镜像本身怎么构建、版本怎么钉，见仓库根目录的
+[`release/`](../../release/)（`Dockerfile`、`versions.env`、`build_image.sh`、
+`precompile_kernels.sh`），本章 §8.4.1 引用的就是它们。
 
 ---
 
-## 附录 A：不用 launcher 的等价手工命令
+## 8.10 不用 launcher 的等价手工命令
 
 这七段是 `run_example.sh <N> --dry-run` 的输出，一段一个例子，**互不共用变量**：
 每段都自带全部 `MODE` / `TRAIN_FP8` / `CONFIG_OVERRIDE` / `STEPS` / `MODEL_PATH` / `LOG`。
 用 `docker exec -e` 传环境变量是有意的：这样就不需要在 `bash -lc "..."` 里嵌套引号，
 而嵌套引号是 `CONFIG_OVERRIDE` 被吃掉、脚本路径被拆碎的主要来源
-（在 `spur exec bash -lc '…'` 里手写要转义三层——**这种环境下怎么写见附录 B 第 6 条**，
+（在 `spur exec bash -lc '…'` 里手写要转义三层——**这种环境下怎么写见 §8.11 第 6 条**，
 那里给了一段实测能跑的形式，别自己现场试引号）。
 
-先照 §4.4 第 2 步把容器起好（下面统一叫 `lumenrl-release`），然后导出数据目录——
+先照 §8.4.4 第 2 步把容器起好（下面统一叫 `lumenrl-release`），然后导出数据目录——
 **下面七段里的 `$DATA_ROOT` 就靠这一句展开，你不需要逐段替换路径**：
 
 ```bash
@@ -768,8 +790,8 @@ export DATA_ROOT=/path/to/data
 日志不会走 stdout，`run_dapo.sh` 直接写到 `$LOG`；跟踪用
 `tail -f "$LOG"`，抠指标用
 `grep -o 'step=[0-9]* .*rollout_corr/kl=[^ ]*' "$LOG"`。
-**每段之间都要 `docker restart lumenrl-release`**（§7 第 1 条），
-**例子 4 和例子 5 之间还要清编译缓存**（§7 第 2 条）。
+**每段之间都要 `docker restart lumenrl-release`**（§8.7 第 1 条），
+**例子 4 和例子 5 之间还要清编译缓存**（§8.7 第 2 条）。
 
 ### 例子 1 · 8B BF16 基线
 
@@ -844,7 +866,7 @@ docker exec \
 
 ### 例子 5 · 8B ATOM BF16
 
-> 跑这一段之前，如果上一次跑的是例子 4，先清编译缓存（§7 第 2 条）：
+> 跑这一段之前，如果上一次跑的是例子 4，先清编译缓存（§8.7 第 2 条）：
 > `docker exec lumenrl-release bash -lc 'rm -rf /tmp/aiter_configs /tmp/atom_torch_compile_cache /tmp/torchinductor_root'`
 
 ```bash
@@ -911,7 +933,7 @@ docker exec \
 ```
 
 
-## 附录 B：在受限 / 有调度器的集群上运行
+## 8.11 在受限 / 有调度器的集群上运行
 
 上面的命令假设你能直接在 GPU 宿主机上敲命令。本发布版实际验证所用的集群
 （Crusoe m2m + spur 调度器）不是这样，这里把差异列出来，因为它们大概率也适用于你的环境。
@@ -954,23 +976,23 @@ spur exec <JobID> bash -lc '
   DATA_ROOT=/path/to/data bash release/run_example.sh 1 --longrun --detach'
 ```
 
-然后**轮询日志文件大小**判存活（`pgrep` 不可用，§7 第 3 条）：
+然后**轮询日志文件大小**判存活（`pgrep` 不可用，§8.7 第 3 条）：
 
 ```bash
 spur exec <JobID> bash -lc 'ls -l /path/to/data/logs/example-1-*.log'
 ```
 
 **4. 别把长任务放在 `exec` 前台。** 客户端一断进程就被打死，还会留下占着显存的孤儿容器
-（正是 §4.4 第 1 步要清的东西）。要么 `--detach`，要么在节点上
+（正是 §8.4.4 第 1 步要清的东西）。要么 `--detach`，要么在节点上
 `setsid nohup ... &` 把启动器自己也放到后台。
 
-**5. `docker restart` 与 `--detach` 的冲突**见 §7 第 4 条：启动器会先探测上一次的日志
+**5. `docker restart` 与 `--detach` 的冲突**见 §8.7 第 4 条：启动器会先探测上一次的日志
 是否还在增长，再决定是拒绝还是重启。
 
-**6. 在 `spur exec` 里跑附录 A 的手工命令。** 附录 A 每段以
+**6. 在 `spur exec` 里跑上一节（§8.10）的手工命令。** 那七段每段都以
 `bash -lc 'bash /opt/lumenrl/…/run_dapo.sh'` 结尾，用的是单引号；而本附录第 1 条又要求把命令
 包进 `spur exec <JobID> bash -lc '…'`，也是单引号。**两层单引号直接嵌套会在第一个 `'` 处断开。**
-可用的写法是**外层换成双引号、内层保留附录 A 原样的单引号**：
+可用的写法是**外层换成双引号、内层的单引号原样不动**：
 
 ```bash
 spur exec <JobID> bash -lc "
@@ -989,7 +1011,7 @@ spur exec <JobID> bash -lc "
     lumenrl-release bash -lc 'bash /opt/lumenrl/Lumen-RL/examples/DAPO/run_dapo.sh'"
 ```
 
-相对附录 A **只有一处要改**：外层双引号里的 `$DATA_ROOT` 必须写成 `\$DATA_ROOT`，
+相对 §8.10 的原文**只有一处要改**：外层双引号里的 `$DATA_ROOT` 必须写成 `\$DATA_ROOT`，
 否则它会在**你本地**展开、把本地路径塞进去，而不是在节点上展开。另外两点是"别动"：
 
 - 内层那对单引号**原样保留**；
@@ -998,7 +1020,7 @@ spur exec <JobID> bash -lc "
 
 这一段实测在 `crsuse2-m2m-v2-035` 上 `exit=0` 跑通（例子 1）：
 **整段含开头那条 `docker restart` 是 3m18s；只给 `docker exec` 那一段计时是 2m31s。**
-两个数都对，差的就是重启——和 §4.1 那个 447 秒是同一类陷阱，报耗时记得说清算到哪里。
+两个数都对，差的就是重启——和 §8.4.1 那个 447 秒是同一类陷阱，报耗时记得说清算到哪里。
 
 **如果你不想碰这些引号细节**，就别手写：`spur exec <JobID> bash -lc '… bash release/run_example.sh 1 --check'`
 （本附录第 1 条那种形式）没有任何嵌套问题，这也是推荐路径。

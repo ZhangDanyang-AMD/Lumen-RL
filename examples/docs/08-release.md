@@ -1,17 +1,31 @@
-# LumenRL — DAPO math RL on AMD Instinct
+> [Examples README](../README.md) > Running from the release image
 
-A reproducible release of the LumenRL reinforcement-learning stack on AMD GPUs:
-**training and inference share the same 8 cards**, the training backend is FSDP2 or
-Megatron, the rollout engine is vLLM or ATOM, and the precision is BF16 or FP8.
+# 8. Running the seven examples from the release image
 
-> 中文版：[README_cn.md](README_cn.md)
+> 中文版：[08-release_cn.md](08-release_cn.md)
 
-Everything here was run end to end on the versions pinned in
-[`versions.env`](versions.env); nothing is "expected to work". Every number in the
-§6 reference table is annotated with the command, the config and the step count it
-came from.
+**This chapter is the other entry point into this directory.** Chapters
+[1](01-env-setup.md)–[4](04-launching.md) build an environment **from source**:
+install dependencies, patch vLLM, precompile the ATOM JIT, then assemble the launch
+command yourself. This chapter uses the **published container image**: the software
+stack is already pinned with its kernels baked in, each of the seven examples is one
+command, nothing has to be installed, and no config or `run_dapo.sh` has to be opened.
 
-**Shortest path** (details in §4):
+Both paths run the same examples — 1–7 in §8.2 are 1–7 in the
+[Examples README](../README.md) "validated examples" table, so the metrics are
+directly comparable. Use this chapter to qualify a new machine, reproduce the
+published numbers, or hand the stack to a customer. Go back to chapters 1–4 to change
+the source, swap models, or run two nodes (example 8, see
+[7. Disaggregated two-node RDMA](07-disaggregated-rdma.md)).
+
+This release of LumenRL on AMD GPUs: **training and inference share the same 8
+cards**, the training backend is FSDP2 or Megatron, the rollout engine is vLLM or
+ATOM, and the precision is BF16 or FP8. Everything in this chapter was run end to end
+on the versions pinned in [`versions.env`](../../release/versions.env); nothing is
+"expected to work". Every number in the §8.6 reference table is annotated with the
+command, the config and the step count it came from.
+
+**Shortest path** (details in §8.4):
 
 ```bash
 export DATA_ROOT=/path/to/data
@@ -26,7 +40,7 @@ metrics against built-in reference values and prints `PASS` / `FAIL`.
 
 ---
 
-## 1. What is in this release
+## 8.1 What is in this release
 
 | | |
 |---|---|
@@ -43,13 +57,13 @@ Algorithm side: clip-higher + dual-clip + token-mean policy loss, dynamic sampli
 
 ---
 
-## 2. The seven validated examples
+## 8.2 The seven validated examples
 
 All seven run training *and* inference on the same 8 cards. Measured on
 8x MI355X (gfx950), ROCm 7.2, image `dapo-gfx950-rocm7.2.3-260902`, versions per
-[`versions.env`](versions.env).
+[`versions.env`](../../release/versions.env).
 
-### 2.1 Overview
+### 8.2.1 Overview
 
 | # | Example | Training | Rollout | Run it |
 |---|---------|----------|---------|--------|
@@ -61,9 +75,9 @@ All seven run training *and* inference on the same 8 cards. Measured on
 | 6 | MoE FSDP2 | FSDP2 BF16 | vLLM BF16 | `bash release/run_example.sh 6 --check` |
 | 7 | MoE Megatron EP=8 | **Megatron** TP=PP=CP=1, EP=8, DP=8 | vLLM BF16 | `bash release/run_example.sh 7 --check` |
 
-### 2.2 Full parameters per example
+### 8.2.2 Full parameters per example
 
-This table *is* the launcher's internal table. When running by hand (appendix A),
+This table *is* the launcher's internal table. When running by hand (§8.10),
 **every column on the row has to be supplied.**
 
 | # | `MODE` | `TRAIN_FP8` | `CONFIG_OVERRIDE` (relative to `$RL_ROOT/Lumen-RL`, all under `examples/DAPO/configs/`) | `STEPS` | `max_response_length` | Model | Extra env |
@@ -77,7 +91,7 @@ This table *is* the launcher's internal table. When running by hand (appendix A)
 | 7 | `bf16` | `0` | `dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml` | 3 | 4096 | Qwen3-30B-A3B-Base | `LUMENRL_FP32_MOE_ROUTER=0` |
 
 All six configs (examples 2 and 3 share one) are `logger.wandb_enabled: false`, so
-**no wandb account is needed** (see §4.6). The `STEPS` column is the command-line `num_training_steps`
+**no wandb account is needed** (see §8.4.6). The `STEPS` column is the command-line `num_training_steps`
 override, not the yaml default.
 
 > ⚠️ **`MODE` and `CONFIG_OVERRIDE` must be given as a pair; changing one alone
@@ -86,9 +100,9 @@ override, not the yaml default.
 > canonical mismatch is example 4: `MODE=atomfp8` unconditionally appends
 > `compilation_config.level=3`, and combining that with a vLLM smoke yaml yields
 > `RuntimeError: aot_compile is not supported by the current configuration`.
-> See §4.5 for the full `CONFIG_OVERRIDE` semantics.
+> See §8.4.5 for the full `CONFIG_OVERRIDE` semantics.
 
-### 2.3 How the examples relate to each other
+### 8.2.3 How the examples relate to each other
 
 - **Examples 2 and 3 share one yaml** and differ only in `TRAIN_FP8`: `0` means
   "rollout quantization only", `1` additionally exports
@@ -124,22 +138,22 @@ and you do not need to isolate anything by hand. The actual paths are:
 
 Examples 6 and 7 both write nothing in smoke mode, and their longrun directories
 differ, so **example 7 can run straight after example 6** (verified back to back,
-see §6). The problem only appears if you point both backends at the same
+see §8.6). The problem only appears if you point both backends at the same
 `checkpoint_dir`: the two formats are mutually unreadable, and each engine sizes
 its KV cache budget as a fraction of the whole card.
 
 ---
 
-## 3. Requirements
+## 8.3 Requirements
 
 - 8x gfx950 (MI350X or MI355X) with all cards idle
 - Host ROCm 7.2, `/dev/kfd` and `/dev/dri` accessible
 - Docker (the `docker` command must work; if it needs sudo see the `DOCKER`
-  variable in §4.4)
+  variable in §8.4.4)
 - Disk: see below
-- Models and data: about **74 GB**, itemized in §4.2
+- Models and data: about **74 GB**, itemized in §8.4.2
 
-### 3.1 Disk (measured on node 035)
+### 8.3.1 Disk (measured on node 035)
 
 | Item | Measured | How |
 |---|---|---|
@@ -157,7 +171,7 @@ its KV cache budget as a fraction of the whole card.
 
 **Recommended budget:**
 
-- Only the seven smokes in §2: **60 GB for the image** (47.3 GB unpacked plus the
+- Only the seven smokes in §8.2: **60 GB for the image** (47.3 GB unpacked plus the
   11.8 GB of compressed layers retained in the content store) **+ 74 GB of models
   and data** ≈ 134 GB. The seven examples use six distinct smoke configs
   (examples 2 and 3 share one); four have `checkpoint_dir: ""` and the other two
@@ -177,7 +191,7 @@ its KV cache budget as a fraction of the whole card.
 > `docker pull` returns in seconds; that is a *warmed* machine, not the cold-node
 > expectation.
 
-### 3.2 gfx950 only
+### 8.3.2 gfx950 only
 
 > **This image only runs on gfx950.** TransformerEngine and Apex are compiled with
 > `NVTE_ROCM_ARCH=gfx950` / `PYTORCH_ROCM_ARCH=gfx950`, and the 16 baked-in aiter
@@ -188,9 +202,9 @@ its KV cache budget as a fraction of the whole card.
 
 ---
 
-## 4. Quick start
+## 8.4 Quick start
 
-### 4.1 Get the image
+### 8.4.1 Get the image
 
 ```bash
 docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260902
@@ -212,11 +226,11 @@ takes **447 s** on an image with all **16** kernel objects baked in versus
 5 of the 16 kernels; see the header of that script for full coverage.
 
 > **Those two numbers are not the same measurement as the 557–602 s given for
-> example 4 in §6.1; do not subtract one from the other.**
+> example 4 in §8.6.1; do not subtract one from the other.**
 > 447 / 1256 s come from `release/validate_image.sh`, which runs **`STEPS=1`** and
 > times only the single `docker exec` of `run_dapo.sh` — it excludes creating the
 > container, probing the idle baseline and checking the software stack.
-> The 557–602 s in §6.1 is `run_example.sh`'s end-to-end figure at **`STEPS=3`**,
+> The 557–602 s in §8.6.1 is `run_example.sh`'s end-to-end figure at **`STEPS=3`**,
 > including the container restart and preflight. The difference is exactly the two
 > extra steps (example 4 measured `perf/time_per_step` at 51.7–83.1 s) plus about
 > 15 s of restart.
@@ -232,7 +246,7 @@ docker run --rm --entrypoint /bin/bash \
   -lc 'ls /opt/lumenrl/aiter-jit/*.so | wc -l'     # measured: 16
 ```
 
-### 4.2 Prepare the data (self-check against this table before running)
+### 8.4.2 Prepare the data (self-check against this table before running)
 
 ```bash
 export DATA_ROOT=/path/to/data
@@ -259,7 +273,7 @@ du -sh "$DATA_ROOT/models"/*
 
 #### Downloading from scratch (two steps, both inside the container)
 
-Start the container first (§4.4), then:
+Start the container first (§8.4.4), then:
 
 ```bash
 # 1) models and raw datasets
@@ -316,9 +330,9 @@ PY'
 > `RuntimeError: filter_groups collected no valid groups`.
 >
 > For ModelScope mirrors (same repo IDs, same local paths) see
-> [`../examples/docs/03-data.md`](../examples/docs/03-data.md).
+> [`03-data.md`](03-data.md).
 
-### 4.3 Run the first example
+### 8.4.3 Run the first example
 
 ```bash
 export DATA_ROOT=/path/to/data
@@ -352,10 +366,10 @@ RESULT: PASS
 
 To switch examples, change the digit: `bash release/run_example.sh 4 --check`.
 **Do not edit `MODE` / `TRAIN_FP8`** — those go together with the config, and the
-launcher has already paired them for you (§2.2 is its internal table; `--dry-run`
+launcher has already paired them for you (§8.2.2 is its internal table; `--dry-run`
 expands it into the full command).
 
-### 4.4 What those three commands actually do
+### 8.4.4 What those three commands actually do
 
 The order is **clear the node → start the container → run → judge health**. The
 launcher does all of it; the manual equivalents are given here because when
@@ -404,7 +418,7 @@ docker run -d --name lumenrl-release \
 Do not name the container `lumenrl`; it collides too easily. The launcher defaults
 to `lumenrl-release` and honours `CONTAINER=...`. **If the container already exists
 the launcher runs `docker restart`**, because after a finished run each card may
-still be holding about 90.9 GB (§7 item 1) and without a restart the next run gets a
+still be holding about 90.9 GB (§8.7 item 1) and without a restart the next run gets a
 smaller KV cache budget.
 
 The container prints four fixed SHAs at startup. To verify the software stack:
@@ -435,7 +449,7 @@ $DATA_ROOT/logs/example-<N>-<timestamp>.log          # trainer log (written by r
 $DATA_ROOT/logs/example-<N>-<timestamp>.launcher.log  # wrapper stdout + exit code
 ```
 
-`--log PATH` overrides it. The manual equivalents are in **appendix A** (seven
+`--log PATH` overrides it. The manual equivalents are in **§8.10** (seven
 self-contained blocks), or let the launcher generate them:
 
 ```bash
@@ -450,9 +464,9 @@ bash release/run_example.sh 4 --check-only --log $DATA_ROOT/logs/example-4-xxx.l
 
 `--check` / `--check-only` does four things: extracts step-1
 `rollout_corr/k3_kl` / `entropy` / `rollout_corr/kl` / `rollout_corr/ppl_ratio`,
-compares each against the built-in reference values (the §6 table), counts
+compares each against the built-in reference values (the §8.6 table), counts
 occurrences of `Traceback` / `OutOfMemory` / `CUDA error` / `HSA_STATUS`, and prints
-`PASS` / `FAIL`. For reading the numbers yourself, see §6.
+`PASS` / `FAIL`. For reading the numbers yourself, see §8.6.
 
 #### All launcher options
 
@@ -465,12 +479,12 @@ bash release/run_example.sh --help
 | `--check` | after the run, compare metrics and print PASS/FAIL |
 | `--check-only --log PATH` | do not run, only validate an existing log |
 | `--steps N` | override the number of training steps |
-| `--longrun` | use the example's longrun config instead (see §4.6) |
-| `--detach` | `docker exec -d` and return immediately; recommended on gated clusters (appendix B) |
+| `--longrun` | use the example's longrun config instead (see §8.4.6) |
+| `--detach` | `docker exec -d` and return immediately; recommended on gated clusters (§8.11) |
 | `--dry-run` | only print the `docker run` / `docker exec` it would issue |
 | `--force` | auto-remediate a dirty node instead of failing |
 | `--no-restart` | do not restart the container (to reuse compile caches) |
-| `--keep-cache` | do not clear compile caches when switching between examples 4 and 5 (see §7) |
+| `--keep-cache` | do not clear compile caches when switching between examples 4 and 5 (see §8.7) |
 | `--verbose` | stream the whole log in the foreground instead of the highlights |
 | `DATA_ROOT` | **required**. Host data directory |
 | `IMAGE` / `CONTAINER` | image tag / container name |
@@ -479,7 +493,7 @@ bash release/run_example.sh --help
 | `WANDB_API_KEY` | only needed with `--longrun` |
 | `STALL_LIMIT` | seconds without a new log line before declaring a hang, default 2400 |
 
-### 4.5 The two semantics of `CONFIG_OVERRIDE` (read this before running by hand)
+### 8.4.5 The two semantics of `CONFIG_OVERRIDE` (read this before running by hand)
 
 Line 156 of `run_dapo.sh` is `CONFIG="${CONFIG_OVERRIDE:-$CONFIG}"`, therefore:
 
@@ -502,7 +516,7 @@ Two more defaults that are easy to miss:
 - **Without a config override, `MODE` selects the longrun yaml, not the smoke one.**
   `MODE=atomfp8` defaults to `dapo_qwen3_8b_ray_atom_fp8_longrun.yaml`
   (`wandb_enabled: true`, `max_response_length: 20480`). This is the second reason
-  "just change `MODE` per the §2 table" fails.
+  "just change `MODE` per the §8.2 table" fails.
 - **`MODEL_PATH` defaults to the 8B model.** Examples 6 and 7 silently run the
   wrong model if it is not passed explicitly.
 
@@ -510,15 +524,15 @@ The empty value after `PYTORCH_CUDA_ALLOC_CONF=` is not a typo: the script reads
 as `${VAR-default}`, so only an explicitly empty string turns off
 `expandable_segments`.
 
-### 4.6 wandb
+### 8.4.6 wandb
 
-| | smoke configs (the six in §2.2) | longrun configs (`--longrun`) |
+| | smoke configs (the six in §8.2.2) | longrun configs (`--longrun`) |
 |---|---|---|
 | `logger.wandb_enabled` | `false` | `true` |
 | Account needed | **no** | yes, `WANDB_API_KEY` |
 | `max_response_length` | 512 / 4096 | 20480 (4096 for example 7) |
 
-So the seven examples in §2 **need no wandb account**. Only `--longrun` runs into it:
+So the seven examples in §8.2 **need no wandb account**. Only `--longrun` runs into it:
 
 ```bash
 # with a key
@@ -541,7 +555,7 @@ EXTRA_OVERRIDE=logger.wandb_enabled=false bash release/run_example.sh 1 --longru
 
 ---
 
-## 5. Developing on top of the image
+## 8.5 Developing on top of the image
 
 The image provides the environment; your code does not have to live inside it.
 Bind-mount over any of the four source trees and it takes effect immediately — all
@@ -570,12 +584,12 @@ AttributeError: module 'aiter.jit.module_aiter_core' has no attribute 'MlaVersio
 
 ---
 
-## 6. How to tell whether the run is healthy
+## 8.6 How to tell whether the run is healthy
 
 Check these four in order. Every one of them has cost somebody an hour.
 
 **1. Every card is at the idle baseline before you start** (about 298 MB measured on
-MI355X). See §4.4 step 1.
+MI355X). See §8.4.4 step 1.
 
 **2. The source installs win over the wheels in the image.** `import aiter` must
 resolve under `/opt/lumenrl/aiter/`, not site-packages.
@@ -600,14 +614,14 @@ metrics, and contains no `Traceback`, `OutOfMemory`, `CUDA error` or `HSA_STATUS
 
 **4. The numbers line up.** See the reference table and the criteria below.
 
-### 6.1 Reference values
+### 8.6.1 Reference values
 
 **Measurement conditions** (every number below was taken under these; change any
 one of them and the table no longer applies):
 
 - 8x MI355X (gfx950), image `zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260902`
 - the command is exactly `bash release/run_example.sh <N>`, i.e. the full row from
-  the §2.2 table
+  the §8.2.2 table
 - **`seed=10086`** (hardcoded in `run_dapo.sh`; identical for all seven examples,
   which is why it does not get its own column); `STEPS` and `max_response_length`
   are columns in the table below
@@ -626,7 +640,7 @@ one of them and the table no longer applies):
 
 The two bold columns with tolerances are what `--check` turns into PASS/FAIL; each
 reference is the **mean** over the number of runs in the `runs` column, and the
-tolerances are derived in §6.2. `rollout_corr/kl` is checked by order of magnitude
+tolerances are derived in §8.6.2. `rollout_corr/kl` is checked by order of magnitude
 only, so it carries no percentage tolerance. "End-to-end wall clock" includes the
 container restart and preflight, i.e. it is what `run_example.sh` reports.
 **That column carries no tolerance and does not affect PASS/FAIL**: it is dominated
@@ -642,9 +656,9 @@ table still shows one value.
 Across all 17 runs the **exit code was 0 every time**, the counts of
 `Traceback` / `OutOfMemory` / `CUDA error` / `HSA_STATUS` were **all zero**, and
 `--check` with the tolerances above is **17/17 PASS**.
-The raw per-run record is in [`VALIDATION-20260903.md`](VALIDATION-20260903.md).
+The raw per-run record is in [`VALIDATION-20260903.md`](../../release/VALIDATION-20260903.md).
 
-### 6.2 How to use this table (important)
+### 8.6.2 How to use this table (important)
 
 **`rollout_corr/kl` cannot be used as a reproducibility criterion.** It is the
 **signed** token mean of `(rollout_logp - train_logp)`, so symmetric disagreement
@@ -710,7 +724,7 @@ so switching the training backend introduces no extra train/rollout drift.
 
 ---
 
-## 7. Known issues
+## 8.7 Known issues
 
 **1. VRAM is not released when a run finishes.** After a clean smoke each card may
 still hold about 90.9 GB (measured on MI355X immediately after example 4:
@@ -747,7 +761,7 @@ watch -n 30 'ls -l $DATA_ROOT/logs/example-4-xxx.log'
 ```
 
 **4. `docker restart` kills a `--detach`ed run.** The two pieces of advice conflict
-(§7 item 1 wants a restart, `--detach` wants the container left alone). The launcher
+(§8.7 item 1 wants a restart, `--detach` wants the container left alone). The launcher
 handles it by checking whether the previous log is still growing before restarting;
 if it is, it refuses to start and tells you what to do. `--force` means "kill it".
 
@@ -760,7 +774,7 @@ exists to cover this stretch.
 **6. `RUN_ID` has `-ray-vllm-8b-` hardcoded.** Without an explicit `LOG`, the log
 filename carries that fragment even for the MoE and ATOM examples, which makes it
 easy to read the wrong file. The launcher always passes `LOG` explicitly, so this
-only bites when running by hand; every block in appendix A sets `LOG`.
+only bites when running by hand; every block in §8.10 sets `LOG`.
 
 **7. Leaving `HSA_DISABLE_FRAGMENT_ALLOCATOR` at its default of 1 is safe on this
 image.** `run_dapo.sh` exports `HSA_DISABLE_FRAGMENT_ALLOCATOR=1` by default, and
@@ -777,7 +791,7 @@ explicit empty string: `-e HSA_DISABLE_FRAGMENT_ALLOCATOR=`.
 
 ---
 
-## 8. Version pinning
+## 8.8 Version pinning
 
 Reproducing a result means reproducing four repositories together. They
 **cannot be upgraded independently**; the aiter note below explains why.
@@ -827,15 +841,25 @@ aiter anywhere in the message.
 
 ---
 
-## 9. Further reading
+## 8.9 Further reading
 
-The full operations manual — dependencies, data preparation, launching,
-troubleshooting, and the two-node disaggregated deployment — is in
-[`../examples/`](../examples/README.md).
+Outside this chapter, the rest of this directory covers building **from source**, plus
+the scenarios the image does not cover:
+
+| When you need it | Where |
+|---|---|
+| Changing the source, swapping models, not using the image | [1. Environment setup](01-env-setup.md) → [2. Dependencies](02-dependencies.md) → [4. Launching](04-launching.md) |
+| Rebuilding the data (§8.4.2 is the condensed version) | [3. Models and data](03-data.md) |
+| A failure §8.7 does not list | [6. Troubleshooting](06-troubleshooting.md) |
+| Two-node disaggregated serving (example 8, not covered by the image) | [5. Multi-node RDMA](05-multinode-rdma.md), [7. Disaggregated two-node RDMA](07-disaggregated-rdma.md) |
+
+How the image itself is built and how the versions are pinned lives in
+[`release/`](../../release/) at the repository root (`Dockerfile`, `versions.env`,
+`build_image.sh`, `precompile_kernels.sh`) — those are what §8.4.1 refers to.
 
 ---
 
-## Appendix A: manual equivalents, without the launcher
+## 8.10 Manual equivalents, without the launcher
 
 These seven blocks are the output of `run_example.sh <N> --dry-run`, one per
 example, **sharing no variables**: each carries its own complete `MODE` /
@@ -843,11 +867,11 @@ example, **sharing no variables**: each carries its own complete `MODE` /
 Passing environment variables via `docker exec -e` is deliberate: it removes the
 need to nest quotes inside `bash -lc "..."`, and nested quoting is the main way
 `CONFIG_OVERRIDE` gets swallowed or a script path gets torn apart (inside
-`spur exec bash -lc '…'` you would be escaping three levels deep — **appendix B
+`spur exec bash -lc '…'` you would be escaping three levels deep — **§8.11
 item 6 gives a form that has been measured to work there**, do not improvise the
 quoting).
 
-Start the container as in §4.4 step 2 (called `lumenrl-release` below), then export
+Start the container as in §8.4.4 step 2 (called `lumenrl-release` below), then export
 the data directory — **the `$DATA_ROOT` in the seven blocks below expands from this
 one line, so there are no paths to substitute per block**:
 
@@ -861,8 +885,8 @@ reaches the container is the resolved absolute path. That is intended.)
 The log does not go to stdout; `run_dapo.sh` writes straight to `$LOG`. Follow it
 with `tail -f "$LOG"` and extract metrics with
 `grep -o 'step=[0-9]* .*rollout_corr/kl=[^ ]*' "$LOG"`.
-**Run `docker restart lumenrl-release` between blocks** (§7 item 1), and
-**also clear the compile caches between examples 4 and 5** (§7 item 2).
+**Run `docker restart lumenrl-release` between blocks** (§8.7 item 1), and
+**also clear the compile caches between examples 4 and 5** (§8.7 item 2).
 
 ### Example 1 · 8B BF16 baseline
 
@@ -938,7 +962,7 @@ docker exec \
 
 ### Example 5 · 8B ATOM BF16
 
-> If the previous run was example 4, clear the compile caches first (§7 item 2):
+> If the previous run was example 4, clear the compile caches first (§8.7 item 2):
 > `docker exec lumenrl-release bash -lc 'rm -rf /tmp/aiter_configs /tmp/atom_torch_compile_cache /tmp/torchinductor_root'`
 
 ```bash
@@ -1009,7 +1033,7 @@ docker exec \
 ```
 
 
-## Appendix B: running on a gated or scheduler-managed cluster
+## 8.11 Running on a gated or scheduler-managed cluster
 
 The commands above assume you can type directly on the GPU host. The cluster this
 release was actually validated on (Crusoe m2m plus the spur scheduler) does not work
@@ -1055,27 +1079,27 @@ spur exec <JobID> bash -lc '
   DATA_ROOT=/path/to/data bash release/run_example.sh 1 --longrun --detach'
 ```
 
-then **poll the log file size** for liveness (`pgrep` does not work, §7 item 3):
+then **poll the log file size** for liveness (`pgrep` does not work, §8.7 item 3):
 
 ```bash
 spur exec <JobID> bash -lc 'ls -l /path/to/data/logs/example-1-*.log'
 ```
 
 **4. Do not leave a long job in `exec`'s foreground.** When the client disconnects
-the process is killed, leaving an orphan container holding VRAM — exactly what §4.4
+the process is killed, leaving an orphan container holding VRAM — exactly what §8.4.4
 step 1 has to clean up. Either use `--detach`, or put the launcher itself into the
 background on the node with `setsid nohup ... &`.
 
-**5. The conflict between `docker restart` and `--detach`** is §7 item 4: the
+**5. The conflict between `docker restart` and `--detach`** is §8.7 item 4: the
 launcher probes whether the previous log is still growing before deciding to refuse
 or restart.
 
-**6. Running appendix A's manual commands inside `spur exec`.** Every block in
-appendix A ends with `bash -lc 'bash /opt/lumenrl/…/run_dapo.sh'`, in single quotes,
+**6. Running the manual commands of §8.10 inside `spur exec`.** Every block there
+ends with `bash -lc 'bash /opt/lumenrl/…/run_dapo.sh'`, in single quotes,
 while item 1 above wants the whole thing wrapped in
 `spur exec <JobID> bash -lc '…'`, also in single quotes. **Nesting two layers of
 single quotes breaks at the first `'`.** The form that works is to make the **outer**
-layer double-quoted and leave appendix A's inner single quotes untouched:
+layer double-quoted and leave the inner single quotes untouched:
 
 ```bash
 spur exec <JobID> bash -lc "
@@ -1094,7 +1118,7 @@ spur exec <JobID> bash -lc "
     lumenrl-release bash -lc 'bash /opt/lumenrl/Lumen-RL/examples/DAPO/run_dapo.sh'"
 ```
 
-Compared with appendix A there is **exactly one thing to change**: inside the outer
+Compared with §8.10 there is **exactly one thing to change**: inside the outer
 double quotes, `$DATA_ROOT` must be written `\$DATA_ROOT`, or it expands **on your
 machine** and injects a local path instead of expanding on the node. The other two
 points are "leave it alone":
@@ -1107,7 +1131,7 @@ points are "leave it alone":
 This block was measured on `crsuse2-m2m-v2-035` with `exit=0` (example 1):
 **3m18s for the whole block including the leading `docker restart`, and 2m31s if you
 time only the `docker exec` part.** Both are correct and the difference is the
-restart — the same trap as the 447 s in §4.1, so state what a duration covers when
+restart — the same trap as the 447 s in §8.4.1, so state what a duration covers when
 you quote one.
 
 **If you would rather not deal with the quoting at all**, do not hand-write it:

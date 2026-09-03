@@ -1,7 +1,8 @@
 # LumenRL release validation — 2026-09-03
 
-Every example in [`README.md`](README.md) §2 was run with the exact command the
-README documents. This file is the raw record behind the reference table in §6.1.
+Every example in [`examples/docs/08-release.md`](../examples/docs/08-release.md)
+§8.2 was run with the exact command that chapter documents. This file is the raw
+record behind its §8.6.1 reference table.
 
 ## Environment
 
@@ -63,12 +64,12 @@ returns immediately, so there is no end-to-end timing for it).
 **Conclusion: 17/17 runs exited 0 with zero error lines, and `--check` with the
 final tolerances is 17/17 PASS.**
 
-## Verification pass — reading only the README
+## Verification pass — reading only the release chapter
 
-After the README and the launcher were finished, the node was reset
+After the chapter and the launcher were finished, the node was reset
 (`docker rm -f lumenrl-release`, all 8 cards confirmed back at
 297766912–297832448 B) and example 1 was run using only the three commands in
-README §4.3, with no other knowledge:
+§8.4.3, with no other knowledge:
 
 ```
 export DATA_ROOT=/path/to/data
@@ -90,7 +91,7 @@ Nothing in the run required opening `examples/DAPO/configs/`, reading
 | option | how it was verified |
 |---|---|
 | `--check` / `--check-only` | every row above; 17/17 PASS against the final references |
-| `--dry-run` | generates appendix A of both READMEs |
+| `--dry-run` | generates §8.10 of both language versions |
 | `--detach` | row 1f: returned in 6 s, printed the liveness instructions, finished exit 0 |
 | detach conflict guard | launching example 2 while 1f was running was refused with `A previous run is still writing to ... (0 -> 141 bytes in 10 s)` and exit 1 |
 | cache clearing | rows 5 and 5b, both logged `ATOM precision changed (atomfp8 -> atombf16)` |
@@ -131,12 +132,12 @@ once and inherit example 1's tolerances (same response length).
 `rollout_corr/kl` is deliberately not given a percentage tolerance — across the
 six example-1 runs it deviated by up to ±50% from its own mean (max/min = 2.8x)
 and `ppl_ratio - 1` changed sign. It is checked only for staying within a 10x band.
-Rationale in README §6.2.
+Rationale in §8.6.2.
 
 ## Specific questions this run answered
 
 **Example 4 now works from the documented command on the first try.** The previous
-README implied the example could be reached by changing `MODE`, which fails with
+release README implied the example could be reached by changing `MODE`, which fails with
 `RuntimeError: aot_compile is not supported by the current configuration`. Pairing
 `MODE=atomfp8` with `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` succeeded twice, in
 557 s and 602 s.
@@ -161,7 +162,7 @@ zero `CUDA error` and zero `HSA_STATUS` lines. The failure that comment describe
 specific to ROCm 7.14 / RCCL 2.28.9 / torch 2.12, which is not this image.
 
 **The example-6 `entropy` discrepancy is real variance, not a config mismatch.**
-The previous README listed 1.013 and an earlier evaluation measured 0.630 on what it
+The previous release README listed 1.013 and an earlier evaluation measured 0.630 on what it
 believed was the same example, a 38% gap that looked like either a numerical
 regression or a wrong yaml. Two runs here on
 `dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml` measured **1.03019 and 0.698045**
@@ -170,13 +171,13 @@ config. The same two runs agree to 8% on `k3_kl` and to 0.7% on
 `response_length/mean` (785.0 versus 779.5), and their `filter_groups` first rounds
 kept 11/24 and 12/24 prompt groups. So the instability is specific to `entropy`,
 which is a mean over the 128 sequences that survive filtering on a MoE base model.
-Consequences: example 6's entropy tolerance is ±60%, and README §6.2 states
+Consequences: example 6's entropy tolerance is ±60%, and §8.6.2 states
 explicitly that MoE reproducibility must be judged on `k3_kl` rather than entropy.
 
 ## What was not measured
 
 - **Cold `docker pull` time.** The image was already present on the node, so the
-  README quotes the download size (11.8 GB) rather than a fabricated duration.
+  chapter quotes the download size (11.8 GB) rather than a fabricated duration.
 - **Long runs.** Only the smoke configs were executed. `--longrun` was verified with
   `--dry-run` only: it picks the right yaml, sets `STEPS=1000` and handles the wandb
   key, but no longrun was actually started, so nothing confirms that a
