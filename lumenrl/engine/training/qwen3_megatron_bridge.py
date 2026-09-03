@@ -117,7 +117,11 @@ def hf_to_megatron(
         m["embedding.word_embeddings.weight"] = hf["model.embed_tokens.weight"]
     if is_last_pp:
         m["decoder.final_layernorm.weight"] = hf["model.norm.weight"]
-        m["output_layer.weight"] = hf["lm_head.weight"]
+        # Tied-embedding checkpoints may omit ``lm_head.weight``
+        lm_head = hf.get("lm_head.weight")
+        if lm_head is None:
+           lm_head = hf["model.embed_tokens.weight"]
+        m["output_layer.weight"] = lm_head
 
     is_moe = d.num_experts > 0
     if is_moe:
@@ -237,7 +241,17 @@ def megatron_to_hf(
         yield "model.embed_tokens.weight", get("embedding.word_embeddings.weight")
     if is_last_pp:
         yield "model.norm.weight", get("decoder.final_layernorm.weight")
-        yield "lm_head.weight", get("output_layer.weight")
+        # With share_embeddings_and_output_weights=True (tied-embedding HF
+        # configs) and PP=1, GPTModel never allocates ``output_layer.weight``
+        out_w = md.get("output_layer.weight")
+        if out_w is None:
+            if not is_first_pp:
+                raise KeyError(
+                    "output_layer.weight missing on last PP stage and word "
+                    "embeddings live on another stage; cannot emit lm_head.weight"
+                )
+            out_w = get("embedding.word_embeddings.weight")
+        yield "lm_head.weight", out_w
 
     is_moe = d.num_experts > 0
     if is_moe:
