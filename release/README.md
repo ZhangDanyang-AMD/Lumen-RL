@@ -562,7 +562,7 @@ one of them and the table no longer applies):
 
 | # | config (`examples/DAPO/configs/`) | steps | resp | end-to-end wall clock | `rollout_corr/k3_kl` | `entropy` | `rollout_corr/kl` (signed) | runs |
 |---|---|---|---|---|---|---|---|---|
-| 1 | `dapo_qwen3_8b_ray_vllm_smoke.yaml` | 3 | 512 | 156–190 s | **0.00109** ±30% | **0.603** ±25% | 0.00097 | 5 |
+| 1 | `dapo_qwen3_8b_ray_vllm_smoke.yaml` | 3 | 512 | 156–190 s | **0.00109** ±30% | **0.609** ±25% | 0.00094 | 6 |
 | 2 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` | 3 | 512 | 166 s | **0.00469** ±30% | **0.789** ±25% | 0.00468 | 1 |
 | 3 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` (`TRAIN_FP8=1`) | 3 | 512 | 176 s | **0.00410** ±30% | **0.812** ±25% | 0.00412 | 1 |
 | 4 | `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` | 3 | 4096 | 557–602 s | **0.00286** ±50% | **0.597** ±50% | 0.00268 | 3 |
@@ -575,24 +575,24 @@ reference is the **mean** over the number of runs in the `runs` column, and the
 tolerances are derived in §6.2. `rollout_corr/kl` is checked by order of magnitude
 only, so it carries no percentage tolerance. "End-to-end wall clock" includes the
 container restart and preflight, i.e. it is what `run_example.sh` reports.
-Across all 16 runs the **exit code was 0 every time**, the counts of
+Across all 17 runs the **exit code was 0 every time**, the counts of
 `Traceback` / `OutOfMemory` / `CUDA error` / `HSA_STATUS` were **all zero**, and
-`--check` with the tolerances above is **16/16 PASS**.
+`--check` with the tolerances above is **17/17 PASS**.
 The raw per-run record is in [`VALIDATION-20260903.md`](VALIDATION-20260903.md).
 
 ### 6.2 How to use this table (important)
 
 **`rollout_corr/kl` cannot be used as a reproducibility criterion.** It is the
 **signed** token mean of `(rollout_logp - train_logp)`, so symmetric disagreement
-cancels inside it and what is left is mostly noise. Running **example 1 five times**
+cancels inside it and what is left is mostly noise. Running **example 1 six times**
 with the same command and the same `seed=10086` measured:
 
-| | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 | max deviation from the mean |
-|---|---|---|---|---|---|---|
-| `rollout_corr/kl` | 0.00122282 | 0.00046895 | 0.00110177 | 0.000748721 | 0.00133158 | **±52%**, max/min = 2.8x |
-| `rollout_corr/ppl_ratio` | 1.00109 | 0.999031 | 1.00072 | 1.00106 | 1.00193 | **the deviation from 1 flipped sign** |
-| `rollout_corr/k3_kl` | 0.00110339 | 0.00117701 | 0.00105992 | 0.00110719 | 0.000994479 | ±9% |
-| `entropy` | 0.635074 | 0.623073 | 0.591768 | 0.605645 | 0.560073 | ±7% |
+| | 1 | 2 | 3 | 4 | 5 | 6 | max deviation from the mean |
+|---|---|---|---|---|---|---|---|
+| `rollout_corr/kl` | 0.00122282 | 0.00046895 | 0.00110177 | 0.000748721 | 0.00133158 | 0.000786981 | **±50%**, max/min = 2.8x |
+| `rollout_corr/ppl_ratio` | 1.00109 | 0.999031 | 1.00072 | 1.00106 | 1.00193 | 1.0015 | **the deviation from 1 flipped sign** |
+| `rollout_corr/k3_kl` | 0.00110339 | 0.00117701 | 0.00105992 | 0.00110719 | 0.000994479 | 0.00107888 | ±9% |
+| `entropy` | 0.635074 | 0.623073 | 0.591768 | 0.605645 | 0.560073 | 0.636252 | ±8% |
 
 The jitter comes from the rollout side: vLLM and ATOM batch continuously and batch
 composition differs between runs, which `seed` does not pin down. **It grows with
@@ -601,7 +601,7 @@ different set of prompts. Maximum deviation from the mean, measured per example:
 
 | example | resp | runs | `k3_kl` | `entropy` |
 |---|---|---|---|---|
-| 1 | 512 | 5 | ±9% | ±7% |
+| 1 | 512 | 6 | ±9% | ±8% |
 | 4 | 4096 | 3 | ±17% | ±16% |
 | 5 | 4096 | 2 | ±4% | ±4% |
 | 6 | 4096 | 2 | ±8% | **±19%** |
@@ -625,7 +625,7 @@ Hence the criteria:
   per-prompt spread is large, so it moves more than anything else.
   **Judge MoE reproducibility on `k3_kl`, not on entropy.**
 - All tolerances are about 3x the measured maximum deviation, to allow for the
-  underestimate that comes from having only 2–5 samples.
+  underestimate that comes from having only 2–6 samples.
 - **`rollout_corr/kl` is only checked by order of magnitude**: `--check` verifies
   that the measured absolute value lies between **1/10 and 10 times** the
   reference. **One order of magnitude above the reference is what counts as bad**,

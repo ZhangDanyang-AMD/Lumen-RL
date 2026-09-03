@@ -514,7 +514,7 @@ AttributeError: module 'aiter.jit.module_aiter_core' has no attribute 'MlaVersio
 
 | # | config（`examples/DAPO/configs/`） | steps | resp | 端到端墙钟 | `rollout_corr/k3_kl` | `entropy` | `rollout_corr/kl`（有符号） | 实测次数 |
 |---|---|---|---|---|---|---|---|---|
-| 1 | `dapo_qwen3_8b_ray_vllm_smoke.yaml` | 3 | 512 | 156–190 s | **0.00109** ±30% | **0.603** ±25% | 0.00097 | 5 |
+| 1 | `dapo_qwen3_8b_ray_vllm_smoke.yaml` | 3 | 512 | 156–190 s | **0.00109** ±30% | **0.609** ±25% | 0.00094 | 6 |
 | 2 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` | 3 | 512 | 166 s | **0.00469** ±30% | **0.789** ±25% | 0.00468 | 1 |
 | 3 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml`（`TRAIN_FP8=1`） | 3 | 512 | 176 s | **0.00410** ±30% | **0.812** ±25% | 0.00412 | 1 |
 | 4 | `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` | 3 | 4096 | 557–602 s | **0.00286** ±50% | **0.597** ±50% | 0.00268 | 3 |
@@ -525,22 +525,22 @@ AttributeError: module 'aiter.jit.module_aiter_core' has no attribute 'MlaVersio
 粗体两列带容差的就是 `--check` 判 PASS/FAIL 的两项，参考值是「实测次数」列那么多遍的**均值**，
 容差的来历见 §6.2。`rollout_corr/kl` 一列只做数量级判据，不给百分比容差。
 「端到端墙钟」含容器重启和预检，即 `run_example.sh` 自己报的耗时。
-一共 16 次运行，**退出码全部为 0**，`Traceback` / `OutOfMemory` / `CUDA error` / `HSA_STATUS`
-计数**全部为 0**，用上表容差 `--check` **16/16 全部 PASS**。
+一共 17 次运行，**退出码全部为 0**，`Traceback` / `OutOfMemory` / `CUDA error` / `HSA_STATUS`
+计数**全部为 0**，用上表容差 `--check` **17/17 全部 PASS**。
 每一次运行的完整原始记录在 [`VALIDATION-20260903.md`](VALIDATION-20260903.md)。
 
 ### 6.2 怎么用这张表（重要）
 
 **`rollout_corr/kl` 不能当复现判据。** 它是 `(rollout_logp - train_logp)` 的
 **有符号** token 均值，对称的分歧在里面会互相抵消，剩下的基本是噪声。
-用同一条命令、同一个 `seed=10086` 把**例子 1 跑五遍**，实测：
+用同一条命令、同一个 `seed=10086` 把**例子 1 跑六遍**，实测：
 
-| | 第 1 遍 | 第 2 遍 | 第 3 遍 | 第 4 遍 | 第 5 遍 | 相对均值最大偏差 |
-|---|---|---|---|---|---|---|
-| `rollout_corr/kl` | 0.00122282 | 0.00046895 | 0.00110177 | 0.000748721 | 0.00133158 | **±52%**，最大与最小差 2.8 倍 |
-| `rollout_corr/ppl_ratio` | 1.00109 | 0.999031 | 1.00072 | 1.00106 | 1.00193 | **偏离 1 的方向翻过符号** |
-| `rollout_corr/k3_kl` | 0.00110339 | 0.00117701 | 0.00105992 | 0.00110719 | 0.000994479 | ±9% |
-| `entropy` | 0.635074 | 0.623073 | 0.591768 | 0.605645 | 0.560073 | ±7% |
+| | 1 | 2 | 3 | 4 | 5 | 6 | 相对均值最大偏差 |
+|---|---|---|---|---|---|---|---|
+| `rollout_corr/kl` | 0.00122282 | 0.00046895 | 0.00110177 | 0.000748721 | 0.00133158 | 0.000786981 | **±50%**，最大与最小差 2.8 倍 |
+| `rollout_corr/ppl_ratio` | 1.00109 | 0.999031 | 1.00072 | 1.00106 | 1.00193 | 1.0015 | **偏离 1 的方向翻过符号** |
+| `rollout_corr/k3_kl` | 0.00110339 | 0.00117701 | 0.00105992 | 0.00110719 | 0.000994479 | 0.00107888 | ±9% |
+| `entropy` | 0.635074 | 0.623073 | 0.591768 | 0.605645 | 0.560073 | 0.636252 | ±8% |
 
 抖动来源在 rollout 侧：vLLM / ATOM 连续批处理每次分批不同，`seed` 固定不了这一层。
 **response 越长抖得越厉害**，因为动态采样（`filter_groups`）会因此选出明显不同的一批 prompt。
@@ -548,7 +548,7 @@ AttributeError: module 'aiter.jit.module_aiter_core' has no attribute 'MlaVersio
 
 | 例子 | resp | 实测次数 | `k3_kl` | `entropy` |
 |---|---|---|---|---|
-| 1 | 512 | 5 | ±9% | ±7% |
+| 1 | 512 | 6 | ±9% | ±8% |
 | 4 | 4096 | 3 | ±17% | ±16% |
 | 5 | 4096 | 2 | ±4% | ±4% |
 | 6 | 4096 | 2 | ±8% | **±19%** |
@@ -567,7 +567,7 @@ AttributeError: module 'aiter.jit.module_aiter_core' has no attribute 'MlaVersio
   而同两遍的 `k3_kl` 只差 8%、`response_length/mean` 只差 0.7%（785.0 / 779.5）。
   entropy 是在 `filter_groups` 筛完后那 128 条序列上取的均值，MoE 上逐 prompt 差异很大，
   所以它抖得比什么都厉害。**判 MoE 复现看 `k3_kl`，不要看 entropy。**
-- 容差都按「实测最大偏差的约 3 倍」取，留出样本只有 2–5 次导致的低估。
+- 容差都按「实测最大偏差的约 3 倍」取，留出样本只有 2–6 次导致的低估。
 - **`rollout_corr/kl` 只做数量级判据**：`--check` 检查 |实测| 落在
   参考值的 **1/10 到 10 倍**之间。**高出一个数量级才算坏**，
   最常见的原因是某一侧没开 model-sensitive RMSNorm。

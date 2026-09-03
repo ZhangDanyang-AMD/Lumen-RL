@@ -13,7 +13,7 @@ README documents. This file is the raw record behind the reference table in §6.
 | Launcher | `release/run_example.sh <N> --check --log <path>` |
 | `DATA_ROOT` | `/home/xysheng/rl_data` |
 | Seed | `10086` (hardcoded in `run_dapo.sh`) |
-| Date | 2026-09-03, 03:28–05:53 UTC |
+| Date | 2026-09-03, 03:28–06:04 UTC |
 
 Software stack as reported by the container:
 `vllm 0.23.0`, `flydsl 0.3.2`, `transformers 5.12.0`, `aiter` resolving to
@@ -49,17 +49,19 @@ the metric check. `errors` is the combined count of `Traceback`, `OutOfMemory`,
 | 6b | 6 | `dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml` | 3 | 4096 | 0 | 526 s | 557 s | 0.00141876 | 0.698045 | 0.00175837 | 1.00214 | 779.46 | 115.89 s | 0 |
 | 7b | 7 | `dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml` | 3 | 4096 | 0 | 498 s | 532 s | 0.00160584 | 0.548498 | 0.00169583 | 1.00323 | 750.07 | 110.31 s | 0 |
 | 1e | 1 | `dapo_qwen3_8b_ray_vllm_smoke.yaml` | 3 | 512 | 0 | 136 s | 156 s | 0.000994479 | 0.560073 | 0.00133158 | 1.00193 | 402.81 | 34.40 s | 0 |
+| 1f | 1 | `dapo_qwen3_8b_ray_vllm_smoke.yaml`, `--detach` | 3 | 512 | 0 | 171 s | n/a | 0.00107888 | 0.636252 | 0.000786981 | 1.0015 | 392.23 | 40.19 s | 0 |
 
 Run 1a was executed as the hand-written `docker exec` command of appendix A against
-a container started by hand; 1b through 1e went through the launcher. All five carry
+a container started by hand; 1b through 1f went through the launcher. All six carry
 identical parameters. 1a and 1b predate the driver that recorded launcher timings,
 hence the two `n/a` cells.
 
-Rows 1d and 4c–7b are the verification pass described below; row 1e is a final
-regression run of the launcher after its last edit.
+Rows 1d and 4c–7b are the verification pass described below; 1e is a regression
+run of the launcher after its last edit, and 1f exercises `--detach` (the launcher
+returns immediately, so there is no end-to-end timing for it).
 
-**Conclusion: 16/16 runs exited 0 with zero error lines, and `--check` with the
-final tolerances is 16/16 PASS.**
+**Conclusion: 17/17 runs exited 0 with zero error lines, and `--check` with the
+final tolerances is 17/17 PASS.**
 
 ## Verification pass — reading only the README
 
@@ -83,11 +85,25 @@ Examples 4, 5, 6 and 7 were then re-run back to back through the launcher
 Nothing in the run required opening `examples/DAPO/configs/`, reading
 `run_dapo.sh`, or supplying a parameter from experience.
 
+### Launcher options exercised
+
+| option | how it was verified |
+|---|---|
+| `--check` / `--check-only` | every row above; 17/17 PASS against the final references |
+| `--dry-run` | generates appendix A of both READMEs |
+| `--detach` | row 1f: returned in 6 s, printed the liveness instructions, finished exit 0 |
+| detach conflict guard | launching example 2 while 1f was running was refused with `A previous run is still writing to ... (0 -> 141 bytes in 10 s)` and exit 1 |
+| cache clearing | rows 5 and 5b, both logged `ATOM precision changed (atomfp8 -> atombf16)` |
+| node-clean gate | reported `0/8 cards busy, peak 0.3 GB in use` on every run |
+| container creation vs restart | `created` on rows 1d and 1f, `restarted` on the others |
+| invalid example number | `run_example.sh 9` exits 2 with `'9' is not a valid example number` |
+| `--longrun` | **dry-run only** (see below): selects the longrun yaml, sets `STEPS=1000`, and appends `logger.wandb_enabled=false` when `WANDB_API_KEY` is unset |
+
 ## Derived reference values and tolerances
 
 | ex | runs | reference `k3_kl` | reference `entropy` | reference `kl` |
 |---|---|---|---|---|
-| 1 | 5 (1a–1e) | 0.00109 | 0.603 | 0.00097 |
+| 1 | 6 (1a–1f) | 0.00109 | 0.609 | 0.00094 |
 | 2 | 1 | 0.00469 | 0.789 | 0.00468 |
 | 3 | 1 | 0.00410 | 0.812 | 0.00412 |
 | 4 | 3 (4a–4c) | 0.00286 | 0.597 | 0.00268 |
@@ -100,7 +116,7 @@ single run from its mean, and the tolerance derived from it:
 
 | ex | resp | runs | `k3_kl` observed | `entropy` observed | `k3_kl` tolerance | `entropy` tolerance |
 |---|---|---|---|---|---|---|
-| 1 | 512 | 5 | ±9% | ±7% | ±30% | ±25% |
+| 1 | 512 | 6 | ±9% | ±8% | ±30% | ±25% |
 | 2 | 512 | 1 | — | — | ±30% | ±25% |
 | 3 | 512 | 1 | — | — | ±30% | ±25% |
 | 4 | 4096 | 3 | ±17% | ±16% | ±50% | ±50% |
@@ -109,11 +125,11 @@ single run from its mean, and the tolerance derived from it:
 | 7 | 4096 | 2 | ±2% | ±16% | ±50% | ±60% |
 
 Tolerances are approximately 3x the observed maximum deviation, floored per group,
-because 2–5 samples underestimate the true spread. Examples 2 and 3 were measured
+because 2–6 samples underestimate the true spread. Examples 2 and 3 were measured
 once and inherit example 1's tolerances (same response length).
 
 `rollout_corr/kl` is deliberately not given a percentage tolerance — across the
-five example-1 runs it deviated by up to ±52% from its own mean (max/min = 2.8x)
+six example-1 runs it deviated by up to ±50% from its own mean (max/min = 2.8x)
 and `ppl_ratio - 1` changed sign. It is checked only for staying within a 10x band.
 Rationale in README §6.2.
 
@@ -161,9 +177,14 @@ explicitly that MoE reproducibility must be judged on `k3_kl` rather than entrop
 
 - **Cold `docker pull` time.** The image was already present on the node, so the
   README quotes the download size (11.8 GB) rather than a fabricated duration.
-- **Long runs.** Only the smoke configs were executed. `--longrun` is documented and
-  the wandb handling is implemented, but no multi-hour run was completed here, so
-  no longrun metrics appear in the reference table.
+- **Long runs.** Only the smoke configs were executed. `--longrun` was verified with
+  `--dry-run` only: it picks the right yaml, sets `STEPS=1000` and handles the wandb
+  key, but no longrun was actually started, so nothing confirms that a
+  20480-token config trains to completion on this image and no longrun metrics
+  appear in the reference table.
+- **Logging to a real wandb project.** The no-key path is exercised; the
+  `WANDB_API_KEY` path was only checked to the point of being passed into the
+  container.
 - **gfx942.** This image is gfx950-only by construction and was not tried elsewhere.
 - **Independent jitter estimates for examples 2 and 3** (one sample each); their
   tolerances are inherited from example 1 rather than measured.

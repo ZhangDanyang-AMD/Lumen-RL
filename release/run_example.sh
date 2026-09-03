@@ -45,10 +45,10 @@ IDLE_VRAM_BYTES=2147483648
 #
 # Why k3_kl and not kl: `rollout_corr/kl` is a SIGNED token mean of
 # (rollout_logp - train_logp). Symmetric disagreement cancels inside it, so it
-# is noise around zero — five runs of example 1 with the same seed spread it by
-# +-52% around its own mean, and the sign of ppl_ratio-1 flipped between them.
+# is noise around zero — six runs of example 1 with the same seed spread it by
+# +-50% around its own mean, and the sign of ppl_ratio-1 flipped between them.
 # `k3_kl` is the non-negative k3 estimator of the same gap and stayed within 9%
-# of its mean over those same five runs. So k3_kl and entropy carry
+# of its mean over those same six runs. So k3_kl and entropy carry
 # the tolerances; kl is only checked for staying inside a 10x band, which is
 # the actual published criterion ("one order of magnitude above is bad").
 #
@@ -57,7 +57,7 @@ IDLE_VRAM_BYTES=2147483648
 # visibly different batch each time. Measured maximum deviation from the mean,
 # over the runs recorded in release/VALIDATION-20260903.md:
 #
-#   example 1 (512,  5 runs):  k3_kl +-9%,  entropy +-7%
+#   example 1 (512,  6 runs):  k3_kl +-9%,  entropy +-8%
 #   example 4 (4096, 3 runs):  k3_kl +-17%, entropy +-16%
 #   example 5 (4096, 2 runs):  k3_kl +-4%,  entropy +-4%
 #   example 6 (4096, 2 runs):  k3_kl +-8%,  entropy +-19%
@@ -72,7 +72,7 @@ IDLE_VRAM_BYTES=2147483648
 # Reference values: see release/README.md §6. Every number was measured on
 # 8x MI355X with this script; "na" means not measured.
 declare -A EX
-EX[1]='8B BF16 baseline|bf16|0|dapo_qwen3_8b_ray_vllm_smoke.yaml|dapo_qwen3_8b_ray_vllm_longrun.yaml|3|Qwen3-8B-Base||512|0.00109|0.603|0.00097|0.30|0.25'
+EX[1]='8B BF16 baseline|bf16|0|dapo_qwen3_8b_ray_vllm_smoke.yaml|dapo_qwen3_8b_ray_vllm_longrun.yaml|3|Qwen3-8B-Base||512|0.00109|0.609|0.00094|0.30|0.25'
 EX[2]='8B FP8 rollout|fp8|0|dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml|dapo_qwen3_8b_ray_vllm_fp8_longrun.yaml|3|Qwen3-8B-Base||512|0.00469|0.789|0.00468|0.30|0.25'
 EX[3]='8B FP8 end-to-end|fp8|1|dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml|dapo_qwen3_8b_ray_vllm_fp8_longrun.yaml|3|Qwen3-8B-Base||512|0.00410|0.812|0.00412|0.30|0.25'
 EX[4]='8B ATOM FP8|atomfp8|1|dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml|dapo_qwen3_8b_ray_atom_fp8_longrun.yaml|3|Qwen3-8B-Base||4096|0.00286|0.597|0.00268|0.50|0.50'
@@ -188,6 +188,9 @@ TOL_ENT="$(field "$N" 14)"
 if [ "$LONGRUN" = 1 ]; then
   CONFIG="$CFG_DIR/$CFG_LONG"
   STEPS="${STEPS:-1000}"
+  # The RESP_LEN column describes the smoke config; every longrun config is
+  # 20480 except example 7's, which stays at 4096.
+  [ "$N" = 7 ] || RESP_LEN=20480
 else
   CONFIG="$CFG_DIR/$CFG_SMOKE"
   STEPS="${STEPS:-$DEF_STEPS}"
