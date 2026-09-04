@@ -16,7 +16,7 @@ models, or run two nodes (example 8, see [chapter 7](07-disaggregated-rdma.md)).
 
 ```bash
 export DATA_ROOT=/path/to/data
-docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260902
+docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260904
 bash release/run_example.sh 1 --check
 ```
 
@@ -45,7 +45,7 @@ spends no time compiling them:
 
 ```bash
 docker run --rm --entrypoint /bin/bash \
-  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260902 \
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260904 \
   -lc 'ls /opt/lumenrl/aiter-jit/*.so | wc -l'     # 16
 ```
 
@@ -56,7 +56,7 @@ upgraded independently**.
 
 | Component | Repository | Branch | Commit |
 |---|---|---|---|
-| Lumen-RL | `ZhangDanyang-AMD/Lumen-RL` | `dev/dsv4-dapo` | `6957ee9c1c79` |
+| Lumen-RL | `ZhangDanyang-AMD/Lumen-RL` | `dev/dapo_release` | `1cd932aa5519` |
 | Lumen | `ZhangDanyang-AMD/Lumen` | `amd-atom-rollout` | `e6379cbd9057` |
 | aiter | `ZhangDanyang-AMD/aiter` | `lumen/moe` | `4ebe6d69c7f4` |
 | ATOM | `xysheng-AMD/ATOM` | `lumen-rl` | `7173f5b8f758` |
@@ -155,7 +155,11 @@ any order.
 | Image download size (compressed layers) | **11.8 GB** |
 | Image unpacked on disk | **47.3 GB** |
 | of which shared with `vllm/vllm-openai-rocm:v0.23.0` | 46.69 GB |
-| unique to this image | 603.4 MB |
+| unique to this image | 603.2 MB |
+
+The compressed-layer row was measured on the `260902` image. `260904` shares 46.69 GB
+of layers with it and differs only in the final one (603.2 MB unpacked), so the download
+size is effectively the same.
 
 **Recommended budget**: 60 GB for the image (47.3 GB unpacked plus 11.8 GB of
 compressed layers retained in the content store) plus 74 GB of models and data, so
@@ -202,7 +206,7 @@ start if any card is above 2 GB and prints what to do about it; `--force` skips 
 ### 8.4.2 Get the image
 
 ```bash
-docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260902
+docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260904
 ```
 
 You can also build it yourself; these are all the steps:
@@ -302,7 +306,7 @@ docker run -d --name lumenrl-release \
   --device=/dev/kfd --device=/dev/dri --group-add=video \
   --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --shm-size 64G \
   -v "$DATA_ROOT":"$DATA_ROOT" -e DATA_ROOT="$DATA_ROOT" \
-  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260902 sleep infinity
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260904 sleep infinity
 ```
 
 Log paths are fixed:
@@ -336,7 +340,7 @@ To run your own code against the image (all four source trees are editable insta
 ```bash
 docker run -d --name lumenrl-dev ... \
   -v "$PWD/Lumen-RL":/opt/lumenrl/Lumen-RL \
-  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260902 sleep infinity
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260904 sleep infinity
 ```
 
 then `CONTAINER=lumenrl-dev bash release/run_example.sh <N>`.
@@ -420,25 +424,26 @@ bash release/run_example.sh 1 --check-only --log $DATA_ROOT/logs/example-1-xxx.l
 ### 8.5.1 Reference values
 
 **Measurement conditions**: 8x MI355X (gfx950), image
-`dapo-gfx950-rocm7.2.3-260902`, the command being `bash release/run_example.sh <N>`
+`dapo-gfx950-rocm7.2.3-260904`, the command being `bash release/run_example.sh <N>`
 (equivalent to a full row of §8.2.2), **`seed=10086`** (fixed inside `run_dapo.sh`), and
 metrics read at **step 1** (`step=1`).
 
 | # | config (`examples/DAPO/configs/`) | steps | resp | end-to-end wall clock | `rollout_corr/k3_kl` | `entropy` | `rollout_corr/kl` (signed) | runs |
 |---|---|---|---|---|---|---|---|---|
-| 1 | `dapo_qwen3_8b_ray_vllm_smoke.yaml` | 3 | 512 | 156–190 s | **0.00109** ±30% | **0.609** ±25% | 0.00094 | 6 |
-| 2 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` | 3 | 512 | 166 s | **0.00469** ±30% | **0.789** ±25% | 0.00468 | 1 |
-| 3 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` (`TRAIN_FP8=1`) | 3 | 512 | 176 s | **0.00410** ±30% | **0.812** ±25% | 0.00412 | 1 |
-| 4 | `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` | 3 | 4096 | 557–602 s | **0.00286** ±50% | **0.597** ±50% | 0.00268 | 3 |
-| 5 | `dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml` | 1 | 4096 | 472 s | **0.000988** ±50% | **0.641** ±50% | 0.000821 | 2 |
-| 6 | `dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml` | 3 | 4096 | 552–557 s | **0.00154** ±50% | **0.864** ±60% | 0.00178 | 2 |
-| 7 | `dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml` | 3 | 4096 | 526–532 s | **0.00157** ±50% | **0.655** ±60% | 0.00166 | 2 |
+| 1 | `dapo_qwen3_8b_ray_vllm_smoke.yaml` | 3 | 512 | 156–196 s | **0.00108** ±30% | **0.605** ±25% | 0.000973 | 7 |
+| 2 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` | 3 | 512 | 165–166 s | **0.00498** ±30% | **0.796** ±25% | 0.00502 | 2 |
+| 3 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` (`TRAIN_FP8=1`) | 3 | 512 | 171–176 s | **0.00392** ±30% | **0.817** ±25% | 0.00382 | 2 |
+| 4 | `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` | 3 | 4096 | 522–602 s | **0.00287** ±50% | **0.600** ±50% | 0.00270 | 6 |
+| 5 | `dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml` | 1 | 4096 | 422–472 s | **0.000974** ±50% | **0.677** ±65% | 0.000852 | 5 |
+| 6 | `dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml` | 3 | 4096 | 552–557 s | **0.00149** ±50% | **0.766** ±60% | 0.00164 | 3 |
+| 7 | `dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml` | 3 | 4096 | 526–537 s | **0.00151** ±50% | **0.662** ±60% | 0.00151 | 3 |
 
 The two bold columns with tolerances are what `--check` turns into PASS / FAIL; each
-reference is the mean over the number of runs in the `runs` column. Across 17 runs the
+reference is the mean over the number of runs in the `runs` column. Across 28 runs the
 **exit code was 0 every time**, all four error counts were **zero**, and `--check` is
-**17/17 PASS**. The per-run record is in
-[`VALIDATION-20260903.md`](../../release/VALIDATION-20260903.md).
+**28/28 PASS**. The per-run record is in
+[`VALIDATION-20260903.md`](../../release/VALIDATION-20260903.md) and
+[`VALIDATION-20260904.md`](../../release/VALIDATION-20260904.md).
 
 **The wall-clock column carries no tolerance and is not part of the verdict**: it is
 dominated by how warm the kernel caches are and has been measured up to ±15% off on the
@@ -452,10 +457,12 @@ same machine with the same image. Read it as a rough duration only.
   between positive and negative contributions, and the most stable number in the table
   (worst measured deviation across all seven examples is ±17%).
 - **`entropy` is the secondary criterion**, with a tolerance of ±25% for the 512 group,
-  ±50% for the ATOM 4096 pair (examples 4/5) and ±60% for the MoE pair (examples 6/7).
+  ±50% for example 4, ±65% for example 5 and ±60% for the MoE pair (examples 6/7).
   It is a mean over the batch that survives `filter_groups`, so the sample is small and
-  the variance high — **especially on MoE, where it was measured between 0.698 and
-  1.030** — which is why MoE reproducibility should be judged on `k3_kl`.
+  the variance high — **especially on MoE, where it was measured between 0.569 and
+  1.030** — which is why MoE reproducibility should be judged on `k3_kl`. Example 5's
+  ±65% is the one tolerance that had to be widened: ±50% did not cover its own samples
+  once five of them existed.
 - **`rollout_corr/kl` is only an order-of-magnitude criterion.** It is a signed mean, so
   symmetric disagreement cancels inside it and repeated runs of the same command can
   differ by 2.8x; only the absolute value is checked, against a band from one tenth to
@@ -464,10 +471,10 @@ same machine with the same image. Read it as a rough duration only.
   side.
 - **`rollout_corr/ppl_ratio` is informational** and not part of the verdict.
 
-The two BF16 rollouts (0.00109 for example 1, 0.000988 for example 5) sit around 1e-3;
-the three FP8 ones (0.00469, 0.00410, 0.00286) are 3–4x larger, which is the price of
-quantization and is expected. The two MoE runs (0.00154, 0.00157) fall in between, and
-FSDP2 versus Megatron differ by only 2%, so changing the training backend introduces no
+The two BF16 rollouts (0.00108 for example 1, 0.000974 for example 5) sit around 1e-3;
+the three FP8 ones (0.00498, 0.00392, 0.00287) are 3–4x larger, which is the price of
+quantization and is expected. The two MoE runs (0.00149, 0.00151) fall in between, and
+FSDP2 versus Megatron differ by only 1%, so changing the training backend introduces no
 additional train/rollout drift.
 
 > When the numbers do not match, **first confirm you ran the same config**:

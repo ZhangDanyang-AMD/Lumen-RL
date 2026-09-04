@@ -14,7 +14,7 @@
 
 ```bash
 export DATA_ROOT=/path/to/data
-docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260902
+docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260904
 bash release/run_example.sh 1 --check
 ```
 
@@ -41,7 +41,7 @@ overlong 奖励缓冲、TIS rollout 修正。
 
 ```bash
 docker run --rm --entrypoint /bin/bash \
-  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260902 \
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260904 \
   -lc 'ls /opt/lumenrl/aiter-jit/*.so | wc -l'     # 16
 ```
 
@@ -51,7 +51,7 @@ docker run --rm --entrypoint /bin/bash \
 
 | 组件 | 仓库 | 分支 | Commit |
 |---|---|---|---|
-| Lumen-RL | `ZhangDanyang-AMD/Lumen-RL` | `dev/dsv4-dapo` | `6957ee9c1c79` |
+| Lumen-RL | `ZhangDanyang-AMD/Lumen-RL` | `dev/dapo_release` | `1cd932aa5519` |
 | Lumen | `ZhangDanyang-AMD/Lumen` | `amd-atom-rollout` | `e6379cbd9057` |
 | aiter | `ZhangDanyang-AMD/aiter` | `lumen/moe` | `4ebe6d69c7f4` |
 | ATOM | `xysheng-AMD/ATOM` | `lumen-rl` | `7173f5b8f758` |
@@ -144,7 +144,10 @@ print(aiter.__file__)"'
 | 镜像下载量（压缩层） | **11.8 GB** |
 | 镜像解包后占盘 | **47.3 GB** |
 | 其中与 `vllm/vllm-openai-rocm:v0.23.0` 共享 | 46.69 GB |
-| 本镜像独有 | 603.4 MB |
+| 本镜像独有 | 603.2 MB |
+
+压缩层那一行测自 `260902` 镜像。`260904` 与它共享 46.69 GB 的层，只有最后一层
+（解包 603.2 MB）不同，下载量的差异可以忽略。
 
 **建议预留**：镜像 60 GB（解包 47.3 GB + 压缩层 11.8 GB 留在 content store）
 + 模型与数据 74 GB ≈ **134 GB**。七个例子都是 smoke，不写 checkpoint。
@@ -187,7 +190,7 @@ rocm-smi --showmeminfo vram | grep -i used      # 宿主机上直接可用
 ### 8.4.2 获取镜像
 
 ```bash
-docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260902
+docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260904
 ```
 
 也可以自行构建，下面就是全部步骤：
@@ -282,7 +285,7 @@ docker run -d --name lumenrl-release \
   --device=/dev/kfd --device=/dev/dri --group-add=video \
   --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --shm-size 64G \
   -v "$DATA_ROOT":"$DATA_ROOT" -e DATA_ROOT="$DATA_ROOT" \
-  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260902 sleep infinity
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260904 sleep infinity
 ```
 
 日志路径固定：
@@ -316,7 +319,7 @@ $DATA_ROOT/logs/example-<N>-<时间戳>.launcher.log  # 包装层输出与退出
 ```bash
 docker run -d --name lumenrl-dev ... \
   -v "$PWD/Lumen-RL":/opt/lumenrl/Lumen-RL \
-  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260902 sleep infinity
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260904 sleep infinity
 ```
 
 然后 `CONTAINER=lumenrl-dev bash release/run_example.sh <N>`。
@@ -393,23 +396,24 @@ bash release/run_example.sh 1 --check-only --log $DATA_ROOT/logs/example-1-xxx.l
 
 ### 8.5.1 参考值表
 
-**测量条件**：8x MI355X（gfx950），镜像 `dapo-gfx950-rocm7.2.3-260902`，
+**测量条件**：8x MI355X（gfx950），镜像 `dapo-gfx950-rocm7.2.3-260904`，
 命令即 `bash release/run_example.sh <N>`（等价于 §8.2.2 的整行参数），
 **`seed=10086`**（`run_dapo.sh` 内固定），取**第 1 步**（`step=1`）的指标。
 
 | # | config（`examples/DAPO/configs/`） | steps | resp | 端到端墙钟 | `rollout_corr/k3_kl` | `entropy` | `rollout_corr/kl`（有符号） | 实测次数 |
 |---|---|---|---|---|---|---|---|---|
-| 1 | `dapo_qwen3_8b_ray_vllm_smoke.yaml` | 3 | 512 | 156–190 s | **0.00109** ±30% | **0.609** ±25% | 0.00094 | 6 |
-| 2 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` | 3 | 512 | 166 s | **0.00469** ±30% | **0.789** ±25% | 0.00468 | 1 |
-| 3 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml`（`TRAIN_FP8=1`） | 3 | 512 | 176 s | **0.00410** ±30% | **0.812** ±25% | 0.00412 | 1 |
-| 4 | `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` | 3 | 4096 | 557–602 s | **0.00286** ±50% | **0.597** ±50% | 0.00268 | 3 |
-| 5 | `dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml` | 1 | 4096 | 472 s | **0.000988** ±50% | **0.641** ±50% | 0.000821 | 2 |
-| 6 | `dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml` | 3 | 4096 | 552–557 s | **0.00154** ±50% | **0.864** ±60% | 0.00178 | 2 |
-| 7 | `dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml` | 3 | 4096 | 526–532 s | **0.00157** ±50% | **0.655** ±60% | 0.00166 | 2 |
+| 1 | `dapo_qwen3_8b_ray_vllm_smoke.yaml` | 3 | 512 | 156–196 s | **0.00108** ±30% | **0.605** ±25% | 0.000973 | 7 |
+| 2 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` | 3 | 512 | 165–166 s | **0.00498** ±30% | **0.796** ±25% | 0.00502 | 2 |
+| 3 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml`（`TRAIN_FP8=1`） | 3 | 512 | 171–176 s | **0.00392** ±30% | **0.817** ±25% | 0.00382 | 2 |
+| 4 | `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` | 3 | 4096 | 522–602 s | **0.00287** ±50% | **0.600** ±50% | 0.00270 | 6 |
+| 5 | `dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml` | 1 | 4096 | 422–472 s | **0.000974** ±50% | **0.677** ±65% | 0.000852 | 5 |
+| 6 | `dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml` | 3 | 4096 | 552–557 s | **0.00149** ±50% | **0.766** ±60% | 0.00164 | 3 |
+| 7 | `dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml` | 3 | 4096 | 526–537 s | **0.00151** ±50% | **0.662** ±60% | 0.00151 | 3 |
 
 粗体两列带容差的即 `--check` 判定 PASS / FAIL 的两项，参考值是「实测次数」列那么多遍的均值。
-共 17 次运行，**退出码全部为 0**，四类错误计数**全部为 0**，`--check` **17/17 PASS**。
-逐次原始记录见 [`VALIDATION-20260903.md`](../../release/VALIDATION-20260903.md)。
+共 28 次运行，**退出码全部为 0**，四类错误计数**全部为 0**，`--check` **28/28 PASS**。
+逐次原始记录见 [`VALIDATION-20260903.md`](../../release/VALIDATION-20260903.md)
+与 [`VALIDATION-20260904.md`](../../release/VALIDATION-20260904.md)。
 
 **端到端墙钟不设容差、不参与判定**：它受 kernel 缓存冷热影响，同一机器同一镜像上偏差可达
 ±15%，只作耗时量级参考。
@@ -419,18 +423,19 @@ bash release/run_example.sh 1 --check-only --log $DATA_ROOT/logs/example-1-xxx.l
 - **`rollout_corr/k3_kl` 是主判据**，容差 512 组（例子 1/2/3）±30%、4096 组（例子 4–7）±50%。
   它是 train / rollout 分布差异的 k3 估计量，非负且不会正负抵消，是全表最稳定的指标
   （七个例子实测最大偏差 ±17%）。
-- **`entropy` 是第二判据**，容差 512 组 ±25%、ATOM 4096 组（例子 4/5）±50%、
+- **`entropy` 是第二判据**，容差 512 组 ±25%、例子 4 ±50%、例子 5 ±65%、
   MoE 4096 组（例子 6/7）±60%。它是 `filter_groups` 筛选后那一批序列上的均值，
-  样本少、方差大，**MoE 上尤其不稳（实测跨度 0.698–1.030）**，
+  样本少、方差大，**MoE 上尤其不稳（实测跨度 0.569–1.030）**，
   所以判 MoE 复现请以 `k3_kl` 为准。
+  例子 5 的 ±65% 是补测到 5 遍后放宽的：原来的 ±50% 覆盖不住它自己的样本。
 - **`rollout_corr/kl` 只作数量级判据**：它是有符号均值，对称分歧会相互抵消，
   同一命令重复运行可相差 2.8 倍，因此只检查实测绝对值是否落在参考值的 1/10–10 倍之间。
   **高出一个数量级才算异常**，最常见原因是某一侧未启用 model-sensitive RMSNorm。
 - **`rollout_corr/ppl_ratio` 仅供参考**，不参与判定。
 
-两个 BF16 rollout（例子 1 的 0.00109、例子 5 的 0.000988）落在 1e-3 附近；
-三个 FP8 的（0.00469 / 0.00410 / 0.00286）是其 3–4 倍，这是量化的代价，属正常。
-两个 MoE（0.00154 / 0.00157）介于两者之间，FSDP2 与 Megatron 仅差 2%，
+两个 BF16 rollout（例子 1 的 0.00108、例子 5 的 0.000974）落在 1e-3 附近；
+三个 FP8 的（0.00498 / 0.00392 / 0.00287）是其 3–4 倍，这是量化的代价，属正常。
+两个 MoE（0.00149 / 0.00151）介于两者之间，FSDP2 与 Megatron 仅差 1%，
 说明更换训练后端未引入额外的 train / rollout 漂移。
 
 > 指标对不上时**先确认跑的是否为同一条 config**：

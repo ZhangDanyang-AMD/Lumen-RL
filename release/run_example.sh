@@ -13,7 +13,7 @@ SCRIPT_NAME="$(basename "$0")"
 # Set DOCKER="sudo docker" if your user is not in the docker group.
 DOCKER_CLI="${DOCKER:-docker}"
 read -r -a DOCKER <<<"$DOCKER_CLI"
-IMAGE="${IMAGE:-zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260902}"
+IMAGE="${IMAGE:-zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260904}"
 CONTAINER="${CONTAINER:-lumenrl-release}"
 RL_ROOT_IN_IMAGE="${RL_ROOT_IN_IMAGE:-/opt/lumenrl}"
 RUN_DAPO="$RL_ROOT_IN_IMAGE/Lumen-RL/examples/DAPO/run_dapo.sh"
@@ -58,30 +58,37 @@ STALL_LIMIT_DEFAULT=2400
 # Why the tolerances differ per example: run-to-run jitter grows with
 # max_response_length, because dynamic sampling (filter_groups) then selects a
 # visibly different batch each time. Measured maximum deviation from the mean,
-# over the runs recorded in release/VALIDATION-20260903.md:
+# pooling the runs in release/VALIDATION-20260903.md and -20260904.md (both
+# images carry identical ATOM / Lumen / aiter / vLLM pins):
 #
-#   example 1 (512,  6 runs):  k3_kl +-9%,  entropy +-8%
-#   example 4 (4096, 3 runs):  k3_kl +-17%, entropy +-16%
-#   example 5 (4096, 2 runs):  k3_kl +-4%,  entropy +-4%
-#   example 6 (4096, 2 runs):  k3_kl +-8%,  entropy +-19%
-#   example 7 (4096, 2 runs):  k3_kl +-2%,  entropy +-16%
+#   example 1 (512,  7 runs):  k3_kl +-8%,  entropy +-7%
+#   example 2 (512,  2 runs):  k3_kl +-6%,  entropy +-1%
+#   example 3 (512,  2 runs):  k3_kl +-5%,  entropy +-1%
+#   example 4 (4096, 6 runs):  k3_kl +-17%, entropy +-17%
+#   example 5 (4096, 5 runs):  k3_kl +-13%, entropy +-21%
+#   example 6 (4096, 3 runs):  k3_kl +-12%, entropy +-35%
+#   example 7 (4096, 3 runs):  k3_kl +-8%,  entropy +-17%
 #
 # Tolerances are ~3x the observed deviation, floored per group: k3_kl 30% at
-# 512 and 50% at 4096; entropy 25% at 512, 50% for the ATOM 4k pair and 60%
-# for the MoE pair. Entropy on a 4k run is therefore only a coarse sanity
-# check -- k3_kl is the metric that actually tracks train/rollout alignment,
-# and it stayed within +-17% everywhere.
+# 512 and 50% at 4096; entropy 25% at 512 and 60% for the MoE pair. Example 5's
+# entropy is the one that needed widening -- 50% did not cover its own five
+# samples once three more were taken, so it is 65%. Entropy on a 4k run is
+# therefore only a coarse sanity check -- k3_kl is the metric that actually
+# tracks train/rollout alignment, and it stayed within +-17% everywhere.
+#
+# Every reference below is the mean over that example's pooled runs, and all 28
+# of them pass against this table.
 #
 # Reference values: see release/README.md §6. Every number was measured on
 # 8x MI355X with this script; "na" means not measured.
 declare -A EX
-EX[1]='8B BF16 baseline|bf16|0|dapo_qwen3_8b_ray_vllm_smoke.yaml|dapo_qwen3_8b_ray_vllm_longrun.yaml|3|Qwen3-8B-Base||512|0.00109|0.609|0.00094|0.30|0.25'
-EX[2]='8B FP8 rollout|fp8|0|dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml|dapo_qwen3_8b_ray_vllm_fp8_longrun.yaml|3|Qwen3-8B-Base||512|0.00469|0.789|0.00468|0.30|0.25'
-EX[3]='8B FP8 end-to-end|fp8|1|dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml|dapo_qwen3_8b_ray_vllm_fp8_longrun.yaml|3|Qwen3-8B-Base||512|0.00410|0.812|0.00412|0.30|0.25'
-EX[4]='8B ATOM FP8|atomfp8|1|dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml|dapo_qwen3_8b_ray_atom_fp8_longrun.yaml|3|Qwen3-8B-Base||4096|0.00286|0.597|0.00268|0.50|0.50'
-EX[5]='8B ATOM BF16|atombf16|0|dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml|dapo_qwen3_8b_ray_atom_bf16_longrun.yaml|1|Qwen3-8B-Base||4096|0.000988|0.641|0.000821|0.50|0.50'
-EX[6]='MoE FSDP2|bf16|0|dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml|dapo_qwen3moe_a3b_ray_vllm_verlref_longrun.yaml|3|Qwen3-30B-A3B-Base|LUMENRL_FP32_MOE_ROUTER=0|4096|0.00154|0.864|0.00178|0.50|0.60'
-EX[7]='MoE Megatron EP=8|bf16|0|dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml|dapo_qwen3moe_a3b_ray_megatron_verlref_4k_longrun.yaml|3|Qwen3-30B-A3B-Base|LUMENRL_FP32_MOE_ROUTER=0|4096|0.00157|0.655|0.00166|0.50|0.60'
+EX[1]='8B BF16 baseline|bf16|0|dapo_qwen3_8b_ray_vllm_smoke.yaml|dapo_qwen3_8b_ray_vllm_longrun.yaml|3|Qwen3-8B-Base||512|0.00108|0.605|0.000973|0.30|0.25'
+EX[2]='8B FP8 rollout|fp8|0|dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml|dapo_qwen3_8b_ray_vllm_fp8_longrun.yaml|3|Qwen3-8B-Base||512|0.00498|0.796|0.00502|0.30|0.25'
+EX[3]='8B FP8 end-to-end|fp8|1|dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml|dapo_qwen3_8b_ray_vllm_fp8_longrun.yaml|3|Qwen3-8B-Base||512|0.00392|0.817|0.00382|0.30|0.25'
+EX[4]='8B ATOM FP8|atomfp8|1|dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml|dapo_qwen3_8b_ray_atom_fp8_longrun.yaml|3|Qwen3-8B-Base||4096|0.00287|0.600|0.00270|0.50|0.50'
+EX[5]='8B ATOM BF16|atombf16|0|dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml|dapo_qwen3_8b_ray_atom_bf16_longrun.yaml|1|Qwen3-8B-Base||4096|0.000974|0.677|0.000852|0.50|0.65'
+EX[6]='MoE FSDP2|bf16|0|dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml|dapo_qwen3moe_a3b_ray_vllm_verlref_longrun.yaml|3|Qwen3-30B-A3B-Base|LUMENRL_FP32_MOE_ROUTER=0|4096|0.00149|0.766|0.00164|0.50|0.60'
+EX[7]='MoE Megatron EP=8|bf16|0|dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml|dapo_qwen3moe_a3b_ray_megatron_verlref_4k_longrun.yaml|3|Qwen3-30B-A3B-Base|LUMENRL_FP32_MOE_ROUTER=0|4096|0.00151|0.662|0.00151|0.50|0.60'
 
 field() { echo "${EX[$1]}" | cut -d'|' -f"$2"; }
 
