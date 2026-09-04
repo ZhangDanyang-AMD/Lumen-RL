@@ -1,0 +1,29 @@
+tasks:
+- id: dense-gemm-fp16
+  type: gemm
+  kernel_path: ../examples/tasks/gemm
+  direction: Optimize all decode and prefill matrix shapes without per-case regressions.
+- id: dense-gemm-fp8
+  type: scaled_quant_gemm
+  kernel_path: ../examples/tasks/gemm_fp8
+  direction: Optimize gfx942 FP8 E4M3 FNUZ A8W8 dense GEMM while preserving per-token FP32 activation scales, per-output-channel FP32 weight scales, FP32 accumulation/scaling, and FP16 output; do not run this case on other architectures.
+- id: dense-gemm-mxfp4
+  type: quant_fp4_mxfp
+  kernel_path: ../examples/tasks/gemm_mxfp4
+  direction: Optimize gfx950-only native MXFP4 dense GEMM while preserving packed E2M1 operands, per-1x32 E8M0 scales, BF16 output, and the no-emulation architecture gate; gfx942 must fail before import or allocation.
+- id: fused-attention-prefill
+  type: fused_attention
+  kernel_path: ../examples/tasks/fused_attention
+  direction: Preserve the full fused softmax(QK^T * scale + mask)V contract.
+- id: grouped-gemm-moe
+  type: grouped_gemm
+  kernel_path: ../examples/tasks/grouped_gemm
+  direction: Preserve variable per-expert routed counts and one grouped launch.
+- id: mi308-gemm-m1-n2048-k4096-fp16
+  type: gemm
+  kernel_path: ../examples/tasks/mi308-gemm-m1-n2048-k4096-fp16
+  direction: 我想在MI308上运行，MNK分别是1/2048/4096
+- id: mi308-gemm-m1234-n1024-k2048-fp16
+  type: gemm
+  kernel_path: ../examples/tasks/mi308-gemm-m1234-n1024-k2048-fp16
+  direction: 在MI308上优化GEMM，MNK分别是1234/1024/2048

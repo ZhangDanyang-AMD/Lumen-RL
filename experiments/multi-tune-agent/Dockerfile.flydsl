@@ -1,0 +1,10 @@
+FROM vllm/vllm-openai-rocm:v0.15.0
+
+ARG FLYDSL_VERSION=0.3.2
+
+RUN python3 -m pip install --no-cache-dir "flydsl==${FLYDSL_VERSION}" \
+    && python3 -c "import flydsl; print('FlyDSL', flydsl.__version__)"
+
+LABEL org.opencontainers.image.title="Lumen-RL MultiTune FlyDSL runtime" \
+      org.opencontainers.image.description="ROCm vLLM runtime with FlyDSL for MultiTune kernel evaluation" \
+      org.opencontainers.image.source="https://github.com/ZhangDanyang-AMD/Lumen-RL"

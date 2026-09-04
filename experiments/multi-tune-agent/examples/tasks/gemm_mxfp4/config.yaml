@@ -1,0 +1,13 @@
+source_file_path:
+  - kernel.py
+target_kernel_functions:
+  - mxfp4_gemm
+compile_command:
+  - docker exec -e HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-0} -w "$PWD" ${GEAK_CONTAINER_NAME:-geak-phase1-vllm} python3 scripts/task_runner.py compile
+correctness_command:
+  - docker exec -e HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-0} -w "$PWD" ${GEAK_CONTAINER_NAME:-geak-phase1-vllm} python3 scripts/task_runner.py correctness
+performance_command:
+  - docker exec -e HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-0} -w "$PWD" ${GEAK_CONTAINER_NAME:-geak-phase1-vllm} python3 scripts/task_runner.py performance
+task_type: aiter2aiter
+prompt:
+  instructions: Optimize only the gfx950 native AITER MXFP4 dense GEMM wrapper/configuration. Preserve the packed E2M1 plus per-1x32 E8M0 contract, BF16 output, hard gfx950 gate, and absence of any emulation fallback.

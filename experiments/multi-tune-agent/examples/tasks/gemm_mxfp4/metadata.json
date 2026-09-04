@@ -1,0 +1,44 @@
+{
+  "name": "gfx950-native-mxfp4-dense-gemm",
+  "operator": "dense_gemm",
+  "format": "mxfp4",
+  "supported_arches": [
+    "gfx950"
+  ],
+  "quant_block": 32,
+  "input_dtype": "packed_e2m1_x2",
+  "weight_dtype": "packed_e2m1_x2",
+  "scale_dtype": "e8m0",
+  "output_dtype": "bfloat16",
+  "operand_contract": {
+    "input": {
+      "logical_shape": "[M, K]",
+      "packed_shape": "[M, K/2]",
+      "packing": "two E2M1 values per byte, low nibble then high nibble",
+      "scales_shape": "[M, K/32]"
+    },
+    "weight": {
+      "logical_shape": "[N, K]",
+      "packed_shape": "[N, K/2]",
+      "packing": "two E2M1 values per byte, low nibble then high nibble",
+      "scales_shape": "[N, K/32]",
+      "gemm_semantics": "weight is transposed by the operator"
+    },
+    "output": {
+      "shape": "[M, N]",
+      "dtype": "bfloat16"
+    }
+  },
+  "production_api": {
+    "quantization": "aiter.ops.quant.quant_mxfp4_hip",
+    "gemm": "aiter.ops.triton.gemm.basic.gemm_afp4wfp4",
+    "native_primitive": "triton.language.dot_scaled with e2m1 operands"
+  },
+  "constraints": {
+    "logical_k_multiple": 32,
+    "rank": 2,
+    "layout": "contiguous row-major packed operands and row-major scales",
+    "fallback": "none",
+    "performance_scope": "native GEMM only; quantization and reference are excluded"
+  }
+}

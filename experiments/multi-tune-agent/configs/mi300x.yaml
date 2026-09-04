@@ -1,0 +1,20 @@
+geak_root: /home/danyzhan/GEAK
+cases_path: ../cases/examples_cases.yaml
+trajectory_root: /home/danyzhan/multi_tune_runs
+base_url: http://127.0.0.1:8000/v1
+model: Qwen/Qwen3-Coder-Next
+gpu_ids: "1"
+
+request_timeout: 600
+command_timeout: 300
+baseline_repeats: 3
+
+max_rounds: 3
+engineers_per_round: 3
+engineer_tool_rounds: 16
+integrator_tool_rounds: 10
+candidate_floor: 1.0
+min_improvement: 0.02
+target_speedup: 1.5
+keep_sessions: true
+

@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Ignore generated tasks while retaining the canonical fixture directories.
+/examples/tasks/*
+!/examples/tasks/gemm/
+!/examples/tasks/gemm/**
+!/examples/tasks/gemm_fp8/
+!/examples/tasks/gemm_fp8/**
+!/examples/tasks/gemm_mxfp4/
+!/examples/tasks/gemm_mxfp4/**
+!/examples/tasks/fused_attention/
+!/examples/tasks/fused_attention/**
+!/examples/tasks/grouped_gemm/
+!/examples/tasks/grouped_gemm/**
