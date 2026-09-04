@@ -271,6 +271,9 @@ PY'
 `release/run_example.sh` 是宿主机侧脚本，负责检查卡是否空闲、管理容器、拼好全部环境变量、
 落地可预测的日志路径，并在跑完后把指标与内置参考值逐项比对。
 
+启动器与本章是同一个提交里的东西，**请用宿主机 `release/` 目录里的那一份**。镜像里也带了一份，
+但它固定在构建镜像所用的提交上，内置参考值可能比本章的表旧。
+
 ```bash
 bash release/run_example.sh <1..7> [选项]
 bash release/run_example.sh --help

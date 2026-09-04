@@ -291,6 +291,10 @@ PY'
 manages the container, assembles every environment variable, writes predictable log
 paths, and after the run compares each metric against built-in reference values.
 
+The launcher and this chapter are versioned together, so **use the copy in the host-side
+`release/` directory**. The image ships one too, but it is fixed at the commit the image
+was built from and its built-in references may predate the table in this chapter.
+
 ```bash
 bash release/run_example.sh <1..7> [options]
 bash release/run_example.sh --help
