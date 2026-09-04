@@ -17,21 +17,35 @@ import requests
 import yaml
 from geak_utils.templates import (
     architecture_for_target,
+    canonical_gemm_template_for_contract,
     get_gemm_template,
     normalize_gemm_format,
     validate_template_target,
+)
+from geak_utils.local_templates import (
+    VerifiedTemplateRecord,
+    find_verified_template,
+    register_verified_template,
 )
 
 from .config import MultiTuneConfig
 from .flow import MultiTuneFlow
 from .geak_tool import GEAKToolEnvironment
-from .request_parser import recognize_gemm_request
+from .request_parser import recognize_kernel_request
 from .resume import find_latest_checkpoint, mark_checkpoint_continued
 from .runtime import OpenAIModelBackend
 from .task_factory import (
+    GeneratedKernelTask,
     generate_gemm_task,
-    parse_gemm_request,
+    materialize_verified_template_task,
     register_generated_case,
+)
+from .template_bootstrap import (
+    BootstrapError,
+    KernelContract,
+    TemplateBootstrapper,
+    promote_validated_template,
+    run_template_gpu_gate,
 )
 
 
@@ -41,6 +55,7 @@ _CASE_TYPES = (
     "grouped_gemm",
     "scaled_quant_gemm",
     "quant_fp4_mxfp",
+    "aiter_generated",
 )
 _PRINT_LOCK = threading.Lock()
 
@@ -92,6 +107,384 @@ def _prompt_gemm_format(
         # and keeps unsupported choices in this menu.
         assert architecture in get_gemm_template(selected).supported_architectures
         return selected
+
+
+def _prompt_gemm_supplement(
+    request: str,
+    reason: object,
+    *,
+    input_fn=None,
+    output_fn=print,
+) -> str | None:
+    """Collect missing GEMM details without dropping the original request."""
+
+    input_fn = input if input_fn is None else input_fn
+    output_fn("More information is needed: %s" % reason)
+    while True:
+        supplement = input_fn(
+            "Add only the missing details shown above ([b] back): "
+        ).strip()
+        if supplement.lower() in {"b", "back", "q", "quit"}:
+            return None
+        if supplement:
+            if request.strip():
+                return "%s; user supplement: %s" % (request.strip(), supplement)
+            return supplement
+        output_fn("Please enter the missing details, or [b] to go back.")
+
+
+def _missing_kernel_fields(recognized: Mapping[str, Any]) -> list[str]:
+    missing = []
+    if not recognized.get("operator"):
+        missing.append("operator")
+    if not recognized.get("target_gpu"):
+        missing.append("GPU")
+    if not recognized.get("dimensions") and not recognized.get("shapes"):
+        missing.append("shape/dimensions")
+    format_name = recognized.get("format") or recognized.get("input_dtype")
+    if not format_name:
+        missing.append("format/input dtype")
+    quantized = str(format_name or "").lower() in {
+        "fp8",
+        "float8",
+        "int8",
+        "mxfp8",
+        "mxfp4",
+        "fp4",
+    }
+    if quantized and str(format_name).lower() not in {"mxfp8", "mxfp4", "fp4"}:
+        if not recognized.get("input_scale_granularity"):
+            missing.append("input scale granularity")
+        if not recognized.get("weight_scale_granularity"):
+            missing.append("weight scale granularity")
+    return missing
+
+
+def _kernel_contract(recognized: Mapping[str, Any], request: str) -> KernelContract:
+    target = str(recognized["target_gpu"])
+    try:
+        architecture = architecture_for_target(target)
+    except ValueError:
+        architecture = re.sub(r"[^a-z0-9]+", "_", target.lower()).strip("_")
+    shapes = recognized.get("shapes") or []
+    if not shapes:
+        dimensions = recognized.get("dimensions")
+        if isinstance(dimensions, Mapping) and dimensions:
+            shapes = [list(dimensions.values())]
+    format_name = recognized.get("format")
+    input_dtype = recognized.get("input_dtype") or format_name
+    weight_dtype = recognized.get("weight_dtype")
+    if not weight_dtype and str(recognized.get("operator")) == "gemm":
+        weight_dtype = input_dtype
+    return KernelContract(
+        operator=str(recognized["operator"]),
+        request=request,
+        target_gpu=target,
+        architecture=architecture,
+        language=str(recognized.get("language") or "triton"),
+        input_dtype=input_dtype,
+        weight_dtype=weight_dtype,
+        output_dtype=recognized.get("output_dtype"),
+        input_format=format_name,
+        weight_format=format_name if weight_dtype else None,
+        input_scale_granularity=recognized.get("input_scale_granularity"),
+        weight_scale_granularity=recognized.get("weight_scale_granularity"),
+        block_size=recognized.get("block_size"),
+        shapes=shapes,
+    )
+
+
+def _validate_native_quant_target(contract: KernelContract) -> None:
+    native_cdna4_formats = {"mxfp4", "mxfp6", "mxfp8", "mxint8"}
+    formats = {contract.input_format, contract.weight_format}
+    requested = sorted(
+        value for value in formats if value in native_cdna4_formats
+    )
+    if requested and contract.architecture != "gfx950":
+        raise ValueError(
+            "%s requires native CDNA4 block-scaled MFMA and is unsupported on "
+            "%s (%s). Use MI350/MI355, or use FP8 A8W8 E4M3FNUZ on MI308."
+            % ("/".join(requested).upper(), contract.target_gpu, contract.architecture)
+        )
+
+
+def _generated_record(
+    contract: KernelContract,
+    template_path: Path,
+    request: str,
+) -> VerifiedTemplateRecord:
+    metadata = json.loads(
+        (template_path / "metadata.json").read_text(encoding="utf-8")
+    )
+    if not isinstance(metadata, Mapping):
+        raise BootstrapError("promoted metadata.json is not an object")
+    return VerifiedTemplateRecord(
+        contract_hash=contract.contract_hash,
+        operator=contract.operator,
+        template_path=template_path,
+        architecture=contract.architecture,
+        language=contract.language,
+        backend=contract.language,
+        provenance=metadata.get("provenance") or {
+            "generation_method": "verified_bootstrap"
+        },
+        direction=request,
+    )
+
+
+def _generate_kernel_task_interactive(
+    config: MultiTuneConfig,
+    backend: OpenAIModelBackend,
+    *,
+    input_fn=None,
+    output_fn=print,
+) -> GeneratedKernelTask | Any | None:
+    """Recognize, generate or reuse, and return one runnable kernel task."""
+
+    input_fn = input if input_fn is None else input_fn
+    request = input_fn(
+        "Describe the operator, GPU, shape/dimensions, and format/input dtype: "
+    ).strip()
+    recognized_state: dict[str, Any] = {}
+    while True:
+        try:
+            recognized = recognize_kernel_request(request, backend)
+        except ValueError as exc:
+            supplemented = _prompt_gemm_supplement(
+                request, exc, input_fn=input_fn, output_fn=output_fn
+            )
+            if supplemented is None:
+                return None
+            request = supplemented
+            continue
+        for field in (
+            "operator",
+            "target_gpu",
+            "format",
+            "input_dtype",
+            "weight_dtype",
+            "output_dtype",
+            "input_scale_granularity",
+            "weight_scale_granularity",
+            "block_size",
+            "dimensions",
+            "shapes",
+            "language",
+        ):
+            if not recognized.get(field) and recognized_state.get(field):
+                recognized[field] = recognized_state[field]
+        recognized_state = dict(recognized)
+        missing = _missing_kernel_fields(recognized)
+        if missing:
+            output_fn(
+                "Recognized so far: operator=%s, GPU=%s, format=%s, "
+                "shape=%s, language=%s"
+                % (
+                    recognized.get("operator") or "?",
+                    recognized.get("target_gpu") or "?",
+                    recognized.get("format")
+                    or recognized.get("input_dtype")
+                    or "?",
+                    recognized.get("shapes")
+                    or recognized.get("dimensions")
+                    or "?",
+                    recognized.get("language") or "?",
+                )
+            )
+            supplemented = _prompt_gemm_supplement(
+                request,
+                ", ".join(missing),
+                input_fn=input_fn,
+                output_fn=output_fn,
+            )
+            if supplemented is None:
+                return None
+            request = supplemented
+            continue
+        break
+
+    output_fn(
+        "Recognized by %s: operator=%s, GPU=%s, format=%s, shapes=%s"
+        % (
+            recognized.get("recognition", "unknown"),
+            recognized["operator"],
+            recognized["target_gpu"],
+            recognized.get("format") or recognized.get("input_dtype"),
+            recognized.get("shapes") or recognized.get("dimensions"),
+        )
+    )
+    descriptor = canonical_gemm_template_for_contract(recognized)
+    canonical_architecture = None
+    if descriptor is not None:
+        try:
+            descriptor, canonical_architecture = validate_template_target(
+                descriptor.format, recognized["target_gpu"]
+            )
+        except ValueError:
+            descriptor = None
+    if descriptor is not None and all(
+        recognized.get(name) is not None for name in ("m", "n", "k")
+    ):
+        decision = input_fn(
+            "Confirm canonical format=%s, backend=%s, architecture=%s? "
+            "[Y/b, or type a correction]: "
+            % (descriptor.format, descriptor.backend, canonical_architecture)
+        ).strip()
+        if decision.lower() in {"b", "back"}:
+            return None
+        if decision.lower() not in {"", "y", "yes"}:
+            request = "%s; user correction: %s" % (request, decision)
+            return _generate_kernel_task_from_request(
+                config, backend, request, input_fn=input_fn, output_fn=output_fn
+            )
+        spec = dict(recognized)
+        spec["dtype"] = descriptor.format
+        return generate_gemm_task(config, request, parsed_spec=spec)
+
+    return _bootstrap_kernel_task(
+        config, backend, request, recognized, input_fn=input_fn, output_fn=output_fn
+    )
+
+
+def _generate_kernel_task_from_request(
+    config: MultiTuneConfig,
+    backend: OpenAIModelBackend,
+    request: str,
+    *,
+    input_fn,
+    output_fn,
+) -> GeneratedKernelTask | Any | None:
+    """Re-recognize an edited request without asking for a new initial description."""
+
+    while True:
+        recognized = recognize_kernel_request(request, backend)
+        missing = _missing_kernel_fields(recognized)
+        if not missing:
+            break
+        supplemented = _prompt_gemm_supplement(
+            request, ", ".join(missing), input_fn=input_fn, output_fn=output_fn
+        )
+        if supplemented is None:
+            return None
+        request = supplemented
+    descriptor = canonical_gemm_template_for_contract(recognized)
+    if descriptor is not None and all(
+        recognized.get(name) is not None for name in ("m", "n", "k")
+    ):
+        try:
+            descriptor, _ = validate_template_target(
+                descriptor.format, recognized["target_gpu"]
+            )
+        except ValueError:
+            descriptor = None
+    if descriptor is not None:
+        spec = dict(recognized)
+        spec["dtype"] = descriptor.format
+        return generate_gemm_task(config, request, parsed_spec=spec)
+    return _bootstrap_kernel_task(
+        config, backend, request, recognized, input_fn=input_fn, output_fn=output_fn
+    )
+
+
+def _bootstrap_kernel_task(
+    config: MultiTuneConfig,
+    backend: OpenAIModelBackend,
+    request: str,
+    recognized: Mapping[str, Any],
+    *,
+    input_fn,
+    output_fn,
+) -> GeneratedKernelTask | None:
+    contract = _kernel_contract(recognized, request)
+    _validate_native_quant_target(contract)
+    registry_path = config.generated_template_root / "templates.yaml"
+    try:
+        existing = find_verified_template(
+            registry_path,
+            contract.contract_hash,
+            verified_root=(
+                config.generated_template_root
+                if config.generated_template_root.exists()
+                else None
+            ),
+        )
+        if existing is not None:
+            output_fn("[lumen-code] Reusing locally verified template")
+            return materialize_verified_template_task(
+                config, existing, request=request
+            )
+        if not config.bootstrap_enabled:
+            output_fn(
+                "[lumen-code] No exact verified template; bootstrap is disabled."
+            )
+            return None
+        output_fn("[lumen-code] Generating isolated template draft")
+
+        def bootstrap_event(event: Mapping[str, Any]) -> None:
+            phase = str(event.get("phase") or "event")
+            details = ", ".join(
+                "%s=%s" % (key, value)
+                for key, value in event.items()
+                if key != "phase" and value is not None
+            )
+            output_fn(
+                "[lumen-code][bootstrap] %s%s"
+                % (phase, ": " + details if details else "")
+            )
+
+        draft = TemplateBootstrapper(
+            backend=backend,
+            draft_root=config.generated_template_root.parent / ".generated",
+            aiter_root=config.aiter_root,
+            minimum_aiter_score=config.bootstrap_min_aiter_score,
+            event_sink=bootstrap_event,
+        ).generate(contract)
+        output_fn("[lumen-code] Running compile, correctness, and performance gate")
+        gate = run_template_gpu_gate(
+            draft,
+            geak_root=config.geak_root,
+            run_root=config.trajectory_root / "template-validation",
+            gpu_ids=config.gpu_ids,
+            command_timeout=config.command_timeout,
+        )
+        if not gate.trusted:
+            output_fn("[lumen-code] Template gate failed; nothing was cataloged.")
+            for error in gate.errors:
+                output_fn("  " + error)
+            if gate.validation_workspace is not None:
+                output_fn("  diagnostics: %s" % gate.validation_workspace)
+            return None
+        if config.bootstrap_auto_promote:
+            output_fn(
+                "[lumen-code] GPU gate passed; automatically promoting and "
+                "registering the template"
+            )
+        else:
+            decision = input_fn(
+                "GPU gate passed. Promote and permanently register this template? [Y/n]: "
+            ).strip().lower()
+            if decision not in {"", "y", "yes"}:
+                output_fn("[lumen-code] Promotion cancelled; nothing was cataloged.")
+                return None
+        output_fn("[lumen-code] Promoting trusted template")
+        promoted = promote_validated_template(
+            draft, gate, config.generated_template_root
+        )
+        record = _generated_record(contract, promoted, request)
+        record = register_verified_template(
+            registry_path,
+            record,
+            verified_root=config.generated_template_root,
+        )
+        return materialize_verified_template_task(config, record, request=request)
+    except BootstrapError as exc:
+        output_fn("[lumen-code] Bootstrap failed: %s" % exc)
+        if exc.validation_report is not None:
+            for issue in exc.validation_report.errors:
+                output_fn("  " + str(issue))
+        if exc.draft_path is not None:
+            output_fn("  draft diagnostics: %s" % exc.draft_path)
+        return None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -252,8 +645,8 @@ def _run_interactive(base_config: MultiTuneConfig) -> int:
     backend = _model_backend(base_config)
     print(
         "\nMulti-Tune interactive CLI\n"
-        "GEMM tasks can be generated from a request containing M, N, and K. "
-        "Other custom operators need an existing trustworthy GEAK harness.\n"
+        "Kernel tasks can be generated from an operator contract or an exact "
+        "canonical GEMM template.\n"
     )
     while True:
         checkpoint = find_latest_checkpoint(base_config.trajectory_root)
@@ -262,7 +655,7 @@ def _run_interactive(base_config: MultiTuneConfig) -> int:
         )
         try:
             choice = input(
-                "Choose [1] existing case, [2] generate GEMM task, "
+                "Choose [1] existing case, [2] generate kernel task, "
                 "[3] existing GEAK task%s, [q] quit: " % continue_choice
             ).strip().lower()
         except EOFError:
@@ -322,98 +715,30 @@ def _run_interactive(base_config: MultiTuneConfig) -> int:
                     "Optimization request (blank uses catalog objective): "
                 ).strip()
             elif choice == "2":
-                request = input(
-                    "Describe target GPU and GEMM, including M, N, K: "
-                ).strip()
-                original_request = request
-                while True:
-                    try:
-                        recognized = recognize_gemm_request(request, backend)
-                    except ValueError as exc:
-                        print("Could not recognize the task: %s" % exc)
-                        correction = input(
-                            "Enter a corrected request or M/N/K only (1/128/128), "
-                            "or [b] back: "
-                        ).strip()
-                        if correction.lower() in {"b", "back", "q", "quit"}:
-                            task = None
-                            break
-                        try:
-                            corrected = parse_gemm_request(correction)
-                        except ValueError:
-                            request = correction
-                        else:
-                            request = "%s; M=%d, N=%d, K=%d" % (
-                                original_request,
-                                corrected["m"],
-                                corrected["n"],
-                                corrected["k"],
-                            )
-                        continue
-                    print(
-                        "Recognized by %s: GPU=%s, language=%s, format=%s, "
-                        "M=%d, N=%d, K=%d"
-                        % (
-                            recognized.get("recognition", "unknown"),
-                            recognized["target_gpu"],
-                            recognized.get("language", "triton"),
-                            recognized["dtype"],
-                            recognized["m"],
-                            recognized["n"],
-                            recognized["k"],
-                        )
-                    )
-                    selected_format = _prompt_gemm_format(
-                        recognized["dtype"], recognized["target_gpu"]
-                    )
-                    recognized = dict(recognized)
-                    recognized["dtype"] = selected_format
-                    descriptor, architecture = validate_template_target(
-                        selected_format, recognized["target_gpu"]
-                    )
-                    print(
-                        "Selected: format=%s, backend=%s, architecture=%s"
-                        % (selected_format, descriptor.backend, architecture)
-                    )
-                    raw_decision = input(
-                        "Confirm format/backend/architecture and values? "
-                        "[Y/e edit/b back, or type a correction]: "
-                    ).strip()
-                    decision = raw_decision.lower()
-                    if decision in {"b", "back"}:
-                        task = None
-                        break
-                    if decision in {"e", "edit", "n", "no"}:
-                        request = input("Corrected request: ").strip()
-                        continue
-                    if decision not in {"", "y", "yes"}:
-                        request = "%s; user correction: %s" % (
-                            request,
-                            raw_decision,
-                        )
-                        continue
-                    language = str(recognized.get("language") or "triton")
-                    if language != "triton":
-                        raise ValueError(
-                            "%s was recognized, but automatic %s GEMM task "
-                            "generation is not implemented yet"
-                            % (language, language)
-                        )
-                    task = generate_gemm_task(
-                        base_config, request, parsed_spec=recognized
-                    )
-                    break
+                task = _generate_kernel_task_interactive(base_config, backend)
                 if task is None:
                     print("Cancelled.\n")
                     continue
                 register_generated_case(base_config.cases_path, task)
                 case_id = task.case_id
+                request = task.request
                 print("Generated task: %s" % task.task_dir)
                 print("Registered case: %s" % base_config.cases_path)
-                print(
-                    "Task contract: format=%s, backend=%s, architecture=%s"
-                    % (task.format, task.backend, task.architecture)
-                )
+                if isinstance(task, GeneratedKernelTask):
+                    print(
+                        "Task contract: operator=%s, hash=%s, backend=%s, architecture=%s"
+                        % (
+                            task.operator,
+                            task.contract_hash,
+                            task.backend,
+                            task.architecture,
+                        )
+                    )
+                else:
+                    print(
+                        "Task contract: format=%s, backend=%s, architecture=%s"
+                        % (task.format, task.backend, task.architecture)
+                    )
             elif choice == "3":
                 raw_path = input("GEAK task directory: ").strip()
                 kernel_path = Path(raw_path).expanduser().resolve()

@@ -60,6 +60,34 @@ def test_config_geak_environment_override_precedence(tmp_path, monkeypatch):
     assert config.geak_root == (tmp_path / "specific-geak").resolve()
 
 
+def test_bootstrap_config_defaults_and_aiter_override(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "geak_root: geak\ncases_path: cases.yaml\ntrajectory_root: runs\n"
+    )
+    monkeypatch.setenv("AITER_HOME", str(tmp_path / "aiter-checkout"))
+    config = MultiTuneConfig.from_yaml(config_path)
+    assert config.bootstrap_enabled is True
+    assert config.bootstrap_auto_promote is True
+    assert config.aiter_root == (tmp_path / "aiter-checkout").resolve()
+    assert config.generated_template_root.name == "generated"
+    assert config.bootstrap_min_aiter_score == 85
+    with pytest.raises(ValueError, match="between 0 and 100"):
+        MultiTuneConfig(
+            tmp_path,
+            tmp_path / "cases.yaml",
+            tmp_path / "runs",
+            bootstrap_min_aiter_score=101,
+        )
+    with pytest.raises(ValueError, match="bootstrap_auto_promote must be a boolean"):
+        MultiTuneConfig(
+            tmp_path,
+            tmp_path / "cases.yaml",
+            tmp_path / "runs",
+            bootstrap_auto_promote="yes",  # type: ignore[arg-type]
+        )
+
+
 def test_config_rejects_unknown_and_invalid_values(tmp_path):
     path = tmp_path / "bad.yaml"
     path.write_text(

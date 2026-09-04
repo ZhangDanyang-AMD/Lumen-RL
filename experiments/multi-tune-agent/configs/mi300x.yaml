@@ -4,6 +4,11 @@ trajectory_root: /home/danyzhan/multi_tune_runs
 base_url: http://127.0.0.1:8000/v1
 model: Qwen/Qwen3-Coder-Next
 gpu_ids: "1"
+bootstrap_enabled: true
+bootstrap_auto_promote: true
+aiter_root: /home/danyzhan/aiter
+generated_template_root: ../examples/tasks/generated
+bootstrap_min_aiter_score: 85
 
 request_timeout: 600
 command_timeout: 300

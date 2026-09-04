@@ -337,6 +337,267 @@ multi-tune --config configs/mi300x.yaml run \
 永久 case 目标保存在 `cases/examples_cases.yaml`。生成的本地 task 位于
 `examples/tasks/` 并被 Git 忽略。原始 task 不会被 Agent 直接修改。
 
+## 自动生成缺失的 kernel 模板
+
+交互菜单 `[2] generate kernel task` 支持任意 operator。用户描述 operator、
+GPU、shape、format/dtype 和量化 scale 契约后，系统按以下顺序处理：
+
+1. 精确匹配 bundled template 或已通过 GPU 验证的本地模板；命中后直接创建
+   case，不调用模板生成模型；
+2. 没有模板时，先让 vLLM 直接生成隔离的 `kernel.py` 和独立
+   `task_runner.py`；
+3. direct draft 静态校验失败时，才只读搜索 `$AITER_HOME` 中的 public
+   wrapper、test、reference、benchmark 和架构配置，并让模型修复整个 draft；
+4. 通过 GEAK GPU lock 顺序执行 compile、correctness、performance；
+5. 三项均通过后提升为本地可信模板并注册 case；默认
+   `bootstrap_auto_promote: true` 会自动继续正常优化，设为 `false` 时才要求
+   用户逐次确认。
+
+### 决策优先级
+
+这套顺序是控制面必须遵守的优先级，而不是给 Agent 的建议：
+
+1. **P0：契约与硬件 hard gate。** 先验证 operator、shape、dtype/format、
+   scale granularity、block size 和目标架构。FP8/gfx942、MXFP4/gfx950 等
+   不兼容组合在创建 task 前立即拒绝，不进入模型生成或 GPU 执行。
+2. **P1：复用可信实现。** 优先使用仓库内不可变的 canonical template；
+   其次按完整 `contract_hash` 复用已通过 GPU gate 的本地模板。命中后直接
+   开始优化，不重新生成、不搜索 AITER，也不重复消耗验证资源。
+3. **P2：LLM 直接生成并测试。** 没有可信模板时，默认假设模型可能已经知道
+   kernel 的实现方式，让模型直接生成完整 draft。只要静态检查通过，就直接
+   进入 GPU compile/correctness/performance；不会为了“找依据”先搜索代码库。
+4. **P3：AITER evidence-assisted repair。** 只有 direct draft 无法通过静态
+   安全检查时，才搜索 AITER。搜索是只读、按 operator/format/scale/arch
+   hard gate 和置信度排序的恢复路径；只把 public wrapper、独立 reference、
+   test、benchmark/config 等证据交给模型修复，不直接执行或复制未知实现。
+5. **P4：信任与晋升。** 静态检查只证明 draft 没有明显绕过 harness；最终仍
+   必须按 compile → correctness → performance 顺序通过独立 GPU gate。只有
+   `bootstrap_auto_promote` 允许时才写入本地可信 registry 和 case catalog。
+   任何失败 draft 都只保留诊断信息，不会成为可优化 baseline。
+
+核心原则是：**已知且可信就复用，模型会写就直接写并实测，模型写不对才借助
+AITER 修复；搜索不能替代独立 oracle 和 GPU 测量。**
+
+已明确写在请求中的 format、scale granularity 不会被重复询问。缺失字段会
+一次性提示补充。例如：
+
+```text
+MI308X FP8 GEMM M=16 N=4096 K=4096,
+activation per-token scale, weight per-channel scale, FP16 output
+```
+
+本地文件位置：
+
+- 未通过验证的 draft：`examples/tasks/.generated/<contract-hash>/`；
+- 验证失败诊断：同目录下 `.failed-<contract-hash>*`；
+- 已通过 GPU gate 的模板：`examples/tasks/generated/<contract-hash>/`；
+- 本地模板索引：`examples/tasks/generated/templates.yaml`。
+
+这些运行时生成的模板不会进入 wheel。`metadata.json` 保存完整 contract、
+模型 provenance、可选 AITER artifact hash 和 GPU gate 证据。失败 draft
+不会写入 `cases/examples_cases.yaml`。`bootstrap_enabled: false` 可以关闭
+自动生成；`AITER_HOME`、`generated_template_root` 和
+`bootstrap_min_aiter_score` 可在配置或环境中调整。
+
+原生 OCP MXFP8/MXFP6/MXFP4 依赖 gfx950 的 CDNA4 block-scaled MFMA。
+MI308/gfx942 请求会在模板生成前拒绝，并建议改用 MI350/MI355 或 gfx942
+原生 FP8 A8W8 E4M3FNUZ；系统不会把普通 FP8 仿真实现注册成原生 MXFP。
+
+GPU 三项通过只能证明模板在指定输入下满足其独立 oracle；静态校验还会阻止
+runner/oracle 成为可写源码、恒真比较、跳过 correctness、过宽容差和架构门禁
+缺失。无法建立独立可信 oracle 时，模板不会注册。
+
+### 硬件验证状态
+
+- gfx942 / GPU 1：FP8 A8W8 的 compile、4 个 correctness case 和 4 个
+  performance case 已通过；
+- gfx942 / GPU 1：模型生成的非 GEMM softmax 模板已通过完整 GPU gate；
+- gfx942：MXFP4 在 task 创建前被拒绝，并明确提示仅支持 gfx950；
+- gfx950：MXFP4 native compile/correctness/performance 仍需在 MI350/MI355
+  硬件上验证，gfx942 结果不能替代该验证。
+
+## 与 GEAK Claude Code CLI / Workflow 的取舍
+
+这里比较的是两种**模型接入和控制面部署方式**：MultiTune 直接调用常驻的
+OpenAI-compatible vLLM 服务；GEAK v4 通常由 Claude Code CLI 启动
+deterministic JS Workflow。两者都使用 GEAK 的 workspace、GPU lock 和真实
+测量能力。GEAK 本身也具备确定性编排、并行 Engineer、独立验证和恢复机制，
+因此 MultiTune 的优势不应表述成“GEAK 不稳定或不能并行”，而主要体现在以下
+方面。
+
+### 大规模并行
+
+- **模型侧路径更直接。** MultiTune 的多个角色由同一个 Python scheduler
+  直接向常驻 vLLM endpoint 发请求，不把 Claude Code CLI 的生命周期、权限
+  交互和本地工具加载作为每个优化 run 的依赖。服务端可以做 continuous
+  batching，Agent 数量增加时更容易共享模型权重和 KV-cache 容量，并统一做
+  并发限制与 backpressure。GEAK Workflow 的 sub-agent 不一定各自对应一个
+  CLI 进程，因此优势是服务化路径和集中调度，而不是简单的“少启动 N 个进程”。
+- **候选天然隔离。** 每个 Engineer 从当前最佳 session fork 独立 workspace，
+  模型分析和源码编辑可以并行；GPU compile/correctness/performance 再按
+  GEAK lock 串行，避免并发 benchmark 互相污染。模型并行度和 GPU 并行度可以
+  分别配置。
+- **更适合作为训练或调度后端。** 请求、tool call、logprob、reward 和
+  latency 都是结构化数据，不必解析 CLI 文本或终端状态，便于后续接入队列、
+  多租户调度、RL rollout 和批量实验。
+
+当前实现还不是完整的分布式调度器：`run_all` 仍按 case 顺序运行，单个
+`base_url` 是模型服务单点，同一 GPU 上的 evaluation 也有意串行。要扩展到
+多机大规模运行，还需要全局任务队列、每 GPU lock、endpoint pool、限流和
+失败重试。GEAK 已支持按 kernel 启动独立 Agent，以及在多 GPU bake-off 中
+并行 lane；在这些现成功能上它目前更成熟。
+
+### 稳定性与可恢复性
+
+- **控制流不交给模型。** round、fan-out、candidate gate、promotion、stop 和
+  final validation 都由 Python 状态机决定；模型只负责结构化判断和受限源码
+  修改。错误的 Agent 结论不能覆盖 deterministic correctness/performance
+  结果。
+- **缩小可变运行面。** 常驻 HTTP 模型服务不依赖交互式 CLI 会话、权限确认、
+  本地插件和终端状态。模型只看到一个受限 `geak` tool，不能执行任意 shell，
+  也不能修改 runner、oracle、metadata 或 config。
+- **证据可重放。** baseline、workspace lineage、每次命令结果、模型消息、
+  reward 和 checkpoint 持久化到 trajectory；中断后从代码和冻结 baseline
+  恢复，而不是依赖某个 CLI 进程或模型 KV-cache 仍然存活。
+- **生成模板有独立信任边界。** 未验证 draft 与可信 registry 分离；静态
+  validator、架构 gate 和 GPU gate 全部通过前，不会进入正常优化 catalog。
+
+代价是 MultiTune 主 Python 进程目前也是单点，`requests`/vLLM endpoint
+故障会影响同一批运行；GEAK 的独立 CLI/Workflow 进程在进程级故障隔离、
+成熟的 hang guard、Web/Profiling 工具生态和端到端 serving workflow 上更强。
+另外，受限 tool 提高了安全性，但 task 中受信任的 Docker command 仍具有执行
+能力，不能等同于完整的系统级 sandbox。
+
+### 可扩展性与可维护性
+
+- **模型后端可替换。** `ModelBackend` 是小接口；任何兼容 chat completions
+  和 tool-calling 的本地或远程模型都可替换，不绑定 Claude Code CLI 的版本、
+  账号体系或权限模式。
+- **operator 与编排解耦。** `TaskSpec`、contract metadata、template
+  registry、静态 validator 和 GEAK adapter 不依赖具体角色。新增 operator
+  主要是补充可信 harness/contract/knowledge mapping，不需要重写 Agent loop。
+- **策略可实验。** Director/TechLead/Engineer/Verifier/Integrator、并发数、
+  reward、candidate threshold 和停止条件都是显式模块或配置，适合做消融、
+  A/B 和训练数据采集。
+- **上游 GEAK 保持不修改。** MultiTune 把 GEAK 当作 materialization、
+  locking 和 evaluation 基础设施，通过 `geak_utils` 适配；升级控制面时不需要
+  fork 上游 GEAK。
+
+GEAK 的优势则是覆盖面更广：现有 e2e serving 优化、profile/Amdahl routing、
+多 backend/language bake-off、Web research 和 learned knowledge workflow
+都比 MultiTune 完整。MultiTune 当前更适合“可控、可观测、可训练的
+kernel-candidate 生成与验证服务”；GEAK CLI/Workflow 更适合“开箱即用、
+工具丰富的单机或端到端自主优化”。长期方向不是替代 GEAK，而是保留其可信
+执行层，并把 MultiTune 的服务化调度、结构化轨迹和训练接口叠加在上面。
+
+## 添加新的 kernel 类型与模板 case
+
+模板不是按 shape 创建的。同一种 operator、输入输出布局、数值语义、量化
+scale contract 和目标架构下，新 case 只需要复用模板并提供新参数。只有新增
+kernel 类型，或上述任一契约发生变化时，才需要添加新的可信模板。例如普通
+FP8 A8W8 shape 复用 `gemm_fp8`；如果改成不同的 scale 粒度或输出类型，则应
+建立另一个模板。模板被删除后不会自动重建，task factory 会明确报缺少可信
+seed。
+
+### 1. 模板目录
+
+在 `examples/tasks/<template_name>/` 中至少提供：
+
+```text
+examples/tasks/<template_name>/
+├── config.yaml
+├── kernel.py
+└── scripts/
+    └── task_runner.py
+```
+
+- `kernel.py`：Agent 唯一允许修改的 kernel 实现或调优配置；
+- `scripts/task_runner.py`：不可由 Agent 修改的 compile、correctness 和
+  performance harness；
+- `config.yaml`：声明可写源码、目标函数和三类验证命令；
+- `metadata.json`：可选；量化格式、packing、scale、架构限制较复杂时建议
+  添加，`gemm_mxfp4` 可作为示例。
+
+最小 `config.yaml` 示例：
+
+```yaml
+source_file_path:
+  - kernel.py
+target_kernel_functions:
+  - my_kernel
+compile_command:
+  - docker exec -e HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-1} -w "$PWD" ${GEAK_CONTAINER_NAME:-geak-phase1-vllm} python3 scripts/task_runner.py compile
+correctness_command:
+  - docker exec -e HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-1} -w "$PWD" ${GEAK_CONTAINER_NAME:-geak-phase1-vllm} python3 scripts/task_runner.py correctness
+performance_command:
+  - docker exec -e HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-1} -w "$PWD" ${GEAK_CONTAINER_NAME:-geak-phase1-vllm} python3 scripts/task_runner.py performance
+task_type: triton2triton
+prompt:
+  instructions: Preserve the complete operator contract while optimizing latency.
+```
+
+不要把 runner、oracle、配置或 metadata 加入 `source_file_path`，否则 Agent
+可以通过修改验证标准获得虚假收益。
+
+### 2. Harness 要求
+
+`task_runner.py` 必须接受三个独立 mode：
+
+```bash
+python3 scripts/task_runner.py compile
+python3 scripts/task_runner.py correctness
+python3 scripts/task_runner.py performance
+```
+
+Harness 应满足以下要求：
+
+1. correctness 使用独立可信 oracle、固定随机种子和明确容差；
+2. 量化算子以实际送入 kernel 的量化值及 scale 计算 reference，不以量化前
+   原始张量代替；
+3. performance 在预热后只测 kernel 热路径，不包含输入生成、量化或
+   reference；
+4. 每个 shape 输出 `Perf: <latency_ms> ms (<case_id>)`，并可写入
+   `build/performance_report.json`；
+5. compile、correctness 或 performance 失败时必须返回非零状态；
+6. 架构不支持时应在导入 JIT 后端或分配大张量前拒绝，不能用软件模拟结果
+   冒充原生 kernel 性能。
+
+可以参考：
+
+- `examples/tasks/gemm`：FP16 Triton 模板；
+- `examples/tasks/gemm_fp8`：gfx942 FP8 A8W8 及逐 token/channel scale；
+- `examples/tasks/gemm_mxfp4`：gfx950 原生 MXFP4 和架构拒绝路径；
+- `examples/tasks/fused_attention`、`grouped_gemm`：非 dense GEMM 模板。
+
+### 3. 接入 MultiTune
+
+新增模板后按以下顺序接入：
+
+1. 在 `cases/examples_cases.yaml` 添加稳定 case ID、case type、模板路径和
+   优化目标；
+2. 新 GEMM format 在 `geak_utils/templates.py` 注册模板目录、case type、
+   支持架构、backend 以及输入/scale/输出 contract；
+3. 新 operator case type 加入 `geak_tool.py` 的
+   `_SUPPORTED_CASE_TYPES`，同时加入 `cli.py` 的 `_CASE_TYPES`；
+4. 在 `agents.py` 的 `_CASE_KNOWLEDGE` 映射对应
+   `GEAK/perf_knowledge/operators/<operator>/` 知识目录；
+5. 在 `.gitignore` 放行可信模板，并在 `pyproject.toml` 与 `setup.py` 中
+   加入 wheel data files；
+6. 添加 parser、catalog、架构门禁、任务生成和 flow 测试，并在受支持 GPU
+   上分别运行 compile、correctness、performance。
+
+Catalog 条目示例：
+
+```yaml
+- id: my-kernel-case
+  type: my_kernel_type
+  kernel_path: ../examples/tasks/my_kernel_template
+  direction: Optimize supported shapes without changing numerical semantics.
+```
+
+只新增已有模板支持的 shape 时，不需要重复以上步骤；通过 task factory
+生成 shape-specific `task_spec.json` 和 catalog 条目即可。
+
 ## Agent, GEAK, and harness boundaries
 
 - **Agent** is the model-driven decision layer in `agents.py` and `runtime.py`.

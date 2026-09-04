@@ -29,12 +29,15 @@ PYTHONPATH=src:. pytest
 
 ```python
 from geak_utils import (
+    AiterQuery,
     CommandResult,
     EvaluationResult,
     KernelSandbox,
     SandboxError,
     TaskSpec,
+    discover_aiter,
     get_gemm_template,
+    validate_generated_template,
     validate_template_target,
     load_tasks,
 )
@@ -55,6 +58,22 @@ including template directory, MultiTune case type, backend, architecture set,
 and operand/scale/output contracts. `validate_template_target()` maps
 MI300/MI308 to gfx942 and MI350/MI355 to gfx950 and rejects unsupported or
 unknown targets before task materialization.
+
+`discover_aiter()` builds a read-only filesystem index of an AITER checkout and
+scores public wrappers together with matching correctness tests, independent
+references, benchmarks, configs, scale contracts, and architecture gates. It
+never imports or executes AITER. `validate_generated_template()` statically
+checks an untrusted generated template before GPU execution, including its file
+boundary, metadata/provenance, runner modes, architecture gate, oracle
+independence, tolerances, and performance output contract.
+
+Locally generated templates are recorded through
+`VerifiedTemplateRecord`, `register_verified_template()`, and
+`find_verified_template()`. The registry accepts only templates whose
+`metadata.json` contains a matching contract hash and `trust.trusted: true`.
+The model-driven direct generation and GPU promotion workflow remains in
+`multi_tune_agent.template_bootstrap`; `geak_utils` itself does not call an
+LLM.
 
 `TaskSpec.task_type` is normalized but intentionally unrestricted. Consumers
 decide which task families they support. Compatibility properties

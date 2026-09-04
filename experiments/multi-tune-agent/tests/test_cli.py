@@ -1,10 +1,12 @@
 from pathlib import Path
 
 import yaml
+import multi_tune_agent.cli as cli
 
 from multi_tune_agent.cli import (
     _default_case_id,
     _has_geak_contract,
+    _prompt_gemm_supplement,
     _write_custom_catalog,
     build_parser,
 )
@@ -58,3 +60,101 @@ def test_custom_catalog_records_task_and_request(tmp_path):
     assert case["id"] == "mi308-gemm"
     assert case["kernel_path"] == str(task.resolve())
     assert case["direction"] == "Optimize M=1234 N=2048 K=4096."
+
+
+def test_missing_gemm_details_are_collected_as_a_supplement():
+    messages = []
+    answers = iter(["", "M=1 N=128 K=256"])
+    request = _prompt_gemm_supplement(
+        "MI308 FP8 GEMM",
+        "recognizer could not identify M",
+        input_fn=lambda _prompt: next(answers),
+        output_fn=messages.append,
+    )
+
+    assert request == "MI308 FP8 GEMM; user supplement: M=1 N=128 K=256"
+    assert messages[0].startswith("More information is needed:")
+    assert "Please enter" in messages[1]
+
+
+def test_missing_gemm_details_can_return_to_menu():
+    assert (
+        _prompt_gemm_supplement(
+            "GEMM",
+            "missing target GPU",
+            input_fn=lambda _prompt: "back",
+            output_fn=lambda _message: None,
+        )
+        is None
+    )
+
+
+def test_explicit_fp8_contract_skips_format_menu(tmp_path, monkeypatch):
+    config = MultiTuneConfig(
+        geak_root=tmp_path,
+        cases_path=tmp_path / "cases.yaml",
+        trajectory_root=tmp_path / "runs",
+    )
+    recognized = {
+        "operator": "gemm",
+        "target_gpu": "gfx942",
+        "format": "fp8",
+        "input_dtype": None,
+        "weight_dtype": None,
+        "output_dtype": None,
+        "input_scale_granularity": "per_token",
+        "weight_scale_granularity": "per_channel",
+        "block_size": None,
+        "dimensions": {"m": 16, "n": 32, "k": 64},
+        "shapes": [[16, 32, 64]],
+        "m": 16,
+        "n": 32,
+        "k": 64,
+        "language": "triton",
+        "explicit_fields": ["format"],
+    }
+    sentinel = object()
+    monkeypatch.setattr(cli, "recognize_kernel_request", lambda *args: recognized)
+    monkeypatch.setattr(cli, "generate_gemm_task", lambda *args, **kwargs: sentinel)
+    monkeypatch.setattr(
+        cli,
+        "_prompt_gemm_format",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("format menu")),
+    )
+    answers = iter(["gfx942 FP8 GEMM M=16 N=32 K=64 scales", ""])
+    assert (
+        cli._generate_kernel_task_interactive(
+            config,
+            object(),
+            input_fn=lambda _: next(answers),
+            output_fn=lambda _: None,
+        )
+        is sentinel
+    )
+
+
+def test_missing_format_and_fp8_scales_are_reported():
+    base = {
+        "operator": "gemm",
+        "target_gpu": "gfx942",
+        "dimensions": {"m": 1, "n": 2, "k": 3},
+        "shapes": [[1, 2, 3]],
+        "format": None,
+        "input_dtype": None,
+    }
+    assert cli._missing_kernel_fields(base) == ["format/input dtype"]
+    assert cli._missing_kernel_fields({**base, "format": "fp8"}) == [
+        "input scale granularity",
+        "weight scale granularity",
+    ]
+    assert (
+        cli._missing_kernel_fields(
+            {
+                **base,
+                "format": "mxfp8",
+                "input_scale_granularity": "per_block",
+                "weight_scale_granularity": "per_block",
+            }
+        )
+        == []
+    )

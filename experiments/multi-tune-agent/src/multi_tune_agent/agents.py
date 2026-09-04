@@ -29,6 +29,7 @@ _CASE_KNOWLEDGE = {
     "grouped_gemm": ("grouped_gemm_moe", "fused_moe_grouped_gemm"),
     "scaled_quant_gemm": ("scaled_quant_gemm",),
     "quant_fp4_mxfp": ("quant_fp4_mxfp",),
+    "aiter_generated": (),
 }
 
 
@@ -92,6 +93,7 @@ class StructuredRoleAgent:
         self.backend = backend
         self.prompts = prompts
         self.trajectory = trajectory
+        self._case_input: dict[str, Any] | None = None
 
     async def run(
         self,
@@ -102,6 +104,12 @@ class StructuredRoleAgent:
         case_type: str = "",
         round_index: int = 0,
     ) -> dict[str, Any]:
+        effective_payload = dict(payload)
+        supplied_case = effective_payload.get("case")
+        if isinstance(supplied_case, Mapping):
+            self._case_input = dict(supplied_case)
+        elif case_type == "aiter_generated" and self._case_input is not None:
+            effective_payload["case"] = dict(self._case_input)
         messages = [
             {
                 "role": "system",
@@ -111,7 +119,12 @@ class StructuredRoleAgent:
             {
                 "role": "user",
                 "content": "PHASE=%s\nINPUT=%s"
-                % (phase, json.dumps(dict(payload), indent=2, sort_keys=True, default=str)),
+                % (
+                    phase,
+                    json.dumps(
+                        effective_payload, indent=2, sort_keys=True, default=str
+                    ),
+                ),
             },
         ]
         started = time.monotonic()
@@ -121,7 +134,7 @@ class StructuredRoleAgent:
         self.trajectory.append(
             "role_response",
             {
-                "input": dict(payload),
+                "input": effective_payload,
                 "text": turn.text,
                 "structured": parsed,
                 "usage": turn.usage,
@@ -167,7 +180,14 @@ class CodeRoleAgent:
                 "content": (
                     "Implement and measure this assigned direction in your private "
                     "workspace. Use the GEAK tool; finish only after correctness and "
-                    "performance evidence.\n\n"
+                    "performance evidence. Preserve every field in the generated "
+                    "kernel contract when one is supplied.\n\nCASE=\n"
+                    + json.dumps(
+                        self.environment.case_observation(case_id),
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n\nDIRECTION=\n"
                     + json.dumps(direction.__dict__, indent=2, sort_keys=True)
                 ),
             },
@@ -216,7 +236,14 @@ class CodeRoleAgent:
                     "Combine only compatible measured wins. Use read_candidate with "
                     "the listed session ids to inspect their source, edit your private "
                     "workspace, and run a full evaluation. If merging is unsafe, copy "
-                    "the strongest single strategy instead.\n\n"
+                    "the strongest single strategy instead. Preserve every field in "
+                    "the generated kernel contract when one is supplied.\n\nCASE=\n"
+                    + json.dumps(
+                        self.environment.case_observation(case_id),
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n\nCANDIDATES=\n"
                     + json.dumps(visible, indent=2, sort_keys=True)
                 ),
             },

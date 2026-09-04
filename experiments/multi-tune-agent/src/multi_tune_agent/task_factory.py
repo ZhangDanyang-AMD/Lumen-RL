@@ -13,6 +13,7 @@ from typing import Any, Mapping, Optional
 
 import yaml
 from geak_utils.paths import example_task_path
+from geak_utils.local_templates import VerifiedTemplateRecord
 from geak_utils.templates import (
     FORMAT_ALIASES,
     get_gemm_template,
@@ -40,6 +41,21 @@ class GeneratedGemmTask:
     @property
     def format(self) -> str:
         return self.dtype
+
+
+@dataclass(frozen=True)
+class GeneratedKernelTask:
+    """A permanent task backed by an already promoted, verified template."""
+
+    case_id: str
+    task_dir: Path
+    case_type: str
+    operator: str
+    architecture: str
+    backend: str
+    request: str
+    contract_hash: str
+    provenance: Any
 
 
 def parse_gemm_request(request: str) -> dict[str, Any]:
@@ -269,7 +285,7 @@ def _validated_gemm_spec(
 
 
 def register_generated_case(
-    catalog_path: Path, task: GeneratedGemmTask
+    catalog_path: Path, task: GeneratedGemmTask | GeneratedKernelTask
 ) -> None:
     """Insert or update one generated task in the permanent case catalog."""
 
@@ -284,17 +300,30 @@ def register_generated_case(
     if not isinstance(tasks, list):
         raise ValueError("case catalog 'tasks' must be a list")
     relative_path = os.path.relpath(task.task_dir, path.parent)
-    entry = {
-        "id": task.case_id,
-        "type": task.case_type,
-        "kernel_path": relative_path,
-        "direction": task.request,
-        "format": task.format,
-        "backend": task.backend,
-        "target_gpu": task.target_gpu,
-        "architecture": task.architecture,
-        "scale_contract": get_gemm_template(task.format).scale_contract,
-    }
+    if isinstance(task, GeneratedKernelTask):
+        entry = {
+            "id": task.case_id,
+            "type": task.case_type,
+            "kernel_path": relative_path,
+            "direction": task.request,
+            "operator": task.operator,
+            "backend": task.backend,
+            "architecture": task.architecture,
+            "contract_hash": task.contract_hash,
+            "provenance": task.provenance,
+        }
+    else:
+        entry = {
+            "id": task.case_id,
+            "type": task.case_type,
+            "kernel_path": relative_path,
+            "direction": task.request,
+            "format": task.format,
+            "backend": task.backend,
+            "target_gpu": task.target_gpu,
+            "architecture": task.architecture,
+            "scale_contract": get_gemm_template(task.format).scale_contract,
+        }
     for index, value in enumerate(tasks):
         if isinstance(value, dict) and value.get("id") == task.case_id:
             tasks[index] = entry
@@ -309,6 +338,61 @@ def register_generated_case(
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+def materialize_verified_template_task(
+    config: MultiTuneConfig,
+    record: VerifiedTemplateRecord,
+    *,
+    request: Optional[str] = None,
+    case_id: Optional[str] = None,
+) -> GeneratedKernelTask:
+    """Register an already-promoted verified template in the main case catalog."""
+
+    if not isinstance(record, VerifiedTemplateRecord):
+        raise TypeError("record must be a VerifiedTemplateRecord")
+    resolved_case_id = case_id or _generated_kernel_case_id(record)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", resolved_case_id):
+        raise ValueError("invalid generated case ID: %s" % resolved_case_id)
+    task_dir = record.template_path.expanduser().resolve(strict=True)
+    metadata_path = task_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if not isinstance(metadata, Mapping):
+        raise ValueError("verified template metadata.json must contain a mapping")
+    if metadata.get("contract_hash") != record.contract_hash:
+        raise ValueError("verified template contract hash does not match registry")
+    task = GeneratedKernelTask(
+        case_id=resolved_case_id,
+        task_dir=task_dir,
+        case_type=record.case_type,
+        operator=record.operator,
+        architecture=record.architecture,
+        backend=record.backend,
+        request=(request or record.direction).strip(),
+        contract_hash=record.contract_hash,
+        provenance=record.provenance,
+    )
+    register_generated_case(config.cases_path, task)
+    return task
+
+
+def materialize_and_register_generated_task(
+    config: MultiTuneConfig,
+    record: VerifiedTemplateRecord,
+    *,
+    request: Optional[str] = None,
+    case_id: Optional[str] = None,
+) -> GeneratedKernelTask:
+    """Compatibility alias for materializing a verified generated task."""
+
+    return materialize_verified_template_task(
+        config, record, request=request, case_id=case_id
+    )
+
+
+def _generated_kernel_case_id(record: VerifiedTemplateRecord) -> str:
+    operator = re.sub(r"[^a-z0-9]+", "-", record.operator.lower()).strip("-")
+    return "%s-%s" % (operator or "kernel", record.contract_hash[:12])
 
 
 def _render_task_runner(m: int, n: int, k: int) -> str:

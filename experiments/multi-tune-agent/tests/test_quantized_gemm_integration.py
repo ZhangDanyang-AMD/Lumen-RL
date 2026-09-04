@@ -10,6 +10,7 @@ from geak_utils import (
     get_gemm_template,
     validate_template_target,
 )
+from geak_utils.templates import canonical_gemm_template_for_contract
 from geak_utils.catalog import load_tasks
 from multi_tune_agent.agents import RolePromptLibrary
 from multi_tune_agent.cli import _prompt_gemm_format
@@ -99,6 +100,23 @@ def test_template_registry_maps_and_rejects_architectures():
         architecture_for_target("MI250X")
     with pytest.raises(ValueError, match="unknown GPU"):
         architecture_for_target("mystery")
+
+
+def test_canonical_contract_matching_includes_scale_scheme():
+    contract = {
+        "operator": "gemm",
+        "format": "fp8",
+        "input_scale_granularity": "per_token",
+        "weight_scale_granularity": "per_channel",
+        "block_size": None,
+    }
+    assert canonical_gemm_template_for_contract(contract).format == "fp8"
+    assert (
+        canonical_gemm_template_for_contract(
+            {**contract, "input_scale_granularity": "per_tensor"}
+        )
+        is None
+    )
 
 
 def test_format_prompt_default_invalid_and_unsupported_retry():

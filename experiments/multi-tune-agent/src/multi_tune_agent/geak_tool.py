@@ -26,6 +26,7 @@ _SUPPORTED_CASE_TYPES = frozenset(
         "grouped_gemm",
         "scaled_quant_gemm",
         "quant_fp4_mxfp",
+        "aiter_generated",
     }
 )
 
@@ -348,12 +349,38 @@ class GEAKToolEnvironment:
 
     def case_observation(self, case_id: str) -> dict[str, Any]:
         case = self._case(case_id)
-        return {
+        observation = {
             "case_id": case.case_id,
             "case_type": case.case_type,
             "kernel_path": str(case.kernel_path),
             "direction": case.direction,
         }
+        if case.case_type == "aiter_generated":
+            metadata = self._generated_metadata(case.kernel_path)
+            if metadata:
+                observation["contract"] = metadata.get("contract", {})
+                observation["contract_hash"] = metadata.get("contract_hash")
+                observation["operator"] = metadata.get("operator")
+                observation["architecture"] = metadata.get("architecture")
+                observation["provenance"] = metadata.get("provenance", {})
+                observation["trust"] = metadata.get("trust", {})
+                observation["optimization_contract_instruction"] = (
+                    "Preserve the supplied generated-kernel contract, shapes, dtypes, "
+                    "scale granularities, block size, architecture gate, and independent "
+                    "correctness oracle while optimizing only declared source files."
+                )
+        return observation
+
+    @staticmethod
+    def _generated_metadata(kernel_path: Path) -> dict[str, Any]:
+        path = kernel_path / "metadata.json"
+        try:
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 256 * 1024:
+                return {}
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return {}
+        return dict(value) if isinstance(value, Mapping) else {}
 
     def _case(self, case_id: str) -> Any:
         try:
