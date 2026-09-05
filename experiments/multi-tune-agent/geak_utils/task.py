@@ -45,6 +45,7 @@ class TaskSpec:
     kernel_path: Path
     direction: str = ""
     max_turns: int | None = None
+    provenance: Mapping[str, Any] | None = None
 
     def __init__(
         self,
@@ -53,6 +54,7 @@ class TaskSpec:
         kernel_path: Path | str | None = None,
         direction: str = "",
         max_turns: int | None = None,
+        provenance: Mapping[str, Any] | None = None,
         *,
         case_id: str | None = None,
         case_type: str | None = None,
@@ -79,6 +81,9 @@ class TaskSpec:
         object.__setattr__(self, "direction", str(direction).strip())
         object.__setattr__(
             self, "max_turns", None if max_turns is None else int(max_turns)
+        )
+        object.__setattr__(
+            self, "provenance", dict(provenance) if provenance is not None else None
         )
 
     @property
@@ -136,6 +141,11 @@ class TaskSpec:
             direction=str(value.get("direction") or ""),
             max_turns=(
                 None if max_turns_raw is None else int(max_turns_raw)
+            ),
+            provenance=(
+                value.get("provenance")
+                if isinstance(value.get("provenance"), Mapping)
+                else None
             ),
         )
 

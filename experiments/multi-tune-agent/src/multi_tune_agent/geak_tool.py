@@ -95,6 +95,7 @@ class GEAKToolEnvironment:
             kernel_path=source,
             direction=case.direction,
             max_turns=case.max_turns,
+            provenance=case.provenance,
         )
         sandbox = KernelSandbox(
             repository_root=self.config.geak_root,
@@ -393,7 +394,19 @@ class GEAKToolEnvironment:
                 observation["contract_hash"] = metadata.get("contract_hash")
                 observation["operator"] = metadata.get("operator")
                 observation["architecture"] = metadata.get("architecture")
-                observation["provenance"] = metadata.get("provenance", {})
+                metadata_provenance = metadata.get("provenance", {})
+                observation["provenance"] = {
+                    **(
+                        dict(metadata_provenance)
+                        if isinstance(metadata_provenance, Mapping)
+                        else {}
+                    ),
+                    **(
+                        dict(case.provenance)
+                        if isinstance(case.provenance, Mapping)
+                        else {}
+                    ),
+                }
                 observation["trust"] = metadata.get("trust", {})
                 observation["optimization_contract_instruction"] = (
                     "Preserve the supplied generated-kernel contract, shapes, dtypes, "
