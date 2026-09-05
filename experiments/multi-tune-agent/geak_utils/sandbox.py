@@ -406,6 +406,14 @@ class KernelSandbox:
             )
         if len(content.encode("utf-8")) > 4 * 1024 * 1024:
             raise SandboxError("refusing to write a source file larger than 4 MiB")
+        if re.search(
+            r"<omitted \d+ written characters; use read_file for current source>",
+            content,
+        ):
+            raise SandboxError(
+                "refusing to write a compacted tool-history placeholder; "
+                "read the current source and submit complete code"
+            )
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
 

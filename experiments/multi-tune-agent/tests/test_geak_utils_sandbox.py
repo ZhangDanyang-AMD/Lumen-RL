@@ -138,6 +138,12 @@ def test_source_only_write_boundary_and_path_guards(tmp_path):
     assert "kernel.py" in sandbox.list_files()
     sandbox.write_file("kernel.py", "VALUE = 2\n")
     assert (sandbox.workspace / "kernel.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+    with pytest.raises(SandboxError, match="compacted tool-history placeholder"):
+        sandbox.write_file(
+            "kernel.py",
+            "<omitted 8412 written characters; use read_file for current source>",
+        )
+    assert (sandbox.workspace / "kernel.py").read_text(encoding="utf-8") == "VALUE = 2\n"
     with pytest.raises(SandboxError, match="write blocked"):
         sandbox.write_file("test_kernel.py", "bad\n")
     with pytest.raises(SandboxError, match="write blocked"):
