@@ -108,9 +108,12 @@ def test_sft_collector_records_plan_sources_patch_and_manifest(tmp_path, monkeyp
     assert role_event["payload"]["api_key"] == "<redacted>"
 
 
-def test_config_refuses_to_mislabel_unimplemented_sft_mode(tmp_path):
-    with pytest.raises(ValueError, match="only direction_conditioned"):
-        make_config(tmp_path, sft_task_type="cold_start")
+@pytest.mark.parametrize(
+    "task_type",
+    ["cold_start", "profile_guided", "error_recovery", "regression_balance"],
+)
+def test_config_accepts_implemented_sft_modes(tmp_path, task_type):
+    assert make_config(tmp_path, sft_task_type=task_type).sft_task_type == task_type
 
 
 def test_independent_verify_uses_fresh_workspace_and_frozen_baseline(

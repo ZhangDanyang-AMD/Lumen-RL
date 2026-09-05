@@ -1,0 +1,85 @@
+tasks:
+- id: phase1-triton-gfx942-softmax-square-bf16
+  type: aiter_generated
+  kernel_path: ../examples/tasks/generated/c606442bb1c24b9701ad13c5f2b737de64ec5d04db8a11c8a57e0ced00c62663
+  direction: 'Generate a standalone TRITON softmax kernel for AMD gfx942. Frozen contract
+    JSON: {"axis":1,"dtype":{"input":"bf16","output":"bf16"},"layout":"row_major","operator":"softmax","shape":{"M":1024,"N":1024}}.
+    Independent oracle JSON: {"method":"torch.softmax","tier":"pure_torch"}. Implement
+    independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or
+    the oracle at runtime. Create a deterministic GEAK harness and require compile,
+    correctness, performance, and fresh-workspace verification.'
+  operator: softmax
+  backend: triton
+  architecture: gfx942
+  contract_hash: c606442bb1c24b9701ad13c5f2b737de64ec5d04db8a11c8a57e0ced00c62663
+  provenance:
+    contract_hash: c606442bb1c24b9701ad13c5f2b737de64ec5d04db8a11c8a57e0ced00c62663
+    generation_method: llm_direct
+    generator: multi_tune_agent.template_bootstrap
+    model: Qwen/Qwen3-Coder-Next
+    source_artifacts: []
+    source_request: 'Generate a standalone TRITON softmax kernel for AMD gfx942. Frozen
+      contract JSON: {"axis":1,"dtype":{"input":"bf16","output":"bf16"},"layout":"row_major","operator":"softmax","shape":{"M":1024,"N":1024}}.
+      Independent oracle JSON: {"method":"torch.softmax","tier":"pure_torch"}. Implement
+      independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators,
+      or the oracle at runtime. Create a deterministic GEAK harness and require compile,
+      correctness, performance, and fresh-workspace verification.'
+    case_seed:
+      source_repo: https://github.com/ROCm/aiter.git
+      source_branch: main
+      source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+      source_license: MIT
+      source_candidate_id: cand-softmax-square-bf16
+      source_test_path: op_tests/triton_tests/test_softmax.py
+      source_test_id: test_softmax
+      source_test_sha256: 56b49b9a7c15c22789dd8e8432f51b8b343408f14f84d92173223616f2fe7925
+      source_kernel_path: null
+      source_kernel_sha256: null
+      contract_family_id: CF-EW-002
+      source_lineage_id: aiter:test_softmax:test_softmax
+      implementation_family_id: independent:cand-softmax-square-bf16:triton
+      split_group: train
+      split_version: v2
+      target_lane: triton_gfx942
+- id: phase1-triton-gfx942-hip-rmsnorm2d
+  type: aiter_generated
+  kernel_path: ../examples/tasks/generated/50a4ce16c95ca9c464a8a1f739ec21f887eca2d7d261bf507103d45a0045ac14
+  direction: 'Generate a standalone TRITON rms_norm kernel for AMD gfx942. Frozen
+    contract JSON: {"dtype":{"accum":"fp32","input":"bf16","output":"bf16","weight":"bf16"},"layout":"contiguous","operator":"rms_norm","shape":{"M":32,"N":4096}}.
+    Independent oracle JSON: {"method":"torch.nn.functional.rms_norm","tier":"pure_torch"}.
+    Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators,
+    or the oracle at runtime. Create a deterministic GEAK harness and require compile,
+    correctness, performance, and fresh-workspace verification.'
+  operator: rms_norm
+  backend: triton
+  architecture: gfx942
+  contract_hash: 50a4ce16c95ca9c464a8a1f739ec21f887eca2d7d261bf507103d45a0045ac14
+  provenance:
+    contract_hash: 50a4ce16c95ca9c464a8a1f739ec21f887eca2d7d261bf507103d45a0045ac14
+    generation_method: llm_direct
+    generator: multi_tune_agent.template_bootstrap
+    model: Qwen/Qwen3-Coder-Next
+    source_artifacts: []
+    source_request: 'Generate a standalone TRITON rms_norm kernel for AMD gfx942.
+      Frozen contract JSON: {"dtype":{"accum":"fp32","input":"bf16","output":"bf16","weight":"bf16"},"layout":"contiguous","operator":"rms_norm","shape":{"M":32,"N":4096}}.
+      Independent oracle JSON: {"method":"torch.nn.functional.rms_norm","tier":"pure_torch"}.
+      Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch
+      operators, or the oracle at runtime. Create a deterministic GEAK harness and
+      require compile, correctness, performance, and fresh-workspace verification.'
+    case_seed:
+      source_repo: https://github.com/ROCm/aiter.git
+      source_branch: main
+      source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+      source_license: MIT
+      source_candidate_id: cand-hip-rmsnorm2d
+      source_test_path: op_tests/test_rmsnorm2d.py
+      source_test_id: test_rmsnorm2d
+      source_test_sha256: 3813dc34558d086bd50cb093f0d01e990cbc421538160cdd57856a279c94eaa3
+      source_kernel_path: null
+      source_kernel_sha256: null
+      contract_family_id: CF-NORM-RMS-002
+      source_lineage_id: aiter:test_rmsnorm2d:test_rmsnorm2d
+      implementation_family_id: independent:cand-hip-rmsnorm2d:triton
+      split_group: train
+      split_version: v2
+      target_lane: triton_gfx942

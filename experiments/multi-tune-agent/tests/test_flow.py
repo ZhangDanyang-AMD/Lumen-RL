@@ -185,3 +185,29 @@ def test_final_report_does_not_publish_incorrect_kernel_speed():
     assert performance["speedup_geomean"] is None
     assert performance["final_kernel_per_case_ms"] == {}
 
+
+@pytest.mark.parametrize("task_type", ["cold_start", "profile_guided"])
+def test_non_direction_modes_skip_tech_lead_planning(
+    tmp_path, monkeypatch, task_type
+):
+    import multi_tune_agent.flow as flow_module
+
+    monkeypatch.setattr(flow_module, "GEAKToolEnvironment", FakeEnvironment)
+    monkeypatch.setattr(flow_module, "RolePromptLibrary", FakePrompts)
+    config = MultiTuneConfig(
+        geak_root=tmp_path,
+        cases_path=tmp_path / "cases.yaml",
+        trajectory_root=tmp_path / "runs",
+        max_rounds=1,
+        engineers_per_round=2,
+        sft_task_type=task_type,
+    )
+    summary = asyncio.run(
+        MultiTuneFlow(config, FakeBackend()).run_case(
+            "demo", user_request="Optimize independently."
+        )
+    )
+    assert "tech_lead_analyze" not in summary["timing_seconds"]
+    assert len(summary["rounds"][0]["candidates"]) == 1
+    assert summary["rounds"][0]["directions"][0]["direction_id"] == task_type
+

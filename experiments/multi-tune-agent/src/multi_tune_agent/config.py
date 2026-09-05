@@ -82,11 +82,6 @@ class MultiTuneConfig:
                 "sft_task_type must be one of: %s"
                 % ", ".join(sorted(allowed_sft_task_types))
             )
-        if self.sft_enabled and self.sft_task_type != "direction_conditioned":
-            raise ValueError(
-                "only direction_conditioned SFT collection is implemented; "
-                "refusing to mislabel another task type"
-            )
         if isinstance(self.bootstrap_min_aiter_score, bool):
             raise ValueError("bootstrap_min_aiter_score must be an integer")
         try:

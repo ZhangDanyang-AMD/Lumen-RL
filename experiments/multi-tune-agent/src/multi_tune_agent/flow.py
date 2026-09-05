@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import math
 import time
 from pathlib import Path
@@ -33,17 +35,26 @@ class MultiTuneFlow:
         case_ids: Optional[list[str]] = None,
         *,
         user_request: Optional[str] = None,
+        resume_workspace: Optional[Path] = None,
+        resume_context: Optional[Mapping[str, Any]] = None,
     ) -> list[dict[str, Any]]:
         probe_env = GEAKToolEnvironment(self.config)
         selected = case_ids or list(probe_env.cases)
-        if user_request and len(selected) != 1:
-            raise ValueError("a user request can target exactly one case")
+        if (user_request or resume_workspace or resume_context) and len(selected) != 1:
+            raise ValueError("request/resume context can target exactly one case")
         unknown = sorted(set(selected) - set(probe_env.cases))
         if unknown:
             raise ValueError("unknown case ids: %s" % ", ".join(unknown))
         results = []
         for case_id in selected:
-            results.append(await self.run_case(case_id, user_request=user_request))
+            results.append(
+                await self.run_case(
+                    case_id,
+                    user_request=user_request,
+                    resume_workspace=resume_workspace,
+                    resume_context=resume_context,
+                )
+            )
         return results
 
     async def run_case(
@@ -78,6 +89,11 @@ class MultiTuneFlow:
             case_input["resumed_from_workspace"] = str(resume_workspace)
         timing: dict[str, float] = {}
         history: list[dict[str, Any]] = []
+        task_type = self.config.sft_task_type
+        if baseline_override is None and isinstance(resume_context, Mapping):
+            context_baseline = resume_context.get("baseline")
+            if isinstance(context_baseline, Mapping):
+                baseline_override = context_baseline
 
         setup_started = time.monotonic()
         create_options: dict[str, Any] = {
@@ -107,6 +123,7 @@ class MultiTuneFlow:
                     "min_improvement": self.config.min_improvement,
                     "target_speedup": self.config.target_speedup,
                     "gpu_ids": self.config.gpu_ids,
+                    "sft_task_type": task_type,
                 },
                 "initial": initial,
                 "resume_context": dict(resume_context or {}),
@@ -129,20 +146,22 @@ class MultiTuneFlow:
         )
         timing["director_setup"] = time.monotonic() - phase_started
 
-        phase_started = time.monotonic()
-        analysis = await structured.run(
-            "tech_lead",
-            "analyze",
-            {
-                "case": case_input,
-                "baseline": initial["baseline"],
-                "source_context": source_context,
-                "resume_context": dict(resume_context or {}),
-                "director_charter": director_setup,
-            },
-            case_type=case.case_type,
-        )
-        timing["tech_lead_analyze"] = time.monotonic() - phase_started
+        analysis: dict[str, Any] = {}
+        if task_type == "direction_conditioned":
+            phase_started = time.monotonic()
+            analysis = await structured.run(
+                "tech_lead",
+                "analyze",
+                {
+                    "case": case_input,
+                    "baseline": initial["baseline"],
+                    "source_context": source_context,
+                    "resume_context": dict(resume_context or {}),
+                    "director_charter": director_setup,
+                },
+                case_type=case.case_type,
+            )
+            timing["tech_lead_analyze"] = time.monotonic() - phase_started
 
         current_session_id = root_session_id
         current_speedup = 1.0
@@ -151,45 +170,56 @@ class MultiTuneFlow:
 
         for round_index in range(1, self.config.max_rounds + 1):
             plan_started = time.monotonic()
-            plan = await structured.run(
-                "tech_lead",
-                "plan_round",
-                {
-                    "round": round_index,
-                    "user_request": user_request or case.direction,
-                    "analysis": analysis,
-                    "current_speedup": current_speedup,
-                    "previous_rounds": history,
-                    "direction_limit": self.config.engineers_per_round,
-                    "allowed_write_paths": initial["allowed_write_paths"],
-                    "direction_constraint": (
-                        "Every direction must be implementable using only allowed_write_paths. "
-                        "Do not propose wrapper, binding, harness, test, or configuration edits "
-                        "unless that exact path is listed."
-                    ),
-                    "required_output": {
-                        "directions": [
-                            {
-                                "id": "unique id",
-                                "title": "short testable hypothesis",
-                                "specialty": "algorithm|memory|compute|host_runtime",
-                                "prompt": "implementation and measurement instructions",
-                            }
-                        ]
+            if task_type == "direction_conditioned":
+                plan = await structured.run(
+                    "tech_lead",
+                    "plan_round",
+                    {
+                        "round": round_index,
+                        "user_request": user_request or case.direction,
+                        "analysis": analysis,
+                        "current_speedup": current_speedup,
+                        "previous_rounds": history,
+                        "direction_limit": self.config.engineers_per_round,
+                        "allowed_write_paths": initial["allowed_write_paths"],
+                        "direction_constraint": (
+                            "Every direction must be implementable using only "
+                            "allowed_write_paths. Do not propose wrapper, binding, "
+                            "harness, test, or configuration edits unless that exact "
+                            "path is listed."
+                        ),
+                        "required_output": {"directions": [{"id": "unique id"}]},
                     },
-                },
-                case_type=case.case_type,
-                round_index=round_index,
-            )
-            timing["round_%d_plan" % round_index] = time.monotonic() - plan_started
-            directions = self._directions(plan, self.config.engineers_per_round)
-            if collector is not None:
-                collector.record_plan(
-                    round_index,
-                    plan,
-                    [item.__dict__ for item in directions],
-                    user_request=user_request or case.direction,
+                    case_type=case.case_type,
+                    round_index=round_index,
                 )
+                directions = self._directions(
+                    plan, self.config.engineers_per_round
+                )
+            else:
+                plan = {}
+                directions = [
+                    Direction(task_type, task_type, task_type, task_type)
+                ]
+            timing["round_%d_plan" % round_index] = time.monotonic() - plan_started
+            if collector is not None:
+                if task_type == "direction_conditioned":
+                    collector.record_plan(
+                        round_index,
+                        plan,
+                        [item.__dict__ for item in directions],
+                        user_request=user_request or case.direction,
+                    )
+
+            frozen_input = self._frozen_input(
+                task_type,
+                case_input,
+                initial["baseline"],
+                source_context,
+                resume_context or {},
+            )
+            if collector is not None:
+                collector.record_frozen_input(round_index, frozen_input)
 
             engineer_started = time.monotonic()
             outputs = await gather_limited(
@@ -201,6 +231,8 @@ class MultiTuneFlow:
                         direction,
                         max_turns=self.config.engineer_tool_rounds,
                         round_index=round_index,
+                        task_type=task_type,
+                        frozen_input=frozen_input,
                     )
                     for direction in directions
                 ],
@@ -217,11 +249,11 @@ class MultiTuneFlow:
                     environment.independent_verify, output.session_id
                 )
                 evaluation = dict(result.get("evaluation") or {})
-                accepted = bool(
-                    result.get("ok")
-                    and evaluation.get("correct")
-                    and float(evaluation.get("speedup_geomean") or 0.0)
-                    >= self.config.candidate_floor
+                accepted = self._candidate_accepted(
+                    task_type,
+                    result,
+                    evaluation,
+                    initial["baseline"],
                 )
                 candidate = Candidate(
                     candidate_id="%s-r%d" % (direction.direction_id, round_index),
@@ -265,7 +297,7 @@ class MultiTuneFlow:
             )
             winner = accepted_candidates[0] if accepted_candidates else None
 
-            if len(accepted_candidates) >= 2:
+            if task_type == "direction_conditioned" and len(accepted_candidates) >= 2:
                 integrate_started = time.monotonic()
                 integration = await code_agent.integrator(
                     case_id,
@@ -308,8 +340,11 @@ class MultiTuneFlow:
 
             committed = bool(
                 winner
-                and winner.speedup
-                >= current_speedup * (1.0 + self.config.min_improvement)
+                and (
+                    task_type == "error_recovery"
+                    or winner.speedup
+                    >= current_speedup * (1.0 + self.config.min_improvement)
+                )
             )
             if committed and winner is not None:
                 current_session_id = winner.session_id
@@ -367,7 +402,10 @@ class MultiTuneFlow:
             and current_session_id != root_session_id
             and final_result.get("ok")
             and final_evaluation.get("correct")
-            and float(final_evaluation.get("speedup_geomean") or 0.0) > 1.0
+            and (
+                task_type == "error_recovery"
+                or float(final_evaluation.get("speedup_geomean") or 0.0) >= 1.0
+            )
         )
         summary = {
             "case_id": case_id,
@@ -392,6 +430,116 @@ class MultiTuneFlow:
         if collector is not None:
             collector.finalize(finalized)
         return finalized
+
+    @staticmethod
+    def _frozen_input(
+        task_type: str,
+        case_input: Mapping[str, Any],
+        baseline: Mapping[str, Any],
+        source_context: Mapping[str, Any],
+        resume_context: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        source_hash = hashlib.sha256(
+            json.dumps(source_context, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+        provenance = case_input.get("provenance")
+        case_seed = (
+            provenance.get("case_seed")
+            if isinstance(provenance, Mapping)
+            else None
+        )
+        split_group = (
+            case_seed.get("split_group")
+            if isinstance(case_seed, Mapping)
+            else None
+        )
+        if split_group == "held_out":
+            raise ValueError("held-out cases cannot be used for SFT collection")
+        frozen: dict[str, Any] = {
+            "contract": dict(case_input),
+            "parent_source": dict(source_context),
+            "parent_source_hash": source_hash,
+            "baseline": dict(baseline),
+            "source_lineage_id": (
+                case_seed.get("source_lineage_id")
+                if isinstance(case_seed, Mapping)
+                else None
+            ),
+            "split_group": split_group,
+            "split_version": (
+                case_seed.get("split_version")
+                if isinstance(case_seed, Mapping)
+                else None
+            ),
+        }
+        if task_type == "profile_guided":
+            profile = resume_context.get("profile")
+            frozen["profile"] = (
+                dict(profile)
+                if isinstance(profile, Mapping)
+                else {
+                    "schema_version": "geak_parent_profile_v1",
+                    "source_hash": source_hash,
+                    "per_case_ms": dict(baseline.get("per_case_ms") or {}),
+                    "geomean_ms": baseline.get("geomean_ms"),
+                    "measurement": "independent_parent_baseline",
+                }
+            )
+            if frozen["profile"].get("source_hash") != source_hash:
+                raise ValueError("profile source hash does not match parent source")
+        elif task_type == "error_recovery":
+            failure = resume_context.get("error_feedback") or resume_context.get(
+                "last_failure"
+            )
+            if not isinstance(failure, Mapping) or not failure:
+                raise ValueError("error_recovery requires exact frozen error feedback")
+            frozen["error_feedback"] = dict(failure)
+        elif task_type == "regression_balance":
+            report = resume_context.get("per_case_benchmark")
+            constraints = resume_context.get("regression_constraints")
+            if not isinstance(report, Mapping) or not report:
+                raise ValueError(
+                    "regression_balance requires a frozen per-case benchmark"
+                )
+            if not isinstance(constraints, Mapping) or not constraints:
+                raise ValueError(
+                    "regression_balance requires frozen regression constraints"
+                )
+            frozen["per_case_benchmark"] = dict(report)
+            frozen["regression_constraints"] = dict(constraints)
+        return frozen
+
+    @staticmethod
+    def _candidate_accepted(
+        task_type: str,
+        result: Mapping[str, Any],
+        evaluation: Mapping[str, Any],
+        baseline: Mapping[str, Any],
+    ) -> bool:
+        if not (
+            result.get("ok")
+            and evaluation.get("compiled")
+            and evaluation.get("correct")
+        ):
+            return False
+        if task_type == "error_recovery":
+            return True
+        if task_type == "regression_balance":
+            base = evaluation.get("baseline_ms") or baseline.get("per_case_ms")
+            candidate = evaluation.get("candidate_ms")
+            if not isinstance(base, Mapping) or not isinstance(candidate, Mapping):
+                return False
+            shared = set(base) & set(candidate)
+            return bool(shared) and all(
+                float(candidate[name]) <= float(base[name]) for name in shared
+            )
+        return (
+            float(evaluation.get("speedup_geomean") or 0.0)
+            >= 1.0
+            if task_type in {"cold_start", "profile_guided"}
+            else float(evaluation.get("speedup_geomean") or 0.0)
+            >= 1.0
+        )
 
     @staticmethod
     def _final_kernel_performance(

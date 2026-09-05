@@ -388,6 +388,24 @@ class TemplateBootstrapper:
             contract_hash=contract.contract_hash[:12],
         )
         if target.is_dir() and not target.is_symlink():
+            config_path = target / "config.yaml"
+            try:
+                existing_config = yaml.safe_load(
+                    config_path.read_text(encoding="utf-8")
+                )
+                if isinstance(existing_config, dict):
+                    for mode in ("compile", "correctness", "performance"):
+                        existing_config[f"{mode}_command"] = [
+                            _canonical_runner_command(mode)
+                        ]
+                    config_path.write_text(
+                        yaml.safe_dump(
+                            existing_config, sort_keys=False, allow_unicode=True
+                        ),
+                        encoding="utf-8",
+                    )
+            except (OSError, yaml.YAMLError):
+                pass
             report = validate_generated_template(target, contract.expected_contract)
             if report.valid:
                 metadata = json.loads((target / "metadata.json").read_text("utf-8"))
@@ -457,6 +475,46 @@ class TemplateBootstrapper:
             )
 
         if not candidates:
+            retry_error: Optional[BootstrapError] = None
+            try:
+                self._event("direct_retry_request")
+                retry_bundle = self._request_bundle(
+                    self._direct_retry_messages(contract, direct_report)
+                )
+                self._install_bundle(
+                    target, retry_bundle, contract, "llm_direct_retry", ()
+                )
+                retry_report = validate_generated_template(
+                    target, contract.expected_contract
+                )
+            except Exception as exc:
+                retry_error = (
+                    exc
+                    if isinstance(exc, BootstrapError)
+                    else BootstrapError(
+                        "direct retry response was unusable: %s" % exc
+                    )
+                )
+                retry_report = ValidationReport(
+                    target,
+                    (
+                        ValidationIssue(
+                            "generation-retry-response",
+                            str(exc),
+                            severity="error",
+                        ),
+                    ),
+                )
+            self._event(
+                "direct_retry_validation",
+                valid=retry_report.valid,
+                errors=len(retry_report.errors),
+            )
+            if retry_report.valid:
+                self._event("direct_retry_ready")
+                return TemplateDraft(
+                    target, contract, retry_report, "llm_direct_retry"
+                )
             failed = (
                 self._preserve_failed(target, contract.contract_hash)
                 if target.exists() or target.is_symlink()
@@ -466,13 +524,15 @@ class TemplateBootstrapper:
                 (
                     str(direct_error)
                     if direct_error is not None
+                    else str(retry_error)
+                    if retry_error is not None
                     else "direct template failed validation and no high-confidence "
                     "AITER evidence was found"
                 ),
-                validation_report=direct_report,
+                validation_report=retry_report,
                 candidate_summaries=summaries,
                 draft_path=failed,
-            )
+            ) from retry_error
 
         excerpts, artifacts = self._candidate_evidence(candidates[0])
         repair_report = direct_report
@@ -573,6 +633,104 @@ class TemplateBootstrapper:
                 ),
             },
         ]
+
+    def _direct_retry_messages(
+        self, contract: KernelContract, report: ValidationReport
+    ) -> list[dict[str, str]]:
+        return [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    "Regenerate the entire four-file bundle. The previous response "
+                    "failed these deterministic static checks:\n%s\n\nContract:\n%s"
+                    % (
+                        json.dumps(
+                            [str(issue) for issue in report.errors], indent=2
+                        ),
+                        json.dumps(contract.as_dict(), indent=2, sort_keys=True),
+                    )
+                ),
+            },
+        ]
+
+    def repair_after_gpu_failure(
+        self,
+        draft: TemplateDraft,
+        gate: TemplateGateResult,
+        *,
+        attempt: int,
+    ) -> TemplateDraft:
+        """Regenerate a complete bundle from exact GPU-gate diagnostics."""
+
+        if gate.trusted:
+            raise ValueError("a trusted template does not require GPU repair")
+        previous = {
+            relative: (draft.path / relative).read_text(encoding="utf-8")
+            for relative in _BUNDLE_PATHS
+        }
+        diagnostics = {
+            "errors": list(gate.errors),
+            "commands": {
+                mode: dict(summary)
+                for mode, summary in gate.command_summaries.items()
+            },
+        }
+        self._event("gpu_repair_request", attempt=attempt, errors=len(gate.errors))
+        bundle = self._request_bundle(
+            [
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        "Regenerate the entire four-file bundle. Preserve the frozen "
+                        "contract and independent oracle; do not weaken tolerances or "
+                        "gates. The prior bundle passed static validation but failed "
+                        "the GPU trust gate.\n\nGPU diagnostics:\n%s\n\nContract:\n%s"
+                        "\n\nPrevious bundle:\n%s"
+                        % (
+                            json.dumps(diagnostics, indent=2, sort_keys=True),
+                            json.dumps(
+                                draft.contract.as_dict(), indent=2, sort_keys=True
+                            ),
+                            json.dumps(previous, indent=2, sort_keys=True),
+                        )
+                    ),
+                },
+            ]
+        )
+        self._preserve_failed(draft.path, draft.contract.contract_hash)
+        self._install_bundle(
+            draft.path,
+            bundle,
+            draft.contract,
+            "llm_gpu_repair",
+            (),
+        )
+        report = validate_generated_template(
+            draft.path, draft.contract.expected_contract
+        )
+        self._event(
+            "gpu_repair_validation",
+            attempt=attempt,
+            valid=report.valid,
+            errors=len(report.errors),
+        )
+        if not report.valid:
+            failed = self._preserve_failed(
+                draft.path, draft.contract.contract_hash
+            )
+            raise BootstrapError(
+                "GPU-informed template repair failed static validation",
+                validation_report=report,
+                draft_path=failed,
+            )
+        return TemplateDraft(
+            draft.path,
+            draft.contract,
+            report,
+            "llm_gpu_repair",
+        )
 
     def _request_bundle(
         self, messages: Sequence[Mapping[str, Any]]
@@ -690,8 +848,19 @@ class TemplateBootstrapper:
                 and targets
                 and all(isinstance(name, str) and name.strip() for name in targets)
             ):
+                kernel_config = config.get("kernel")
+                declared_target = (
+                    kernel_config.get("name")
+                    if isinstance(kernel_config, Mapping)
+                    else None
+                )
                 inferred_targets = _infer_target_kernel_functions(
-                    str(bundle["kernel.py"])
+                    str(bundle["kernel.py"]),
+                    declared_target=(
+                        str(declared_target).strip()
+                        if declared_target is not None
+                        else None
+                    ),
                 )
                 if inferred_targets:
                     config["target_kernel_functions"] = inferred_targets
@@ -699,9 +868,7 @@ class TemplateBootstrapper:
             # choices. Canonicalize them so an otherwise useful LLM draft
             # cannot fail repeatedly by emitting multiple shell commands.
             for mode in ("compile", "correctness", "performance"):
-                config[f"{mode}_command"] = [
-                    f"python3 scripts/task_runner.py {mode}"
-                ]
+                config[f"{mode}_command"] = [_canonical_runner_command(mode)]
             rendered["config.yaml"] = yaml.safe_dump(
                 config, sort_keys=False, allow_unicode=True
             )
@@ -820,11 +987,28 @@ def _ensure_template_root_importable(runner: str) -> str:
     return "".join(lines)
 
 
-def _infer_target_kernel_functions(kernel: str) -> list[str]:
+def _canonical_runner_command(mode: str) -> str:
+    return (
+        "docker exec -e HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-1} "
+        '-w "$PWD" ${GEAK_CONTAINER_NAME:-geak-phase1-vllm} '
+        "python3 scripts/task_runner.py %s"
+    ) % mode
+
+
+def _infer_target_kernel_functions(
+    kernel: str, *, declared_target: Optional[str] = None
+) -> list[str]:
     try:
         tree = ast.parse(kernel, filename="kernel.py")
     except SyntaxError:
         return []
+    definitions = {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    if declared_target and declared_target in definitions:
+        return [declared_target]
     for node in tree.body:
         if not isinstance(node, (ast.Assign, ast.AnnAssign)):
             continue

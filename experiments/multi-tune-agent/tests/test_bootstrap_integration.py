@@ -124,6 +124,9 @@ def test_failed_gate_never_catalogs(tmp_path, monkeypatch):
         def generate(self, contract):
             return draft
 
+        def repair_after_gpu_failure(self, current, gate, *, attempt):
+            return current
+
     class Gate:
         trusted = False
         errors = ("correctness failed",)

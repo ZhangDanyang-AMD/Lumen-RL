@@ -168,27 +168,43 @@ class CodeRoleAgent:
         case_id: str,
         case_type: str,
         parent_session_id: str,
-        direction: Direction,
+        direction: Direction | None,
         *,
         max_turns: int,
         round_index: int,
+        task_type: str = "direction_conditioned",
+        frozen_input: Mapping[str, Any] | None = None,
     ) -> AgentLoopOutput:
+        visible = {
+            "task_type": task_type,
+            "case": self.environment.case_observation(case_id),
+            **dict(frozen_input or {}),
+        }
+        if task_type == "direction_conditioned":
+            if direction is None:
+                raise ValueError("direction_conditioned requires a frozen direction")
+            visible["direction"] = direction.__dict__
+        instruction = {
+            "cold_start": "Optimize independently from the frozen contract and baseline.",
+            "profile_guided": "Optimize using only the frozen parent profile.",
+            "direction_conditioned": "Implement and measure the frozen TechLead direction.",
+            "error_recovery": "Repair the failed source using the exact frozen error feedback.",
+            "regression_balance": (
+                "Remove the frozen per-case regressions while preserving correctness."
+            ),
+        }.get(task_type)
+        if instruction is None:
+            raise ValueError("unsupported SFT task type: %s" % task_type)
         messages = [
             {"role": "system", "content": self.prompts.system("engineer", case_type)},
             {
                 "role": "user",
                 "content": (
-                    "Implement and measure this assigned direction in your private "
-                    "workspace. Use the GEAK tool; finish only after correctness and "
+                    instruction
+                    + " Use the GEAK tool; finish only after correctness and "
                     "performance evidence. Preserve every field in the generated "
-                    "kernel contract when one is supplied.\n\nCASE=\n"
-                    + json.dumps(
-                        self.environment.case_observation(case_id),
-                        indent=2,
-                        sort_keys=True,
-                    )
-                    + "\n\nDIRECTION=\n"
-                    + json.dumps(direction.__dict__, indent=2, sort_keys=True)
+                    "kernel contract when one is supplied.\n\nFROZEN_INPUT=\n"
+                    + json.dumps(visible, indent=2, sort_keys=True)
                 ),
             },
         ]
@@ -205,7 +221,13 @@ class CodeRoleAgent:
                 "parent_session_id": parent_session_id,
             },
         )
-        self._record_loop(output, "engineer", "optimize", round_index, direction.direction_id)
+        self._record_loop(
+            output,
+            "engineer",
+            "optimize",
+            round_index,
+            direction.direction_id if direction is not None else task_type,
+        )
         return output
 
     async def integrator(

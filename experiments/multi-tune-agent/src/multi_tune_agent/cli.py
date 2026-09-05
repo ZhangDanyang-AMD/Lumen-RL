@@ -447,21 +447,44 @@ def _bootstrap_kernel_task(
                 % (phase, ": " + details if details else "")
             )
 
-        draft = TemplateBootstrapper(
+        bootstrapper = TemplateBootstrapper(
             backend=backend,
             draft_root=config.generated_template_root.parent / ".generated",
             aiter_root=config.aiter_root,
             minimum_aiter_score=config.bootstrap_min_aiter_score,
             event_sink=bootstrap_event,
-        ).generate(contract)
-        output_fn("[lumen-code] Running compile, correctness, and performance gate")
-        gate = run_template_gpu_gate(
-            draft,
-            geak_root=config.geak_root,
-            run_root=config.trajectory_root / "template-validation",
-            gpu_ids=config.gpu_ids,
-            command_timeout=config.command_timeout,
         )
+        draft = bootstrapper.generate(contract)
+        gate = None
+        for gate_attempt in range(3):
+            output_fn(
+                "[lumen-code] Running compile, correctness, and performance gate"
+            )
+            gate = run_template_gpu_gate(
+                draft,
+                geak_root=config.geak_root,
+                run_root=config.trajectory_root / "template-validation",
+                gpu_ids=config.gpu_ids,
+                command_timeout=config.command_timeout,
+            )
+            if gate.trusted or gate_attempt == 2:
+                break
+            output_fn(
+                "[lumen-code] GPU gate failed; regenerating the complete template "
+                "from exact diagnostics (%d/2)" % (gate_attempt + 1)
+            )
+            try:
+                draft = bootstrapper.repair_after_gpu_failure(
+                    draft, gate, attempt=gate_attempt + 1
+                )
+            except BootstrapError as exc:
+                output_fn(
+                    "[lumen-code] GPU-informed repair response was unusable: %s"
+                    % exc
+                )
+                if gate_attempt == 1:
+                    break
+        assert gate is not None
         if not gate.trusted:
             output_fn("[lumen-code] Template gate failed; nothing was cataloged.")
             for error in gate.errors:
@@ -510,9 +533,14 @@ def _generate_kernel_task_noninteractive(
     *,
     case_id: str,
     request: str,
+    recognized_contract: Mapping[str, Any] | None = None,
     output_fn=print,
 ) -> GeneratedKernelTask | Any:
-    recognized = recognize_kernel_request(request, backend)
+    recognized = (
+        dict(recognized_contract)
+        if recognized_contract is not None
+        else recognize_kernel_request(request, backend)
+    )
     missing = _missing_kernel_fields(recognized)
     if missing:
         raise ValueError(
@@ -616,6 +644,11 @@ def _run_generation_manifest(
                     backend,
                     case_id=case_id,
                     request=request,
+                    recognized_contract=(
+                        item.get("recognized_contract")
+                        if isinstance(item.get("recognized_contract"), Mapping)
+                        else None
+                    ),
                     output_fn=(
                         (lambda message: print("[%s] %s" % (case_id, message)))
                         if stream
@@ -687,6 +720,23 @@ def build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("run")
     run.add_argument("--case", action="append", dest="cases")
     run.add_argument("--request", help="natural-language objective for one case")
+    run.add_argument("--resume-workspace", type=Path)
+    run.add_argument(
+        "--context-json",
+        type=Path,
+        help="frozen mode context for recovery/profile/regression collection",
+    )
+    run.add_argument(
+        "--sft-task-type",
+        choices=(
+            "cold_start",
+            "profile_guided",
+            "direction_conditioned",
+            "error_recovery",
+            "regression_balance",
+        ),
+        help="override the configured SFT collection mode",
+    )
     run.add_argument(
         "--stream", action="store_true", help="print role/tool progress while running"
     )
@@ -1038,11 +1088,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.request and (not args.cases or len(args.cases) != 1):
         parser.error("--request requires exactly one --case")
+    if (args.resume_workspace or args.context_json) and (
+        not args.cases or len(args.cases) != 1
+    ):
+        parser.error("--resume-workspace/--context-json require exactly one --case")
+    if args.sft_task_type:
+        config = replace(config, sft_task_type=args.sft_task_type)
+    mode_context = (
+        json.loads(args.context_json.expanduser().read_text(encoding="utf-8"))
+        if args.context_json
+        else None
+    )
     backend = _model_backend(config)
     summaries = asyncio.run(
         MultiTuneFlow(
             config, backend, event_sink=_console_event if args.stream else None
-        ).run_all(args.cases, user_request=args.request)
+        ).run_all(
+            args.cases,
+            user_request=args.request,
+            resume_workspace=(
+                args.resume_workspace.expanduser().resolve()
+                if args.resume_workspace
+                else None
+            ),
+            resume_context=mode_context,
+        )
     )
     print(json.dumps(summaries, indent=2, sort_keys=True, default=str))
     return 0 if all(item["status"] == "success" for item in summaries) else 2

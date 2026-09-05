@@ -1,0 +1,1027 @@
+version: 1
+schema_version: geak_phase1_generation_requests_v1
+source_catalog: /home/danyzhan/Lumen-RL/experiments/multi-tune-agent/cases/phase1-case-candidates.yaml
+source_catalog_sha256: 14a25859f0b066fdb9d5789e421df8071dd54fde88e448998137239d708a2a76
+split_manifest: /home/danyzhan/phase1_control/splits/v2/manifest.json
+split_manifest_sha256: f47a146195e9e8767b35576797a9d7f0ed596fd226b003b4f2fd98b078af2091
+selection:
+  priority: P0
+  split: train
+  architecture: gfx942
+  explicit_contract_variants: true
+  existing_production_templates: revalidate_separately
+requests:
+- id: phase1-triton-gfx942-a16w16-router-bf16
+  request: 'Generate a standalone TRITON gemm kernel for AMD gfx942. Frozen contract JSON: {"dtype":{"accum":"fp32","input":"bf16","output":"bf16","weight":"bf16"},"layout":"TN","operator":"gemm","shape":{"K":256,"M":32,"N":7168}}.
+    Independent oracle JSON: {"method":"torch.nn.functional.linear","tier":"pure_torch"}. Implement independently; do not
+    call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and
+    require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/ROCm/aiter.git
+    source_branch: main
+    source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    source_license: MIT
+    source_candidate_id: cand-a16w16-router-bf16
+    source_test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    source_test_id: test_gemm_a16_w16
+    source_test_sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    source_kernel_path: null
+    source_kernel_sha256: null
+    contract_family_id: CF-TG-003
+    source_lineage_id: aiter:test_gemm_a16w16:test_gemm_a16_w16
+    implementation_family_id: independent:cand-a16w16-router-bf16:triton
+    split_group: train
+    split_version: v2
+    target_lane: triton_gfx942
+  recognized_contract:
+    operator: gemm
+    target_gpu: gfx942
+    format: bf16
+    input_dtype: bf16
+    weight_dtype: bf16
+    output_dtype: bf16
+    language: triton
+    dimensions: &id001
+      M: 32
+      N: 7168
+      K: 256
+    m: 32
+    n: 7168
+    k: 256
+- id: phase1-hip-gfx942-a16w16-router-bf16
+  request: 'Generate a standalone HIP gemm kernel for AMD gfx942. Frozen contract JSON: {"dtype":{"accum":"fp32","input":"bf16","output":"bf16","weight":"bf16"},"layout":"TN","operator":"gemm","shape":{"K":256,"M":32,"N":7168}}.
+    Independent oracle JSON: {"method":"torch.nn.functional.linear","tier":"pure_torch"}. Implement independently; do not
+    call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and
+    require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/ROCm/aiter.git
+    source_branch: main
+    source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    source_license: MIT
+    source_candidate_id: cand-a16w16-router-bf16
+    source_test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    source_test_id: test_gemm_a16_w16
+    source_test_sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    source_kernel_path: null
+    source_kernel_sha256: null
+    contract_family_id: CF-TG-003
+    source_lineage_id: aiter:test_gemm_a16w16:test_gemm_a16_w16
+    implementation_family_id: independent:cand-a16w16-router-bf16:hip
+    split_group: train
+    split_version: v2
+    target_lane: hip_gfx942
+  recognized_contract:
+    operator: gemm
+    target_gpu: gfx942
+    format: bf16
+    input_dtype: bf16
+    weight_dtype: bf16
+    output_dtype: bf16
+    language: hip
+    dimensions: *id001
+    m: 32
+    n: 7168
+    k: 256
+- id: phase1-hip-gfx942-hip-a16w16-narrow-n
+  request: 'Generate a standalone HIP gemm kernel for AMD gfx942. Frozen contract JSON: {"dtype":{"accum":"fp32","input":"bf16","output":"bf16","weight":"bf16"},"layout":"TN","operator":"gemm","shape":{"K":8192,"M":128,"N":32}}.
+    Independent oracle JSON: {"method":"torch.nn.functional.linear","tier":"pure_torch"}. Implement independently; do not
+    call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and
+    require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/ROCm/aiter.git
+    source_branch: main
+    source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    source_license: MIT
+    source_candidate_id: cand-hip-a16w16-narrow-n
+    source_test_path: op_tests/test_gemm_a16w16.py
+    source_test_id: test_gemm
+    source_test_sha256: 9fb8baa1f7aa6526e274a907a9e8b25dfa04de76c4cff5350dfdd031e810fb46
+    source_kernel_path: null
+    source_kernel_sha256: null
+    contract_family_id: CF-HG-A16-002
+    source_lineage_id: aiter:test_gemm_a16w16:test_gemm
+    implementation_family_id: independent:cand-hip-a16w16-narrow-n:hip
+    split_group: train
+    split_version: v2
+    target_lane: hip_gfx942
+  recognized_contract:
+    operator: gemm
+    target_gpu: gfx942
+    format: bf16
+    input_dtype: bf16
+    weight_dtype: bf16
+    output_dtype: bf16
+    language: hip
+    dimensions: &id002
+      M: 128
+      N: 32
+      K: 8192
+    m: 128
+    n: 32
+    k: 8192
+- id: phase1-triton-gfx942-hip-a16w16-narrow-n
+  request: 'Generate a standalone TRITON gemm kernel for AMD gfx942. Frozen contract JSON: {"dtype":{"accum":"fp32","input":"bf16","output":"bf16","weight":"bf16"},"layout":"TN","operator":"gemm","shape":{"K":8192,"M":128,"N":32}}.
+    Independent oracle JSON: {"method":"torch.nn.functional.linear","tier":"pure_torch"}. Implement independently; do not
+    call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and
+    require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/ROCm/aiter.git
+    source_branch: main
+    source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    source_license: MIT
+    source_candidate_id: cand-hip-a16w16-narrow-n
+    source_test_path: op_tests/test_gemm_a16w16.py
+    source_test_id: test_gemm
+    source_test_sha256: 9fb8baa1f7aa6526e274a907a9e8b25dfa04de76c4cff5350dfdd031e810fb46
+    source_kernel_path: null
+    source_kernel_sha256: null
+    contract_family_id: CF-HG-A16-002
+    source_lineage_id: aiter:test_gemm_a16w16:test_gemm
+    implementation_family_id: independent:cand-hip-a16w16-narrow-n:triton
+    split_group: train
+    split_version: v2
+    target_lane: triton_gfx942
+  recognized_contract:
+    operator: gemm
+    target_gpu: gfx942
+    format: bf16
+    input_dtype: bf16
+    weight_dtype: bf16
+    output_dtype: bf16
+    language: triton
+    dimensions: *id002
+    m: 128
+    n: 32
+    k: 8192
+- id: phase1-triton-gfx942-batched-bf16-bmn
+  request: 'Generate a standalone TRITON batched_gemm kernel for AMD gfx942. Frozen contract JSON: {"dtype":{"accum":"fp32","input":"bf16","output":"bf16","weight":"bf16"},"layout":"bmn","operator":"batched_gemm","shape":{"B":16,"K":4096,"M":256,"N":1024}}.
+    Independent oracle JSON: {"method":"per-batch F.linear","tier":"pure_torch"}. Implement independently; do not call AITER,
+    CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile,
+    correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/ROCm/aiter.git
+    source_branch: main
+    source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    source_license: MIT
+    source_candidate_id: cand-batched-bf16-bmn
+    source_test_path: op_tests/test_batched_gemm_bf16.py
+    source_test_id: test_gemm
+    source_test_sha256: 1f2cf5482530924ce6a4c7f035d9b446a5f1e0fcb26523f9c7b96ee08b7a6458
+    source_kernel_path: null
+    source_kernel_sha256: null
+    contract_family_id: CF-BG-BF16-001
+    source_lineage_id: aiter:test_batched_gemm_bf16:test_gemm:bmn
+    implementation_family_id: independent:cand-batched-bf16-bmn:triton
+    split_group: train
+    split_version: v2
+    target_lane: triton_gfx942
+  recognized_contract:
+    operator: batched_gemm
+    target_gpu: gfx942
+    format: bf16
+    input_dtype: bf16
+    weight_dtype: bf16
+    output_dtype: bf16
+    language: triton
+    dimensions: &id003
+      B: 16
+      M: 256
+      N: 1024
+      K: 4096
+    m: 256
+    n: 1024
+    k: 4096
+- id: phase1-hip-gfx942-batched-bf16-bmn
+  request: 'Generate a standalone HIP batched_gemm kernel for AMD gfx942. Frozen contract JSON: {"dtype":{"accum":"fp32","input":"bf16","output":"bf16","weight":"bf16"},"layout":"bmn","operator":"batched_gemm","shape":{"B":16,"K":4096,"M":256,"N":1024}}.
+    Independent oracle JSON: {"method":"per-batch F.linear","tier":"pure_torch"}. Implement independently; do not call AITER,
+    CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile,
+    correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/ROCm/aiter.git
+    source_branch: main
+    source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    source_license: MIT
+    source_candidate_id: cand-batched-bf16-bmn
+    source_test_path: op_tests/test_batched_gemm_bf16.py
+    source_test_id: test_gemm
+    source_test_sha256: 1f2cf5482530924ce6a4c7f035d9b446a5f1e0fcb26523f9c7b96ee08b7a6458
+    source_kernel_path: null
+    source_kernel_sha256: null
+    contract_family_id: CF-BG-BF16-001
+    source_lineage_id: aiter:test_batched_gemm_bf16:test_gemm:bmn
+    implementation_family_id: independent:cand-batched-bf16-bmn:hip
+    split_group: train
+    split_version: v2
+    target_lane: hip_gfx942
+  recognized_contract:
+    operator: batched_gemm
+    target_gpu: gfx942
+    format: bf16
+    input_dtype: bf16
+    weight_dtype: bf16
+    output_dtype: bf16
+    language: hip
+    dimensions: *id003
+    m: 256
+    n: 1024
+    k: 4096
+- id: phase1-hip-gfx942-opus-a16w16-model-shape
+  request: 'Generate a standalone HIP gemm kernel for AMD gfx942. Frozen contract JSON: {"dtype":{"accum":"fp32","input":"bf16","output":"bf16","weight":"bf16"},"layout":"TN","operator":"gemm","shape":{"B":1,"K":7168,"M":128,"N":2048}}.
+    Independent oracle JSON: {"method":"fp32 einsum or bmm then cast","tier":"pure_torch"}. Implement independently; do not
+    call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and
+    require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/ROCm/aiter.git
+    source_branch: main
+    source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    source_license: MIT
+    source_candidate_id: cand-opus-a16w16-model-shape
+    source_test_path: op_tests/test_opus_a16w16_gemm.py
+    source_test_id: test_a16w16
+    source_test_sha256: 3e05e3ae793df476b5a5bd0798960f9776c94832bb4605fc5de4906b73fcf123
+    source_kernel_path: null
+    source_kernel_sha256: null
+    contract_family_id: CF-HG-001
+    source_lineage_id: aiter:test_opus_a16w16_gemm:test_a16w16
+    implementation_family_id: independent:cand-opus-a16w16-model-shape:hip
+    split_group: train
+    split_version: v2
+    target_lane: hip_gfx942
+  recognized_contract:
+    operator: gemm
+    target_gpu: gfx942
+    format: bf16
+    input_dtype: bf16
+    weight_dtype: bf16
+    output_dtype: bf16
+    language: hip
+    dimensions: &id004
+      B: 1
+      M: 128
+      N: 2048
+      K: 7168
+    m: 128
+    n: 2048
+    k: 7168
+- id: phase1-triton-gfx942-opus-a16w16-model-shape
+  request: 'Generate a standalone TRITON gemm kernel for AMD gfx942. Frozen contract JSON: {"dtype":{"accum":"fp32","input":"bf16","output":"bf16","weight":"bf16"},"layout":"TN","operator":"gemm","shape":{"B":1,"K":7168,"M":128,"N":2048}}.
+    Independent oracle JSON: {"method":"fp32 einsum or bmm then cast","tier":"pure_torch"}. Implement independently; do not
+    call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and
+    require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/ROCm/aiter.git
+    source_branch: main
+    source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    source_license: MIT
+    source_candidate_id: cand-opus-a16w16-model-shape
+    source_test_path: op_tests/test_opus_a16w16_gemm.py
+    source_test_id: test_a16w16
+    source_test_sha256: 3e05e3ae793df476b5a5bd0798960f9776c94832bb4605fc5de4906b73fcf123
+    source_kernel_path: null
+    source_kernel_sha256: null
+    contract_family_id: CF-HG-001
+    source_lineage_id: aiter:test_opus_a16w16_gemm:test_a16w16
+    implementation_family_id: independent:cand-opus-a16w16-model-shape:triton
+    split_group: train
+    split_version: v2
+    target_lane: triton_gfx942
+  recognized_contract:
+    operator: gemm
+    target_gpu: gfx942
+    format: bf16
+    input_dtype: bf16
+    weight_dtype: bf16
+    output_dtype: bf16
+    language: triton
+    dimensions: *id004
+    m: 128
+    n: 2048
+    k: 7168
+- id: phase1-triton-gfx942-dynamic-per-tensor-quant-int8
+  request: 'Generate a standalone TRITON dynamic_per_tensor_quant kernel for AMD gfx942. Frozen contract JSON: {"dtype":{"input":"bf16","output":"int8","scale":"fp32_scalar"},"layout":"contiguous","operator":"dynamic_per_tensor_quant","shape":{"M":32,"N":8192}}.
+    Independent oracle JSON: {"method":"fp32 absmax divided by dtype max","tier":"pure_torch"}. Implement independently; do
+    not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness
+    and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/ROCm/aiter.git
+    source_branch: main
+    source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    source_license: MIT
+    source_candidate_id: cand-dynamic-per-tensor-quant-int8
+    source_test_path: op_tests/triton_tests/quant/test_quant.py
+    source_test_id: test_dynamic_per_tensor_quant
+    source_test_sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    source_kernel_path: null
+    source_kernel_sha256: null
+    contract_family_id: CF-EW-006-INT8
+    source_lineage_id: aiter:test_quant:test_dynamic_per_tensor_quant
+    implementation_family_id: independent:cand-dynamic-per-tensor-quant-int8:triton
+    split_group: train
+    split_version: v2
+    target_lane: triton_gfx942
+  recognized_contract:
+    operator: dynamic_per_tensor_quant
+    target_gpu: gfx942
+    format: bf16
+    input_dtype: bf16
+    output_dtype: int8
+    language: triton
+    dimensions: &id005
+      M: 32
+      N: 8192
+- id: phase1-hip-gfx942-dynamic-per-tensor-quant-int8
+  request: 'Generate a standalone HIP dynamic_per_tensor_quant kernel for AMD gfx942. Frozen contract JSON: {"dtype":{"input":"bf16","output":"int8","scale":"fp32_scalar"},"layout":"contiguous","operator":"dynamic_per_tensor_quant","shape":{"M":32,"N":8192}}.
+    Independent oracle JSON: {"method":"fp32 absmax divided by dtype max","tier":"pure_torch"}. Implement independently; do
+    not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness
+    and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/ROCm/aiter.git
+    source_branch: main
+    source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    source_license: MIT
+    source_candidate_id: cand-dynamic-per-tensor-quant-int8
+    source_test_path: op_tests/triton_tests/quant/test_quant.py
+    source_test_id: test_dynamic_per_tensor_quant
+    source_test_sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    source_kernel_path: null
+    source_kernel_sha256: null
+    contract_family_id: CF-EW-006-INT8
+    source_lineage_id: aiter:test_quant:test_dynamic_per_tensor_quant
+    implementation_family_id: independent:cand-dynamic-per-tensor-quant-int8:hip
+    split_group: train
+    split_version: v2
+    target_lane: hip_gfx942
+  recognized_contract:
+    operator: dynamic_per_tensor_quant
+    target_gpu: gfx942
+    format: bf16
+    input_dtype: bf16
+    output_dtype: int8
+    language: hip
+    dimensions: *id005
+- id: phase1-triton-gfx942-dynamic-per-tensor-quant-fp8-fnuz
+  request: 'Generate a standalone TRITON dynamic_per_tensor_quant kernel for AMD gfx942. Frozen contract JSON: {"dtype":{"input":"bf16","output":"fp8_e4m3fnuz","scale":"fp32_scalar"},"layout":"contiguous","operator":"dynamic_per_tensor_quant","shape":{"M":32,"N":8192}}.
+    Independent oracle JSON: {"method":"fp32 absmax divided by dtype max","tier":"pure_torch"}. Implement independently; do
+    not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness
+    and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/ROCm/aiter.git
+    source_branch: main
+    source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    source_license: MIT
+    source_candidate_id: cand-dynamic-per-tensor-quant-fp8-fnuz
+    source_test_path: op_tests/triton_tests/quant/test_quant.py
+    source_test_id: test_dynamic_per_tensor_quant
+    source_test_sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    source_kernel_path: null
+    source_kernel_sha256: null
+    contract_family_id: CF-EW-006-FP8-FNUZ
+    source_lineage_id: aiter:test_quant:test_dynamic_per_tensor_quant
+    implementation_family_id: independent:cand-dynamic-per-tensor-quant-fp8-fnuz:triton
+    split_group: train
+    split_version: v2
+    target_lane: triton_gfx942
+  recognized_contract:
+    operator: dynamic_per_tensor_quant
+    target_gpu: gfx942
+    format: bf16
+    input_dtype: bf16
+    output_dtype: fp8_e4m3fnuz
+    language: triton
+    dimensions: &id006
+      M: 32
+      N: 8192
+- id: phase1-hip-gfx942-dynamic-per-tensor-quant-fp8-fnuz
+  request: 'Generate a standalone HIP dynamic_per_tensor_quant kernel for AMD gfx942. Frozen contract JSON: {"dtype":{"input":"bf16","output":"fp8_e4m3fnuz","scale":"fp32_scalar"},"layout":"contiguous","operator":"dynamic_per_tensor_quant","shape":{"M":32,"N":8192}}.
+    Independent oracle JSON: {"method":"fp32 absmax divided by dtype max","tier":"pure_torch"}. Implement independently; do
+    not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness
+    and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/ROCm/aiter.git
+    source_branch: main
+    source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    source_license: MIT
+    source_candidate_id: cand-dynamic-per-tensor-quant-fp8-fnuz
+    source_test_path: op_tests/triton_tests/quant/test_quant.py
+    source_test_id: test_dynamic_per_tensor_quant
+    source_test_sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    source_kernel_path: null
+    source_kernel_sha256: null
+    contract_family_id: CF-EW-006-FP8-FNUZ
+    source_lineage_id: aiter:test_quant:test_dynamic_per_tensor_quant
+    implementation_family_id: independent:cand-dynamic-per-tensor-quant-fp8-fnuz:hip
+    split_group: train
+    split_version: v2
+    target_lane: hip_gfx942
+  recognized_contract:
+    operator: dynamic_per_tensor_quant
+    target_gpu: gfx942
+    format: bf16
+    input_dtype: bf16
+    output_dtype: fp8_e4m3fnuz
+    language: hip
+    dimensions: *id006
+- id: phase1-triton-gfx942-dynamic-per-token-quant-int8
+  request: 'Generate a standalone TRITON dynamic_per_token_quant kernel for AMD gfx942. Frozen contract JSON: {"dtype":{"input":"bf16","output":"int8","scale":"fp32_per_row"},"layout":"contiguous","operator":"dynamic_per_token_quant","shape":{"M":1024,"N":128}}.
+    Independent oracle JSON: {"method":"row-wise absmax divided by dtype max","tier":"pure_torch"}. Implement independently;
+    do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness
+    and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/ROCm/aiter.git
+    source_branch: main
+    source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    source_license: MIT
+    source_candidate_id: cand-dynamic-per-token-quant-int8
+    source_test_path: op_tests/triton_tests/quant/test_quant.py
+    source_test_id: test_dynamic_per_token_quant
+    source_test_sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    source_kernel_path: null
+    source_kernel_sha256: null
+    contract_family_id: CF-Q-PERTOKEN-001-INT8
+    source_lineage_id: aiter:test_quant:test_dynamic_per_token_quant
+    implementation_family_id: independent:cand-dynamic-per-token-quant-int8:triton
+    split_group: train
+    split_version: v2
+    target_lane: triton_gfx942
+  recognized_contract:
+    operator: dynamic_per_token_quant
+    target_gpu: gfx942
+    format: bf16
+    input_dtype: bf16
+    output_dtype: int8
+    language: triton
+    dimensions: &id007
+      M: 1024
+      N: 128
+- id: phase1-hip-gfx942-dynamic-per-token-quant-int8
+  request: 'Generate a standalone HIP dynamic_per_token_quant kernel for AMD gfx942. Frozen contract JSON: {"dtype":{"input":"bf16","output":"int8","scale":"fp32_per_row"},"layout":"contiguous","operator":"dynamic_per_token_quant","shape":{"M":1024,"N":128}}.
+    Independent oracle JSON: {"method":"row-wise absmax divided by dtype max","tier":"pure_torch"}. Implement independently;
+    do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness
+    and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/ROCm/aiter.git
+    source_branch: main
+    source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    source_license: MIT
+    source_candidate_id: cand-dynamic-per-token-quant-int8
+    source_test_path: op_tests/triton_tests/quant/test_quant.py
+    source_test_id: test_dynamic_per_token_quant
+    source_test_sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    source_kernel_path: null
+    source_kernel_sha256: null
+    contract_family_id: CF-Q-PERTOKEN-001-INT8
+    source_lineage_id: aiter:test_quant:test_dynamic_per_token_quant
+    implementation_family_id: independent:cand-dynamic-per-token-quant-int8:hip
+    split_group: train
+    split_version: v2
+    target_lane: hip_gfx942
+  recognized_contract:
+    operator: dynamic_per_token_quant
+    target_gpu: gfx942
+    format: bf16
+    input_dtype: bf16
+    output_dtype: int8
+    language: hip
+    dimensions: *id007
+- id: phase1-triton-gfx942-dynamic-per-token-quant-fp8-fnuz
+  request: 'Generate a standalone TRITON dynamic_per_token_quant kernel for AMD gfx942. Frozen contract JSON: {"dtype":{"input":"bf16","output":"fp8_e4m3fnuz","scale":"fp32_per_row"},"layout":"contiguous","operator":"dynamic_per_token_quant","shape":{"M":1024,"N":128}}.
+    Independent oracle JSON: {"method":"row-wise absmax divided by dtype max","tier":"pure_torch"}. Implement independently;
+    do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness
+    and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/ROCm/aiter.git
+    source_branch: main
+    source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    source_license: MIT
+    source_candidate_id: cand-dynamic-per-token-quant-fp8-fnuz
+    source_test_path: op_tests/triton_tests/quant/test_quant.py
+    source_test_id: test_dynamic_per_token_quant
+    source_test_sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    source_kernel_path: null
+    source_kernel_sha256: null
+    contract_family_id: CF-Q-PERTOKEN-001-FP8-FNUZ
+    source_lineage_id: aiter:test_quant:test_dynamic_per_token_quant
+    implementation_family_id: independent:cand-dynamic-per-token-quant-fp8-fnuz:triton
+    split_group: train
+    split_version: v2
+    target_lane: triton_gfx942
+  recognized_contract:
+    operator: dynamic_per_token_quant
+    target_gpu: gfx942
+    format: bf16
+    input_dtype: bf16
+    output_dtype: fp8_e4m3fnuz
+    language: triton
+    dimensions: &id008
+      M: 1024
+      N: 128
+- id: phase1-hip-gfx942-dynamic-per-token-quant-fp8-fnuz
+  request: 'Generate a standalone HIP dynamic_per_token_quant kernel for AMD gfx942. Frozen contract JSON: {"dtype":{"input":"bf16","output":"fp8_e4m3fnuz","scale":"fp32_per_row"},"layout":"contiguous","operator":"dynamic_per_token_quant","shape":{"M":1024,"N":128}}.
+    Independent oracle JSON: {"method":"row-wise absmax divided by dtype max","tier":"pure_torch"}. Implement independently;
+    do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness
+    and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/ROCm/aiter.git
+    source_branch: main
+    source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    source_license: MIT
+    source_candidate_id: cand-dynamic-per-token-quant-fp8-fnuz
+    source_test_path: op_tests/triton_tests/quant/test_quant.py
+    source_test_id: test_dynamic_per_token_quant
+    source_test_sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    source_kernel_path: null
+    source_kernel_sha256: null
+    contract_family_id: CF-Q-PERTOKEN-001-FP8-FNUZ
+    source_lineage_id: aiter:test_quant:test_dynamic_per_token_quant
+    implementation_family_id: independent:cand-dynamic-per-token-quant-fp8-fnuz:hip
+    split_group: train
+    split_version: v2
+    target_lane: hip_gfx942
+  recognized_contract:
+    operator: dynamic_per_token_quant
+    target_gpu: gfx942
+    format: bf16
+    input_dtype: bf16
+    output_dtype: fp8_e4m3fnuz
+    language: hip
+    dimensions: *id008
+- id: phase1-triton-gfx942-static-per-tensor-quant-large-int8
+  request: 'Generate a standalone TRITON static_per_tensor_quant kernel for AMD gfx942. Frozen contract JSON: {"dtype":{"input":"bf16","output":"int8","scale":"fp32_scalar"},"layout":"contiguous","operator":"static_per_tensor_quant","shape":{"M":2048,"N":1024}}.
+    Independent oracle JSON: {"method":"clamp and round x divided by scale","tier":"pure_torch"}. Implement independently;
+    do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness
+    and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/ROCm/aiter.git
+    source_branch: main
+    source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    source_license: MIT
+    source_candidate_id: cand-static-per-tensor-quant-large-int8
+    source_test_path: op_tests/triton_tests/quant/test_quant.py
+    source_test_id: test_static_per_tensor_quant
+    source_test_sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    source_kernel_path: null
+    source_kernel_sha256: null
+    contract_family_id: CF-EW-005-INT8
+    source_lineage_id: aiter:test_quant:test_static_per_tensor_quant
+    implementation_family_id: independent:cand-static-per-tensor-quant-large-int8:triton
+    split_group: train
+    split_version: v2
+    target_lane: triton_gfx942
+  recognized_contract:
+    operator: static_per_tensor_quant
+    target_gpu: gfx942
+    format: bf16
+    input_dtype: bf16
+    output_dtype: int8
+    language: triton
+    dimensions: &id009
+      M: 2048
+      N: 1024
+- id: phase1-hip-gfx942-static-per-tensor-quant-large-int8
+  request: 'Generate a standalone HIP static_per_tensor_quant kernel for AMD gfx942. Frozen contract JSON: {"dtype":{"input":"bf16","output":"int8","scale":"fp32_scalar"},"layout":"contiguous","operator":"static_per_tensor_quant","shape":{"M":2048,"N":1024}}.
+    Independent oracle JSON: {"method":"clamp and round x divided by scale","tier":"pure_torch"}. Implement independently;
+    do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness
+    and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/ROCm/aiter.git
+    source_branch: main
+    source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    source_license: MIT
+    source_candidate_id: cand-static-per-tensor-quant-large-int8
+    source_test_path: op_tests/triton_tests/quant/test_quant.py
+    source_test_id: test_static_per_tensor_quant
+    source_test_sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    source_kernel_path: null
+    source_kernel_sha256: null
+    contract_family_id: CF-EW-005-INT8
+    source_lineage_id: aiter:test_quant:test_static_per_tensor_quant
+    implementation_family_id: independent:cand-static-per-tensor-quant-large-int8:hip
+    split_group: train
+    split_version: v2
+    target_lane: hip_gfx942
+  recognized_contract:
+    operator: static_per_tensor_quant
+    target_gpu: gfx942
+    format: bf16
+    input_dtype: bf16
+    output_dtype: int8
+    language: hip
+    dimensions: *id009
+- id: phase1-triton-gfx942-static-per-tensor-quant-large-fp8-fnuz
+  request: 'Generate a standalone TRITON static_per_tensor_quant kernel for AMD gfx942. Frozen contract JSON: {"dtype":{"input":"bf16","output":"fp8_e4m3fnuz","scale":"fp32_scalar"},"layout":"contiguous","operator":"static_per_tensor_quant","shape":{"M":2048,"N":1024}}.
+    Independent oracle JSON: {"method":"clamp and round x divided by scale","tier":"pure_torch"}. Implement independently;
+    do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness
+    and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/ROCm/aiter.git
+    source_branch: main
+    source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    source_license: MIT
+    source_candidate_id: cand-static-per-tensor-quant-large-fp8-fnuz
+    source_test_path: op_tests/triton_tests/quant/test_quant.py
+    source_test_id: test_static_per_tensor_quant
+    source_test_sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    source_kernel_path: null
+    source_kernel_sha256: null
+    contract_family_id: CF-EW-005-FP8-FNUZ
+    source_lineage_id: aiter:test_quant:test_static_per_tensor_quant
+    implementation_family_id: independent:cand-static-per-tensor-quant-large-fp8-fnuz:triton
+    split_group: train
+    split_version: v2
+    target_lane: triton_gfx942
+  recognized_contract:
+    operator: static_per_tensor_quant
+    target_gpu: gfx942
+    format: bf16
+    input_dtype: bf16
+    output_dtype: fp8_e4m3fnuz
+    language: triton
+    dimensions: &id010
+      M: 2048
+      N: 1024
+- id: phase1-hip-gfx942-static-per-tensor-quant-large-fp8-fnuz
+  request: 'Generate a standalone HIP static_per_tensor_quant kernel for AMD gfx942. Frozen contract JSON: {"dtype":{"input":"bf16","output":"fp8_e4m3fnuz","scale":"fp32_scalar"},"layout":"contiguous","operator":"static_per_tensor_quant","shape":{"M":2048,"N":1024}}.
+    Independent oracle JSON: {"method":"clamp and round x divided by scale","tier":"pure_torch"}. Implement independently;
+    do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness
+    and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/ROCm/aiter.git
+    source_branch: main
+    source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    source_license: MIT
+    source_candidate_id: cand-static-per-tensor-quant-large-fp8-fnuz
+    source_test_path: op_tests/triton_tests/quant/test_quant.py
+    source_test_id: test_static_per_tensor_quant
+    source_test_sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    source_kernel_path: null
+    source_kernel_sha256: null
+    contract_family_id: CF-EW-005-FP8-FNUZ
+    source_lineage_id: aiter:test_quant:test_static_per_tensor_quant
+    implementation_family_id: independent:cand-static-per-tensor-quant-large-fp8-fnuz:hip
+    split_group: train
+    split_version: v2
+    target_lane: hip_gfx942
+  recognized_contract:
+    operator: static_per_tensor_quant
+    target_gpu: gfx942
+    format: bf16
+    input_dtype: bf16
+    output_dtype: fp8_e4m3fnuz
+    language: hip
+    dimensions: *id010
+- id: phase1-hip-gfx942-hip-rmsnorm2d
+  request: 'Generate a standalone HIP rms_norm kernel for AMD gfx942. Frozen contract JSON: {"dtype":{"accum":"fp32","input":"bf16","output":"bf16","weight":"bf16"},"layout":"contiguous","operator":"rms_norm","shape":{"M":32,"N":4096}}.
+    Independent oracle JSON: {"method":"torch.nn.functional.rms_norm","tier":"pure_torch"}. Implement independently; do not
+    call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and
+    require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/ROCm/aiter.git
+    source_branch: main
+    source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    source_license: MIT
+    source_candidate_id: cand-hip-rmsnorm2d
+    source_test_path: op_tests/test_rmsnorm2d.py
+    source_test_id: test_rmsnorm2d
+    source_test_sha256: 3813dc34558d086bd50cb093f0d01e990cbc421538160cdd57856a279c94eaa3
+    source_kernel_path: null
+    source_kernel_sha256: null
+    contract_family_id: CF-NORM-RMS-002
+    source_lineage_id: aiter:test_rmsnorm2d:test_rmsnorm2d
+    implementation_family_id: independent:cand-hip-rmsnorm2d:hip
+    split_group: train
+    split_version: v2
+    target_lane: hip_gfx942
+  recognized_contract:
+    operator: rms_norm
+    target_gpu: gfx942
+    format: bf16
+    input_dtype: bf16
+    weight_dtype: bf16
+    output_dtype: bf16
+    language: hip
+    dimensions: &id011
+      M: 32
+      N: 4096
+- id: phase1-triton-gfx942-hip-rmsnorm2d
+  request: 'Generate a standalone TRITON rms_norm kernel for AMD gfx942. Frozen contract JSON: {"dtype":{"accum":"fp32","input":"bf16","output":"bf16","weight":"bf16"},"layout":"contiguous","operator":"rms_norm","shape":{"M":32,"N":4096}}.
+    Independent oracle JSON: {"method":"torch.nn.functional.rms_norm","tier":"pure_torch"}. Implement independently; do not
+    call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and
+    require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/ROCm/aiter.git
+    source_branch: main
+    source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    source_license: MIT
+    source_candidate_id: cand-hip-rmsnorm2d
+    source_test_path: op_tests/test_rmsnorm2d.py
+    source_test_id: test_rmsnorm2d
+    source_test_sha256: 3813dc34558d086bd50cb093f0d01e990cbc421538160cdd57856a279c94eaa3
+    source_kernel_path: null
+    source_kernel_sha256: null
+    contract_family_id: CF-NORM-RMS-002
+    source_lineage_id: aiter:test_rmsnorm2d:test_rmsnorm2d
+    implementation_family_id: independent:cand-hip-rmsnorm2d:triton
+    split_group: train
+    split_version: v2
+    target_lane: triton_gfx942
+  recognized_contract:
+    operator: rms_norm
+    target_gpu: gfx942
+    format: bf16
+    input_dtype: bf16
+    weight_dtype: bf16
+    output_dtype: bf16
+    language: triton
+    dimensions: *id011
+- id: phase1-hip-gfx942-hip-fused-add-rmsnorm
+  request: 'Generate a standalone HIP fused_add_rms_norm kernel for AMD gfx942. Frozen contract JSON: {"dtype":{"accum":"fp32","input":"bf16","output":"bf16","residual":"bf16","weight":"bf16"},"layout":"contiguous","operator":"fused_add_rms_norm","shape":{"M":32,"N":4096}}.
+    Independent oracle JSON: {"method":"residual add then F.rms_norm","tier":"pure_torch"}. Implement independently; do not
+    call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and
+    require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/ROCm/aiter.git
+    source_branch: main
+    source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    source_license: MIT
+    source_candidate_id: cand-hip-fused-add-rmsnorm
+    source_test_path: op_tests/test_rmsnorm2d.py
+    source_test_id: test_rmsnorm2d_fuseAdd
+    source_test_sha256: 3813dc34558d086bd50cb093f0d01e990cbc421538160cdd57856a279c94eaa3
+    source_kernel_path: null
+    source_kernel_sha256: null
+    contract_family_id: CF-NORM-RMS-ADD-001
+    source_lineage_id: aiter:test_rmsnorm2d:test_rmsnorm2d_fuseAdd
+    implementation_family_id: independent:cand-hip-fused-add-rmsnorm:hip
+    split_group: train
+    split_version: v2
+    target_lane: hip_gfx942
+  recognized_contract:
+    operator: fused_add_rms_norm
+    target_gpu: gfx942
+    format: bf16
+    input_dtype: bf16
+    weight_dtype: bf16
+    output_dtype: bf16
+    language: hip
+    dimensions: &id012
+      M: 32
+      N: 4096
+- id: phase1-triton-gfx942-hip-fused-add-rmsnorm
+  request: 'Generate a standalone TRITON fused_add_rms_norm kernel for AMD gfx942. Frozen contract JSON: {"dtype":{"accum":"fp32","input":"bf16","output":"bf16","residual":"bf16","weight":"bf16"},"layout":"contiguous","operator":"fused_add_rms_norm","shape":{"M":32,"N":4096}}.
+    Independent oracle JSON: {"method":"residual add then F.rms_norm","tier":"pure_torch"}. Implement independently; do not
+    call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and
+    require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/ROCm/aiter.git
+    source_branch: main
+    source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    source_license: MIT
+    source_candidate_id: cand-hip-fused-add-rmsnorm
+    source_test_path: op_tests/test_rmsnorm2d.py
+    source_test_id: test_rmsnorm2d_fuseAdd
+    source_test_sha256: 3813dc34558d086bd50cb093f0d01e990cbc421538160cdd57856a279c94eaa3
+    source_kernel_path: null
+    source_kernel_sha256: null
+    contract_family_id: CF-NORM-RMS-ADD-001
+    source_lineage_id: aiter:test_rmsnorm2d:test_rmsnorm2d_fuseAdd
+    implementation_family_id: independent:cand-hip-fused-add-rmsnorm:triton
+    split_group: train
+    split_version: v2
+    target_lane: triton_gfx942
+  recognized_contract:
+    operator: fused_add_rms_norm
+    target_gpu: gfx942
+    format: bf16
+    input_dtype: bf16
+    weight_dtype: bf16
+    output_dtype: bf16
+    language: triton
+    dimensions: *id012
+- id: phase1-hip-gfx942-hip-silu-and-mul
+  request: 'Generate a standalone HIP silu_and_mul kernel for AMD gfx942. Frozen contract JSON: {"dtype":{"input":"bf16","output":"bf16"},"layout":"split_last_dimension","operator":"silu_and_mul","shape":{"M":256,"N":8192}}.
+    Independent oracle JSON: {"method":"F.silu on first half times second half","tier":"pure_torch"}. Implement independently;
+    do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness
+    and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/ROCm/aiter.git
+    source_branch: main
+    source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    source_license: MIT
+    source_candidate_id: cand-hip-silu-and-mul
+    source_test_path: op_tests/test_activation.py
+    source_test_id: test_silu_and_mul
+    source_test_sha256: e68f2e907e91791110ad6d37588da01fcce506163391de7619cfec1c612197e0
+    source_kernel_path: null
+    source_kernel_sha256: null
+    contract_family_id: CF-ACT-SILU-002
+    source_lineage_id: aiter:test_activation:test_silu_and_mul
+    implementation_family_id: independent:cand-hip-silu-and-mul:hip
+    split_group: train
+    split_version: v2
+    target_lane: hip_gfx942
+  recognized_contract:
+    operator: silu_and_mul
+    target_gpu: gfx942
+    format: bf16
+    input_dtype: bf16
+    output_dtype: bf16
+    language: hip
+    dimensions: &id013
+      M: 256
+      N: 8192
+- id: phase1-triton-gfx942-hip-silu-and-mul
+  request: 'Generate a standalone TRITON silu_and_mul kernel for AMD gfx942. Frozen contract JSON: {"dtype":{"input":"bf16","output":"bf16"},"layout":"split_last_dimension","operator":"silu_and_mul","shape":{"M":256,"N":8192}}.
+    Independent oracle JSON: {"method":"F.silu on first half times second half","tier":"pure_torch"}. Implement independently;
+    do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness
+    and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/ROCm/aiter.git
+    source_branch: main
+    source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    source_license: MIT
+    source_candidate_id: cand-hip-silu-and-mul
+    source_test_path: op_tests/test_activation.py
+    source_test_id: test_silu_and_mul
+    source_test_sha256: e68f2e907e91791110ad6d37588da01fcce506163391de7619cfec1c612197e0
+    source_kernel_path: null
+    source_kernel_sha256: null
+    contract_family_id: CF-ACT-SILU-002
+    source_lineage_id: aiter:test_activation:test_silu_and_mul
+    implementation_family_id: independent:cand-hip-silu-and-mul:triton
+    split_group: train
+    split_version: v2
+    target_lane: triton_gfx942
+  recognized_contract:
+    operator: silu_and_mul
+    target_gpu: gfx942
+    format: bf16
+    input_dtype: bf16
+    output_dtype: bf16
+    language: triton
+    dimensions: *id013
+- id: phase1-triton-gfx942-triton-silu-mul-moe-shape
+  request: 'Generate a standalone TRITON fused_silu_mul kernel for AMD gfx942. Frozen contract JSON: {"dtype":{"input":"bf16","output":"bf16"},"layout":"split_last_dimension","operator":"fused_silu_mul","shape":{"last_dim":768,"rows":256}}.
+    Independent oracle JSON: {"method":"local silu_exp2 reference times gate","tier":"pure_torch"}. Implement independently;
+    do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness
+    and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/ROCm/aiter.git
+    source_branch: main
+    source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    source_license: MIT
+    source_candidate_id: cand-triton-silu-mul-moe-shape
+    source_test_path: op_tests/triton_tests/fusions/test_fused_silu_mul.py
+    source_test_id: test_fused_silu_mul_tp4_moe_shapes
+    source_test_sha256: 636efeb6a45d537fed124f132390cde2d76134f545fe4c8a85acf92dc3084c07
+    source_kernel_path: null
+    source_kernel_sha256: null
+    contract_family_id: CF-EW-004
+    source_lineage_id: aiter:test_fused_silu_mul:test_fused_silu_mul_tp4_moe_shapes
+    implementation_family_id: independent:cand-triton-silu-mul-moe-shape:triton
+    split_group: train
+    split_version: v2
+    target_lane: triton_gfx942
+  recognized_contract:
+    operator: fused_silu_mul
+    target_gpu: gfx942
+    format: bf16
+    input_dtype: bf16
+    output_dtype: bf16
+    language: triton
+    dimensions: &id014
+      rows: 256
+      last_dim: 768
+- id: phase1-hip-gfx942-triton-silu-mul-moe-shape
+  request: 'Generate a standalone HIP fused_silu_mul kernel for AMD gfx942. Frozen contract JSON: {"dtype":{"input":"bf16","output":"bf16"},"layout":"split_last_dimension","operator":"fused_silu_mul","shape":{"last_dim":768,"rows":256}}.
+    Independent oracle JSON: {"method":"local silu_exp2 reference times gate","tier":"pure_torch"}. Implement independently;
+    do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness
+    and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/ROCm/aiter.git
+    source_branch: main
+    source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    source_license: MIT
+    source_candidate_id: cand-triton-silu-mul-moe-shape
+    source_test_path: op_tests/triton_tests/fusions/test_fused_silu_mul.py
+    source_test_id: test_fused_silu_mul_tp4_moe_shapes
+    source_test_sha256: 636efeb6a45d537fed124f132390cde2d76134f545fe4c8a85acf92dc3084c07
+    source_kernel_path: null
+    source_kernel_sha256: null
+    contract_family_id: CF-EW-004
+    source_lineage_id: aiter:test_fused_silu_mul:test_fused_silu_mul_tp4_moe_shapes
+    implementation_family_id: independent:cand-triton-silu-mul-moe-shape:hip
+    split_group: train
+    split_version: v2
+    target_lane: hip_gfx942
+  recognized_contract:
+    operator: fused_silu_mul
+    target_gpu: gfx942
+    format: bf16
+    input_dtype: bf16
+    output_dtype: bf16
+    language: hip
+    dimensions: *id014
+- id: phase1-triton-gfx942-softmax-square-bf16
+  request: 'Generate a standalone TRITON softmax kernel for AMD gfx942. Frozen contract JSON: {"axis":1,"dtype":{"input":"bf16","output":"bf16"},"layout":"row_major","operator":"softmax","shape":{"M":1024,"N":1024}}.
+    Independent oracle JSON: {"method":"torch.softmax","tier":"pure_torch"}. Implement independently; do not call AITER, CK,
+    ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile,
+    correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/ROCm/aiter.git
+    source_branch: main
+    source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    source_license: MIT
+    source_candidate_id: cand-softmax-square-bf16
+    source_test_path: op_tests/triton_tests/test_softmax.py
+    source_test_id: test_softmax
+    source_test_sha256: 56b49b9a7c15c22789dd8e8432f51b8b343408f14f84d92173223616f2fe7925
+    source_kernel_path: null
+    source_kernel_sha256: null
+    contract_family_id: CF-EW-002
+    source_lineage_id: aiter:test_softmax:test_softmax
+    implementation_family_id: independent:cand-softmax-square-bf16:triton
+    split_group: train
+    split_version: v2
+    target_lane: triton_gfx942
+  recognized_contract:
+    operator: softmax
+    target_gpu: gfx942
+    format: bf16
+    input_dtype: bf16
+    output_dtype: bf16
+    language: triton
+    dimensions: &id015
+      M: 1024
+      N: 1024
+- id: phase1-hip-gfx942-softmax-square-bf16
+  request: 'Generate a standalone HIP softmax kernel for AMD gfx942. Frozen contract JSON: {"axis":1,"dtype":{"input":"bf16","output":"bf16"},"layout":"row_major","operator":"softmax","shape":{"M":1024,"N":1024}}.
+    Independent oracle JSON: {"method":"torch.softmax","tier":"pure_torch"}. Implement independently; do not call AITER, CK,
+    ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile,
+    correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/ROCm/aiter.git
+    source_branch: main
+    source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    source_license: MIT
+    source_candidate_id: cand-softmax-square-bf16
+    source_test_path: op_tests/triton_tests/test_softmax.py
+    source_test_id: test_softmax
+    source_test_sha256: 56b49b9a7c15c22789dd8e8432f51b8b343408f14f84d92173223616f2fe7925
+    source_kernel_path: null
+    source_kernel_sha256: null
+    contract_family_id: CF-EW-002
+    source_lineage_id: aiter:test_softmax:test_softmax
+    implementation_family_id: independent:cand-softmax-square-bf16:hip
+    split_group: train
+    split_version: v2
+    target_lane: hip_gfx942
+  recognized_contract:
+    operator: softmax
+    target_gpu: gfx942
+    format: bf16
+    input_dtype: bf16
+    output_dtype: bf16
+    language: hip
+    dimensions: *id015
+- id: phase1-hip-gfx942-local-hip-knn
+  request: 'Generate a standalone HIP knn kernel for AMD gfx942. Frozen contract JSON: {"dtype":{"output":"int32","points":"fp32"},"layouts":["standard","transposed","self_query"],"operator":"knn","shapes":[{"B":2,"M":16,"N":64,"k":3},{"B":8,"M":128,"N":1024,"k":5},{"B":2,"M":256,"N":2048,"k":10}]}.
+    Independent oracle JSON: {"method":"torch.cdist then topk","tier":"pure_torch"}. Implement independently; do not call
+    AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require
+    compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    source_repo: https://github.com/AMD-AGI/GEAK.git
+    source_branch: main
+    source_sha: fa86fd1e9bec56dadf27d6575a0c8f8ab7875c57
+    source_license: repository license
+    source_candidate_id: cand-local-hip-knn
+    source_test_path: examples/tasks/knn/scripts/task_runner.py
+    source_test_id: TEST_SHAPES
+    source_test_sha256: 62a59b6bb290efe319950dfbc841c1b0fc3f9d06f4eacc7c1e365981105a0640
+    source_kernel_path: examples/tasks/knn/src/knn_cuda.hip
+    source_kernel_sha256: e4b97cd0911d613f8cc117d4fb75891c6b81472dc239628d30125ca0b4f5634e
+    contract_family_id: CF-KNN-001
+    source_lineage_id: geak:examples:knn
+    implementation_family_id: geak_hip_knn_v1
+    split_group: train
+    split_version: v2
+    target_lane: hip_gfx942
+  recognized_contract:
+    operator: knn
+    target_gpu: gfx942
+    format: fp32
+    input_dtype: fp32
+    output_dtype: int32
+    language: hip
+    shapes:
+    - - 2
+      - 64
+      - 16
+      - 3
+    - - 8
+      - 1024
+      - 128
+      - 5
+    - - 2
+      - 2048
+      - 256
+      - 10

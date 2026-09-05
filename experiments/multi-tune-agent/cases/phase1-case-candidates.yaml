@@ -14,7 +14,7 @@ source_revisions:
   lumen_rl:
     repository: https://github.com/ZhangDanyang-AMD/Lumen-RL.git
     branch: dev/multi-loop-agent
-    git_sha: b0c029d257e288709163feb668d2c081a2d2fd23
+    git_sha: 2f255d5c898e215d3bea8fa100829214c61e87f9
     local_root: /home/danyzhan/Lumen-RL
 policy:
   candidate_is_runnable: false
@@ -292,9 +292,9 @@ candidates:
     target_lanes: [hip_gfx950, triton_gfx950]
     flags: [gfx950_only, complex_layout]
 
-  - id: cand-dynamic-per-tensor-quant
+  - id: cand-dynamic-per-tensor-quant-int8
     priority: P0
-    contract_family_id: CF-EW-006
+    contract_family_id: CF-EW-006-INT8
     source_lineage_id: aiter:test_quant:test_dynamic_per_tensor_quant
     source:
       revision: aiter
@@ -305,14 +305,52 @@ candidates:
     contract:
       operator: dynamic_per_tensor_quant
       shape: {M: 32, N: 8192}
-      dtype: {input: bf16, output: fp8_or_int8, scale: fp32_scalar}
+      dtype: {input: bf16, output: int8, scale: fp32_scalar}
       layout: contiguous
     oracle: {tier: pure_torch, method: fp32 absmax divided by dtype max}
     target_lanes: [triton_gfx942, triton_gfx950, hip_gfx942, hip_gfx950]
 
-  - id: cand-dynamic-per-token-quant
+  - id: cand-dynamic-per-tensor-quant-fp8-fnuz
     priority: P0
-    contract_family_id: CF-Q-PERTOKEN-001
+    contract_family_id: CF-EW-006-FP8-FNUZ
+    source_lineage_id: aiter:test_quant:test_dynamic_per_tensor_quant
+    source:
+      revision: aiter
+      test_path: op_tests/triton_tests/quant/test_quant.py
+      test_id: test_dynamic_per_tensor_quant
+      source_language: triton
+      source_backend: triton
+    contract:
+      operator: dynamic_per_tensor_quant
+      shape: {M: 32, N: 8192}
+      dtype: {input: bf16, output: fp8_e4m3fnuz, scale: fp32_scalar}
+      layout: contiguous
+    oracle: {tier: pure_torch, method: fp32 absmax divided by dtype max}
+    target_lanes: [triton_gfx942, hip_gfx942]
+    flags: [gfx942_only_dtype]
+
+  - id: cand-dynamic-per-tensor-quant-fp8-fn
+    priority: P0
+    contract_family_id: CF-EW-006-FP8-FN
+    source_lineage_id: aiter:test_quant:test_dynamic_per_tensor_quant
+    source:
+      revision: aiter
+      test_path: op_tests/triton_tests/quant/test_quant.py
+      test_id: test_dynamic_per_tensor_quant
+      source_language: triton
+      source_backend: triton
+    contract:
+      operator: dynamic_per_tensor_quant
+      shape: {M: 32, N: 8192}
+      dtype: {input: bf16, output: fp8_e4m3fn, scale: fp32_scalar}
+      layout: contiguous
+    oracle: {tier: pure_torch, method: fp32 absmax divided by dtype max}
+    target_lanes: [triton_gfx950, hip_gfx950]
+    flags: [gfx950_only_dtype]
+
+  - id: cand-dynamic-per-token-quant-int8
+    priority: P0
+    contract_family_id: CF-Q-PERTOKEN-001-INT8
     source_lineage_id: aiter:test_quant:test_dynamic_per_token_quant
     source:
       revision: aiter
@@ -323,14 +361,52 @@ candidates:
     contract:
       operator: dynamic_per_token_quant
       shape: {M: 1024, N: 128}
-      dtype: {input: bf16, output: fp8_or_int8, scale: fp32_per_row}
+      dtype: {input: bf16, output: int8, scale: fp32_per_row}
       layout: contiguous
     oracle: {tier: pure_torch, method: row-wise absmax divided by dtype max}
     target_lanes: [triton_gfx942, triton_gfx950, hip_gfx942, hip_gfx950]
 
-  - id: cand-static-per-tensor-quant-large
+  - id: cand-dynamic-per-token-quant-fp8-fnuz
     priority: P0
-    contract_family_id: CF-EW-005
+    contract_family_id: CF-Q-PERTOKEN-001-FP8-FNUZ
+    source_lineage_id: aiter:test_quant:test_dynamic_per_token_quant
+    source:
+      revision: aiter
+      test_path: op_tests/triton_tests/quant/test_quant.py
+      test_id: test_dynamic_per_token_quant
+      source_language: triton
+      source_backend: triton
+    contract:
+      operator: dynamic_per_token_quant
+      shape: {M: 1024, N: 128}
+      dtype: {input: bf16, output: fp8_e4m3fnuz, scale: fp32_per_row}
+      layout: contiguous
+    oracle: {tier: pure_torch, method: row-wise absmax divided by dtype max}
+    target_lanes: [triton_gfx942, hip_gfx942]
+    flags: [gfx942_only_dtype]
+
+  - id: cand-dynamic-per-token-quant-fp8-fn
+    priority: P0
+    contract_family_id: CF-Q-PERTOKEN-001-FP8-FN
+    source_lineage_id: aiter:test_quant:test_dynamic_per_token_quant
+    source:
+      revision: aiter
+      test_path: op_tests/triton_tests/quant/test_quant.py
+      test_id: test_dynamic_per_token_quant
+      source_language: triton
+      source_backend: triton
+    contract:
+      operator: dynamic_per_token_quant
+      shape: {M: 1024, N: 128}
+      dtype: {input: bf16, output: fp8_e4m3fn, scale: fp32_per_row}
+      layout: contiguous
+    oracle: {tier: pure_torch, method: row-wise absmax divided by dtype max}
+    target_lanes: [triton_gfx950, hip_gfx950]
+    flags: [gfx950_only_dtype]
+
+  - id: cand-static-per-tensor-quant-large-int8
+    priority: P0
+    contract_family_id: CF-EW-005-INT8
     source_lineage_id: aiter:test_quant:test_static_per_tensor_quant
     source:
       revision: aiter
@@ -341,10 +417,48 @@ candidates:
     contract:
       operator: static_per_tensor_quant
       shape: {M: 2048, N: 1024}
-      dtype: {input: bf16, output: fp8_or_int8, scale: fp32_scalar}
+      dtype: {input: bf16, output: int8, scale: fp32_scalar}
       layout: contiguous
     oracle: {tier: pure_torch, method: clamp and round x divided by scale}
     target_lanes: [triton_gfx942, triton_gfx950, hip_gfx942, hip_gfx950]
+
+  - id: cand-static-per-tensor-quant-large-fp8-fnuz
+    priority: P0
+    contract_family_id: CF-EW-005-FP8-FNUZ
+    source_lineage_id: aiter:test_quant:test_static_per_tensor_quant
+    source:
+      revision: aiter
+      test_path: op_tests/triton_tests/quant/test_quant.py
+      test_id: test_static_per_tensor_quant
+      source_language: triton
+      source_backend: triton
+    contract:
+      operator: static_per_tensor_quant
+      shape: {M: 2048, N: 1024}
+      dtype: {input: bf16, output: fp8_e4m3fnuz, scale: fp32_scalar}
+      layout: contiguous
+    oracle: {tier: pure_torch, method: clamp and round x divided by scale}
+    target_lanes: [triton_gfx942, hip_gfx942]
+    flags: [gfx942_only_dtype]
+
+  - id: cand-static-per-tensor-quant-large-fp8-fn
+    priority: P0
+    contract_family_id: CF-EW-005-FP8-FN
+    source_lineage_id: aiter:test_quant:test_static_per_tensor_quant
+    source:
+      revision: aiter
+      test_path: op_tests/triton_tests/quant/test_quant.py
+      test_id: test_static_per_tensor_quant
+      source_language: triton
+      source_backend: triton
+    contract:
+      operator: static_per_tensor_quant
+      shape: {M: 2048, N: 1024}
+      dtype: {input: bf16, output: fp8_e4m3fn, scale: fp32_scalar}
+      layout: contiguous
+    oracle: {tier: pure_torch, method: clamp and round x divided by scale}
+    target_lanes: [triton_gfx950, hip_gfx950]
+    flags: [gfx950_only_dtype]
 
   - id: cand-act-mul-mxfp4-gfx950
     priority: P1

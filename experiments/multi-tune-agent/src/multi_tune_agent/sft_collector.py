@@ -93,6 +93,7 @@ class SFTCollector:
         self._errors: list[str] = []
         self._candidate_count = 0
         self._accepted_candidate_count = 0
+        self._frozen_input_hashes: dict[int, str] = {}
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.blob_root.mkdir(parents=True, exist_ok=True)
 
@@ -196,6 +197,34 @@ class SFTCollector:
         )
         return path
 
+    def record_frozen_input(
+        self, round_index: int, frozen_input: Mapping[str, Any]
+    ) -> Path:
+        created_at = time.time()
+        payload = {
+            "schema_version": "geak_sft_frozen_input_v1",
+            "run_id": self.run_id,
+            "round": int(round_index),
+            "task_type": self.task_type,
+            "created_at": created_at,
+            "input": _redact(dict(frozen_input)),
+        }
+        path = self.run_dir / ("round_%d" % round_index) / "frozen_input.json"
+        digest = self.store_blob(_json_bytes(payload))
+        self._frozen_input_hashes[int(round_index)] = digest
+        self._write_json(path, payload)
+        self.append(
+            {
+                "event": "sft_input_frozen",
+                "timestamp": created_at,
+                "role": "orchestrator",
+                "phase": "freeze_input",
+                "round": round_index,
+                "payload": {"input_path": str(path), "input_hash": digest},
+            }
+        )
+        return path
+
     def record_candidate(
         self,
         environment: Any,
@@ -228,6 +257,7 @@ class SFTCollector:
             "round": int(round_index),
             "role": role,
             "task_type": self.task_type,
+            "frozen_input_hash": self._frozen_input_hashes.get(int(round_index)),
             "recorded_at": time.time(),
             "candidate": _redact(dict(candidate)),
             "parent_session_id": parent_session_id,
@@ -248,13 +278,17 @@ class SFTCollector:
                 and float(evaluation.get("speedup_geomean") or 0.0) > 0.0
             ),
         }
-        accepted = bool(
+        common_accepted = bool(
             record["patch_applies"]
             and record["independent_verify"]
             and record["compile_pass"]
             and record["correctness_pass"]
-            and record["benchmark_valid"]
             and candidate.get("accepted")
+        )
+        accepted = (
+            common_accepted
+            if self.task_type == "error_recovery"
+            else common_accepted and record["benchmark_valid"]
         )
         record["sft_positive_eligible"] = accepted and role == "engineer"
         path = self.run_dir / ("round_%d" % round_index) / "candidates.jsonl"

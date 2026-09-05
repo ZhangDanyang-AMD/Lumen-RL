@@ -284,6 +284,19 @@ def test_malformed_direct_response_is_repaired_with_aiter(
     assert "generation-response" in backend.messages[1][1]["content"]
 
 
+def test_invalid_direct_retries_without_aiter(
+    tmp_path: Path, contract: KernelContract
+) -> None:
+    backend = FakeBackend([bundle(runner="not python"), bundle()])
+
+    draft = TemplateBootstrapper(backend, tmp_path / "drafts").generate(contract)
+
+    assert draft.valid
+    assert draft.generation_method == "llm_direct_retry"
+    assert len(backend.messages) == 2
+    assert "previous response failed" in backend.messages[1][1]["content"]
+
+
 def test_bundle_normalizes_scalar_config_and_runner_import_path(
     tmp_path: Path, contract: KernelContract
 ) -> None:
@@ -312,13 +325,14 @@ def test_bundle_normalizes_scalar_config_and_runner_import_path(
     config = yaml.safe_load((draft.path / "config.yaml").read_text(encoding="utf-8"))
     assert config["source_file_path"] == ["kernel.py"]
     assert config["target_kernel_functions"] == ["candidate"]
-    assert config["compile_command"] == ["python3 scripts/task_runner.py compile"]
-    assert config["correctness_command"] == [
-        "python3 scripts/task_runner.py correctness"
-    ]
-    assert config["performance_command"] == [
-        "python3 scripts/task_runner.py performance"
-    ]
+    command_prefix = (
+        "docker exec -e HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-1} "
+        '-w "$PWD" ${GEAK_CONTAINER_NAME:-geak-phase1-vllm} '
+        "python3 scripts/task_runner.py "
+    )
+    assert config["compile_command"] == [command_prefix + "compile"]
+    assert config["correctness_command"] == [command_prefix + "correctness"]
+    assert config["performance_command"] == [command_prefix + "performance"]
     runner = (draft.path / "scripts/task_runner.py").read_text(encoding="utf-8")
     assert "_bootstrap_sys.path.insert" in runner
     assert "_BootstrapPath(__file__).resolve().parents[1]" in runner
@@ -344,6 +358,26 @@ def test_bundle_infers_safe_source_and_target_function_config(
     assert config["target_kernel_functions"] == ["candidate"]
 
 
+def test_bundle_infers_declared_wrapper_ending_in_kernel(
+    tmp_path: Path, contract: KernelContract
+) -> None:
+    response = bundle()
+    response["files"]["kernel.py"] = KERNEL.replace(
+        "def candidate(a, b):", "def rms_norm_kernel(a, b):"
+    )
+    response["files"]["config.yaml"] = CONFIG.replace(
+        "target_kernel_functions:\n  - candidate\n",
+        "kernel:\n  name: rms_norm_kernel\n",
+    )
+
+    draft = TemplateBootstrapper(
+        FakeBackend([response]), tmp_path / "drafts"
+    ).generate(contract)
+
+    config = yaml.safe_load((draft.path / "config.yaml").read_text(encoding="utf-8"))
+    assert config["target_kernel_functions"] == ["rms_norm_kernel"]
+
+
 def test_low_confidence_evidence_does_not_trigger_repair(
     tmp_path: Path, contract: KernelContract
 ) -> None:
@@ -354,7 +388,8 @@ def test_low_confidence_evidence_does_not_trigger_repair(
             backend, tmp_path / "drafts", aiter_root=aiter
         ).generate(contract)
 
-    assert len(backend.messages) == 1
+    assert len(backend.messages) == 2
+    assert "Read-only AITER evidence" not in backend.messages[1][1]["content"]
     assert caught.value.validation_report is not None
     assert caught.value.draft_path is not None
     assert caught.value.draft_path.name.startswith(".failed-" + contract.contract_hash)
@@ -408,11 +443,21 @@ def test_existing_valid_draft_is_idempotent(
     backend = FakeBackend([bundle()])
     bootstrapper = TemplateBootstrapper(backend, tmp_path / "drafts")
     first = bootstrapper.generate(contract)
+    config_path = first.path / "config.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["compile_command"] = ["python3 scripts/task_runner.py compile"]
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
     second = bootstrapper.generate(contract)
 
     assert first.path == second.path
     assert second.valid
     assert len(backend.messages) == 1
+    migrated = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert migrated["compile_command"] == [
+        "docker exec -e HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-1} "
+        '-w "$PWD" ${GEAK_CONTAINER_NAME:-geak-phase1-vllm} '
+        "python3 scripts/task_runner.py compile"
+    ]
 
 
 def test_contract_normalization_stable_hash_and_validation() -> None:

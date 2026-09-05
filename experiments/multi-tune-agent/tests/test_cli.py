@@ -71,9 +71,17 @@ def test_generation_manifest_records_each_noninteractive_result(tmp_path, monkey
         "    seed_provenance:\n"
         "      source_repo: https://github.com/ROCm/aiter.git\n"
         "      source_sha: abc123\n"
+        "    recognized_contract:\n"
+        "      operator: gemm\n"
+        "      target_gpu: gfx942\n"
+        "      input_dtype: fp16\n"
+        "      output_dtype: fp16\n"
+        "      dimensions: {M: 1, N: 2, K: 3}\n"
+        "      language: hip\n"
     )
     catalog = tmp_path / "cases.yaml"
     seen = []
+    generated = []
     task = GeneratedKernelTask(
         case_id="hip-gfx942-demo",
         task_dir=tmp_path / "task",
@@ -85,11 +93,11 @@ def test_generation_manifest_records_each_noninteractive_result(tmp_path, monkey
         contract_hash="contract",
         provenance={"template": "generated"},
     )
-    monkeypatch.setattr(
-        cli,
-        "_generate_kernel_task_noninteractive",
-        lambda config, backend, **kwargs: task,
-    )
+    def generate(config, backend, **kwargs):
+        generated.append(kwargs)
+        return task
+
+    monkeypatch.setattr(cli, "_generate_kernel_task_noninteractive", generate)
 
     def register(path, value):
         seen.append((path, value))
@@ -105,6 +113,11 @@ def test_generation_manifest_records_each_noninteractive_result(tmp_path, monkey
     assert seen[0][0] == catalog.resolve()
     assert seen[0][1].provenance["template"] == "generated"
     assert seen[0][1].provenance["case_seed"]["source_sha"] == "abc123"
+    assert generated[0]["recognized_contract"]["dimensions"] == {
+        "M": 1,
+        "N": 2,
+        "K": 3,
+    }
     result_path = (
         config.trajectory_root
         / "requests"
