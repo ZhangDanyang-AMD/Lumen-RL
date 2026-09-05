@@ -9,6 +9,9 @@ bootstrap_auto_promote: true
 aiter_root: /home/danyzhan/aiter
 generated_template_root: ../examples/tasks/generated
 bootstrap_min_aiter_score: 85
+sft_enabled: true
+sft_dataset_root: /home/danyzhan/geak_sft_dataset/phase1
+sft_task_type: direction_conditioned
 
 request_timeout: 600
 command_timeout: 300

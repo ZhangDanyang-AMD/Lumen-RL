@@ -277,6 +277,7 @@ class CodeRoleAgent:
             {
                 "direction_id": direction_id,
                 "session_id": output.session_id,
+                "messages": output.messages,
                 "final_text": output.final_text,
                 "policy_logprobs": output.policy_logprobs,
                 "tool_rewards": output.tool_rewards,

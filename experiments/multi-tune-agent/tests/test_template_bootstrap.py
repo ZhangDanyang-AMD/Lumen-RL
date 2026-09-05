@@ -298,6 +298,10 @@ def test_bundle_normalizes_scalar_config_and_runner_import_path(
             f"{mode}_command:\n  - python3 scripts/task_runner.py {mode}",
             f"{mode}_command: python3 scripts/task_runner.py {mode}",
         )
+    scalar_config = scalar_config.replace(
+        "compile_command: python3 scripts/task_runner.py compile",
+        "compile_command:\n  - echo compile\n  - echo duplicate",
+    )
     response = bundle()
     response["files"]["config.yaml"] = scalar_config
 
@@ -309,6 +313,12 @@ def test_bundle_normalizes_scalar_config_and_runner_import_path(
     assert config["source_file_path"] == ["kernel.py"]
     assert config["target_kernel_functions"] == ["candidate"]
     assert config["compile_command"] == ["python3 scripts/task_runner.py compile"]
+    assert config["correctness_command"] == [
+        "python3 scripts/task_runner.py correctness"
+    ]
+    assert config["performance_command"] == [
+        "python3 scripts/task_runner.py performance"
+    ]
     runner = (draft.path / "scripts/task_runner.py").read_text(encoding="utf-8")
     assert "_bootstrap_sys.path.insert" in runner
     assert "_BootstrapPath(__file__).resolve().parents[1]" in runner

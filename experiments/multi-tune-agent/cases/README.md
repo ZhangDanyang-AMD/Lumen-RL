@@ -4,6 +4,39 @@ This committed directory stores stable batch manifests and default optimization
 objectives. Kernel source, generated harnesses, build output, and private task
 data belong under `../examples/tasks/`, which is intentionally ignored by Git.
 
+## Phase 1 lifecycle
+
+Phase 1 uses four separate artifact tiers. Do not point `cases_path` at the
+first three tiers:
+
+```text
+phase1-case-candidates.yaml
+  candidates: extracted cross-language contracts; not runnable
+        ↓ source/hash/lineage review
+phase1-aiter-seeds.yaml
+  seeds: registered extraction sources; not runnable
+        ↓ frozen generation request
+phase1-generation-requests.yaml
+  requests: batch generation input; not runnable
+        ↓ static + GPU trust gate
+phase1-cases.yaml
+  tasks: validated GEAK harnesses; runnable by load_tasks()
+```
+
+Cross-language reuse is allowed for shapes, dtypes, layouts, scale contracts,
+and independent oracles. `source_language` and `target_language` must remain
+separate. Mechanical translations share one `implementation_family_id`, and
+all language variants from the same source/implementation family must remain
+in one split group.
+
+Candidate status values are:
+
+```text
+extracted_candidate -> registered_seed -> validated_case
+```
+
+Only `validated_case` entries belong in a `tasks:` catalog.
+
 Each catalog has this shape:
 
 ```yaml
@@ -46,9 +79,19 @@ language. Model generation and static validation may run concurrently, while
 GPU compile/correctness/performance remains serialized per GPU. Only templates
 that pass the complete trust gate may be registered in `examples_cases.yaml`.
 
-The manifest format is present for batch preparation. The planned
-`multi-tune generate --manifest ...` command is not implemented yet; use
-interactive menu option `[2]` to generate one request at a time.
+Batch generation is available:
+
+```bash
+PYTHONPATH=src:. python3 -m multi_tune_agent.cli \
+  --config configs/mi300x.yaml generate \
+  --manifest cases/phase1-generation-requests.yaml \
+  --output-catalog cases/phase1-cases.yaml \
+  --stream
+```
+
+The command registers only templates that pass the complete static and GPU
+trust gate. Preserve candidate/seed provenance in each request's
+`seed_provenance` mapping.
 
 Run every entry sequentially:
 

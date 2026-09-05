@@ -695,13 +695,13 @@ class TemplateBootstrapper:
                 )
                 if inferred_targets:
                     config["target_kernel_functions"] = inferred_targets
-            for command_name in (
-                "compile_command",
-                "correctness_command",
-                "performance_command",
-            ):
-                if isinstance(config.get(command_name), str):
-                    config[command_name] = [config[command_name]]
+            # These are framework protocol fields, not kernel implementation
+            # choices. Canonicalize them so an otherwise useful LLM draft
+            # cannot fail repeatedly by emitting multiple shell commands.
+            for mode in ("compile", "correctness", "performance"):
+                config[f"{mode}_command"] = [
+                    f"python3 scripts/task_runner.py {mode}"
+                ]
             rendered["config.yaml"] = yaml.safe_dump(
                 config, sort_keys=False, allow_unicode=True
             )
@@ -1135,14 +1135,24 @@ be either an object or a JSON string. Do not use markdown fences.
 
 Requirements:
 - kernel.py defines every target_kernel_functions entry from config.yaml.
+- Honor the contract language exactly. For a HIP contract, kernel.py must compile
+  and launch a real HIP C++ kernel or extension; a torch matmul/linear/reference
+  wrapper, Triton kernel, no-op compile mode, or reference-only implementation is
+  invalid. For a Triton contract, implement and launch a real Triton kernel.
 - config commands invoke scripts/task_runner.py in exactly compile, correctness,
   and performance modes through `docker exec -e
   HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-1} -w "$PWD"
   ${GEAK_CONTAINER_NAME:-geak-phase1-vllm} python3 ...`.
+- scripts/task_runner.py must accept one required positional argparse `mode` with
+  choices exactly ("compile", "correctness", "performance") and dispatch all
+  three modes. Do not select the mode from an environment variable.
 - Because the runner lives under scripts/, add its template root
   (`Path(__file__).resolve().parents[1]`) to sys.path before importing kernel.py.
 - The runner uses fixed torch random seeds and an independent torch high-precision
   reference; the reference must never invoke or derive from the kernel under test.
+- Correctness must execute the target kernel and compare its returned tensor to
+  the independent reference with torch.testing.assert_close or an equally strict
+  numerical assertion. Printing success without this comparison is invalid.
 - Gate the requested GPU architecture before kernel import, tensor allocation,
   compilation, correctness, or benchmarking. Normalize ROCm gcnArchName by
   splitting at `:` before comparing it with gfx942/gfx950.

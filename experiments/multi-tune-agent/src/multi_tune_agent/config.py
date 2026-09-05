@@ -36,6 +36,9 @@ class MultiTuneConfig:
         Path(__file__).resolve().parents[2] / "examples" / "tasks" / "generated"
     )
     bootstrap_min_aiter_score: int = 85
+    sft_enabled: bool = False
+    sft_dataset_root: Path = Path("~/geak_sft_dataset")
+    sft_task_type: str = "direction_conditioned"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "geak_root", self.geak_root.expanduser().resolve())
@@ -49,6 +52,11 @@ class MultiTuneConfig:
             "generated_template_root",
             Path(self.generated_template_root).expanduser().resolve(),
         )
+        object.__setattr__(
+            self,
+            "sft_dataset_root",
+            Path(self.sft_dataset_root).expanduser().resolve(),
+        )
         if self.max_rounds < 1 or self.engineers_per_round < 1:
             raise ValueError("max_rounds and engineers_per_round must be positive")
         if self.engineer_tool_rounds < 1 or self.integrator_tool_rounds < 1:
@@ -59,9 +67,26 @@ class MultiTuneConfig:
             raise ValueError("speedup thresholds must be positive")
         if self.min_improvement < 0:
             raise ValueError("min_improvement cannot be negative")
-        for name in ("bootstrap_enabled", "bootstrap_auto_promote"):
+        for name in ("bootstrap_enabled", "bootstrap_auto_promote", "sft_enabled"):
             if isinstance(getattr(self, name), bool) is False:
                 raise ValueError("%s must be a boolean" % name)
+        allowed_sft_task_types = {
+            "cold_start",
+            "profile_guided",
+            "direction_conditioned",
+            "error_recovery",
+            "regression_balance",
+        }
+        if self.sft_task_type not in allowed_sft_task_types:
+            raise ValueError(
+                "sft_task_type must be one of: %s"
+                % ", ".join(sorted(allowed_sft_task_types))
+            )
+        if self.sft_enabled and self.sft_task_type != "direction_conditioned":
+            raise ValueError(
+                "only direction_conditioned SFT collection is implemented; "
+                "refusing to mislabel another task type"
+            )
         if isinstance(self.bootstrap_min_aiter_score, bool):
             raise ValueError("bootstrap_min_aiter_score must be an integer")
         try:
@@ -102,12 +127,14 @@ class MultiTuneConfig:
             Path(__file__).resolve().parents[2] / "examples" / "tasks" / "generated",
         )
         values.setdefault("aiter_root", Path("~/aiter"))
+        values.setdefault("sft_dataset_root", Path("~/geak_sft_dataset"))
         for name in (
             "geak_root",
             "cases_path",
             "trajectory_root",
             "aiter_root",
             "generated_template_root",
+            "sft_dataset_root",
         ):
             if name not in values:
                 raise ValueError("missing required configuration key: %s" % name)

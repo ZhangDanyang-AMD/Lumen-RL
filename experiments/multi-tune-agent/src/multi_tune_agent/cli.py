@@ -8,6 +8,7 @@ import json
 import re
 import sys
 import threading
+import time
 import uuid
 from dataclasses import replace
 from pathlib import Path
@@ -64,6 +65,15 @@ _GEMM_FORMAT_CHOICES = (
     ("fp8", "FP8 A8W8"),
     ("mxfp4", "MXFP4 (native gfx950 only)"),
 )
+
+
+def _template_matches_requested_language(
+    descriptor: Any | None, recognized: Mapping[str, Any]
+) -> bool:
+    if descriptor is None:
+        return False
+    language = str(recognized.get("language") or "").strip().lower()
+    return not language or language == str(descriptor.backend).strip().lower()
 
 
 def _prompt_gemm_format(
@@ -314,6 +324,8 @@ def _generate_kernel_task_interactive(
         )
     )
     descriptor = canonical_gemm_template_for_contract(recognized)
+    if not _template_matches_requested_language(descriptor, recognized):
+        descriptor = None
     canonical_architecture = None
     if descriptor is not None:
         try:
@@ -368,6 +380,8 @@ def _generate_kernel_task_from_request(
             return None
         request = supplemented
     descriptor = canonical_gemm_template_for_contract(recognized)
+    if not _template_matches_requested_language(descriptor, recognized):
+        descriptor = None
     if descriptor is not None and all(
         recognized.get(name) is not None for name in ("m", "n", "k")
     ):
@@ -394,6 +408,7 @@ def _bootstrap_kernel_task(
     *,
     input_fn,
     output_fn,
+    case_id: str | None = None,
 ) -> GeneratedKernelTask | None:
     contract = _kernel_contract(recognized, request)
     _validate_native_quant_target(contract)
@@ -411,7 +426,7 @@ def _bootstrap_kernel_task(
         if existing is not None:
             output_fn("[lumen-code] Reusing locally verified template")
             return materialize_verified_template_task(
-                config, existing, request=request
+                config, existing, request=request, case_id=case_id
             )
         if not config.bootstrap_enabled:
             output_fn(
@@ -476,7 +491,9 @@ def _bootstrap_kernel_task(
             record,
             verified_root=config.generated_template_root,
         )
-        return materialize_verified_template_task(config, record, request=request)
+        return materialize_verified_template_task(
+            config, record, request=request, case_id=case_id
+        )
     except BootstrapError as exc:
         output_fn("[lumen-code] Bootstrap failed: %s" % exc)
         if exc.validation_report is not None:
@@ -485,6 +502,181 @@ def _bootstrap_kernel_task(
         if exc.draft_path is not None:
             output_fn("  draft diagnostics: %s" % exc.draft_path)
         return None
+
+
+def _generate_kernel_task_noninteractive(
+    config: MultiTuneConfig,
+    backend: OpenAIModelBackend,
+    *,
+    case_id: str,
+    request: str,
+    output_fn=print,
+) -> GeneratedKernelTask | Any:
+    recognized = recognize_kernel_request(request, backend)
+    missing = _missing_kernel_fields(recognized)
+    if missing:
+        raise ValueError(
+            "generation request %s is incomplete: %s"
+            % (case_id, ", ".join(missing))
+        )
+    descriptor = canonical_gemm_template_for_contract(recognized)
+    if not _template_matches_requested_language(descriptor, recognized):
+        descriptor = None
+    if descriptor is not None and all(
+        recognized.get(name) is not None for name in ("m", "n", "k")
+    ):
+        descriptor, _ = validate_template_target(
+            descriptor.format, recognized["target_gpu"]
+        )
+        spec = dict(recognized)
+        spec["dtype"] = descriptor.format
+        return generate_gemm_task(
+            config, request, parsed_spec=spec, case_id=case_id
+        )
+    task = _bootstrap_kernel_task(
+        config,
+        backend,
+        request,
+        recognized,
+        input_fn=lambda _prompt: "",
+        output_fn=output_fn,
+        case_id=case_id,
+    )
+    if task is None:
+        raise BootstrapError("template generation or GPU trust gate failed")
+    return task
+
+
+def _catalog_case_ids(path: Path) -> set[str]:
+    if not path.is_file():
+        return set()
+    payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    tasks = payload.get("tasks") if isinstance(payload, Mapping) else None
+    if not isinstance(tasks, list):
+        raise ValueError("output catalog 'tasks' must be a list")
+    return {
+        str(item["id"])
+        for item in tasks
+        if isinstance(item, Mapping) and item.get("id")
+    }
+
+
+def _run_generation_manifest(
+    config: MultiTuneConfig,
+    backend: OpenAIModelBackend,
+    manifest_path: Path,
+    output_catalog: Path,
+    *,
+    stream: bool = False,
+) -> int:
+    source = Path(manifest_path).expanduser().resolve()
+    destination = Path(output_catalog).expanduser().resolve()
+    payload = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
+    if not isinstance(payload, Mapping) or payload.get("version") != 1:
+        raise ValueError("generation manifest must be a mapping with version: 1")
+    requests_value = payload.get("requests")
+    if not isinstance(requests_value, list) or not requests_value:
+        raise ValueError("generation manifest requires a non-empty requests list")
+    if not config.bootstrap_auto_promote:
+        raise ValueError(
+            "non-interactive generation requires bootstrap_auto_promote: true"
+        )
+
+    run_config = replace(config, cases_path=destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    results_path = (
+        config.trajectory_root
+        / "requests"
+        / ("%s-generation-results.jsonl" % source.stem)
+    )
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = _catalog_case_ids(destination)
+    failures = 0
+
+    for index, item in enumerate(requests_value):
+        if not isinstance(item, Mapping):
+            raise ValueError("request %d must be a mapping" % (index + 1))
+        case_id = str(item.get("id") or "").strip()
+        request = str(item.get("request") or "").strip()
+        if not case_id or not request:
+            raise ValueError("request %d requires id and request" % (index + 1))
+        started = time.time()
+        result: dict[str, Any] = {
+            "manifest": str(source),
+            "output_catalog": str(destination),
+            "case_id": case_id,
+            "started_at": started,
+        }
+        try:
+            if case_id in existing:
+                result["status"] = "already_registered"
+            else:
+                task = _generate_kernel_task_noninteractive(
+                    run_config,
+                    backend,
+                    case_id=case_id,
+                    request=request,
+                    output_fn=(
+                        (lambda message: print("[%s] %s" % (case_id, message)))
+                        if stream
+                        else (lambda _message: None)
+                    ),
+                )
+                seed_provenance = item.get("seed_provenance")
+                if isinstance(task, GeneratedKernelTask) and isinstance(
+                    seed_provenance, Mapping
+                ):
+                    existing_provenance = (
+                        dict(task.provenance)
+                        if isinstance(task.provenance, Mapping)
+                        else {"template_provenance": task.provenance}
+                    )
+                    task = replace(
+                        task,
+                        provenance={
+                            **existing_provenance,
+                            "case_seed": dict(seed_provenance),
+                        },
+                    )
+                register_generated_case(destination, task)
+                existing.add(case_id)
+                result.update(
+                    {
+                        "status": "generated",
+                        "task_dir": str(task.task_dir),
+                        "case_type": task.case_type,
+                        "architecture": task.architecture,
+                        "backend": task.backend,
+                        "seed_provenance": (
+                            dict(seed_provenance)
+                            if isinstance(seed_provenance, Mapping)
+                            else None
+                        ),
+                    }
+                )
+        except Exception as exc:
+            failures += 1
+            result.update(
+                {
+                    "status": "failed",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            )
+        result["finished_at"] = time.time()
+        with results_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(result, sort_keys=True, default=str, ensure_ascii=False)
+                + "\n"
+            )
+            handle.flush()
+        if stream:
+            print(
+                "[lumen-code] generation case=%s status=%s"
+                % (case_id, result["status"]),
+                flush=True,
+            )
+    return 0 if failures == 0 else 2
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -497,6 +689,14 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--request", help="natural-language objective for one case")
     run.add_argument(
         "--stream", action="store_true", help="print role/tool progress while running"
+    )
+    generate = subparsers.add_parser(
+        "generate", help="generate and GPU-gate tasks from a versioned manifest"
+    )
+    generate.add_argument("--manifest", required=True, type=Path)
+    generate.add_argument("--output-catalog", required=True, type=Path)
+    generate.add_argument(
+        "--stream", action="store_true", help="print generation and trust-gate progress"
     )
     subparsers.add_parser(
         "interactive",
@@ -826,6 +1026,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.command == "interactive":
         return _run_interactive(config)
+
+    if args.command == "generate":
+        return _run_generation_manifest(
+            config,
+            _model_backend(config),
+            args.manifest,
+            args.output_catalog,
+            stream=args.stream,
+        )
 
     if args.request and (not args.cases or len(args.cases) != 1):
         parser.error("--request requires exactly one --case")

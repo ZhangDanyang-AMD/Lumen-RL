@@ -14,6 +14,7 @@ class TrajectoryWriter:
         self,
         run_dir: Path,
         event_sink: Optional[Callable[[Mapping[str, Any]], None]] = None,
+        sft_sink: Optional[Callable[[Mapping[str, Any]], None]] = None,
     ) -> None:
         self.run_dir = Path(run_dir).resolve()
         self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -21,6 +22,7 @@ class TrajectoryWriter:
         self.summary_path = self.run_dir / "summary.json"
         self._lock = threading.Lock()
         self._event_sink = event_sink
+        self._sft_sink = sft_sink
 
     def append(
         self,
@@ -43,6 +45,11 @@ class TrajectoryWriter:
         with self._lock:
             with self.path.open("a", encoding="utf-8") as handle:
                 handle.write(line)
+                handle.flush()
+        if self._sft_sink is not None:
+            # Dataset provenance is authoritative. Unlike terminal/UI subscribers,
+            # a failed SFT sink must fail the run rather than silently lose data.
+            self._sft_sink(record)
         if self._event_sink is not None:
             try:
                 self._event_sink(record)

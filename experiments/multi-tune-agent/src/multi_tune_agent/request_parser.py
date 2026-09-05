@@ -329,6 +329,20 @@ def _finish_kernel_result(
     result: dict[str, Any], explicit_fields: set[str]
 ) -> dict[str, Any]:
     implied_fields: list[str] = []
+    target = str(result.get("target_gpu") or "").strip().lower()
+    if (
+        result["operator"] == "gemm"
+        and result["format"] == "fp8"
+        and target in {"gfx942", "mi300", "mi300x", "mi308", "mi308x"}
+    ):
+        fp8_defaults = {
+            "input_scale_granularity": "per_token",
+            "weight_scale_granularity": "per_channel",
+        }
+        for field, value in fp8_defaults.items():
+            if result[field] is None:
+                result[field] = value
+                implied_fields.append(field)
     if result["format"] in {"mxfp4", "mxfp8"}:
         for field in ("input_scale_granularity", "weight_scale_granularity"):
             if result[field] is None:
@@ -747,7 +761,18 @@ def _language_from_text(text: str) -> str | None:
             re.I,
         )
     )
-    return _normalize_language(matches[-1].group(1)) if matches else None
+    positive = []
+    for match in matches:
+        prefix = text[max(0, match.start() - 24) : match.start()]
+        if re.search(
+            r"(?:not|rather\s+than|instead\s+of|do\s+not\s+use|"
+            r"不要使用|不要用|不用|而不是)\s*$",
+            prefix,
+            re.I,
+        ):
+            continue
+        positive.append(match)
+    return _normalize_language(positive[-1].group(1)) if positive else None
 
 
 def _format_from_text(text: str) -> str | None:

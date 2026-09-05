@@ -1,0 +1,211 @@
+schema_version: geak_aiter_case_seeds_v1
+source:
+  repository: https://github.com/ROCm/aiter.git
+  branch: main
+  git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+  license: MIT
+policy:
+  purpose: Extract contracts, shapes, input generation, architecture support, and independent oracles.
+  student_runtime_may_call_aiter: false
+  require_fresh_workspace_verify: true
+  require_source_file_sha256: true
+  require_grouped_split_by_source_lineage: true
+seeds:
+  - id: aiter-triton-gfx942-fused-mul-add-bf16
+    wave: 1
+    operator: fused_mul_add
+    language: triton
+    backend: triton
+    architecture: gfx942
+    dtype_in: bf16
+    dtype_out: bf16
+    shape: [128, 7168]
+    source_test_path: op_tests/triton_tests/fusions/test_fused_mul_add.py
+    source_kernel_path: aiter/ops/triton/fusions/fused_mul_add.py
+    oracle_method: torch expression a*x+b
+    baseline_editable_without_aiter_call: true
+
+  - id: aiter-triton-gfx942-softmax-fp32
+    wave: 1
+    operator: softmax
+    language: triton
+    backend: triton
+    architecture: gfx942
+    dtype_in: fp32
+    dtype_out: fp32
+    shape: [4096, 8192]
+    source_test_path: op_tests/triton_tests/test_softmax.py
+    source_kernel_path: aiter/ops/triton/softmax.py
+    oracle_method: torch.softmax
+    baseline_editable_without_aiter_call: true
+
+  - id: aiter-triton-gfx942-fused-silu-mul-bf16
+    wave: 1
+    operator: fused_silu_mul
+    language: triton
+    backend: triton
+    architecture: gfx942
+    dtype_in: bf16
+    dtype_out: bf16
+    shape: [4, 64]
+    source_test_path: op_tests/triton_tests/fusions/test_fused_silu_mul.py
+    source_kernel_path: aiter/ops/triton/activation.py
+    oracle_method: local silu_exp2 reference
+    baseline_editable_without_aiter_call: true
+
+  - id: aiter-triton-gfx942-static-per-tensor-quant
+    wave: 1
+    operator: static_per_tensor_quant
+    language: triton
+    backend: triton
+    architecture: gfx942
+    dtype_in: bf16
+    dtype_out: fp8_e4m3fnuz
+    shape: [32, 8192]
+    source_test_path: op_tests/triton_tests/quant/test_quant.py
+    source_kernel_path: aiter/ops/triton/quant
+    oracle_method: torch_static_per_tensor_quant_fp8_i8
+    fp8_dtype_variant: fnuz
+    baseline_editable_without_aiter_call: true
+
+  - id: aiter-triton-gfx942-topk-fp32
+    wave: 1
+    operator: topk
+    language: triton
+    backend: triton
+    architecture: gfx942
+    dtype_in: fp32
+    dtype_out: fp32_and_indices
+    shape: [8, 128256]
+    contract:
+      k: 8
+    source_test_path: op_tests/triton_tests/test_topk.py
+    source_kernel_path: aiter/ops/triton/topk.py
+    oracle_method: torch.topk
+    baseline_editable_without_aiter_call: true
+
+  - id: aiter-triton-gfx942-rmsnorm-bf16
+    wave: 1
+    operator: rms_norm
+    language: triton
+    backend: triton
+    architecture: gfx942
+    dtype_in: bf16
+    dtype_out: bf16
+    shape: [256, 4096]
+    source_test_path: op_tests/triton_tests/normalization/test_rmsnorm.py
+    source_kernel_path: aiter/ops/triton/normalization/rmsnorm.py
+    oracle_method: local torch_rmsnorm
+    baseline_editable_without_aiter_call: true
+
+  - id: aiter-triton-gfx942-gemm-a16w16-irregular
+    wave: 1
+    operator: gemm
+    language: triton
+    backend: triton
+    architecture: gfx942
+    dtype_in: bf16
+    dtype_weight: bf16
+    dtype_accum: fp32
+    dtype_out: bf16
+    shape: {M: 3, N: 5, K: 2}
+    layout: TN
+    source_test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    source_kernel_path: aiter/ops/triton/gemm/basic/gemm_a16w16.py
+    source_config_path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+    oracle_method: torch.nn.functional.linear
+    baseline_editable_without_aiter_call: partial
+
+  - id: aiter-triton-gfx942-gemm-a16w16-square
+    wave: 1
+    operator: gemm
+    language: triton
+    backend: triton
+    architecture: gfx942
+    dtype_in: bf16
+    dtype_weight: bf16
+    dtype_accum: fp32
+    dtype_out: bf16
+    shape: {M: 1024, N: 1024, K: 1024}
+    layout: TN
+    source_test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    source_kernel_path: aiter/ops/triton/gemm/basic/gemm_a16w16.py
+    source_config_path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+    oracle_method: torch.nn.functional.linear
+    baseline_editable_without_aiter_call: partial
+
+  - id: aiter-hip-gfx942-opus-gemm-a16w16
+    wave: 2
+    operator: gemm
+    language: hip
+    backend: opus_hip
+    architecture: gfx942
+    dtype_in: bf16
+    dtype_weight: bf16
+    dtype_accum: fp32
+    dtype_out: bf16
+    shape: {batch: 1, M: 128, N: 256, K: 5120}
+    layout: TN
+    source_test_path: op_tests/test_opus_a16w16_gemm.py
+    source_kernel_path: csrc/opus_gemm
+    oracle_method: torch einsum/bmm in fp32, cast to bf16
+    oracle_tolerance: {rtol: 0.1, atol: 0.5}
+    support_guard: gfx in [gfx942, gfx950, gfx1250]
+    baseline_editable_without_aiter_call: true
+
+  - id: aiter-hip-gfx942-ck-batched-gemm-bf16
+    wave: 2
+    operator: batched_gemm
+    language: hip
+    backend: ck
+    architecture: gfx942
+    dtype_in: bf16
+    dtype_weight: bf16
+    dtype_accum: fp32
+    dtype_out: bf16
+    shape: {batch: 4, M: 1024, N: 4096, K: 1024}
+    layout: bmn
+    source_test_path: op_tests/test_batched_gemm_bf16.py
+    source_kernel_path: aiter/ops/batched_gemm_op_bf16.py
+    oracle_method: per-batch torch.nn.functional.linear in fp32
+    oracle_tolerance: {rtol: 0.01, atol: 0.01}
+    support_guard: gfx in [gfx942, gfx950]
+    baseline_editable_without_aiter_call: true
+
+  - id: aiter-hip-gfx942-asm-gemm-a16w16
+    wave: 2
+    operator: gemm
+    language: hip
+    backend: asm
+    architecture: gfx942
+    dtype_in: bf16
+    dtype_weight: bf16
+    dtype_accum: fp32
+    dtype_out: bf16
+    shape: {M: 128, N: 2048, K: 6144}
+    layout: TN
+    source_test_path: op_tests/test_gemm_a16w16.py
+    source_kernel_path: hsa/gfx942/bf16gemm
+    oracle_method: torch.nn.functional.linear
+    support_guard: N and K divisible by 64
+    input_preparation: shuffle_weight may be required for bpreshuffle variant
+    baseline_editable_without_aiter_call: partial
+
+  - id: aiter-hip-gfx942-ck-gemm-a8w8-int8
+    wave: 2
+    operator: quantized_gemm
+    language: hip
+    backend: ck
+    architecture: gfx942
+    dtype_in: int8
+    dtype_weight: int8
+    dtype_accum: int32
+    dtype_out: bf16
+    shape: {M: 32, N: 8192, K: 1024}
+    layout: TN
+    source_test_path: op_tests/test_gemm_a8w8.py
+    source_kernel_path: aiter/ops/gemm_op_a8w8.py
+    source_config_path: aiter/configs/a8w8_tuned_gemm.csv
+    oracle_method: torch dequantization plus torch.nn.functional.linear
+    input_preparation: per-token quantization must be frozen outside student kernel
+    baseline_editable_without_aiter_call: partial

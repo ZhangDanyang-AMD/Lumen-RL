@@ -1,0 +1,724 @@
+schema_version: geak_phase1_case_candidates_v1
+source_revisions:
+  aiter:
+    repository: https://github.com/ROCm/aiter.git
+    branch: main
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    license: MIT
+    local_root: /home/danyzhan/aiter
+  geak:
+    repository: https://github.com/AMD-AGI/GEAK.git
+    branch: main
+    git_sha: fa86fd1e9bec56dadf27d6575a0c8f8ab7875c57
+    local_root: /home/danyzhan/GEAK
+  lumen_rl:
+    repository: https://github.com/ZhangDanyang-AMD/Lumen-RL.git
+    branch: dev/multi-loop-agent
+    git_sha: b0c029d257e288709163feb668d2c081a2d2fd23
+    local_root: /home/danyzhan/Lumen-RL
+policy:
+  candidate_is_runnable: false
+  student_runtime_may_call_reference_backend: false
+  cross_language_contract_reuse_allowed: true
+  translated_implementations_share_family: true
+  same_shape_does_not_create_new_lineage: true
+  require_source_file_sha256_before_seed_promotion: true
+  require_split_group_before_batch_generation: true
+  require_target_gpu_smoke_before_validated_case: true
+  require_fresh_workspace_independent_verify: true
+status_flow:
+  - extracted_candidate
+  - registered_seed
+  - validated_case
+defaults:
+  status: extracted_candidate
+  implementation_family_id: pending_independent_baseline
+  split_group: pending_split_freeze
+  source_file_sha256: pending_seed_promotion
+  promotion_requires:
+    - source_file_sha256
+    - standalone_geak_harness
+    - no_reference_runtime_call
+    - target_gpu_compile_correctness_performance
+    - frozen_split_group
+    - fresh_workspace_independent_verify
+candidates:
+  - id: cand-a16w16-router-bf16
+    priority: P0
+    contract_family_id: CF-TG-003
+    source_lineage_id: aiter:test_gemm_a16w16:test_gemm_a16_w16
+    source:
+      revision: aiter
+      test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+      test_id: test_gemm_a16_w16
+      source_language: triton
+      source_backend: triton
+    contract:
+      operator: gemm
+      shape: {M: 32, N: 7168, K: 256}
+      dtype: {input: bf16, weight: bf16, accum: fp32, output: bf16}
+      layout: TN
+    oracle: {tier: pure_torch, method: torch.nn.functional.linear}
+    target_lanes: [triton_gfx942, triton_gfx950, hip_gfx942, hip_gfx950]
+
+  - id: cand-a16w16-gelu-bf16
+    priority: P1
+    contract_family_id: CF-TG-ACT-001
+    source_lineage_id: aiter:test_gemm_a16w16:test_gemm_a16_w16_activation
+    source:
+      revision: aiter
+      test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+      test_id: test_gemm_a16_w16_activation
+      source_language: triton
+      source_backend: triton
+    contract:
+      operator: gemm_gelu
+      shape: {M: 16, N: 1024, K: 1024}
+      dtype: {input: bf16, weight: bf16, accum: fp32, output: bf16}
+      layout: TN
+      activation: gelu
+    oracle: {tier: pure_torch, method: F.linear then F.gelu}
+    target_lanes: [triton_gfx942, triton_gfx950, hip_gfx942, hip_gfx950]
+
+  - id: cand-a16w16-nt-layout-bf16
+    priority: P1
+    contract_family_id: CF-TG-LAYOUT-001
+    source_lineage_id: aiter:test_gemm_a16w16:test_gemm_a16_w16_layout
+    source:
+      revision: aiter
+      test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+      test_id: test_gemm_a16_w16_layout
+      source_language: triton
+      source_backend: triton
+    contract:
+      operator: gemm
+      shape: {M: 1024, N: 1024, K: 1024}
+      dtype: {input: bf16, weight: bf16, accum: fp32, output: bf16}
+      layout: NT
+    oracle: {tier: pure_torch, method: F.linear on strided views}
+    target_lanes: [triton_gfx942, triton_gfx950, hip_gfx942, hip_gfx950]
+
+  - id: cand-a16w16-gated-silu
+    priority: P1
+    contract_family_id: CF-TG-GATED-001
+    source_lineage_id: aiter:test_gemm_a16w16_gated:test_gemm_a16_w16_gated
+    source:
+      revision: aiter
+      test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16_gated.py
+      test_id: test_gemm_a16_w16_gated
+      source_language: triton
+      source_backend: triton
+    contract:
+      operator: gated_gemm
+      shape: {M: 32, N: 7168, K: 256}
+      dtype: {input: bf16, weight: bf16, accum: fp32, output: bf16}
+      layout: TN
+      activation: silu
+      output_shape: [32, 3584]
+    oracle: {tier: pure_torch, method: F.linear then split and silu multiply}
+    target_lanes: [triton_gfx942, triton_gfx950, hip_gfx942, hip_gfx950]
+
+  - id: cand-hip-a16w16-narrow-n
+    priority: P0
+    contract_family_id: CF-HG-A16-002
+    source_lineage_id: aiter:test_gemm_a16w16:test_gemm
+    source:
+      revision: aiter
+      test_path: op_tests/test_gemm_a16w16.py
+      test_id: test_gemm
+      source_language: hip
+      source_backend: asm_hipblaslt_triton
+    contract:
+      operator: gemm
+      shape: {M: 128, N: 32, K: 8192}
+      dtype: {input: bf16, weight: bf16, accum: fp32, output: bf16}
+      layout: TN
+    oracle: {tier: pure_torch, method: torch.nn.functional.linear}
+    target_lanes: [hip_gfx942, triton_gfx942]
+    flags: [multi_backend_source]
+
+  - id: cand-fp8-a8w8-production
+    priority: P0
+    contract_family_id: CF-QG-FP8-001
+    source_lineage_id: aiter:test_gemm_a8w8:test_gemm_fp8
+    source:
+      revision: aiter
+      test_path: op_tests/triton_tests/gemm/basic/test_gemm_a8w8.py
+      test_id: test_gemm_fp8
+      source_language: triton_gluon
+      source_backend: triton_gluon
+    contract:
+      operator: scaled_quant_gemm
+      shape: {M: 128, N: 1280, K: 8192}
+      dtype: {input: fp8_e4m3_arch_specific, weight: fp8_e4m3_arch_specific, accum: fp32, output: bf16}
+      layout: TN
+      scale: {activation: per_row, weight: per_column}
+    oracle: {tier: pure_torch, method: fp32 matmul with broadcast scales}
+    target_lanes: [triton_gfx942, triton_gfx950, hip_gfx942, hip_gfx950]
+    flags: [gfx942_fnuz, gfx950_fn]
+
+  - id: cand-fp8-a8w8-gelu-bias-gfx942
+    priority: P1
+    contract_family_id: CF-HG-FP8-ACT-001
+    source_lineage_id: aiter:test_gemm_a8w8:test_gemm
+    source:
+      revision: aiter
+      test_path: op_tests/test_gemm_a8w8.py
+      test_id: test_gemm
+      source_language: hip
+      source_backend: hipblaslt
+    contract:
+      operator: scaled_quant_gemm_gelu_bias
+      shape: {M: 32, N: 3072, K: 768}
+      dtype: {input: fp8_e4m3fnuz, weight: fp8_e4m3fnuz, accum: fp32, output: bf16}
+      layout: TN
+      activation: gelu
+      bias: true
+    oracle: {tier: pure_torch, method: fp32 dequant linear plus bias and gelu}
+    target_lanes: [hip_gfx942, triton_gfx942]
+    flags: [gfx942_only_source_guard]
+
+  - id: cand-fp8-blockscale-wide-n
+    priority: P1
+    contract_family_id: CF-QG-BLOCK-001
+    source_lineage_id: aiter:test_gemm_a8w8_blockscale:test_gemm
+    source:
+      revision: aiter
+      test_path: op_tests/test_gemm_a8w8_blockscale.py
+      test_id: test_gemm
+      source_language: hip_triton
+      source_backend: ck_asm_triton
+    contract:
+      operator: blockscale_gemm
+      shape: {M: 128, N: 24576, K: 1536}
+      dtype: {input: fp8_e4m3_arch_specific, weight: fp8_e4m3_arch_specific, accum: fp32, output: bf16}
+      layout: TN
+      scale: {activation_block: [1, 128], weight_block: [128, 128]}
+    oracle: {tier: pure_torch, method: block dequantization then F.linear}
+    target_lanes: [triton_gfx942, triton_gfx950, hip_gfx942, hip_gfx950]
+    flags: [complex_scale_layout]
+
+  - id: cand-batched-bf16-bmn
+    priority: P0
+    contract_family_id: CF-BG-BF16-001
+    source_lineage_id: aiter:test_batched_gemm_bf16:test_gemm:bmn
+    source:
+      revision: aiter
+      test_path: op_tests/test_batched_gemm_bf16.py
+      test_id: test_gemm
+      source_language: hip_triton
+      source_backend: ck_triton
+    contract:
+      operator: batched_gemm
+      shape: {B: 16, M: 256, N: 1024, K: 4096}
+      dtype: {input: bf16, weight: bf16, accum: fp32, output: bf16}
+      layout: bmn
+    oracle: {tier: pure_torch, method: per-batch F.linear}
+    target_lanes: [triton_gfx942, triton_gfx950, hip_gfx942, hip_gfx950]
+
+  - id: cand-batched-bf16-mbn
+    priority: P1
+    contract_family_id: CF-BG-BF16-LAYOUT-001
+    source_lineage_id: aiter:test_batched_gemm_bf16:test_gemm:mbn
+    source:
+      revision: aiter
+      test_path: op_tests/test_batched_gemm_bf16.py
+      test_id: test_gemm
+      source_language: triton
+      source_backend: triton_einsum
+    contract:
+      operator: batched_gemm
+      shape: {B: 16, M: 256, N: 1024, K: 4096}
+      dtype: {input: bf16, weight: bf16, accum: fp32, output: bf16}
+      layout: mbn
+    oracle: {tier: pure_torch, method: torch.einsum}
+    target_lanes: [triton_gfx942, triton_gfx950, hip_gfx942, hip_gfx950]
+
+  - id: cand-batched-int8-a8w8
+    priority: P1
+    contract_family_id: CF-BG-INT8-001
+    source_lineage_id: aiter:test_batched_gemm_a8w8:test_gemm
+    source:
+      revision: aiter
+      test_path: op_tests/test_batched_gemm_a8w8.py
+      test_id: test_gemm
+      source_language: hip
+      source_backend: ck
+    contract:
+      operator: batched_scaled_quant_gemm
+      shape: {B: 16, M: 128, N: 1280, K: 8192}
+      dtype: {input: int8, weight: int8, accum: int32, output: bf16}
+      layout: bmn
+      scale: {activation: per_batch_row, weight: per_batch_column}
+    oracle: {tier: pure_torch, method: per-batch fp32 linear with scales}
+    target_lanes: [hip_gfx942, hip_gfx950, triton_gfx942, triton_gfx950]
+
+  - id: cand-opus-a16w16-model-shape
+    priority: P0
+    contract_family_id: CF-HG-001
+    source_lineage_id: aiter:test_opus_a16w16_gemm:test_a16w16
+    source:
+      revision: aiter
+      test_path: op_tests/test_opus_a16w16_gemm.py
+      test_id: test_a16w16
+      source_language: hip
+      source_backend: opus
+    contract:
+      operator: gemm
+      shape: {B: 1, M: 128, N: 2048, K: 7168}
+      dtype: {input: bf16, weight: bf16, accum: fp32, output: bf16}
+      layout: TN
+    oracle: {tier: pure_torch, method: fp32 einsum or bmm then cast}
+    target_lanes: [hip_gfx942, hip_gfx950, triton_gfx942, triton_gfx950]
+    flags: [ignore_cuda_graph_reference_path]
+
+  - id: cand-opus-mxscale-bmm-gfx950
+    priority: P1
+    contract_family_id: CF-HG-MXSCALE-001
+    source_lineage_id: aiter:test_opus_a8w8_bmm:test_mxscale_bmm
+    source:
+      revision: aiter
+      test_path: op_tests/test_opus_a8w8_bmm.py
+      test_id: test_mxscale_bmm
+      source_language: hip
+      source_backend: opus
+    contract:
+      operator: batched_mxscale_gemm
+      shape: {G: 2, M: 512, N: 1024, K: 4096}
+      dtype: {input: fp8_e4m3fn, weight: fp8_e4m3fn, accum: fp32, output: bf16}
+      layout: group_m_major
+      scale: {activation: e8m0_per_token_k128, weight: e8m0_block_128x128}
+    oracle: {tier: torch_composed, method: fp32 dequant einsum}
+    target_lanes: [hip_gfx950, triton_gfx950]
+    flags: [gfx950_only, complex_layout]
+
+  - id: cand-dynamic-per-tensor-quant
+    priority: P0
+    contract_family_id: CF-EW-006
+    source_lineage_id: aiter:test_quant:test_dynamic_per_tensor_quant
+    source:
+      revision: aiter
+      test_path: op_tests/triton_tests/quant/test_quant.py
+      test_id: test_dynamic_per_tensor_quant
+      source_language: triton
+      source_backend: triton
+    contract:
+      operator: dynamic_per_tensor_quant
+      shape: {M: 32, N: 8192}
+      dtype: {input: bf16, output: fp8_or_int8, scale: fp32_scalar}
+      layout: contiguous
+    oracle: {tier: pure_torch, method: fp32 absmax divided by dtype max}
+    target_lanes: [triton_gfx942, triton_gfx950, hip_gfx942, hip_gfx950]
+
+  - id: cand-dynamic-per-token-quant
+    priority: P0
+    contract_family_id: CF-Q-PERTOKEN-001
+    source_lineage_id: aiter:test_quant:test_dynamic_per_token_quant
+    source:
+      revision: aiter
+      test_path: op_tests/triton_tests/quant/test_quant.py
+      test_id: test_dynamic_per_token_quant
+      source_language: triton
+      source_backend: triton
+    contract:
+      operator: dynamic_per_token_quant
+      shape: {M: 1024, N: 128}
+      dtype: {input: bf16, output: fp8_or_int8, scale: fp32_per_row}
+      layout: contiguous
+    oracle: {tier: pure_torch, method: row-wise absmax divided by dtype max}
+    target_lanes: [triton_gfx942, triton_gfx950, hip_gfx942, hip_gfx950]
+
+  - id: cand-static-per-tensor-quant-large
+    priority: P0
+    contract_family_id: CF-EW-005
+    source_lineage_id: aiter:test_quant:test_static_per_tensor_quant
+    source:
+      revision: aiter
+      test_path: op_tests/triton_tests/quant/test_quant.py
+      test_id: test_static_per_tensor_quant
+      source_language: triton
+      source_backend: triton
+    contract:
+      operator: static_per_tensor_quant
+      shape: {M: 2048, N: 1024}
+      dtype: {input: bf16, output: fp8_or_int8, scale: fp32_scalar}
+      layout: contiguous
+    oracle: {tier: pure_torch, method: clamp and round x divided by scale}
+    target_lanes: [triton_gfx942, triton_gfx950, hip_gfx942, hip_gfx950]
+
+  - id: cand-act-mul-mxfp4-gfx950
+    priority: P1
+    contract_family_id: CF-Q-MXFP4-ACT-001
+    source_lineage_id: aiter:test_activation:test_act_mul_and_mxfp4_quant
+    source:
+      revision: aiter
+      test_path: op_tests/triton_tests/test_activation.py
+      test_id: test_act_mul_and_mxfp4_quant
+      source_language: triton
+      source_backend: triton
+    contract:
+      operator: silu_mul_mxfp4_quant
+      shape: {M: 32, N: 8192}
+      dtype: {input: bf16, output: mxfp4_e2m1, scale: e8m0}
+      layout: contiguous_with_optional_scale_shuffle
+      scale: {block_size: 32}
+    oracle: {tier: torch_composed, method: silu multiply then torch MXFP4 quant}
+    target_lanes: [triton_gfx950, hip_gfx950]
+    flags: [gfx950_only, packed_output]
+
+  - id: cand-hip-rmsnorm2d
+    priority: P0
+    contract_family_id: CF-NORM-RMS-002
+    source_lineage_id: aiter:test_rmsnorm2d:test_rmsnorm2d
+    source:
+      revision: aiter
+      test_path: op_tests/test_rmsnorm2d.py
+      test_id: test_rmsnorm2d
+      source_language: hip
+      source_backend: ck
+    contract:
+      operator: rms_norm
+      shape: {M: 32, N: 4096}
+      dtype: {input: bf16, weight: bf16, accum: fp32, output: bf16}
+      layout: contiguous
+    oracle: {tier: pure_torch, method: torch.nn.functional.rms_norm}
+    target_lanes: [hip_gfx942, hip_gfx950, triton_gfx942, triton_gfx950]
+
+  - id: cand-hip-fused-add-rmsnorm
+    priority: P0
+    contract_family_id: CF-NORM-RMS-ADD-001
+    source_lineage_id: aiter:test_rmsnorm2d:test_rmsnorm2d_fuseAdd
+    source:
+      revision: aiter
+      test_path: op_tests/test_rmsnorm2d.py
+      test_id: test_rmsnorm2d_fuseAdd
+      source_language: hip
+      source_backend: ck
+    contract:
+      operator: fused_add_rms_norm
+      shape: {M: 32, N: 4096}
+      dtype: {input: bf16, residual: bf16, weight: bf16, accum: fp32, output: bf16}
+      layout: contiguous
+    oracle: {tier: pure_torch, method: residual add then F.rms_norm}
+    target_lanes: [hip_gfx942, hip_gfx950, triton_gfx942, triton_gfx950]
+
+  - id: cand-triton-fused-add-rmsnorm-pad
+    priority: P1
+    contract_family_id: CF-NORM-RMS-PAD-001
+    source_lineage_id: aiter:test_fused_add_rmsnorm_pad:test_mul_add
+    source:
+      revision: aiter
+      test_path: op_tests/triton_tests/normalization/test_fused_add_rmsnorm_pad.py
+      test_id: test_mul_add
+      source_language: triton
+      source_backend: triton
+    contract:
+      operator: fused_add_rms_norm_pad
+      shape: {M: 256, N: 2880}
+      dtype: {input: bf16, residual: bf16, output: bf16}
+      layout: contiguous
+      pad_to_multiple: 256
+    oracle: {tier: pure_torch, method: fp32 add and RMS norm then pad}
+    target_lanes: [triton_gfx942, triton_gfx950, hip_gfx942, hip_gfx950]
+
+  - id: cand-hip-fused-add-layernorm
+    priority: P1
+    contract_family_id: CF-NORM-LAYER-ADD-001
+    source_lineage_id: aiter:test_layernorm2d:test_layernorm2d_fuseAdd
+    source:
+      revision: aiter
+      test_path: op_tests/test_layernorm2d.py
+      test_id: test_layernorm2d_fuseAdd
+      source_language: hip
+      source_backend: ck
+    contract:
+      operator: fused_add_layer_norm
+      shape: {M: 32, N: 4096}
+      dtype: {input: bf16, residual: bf16, weight: bf16, bias: bf16, output: bf16}
+      layout: contiguous
+    oracle: {tier: pure_torch, method: residual add then F.layer_norm}
+    target_lanes: [hip_gfx942, hip_gfx950, triton_gfx942, triton_gfx950]
+
+  - id: cand-hip-gated-rmsnorm-fp8
+    priority: P1
+    contract_family_id: CF-NORM-GATED-FP8-001
+    source_lineage_id: aiter:test_gated_rmsnorm_fp8_quant:test_gated_rmsnorm_fp8_per_token_quant
+    source:
+      revision: aiter
+      test_path: op_tests/test_gated_rmsnorm_fp8_quant.py
+      test_id: test_gated_rmsnorm_fp8_per_token_quant
+      source_language: hip
+      source_backend: hip
+    contract:
+      operator: gated_rmsnorm_fp8_per_token_quant
+      shape: {tokens: 512, heads: 32, head_dim: 128}
+      dtype: {input: bf16, output: fp8_arch_specific, scale: fp32_per_token}
+      layout: token_head_dim
+    oracle: {tier: pure_torch, method: RMS norm plus SiLU gate and clamp quant}
+    target_lanes: [hip_gfx942, hip_gfx950, triton_gfx942, triton_gfx950]
+
+  - id: cand-hip-silu-and-mul
+    priority: P0
+    contract_family_id: CF-ACT-SILU-002
+    source_lineage_id: aiter:test_activation:test_silu_and_mul
+    source:
+      revision: aiter
+      test_path: op_tests/test_activation.py
+      test_id: test_silu_and_mul
+      source_language: hip
+      source_backend: hip
+    contract:
+      operator: silu_and_mul
+      shape: {M: 256, N: 8192}
+      dtype: {input: bf16, output: bf16}
+      layout: split_last_dimension
+    oracle: {tier: pure_torch, method: F.silu on first half times second half}
+    target_lanes: [hip_gfx942, hip_gfx950, triton_gfx942, triton_gfx950]
+
+  - id: cand-hip-scaled-silu-and-mul
+    priority: P1
+    contract_family_id: CF-ACT-SILU-FP8-001
+    source_lineage_id: aiter:test_activation:test_scaled_silu_and_mul
+    source:
+      revision: aiter
+      test_path: op_tests/test_activation.py
+      test_id: test_scaled_silu_and_mul
+      source_language: hip
+      source_backend: hip
+    contract:
+      operator: scaled_silu_and_mul
+      shape: {M: 256, N: 8192}
+      dtype: {input: bf16, output: fp8_arch_specific, scale: fp32_global}
+      layout: split_last_dimension
+    oracle: {tier: pure_torch, method: silu multiply then global-scale quant}
+    target_lanes: [hip_gfx942, hip_gfx950, triton_gfx942, triton_gfx950]
+
+  - id: cand-triton-silu-mul-moe-shape
+    priority: P0
+    contract_family_id: CF-EW-004
+    source_lineage_id: aiter:test_fused_silu_mul:test_fused_silu_mul_tp4_moe_shapes
+    source:
+      revision: aiter
+      test_path: op_tests/triton_tests/fusions/test_fused_silu_mul.py
+      test_id: test_fused_silu_mul_tp4_moe_shapes
+      source_language: triton
+      source_backend: triton
+    contract:
+      operator: fused_silu_mul
+      shape: {rows: 256, last_dim: 768}
+      dtype: {input: bf16, output: bf16}
+      layout: split_last_dimension
+    oracle: {tier: pure_torch, method: local silu_exp2 reference times gate}
+    target_lanes: [triton_gfx942, triton_gfx950, hip_gfx942, hip_gfx950]
+
+  - id: cand-softmax-square-bf16
+    priority: P0
+    contract_family_id: CF-EW-002
+    source_lineage_id: aiter:test_softmax:test_softmax
+    source:
+      revision: aiter
+      test_path: op_tests/triton_tests/test_softmax.py
+      test_id: test_softmax
+      source_language: triton
+      source_backend: triton
+    contract:
+      operator: softmax
+      shape: {M: 1024, N: 1024}
+      dtype: {input: bf16, output: bf16}
+      layout: row_major
+      axis: 1
+    oracle: {tier: pure_torch, method: torch.softmax}
+    target_lanes: [triton_gfx942, triton_gfx950, hip_gfx942, hip_gfx950]
+
+  - id: cand-hip-topk-large
+    priority: P1
+    contract_family_id: CF-TOPK-HIP-001
+    source_lineage_id: aiter:test_topk_plain:run_topk_case
+    source:
+      revision: aiter
+      test_path: op_tests/test_topk_plain.py
+      test_id: run_topk_case
+      source_language: hip
+      source_backend: asm
+    contract:
+      operator: topk
+      shape: {batch: 3072, hidden_size: 4096, k: 2048}
+      dtype: {input: fp32, values: fp32, indices: int32}
+      layout: row_major
+    oracle: {tier: pure_torch, method: torch.topk}
+    target_lanes: [hip_gfx942, hip_gfx950, triton_gfx942, triton_gfx950]
+    flags: [large_workspace]
+
+  - id: cand-hip-topk-softmax-moe
+    priority: P1
+    contract_family_id: CF-TOPK-SOFTMAX-001
+    source_lineage_id: aiter:test_topk_softmax:test_topk_softmax
+    source:
+      revision: aiter
+      test_path: op_tests/test_topk_softmax.py
+      test_id: test_topk_softmax
+      source_language: hip
+      source_backend: asm
+    contract:
+      operator: topk_softmax
+      shape: {tokens: 512, experts: 128, k: 8}
+      dtype: {input: fp32, values: fp32, indices: int32}
+      layout: token_expert
+      renormalize: true
+    oracle: {tier: pure_torch, method: softmax then topk and renormalize}
+    target_lanes: [hip_gfx942, hip_gfx950, triton_gfx942, triton_gfx950]
+
+  - id: cand-triton-moe-routing-gfx950
+    priority: P1
+    contract_family_id: CF-MOE-ROUTE-001
+    source_lineage_id: aiter:test_moe_routing:test_routing
+    source:
+      revision: aiter
+      test_path: op_tests/triton_tests/moe/test_moe_routing.py
+      test_id: test_routing
+      source_language: triton
+      source_backend: triton
+    contract:
+      operator: moe_routing
+      shape: {tokens: 64, experts: 128, k: 4}
+      dtype: {input: bf16, scores: fp32, indices: int32}
+      layout: token_expert
+    oracle: {tier: pure_torch, method: softmax then topk and sort}
+    target_lanes: [triton_gfx950, hip_gfx950]
+    flags: [gfx950_only_source_guard, multi_stage_contract]
+
+  - id: cand-fused-qk-concat
+    priority: P1
+    contract_family_id: CF-QK-CONCAT-001
+    source_lineage_id: aiter:test_fused_qk_concat:test_qk_cat
+    source:
+      revision: aiter
+      test_path: op_tests/triton_tests/fusions/test_fused_qk_concat.py
+      test_id: test_qk_cat
+      source_language: triton
+      source_backend: triton
+    contract:
+      operator: fused_qk_concat
+      shape: {B: 8, q_heads_per_kv: 8, kv_heads: 4, d_nope: 512, d_pe: 128}
+      dtype: {input: bf16, output: bf16}
+      layout: batch_head_dim
+    oracle: {tier: pure_torch, method: torch.cat for q and k}
+    target_lanes: [triton_gfx942, triton_gfx950, hip_gfx942, hip_gfx950]
+
+  - id: cand-local-hip-knn
+    priority: P0
+    contract_family_id: CF-KNN-001
+    source_lineage_id: geak:examples:knn
+    source:
+      revision: geak
+      test_path: examples/tasks/knn/scripts/task_runner.py
+      kernel_path: examples/tasks/knn/src/knn_cuda.hip
+      test_id: TEST_SHAPES
+      source_language: hip
+      source_backend: hip
+    contract:
+      operator: knn
+      shapes:
+        - {B: 2, N: 64, M: 16, k: 3}
+        - {B: 8, N: 1024, M: 128, k: 5}
+        - {B: 2, N: 2048, M: 256, k: 10}
+      dtype: {points: fp32, output: int32}
+      layouts: [standard, transposed, self_query]
+    oracle: {tier: pure_torch, method: torch.cdist then topk}
+    target_lanes: [hip_gfx942, hip_gfx950]
+    implementation_family_id: geak_hip_knn_v1
+
+  - id: cand-local-triton-fp16-gemm
+    priority: P0
+    contract_family_id: CF-LOCAL-GEMM-001
+    source_lineage_id: lumen:template:gemm_fp16
+    source:
+      revision: lumen_rl
+      test_path: experiments/multi-tune-agent/examples/tasks/gemm/scripts/task_runner.py
+      kernel_path: experiments/multi-tune-agent/examples/tasks/gemm/kernel.py
+      test_id: CASES
+      source_language: triton
+      source_backend: triton
+    contract:
+      operator: gemm
+      shapes:
+        - {M: 32, N: 4096, K: 4096}
+        - {M: 512, N: 4096, K: 4096}
+        - {M: 1024, N: 3072, K: 4096}
+      dtype: {input: fp16, weight: fp16, accum: fp32, output: fp16}
+      layout: NN
+    oracle: {tier: pure_torch, method: torch.matmul}
+    target_lanes: [triton_gfx942, triton_gfx950]
+    implementation_family_id: lumen_triton_fp16_gemm_v1
+    flags: [production_template]
+
+  - id: cand-local-triton-fp8-gemm-gfx942
+    priority: P0
+    contract_family_id: CF-LOCAL-FP8-GEMM-001
+    source_lineage_id: lumen:template:gemm_fp8
+    source:
+      revision: lumen_rl
+      test_path: experiments/multi-tune-agent/examples/tasks/gemm_fp8/scripts/task_runner.py
+      kernel_path: experiments/multi-tune-agent/examples/tasks/gemm_fp8/kernel.py
+      test_id: CASES
+      source_language: triton
+      source_backend: triton
+    contract:
+      operator: scaled_quant_gemm
+      shapes:
+        - {M: 1, N: 4096, K: 4096}
+        - {M: 32, N: 6144, K: 4096}
+        - {M: 512, N: 4096, K: 4096}
+      dtype: {input: fp8_e4m3fnuz, weight: fp8_e4m3fnuz, accum: fp32, output: fp16}
+      layout: NN
+      scale: {activation: per_token, weight: per_output_channel}
+    oracle: {tier: pure_torch, method: fp32 dequantized torch.matmul}
+    target_lanes: [triton_gfx942]
+    implementation_family_id: lumen_triton_fp8_gemm_v1
+    flags: [production_template, gfx942_only]
+
+  - id: cand-local-triton-fused-attention
+    priority: P1
+    contract_family_id: CF-LOCAL-ATTN-001
+    source_lineage_id: lumen:template:fused_attention
+    source:
+      revision: lumen_rl
+      test_path: experiments/multi-tune-agent/examples/tasks/fused_attention/scripts/task_runner.py
+      kernel_path: experiments/multi-tune-agent/examples/tasks/fused_attention/kernel.py
+      test_id: CASES
+      source_language: triton
+      source_backend: triton
+    contract:
+      operator: fused_causal_attention
+      shapes:
+        - {B: 1, H: 8, S: 128, D: 64}
+        - {B: 2, H: 16, S: 256, D: 64}
+        - {B: 1, H: 16, S: 512, D: 64}
+      dtype: {input: fp16, accum: fp32, output: fp16}
+      layout: BHSD
+    oracle: {tier: pure_torch, method: F.scaled_dot_product_attention causal}
+    target_lanes: [triton_gfx942, triton_gfx950]
+    implementation_family_id: lumen_triton_fused_attention_v1
+    flags: [production_template]
+
+  - id: cand-local-triton-grouped-gemm
+    priority: P1
+    contract_family_id: CF-LOCAL-GROUPED-GEMM-001
+    source_lineage_id: lumen:template:grouped_gemm
+    source:
+      revision: lumen_rl
+      test_path: experiments/multi-tune-agent/examples/tasks/grouped_gemm/scripts/task_runner.py
+      kernel_path: experiments/multi-tune-agent/examples/tasks/grouped_gemm/kernel.py
+      test_id: CASES
+      source_language: triton
+      source_backend: triton
+    contract:
+      operator: grouped_gemm
+      shape: {experts: variable, M_max: variable, K: fixed_per_case, N: fixed_per_case}
+      dtype: {input: fp16, weight: fp16, accum: fp32, output: fp16}
+      layout: expert_mk_expert_kn
+      routed_counts: skewed
+    oracle: {tier: pure_torch, method: per-expert torch.matmul}
+    target_lanes: [triton_gfx942, triton_gfx950]
+    implementation_family_id: lumen_triton_grouped_gemm_v1
+    flags: [production_template]

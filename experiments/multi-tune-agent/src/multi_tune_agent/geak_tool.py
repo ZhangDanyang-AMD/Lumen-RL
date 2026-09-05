@@ -274,6 +274,37 @@ class GEAKToolEnvironment:
     ) -> tuple[dict[str, Any], RewardBreakdown, dict[str, Any]]:
         return self.execute(session_id, {"action": "evaluate", "mode": "full"})
 
+    def independent_verify(
+        self, session_id: str
+    ) -> tuple[dict[str, Any], RewardBreakdown, dict[str, Any]]:
+        """Re-materialize candidate source and evaluate it in a fresh workspace."""
+
+        candidate = self.get(session_id)
+        with self._lock:
+            baseline = copy.deepcopy(self._baseline_cache.get(candidate.case_id) or {})
+        if not baseline:
+            raise RuntimeError(
+                "cannot independently verify without frozen baseline: %s"
+                % candidate.case_id
+            )
+        verify_session_id, observation = self.create(
+            candidate.case_id,
+            role="verify_engineer",
+            source_path=candidate.workspace,
+            baseline_override=baseline,
+        )
+        result, reward, metrics = self.verify(verify_session_id)
+        value = dict(result)
+        value.update(
+            {
+                "verify_source": "multitune_independent",
+                "source_session_id": session_id,
+                "verify_session_id": verify_session_id,
+                "verify_workspace": observation["workspace"],
+            }
+        )
+        return value, reward, metrics
+
     def release(self, session_id: str) -> None:
         state = self.get(session_id)
         state.closed = True

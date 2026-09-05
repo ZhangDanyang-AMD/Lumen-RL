@@ -13,6 +13,7 @@ from .config import MultiTuneConfig
 from .geak_tool import GEAKToolEnvironment
 from .models import Candidate, Direction
 from .runtime import ModelBackend, gather_limited
+from .sft_collector import SFTCollector
 from .trajectory import TrajectoryWriter
 
 
@@ -57,7 +58,14 @@ class MultiTuneFlow:
         run_started = time.monotonic()
         stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
         run_dir = self._unique_run_dir(case_id, stamp)
-        trajectory = TrajectoryWriter(run_dir, event_sink=self.event_sink)
+        collector = (
+            SFTCollector(run_dir, self.config) if self.config.sft_enabled else None
+        )
+        trajectory = TrajectoryWriter(
+            run_dir,
+            event_sink=self.event_sink,
+            sft_sink=collector.append if collector is not None else None,
+        )
         environment = GEAKToolEnvironment(self.config, trajectory)
         prompts = RolePromptLibrary(self.config.geak_root)
         structured = StructuredRoleAgent(self.backend, prompts, trajectory)
@@ -175,6 +183,13 @@ class MultiTuneFlow:
             )
             timing["round_%d_plan" % round_index] = time.monotonic() - plan_started
             directions = self._directions(plan, self.config.engineers_per_round)
+            if collector is not None:
+                collector.record_plan(
+                    round_index,
+                    plan,
+                    [item.__dict__ for item in directions],
+                    user_request=user_request or case.direction,
+                )
 
             engineer_started = time.monotonic()
             outputs = await gather_limited(
@@ -199,7 +214,7 @@ class MultiTuneFlow:
             candidates: list[Candidate] = []
             for direction, output in zip(directions, outputs):
                 result, reward, _ = await asyncio.to_thread(
-                    environment.verify, output.session_id
+                    environment.independent_verify, output.session_id
                 )
                 evaluation = dict(result.get("evaluation") or {})
                 accepted = bool(
@@ -231,6 +246,15 @@ class MultiTuneFlow:
                     case_type=case.case_type,
                     round_index=round_index,
                 )
+                if collector is not None:
+                    collector.record_candidate(
+                        environment,
+                        current_session_id,
+                        output.session_id,
+                        candidate.to_dict(),
+                        result,
+                        round_index=round_index,
+                    )
                 candidates.append(candidate)
             timing["round_%d_verify" % round_index] = time.monotonic() - verify_started
 
@@ -252,7 +276,7 @@ class MultiTuneFlow:
                     round_index=round_index,
                 )
                 result, reward, _ = await asyncio.to_thread(
-                    environment.verify, integration.session_id
+                    environment.independent_verify, integration.session_id
                 )
                 evaluation = dict(result.get("evaluation") or {})
                 integrated = Candidate(
@@ -266,6 +290,16 @@ class MultiTuneFlow:
                     accepted=bool(result.get("ok") and evaluation.get("correct")),
                     agent_text=integration.final_text,
                 )
+                if collector is not None:
+                    collector.record_candidate(
+                        environment,
+                        current_session_id,
+                        integration.session_id,
+                        integrated.to_dict(),
+                        result,
+                        round_index=round_index,
+                        role="integrator",
+                    )
                 if integrated.accepted and integrated.speedup >= winner.speedup:
                     winner = integrated
                 timing["round_%d_integrate" % round_index] = (
@@ -307,7 +341,7 @@ class MultiTuneFlow:
 
         final_started = time.monotonic()
         final_result, final_reward, _ = await asyncio.to_thread(
-            environment.verify, current_session_id
+            environment.independent_verify, current_session_id
         )
         final_evaluation = dict(final_result.get("evaluation") or {})
         final_kernel_performance = self._final_kernel_performance(
@@ -354,7 +388,10 @@ class MultiTuneFlow:
             "timing_seconds": timing,
             "run_dir": str(run_dir),
         }
-        return trajectory.finalize(summary)
+        finalized = trajectory.finalize(summary)
+        if collector is not None:
+            collector.finalize(finalized)
+        return finalized
 
     @staticmethod
     def _final_kernel_performance(

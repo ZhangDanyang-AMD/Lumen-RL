@@ -1,4 +1,6 @@
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import yaml
 import multi_tune_agent.cli as cli
@@ -11,6 +13,7 @@ from multi_tune_agent.cli import (
     build_parser,
 )
 from multi_tune_agent.config import MultiTuneConfig
+from multi_tune_agent.task_factory import GeneratedKernelTask
 
 
 def test_parser_exposes_interactive_and_request_modes():
@@ -34,6 +37,85 @@ def test_parser_exposes_interactive_and_request_modes():
     assert run.cases == ["demo"]
     assert run.request.startswith("optimize")
     assert run.stream is True
+
+    generate = parser.parse_args(
+        [
+            "--config",
+            "config.yaml",
+            "generate",
+            "--manifest",
+            "requests.yaml",
+            "--output-catalog",
+            "cases.yaml",
+            "--stream",
+        ]
+    )
+    assert generate.command == "generate"
+    assert generate.manifest == Path("requests.yaml")
+    assert generate.output_catalog == Path("cases.yaml")
+    assert generate.stream is True
+
+
+def test_generation_manifest_records_each_noninteractive_result(tmp_path, monkeypatch):
+    config = MultiTuneConfig(
+        geak_root=tmp_path,
+        cases_path=tmp_path / "unused.yaml",
+        trajectory_root=tmp_path / "runs",
+        bootstrap_auto_promote=True,
+    )
+    manifest = tmp_path / "requests.yaml"
+    manifest.write_text(
+        "version: 1\nrequests:\n"
+        "  - id: hip-gfx942-demo\n"
+        "    request: Generate HIP GEMM on gfx942 M=1 N=2 K=3 FP16\n"
+        "    seed_provenance:\n"
+        "      source_repo: https://github.com/ROCm/aiter.git\n"
+        "      source_sha: abc123\n"
+    )
+    catalog = tmp_path / "cases.yaml"
+    seen = []
+    task = GeneratedKernelTask(
+        case_id="hip-gfx942-demo",
+        task_dir=tmp_path / "task",
+        case_type="gemm",
+        operator="gemm",
+        architecture="gfx942",
+        backend="hip",
+        request="Generate HIP GEMM on gfx942 M=1 N=2 K=3 FP16",
+        contract_hash="contract",
+        provenance={"template": "generated"},
+    )
+    monkeypatch.setattr(
+        cli,
+        "_generate_kernel_task_noninteractive",
+        lambda config, backend, **kwargs: task,
+    )
+
+    def register(path, value):
+        seen.append((path, value))
+        path.write_text("tasks:\n  - id: hip-gfx942-demo\n")
+
+    monkeypatch.setattr(cli, "register_generated_case", register)
+    assert (
+        cli._run_generation_manifest(
+            config, object(), manifest, catalog, stream=False
+        )
+        == 0
+    )
+    assert seen[0][0] == catalog.resolve()
+    assert seen[0][1].provenance["template"] == "generated"
+    assert seen[0][1].provenance["case_seed"]["source_sha"] == "abc123"
+    result_path = (
+        config.trajectory_root
+        / "requests"
+        / "requests-generation-results.jsonl"
+    )
+    result = json.loads(result_path.read_text().strip())
+    assert result["case_id"] == "hip-gfx942-demo"
+    assert result["status"] == "generated"
+    assert result["seed_provenance"]["source_repo"] == (
+        "https://github.com/ROCm/aiter.git"
+    )
 
 
 def test_custom_catalog_records_task_and_request(tmp_path):
@@ -157,4 +239,14 @@ def test_missing_format_and_fp8_scales_are_reported():
             }
         )
         == []
+    )
+
+
+def test_canonical_template_cannot_override_explicit_hip_language():
+    descriptor = SimpleNamespace(backend="triton")
+    assert not cli._template_matches_requested_language(
+        descriptor, {"language": "hip"}
+    )
+    assert cli._template_matches_requested_language(
+        descriptor, {"language": "triton"}
     )

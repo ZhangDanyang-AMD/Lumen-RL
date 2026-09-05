@@ -128,6 +128,32 @@ def test_quantized_kernel_reports_missing_scale_fields():
     ]
 
 
+def test_gfx942_fp8_gemm_implies_standard_scale_contract():
+    result = recognize_kernel_request(
+        "MI308 FP8 GEMM M=1 N=128 K=128 in Triton",
+        JsonBackend(
+            {
+                "operator": "gemm",
+                "target_gpu": "MI308",
+                "format": "fp8",
+                "dimensions": {"m": 1, "n": 128, "k": 128},
+                "shapes": [[1, 128, 128]],
+                "language": "triton",
+                "confidence": 0.95,
+            }
+        ),
+    )
+
+    assert result["target_gpu"] == "gfx942"
+    assert result["input_scale_granularity"] == "per_token"
+    assert result["weight_scale_granularity"] == "per_channel"
+    assert set(result["format_implied_fields"]) == {
+        "input_scale_granularity",
+        "weight_scale_granularity",
+    }
+    assert result["missing_fields"] == []
+
+
 def test_native_mxfp4_implies_scales_and_block_size():
     result = recognize_kernel_request(
         "MI325 GEMM m=4 n=128 k=256 native MXFP4",
@@ -278,6 +304,14 @@ def test_failed_model_returns_partial_deterministic_result():
     result = recognize_kernel_request("please optimize softmax", FailedBackend())
     assert result["operator"] == "softmax"
     assert set(result["missing_fields"]) == {"target_gpu", "shape_or_dimensions"}
+
+
+def test_negated_language_does_not_override_requested_backend():
+    result = recognize_kernel_request(
+        "gfx942 GEMM M=1 N=128 K=128 FP16. Use HIP, not Triton.",
+        FailedBackend(),
+    )
+    assert result["language"] == "hip"
     assert result["recognition"] == "deterministic_fallback"
 
 

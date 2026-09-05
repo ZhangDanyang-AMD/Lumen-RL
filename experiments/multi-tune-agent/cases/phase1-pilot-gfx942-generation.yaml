@@ -1,0 +1,19 @@
+version: 1
+requests:
+  - id: phase1-hip-gfx942-opus-gemm-m128-n256-k5120-bf16
+    request: >
+      Generate a standalone HIP C++ BF16 GEMM kernel for AMD gfx942 with
+      batch=1, M=128, N=256, and K=5120. A is row-major [M,K], B is
+      row-major [N,K] and is logically transposed for A @ B^T. Inputs and
+      output are BF16, accumulation is FP32. Correctness must compare the
+      target kernel against an independent FP32 torch einsum or matmul oracle
+      before casting to BF16, using rtol=0.1 and atol=0.5. The target kernel
+      must compile and launch real HIP C++; it may not call AITER or the oracle.
+    seed_provenance:
+      source_repo: https://github.com/ROCm/aiter.git
+      source_branch: main
+      source_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+      source_license: MIT
+      source_seed_id: aiter-hip-gfx942-opus-gemm-a16w16
+      source_test_path: op_tests/test_opus_a16w16_gemm.py
+      source_kernel_path: csrc/opus_gemm

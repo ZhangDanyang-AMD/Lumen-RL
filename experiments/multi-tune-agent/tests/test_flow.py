@@ -120,6 +120,14 @@ class FakeEnvironment:
         state.last_reward = reward.total
         return {"ok": True, "evaluation": evaluation}, reward, {}
 
+    def independent_verify(self, session_id):
+        result, reward, metrics = self.verify(session_id)
+        return {
+            **result,
+            "verify_source": "multitune_independent",
+            "verify_session_id": "verify-" + session_id,
+        }, reward, metrics
+
 
 class FakePrompts:
     def __init__(self, geak_root):
