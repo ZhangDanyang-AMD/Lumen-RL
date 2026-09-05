@@ -58,7 +58,17 @@ class FakeEnvironment:
         return self.cases[case_id]
 
     def case_observation(self, case_id):
-        return {"case_id": case_id, "case_type": "gemm"}
+        return {
+            "case_id": case_id,
+            "case_type": "gemm",
+            "provenance": {
+                "case_seed": {
+                    "source_lineage_id": "test:demo",
+                    "split_group": "train",
+                    "split_version": "v2",
+                }
+            },
+        }
 
     def create(
         self,

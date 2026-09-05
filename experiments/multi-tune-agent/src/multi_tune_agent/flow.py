@@ -451,25 +451,33 @@ class MultiTuneFlow:
         split_group = (
             case_seed.get("split_group")
             if isinstance(case_seed, Mapping)
-            else None
+            else resume_context.get("split_group")
         )
         if split_group == "held_out":
             raise ValueError("held-out cases cannot be used for SFT collection")
+        source_lineage_id = (
+            case_seed.get("source_lineage_id")
+            if isinstance(case_seed, Mapping)
+            else resume_context.get("source_lineage_id")
+        )
+        if task_type != "direction_conditioned" and (
+            not source_lineage_id or split_group not in {"train", "dev"}
+        ):
+            raise ValueError(
+                "%s requires a frozen non-held-out source lineage and split"
+                % task_type
+            )
         frozen: dict[str, Any] = {
             "contract": dict(case_input),
             "parent_source": dict(source_context),
             "parent_source_hash": source_hash,
             "baseline": dict(baseline),
-            "source_lineage_id": (
-                case_seed.get("source_lineage_id")
-                if isinstance(case_seed, Mapping)
-                else None
-            ),
+            "source_lineage_id": source_lineage_id,
             "split_group": split_group,
             "split_version": (
                 case_seed.get("split_version")
                 if isinstance(case_seed, Mapping)
-                else None
+                else resume_context.get("split_version")
             ),
         }
         if task_type == "profile_guided":
