@@ -11,8 +11,8 @@
 # the collectives go over IB is also what miles' own multi-node script does
 # (scripts/run-glm4.5-355B-A32B.sh puts only GLOO/TP_SOCKET_IFNAME on the socket).
 #
-#   bash ~/4node/run_a2a_anp.sh 0 --seqs 6144 --iters 5
-#   bash ~/4node/run_a2a_anp.sh 1 --seqs 6144 --iters 5
+#   bash scripts/primus/run_a2a_anp.sh 0 --seqs 6144 --iters 5
+#   bash scripts/primus/run_a2a_anp.sh 1 --seqs 6144 --iters 5
 #
 # Read three things in the output:
 #   1. "NET/Plugin ... anp"      -- the plugin actually loaded (the whole point)
@@ -21,7 +21,7 @@
 #                                   which is the positive proof it was RDMA
 set -uo pipefail
 # Per-allocation settings; see ray_start_primus.sh.
-source "${LUMEN_CLUSTER_ENV:-/home/xysheng/4node/env.sh}"
+source "${LUMEN_CLUSTER_ENV:?set LUMEN_CLUSTER_ENV to your cluster env.sh}"
 
 NODE_RANK="${1:?usage: run_a2a_anp.sh <node_rank> [probe args...]}"
 shift

@@ -10,15 +10,15 @@
 # Building happens in a throwaway `primus-build` container so the RDMA-verified
 # anp-primus is never touched.
 #
-#   bash ~/4node/build_megatron_primus.sh              # apex + TE
-#   STAGE=apex bash ~/4node/build_megatron_primus.sh   # one at a time
-#   STAGE=te   bash ~/4node/build_megatron_primus.sh
+#   bash scripts/primus/build_megatron_primus.sh              # apex + TE
+#   STAGE=apex bash scripts/primus/build_megatron_primus.sh   # one at a time
+#   STAGE=te   bash scripts/primus/build_megatron_primus.sh
 set -uo pipefail
 
 IMAGE=${IMAGE:-rocm/primus:v26.4}
 NAME=${NAME:-primus-build}
-SRCROOT=${SRCROOT:-/mnt/m2m_nobackup/xysheng/megatron_build}   # node-local: 2.8 G of submodules
-OUT=${OUT:-/home/xysheng/vllm_primus}                          # NFS, shared with the vLLM tree
+SRCROOT=${SRCROOT:-/tmp/megatron_build}   # keep it node-local: 2.8 G of submodules
+OUT=${OUT:-$HOME/vllm_primus}             # put this on shared storage: the vLLM tree reads it
 SITE=$OUT/site
 ARCH=${ARCH:-gfx950}
 JOBS=${JOBS:-96}
@@ -32,8 +32,8 @@ if ! docker inspect "$NAME" >/dev/null 2>&1; then
     --network=host --ipc=host \
     --device=/dev/kfd --device=/dev/dri --group-add=video \
     --shm-size 16G \
-    -v /home/xysheng:/home/xysheng \
-    -v /mnt/m2m_nobackup:/mnt/m2m_nobackup \
+    -v "$HOME:$HOME" \
+    -v "$SRCROOT:$SRCROOT" \
     "$IMAGE" -lc "sleep infinity" >/dev/null
 fi
 
@@ -86,4 +86,4 @@ fi
 echo "=== wheels in $OUT/wheels"
 ls -la "$OUT/wheels/"
 echo
-echo "next: bash ~/4node/install_megatron_primus.sh"
+echo "next: bash scripts/primus/install_megatron_primus.sh"

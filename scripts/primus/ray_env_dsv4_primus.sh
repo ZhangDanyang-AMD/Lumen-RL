@@ -29,14 +29,14 @@ export VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=0 VLLM_ROCM_USE_AITER_LINEAR=0
 # package on both sides, so these merge with the installed megatron-core rather
 # than shadowing it: megatron.core resolves here, megatron.bridge still resolves
 # from the shared tree.
-DSV4_PROBE=/home/xysheng/dsv4/mhc_probe
+DSV4_PROBE=${DSV4_PROBE:-$HOME/dsv4/mhc_probe}
 # ⚠️ VIME_SRC is the third entry and it is easy to miss. The DSv4 router does a
 # late `from vime.utils.routing_replay import register_routing_replay` inside
 # routing(), so nothing fails until the first MoE layer runs a forward -- on the
 # 22.04 line the vime image supplied that package in site-packages, and primus
 # does not. Symptom: probe_70 dies with ModuleNotFoundError: No module named
 # 'vime' deep inside moe_layer.route.
-VIME_SRC=${VIME_SRC:-/home/xysheng/working/vime-rl/vime}
+VIME_SRC=${VIME_SRC:-$HOME/vime-rl/vime}
 export PYTHONPATH="$DSV4_PROBE/megatron_dsv4:$DSV4_PROBE/vendored:$VIME_SRC:${PYTHONPATH:-}"
 
 # ---- 3. deterministic training ----
@@ -54,4 +54,4 @@ export LUMENRL_WEIGHT_SYNC_VERIFY=1
 
 # Node-local, not $DATA_ROOT: the checkpoint is 275 GB and /home is a shared
 # volume that was already 97% full on job 32407.
-export MODEL_NAME=${MODEL_NAME:-/mnt/m2m_nobackup/xysheng/models/DeepSeek-V4-Flash-Base}
+export MODEL_NAME=${MODEL_NAME:-${DATA_ROOT:?set DATA_ROOT or MODEL_NAME}/models/DeepSeek-V4-Flash-Base}

@@ -7,11 +7,11 @@
 # (PYTHONPATH always wins over site-packages). megatron-core went in the same
 # way -- `pip install --target $SITE --no-deps "megatron-core==0.18.2"`.
 #
-#   bash ~/4node/install_megatron_primus.sh
-#   PYTHONPATH=/home/xysheng/vllm_primus/site   # how to consume it
+#   bash scripts/primus/install_megatron_primus.sh
+#   PYTHONPATH=$OUT/site   # how to consume it
 set -uo pipefail
 
-OUT=${OUT:-/home/xysheng/vllm_primus}
+OUT=${OUT:-$HOME/vllm_primus}
 SITE=$OUT/site
 NAME=${NAME:-primus-build}
 

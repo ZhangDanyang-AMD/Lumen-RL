@@ -11,14 +11,14 @@
 # Runs on the docker host. The build container is separate from anp-primus so the
 # RDMA-verified container is never touched.
 #
-#   bash ~/4node/build_vllm_primus.sh            # full build
-#   STAGE=deps bash ~/4node/build_vllm_primus.sh # just (re)install build deps
+#   bash scripts/primus/build_vllm_primus.sh            # full build
+#   STAGE=deps bash scripts/primus/build_vllm_primus.sh # just (re)install build deps
 set -uo pipefail
 
 IMAGE=${IMAGE:-rocm/primus:v26.4}
 NAME=${NAME:-primus-build}
-SRC=${SRC:-/mnt/m2m_nobackup/xysheng/vllm-build/vllm}
-OUT=${OUT:-/home/xysheng/vllm_primus}          # NFS, so both nodes see the wheel
+SRC=${SRC:-/tmp/vllm-build/vllm}
+OUT=${OUT:-$HOME/vllm_primus}    # put this on shared storage so every node sees the wheel
 ARCH=${ARCH:-gfx950}                            # MI350X only; gfx942 would double the build
 JOBS=${JOBS:-96}
 STAGE=${STAGE:-all}
@@ -31,8 +31,8 @@ if ! docker inspect "$NAME" >/dev/null 2>&1; then
     --network=host --ipc=host \
     --device=/dev/kfd --device=/dev/dri --group-add=video \
     --shm-size 16G \
-    -v /home/xysheng:/home/xysheng \
-    -v /mnt/m2m_nobackup:/mnt/m2m_nobackup \
+    -v "$HOME:$HOME" \
+    -v "$SRC:$SRC" \
     "$IMAGE" -lc "sleep infinity" >/dev/null
 fi
 

@@ -21,8 +21,8 @@
 # meaningless in this file; the metric to read is rollout_corr/kl.
 #
 #   CFG=examples/DAPO/configs/dapo_dsv4_flash_full43_ray_vllm_megatron_4node_shortsmoke.yaml \
-#   MODEL_PATH=/mnt/m2m_nobackup/xysheng/models/DeepSeek-V4-Flash-Base-bf16-native \
-#   DETACH=1 RAY=1 STEPS=2 bash ~/4node/08_dsv4_megatron_multinode.sh
+#   MODEL_PATH=$DATA_ROOT/models/DeepSeek-V4-Flash-Base-bf16-native \
+#   DETACH=1 RAY=1 STEPS=2 bash <your multi-node launcher>
 
 cluster:
   num_nodes: 4
@@ -38,7 +38,7 @@ controller:
       process_on_nodes: [8, 8, 8, 8]
 
 policy:
-  model_name: "/mnt/m2m_nobackup/xysheng/models/DeepSeek-V4-Flash-Base-bf16-native"
+  model_name: "${oc.env:DATA_ROOT}/models/DeepSeek-V4-Flash-Base-bf16-native"
   training_backend: megatron_native
   generation_backend: vllm
   max_total_sequence_length: 1280       # 1024 prompt budget + 256 response
@@ -61,7 +61,7 @@ policy:
       pipeline_model_parallel_size: 1
       context_parallel_size: 1
       expert_model_parallel_size: 32
-      dist_checkpoint_path: "/mnt/m2m_nobackup/xysheng/models/DeepSeek-V4-Flash-Base_torch_dist"
+      dist_checkpoint_path: "${oc.env:DATA_ROOT}/models/DeepSeek-V4-Flash-Base_torch_dist"
       recompute_granularity: full
       recompute_method: uniform
       recompute_num_layers: 1

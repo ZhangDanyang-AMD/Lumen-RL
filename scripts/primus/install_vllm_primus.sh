@@ -8,11 +8,11 @@
 # pristine primus container, take only the packages pip says are MISSING, and
 # install exactly those. Everything primus already ships keeps being used.
 #
-#   bash ~/4node/install_vllm_primus.sh
-#   PYTHONPATH=/home/xysheng/vllm_primus/site  # how to consume it
+#   bash scripts/primus/install_vllm_primus.sh
+#   PYTHONPATH=$OUT/site  # how to consume it
 set -uo pipefail
 
-OUT=${OUT:-/home/xysheng/vllm_primus}
+OUT=${OUT:-$HOME/vllm_primus}
 SITE=$OUT/site
 PROBE_CONTAINER=${PROBE_CONTAINER:-anp-primus}   # pristine: used only to resolve
 WORK_CONTAINER=${WORK_CONTAINER:-primus-build}   # has network + pip, does the work

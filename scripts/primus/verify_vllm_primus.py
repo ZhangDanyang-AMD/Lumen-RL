@@ -2,7 +2,7 @@
 
 Run inside the primus container with the NFS tree on the path:
 
-    PYTHONPATH=/home/xysheng/vllm_primus/site python3 ~/4node/verify_vllm_primus.py
+    PYTHONPATH=$OUT/site python3 scripts/primus/verify_vllm_primus.py
 
 `import vllm` succeeding proves nothing -- the pure-python half imports fine even
 when every compiled extension failed on a libtorch symbol, which is the exact

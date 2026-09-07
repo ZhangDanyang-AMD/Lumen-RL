@@ -2,7 +2,7 @@
 # DeepSeek-V4 DAPO on the megatron_native backend, ONE node / 8 GPUs, on primus.
 # Runs on the node (docker host side).
 #
-# The primus replacement for ~/4node/07_dsv4_megatron_1node.sh, which predates
+# The primus replacement for your single-node launcher, which predates
 # the primus migration and sources the 22.04 ray_env_dsv4_megatron.sh. Two lines
 # in that file are fatal here: NCCL_IB_DISABLE=1 throws away the 26x RDMA fabric,
 # and HSA_DISABLE_FRAGMENT_ALLOCATOR=1 breaks intra-node reduce-scatter, which is
@@ -14,20 +14,20 @@
 #     bash scripts/primus/run_dsv4_dapo_1node.sh
 #
 # DETACH=1 hands the driver to the docker daemon rather than holding it on this
-# script's stdout: reached over `spur exec`, the driver is a child of a job step
+# script's stdout: reached over a scheduler job step, the driver is a child of it
 # that tears its children down when it ends. run_dapo.sh still writes $LOG.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Per-allocation settings (JOBID / HEAD_NODE / HEAD_IP / NODES / NET_IF); these
 # change every job and are not in the repo.
-source "${LUMEN_CLUSTER_ENV:-/home/xysheng/4node/env.sh}"
+source "${LUMEN_CLUSTER_ENV:?set LUMEN_CLUSTER_ENV to your cluster env.sh}"
 mkdir -p "$LOG4N"
 
 CONTAINER=${RL24_CONTAINER:-anp-primus}
 # BF16 weights under the checkpoint's own tensor names (make_native_bf16.py):
 # vLLM's DSv4 loader keys on those names, and a BF16 rollout takes the trainer's
 # BF16 weight sync unquantized.
-MODEL_PATH="${MODEL_PATH:-/mnt/m2m_nobackup/xysheng/models/dsv4-L4-bf16-native}"
+MODEL_PATH="${MODEL_PATH:-${DATA_ROOT:?set DATA_ROOT or MODEL_PATH}/models/dsv4-L4-bf16-native}"
 CFG="${CFG:-examples/DAPO/configs/dapo_dsv4_flash_ray_vllm_megatron_1node_shortsmoke.yaml}"
 STEPS="${STEPS:-1}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
@@ -55,7 +55,7 @@ source $HERE/ray_env_dsv4_primus.sh
 $PASSTHROUGH
 # Swallows run_dapo.sh's opening 'ray stop --force', which would tear down the
 # head this driver is about to connect to.
-export PATH=/home/xysheng/4node/bin:\$PATH
+export PATH=${LUMEN_CLUSTER_BIN:-\$HOME/bin}:\$PATH
 export SCRATCH_ROOT=\"\${SCRATCH_ROOT:-\$DATA_ROOT}\"
 # Both are '\${VAR-default}' inside run_dapo.sh, so an explicit empty value is
 # the only way to turn them off. ROCm/HIP has no expandable_segments, and

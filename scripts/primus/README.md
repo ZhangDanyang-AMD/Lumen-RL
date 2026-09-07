@@ -2,7 +2,7 @@
 
 Bring-up scripts and probes for the MI350X/gfx950 cluster whose inter-node
 fabric is eight ionic RoCE HCAs. Validated 2026-08-20 on job 32407
-(`crsuse2-m2m-031` / `-057`): RDMA baseline, vLLM + ray + Megatron installed,
+(two RDMA-connected nodes): RDMA baseline, vLLM + ray + Megatron installed,
 Qwen3-8B DAPO smoke `exit 0`, and the DeepSeek-V4 4-layer-slice probes 67/68/70
 all passing.
 
@@ -20,7 +20,7 @@ The cost is that primus ships **neither vLLM nor ray**, so everything below is
 installed into one NFS tree that every node mounts:
 
 ```
-/home/xysheng/vllm_primus/site        # override with PRIMUS_SITE
+$HOME/vllm_primus/site               # override with PRIMUS_SITE
   vLLM 0.26.0+rocm714 (built from source), ray 2.57.0, megatron-core 0.18.2,
   apex 1.14.0a0 (28 compiled extensions), transformer_engine 2.15.0.dev0+6e541a10,
   datasets 4.0.0, flydsl 0.1.8, sitecustomize.py

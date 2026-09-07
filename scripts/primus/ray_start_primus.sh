@@ -18,7 +18,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # The per-allocation settings (JOBID / HEAD_NODE / HEAD_IP / NODES / NET_IF)
 # change every job and are not in the repo. Point LUMEN_CLUSTER_ENV at wherever
 # yours lives.
-source "${LUMEN_CLUSTER_ENV:-/home/xysheng/4node/env.sh}"
+source "${LUMEN_CLUSTER_ENV:?set LUMEN_CLUSTER_ENV to your cluster env.sh}"
 ROLE="${1:?usage: ray_start_primus.sh head|worker}"
 CONTAINER=${RL24_CONTAINER:-anp-primus}
 # The raylet's environment is what every actor inherits, so a model that needs

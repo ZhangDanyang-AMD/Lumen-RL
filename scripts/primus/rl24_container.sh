@@ -16,7 +16,7 @@
 # RDMA; they are inert until run_a2a_anp.sh-style env is set.
 set -euo pipefail
 # Per-allocation settings; see ray_start_primus.sh.
-source "${LUMEN_CLUSTER_ENV:-/home/xysheng/4node/env.sh}"
+source "${LUMEN_CLUSTER_ENV:?set LUMEN_CLUSTER_ENV to your cluster env.sh}"
 
 IMAGE=${RL24_IMAGE:-rocm/vllm:rocm7.14.0_cdna_ubuntu24.04_py3.14_pytorch_2.11.0_vllm_0.23.0}
 NAME=${RL24_CONTAINER:-rl-vllm-24}
@@ -41,8 +41,8 @@ docker run -d --name "$NAME" --entrypoint /bin/bash \
   --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
   --ulimit memlock=-1 --ulimit stack=67108864 --ulimit nofile=1048576:1048576 \
   --shm-size 64G \
-  -v /home/xysheng:/home/xysheng \
-  -v /mnt/m2m_nobackup:/mnt/m2m_nobackup \
+  -v "$HOME:$HOME" \
+  -v "$SCRATCH_ROOT:$SCRATCH_ROOT" \
   "${MOUNTS[@]}" \
   -e RL_ROOT="$RL_ROOT" -e DATA_ROOT="$DATA_ROOT" -e SCRATCH_ROOT="$SCRATCH_ROOT" \
   -e HF_HOME="$DATA_ROOT/hf_home" \

@@ -17,7 +17,7 @@
 #     DSv4 lines, which disagree about it.
 : "${RL_ROOT:?}"; : "${DATA_ROOT:?}"
 
-PRIMUS_SITE=${PRIMUS_SITE:-/home/xysheng/vllm_primus/site}
+PRIMUS_SITE=${PRIMUS_SITE:-$HOME/vllm_primus/site}
 
 export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false TORCHDYNAMO_DISABLE=1 HYDRA_FULL_ERROR=1
 export NCCL_TIMEOUT=7200 NCCL_CUMEM_ENABLE=0
