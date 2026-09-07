@@ -46,6 +46,7 @@ class ATOMRayServer:
         kwargs.setdefault("model", self.model_name)
         kwargs.setdefault("master_addr", self._get_node_ip())
         kwargs.setdefault("port", self._get_free_port())
+        self._pin_cudagraph_mode(kwargs)
         self.engine = AsyncLLMEngine(**kwargs)
         logger.info(
             "ATOMRayServer[%d]: AsyncLLMEngine ready (master=%s:%s online_quant=%s).",
@@ -55,6 +56,50 @@ class ATOMRayServer:
             kwargs.get("online_quant_config"),
         )
         return True
+
+    def _pin_cudagraph_mode(self, kwargs: dict[str, Any]) -> None:
+        """Choose ATOM's CUDA-graph strategy for a no-eager rollout.
+
+        Only applies once torch.compile is on (``enforce_eager=false`` or
+        ``compilation_config.level>0``). ATOM leaves ``cudagraph_mode`` unset and
+        then defaults it to PIECEWISE, which gives every compiled dense piece its
+        own graph and asserts that the piece's inputs keep their capture-time
+        addresses. The attention between two pieces runs eager and allocates its
+        output afresh each call, so the very first replay aborts all rollout
+        workers with "Input addresses for cudagraphs are different during
+        replay". FULL captures the whole forward instead and has no such
+        boundary.
+
+        Override with ``atom_cfg.engine_kwargs.compilation_config.cudagraph_mode``.
+        ATOM builds that pin the mode themselves still win — this only supplies a
+        value.
+        """
+        comp_cfg = dict(kwargs.get("compilation_config") or {})
+        level = int(comp_cfg.get("level", 0) or 0)
+        if level <= 0 and bool(kwargs.get("enforce_eager", True)):
+            return
+
+        mode = comp_cfg.get("cudagraph_mode") or "FULL"
+        if isinstance(mode, str):
+            from atom.config import CUDAGraphMode
+
+            try:
+                mode = CUDAGraphMode[mode.upper()]
+            except KeyError as exc:
+                supported = ", ".join(m.name for m in CUDAGraphMode)
+                raise ValueError(
+                    f"unknown ATOM cudagraph_mode {mode!r}; supported: {supported}"
+                ) from exc
+
+        comp_cfg["cudagraph_mode"] = mode
+        kwargs["compilation_config"] = comp_cfg
+        logger.info(
+            "ATOMRayServer[%d]: no-eager rollout with compilation level=%d, "
+            "cudagraph_mode=%s",
+            self.replica_rank,
+            level,
+            getattr(mode, "name", mode),
+        )
 
     @staticmethod
     def _get_node_ip() -> str:
