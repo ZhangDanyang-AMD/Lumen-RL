@@ -19,6 +19,7 @@ __all__ = [
     "policy_gradient_loss",
     "asymmetric_clip_loss",
     "gmpo_loss",
+    "gspo_loss",
     "value_loss",
     "kl_penalty",
     "opd_kl_divergence",
@@ -291,6 +292,42 @@ def gmpo_loss(
         seq_adv = advantages.mean(dim=-1)
 
     pg_losses = -seq_adv * ratio
+    return pg_losses.mean()
+
+
+def gspo_loss(
+    logprobs: Tensor,
+    old_logprobs: Tensor,
+    advantages: Tensor,
+    clip_ratio: float,
+    *,
+    mask: Optional[Tensor] = None,
+) -> Tensor:
+    """Group Sequence Policy Optimization (GSPO) loss.
+
+    Computes a sequence-level importance ratio by averaging token log-ratios,
+    then clips the ratio in probability space with a symmetric PPO-style clip.
+    Designed for MoE models where token-level ratio variance is high.
+
+    Reference: Qwen3 technical report — sequence-level ratio stabilizes MoE RL.
+    """
+    log_ratio = logprobs - old_logprobs  # [B, T]
+
+    if mask is not None:
+        w = mask.to(dtype=log_ratio.dtype)
+        denom = w.sum(dim=-1).clamp(min=1.0)  # [B]
+        seq_log_ratio = (log_ratio * w).sum(dim=-1) / denom
+        seq_adv = (advantages * w).sum(dim=-1) / denom
+    else:
+        seq_log_ratio = log_ratio.mean(dim=-1)
+        seq_adv = advantages.mean(dim=-1)
+
+    ratio = torch.exp(seq_log_ratio)  # [B]
+    clipped_ratio = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio)
+
+    pg_unclipped = -seq_adv * ratio
+    pg_clipped = -seq_adv * clipped_ratio
+    pg_losses = torch.max(pg_unclipped, pg_clipped)
     return pg_losses.mean()
 
 

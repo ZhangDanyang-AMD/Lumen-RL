@@ -377,6 +377,17 @@ class PolicyConfig:
 
 
 @dataclass
+class GSPOConfig:
+    """Group Sequence Policy Optimization — sequence-level ratio, MoE-friendly."""
+    num_generations: int = 8
+    kl_coeff: float = 0.0
+    clip_ratio: float = 0.2
+    num_ppo_epochs: int = 1
+    num_mini_batches: int = 1
+    discount: float = 1.0
+
+
+@dataclass
 class GRPOConfig:
     num_generations: int = 8
     kl_coeff: float = 0.0
@@ -542,6 +553,7 @@ class AlgorithmConfig:
     name: str = AlgorithmName.GRPO.value
     adv_estimator: str = ""  # empty = auto-infer from algorithm.name
     grpo: GRPOConfig = field(default_factory=GRPOConfig)
+    gspo: GSPOConfig = field(default_factory=GSPOConfig)
     dapo: DAPOConfig = field(default_factory=DAPOConfig)
     ppo: PPOConfig = field(default_factory=PPOConfig)
     opd: OPDConfig = field(default_factory=OPDConfig)

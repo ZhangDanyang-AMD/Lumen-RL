@@ -43,7 +43,7 @@ class BaseAlgorithm(ABC):
         if explicit:
             return explicit
         name = self._config.algorithm.name.lower()
-        mapping = {"grpo": "grpo", "dapo": "dapo", "ppo": "gae", "opd": "grpo"}
+        mapping = {"grpo": "grpo", "dapo": "dapo", "ppo": "gae", "opd": "grpo", "gspo": "gspo"}
         return mapping.get(name, "grpo")
 
     @abstractmethod

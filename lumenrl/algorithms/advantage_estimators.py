@@ -176,6 +176,34 @@ def compute_grpo_advantage(batch: DataProto, config: LumenRLConfig) -> DataProto
     return batch
 
 
+@register_adv_est("gspo")
+def compute_gspo_advantage(batch: DataProto, config: LumenRLConfig) -> DataProto:
+    """Group-based normalization for GSPO (same grouping as GRPO)."""
+    if "rewards" not in batch.tensors:
+        raise KeyError("GSPO requires tensor key 'rewards' on the batch.")
+    rewards = batch.tensors["rewards"]
+    if rewards.dim() > 1:
+        rewards = rewards.squeeze(-1)
+    cfg = config.algorithm.gspo
+    g = cfg.num_generations
+    if rewards.shape[0] % g != 0:
+        raise ValueError(
+            f"Batch size {rewards.shape[0]} not divisible by num_generations={g}."
+        )
+    grouped = rewards.view(-1, g)
+    mean = grouped.mean(dim=1, keepdim=True)
+    std = grouped.std(dim=1, unbiased=False, keepdim=True).clamp_min(1e-8)
+    adv = (grouped - mean) / std
+    adv_flat = adv.reshape(-1)
+    batch.tensors["advantages"] = adv_flat
+    logger.debug(
+        "GSPO advantages: mean=%.6f std=%.6f",
+        adv_flat.mean().item(),
+        adv_flat.std().item(),
+    )
+    return batch
+
+
 @register_adv_est("dapo")
 def compute_dapo_advantage(batch: DataProto, config: LumenRLConfig) -> DataProto:
     """DAPO: group-relative advantages with dynamic sampling and overlong shaping."""
@@ -693,4 +721,60 @@ def compute_rloo_vectorized_advantage(batch: DataProto, config: LumenRLConfig) -
         batch.tensors["advantages"] = adv.unsqueeze(-1) * mask.float()
     else:
         batch.tensors["advantages"] = adv
+    return batch
+
+
+@register_adv_est("trloo")
+def compute_trloo_advantage(batch: DataProto, config: LumenRLConfig) -> DataProto:
+    """Turn-level Reinforce-Leave-One-Out (TRLOO) advantage estimation.
+
+    Applies RLOO per-turn instead of per-episode.  Requires:
+      - ``turn_rewards`` [B, max_turns]: reward for each turn
+      - ``turn_ids`` [B, T]: turn index (0-based) for each token
+    """
+    if "turn_rewards" not in batch.tensors:
+        raise KeyError("TRLOO requires 'turn_rewards' tensor [B, max_turns].")
+    if "turn_ids" not in batch.tensors:
+        raise KeyError("TRLOO requires 'turn_ids' tensor [B, T].")
+
+    turn_rewards = batch.tensors["turn_rewards"]  # [B, max_turns]
+    turn_ids = batch.tensors["turn_ids"]           # [B, T]
+    num_turns = turn_rewards.shape[1]
+
+    gspo_cfg = getattr(config.algorithm, "gspo", None)
+    grpo_cfg = config.algorithm.grpo
+    g = int(
+        (gspo_cfg.num_generations if gspo_cfg else None)
+        or grpo_cfg.num_generations
+    )
+    B = turn_rewards.shape[0]
+    if B % g != 0:
+        raise ValueError(
+            f"Batch size {B} not divisible by num_generations={g}."
+        )
+
+    # [num_prompts, g, max_turns]
+    grouped = turn_rewards.view(-1, g, num_turns)
+    group_sum = grouped.sum(dim=1, keepdim=True)  # [P, 1, max_turns]
+    baseline = (group_sum - grouped) / max(g - 1, 1)
+    turn_adv = grouped - baseline  # [P, g, max_turns]
+
+    turn_adv_flat = turn_adv.reshape(B, num_turns)  # [B, max_turns]
+
+    # Scatter turn advantages to token level
+    clamped_ids = turn_ids.clamp(0, num_turns - 1).long()
+    token_advantages = torch.gather(turn_adv_flat, 1, clamped_ids)  # [B, T]
+
+    mask = _response_mask_from_batch(batch)
+    if mask is not None:
+        token_advantages = _masked_whiten(
+            token_advantages, mask.float(), shift_mean=True
+        )
+
+    batch.tensors["advantages"] = token_advantages
+    logger.debug(
+        "TRLOO advantages: mean=%.6f std=%.6f",
+        token_advantages.mean().item(),
+        token_advantages.std().item(),
+    )
     return batch

@@ -1,0 +1,142 @@
+# Qwen3-30B-A3B Agentic RL — GSPO + GEAK sandbox + TRLOO turn-level reward
+#
+# AMD-specific kernel agent training:
+#   Base model: Qwen3-30B-A3B (MoE, 128 experts, A3B active)
+#   Algorithm: GSPO (sequence-level ratio, MoE-friendly)
+#   Advantage: TRLOO (turn-level LOO, multi-turn agent)
+#   Environment: GEAK sandbox (HIP/Triton/FlyDSL kernel optimisation)
+#   Reward: correctness + speedup + profiling + hacking detection
+#
+# Smoke test config — 3 steps, minimal batch for fast validation.
+#
+# 2-node training/inference separation:
+#   Node 0: ATOM inference (4 replicas × TP=2, 8 GPUs)
+#   Node 1: Megatron training (8 workers, TP=4, EP=8)
+
+cluster:
+  num_nodes: 2
+  gpus_per_node: 8
+  ray_address: "auto"
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    actor:
+      num_workers: 8
+      dispatch_mode: dp_compute_proto
+      process_on_nodes: [8]
+    rollout:
+      num_workers: 8
+      process_on_nodes: [8]
+
+policy:
+  model_name: /mnt/raid0/models/Qwen3-30B-A3B
+  training_backend: megatron
+  generation_backend: atom
+  max_total_sequence_length: 8192         # multi-turn agent needs long context
+  max_response_length: 4096               # each turn can be up to 4k tokens
+  train_global_batch_size: 8              # 1 prompt × 8 generations
+  gen_batch_size: 8
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 4096
+  learning_rate: 5.0e-7                   # lower LR for agentic RL stability
+  lr_warmup_steps: 10
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  training:
+    optimizer_dtype: bf16
+    megatron_cfg:
+      tensor_model_parallel_size: 4
+      expert_model_parallel_size: 8
+      expert_tensor_parallel_size: 1
+      num_experts: 128
+      moe_grouped_gemm: false
+      use_distributed_optimizer: true
+      sequence_parallel: true
+      recompute_granularity: full
+      recompute_method: uniform
+      recompute_num_layers: 1
+      attention_backend: flash
+      log_probs_chunk_size: 1024
+      optimizer_cpu_offload: true
+    fsdp_cfg:
+      param_offload: false
+      optimizer_offload: false
+      reshard_after_forward: true
+  generation:
+    atom_cfg:
+      tensor_parallel_size: 2
+      kv_cache_dtype: fp8
+      transport: ray_http
+      expert_parallel_size: 1
+      engine_kwargs:
+        enforce_eager: false
+        compilation_config:
+          level: 3
+
+algorithm:
+  name: gspo
+  adv_estimator: trloo                    # turn-level LOO advantage
+  use_kl_in_reward: false
+  loss_agg_mode: token-mean
+  gspo:
+    num_generations: 8
+    kl_coeff: 0.0
+    clip_ratio: 0.2                       # sequence-level clip
+  grpo:
+    num_generations: 8
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+    rollout_is_batch_normalize: false
+
+moe:
+  r3:
+    enabled: true
+    record_router_logits: true
+    replay_mode: distribution
+
+# GEAK kernel sandbox reward
+reward:
+  type: function
+  function: lumenrl.rewards.profiling_reward.profiling_reward_batch
+
+# Multi-turn agent config (consumed by the experiment launcher, not LumenRL core)
+agentic_rl:
+  environment: geak
+  geak_root: /mnt/raid0/geak
+  cases_path: /mnt/raid0/geak/cases/phase1-pilot-gfx942-generation.yaml
+  max_turns: 15                           # max turns per episode
+  gpu_ids: "0"                            # sandbox GPU for kernel evaluation
+  command_timeout: 300
+  baseline_repeats: 3
+  hacking_detection:
+    enabled: true
+    lazy_deletion_threshold: 0.5
+    suspicion_threshold: 0.1
+  profiling:
+    enabled: true
+    bandwidth_weight: 0.3
+    occupancy_weight: 0.3
+    instruction_efficiency_weight: 0.4
+
+checkpointing:
+  checkpoint_dir: /mnt/raid0/ckpts/qwen3-30b-a3b-agentic/smoke
+  save_steps: 9999
+  save_total_limit: 1
+  resume: false
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 3
+seed: 10086

@@ -21,4 +21,5 @@ class AlgorithmName(str, Enum):
     DAPO = "dapo"
     PPO = "ppo"
     OPD = "opd"
+    GSPO = "gspo"
     SPEC_DISTILL = "spec_distill"
