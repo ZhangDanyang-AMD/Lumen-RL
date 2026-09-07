@@ -71,20 +71,16 @@ the replica-side exception above it, because two different causes share it:
   `/tmp/aiter_configs` matters on its own account too: aiter otherwise silently
   reuses a merged tuning config from the previous run.
 
-**Example 5 runs but its `rollout_corr/kl` is ~7x too high.** Distinct from the crash
-above, and it does not trip the pass criteria — exit 0, generation healthy
-(`reward/accuracy` 0.17, `ppo_kl` ~0, `grad_norm` 0.76, no `kept 0/` rounds, no
-`finished with reason max`). Only the train-vs-rollout log-prob gap is off: measured
-0.0074 and 0.0077 on two runs, against 0.00085-0.00111 previously measured for this
-same config and the ~0.001 §4.7 expects. Example 4 on the same stack also ran high
-(0.0051 and 0.0089 against ~0.004).
+**Example 5 runs but its `rollout_corr/kl` is clearly too high.** Distinct from the
+crash above, and it does not trip the pass criteria — exit 0, generation healthy
+(`ppo_kl` ~0, no `kept 0/` rounds, no `finished with reason max`). Only the
+train-vs-rollout log-prob gap is off.
 
 Since example 5 exists precisely to answer "is the gap FP8 or ATOM alignment", a
-value **above** example 4's says the answer is alignment, not quantization. The
-documented first suspect does not apply at ATOM `7173f5b`, where
-`atom/model_ops/layernorm.py` already passes `use_model_sensitive_rmsnorm=1` at both
-call sites — so if you see this, the misalignment is elsewhere and worth reporting
-upstream rather than re-checking that flag.
+value **above** example 4's says the answer is alignment, not quantization. Do not
+re-check `use_model_sensitive_rmsnorm` for this: the ATOM this release pins already
+passes it at both call sites in `atom/model_ops/layernorm.py`. The misalignment is
+elsewhere and worth reporting upstream.
 
 **ATOM rollout degradation** (with `MODE=atomfp8` / `atombf16`: `filter_groups: kept 0/96`
 plus `Rollout reward: accuracy=0.0000` plus many `finished with reason max` and no `eos`

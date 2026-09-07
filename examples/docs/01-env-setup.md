@@ -41,7 +41,12 @@ cd "$RL_ROOT"
 git clone -b dev/vllm-fsdp-dapo   https://github.com/ZhangDanyang-AMD/Lumen-RL.git
 git clone -b amd-atom-rollout     https://github.com/ZhangDanyang-AMD/Lumen.git
 git clone -b lumen/triton_kernels https://github.com/ZhangDanyang-AMD/aiter.git
-git clone -b lumen-rl             https://github.com/xysheng-AMD/ATOM.git   # examples 4, 5
+
+# ATOM (examples 4, 5) is pinned at the head of upstream ROCm/ATOM PR #2028; see
+# chapter 8 §8.1.1. The PR is unmerged, so take it by SHA rather than by branch:
+git init ATOM && git -C ATOM remote add origin https://github.com/ROCm/ATOM.git
+git -C ATOM fetch --depth 1 origin 28721a5094b9753b9d5a7c68abcceec928bb1bfb
+git -C ATOM checkout FETCH_HEAD
 
 # aiter's JIT needs composable_kernel. Without it, examples 3/4/5 fail to find
 # generate.py the moment they trigger module_rmsnorm.
@@ -58,7 +63,9 @@ GHP=https://gh-proxy.com/https://github.com
 git -c http.version=HTTP/1.1 clone --depth 1 --single-branch -b dev/vllm-fsdp-dapo   "$GHP/ZhangDanyang-AMD/Lumen-RL.git"
 git -c http.version=HTTP/1.1 clone --depth 1 --single-branch -b amd-atom-rollout     "$GHP/ZhangDanyang-AMD/Lumen.git"
 git -c http.version=HTTP/1.1 clone --depth 1 --single-branch -b lumen/triton_kernels "$GHP/ZhangDanyang-AMD/aiter.git"
-git -c http.version=HTTP/1.1 clone --depth 1 --single-branch -b lumen-rl             "$GHP/xysheng-AMD/ATOM.git"
+git init ATOM && git -C ATOM remote add origin "$GHP/ROCm/ATOM.git"
+git -C ATOM -c http.version=HTTP/1.1 fetch --depth 1 origin 28721a5094b9753b9d5a7c68abcceec928bb1bfb
+git -C ATOM checkout FETCH_HEAD
 
 cd "$RL_ROOT/aiter"
 git -c http.version=HTTP/1.1 -c url."$GHP/".insteadOf=https://github.com/ \
