@@ -184,6 +184,59 @@ def test_patch_distrib_optimizer_routes_offloaded_grads_without_gpu_fp32_copy(
     assert not patcher.patch_distrib_optimizer_grad_copy(str(tmp_path))
 
 
+def test_patch_chained_optimizer_canonicalizes_divergent_steps(
+    tmp_path, caplog
+) -> None:
+    optimizer = tmp_path / "megatron" / "core" / "optimizer" / "optimizer.py"
+    optimizer.parent.mkdir(parents=True)
+    optimizer.write_text(
+        """
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class ChainedOptimizer:
+    def _synchronize_steps(self):
+        steps = []
+        for optimizer in self.chained_optimizers:
+            for param_group in optimizer.optimizer.param_groups:
+                if len(param_group['params']) > 0 and 'step' in param_group:
+                    steps.append(param_group['step'])
+        steps = list(set(steps))
+        assert len(steps) <= 1, f"steps: {steps}"
+        step = steps[0] if len(steps) == 1 else None
+        for optimizer in self.chained_optimizers:
+            for param_group in optimizer.optimizer.param_groups:
+                if len(param_group['params']) > 0 and 'step' in param_group:
+                    param_group['step'] = step
+        return step
+"""
+    )
+
+    assert hasattr(patcher, "patch_chained_optimizer_step_canonicalization")
+    assert patcher.patch_chained_optimizer_step_canonicalization(str(tmp_path))
+    namespace: dict[str, object] = {}
+    exec(compile(optimizer.read_text(), str(optimizer), "exec"), namespace)
+    chained = namespace["ChainedOptimizer"]()
+    groups = [
+        {"params": [object()], "step": 4375.0},
+        {"params": [object()], "step": 35225.0},
+    ]
+    chained.chained_optimizers = [
+        SimpleNamespace(optimizer=SimpleNamespace(param_groups=[group]))
+        for group in groups
+    ]
+
+    with caplog.at_level("WARNING"):
+        step = chained._synchronize_steps()
+
+    assert step == 35225.0
+    assert [group["step"] for group in groups] == [35225.0, 35225.0]
+    assert "canonicalizing divergent chained optimizer steps" in caplog.text
+    assert not patcher.patch_chained_optimizer_step_canonicalization(str(tmp_path))
+
+
 def _write_distrib_optimizer_checkpoint_fixture(path: Path) -> None:
     """Write the relevant p22 DistributedOptimizer source anchors."""
     path.parent.mkdir(parents=True)
@@ -268,6 +321,24 @@ class DistributedOptimizer:
             ) and step is not None:
                 param_group["step"] = int(step)
         return state_dict
+
+    def load_state_dict(self, state_dict):
+        state_dict_state = {}
+        if not HAVE_APEX_OR_TE:
+            steps = list(set([g["step"] for g in state_dict["optimizer"]["param_groups"]]))
+            assert len(steps) == 1
+            step = torch.tensor(steps[0], dtype=torch.float)
+
+            for s in state_dict_state.values():
+                s["step"] = step
+        elif isinstance(self.optimizer, HybridDeviceOptimizer):
+            steps = list(set([g["step"] for g in state_dict["optimizer"]["param_groups"] if "step" in g]))
+            if len(steps) != 0:
+                assert len(steps) == 1, f"steps: {steps}"
+                step = torch.tensor(steps[0], dtype=torch.float32, device="cpu")
+                for value in self.optimizer.state.values():
+                    value["step"] = step.detach().clone()
+        return state_dict_state
 
     def _set_main_param_and_optimizer_states(self, model_param, tensors):
         group_index, group_order = self.model_param_group_index_map[model_param]
@@ -562,6 +633,68 @@ def test_patch_distrib_optimizer_checkpoint_canonicalizes_divergent_hdo_steps(
     assert "unique_count=3" in caplog.text
 
 
+def test_patch_distrib_optimizer_checkpoint_canonicalizes_hdo_suboptimizer_steps(
+    tmp_path, caplog
+) -> None:
+    _, _, namespace = _load_patched_distrib_optimizer(tmp_path)
+    optimizer_type = namespace["DistributedOptimizer"]
+    hdo_type = namespace["HybridDeviceOptimizer"]
+    parameters = [torch.nn.Parameter(torch.tensor(float(index))) for index in range(2)]
+    adam = torch.optim.Adam(parameters)
+    for parameter, step in zip(parameters, (4375.0, 35225.0)):
+        adam.state[parameter] = {
+            "step": torch.tensor(step),
+            "exp_avg": torch.zeros_like(parameter),
+            "exp_avg_sq": torch.zeros_like(parameter),
+        }
+    hdo = hdo_type([adam])
+    hdo.param_groups[0]["params"] = parameters
+    instance = optimizer_type.__new__(optimizer_type)
+    instance.optimizer = hdo
+    namespace["HAVE_APEX_OR_TE"] = True
+
+    with caplog.at_level("WARNING"):
+        state_dict = instance.state_dict()
+
+    assert state_dict["optimizer"]["param_groups"][0]["step"] == 35225
+    assert "canonicalizing divergent HDO Adam steps" in caplog.text
+
+
+def test_patch_distrib_optimizer_checkpoint_canonicalizes_loaded_group_steps(
+    tmp_path, caplog
+) -> None:
+    _, _, namespace = _load_patched_distrib_optimizer(tmp_path)
+    optimizer_type = namespace["DistributedOptimizer"]
+    hdo = namespace["HybridDeviceOptimizer"]()
+    parameter = torch.nn.Parameter(torch.tensor(1.0))
+    hdo.state = {parameter: {"step": torch.tensor(0.0)}}
+    instance = optimizer_type.__new__(optimizer_type)
+    instance.optimizer = hdo
+    state_dict = {
+        "optimizer": {
+            "param_groups": [
+                {"step": 4375.0},
+                {"step": 35225.0},
+            ]
+        }
+    }
+
+    with caplog.at_level("WARNING"):
+        instance.load_state_dict(state_dict)
+
+    assert hdo.state[parameter]["step"].item() == 35225
+    assert "canonicalizing divergent HDO checkpoint param-group steps" in caplog.text
+
+
+def test_patch_distrib_optimizer_checkpoint_canonicalizes_torch_loaded_group_steps(
+    tmp_path,
+) -> None:
+    _, patched, _ = _load_patched_distrib_optimizer(tmp_path)
+
+    assert "Torch-backed checkpoint load uses a canonical param-group step" in patched
+    assert "step = torch.tensor(max(steps), dtype=torch.float)" in patched
+
+
 def test_patch_distrib_optimizer_checkpoint_preserves_uniform_hdo_step(
     tmp_path, caplog
 ) -> None:
@@ -587,6 +720,64 @@ def test_patch_distrib_optimizer_checkpoint_preserves_uniform_hdo_step(
 
     assert state_dict["optimizer"]["param_groups"][0]["step"] == 50
     assert "canonicalizing divergent HDO Adam steps" not in caplog.text
+
+
+def test_patch_distrib_optimizer_checkpoint_canonicalizes_wrapped_torch_steps(
+    tmp_path, caplog
+) -> None:
+    _, _, namespace = _load_patched_distrib_optimizer(tmp_path)
+    optimizer_type = namespace["DistributedOptimizer"]
+    parameters = [torch.nn.Parameter(torch.tensor(float(index))) for index in range(2)]
+    adam = torch.optim.Adam(parameters)
+    for parameter, step in zip(parameters, (50.0, 4625.0)):
+        adam.state[parameter] = {
+            "step": torch.tensor(step),
+            "exp_avg": torch.zeros_like(parameter),
+            "exp_avg_sq": torch.zeros_like(parameter),
+        }
+    instance = optimizer_type.__new__(optimizer_type)
+    instance.optimizer = adam
+    namespace["HAVE_APEX_OR_TE"] = False
+
+    with caplog.at_level("WARNING"):
+        state_dict = instance.state_dict()
+
+    assert "optimizer" in state_dict
+    assert [adam.state[parameter]["step"].item() for parameter in parameters] == [
+        50.0,
+        4625.0,
+    ]
+    assert "canonicalizing divergent HDO Adam steps" in caplog.text
+
+
+def test_patch_distrib_optimizer_checkpoint_canonicalizes_fused_group_steps(
+    tmp_path, caplog
+) -> None:
+    _, _, namespace = _load_patched_distrib_optimizer(tmp_path)
+    optimizer_type = namespace["DistributedOptimizer"]
+
+    class FusedOptimizer:
+        def state_dict(self):
+            return {
+                "state": {},
+                "param_groups": [
+                    {"params": [0], "step": 4375.0},
+                    {"params": [1], "step": 35225.0},
+                ],
+            }
+
+    instance = optimizer_type.__new__(optimizer_type)
+    instance.optimizer = FusedOptimizer()
+    namespace["HAVE_APEX_OR_TE"] = True
+    namespace["USING_TE_OPTIMIZER"] = True
+
+    with caplog.at_level("WARNING"):
+        state_dict = instance.state_dict()
+
+    assert [
+        group["step"] for group in state_dict["optimizer"]["param_groups"]
+    ] == [35225, 35225]
+    assert "canonicalizing divergent fused optimizer steps" in caplog.text
 
 
 def test_patch_distrib_optimizer_compiles_and_idempotently_patches_p22_source(

@@ -11,7 +11,7 @@ import torch.distributed as dist
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 
-HEAD_IP = "10.194.132.76"
+HEAD_IP = "10.235.200.32"
 
 
 @ray.remote(num_gpus=1, num_cpus=1)
@@ -78,10 +78,10 @@ def main() -> None:
 
     env_vars = {
         "NCCL_IB_DISABLE": "0",
-        "NCCL_SOCKET_IFNAME": "ens14np0",
-        "NCCL_IB_HCA": "mlx5_0",
-        "NCCL_IB_GID_INDEX": "3",
-        "NCCL_NET": "IB",
+        "GLOO_SOCKET_IFNAME": "ens50f0",
+        "NCCL_SOCKET_IFNAME": "ens50f0",
+        "NCCL_IB_HCA": "ionic_0",
+        "NCCL_IB_GID_INDEX": "1",
         "NCCL_CUMEM_ENABLE": "0",
         "NCCL_DEBUG": "WARN",
     }

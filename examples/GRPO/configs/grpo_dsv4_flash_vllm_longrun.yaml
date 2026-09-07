@@ -19,7 +19,7 @@
 #   Node 2: vLLM inference (1 replica, TP=8, FP8 per-block, 8 GPUs)
 #
 # Rollout: vLLM AsyncLLM (FP8 per-block weights + FP8 KV cache, TP=8,
-#   enforce_eager, AITER kernels, gpu_memory_utilization=0.92)
+#   enforce_eager, AITER kernels, gpu_memory_utilization=0.90)
 #
 # Weight sync: RDMA via RCCL (2048 MB buckets, 1200s timeout)
 
@@ -127,7 +127,9 @@ policy:
       # DSV4's fp8_ds_mla attention layout requires FP8 KV cache; MILES does
       # not override its SGLang rollout to BF16 KV.
       kv_cache_dtype: fp8_e4m3
-      gpu_memory_utilization: 0.92
+      # Leave enough headroom for the 2 GiB RDMA receive buffer used while
+      # replacing FP8 rollout weights. 0.92 left only 1.26 GiB free at step 59.
+      gpu_memory_utilization: 0.90
       max_model_len: 16384
       dtype: bfloat16
       enable_chunked_prefill: true

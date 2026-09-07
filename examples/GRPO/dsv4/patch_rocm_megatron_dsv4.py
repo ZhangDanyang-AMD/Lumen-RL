@@ -1163,6 +1163,43 @@ def patch_distrib_optimizer_grad_copy(megatron_root: str) -> bool:
     return True
 
 
+def patch_chained_optimizer_step_canonicalization(megatron_root: str) -> bool:
+    """Canonicalize divergent steps across chained optimizer groups."""
+    path = os.path.join(
+        megatron_root, "megatron", "core", "optimizer", "optimizer.py"
+    )
+    if not os.path.isfile(path):
+        return False
+    with open(path) as f:
+        content = f.read()
+    marker = "canonicalizing divergent chained optimizer steps"
+    if marker in content:
+        return False
+    old = (
+        '        assert len(steps) <= 1, f"steps: {steps}"\n'
+        "        step = steps[0] if len(steps) == 1 else None"
+    )
+    if old not in content:
+        raise RuntimeError(
+            "Unable to patch chained optimizer step synchronization: anchor missing"
+        )
+    new = (
+        "        if len(steps) > 1:\n"
+        "            logger.warning(\n"
+        '                "canonicalizing divergent chained optimizer steps: "\n'
+        '                "minimum=%s maximum=%s unique_count=%s",\n'
+        "                min(steps),\n"
+        "                max(steps),\n"
+        "                len(steps),\n"
+        "            )\n"
+        "        step = max(steps) if steps else None"
+    )
+    content = content.replace(old, new, 1)
+    with open(path, "w") as f:
+        f.write(content)
+    return True
+
+
 def patch_distrib_optimizer_hdo_checkpoint(megatron_root: str) -> bool:
     """Keep mixed-dtype HDO parameter/state ordering stable for checkpoints.
 
@@ -1206,6 +1243,17 @@ def patch_distrib_optimizer_hdo_checkpoint(megatron_root: str) -> bool:
         content = content.replace(build_anchor, remap, 1)
 
     torch_hdo_step_marker = "Torch-backed HDO checkpoint uses a canonical Adam step"
+    guarded_torch_step_check = (
+        "            if len(steps) > 1 and isinstance(\n"
+        "                self.optimizer, HybridDeviceOptimizer\n"
+        "            ):\n"
+    )
+    if guarded_torch_step_check in content:
+        content = content.replace(
+            guarded_torch_step_check,
+            "            if len(steps) > 1:\n",
+            1,
+        )
     if torch_hdo_step_marker not in content:
         torch_step_block = (
             '            steps = list(set([s["step"].item() '
@@ -1222,9 +1270,7 @@ def patch_distrib_optimizer_hdo_checkpoint(megatron_root: str) -> bool:
             "            # Torch-backed HDO checkpoint uses a canonical Adam step.\n"
             + torch_step_block.splitlines()[0]
             + "\n"
-            "            if len(steps) > 1 and isinstance(\n"
-            "                self.optimizer, HybridDeviceOptimizer\n"
-            "            ):\n"
+            "            if len(steps) > 1:\n"
             "                logger.warning(\n"
             '                    "canonicalizing divergent HDO Adam steps: "\n'
             '                    "minimum=%s maximum=%s unique_count=%s",\n'
@@ -1242,7 +1288,7 @@ def patch_distrib_optimizer_hdo_checkpoint(megatron_root: str) -> bool:
             1,
         )
 
-    step_marker = "canonicalizing divergent HDO Adam steps"
+    step_marker = "HDO sub-optimizer checkpoint uses a canonical Adam step"
     if step_marker not in content:
         step_prefix = (
             '                    steps = list(set([s["step"].item() '
@@ -1267,7 +1313,10 @@ def patch_distrib_optimizer_hdo_checkpoint(megatron_root: str) -> bool:
             raise RuntimeError(
                 "Unable to patch HDO checkpoint step: extraction anchor missing"
             )
-        canonical_step_block = step_prefix + (
+        canonical_step_block = (
+            "                    # HDO sub-optimizer checkpoint uses a canonical Adam step.\n"
+            + step_prefix
+            + (
             "                    if len(steps) > 1:\n"
             "                        logger.warning(\n"
             '                            "canonicalizing divergent HDO Adam steps: "\n'
@@ -1277,8 +1326,114 @@ def patch_distrib_optimizer_hdo_checkpoint(megatron_root: str) -> bool:
             "                            len(steps),\n"
             "                        )\n"
             "                    step = max(steps)"
+            )
         )
         content = content.replace(old_step_block, canonical_step_block, 1)
+
+    fused_step_marker = "canonicalizing divergent fused optimizer steps"
+    if fused_step_marker not in content:
+        fused_step_blocks = (
+            '            assert len(steps) <= 1, f"steps: {steps}"\n'
+            "            step = steps[0] if len(steps) == 1 else None",
+            "            assert len(steps) <= 1\n"
+            "            step = steps[0] if len(steps) == 1 else None",
+        )
+        fused_step_block = next(
+            (block for block in fused_step_blocks if block in content),
+            None,
+        )
+        if fused_step_block is None:
+            raise RuntimeError(
+                "Unable to patch fused optimizer checkpoint step: anchor missing"
+            )
+        canonical_fused_step_block = (
+            "            if len(steps) > 1:\n"
+            "                logger.warning(\n"
+            '                    "canonicalizing divergent fused optimizer steps: "\n'
+            '                    "minimum=%s maximum=%s unique_count=%s",\n'
+            "                    min(steps),\n"
+            "                    max(steps),\n"
+            "                    len(steps),\n"
+            "                )\n"
+            "            step = max(steps) if steps else None"
+        )
+        content = content.replace(
+            fused_step_block,
+            canonical_fused_step_block,
+            1,
+        )
+
+    torch_load_step_marker = (
+        "Torch-backed checkpoint load uses a canonical param-group step"
+    )
+    if torch_load_step_marker not in content:
+        torch_load_step_block = (
+            '            steps = list(set([g["step"] for g in '
+            'state_dict["optimizer"]["param_groups"]]))\n'
+            "            assert len(steps) == 1\n"
+            "            step = torch.tensor(steps[0], dtype=torch.float)"
+        )
+        if torch_load_step_block not in content:
+            raise RuntimeError(
+                "Unable to patch Torch-backed checkpoint load step: "
+                "param-group anchor missing"
+            )
+        canonical_torch_load_step_block = (
+            "            # Torch-backed checkpoint load uses a canonical "
+            "param-group step.\n"
+            + torch_load_step_block.splitlines()[0]
+            + "\n"
+            "            if len(steps) > 1:\n"
+            "                logger.warning(\n"
+            '                    "canonicalizing divergent Torch-backed checkpoint "\n'
+            '                    "param-group steps: minimum=%s maximum=%s "\n'
+            '                    "unique_count=%s",\n'
+            "                    min(steps),\n"
+            "                    max(steps),\n"
+            "                    len(steps),\n"
+            "                )\n"
+            "            step = torch.tensor(max(steps), dtype=torch.float)"
+        )
+        content = content.replace(
+            torch_load_step_block,
+            canonical_torch_load_step_block,
+            1,
+        )
+
+    load_step_marker = "HDO checkpoint load uses a canonical param-group step"
+    if load_step_marker not in content:
+        load_step_assert = '                assert len(steps) == 1, f"steps: {steps}"'
+        if load_step_assert not in content:
+            raise RuntimeError(
+                "Unable to patch HDO checkpoint load step: param-group anchor missing"
+            )
+        canonical_load_step_check = (
+            "                # HDO checkpoint load uses a canonical param-group step.\n"
+            "                if len(steps) > 1:\n"
+            "                    logger.warning(\n"
+            '                        "canonicalizing divergent HDO checkpoint "\n'
+            '                        "param-group steps: minimum=%s maximum=%s "\n'
+            '                        "unique_count=%s",\n'
+            "                        min(steps),\n"
+            "                        max(steps),\n"
+            "                        len(steps),\n"
+            "                    )\n"
+        )
+        content = content.replace(
+            load_step_assert,
+            canonical_load_step_check.rstrip("\n"),
+            1,
+        )
+        marker_index = content.index(load_step_marker)
+        step_index = content.index("torch.tensor(steps[0]", marker_index)
+        content = (
+            content[:step_index]
+            + content[step_index:].replace(
+                "torch.tensor(steps[0]",
+                "torch.tensor(max(steps)",
+                1,
+            )
+        )
 
     fast_path_marker = "DP=1 HDO checkpoint state in place"
     if fast_path_marker not in content:
@@ -3016,6 +3171,9 @@ def main(megatron_root: str) -> None:
         ),
         "optimizer/distrib_optimizer.py": patch_distrib_optimizer_fp32_detach(megatron_root),
         "optimizer/distrib_optimizer.py grad copy": patch_distrib_optimizer_grad_copy(megatron_root),
+        "optimizer/optimizer.py chained step": patch_chained_optimizer_step_canonicalization(
+            megatron_root
+        ),
         "optimizer/distrib_optimizer.py HDO checkpoint": patch_distrib_optimizer_hdo_checkpoint(
             megatron_root
         ),

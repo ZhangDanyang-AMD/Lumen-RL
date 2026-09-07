@@ -10,12 +10,31 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 ROOT = Path("/workspace/Lumen-RL")
 FILES = (
+    "lumenrl/algorithms/grpo.py",
     "lumenrl/core/config.py",
+    "lumenrl/controller/ray_worker_group.py",
     "lumenrl/trainer/rl_trainer.py",
+    "lumenrl/engine/training/megatron_base_engine.py",
+    "lumenrl/engine/training/megatron_engine.py",
+    "lumenrl/engine/training/megatron_lumen_dsv4_engine.py",
+    "lumenrl/engine/training/streamed_adam.py",
+    "lumenrl/engine/training/config.py",
+    "lumenrl/engine/training/actor_worker.py",
+    "lumenrl/workers/actor_worker.py",
+    "lumenrl/utils/checkpoint.py",
     "lumenrl/engine/inference/fp8_weight_quantizer.py",
+    "lumenrl/engine/inference/rdma_protocol.py",
     "lumenrl/engine/inference/rdma_weight_transfer.py",
+    "lumenrl/engine/inference/weight_integrity.py",
     "lumenrl/engine/inference/vllm_colocate_worker_ext.py",
     "lumenrl/engine/inference/vllm_fp8_utils.py",
+    "lumenrl/engine/inference/vllm_ray_server.py",
+    "examples/GRPO/dsv4/patch_rocm_megatron_dsv4.py",
+    "examples/GRPO/configs/grpo_dsv4_flash_vllm_longrun.yaml",
+    "tests/integration/run_dsv4_megatron_logprob_capture.py",
+    "tests/integration/run_dsv4_megatron_weight_parity.py",
+    "tests/integration/run_dsv4_weight_sync_integrity.py",
+    "tests/integration/run_streamed_adam_hdo.py",
 )
 
 
