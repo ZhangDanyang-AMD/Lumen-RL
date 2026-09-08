@@ -1,19 +1,33 @@
 #!/usr/bin/env bash
-# LumenRL release launcher: run one of the seven validated examples with a
+# LumenRL release launcher: run one of the eight validated examples with a
 # single argument. Runs on the GPU *host* (not inside the container) and drives
 # the published image through `docker run` / `docker exec`.
 #
 #   DATA_ROOT=/path/to/data bash release/run_example.sh 1 --check
 #
+# The image supplies the environment; this checkout supplies the code, bind-
+# mounted over the copy in the image (see LUMENRL_SRC below). Editing Lumen-RL
+# and running again is all it takes -- the image is not rebuilt or re-tagged.
+#
 # See release/README.md §4 for the full user-facing documentation.
 set -euo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# The checkout this script lives in is the code that runs. The image carries the
+# environment -- pinned aiter / Lumen / ATOM, Megatron/Apex/TE, and the baked
+# aiter kernels -- and a copy of Lumen-RL that only exists so the editable
+# install has somewhere to point; the bind-mount below covers it. You already
+# need this checkout to have this script at all, so mounting it is what removes
+# the version skew rather than adding any: there is no second copy to disagree
+# with. Change Lumen-RL, run again -- no rebuild, no new tag.
+LUMENRL_SRC="${LUMENRL_SRC:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 
 # Set DOCKER="sudo docker" if your user is not in the docker group.
 DOCKER_CLI="${DOCKER:-docker}"
 read -r -a DOCKER <<<"$DOCKER_CLI"
-IMAGE="${IMAGE:-zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260907}"
+IMAGE="${IMAGE:-zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260908}"
 CONTAINER="${CONTAINER:-lumenrl-release}"
 RL_ROOT_IN_IMAGE="${RL_ROOT_IN_IMAGE:-/opt/lumenrl}"
 RUN_DAPO="$RL_ROOT_IN_IMAGE/Lumen-RL/examples/DAPO/run_dapo.sh"
@@ -60,29 +74,34 @@ STALL_LIMIT_DEFAULT=2400
 # visibly different batch each time. Measured on the released image:
 #
 #   examples 1, 2, 3 (512 tokens)   one run each
-#   example 4 (4096)  six runs      k3_kl +-37%, entropy +-28%
-#   example 5 (4096)  three runs    k3_kl +-11%, entropy +-30%
-#   examples 6, 7 (4096)            one run each
+#   example 4 (4096)  three runs    k3_kl +-31%, entropy +-12%
+#   example 9 (4096)  three runs    k3_kl +-6%,  entropy +-15%
+#   examples 5, 6, 7 (4096)         one run each
 #
 # The tolerance is a per-group floor: k3_kl 30% at 512 and 50% at 4096; entropy
-# 25% at 512, 50% at 4096, 60% for the two MoE examples. Example 4, the widest
-# path and the most sampled, uses 73% of its band, so the floors carry the
-# spread with margin to spare.
+# 25% at 512, 50% at 4096, 60% for the three MoE examples. Example 4, the widest
+# path and the one with the largest spread, uses 62% of its band, so the floors
+# carry the observed spread with margin.
+#
+# Example 4 is why the floors are not tightened to what a single run suggests:
+# its three runs came in at 0.00241, 0.00243 and 0.00377. Either of the first
+# two, taken alone, would put the third outside a +-50% band around it.
 #
 # Entropy on a 4k run is only a coarse sanity check -- it is a mean over the
 # batch that survives filtering. k3_kl tracks train/rollout alignment more
 # directly and is the metric to judge a reproduction on.
 #
 # Every reference below is the mean over that example's runs on the released
-# image, and all 14 of those runs pass against this table.
+# image, and all 12 of those runs pass against this table.
 declare -A EX
-EX[1]='8B BF16 baseline|bf16|0|dapo_qwen3_8b_ray_vllm_smoke.yaml|dapo_qwen3_8b_ray_vllm_longrun.yaml|3|Qwen3-8B-Base||512|0.00114|0.636|0.000859|0.30|0.25'
-EX[2]='8B FP8 rollout|fp8|0|dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml|dapo_qwen3_8b_ray_vllm_fp8_longrun.yaml|3|Qwen3-8B-Base||512|0.00519|0.791|0.00556|0.30|0.25'
-EX[3]='8B FP8 end-to-end|fp8|1|dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml|dapo_qwen3_8b_ray_vllm_fp8_longrun.yaml|3|Qwen3-8B-Base||512|0.00413|0.808|0.00405|0.30|0.25'
-EX[4]='8B ATOM FP8|atomfp8|1|dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml|dapo_qwen3_8b_ray_atom_fp8_longrun.yaml|3|Qwen3-8B-Base||4096|0.00374|0.723|0.00390|0.50|0.50'
-EX[5]='8B ATOM BF16|atombf16|0|dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml|dapo_qwen3_8b_ray_atom_bf16_longrun.yaml|1|Qwen3-8B-Base||4096|0.000860|0.572|0.000762|0.50|0.50'
-EX[6]='MoE FSDP2|bf16|0|dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml|dapo_qwen3moe_a3b_ray_vllm_verlref_longrun.yaml|3|Qwen3-30B-A3B-Base|LUMENRL_FP32_MOE_ROUTER=0|4096|0.00134|0.629|0.00128|0.50|0.60'
-EX[7]='MoE Megatron EP=8|bf16|0|dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml|dapo_qwen3moe_a3b_ray_megatron_verlref_4k_longrun.yaml|3|Qwen3-30B-A3B-Base|LUMENRL_FP32_MOE_ROUTER=0|4096|0.00138|0.628|0.00140|0.50|0.60'
+EX[1]='8B BF16 baseline|bf16|0|dapo_qwen3_8b_ray_vllm_smoke.yaml|dapo_qwen3_8b_ray_vllm_longrun.yaml|3|Qwen3-8B-Base||512|0.00106|0.582|0.00106|0.30|0.25'
+EX[2]='8B FP8 rollout|fp8|0|dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml|dapo_qwen3_8b_ray_vllm_fp8_longrun.yaml|3|Qwen3-8B-Base||512|0.00498|0.784|0.00538|0.30|0.25'
+EX[3]='8B FP8 end-to-end|fp8|1|dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml|dapo_qwen3_8b_ray_vllm_fp8_longrun.yaml|3|Qwen3-8B-Base||512|0.00404|0.832|0.00419|0.30|0.25'
+EX[4]='8B ATOM FP8|atomfp8|1|dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml|dapo_qwen3_8b_ray_atom_fp8_longrun.yaml|3|Qwen3-8B-Base||4096|0.00287|0.540|0.00288|0.50|0.50'
+EX[5]='8B ATOM BF16|atombf16|0|dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml|dapo_qwen3_8b_ray_atom_bf16_longrun.yaml|1|Qwen3-8B-Base||4096|0.000930|0.568|0.000880|0.50|0.50'
+EX[6]='MoE FSDP2|bf16|0|dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml|dapo_qwen3moe_a3b_ray_vllm_verlref_longrun.yaml|3|Qwen3-30B-A3B-Base|LUMENRL_FP32_MOE_ROUTER=0|4096|0.00158|0.679|0.00154|0.50|0.60'
+EX[7]='MoE Megatron EP=8|bf16|0|dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml|dapo_qwen3moe_a3b_ray_megatron_verlref_4k_longrun.yaml|3|Qwen3-30B-A3B-Base|LUMENRL_FP32_MOE_ROUTER=0|4096|0.00158|0.660|0.00188|0.50|0.60'
+EX[9]='MoE ATOM BF16|atombf16|0|dapo_qwen3moe_a3b_ray_atom_bf16_4k_smoke.yaml|dapo_qwen3moe_a3b_ray_atom_bf16_longrun.yaml|3|Qwen3-30B-A3B-Base|LUMENRL_FP32_MOE_ROUTER=0|4096|0.00138|0.692|0.00138|0.50|0.60'
 
 field() { echo "${EX[$1]}" | cut -d'|' -f"$2"; }
 
@@ -94,13 +113,13 @@ usage() {
 $SCRIPT_NAME — run one validated LumenRL example end to end.
 
 USAGE
-  DATA_ROOT=/path/to/data bash release/$SCRIPT_NAME <1..7> [options]
+  DATA_ROOT=/path/to/data bash release/$SCRIPT_NAME <1..7|9> [options]
 
 EXAMPLES (smoke defaults; all of them fit on one 8x gfx950 node)
   #  name                 MODE      TRAIN_FP8  config                                              steps  resp
 EOF
   local n
-  for n in 1 2 3 4 5 6 7; do
+  for n in 1 2 3 4 5 6 7 9; do
     printf '  %s  %-19s %-9s %-10s %-51s %-6s %s\n' \
       "$n" "$(field "$n" 1)" "$(field "$n" 2)" "$(field "$n" 3)" \
       "$(field "$n" 4)" "$(field "$n" 6)" "$(field "$n" 9)"
@@ -129,6 +148,9 @@ OPTIONS
 ENVIRONMENT
   DATA_ROOT   required. Host directory holding models/, data_cached/, logs/.
   IMAGE       default $IMAGE
+  LUMENRL_SRC the Lumen-RL checkout to mount into the container as the code
+              that runs. Default is the checkout holding this script,
+              $LUMENRL_SRC
   CONTAINER   default $CONTAINER
   DOCKER      docker CLI to use, e.g. DOCKER="sudo docker" if your user is not
               in the docker group. Default $DOCKER_CLI
@@ -159,9 +181,14 @@ while [ $# -gt 0 ]; do
     --no-restart) NO_RESTART=1 ;;
     --keep-cache) KEEP_CACHE=1 ;;
     --verbose) VERBOSE=1 ;;
-    [1-7]) N="$1" ;;
+    [1-7]|9) N="$1" ;;
+    8)
+      echo "ERROR: example 8 is the two-node disaggregated RDMA deployment. It needs" >&2
+      echo "       2x8 gfx942 and is not covered by this image; see" >&2
+      echo "       examples/docs/07-disaggregated-rdma.md. This image runs 1..7 and 9." >&2
+      exit 2 ;;
     [0-9]*)
-      echo "ERROR: '$1' is not a valid example number. Valid values are 1..7; see --help." >&2
+      echo "ERROR: '$1' is not a valid example number. Valid values are 1..7 and 9; see --help." >&2
       exit 2 ;;
     *) echo "ERROR: unknown argument '$1'. Try --help." >&2; exit 2 ;;
   esac
@@ -169,7 +196,7 @@ while [ $# -gt 0 ]; do
 done
 
 if [ -z "$N" ]; then
-  echo "ERROR: no example number given. Valid values are 1..7; see --help." >&2
+  echo "ERROR: no example number given. Valid values are 1..7 and 9; see --help." >&2
   exit 2
 fi
 
@@ -228,6 +255,17 @@ check_log() {
     printf '  %-14s %s\n' "$pat" "$rc"
     errs=$((errs + rc))
   done
+
+  # A weight-sync bucket that skips tensors is the one failure the four counts
+  # above cannot see: the run exits 0, every step logs, and the rollout serves
+  # weights that were never updated. It is how the fused MoE expert weights went
+  # stale for a whole run -- 96 tensors per replica per sync, silently. Every
+  # bucket must account for every tensor in it.
+  local skipped_buckets
+  skipped_buckets="$(grep -oE 'bucket done - updated=[0-9]+, skipped=[0-9]+' "$log" \
+    | grep -cvE 'skipped=0$' || true)"
+  printf '  %-14s %s\n' 'skipped>0' "$skipped_buckets"
+  errs=$((errs + skipped_buckets))
 
   # Two different lines start with "step=1 "; the one we want is the metrics
   # dump from LoggingCallback, identified by rollout_corr/kl.
@@ -364,6 +402,7 @@ $DOCKER_CLI run -d --name $CONTAINER \\
   --device=/dev/kfd --device=/dev/dri --group-add=video \\
   --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --shm-size 64G \\
   -v \$DATA_ROOT:\$DATA_ROOT -e DATA_ROOT=\$DATA_ROOT \\
+  -v $LUMENRL_SRC:$RL_ROOT_IN_IMAGE/Lumen-RL \\
   $IMAGE sleep infinity
 
 # 2. the example. Every variable below is required: MODE alone does NOT pick
@@ -390,6 +429,13 @@ fi
 # ---------------------------------------------------------------------------
 echo "== example $N — $TITLE"
 echo "   config $CONFIG   steps $STEPS   model $MODEL_SUBDIR"
+# Print the code as well as the image: the image no longer pins it, so a result
+# is only reproducible if both are recorded.
+src_rev="$(git -C "$LUMENRL_SRC" rev-parse --short HEAD 2>/dev/null || echo 'not a git checkout')"
+src_dirty=""
+git -C "$LUMENRL_SRC" diff --quiet 2>/dev/null || src_dirty=" (uncommitted changes)"
+echo "   code   $LUMENRL_SRC @ $src_rev$src_dirty"
+echo "   image  $IMAGE"
 
 command -v "${DOCKER[0]}" >/dev/null || die "'${DOCKER[*]}' not found on this host. Set DOCKER='sudo docker' if needed."
 
@@ -404,7 +450,7 @@ if [ "$missing" = 1 ]; then
   echo
   echo "DATA_ROOT=$DATA_ROOT is incomplete. Required layout (see README §4.2):"
   echo "  \$DATA_ROOT/models/Qwen3-8B-Base/                                  ~16 GB (all examples)"
-  echo "  \$DATA_ROOT/models/Qwen3-30B-A3B-Base/                             ~57 GB (examples 6, 7)"
+  echo "  \$DATA_ROOT/models/Qwen3-30B-A3B-Base/                             ~57 GB (examples 6, 7, 9)"
   echo "  \$DATA_ROOT/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet   ~1.0 GB"
   echo "  \$DATA_ROOT/data_cached/qwen3-8b-maxprompt1024/aime-2024.filtered.parquet       ~0.9 MB"
   exit 1
@@ -453,8 +499,32 @@ fi
 # ---------------------------------------------------------------------------
 # Container lifecycle
 # ---------------------------------------------------------------------------
+create_container() {
+  "${DOCKER[@]}" run -d --name "$CONTAINER" \
+    --network=host --ipc=host \
+    --device=/dev/kfd --device=/dev/dri --group-add=video \
+    --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --shm-size 64G \
+    -v "$DATA_ROOT":"$DATA_ROOT" -e DATA_ROOT="$DATA_ROOT" \
+    -v "$LUMENRL_SRC":"$RL_ROOT_IN_IMAGE/Lumen-RL" \
+    "$IMAGE" sleep infinity >/dev/null
+}
+
+# A bind-mount is fixed when the container is created, so a container left over
+# from an older launcher -- or from a different checkout -- would keep serving
+# the code it was created with while this script reported the mount it intended.
+# That is the exact silent-skew failure the mount exists to prevent, so a
+# mismatch recreates rather than restarts.
+mounted_src=""
 if "${DOCKER[@]}" container inspect "$CONTAINER" >/dev/null 2>&1; then
-  if [ "$NO_RESTART" = 1 ]; then
+  mounted_src="$("${DOCKER[@]}" container inspect "$CONTAINER" \
+    --format "{{range .Mounts}}{{if eq .Destination \"$RL_ROOT_IN_IMAGE/Lumen-RL\"}}{{.Source}}{{end}}{{end}}" 2>/dev/null || true)"
+  mounted_img="$("${DOCKER[@]}" container inspect "$CONTAINER" --format '{{.Config.Image}}' 2>/dev/null || true)"
+  if [ "$mounted_src" != "$LUMENRL_SRC" ] || [ "$mounted_img" != "$IMAGE" ]; then
+    echo "   container $CONTAINER was built from ${mounted_img:-?} with code ${mounted_src:-<none, baked copy>}; recreating"
+    "${DOCKER[@]}" rm -f "$CONTAINER" >/dev/null
+    create_container
+    echo "   container $CONTAINER created"
+  elif [ "$NO_RESTART" = 1 ]; then
     "${DOCKER[@]}" start "$CONTAINER" >/dev/null 2>&1 || true
     echo "   container $CONTAINER reused (--no-restart)"
   else
@@ -464,12 +534,7 @@ if "${DOCKER[@]}" container inspect "$CONTAINER" >/dev/null 2>&1; then
     echo "   container $CONTAINER restarted"
   fi
 else
-  "${DOCKER[@]}" run -d --name "$CONTAINER" \
-    --network=host --ipc=host \
-    --device=/dev/kfd --device=/dev/dri --group-add=video \
-    --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --shm-size 64G \
-    -v "$DATA_ROOT":"$DATA_ROOT" -e DATA_ROOT="$DATA_ROOT" \
-    "$IMAGE" sleep infinity >/dev/null
+  create_container
   echo "   container $CONTAINER created"
 fi
 sleep 5
@@ -499,17 +564,24 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# ATOM compile cache hygiene (examples 4 <-> 5)
+# ATOM compile cache hygiene (examples 4, 5, 9)
 # ---------------------------------------------------------------------------
+# Keyed on precision *and* model, because either one changing invalidates the
+# cached graphs and the failure is not a cache miss -- it is a crash deep in
+# AOTAutograd during warmup, with a stack that says nothing about caching.
+# Precision alone was not enough: example 5 (atombf16, 8B dense) followed by
+# example 9 (atombf16, 30B MoE) keeps the same MODE, and reusing the 8B graphs
+# for the MoE model killed the rollout runner before step 1.
 STATE="$DATA_ROOT/logs/.atom-precision-$CONTAINER"
 if [ "$MODE" = atomfp8 ] || [ "$MODE" = atombf16 ]; then
+  atom_key="$MODE $MODEL_SUBDIR"
   prev_atom="$(cat "$STATE" 2>/dev/null || true)"
-  if [ "$KEEP_CACHE" != 1 ] && [ -n "$prev_atom" ] && [ "$prev_atom" != "$MODE" ]; then
-    echo "   ATOM precision changed ($prev_atom -> $MODE): clearing compile caches"
+  if [ "$KEEP_CACHE" != 1 ] && [ -n "$prev_atom" ] && [ "$prev_atom" != "$atom_key" ]; then
+    echo "   ATOM graphs changed ($prev_atom -> $atom_key): clearing compile caches"
     "${DOCKER[@]}" exec "$CONTAINER" bash -lc \
       'rm -rf /tmp/aiter_configs /tmp/atom_torch_compile_cache /tmp/torchinductor_root'
   fi
-  echo "$MODE" > "$STATE"
+  echo "$atom_key" > "$STATE"
 fi
 
 # ---------------------------------------------------------------------------

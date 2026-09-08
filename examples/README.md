@@ -23,10 +23,11 @@ data -> smoke -> launch the long run with `docker exec -d`.
 > **published container image**: the software stack is already pinned with its kernels
 > baked in, each example is a single command, and the launcher compares the metrics
 > against reference values to print PASS/FAIL.
-> See [**8. Running the seven examples from the release image**](docs/08-release.md) —
-> three commands from `docker pull` to a verdict, and chapters 1–4 of this page can be
-> skipped entirely. You need the from-scratch path below only to change the source,
-> swap models, or run two nodes (example 8).
+> See [**8. Running the eight examples from the release image**](docs/08-release.md) —
+> four commands from `git clone` to a verdict, and chapters 1–4 of this page can be
+> skipped entirely. The image carries the environment and mounts your checkout as the
+> code, so changing Lumen-RL needs no rebuild; you need the from-scratch path below
+> only to swap models or run two nodes (example 8).
 
 ---
 
@@ -42,10 +43,15 @@ data -> smoke -> launch the long run with `docker exec -d`.
 | 6 | MoE FSDP2 | Qwen3-30B-A3B-Base | Lumen FSDP2, BF16 | vLLM / BF16 | same | same | `MODE=bf16` + MoE config |
 | 7 | MoE Megatron EP=8 | Qwen3-30B-A3B-Base | **Megatron-Native**, TP=PP=CP=1, EP=8, DP=8 | vLLM / BF16 | same | same | `MODE=bf16` + Megatron config |
 | 8 | MoE 2-node RDMA | Qwen3-30B-A3B | **Megatron-Native**, TP=4, EP=8 | vLLM TP=2 x 4 / BF16 | 2x 8x MI308X (gfx942) | `qwen3-30b-a3b:rollout` + `trainer` | [Disaggregated guide](docs/07-disaggregated-rdma.md) |
+| 9 | MoE ATOM BF16 | Qwen3-30B-A3B-Base | Lumen FSDP2, BF16 | **ATOM** / BF16 | 8x MI355X (gfx950) | `vllm/vllm-openai-rocm:v0.23.0` | `MODE=atombf16` + MoE config |
 
 Examples 1-7 have been run on **8x MI355X** and **8x MI325X**: smoke plus long run,
 exit 0, no traceback, no OOM, no `HSA_STATUS`, weight-sync coverage assertions all
 passing, and memory back to the ~298 MB/card idle baseline afterwards.
+
+Example 9 is example 6 with the rollout switched from vLLM to ATOM, and has been
+run on **8x MI355X** only; it is the one example that drives MoE expert weights
+through the ATOM weight-sync path.
 
 Example 8 runs on **2x 8x MI308X** with disaggregated training and inference: Megatron
 trainer on node 1, vLLM rollout on node 2, connected via RCCL/RoCE GPU Direct RDMA
@@ -124,7 +130,7 @@ examples 6 and 7 need `MODEL_PATH` pointed at the MoE model explicitly plus
 | 5 | [Multi-node RDMA](docs/05-multinode-rdma.md) | RDMA pre-checks, launch/checkpoint verification, baselines (two-node only) |
 | 6 | [Troubleshooting](docs/06-troubleshooting.md) | All known failure modes and fixes |
 | 7 | [Disaggregated 2-node RDMA](docs/07-disaggregated-rdma.md) | Full deployment: Megatron trainer + vLLM rollout, RDMA weight sync, from-zero setup |
-| 8 | [**Running from the release image**](docs/08-release.md) | ⚡ **Fast path, replaces steps 1–4**: `docker pull` plus one command per example for 1–7, with node clearing, predictable logs, metric checking (`--check`), and reference values with tolerances |
+| 8 | [**Running from the release image**](docs/08-release.md) | ⚡ **Fast path, replaces steps 1–4**: `docker pull` plus one command per example for 1–7 and 9, with node clearing, predictable logs, metric checking (`--check`), and reference values with tolerances |
 
 Steps 1–7 build **from source**; step 8 uses the **published image**. Both run the same
 examples (1–7 in step 8 are 1–7 in the table above), so the metrics are directly

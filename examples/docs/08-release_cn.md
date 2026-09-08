@@ -1,24 +1,29 @@
 > [Examples README](../README_cn.md) > 用发布镜像跑
 
-# 8. 用发布镜像跑七个例子
+# 8. 用发布镜像跑八个例子
 
 > English version: [08-release.md](08-release.md)
 
-这一章用**已发布的容器镜像**跑 §8.2 的七个例子：软件栈已固定、aiter kernel 已预编译，
-每个例子一条命令，不需要安装任何依赖，也不需要打开 config 或启动脚本。
+这一章用**已发布的容器镜像**跑 §8.2 的八个例子：软件栈已固定、aiter kernel 已预编译，
+每个例子一条命令，不需要安装任何依赖。
 第 [1](01-env-setup_cn.md)–[4](04-launching_cn.md) 章是另一条路——从源码搭一套环境，
-要改代码、换模型或跑双节点（例子 8，见 [第 7 章](07-disaggregated-rdma_cn.md)）时用那一条。
+要换模型或跑双节点（例子 8，见 [第 7 章](07-disaggregated-rdma_cn.md)）时用那一条。
 
 > ⚠️ **本镜像仅支持 AMD gfx950 架构**（Instinct MI350X / MI355X），需要 8 张卡。
 > 详见 §8.3.1。
 
 ```bash
+git clone https://github.com/ZhangDanyang-AMD/Lumen-RL.git && cd Lumen-RL
 export DATA_ROOT=/path/to/data
-docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260907
+docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260908
 bash release/run_example.sh 1 --check
 ```
 
-三条命令跑完第一个例子并自动判定结果是否正确。换例子只改最后那个数字。
+四条命令跑完第一个例子并自动判定结果是否正确。换例子只改最后那个数字。
+
+**改代码不需要离开这一章。** 镜像提供环境，刚 clone 的这份代码提供 Lumen-RL 本身，
+以 bind-mount 的方式盖在镜像里那份之上。改 `lumenrl/`，再跑同一条命令，跑的就是改动后的
+代码——见 §8.1.1。
 
 ---
 
@@ -41,18 +46,51 @@ overlong 奖励缓冲、TIS rollout 修正。
 
 ```bash
 docker run --rm --entrypoint /bin/bash \
-  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260907 \
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260908 \
   -lc 'ls /opt/lumenrl/aiter-jit/*.so | wc -l'     # 16
 ```
 
-### 8.1.1 版本固定
+### 8.1.1 镜像是环境，你的 checkout 是代码
+
+`run_example.sh` 会把它自己所在的这份 checkout 挂到容器里的
+`/opt/lumenrl/Lumen-RL`。所以镜像固定的是那些构建代价大、又容易配错的东西——aiter、
+Lumen、ATOM、Megatron/Apex/TE，以及编译好的 kernel——而 Lumen-RL 本身来自你的工作区：
+
+```bash
+vim lumenrl/trainer/rl_trainer.py
+bash release/run_example.sh 1 --check        # 直接跑改动；不重建镜像，不换 tag
+```
+
+这不是「多出一份可能和镜像不一致的副本」。你本来就得有这份 checkout 才能拿到
+`run_example.sh`，所以挂载它恰恰是**消除**版本漂移的手段：镜像里那份的存在意义只是让
+editable 安装有个路径可指，挂载把它盖住了。每次运行都会打印用的是哪份代码、哪个 commit：
+
+```
+   code   /path/to/Lumen-RL @ f4439f3
+   image  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260908
+```
+
+两点需要知道：
+
+- **一个结果由镜像 digest \*和\* commit 共同确定**，不是只看镜像。§8.5.1 两个都记了，
+  你也应该两个都记。
+- **容器记着自己的挂载。** bind-mount 在容器创建时就定死了，所以把 `LUMENRL_SRC` 指到
+  别处、或者容器是旧版启动器建的，`run_example.sh` 会**删掉重建**容器而不是重启它，
+  并且会在日志里说明。
+
+要跑别处的代码，设 `LUMENRL_SRC=/other/checkout`。
+
+只有下面三个上游之一变动、或系统级依赖变化时才需要重建镜像。**Lumen-RL 的改动永远不需要。**
+
+### 8.1.2 版本固定
 
 复现一个结果依赖下面三个上游仓库，它们**不能各自独立升级**，所以都按 commit 固定。
-Lumen-RL 是本仓库，**不固定**，镜像取所列分支的最新代码。
+Lumen-RL 是本仓库，**镜像完全不固定它**——跑的是你 checkout 里的版本，见 §8.1.1。
+镜像里那份只是兜底，不是实际运行的代码。
 
 | 组件 | 仓库 | 分支 | Commit |
 |---|---|---|---|
-| Lumen-RL | `ZhangDanyang-AMD/Lumen-RL` | `dev/dapo_release` | 分支最新（不固定） |
+| Lumen-RL | `ZhangDanyang-AMD/Lumen-RL` | `dev/dapo_release` | 你的 checkout（挂载，不固定） |
 | Lumen | `ZhangDanyang-AMD/Lumen` | `amd-atom-rollout` | `e6379cbd9057` |
 | aiter | `ZhangDanyang-AMD/aiter` | `lumen/moe` | `4ebe6d69c7f4` |
 | ATOM | `ROCm/ATOM` | `refs/pull/2028/head` | `28721a5094b9` |
@@ -84,9 +122,9 @@ print(aiter.__file__)"'
 
 ---
 
-## 8.2 七个例子
+## 8.2 八个例子
 
-七个例子的训练与推理**都跑在同一组 8 张卡上**。
+八个例子的训练与推理**都跑在同一组 8 张卡上**。
 
 ### 8.2.1 概览
 
@@ -99,12 +137,22 @@ print(aiter.__file__)"'
 | 5 | 8B ATOM BF16 | FSDP2 BF16 | **ATOM** BF16 | `bash release/run_example.sh 5 --check` |
 | 6 | MoE FSDP2 | FSDP2 BF16 | vLLM BF16 | `bash release/run_example.sh 6 --check` |
 | 7 | MoE Megatron EP=8 | **Megatron** TP=PP=CP=1，EP=8，DP=8 | vLLM BF16 | `bash release/run_example.sh 7 --check` |
+| 9 | MoE ATOM BF16 | FSDP2 BF16 | **ATOM** BF16 | `bash release/run_example.sh 9 --check` |
+
+**这里没有例子 8。** [examples README](../README_cn.md) 里的例子 8 是双节点
+disaggregated RDMA 部署，需要 2×8 张 gfx942，本镜像不覆盖它，见
+[第 7 章](07-disaggregated-rdma_cn.md)。编号在整个 examples 体系里是通用的，
+所以这一章跑的是 1–7 和 9。
 
 - 例子 2 / 3 共用一条 config，只差 `TRAIN_FP8`：`0` 只量化 rollout，`1` 训练前向也走 FP8。
 - 例子 5 是例子 4 的 BF16 对照组：同一个 ATOM 引擎，只关掉 rollout 在线量化与训练侧 FP8。
 - 例子 7 是例子 6 的 Megatron 孪生：两条 config 除 `training_backend` 与 `megatron_cfg`
   外逐字段相同，拓扑 EP=8 使 DP=8 与 FSDP2 一致，所以两者指标可直接相减，
   差值就是训练后端本身的差异。
+- 例子 9 是例子 6 的 ATOM 孪生，这一对回答的是「换掉 rollout 引擎要付什么代价」：
+  同模型、同训练配置，只把 `generation_backend` 从 vllm 改成 atom 并加一个 `atom_cfg`
+  块，其余不动。它也是唯一一个让 MoE 专家权重走 ATOM 权重同步这条路的例子——
+  为什么把 `skipped` 列为健康判据，见 §8.5.2。
 
 ### 8.2.2 每个例子的完整参数
 
@@ -119,6 +167,7 @@ print(aiter.__file__)"'
 | 5 | `atombf16` | `0` | `dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml` | 1 | 4096 | Qwen3-8B-Base | — |
 | 6 | `bf16` | `0` | `dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml` | 3 | 4096 | Qwen3-30B-A3B-Base | `LUMENRL_FP32_MOE_ROUTER=0` |
 | 7 | `bf16` | `0` | `dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml` | 3 | 4096 | Qwen3-30B-A3B-Base | `LUMENRL_FP32_MOE_ROUTER=0` |
+| 9 | `atombf16` | `0` | `dapo_qwen3moe_a3b_ray_atom_bf16_4k_smoke.yaml` | 3 | 4096 | Qwen3-30B-A3B-Base | `LUMENRL_FP32_MOE_ROUTER=0` |
 
 > ⚠️ **`MODE` 与 `CONFIG_OVERRIDE` 必须成对给出。** `MODE` 除了选择环境变量，还会**追加一批
 > Hydra override**，`CONFIG_OVERRIDE` 只替换 config 文件而不会取消这些追加项。
@@ -163,7 +212,7 @@ print(aiter.__file__)"'
 **强依赖网络**（约合 139 MB/s），换机器不可移植；可移植的是 11.8 GB 这个下载量。
 
 **建议预留**：镜像 60 GB（解包 47.3 GB + 压缩层 11.8 GB 留在 content store）
-+ 模型与数据 74 GB ≈ **134 GB**。七个例子都是 smoke，不写 checkpoint。
++ 模型与数据 74 GB ≈ **134 GB**。八个例子都是 smoke，不写 checkpoint。
 若要长跑（`--longrun`）另需 checkpoint 空间——30B-A3B 的一份 FSDP2 checkpoint
 （fp32 权重 + optimizer）约 342 GB，`save_total_limit` 决定同时保留几份。
 
@@ -177,7 +226,7 @@ print(aiter.__file__)"'
 | 路径（相对 `$DATA_ROOT`） | 体积 | 谁需要 |
 |---|---|---|
 | `models/Qwen3-8B-Base/` | 16 GB | 例子 1–5，以及所有例子的 tokenizer |
-| `models/Qwen3-30B-A3B-Base/` | 57 GB | 例子 6、7 |
+| `models/Qwen3-30B-A3B-Base/` | 57 GB | 例子 6、7、9 |
 | `data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet` | 1.02 GB | 全部（train） |
 | `data_cached/qwen3-8b-maxprompt1024/aime-2024.filtered.parquet` | 892 KB | 全部（val） |
 | `logs/` | — | 启动器自动创建 |
@@ -203,7 +252,7 @@ rocm-smi --showmeminfo vram | grep -i used      # 宿主机上直接可用
 ### 8.4.2 获取镜像
 
 ```bash
-docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260907
+docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260908
 ```
 
 也可以自行构建，下面就是全部步骤：
@@ -240,7 +289,7 @@ snapshot_download("BytedTsinghua-SIA/AIME-2024", repo_type="dataset",
                   local_dir=f"{D}/raw/AIME-2024")
 PY'
 
-# 例子 6、7 追加（约 57 GB）
+# 例子 6、7、9 追加（约 57 GB）
 docker exec -e DATA_ROOT="$DATA_ROOT" lumenrl-release bash -lc '
 hf download Qwen/Qwen3-30B-A3B-Base \
   --local-dir "$DATA_ROOT/models/Qwen3-30B-A3B-Base" --max-workers 8'
@@ -268,7 +317,7 @@ for src, dst in jobs:
 PY'
 ```
 
-> 数据只需过滤一次，七个例子共用：两个模型的 `tokenizer.json` / `vocab.json` /
+> 数据只需过滤一次，八个例子共用：两个模型的 `tokenizer.json` / `vocab.json` /
 > `merges.txt` md5 相同（vocab 151936），按 8B tokenizer 过滤的结果对 MoE 同样成立。
 >
 > **MoE 必须用 Base 版。** instruct / thinking 版的 Qwen3-30B-A3B 在
@@ -301,8 +350,12 @@ docker run -d --name lumenrl-release \
   --device=/dev/kfd --device=/dev/dri --group-add=video \
   --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --shm-size 64G \
   -v "$DATA_ROOT":"$DATA_ROOT" -e DATA_ROOT="$DATA_ROOT" \
-  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260907 sleep infinity
+  -v "$PWD":/opt/lumenrl/Lumen-RL \
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260908 sleep infinity
 ```
+
+第二个挂载是代码（§8.1.1），`$PWD` 是这份 checkout 的根目录。不挂它，容器跑的就是镜像里
+烤进去的那份——只要你改过任何东西，那就是另一个 commit 了。
 
 日志路径固定：
 
@@ -330,20 +383,28 @@ $DATA_ROOT/logs/example-<N>-<时间戳>.launcher.log  # 包装层输出与退出
 | `WANDB_API_KEY` | 仅 `--longrun` 需要 |
 | `STALL_LIMIT` | 日志静默多少秒判定卡死，默认 2400 |
 
-用自己的代码覆盖镜像（四棵源码树都是 editable 安装）：
+跑自己的 Lumen-RL 不需要任何额外操作——那本来就是默认行为，见 §8.1.1。要跑**另一份**
+checkout（不是启动器所在的那份）：
+
+```bash
+LUMENRL_SRC=/other/Lumen-RL bash release/run_example.sh <N>
+```
+
+另外三棵源码树也是 editable 安装，同样可以挂：
 
 ```bash
 docker run -d --name lumenrl-dev ... \
-  -v "$PWD/Lumen-RL":/opt/lumenrl/Lumen-RL \
-  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260907 sleep infinity
+  -v "$PWD/ATOM":/opt/lumenrl/ATOM \
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260908 sleep infinity
 ```
 
-然后 `CONTAINER=lumenrl-dev bash release/run_example.sh <N>`。
+然后 `CONTAINER=lumenrl-dev bash release/run_example.sh <N>`。但与 Lumen-RL 不同，
+参考值是钉在这三棵树上的，换掉 ATOM / Lumen / aiter 之后的结果就不能再和 §8.5.1 比了。
 
 ### 8.4.5 不用启动器的手工命令
 
 下面是例子 1 的完整命令。换其他例子时，按 §8.2.2 的表替换 `MODE`、`TRAIN_FP8`、
-`CONFIG_OVERRIDE`、`STEPS`、`MODEL_PATH`，例子 6、7 再追加 `-e LUMENRL_FP32_MOE_ROUTER=0`。
+`CONFIG_OVERRIDE`、`STEPS`、`MODEL_PATH`，例子 6、7、9 再追加 `-e LUMENRL_FP32_MOE_ROUTER=0`。
 `bash release/run_example.sh <N> --dry-run` 会直接生成对应例子的这段命令。
 
 ```bash
@@ -372,7 +433,7 @@ docker exec \
 - `CONFIG_OVERRIDE` 的路径**相对 `$RL_ROOT/Lumen-RL`**，写绝对路径找不到。
 - 不给 `CONFIG_OVERRIDE` 时，`MODE` 选中的是 **longrun** config
   （`wandb_enabled: true`、`max_response_length: 20480`），不是 smoke。
-- `MODEL_PATH` 默认是 8B，例子 6、7 不显式给会静默跑错模型。
+- `MODEL_PATH` 默认是 8B，例子 6、7、9 不显式给会静默跑错模型。
 - `PYTORCH_CUDA_ALLOC_CONF=` 后面的空值不是笔误：只有显式传空串才能关掉
   `expandable_segments`。
 
@@ -384,7 +445,7 @@ docker exec \
 | 需要账号 | **不需要** | 需要 `WANDB_API_KEY` |
 | `max_response_length` | 512 / 4096 | 20480（例子 7 为 4096） |
 
-所以 §8.2 的七个例子不需要 wandb 账号。仅 `--longrun` 会用到：
+所以 §8.2 的八个例子不需要 wandb 账号。仅 `--longrun` 会用到：
 
 ```bash
 WANDB_API_KEY=xxxx bash release/run_example.sh 1 --longrun --detach
@@ -403,7 +464,7 @@ EXTRA_OVERRIDE=logger.wandb_enabled=false bash release/run_example.sh 1 --longru
 
 `--check` 自动完成本节的判定：抠出第 1 步的四个指标与内置参考值比对，
 统计 `Traceback` / `OutOfMemory` / `CUDA error` / `HSA_STATUS` 的出现次数，
-输出 PASS / FAIL。人工判读见下。
+统计跳过了张量的权重同步 bucket 数，输出 PASS / FAIL。人工判读见下。
 
 ```bash
 bash release/run_example.sh 1 --check
@@ -412,28 +473,40 @@ bash release/run_example.sh 1 --check-only --log $DATA_ROOT/logs/example-1-xxx.l
 
 ### 8.5.1 参考值表
 
-**测量条件**：8x MI355X（gfx950），镜像 `dapo-gfx950-rocm7.2.3-260907`，
+**测量条件**：8x MI355X（gfx950），镜像 `dapo-gfx950-rocm7.2.3-260908`
+（digest `sha256:41eeaf8d5db5…`）+ Lumen-RL `f4439f3`——两者都要记，原因见 §8.1.1；
 命令即 `bash release/run_example.sh <N>`（等价于 §8.2.2 的整行参数），
 **`seed=10086`**（`run_dapo.sh` 内固定），取**第 1 步**（`step=1`）的指标。
 
 | # | config（`examples/DAPO/configs/`） | steps | resp | 日志时间跨度 | `rollout_corr/k3_kl` | `entropy` | `rollout_corr/kl`（有符号） | 实测次数 |
 |---|---|---|---|---|---|---|---|---|
-| 1 | `dapo_qwen3_8b_ray_vllm_smoke.yaml` | 3 | 512 | 142 s | **0.00114** ±30% | **0.636** ±25% | 0.000859 | 1 |
-| 2 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` | 3 | 512 | 129 s | **0.00519** ±30% | **0.791** ±25% | 0.00556 | 1 |
-| 3 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml`（`TRAIN_FP8=1`） | 3 | 512 | 140 s | **0.00413** ±30% | **0.808** ±25% | 0.00405 | 1 |
-| 4 | `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` | 3 | 4096 | 495–561 s | **0.00374** ±50% | **0.723** ±50% | 0.00390 | 6 |
-| 5 | `dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml` | 1 | 4096 | 384–401 s | **0.000860** ±50% | **0.572** ±50% | 0.000762 | 3 |
-| 6 | `dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml` | 3 | 4096 | 530 s | **0.00134** ±50% | **0.629** ±60% | 0.00128 | 1 |
-| 7 | `dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml` | 3 | 4096 | 503 s | **0.00138** ±50% | **0.628** ±60% | 0.00140 | 1 |
+| 1 | `dapo_qwen3_8b_ray_vllm_smoke.yaml` | 3 | 512 | 170 s | **0.00106** ±30% | **0.582** ±25% | 0.00106 | 1 |
+| 2 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` | 3 | 512 | 129 s | **0.00498** ±30% | **0.784** ±25% | 0.00538 | 1 |
+| 3 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml`（`TRAIN_FP8=1`） | 3 | 512 | 140 s | **0.00404** ±30% | **0.832** ±25% | 0.00419 | 1 |
+| 4 | `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` | 3 | 4096 | 559–629 s | **0.00287** ±50% | **0.540** ±50% | 0.00288 | 3 |
+| 5 | `dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml` | 1 | 4096 | 408 s | **0.000930** ±50% | **0.568** ±50% | 0.000880 | 1 |
+| 6 | `dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml` | 3 | 4096 | 1202 s | **0.00158** ±50% | **0.679** ±60% | 0.00154 | 1 |
+| 7 | `dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml` | 3 | 4096 | 501 s | **0.00158** ±50% | **0.660** ±60% | 0.00188 | 1 |
+| 9 | `dapo_qwen3moe_a3b_ray_atom_bf16_4k_smoke.yaml` | 3 | 4096 | 557–684 s | **0.00138** ±50% | **0.692** ±60% | 0.00138 | 3 |
 
 粗体两列带容差的即 `--check` 判定 PASS / FAIL 的两项，参考值是「实测次数」列那么多遍的均值。
 
-参考值全部测自上表所述的这一个镜像。**共实测 14 次**（例子 4 六遍、例子 5 三遍、
-其余各一遍），**退出码全部为 0**，四类错误计数**全部为 0**，`--check` **14/14 PASS**。
-逐次原始记录与容差推导见 [`VALIDATION.md`](../../release/VALIDATION.md)。
+参考值全部测自上表所述的这一个镜像。**共实测 12 次**（例子 4、9 各三遍，其余各一遍），
+**退出码全部为 0**，四类错误计数**全部为 0**，每个权重同步 bucket 都是 `skipped=0`，
+`--check` **12/12 PASS**。逐次原始记录与容差推导见
+[`VALIDATION.md`](../../release/VALIDATION.md)。
 
-「实测次数」为 1 的例子，参考值就是那一次的实测值，容差取所在组的下限；
-例子 4、5 是 ATOM 通路，多采了几遍以看清抖动幅度。
+「实测次数」为 1 的例子，参考值就是那一次的实测值，容差取所在组的下限。
+例子 4 正是「不能按单次实测收紧容差」的理由：它三遍分别是 0.00241、0.00243、0.00377，
+用前两遍中任意一遍单独作参考值，第三遍都会掉出 ±50% 区间之外。
+
+**例子 9 对例子 6——换 rollout 引擎的代价。** 同模型、同训练配置，把 vLLM 换成 ATOM：
+`k3_kl` 是 0.00138 对 0.00158，即 ATOM **低** 12%，落在例子 9 自身 ±6% 抖动的两倍之内，
+更远在 ±50% 容差之内。**换 rollout 引擎并没有可测量地改变 train / rollout 对齐程度。**
+真正变的是时间：每步 64.3 s 对 117.3 s，ATOM 每步快约 1.8 倍；代价在 setup——
+热态 390 s，当天首次（aiter JIT 缓存被重置过）514 s。所以 3 步的 smoke 看端到端会觉得
+ATOM 更慢，而真正长跑该看的是每步耗时。例子 6 这次 1202 s 的跨度不是反例：
+那一遍付了 57 GB checkpoint 的首次冷读，例子 7 随后就从 page cache 白拿了（501 s）。
 
 **时间跨度不设容差、不参与判定**：它是训练日志首末时间戳之差，受 kernel 缓存冷热影响，
 同一机器同一镜像上偏差可达 ±15%，只作耗时量级参考。启动器报的端到端墙钟比它多
@@ -441,22 +514,34 @@ bash release/run_example.sh 1 --check-only --log $DATA_ROOT/logs/example-1-xxx.l
 
 ### 8.5.2 判据
 
-- **`rollout_corr/k3_kl` 是主判据**，容差 512 组（例子 1/2/3）±30%、4096 组（例子 4–7）±50%。
+- **`rollout_corr/k3_kl` 是主判据**，容差 512 组（例子 1/2/3）±30%、4096 组（例子 4–7 和 9）±50%。
   它是 train / rollout 分布差异的 k3 估计量，非负且不会正负抵消，比 `entropy` 稳得多，
-  是判断复现是否成功的首选指标。多采样的两个例子实测抖动为例子 4 ±37%、例子 5 ±11%。
+  是判断复现是否成功的首选指标。多采样的两个例子实测抖动为例子 4 ±31%、例子 9 ±6%。
 - **`entropy` 是第二判据**，容差 512 组 ±25%、4096 组 ±50%、
-  MoE 4096 组（例子 6/7）±60%。它是 `filter_groups` 筛选后那一批序列上的均值，
+  MoE 三个例子（6、7、9）±60%。它是 `filter_groups` 筛选后那一批序列上的均值，
   样本少、方差大，**MoE 上尤其不稳（实测跨度 0.512–1.030，即 ±47%）**，
   所以判 MoE 复现请以 `k3_kl` 为准。
 - **`rollout_corr/kl` 只作数量级判据**：它是有符号均值，对称分歧会相互抵消，
   同一命令重复运行可相差 2.8 倍，因此只检查实测绝对值是否落在参考值的 1/10–10 倍之间。
   **高出一个数量级才算异常**，最常见原因是某一侧未启用 model-sensitive RMSNorm。
 - **`rollout_corr/ppl_ratio` 仅供参考**，不参与判定。
+- **每个权重同步 bucket 都必须 `skipped=0`。** 这是上面四个错误计数替代不了的一条。
+  rollout 引擎如果悄悄漏更新了一部分权重，进程照样 `exit=0`、每一步照样打日志、
+  什么都不抛——它只是在拿一半新一半旧的权重做生成，表现出来像是精度慢慢变差，
+  而不像故障。这事真发生过：一次 ATOM MoE rollout 每个 replica 每次同步都丢掉全部 96 个
+  routed expert 权重，整轮 2304 次，而四项计数全过。从日志里这样读：
 
-两个 BF16 rollout（例子 1 的 0.00114、例子 5 的 0.000860）落在 1e-3 附近；
-三个 FP8 的（0.00519 / 0.00413 / 0.00374）是其 3–4 倍，这是量化的代价，属正常。
-两个 MoE（0.00134 / 0.00138）介于两者之间，且彼此接近，
-说明 FSDP2 与 Megatron 两条训练后端给出的 train / rollout 对齐水平相当。
+  ```bash
+  grep -oE 'bucket done - updated=[0-9]+, skipped=[0-9]+' <log> | sort | uniq -c
+  ```
+
+  健康的运行每一行都是 `skipped=0`。例子 1、2、3、6、7 走 vLLM 路径，
+  根本不打这种行，同样算干净。
+
+两个 8B BF16 rollout（例子 1 的 0.00106、例子 5 的 0.000930）落在 1e-3 附近；
+三个 FP8 的（0.00498 / 0.00404 / 0.00287）是其 3–5 倍，这是量化的代价，属正常。
+三个 MoE（0.00158 / 0.00158 / 0.00138）介于两者之间，且彼此接近，
+说明 FSDP2、Megatron 与 ATOM rollout 在这个模型上给出的 train / rollout 对齐水平相当。
 
 > 指标对不上时**先确认跑的是否为同一条 config**：
 > `grep -m1 'CONFIG=' $DATA_ROOT/logs/example-<N>-*.launcher.log`

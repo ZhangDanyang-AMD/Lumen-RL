@@ -1,27 +1,33 @@
 > [Examples README](../README.md) > Running from the release image
 
-# 8. Running the seven examples from the release image
+# 8. Running the eight examples from the release image
 
 > 中文版：[08-release_cn.md](08-release_cn.md)
 
-This chapter runs the seven examples in §8.2 from the **published container image**:
+This chapter runs the eight examples in §8.2 from the **published container image**:
 the software stack is pinned and the aiter kernels are already compiled, so each
-example is a single command with nothing to install and no config or launch script to
-open. Chapters [1](01-env-setup.md)–[4](04-launching.md) are the other path — building
-an environment from source — which is what you need in order to change the code, swap
-models, or run two nodes (example 8, see [chapter 7](07-disaggregated-rdma.md)).
+example is a single command with nothing to install. Chapters
+[1](01-env-setup.md)–[4](04-launching.md) are the other path — building the
+environment from source — which is what you need in order to swap models or run two
+nodes (example 8, see [chapter 7](07-disaggregated-rdma.md)).
 
 > ⚠️ **This image supports AMD gfx950 only** (Instinct MI350X / MI355X) and requires
 > 8 cards. See §8.3.1.
 
 ```bash
+git clone https://github.com/ZhangDanyang-AMD/Lumen-RL.git && cd Lumen-RL
 export DATA_ROOT=/path/to/data
-docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260907
+docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260908
 bash release/run_example.sh 1 --check
 ```
 
-Three commands run the first example and verify the result automatically. To switch
+Four commands run the first example and verify the result automatically. To switch
 examples, change the final digit.
+
+**Changing the code does not mean leaving this chapter.** The image supplies the
+environment; the checkout you just cloned supplies the code, bind-mounted over the
+copy inside the image. Edit `lumenrl/`, run the same command again, and the change is
+what runs — see §8.1.1.
 
 ---
 
@@ -45,19 +51,56 @@ spends no time compiling them:
 
 ```bash
 docker run --rm --entrypoint /bin/bash \
-  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260907 \
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260908 \
   -lc 'ls /opt/lumenrl/aiter-jit/*.so | wc -l'     # 16
 ```
 
-### 8.1.1 Pinned versions
+### 8.1.1 The image is the environment; your checkout is the code
+
+`run_example.sh` bind-mounts the checkout it lives in over
+`/opt/lumenrl/Lumen-RL` inside the container. So the image pins everything that is
+expensive to build and awkward to get right — aiter, Lumen, ATOM, Megatron/Apex/TE,
+and the compiled kernels — while Lumen-RL itself comes from your working tree:
+
+```bash
+vim lumenrl/trainer/rl_trainer.py
+bash release/run_example.sh 1 --check        # runs the edit; no rebuild, no new tag
+```
+
+This is not a second copy that can disagree with the image. You already need this
+checkout to have `run_example.sh` at all, so mounting it is what removes the skew: the
+copy baked into the image exists only so the editable install has a path to point at,
+and the mount covers it. Every run prints which checkout and which commit it used:
+
+```
+   code   /path/to/Lumen-RL @ f4439f3
+   image  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260908
+```
+
+Two consequences worth knowing:
+
+- **A result is identified by the image digest *and* the commit**, not by the image
+  alone. §8.5.1 records both, and so should you.
+- **The container remembers its mount.** A bind-mount is fixed when the container is
+  created, so pointing `LUMENRL_SRC` somewhere else — or coming from an older
+  launcher — makes `run_example.sh` delete and recreate the container rather than
+  restart it. It says so when it does.
+
+Set `LUMENRL_SRC=/other/checkout` to run code from somewhere else.
+
+The image only needs rebuilding when one of the three pinned upstreams below moves, or
+when a system-level dependency changes. Lumen-RL changes never require it.
+
+### 8.1.2 Pinned versions
 
 Reproducing a result depends on the three upstream repositories below, which **cannot
 be upgraded independently** and are therefore pinned by commit. Lumen-RL is this
-repository and is **not pinned**: the image takes the tip of the branch listed.
+repository and is **not pinned by the image at all** — it is whatever your checkout
+holds, per §8.1.1. The copy inside the image is a fallback and is not what runs.
 
 | Component | Repository | Branch | Commit |
 |---|---|---|---|
-| Lumen-RL | `ZhangDanyang-AMD/Lumen-RL` | `dev/dapo_release` | branch tip (not pinned) |
+| Lumen-RL | `ZhangDanyang-AMD/Lumen-RL` | `dev/dapo_release` | your checkout (mounted, not pinned) |
 | Lumen | `ZhangDanyang-AMD/Lumen` | `amd-atom-rollout` | `e6379cbd9057` |
 | aiter | `ZhangDanyang-AMD/aiter` | `lumen/moe` | `4ebe6d69c7f4` |
 | ATOM | `ROCm/ATOM` | `refs/pull/2028/head` | `28721a5094b9` |
@@ -93,9 +136,9 @@ Expect `0.23.0 0.3.2 5.12.0`, with `aiter` resolving under `/opt/lumenrl/aiter/`
 
 ---
 
-## 8.2 The seven examples
+## 8.2 The eight examples
 
-All seven run training *and* inference on the same 8 cards.
+All eight run training *and* inference on the same 8 cards.
 
 ### 8.2.1 Overview
 
@@ -108,6 +151,13 @@ All seven run training *and* inference on the same 8 cards.
 | 5 | 8B ATOM BF16 | FSDP2 BF16 | **ATOM** BF16 | `bash release/run_example.sh 5 --check` |
 | 6 | MoE FSDP2 | FSDP2 BF16 | vLLM BF16 | `bash release/run_example.sh 6 --check` |
 | 7 | MoE Megatron EP=8 | **Megatron** TP=PP=CP=1, EP=8, DP=8 | vLLM BF16 | `bash release/run_example.sh 7 --check` |
+| 9 | MoE ATOM BF16 | FSDP2 BF16 | **ATOM** BF16 | `bash release/run_example.sh 9 --check` |
+
+**There is no example 8 here.** Example 8 in the
+[examples README](../README.md) is the two-node disaggregated RDMA deployment, which
+needs 2x8 gfx942 and is not covered by this image; see
+[chapter 7](07-disaggregated-rdma.md). The numbering is shared across the whole
+examples set, so this chapter runs 1–7 and 9.
 
 - Examples 2 and 3 share one config and differ only in `TRAIN_FP8`: `0` quantizes the
   rollout only, `1` puts the training forward pass on FP8 as well.
@@ -116,6 +166,11 @@ All seven run training *and* inference on the same 8 cards.
 - Example 7 is example 6's Megatron twin: the two configs are field-for-field identical
   apart from `training_backend` and `megatron_cfg`, and EP=8 gives DP=8 to match FSDP2,
   so the two metric sets can be subtracted and the difference is the training backend.
+- Example 9 is example 6's ATOM twin, and the pair answers "what does switching the
+  rollout engine cost?": same model, same training config, `generation_backend` vllm
+  → atom plus an `atom_cfg` block, nothing else. It is also the only example that
+  exercises MoE expert weights over the ATOM weight-sync path — see §8.5.2 on why
+  `skipped` is a health criterion.
 
 ### 8.2.2 Full parameters per example
 
@@ -131,6 +186,7 @@ every column on the row has to be supplied.
 | 5 | `atombf16` | `0` | `dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml` | 1 | 4096 | Qwen3-8B-Base | — |
 | 6 | `bf16` | `0` | `dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml` | 3 | 4096 | Qwen3-30B-A3B-Base | `LUMENRL_FP32_MOE_ROUTER=0` |
 | 7 | `bf16` | `0` | `dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml` | 3 | 4096 | Qwen3-30B-A3B-Base | `LUMENRL_FP32_MOE_ROUTER=0` |
+| 9 | `atombf16` | `0` | `dapo_qwen3moe_a3b_ray_atom_bf16_4k_smoke.yaml` | 3 | 4096 | Qwen3-30B-A3B-Base | `LUMENRL_FP32_MOE_ROUTER=0` |
 
 > ⚠️ **`MODE` and `CONFIG_OVERRIDE` must be given as a pair.** Besides selecting
 > environment variables, `MODE` **appends a set of Hydra overrides**, and
@@ -140,9 +196,9 @@ every column on the row has to be supplied.
 > `RuntimeError: aot_compile is not supported by the current configuration`.
 > The launcher already pairs them correctly, so this is not a concern when using it.
 
-All seven configs are `logger.wandb_enabled: false`, so **no wandb account is needed**
+All eight configs are `logger.wandb_enabled: false`, so **no wandb account is needed**
 (see §8.4.6). `STEPS` is the command-line override for `num_training_steps`. None of
-the seven smoke configs writes a checkpoint, so the examples can be run back to back in
+the eight smoke configs writes a checkpoint, so the examples can be run back to back in
 any order.
 
 ---
@@ -181,7 +237,7 @@ machine; the portable number is the 11.8 GB download size.
 
 **Recommended budget**: 60 GB for the image (47.3 GB unpacked plus 11.8 GB of
 compressed layers retained in the content store) plus 74 GB of models and data, so
-about **134 GB**. All seven examples are smokes and write no checkpoints. A long run
+about **134 GB**. All eight examples are smokes and write no checkpoints. A long run
 (`--longrun`) needs checkpoint space on top — a single 30B-A3B FSDP2 checkpoint
 (fp32 weights plus optimizer) is about 342 GB, and `save_total_limit` decides how many
 are kept.
@@ -198,7 +254,7 @@ preflights:
 | Path (relative to `$DATA_ROOT`) | Size | Needed by |
 |---|---|---|
 | `models/Qwen3-8B-Base/` | 16 GB | examples 1–5, plus the tokenizer for all of them |
-| `models/Qwen3-30B-A3B-Base/` | 57 GB | examples 6, 7 |
+| `models/Qwen3-30B-A3B-Base/` | 57 GB | examples 6, 7, 9 |
 | `data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet` | 1.02 GB | all (train) |
 | `data_cached/qwen3-8b-maxprompt1024/aime-2024.filtered.parquet` | 892 KB | all (val) |
 | `logs/` | — | created by the launcher |
@@ -224,7 +280,7 @@ start if any card is above 2 GB and prints what to do about it; `--force` skips 
 ### 8.4.2 Get the image
 
 ```bash
-docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260907
+docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260908
 ```
 
 You can also build it yourself; these are all the steps:
@@ -263,7 +319,7 @@ snapshot_download("BytedTsinghua-SIA/AIME-2024", repo_type="dataset",
                   local_dir=f"{D}/raw/AIME-2024")
 PY'
 
-# extra for examples 6 and 7 (about 57 GB)
+# extra for examples 6, 7 and 9 (about 57 GB)
 docker exec -e DATA_ROOT="$DATA_ROOT" lumenrl-release bash -lc '
 hf download Qwen/Qwen3-30B-A3B-Base \
   --local-dir "$DATA_ROOT/models/Qwen3-30B-A3B-Base" --max-workers 8'
@@ -291,7 +347,7 @@ for src, dst in jobs:
 PY'
 ```
 
-> The data only has to be filtered once and is shared by all seven examples: the two
+> The data only has to be filtered once and is shared by all eight examples: the two
 > models have identical `tokenizer.json` / `vocab.json` / `merges.txt` (vocab 151936),
 > so a filter computed with the 8B tokenizer is valid for the MoE model too.
 >
@@ -328,8 +384,13 @@ docker run -d --name lumenrl-release \
   --device=/dev/kfd --device=/dev/dri --group-add=video \
   --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --shm-size 64G \
   -v "$DATA_ROOT":"$DATA_ROOT" -e DATA_ROOT="$DATA_ROOT" \
-  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260907 sleep infinity
+  -v "$PWD":/opt/lumenrl/Lumen-RL \
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260908 sleep infinity
 ```
+
+The second mount is the code (§8.1.1), with `$PWD` being the root of this checkout.
+Leave it out and the container runs the copy baked into the image instead, which is a
+different commit as soon as you change anything.
 
 Log paths are fixed:
 
@@ -357,21 +418,30 @@ $DATA_ROOT/logs/example-<N>-<timestamp>.launcher.log  # wrapper output and exit 
 | `WANDB_API_KEY` | only needed with `--longrun` |
 | `STALL_LIMIT` | seconds of log silence before declaring a hang, default 2400 |
 
-To run your own code against the image (all four source trees are editable installs):
+Running your own Lumen-RL needs nothing extra — that is the default, see §8.1.1. To
+run it from a *different* checkout than the one holding the launcher:
+
+```bash
+LUMENRL_SRC=/other/Lumen-RL bash release/run_example.sh <N>
+```
+
+The other three trees are editable installs too, so the same mount works for them:
 
 ```bash
 docker run -d --name lumenrl-dev ... \
-  -v "$PWD/Lumen-RL":/opt/lumenrl/Lumen-RL \
-  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260907 sleep infinity
+  -v "$PWD/ATOM":/opt/lumenrl/ATOM \
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260908 sleep infinity
 ```
 
-then `CONTAINER=lumenrl-dev bash release/run_example.sh <N>`.
+then `CONTAINER=lumenrl-dev bash release/run_example.sh <N>`. Unlike Lumen-RL, those
+three are what the reference values are pinned to, so a result from a swapped ATOM,
+Lumen or aiter is no longer comparable with §8.5.1.
 
 ### 8.4.5 The manual command, without the launcher
 
 Below is the complete command for example 1. For the other examples, replace `MODE`,
 `TRAIN_FP8`, `CONFIG_OVERRIDE`, `STEPS` and `MODEL_PATH` per the table in §8.2.2, and
-for examples 6 and 7 add `-e LUMENRL_FP32_MOE_ROUTER=0`.
+for examples 6, 7 and 9 add `-e LUMENRL_FP32_MOE_ROUTER=0`.
 `bash release/run_example.sh <N> --dry-run` prints this command for any example.
 
 ```bash
@@ -402,20 +472,20 @@ Four things that are easy to miss:
 - `CONFIG_OVERRIDE` is **relative to `$RL_ROOT/Lumen-RL`**; an absolute path is not found.
 - Without `CONFIG_OVERRIDE`, `MODE` selects the **longrun** config
   (`wandb_enabled: true`, `max_response_length: 20480`), not the smoke one.
-- `MODEL_PATH` defaults to the 8B model, so examples 6 and 7 silently run the wrong
+- `MODEL_PATH` defaults to the 8B model, so examples 6, 7 and 9 silently run the wrong
   model if it is not given.
 - The empty value after `PYTORCH_CUDA_ALLOC_CONF=` is not a typo: only an explicitly
   empty string turns off `expandable_segments`.
 
 ### 8.4.6 wandb
 
-| | smoke configs (the seven in §8.2.2) | longrun configs (`--longrun`) |
+| | smoke configs (the eight in §8.2.2) | longrun configs (`--longrun`) |
 |---|---|---|
 | `logger.wandb_enabled` | `false` | `true` |
 | Account needed | **no** | yes, `WANDB_API_KEY` |
 | `max_response_length` | 512 / 4096 | 20480 (4096 for example 7) |
 
-So the seven examples in §8.2 need no wandb account. Only `--longrun` uses it:
+So the eight examples in §8.2 need no wandb account. Only `--longrun` uses it:
 
 ```bash
 WANDB_API_KEY=xxxx bash release/run_example.sh 1 --longrun --detach
@@ -435,8 +505,9 @@ EXTRA_OVERRIDE=logger.wandb_enabled=false bash release/run_example.sh 1 --longru
 
 `--check` performs the judgement described in this section: it extracts the four step-1
 metrics and compares them against the built-in reference values, counts occurrences of
-`Traceback` / `OutOfMemory` / `CUDA error` / `HSA_STATUS`, and reports PASS or FAIL.
-For reading the numbers yourself, see below.
+`Traceback` / `OutOfMemory` / `CUDA error` / `HSA_STATUS`, counts weight-sync buckets
+that skipped a tensor, and reports PASS or FAIL. For reading the numbers yourself, see
+below.
 
 ```bash
 bash release/run_example.sh 1 --check
@@ -446,32 +517,48 @@ bash release/run_example.sh 1 --check-only --log $DATA_ROOT/logs/example-1-xxx.l
 ### 8.5.1 Reference values
 
 **Measurement conditions**: 8x MI355X (gfx950), image
-`dapo-gfx950-rocm7.2.3-260907`, the command being `bash release/run_example.sh <N>`
-(equivalent to a full row of §8.2.2), **`seed=10086`** (fixed inside `run_dapo.sh`), and
-metrics read at **step 1** (`step=1`).
+`dapo-gfx950-rocm7.2.3-260908` (digest `sha256:41eeaf8d5db5…`) with Lumen-RL at
+`f4439f3` — both matter, see §8.1.1 — the command being
+`bash release/run_example.sh <N>` (equivalent to a full row of §8.2.2),
+**`seed=10086`** (fixed inside `run_dapo.sh`), and metrics read at **step 1**
+(`step=1`).
 
 | # | config (`examples/DAPO/configs/`) | steps | resp | trainer-log span | `rollout_corr/k3_kl` | `entropy` | `rollout_corr/kl` (signed) | runs |
 |---|---|---|---|---|---|---|---|---|
-| 1 | `dapo_qwen3_8b_ray_vllm_smoke.yaml` | 3 | 512 | 142 s | **0.00114** ±30% | **0.636** ±25% | 0.000859 | 1 |
-| 2 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` | 3 | 512 | 129 s | **0.00519** ±30% | **0.791** ±25% | 0.00556 | 1 |
-| 3 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` (`TRAIN_FP8=1`) | 3 | 512 | 140 s | **0.00413** ±30% | **0.808** ±25% | 0.00405 | 1 |
-| 4 | `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` | 3 | 4096 | 495–561 s | **0.00374** ±50% | **0.723** ±50% | 0.00390 | 6 |
-| 5 | `dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml` | 1 | 4096 | 384–401 s | **0.000860** ±50% | **0.572** ±50% | 0.000762 | 3 |
-| 6 | `dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml` | 3 | 4096 | 530 s | **0.00134** ±50% | **0.629** ±60% | 0.00128 | 1 |
-| 7 | `dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml` | 3 | 4096 | 503 s | **0.00138** ±50% | **0.628** ±60% | 0.00140 | 1 |
+| 1 | `dapo_qwen3_8b_ray_vllm_smoke.yaml` | 3 | 512 | 170 s | **0.00106** ±30% | **0.582** ±25% | 0.00106 | 1 |
+| 2 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` | 3 | 512 | 129 s | **0.00498** ±30% | **0.784** ±25% | 0.00538 | 1 |
+| 3 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` (`TRAIN_FP8=1`) | 3 | 512 | 140 s | **0.00404** ±30% | **0.832** ±25% | 0.00419 | 1 |
+| 4 | `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` | 3 | 4096 | 559–629 s | **0.00287** ±50% | **0.540** ±50% | 0.00288 | 3 |
+| 5 | `dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml` | 1 | 4096 | 408 s | **0.000930** ±50% | **0.568** ±50% | 0.000880 | 1 |
+| 6 | `dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml` | 3 | 4096 | 1202 s | **0.00158** ±50% | **0.679** ±60% | 0.00154 | 1 |
+| 7 | `dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml` | 3 | 4096 | 501 s | **0.00158** ±50% | **0.660** ±60% | 0.00188 | 1 |
+| 9 | `dapo_qwen3moe_a3b_ray_atom_bf16_4k_smoke.yaml` | 3 | 4096 | 557–684 s | **0.00138** ±50% | **0.692** ±60% | 0.00138 | 3 |
 
 The two bold columns with tolerances are what `--check` turns into PASS / FAIL; each
 reference is the mean over the number of runs in the `runs` column.
 
-Every reference was measured on the single image described above. It was run **14
-times** (example 4 six times, example 5 three times, one each for the rest) with the
-**exit code 0 every time**, all four error counts **zero**, and `--check` **14/14
-PASS**. The per-run record and the tolerance derivation are in
-[`VALIDATION.md`](../../release/VALIDATION.md).
+Every reference was measured on the single image described above. It was run **12
+times** (examples 4 and 9 three times each, one each for the rest) with the **exit code
+0 every time**, all four error counts **zero**, every weight-sync bucket at
+`skipped=0`, and `--check` **12/12 PASS**. The per-run record and the tolerance
+derivation are in [`VALIDATION.md`](../../release/VALIDATION.md).
 
 Where the `runs` column reads 1, the reference is that single measurement and the
-tolerance is its group's floor. Examples 4 and 5 are the ATOM path and were sampled
-several times to see how much they move between runs.
+tolerance is its group's floor. Example 4 is the reason the floors are not tightened
+to fit a single run: its three came in at 0.00241, 0.00243 and 0.00377, so either of
+the first two, alone, would have put the third outside a ±50% band around it.
+
+**Example 9 versus example 6 — what the rollout engine costs.** Same model, same
+training config, ATOM instead of vLLM: `k3_kl` is 0.00138 against 0.00158, i.e. ATOM
+is 12% *lower*, which is inside example 9's own ±6% run-to-run band doubled and well
+inside the ±50% tolerance. **Switching the rollout engine does not move
+train/rollout alignment measurably.** What it does move is time: 64.3 s per step
+against 117.3 s, so ATOM's steps are about 1.8x faster. Its setup is the offsetting
+cost — 390 s warm, 514 s on the first run of the day when aiter's JIT cache has been
+reset — so a 3-step smoke reports ATOM as slower end to end while the per-step figure
+is what matters for a real run. Example 6's 1202 s span here is not the counter-example
+it looks like: that single run paid a cold first read of the 57 GB checkpoint, which
+example 7 then got for free from page cache (501 s).
 
 **The span column carries no tolerance and is not part of the verdict**: it is the
 difference between the first and last timestamp in the trainer log, is dominated by how
@@ -482,13 +569,14 @@ with the same image. The launcher's end-to-end wall clock is about 20–35 s lon
 ### 8.5.2 Criteria
 
 - **`rollout_corr/k3_kl` is the primary criterion**, with a tolerance of ±30% for the
-  512 group (examples 1/2/3) and ±50% for the 4096 group (examples 4–7). It is the k3
-  estimator of the train/rollout distribution gap: non-negative, with no cancellation
-  between positive and negative contributions, far steadier than `entropy`, and the
-  metric to judge a reproduction on. Measured run-to-run spread on the two examples that
-  were sampled several times: ±37% for example 4 and ±11% for example 5.
+  512 group (examples 1/2/3) and ±50% for the 4096 group (examples 4–7 and 9). It is
+  the k3 estimator of the train/rollout distribution gap: non-negative, with no
+  cancellation between positive and negative contributions, far steadier than
+  `entropy`, and the metric to judge a reproduction on. Measured run-to-run spread on
+  the two examples that were sampled several times: ±31% for example 4 and ±6% for
+  example 9.
 - **`entropy` is the secondary criterion**, with a tolerance of ±25% for the 512 group,
-  ±50% for the 4096 group and ±60% for the MoE pair (examples 6/7).
+  ±50% for the 4096 group and ±60% for the three MoE examples (6, 7 and 9).
   It is a mean over the batch that survives `filter_groups`, so the sample is small and
   the variance high — **especially on MoE, where it was measured between 0.512 and
   1.030, i.e. ±47%** — which is why MoE reproducibility should be judged on `k3_kl`.
@@ -499,12 +587,26 @@ with the same image. The launcher's end-to-end wall clock is about 20–35 s lon
   as wrong**, and the usual cause is model-sensitive RMSNorm not being enabled on one
   side.
 - **`rollout_corr/ppl_ratio` is informational** and not part of the verdict.
+- **Every weight-sync bucket must report `skipped=0`.** This is the one criterion the
+  four error counts cannot stand in for. A rollout engine that silently fails to
+  update some of its weights exits 0, logs every step, and raises nothing — it just
+  serves a mix of current and stale weights, which reads as a slow accuracy
+  regression rather than a fault. It has happened: an ATOM MoE rollout dropped all 96
+  routed expert weights per replica on every sync, 2304 times over one run, and
+  passed all four counts. Read it off the log with
 
-The two BF16 rollouts (0.00114 for example 1, 0.000860 for example 5) sit around 1e-3;
-the three FP8 ones (0.00519, 0.00413, 0.00374) are 3–4x larger, which is the price of
-quantization and is expected. The two MoE runs (0.00134, 0.00138) fall in between and
-close to each other, so FSDP2 and Megatron deliver comparable train/rollout
-alignment.
+  ```bash
+  grep -oE 'bucket done - updated=[0-9]+, skipped=[0-9]+' <log> | sort | uniq -c
+  ```
+
+  A healthy run is `skipped=0` on every line. Examples 1, 2, 3, 6 and 7 use the vLLM
+  path and print no such line at all, which also counts as clean.
+
+The two 8B BF16 rollouts (0.00106 for example 1, 0.000930 for example 5) sit around
+1e-3; the three FP8 ones (0.00498, 0.00404, 0.00287) are 3–5x larger, which is the
+price of quantization and is expected. The three MoE runs (0.00158, 0.00158, 0.00138)
+fall in between and close to each other, so FSDP2, Megatron and the ATOM rollout all
+deliver comparable train/rollout alignment on this model.
 
 > When the numbers do not match, **first confirm you ran the same config**:
 > `grep -m1 'CONFIG=' $DATA_ROOT/logs/example-<N>-*.launcher.log`
