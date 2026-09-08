@@ -67,6 +67,9 @@ _FUSED_TO_ATOM = {
 _EXPERTS_SUFFIX = ".experts"
 
 
+_SHIM_ENV = "LUMENRL_ATOM_FUSED_EXPERT_SHIM"
+
+
 def atom_routes_fused_experts() -> bool:
     """Whether the ATOM in this process handles fused expert names itself.
 
@@ -82,7 +85,22 @@ def atom_routes_fused_experts() -> bool:
     predates that support, and the same Lumen-RL has to serve both. The probe
     is a method on the mixin rather than a version number: ATOM has no
     published version that brackets this, and the capability is what matters.
+
+    ``LUMENRL_ATOM_FUSED_EXPERT_SHIM`` overrides the probe: ``force`` keeps the
+    shim on against an ATOM that would have taken over, ``off`` hands over
+    unconditionally. It exists because which side does the expert relayout
+    moves ~36 GB of transient device memory between two processes, which on a
+    colocated run is the difference between a KV pool and an assertion — so
+    when that bites, an operator needs to be able to move it back without a
+    code change.
     """
+    override = os.environ.get(_SHIM_ENV, "auto").strip().lower()
+    if override == "force":
+        return False
+    if override == "off":
+        return True
+    if override not in ("", "auto"):
+        logger.warning("ignoring %s=%r; expected auto|force|off", _SHIM_ENV, override)
     try:
         from atom.rollout.weight_updater import WeightUpdaterMixin
     except Exception as exc:  # pragma: no cover - ATOM absent in unit tests
