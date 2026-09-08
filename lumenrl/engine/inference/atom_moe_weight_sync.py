@@ -67,6 +67,30 @@ _FUSED_TO_ATOM = {
 _EXPERTS_SUFFIX = ".experts"
 
 
+def atom_routes_fused_experts() -> bool:
+    """Whether the ATOM in this process handles fused expert names itself.
+
+    ROCm/ATOM#2028 taught the updater the two names above: it resolves them to
+    ``w13_weight`` / ``w2_weight``, drives ``FusedMoE.weight_loader`` per shard
+    and re-establishes the expert layout per rewritten slice, in place, at the
+    end of the sync. When that ATOM is in the process, everything below is not
+    merely redundant -- it is the wrong side of the boundary, and it would go
+    on encoding ATOM's private kernel layout in a downstream project. So the
+    trainer's names go through untouched instead.
+
+    Both halves stay in the tree because the pinned ATOM in the release image
+    predates that support, and the same Lumen-RL has to serve both. The probe
+    is a method on the mixin rather than a version number: ATOM has no
+    published version that brackets this, and the capability is what matters.
+    """
+    try:
+        from atom.rollout.weight_updater import WeightUpdaterMixin
+    except Exception as exc:  # pragma: no cover - ATOM absent in unit tests
+        logger.debug("ATOM weight updater unavailable (%s); staying on the shim", exc)
+        return False
+    return hasattr(WeightUpdaterMixin, "_apply_fused_expert_weight")
+
+
 def fused_expert_renames(names: Iterable[str]) -> dict[str, str]:
     """``{incoming name: ATOM parameter name}`` for a bucket's fused expert tensors.
 

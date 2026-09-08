@@ -274,6 +274,52 @@ def test_coverage_modes_are_configurable():
             os.environ["LUMENRL_WEIGHT_SYNC_CHECK"] = previous
 
 
+def test_the_capability_probe_reads_the_atom_in_the_process():
+    """Which side does the renaming and the layout is ATOM's answer, not ours.
+
+    An ATOM that routes fused expert names itself (ROCm/ATOM#2028) must see the
+    trainer's names untouched; the pinned one, which predates that, still needs
+    the shim. Both are in the tree at once, so the probe decides, and it has to
+    answer False when ATOM is not importable at all -- which is the case in
+    this test process, and the case that keeps the shim on for the release
+    image.
+    """
+    from lumenrl.engine.inference import atom_moe_weight_sync as mod
+
+    saved = sys.modules.get("atom.rollout.weight_updater")
+    try:
+        module = types.ModuleType("atom.rollout.weight_updater")
+
+        class _Old:
+            pass
+
+        module.WeightUpdaterMixin = _Old
+        sys.modules["atom.rollout.weight_updater"] = module
+        if mod.atom_routes_fused_experts():
+            raise AssertionError("an ATOM without the method must keep the shim")
+
+        class _New:
+            def _apply_fused_expert_weight(self):  # pragma: no cover - probe only
+                pass
+
+        module.WeightUpdaterMixin = _New
+        if not mod.atom_routes_fused_experts():
+            raise AssertionError("an ATOM with the method must take over")
+    finally:
+        if saved is None:
+            sys.modules.pop("atom.rollout.weight_updater", None)
+        else:
+            sys.modules["atom.rollout.weight_updater"] = saved
+
+    # No ATOM at all: the shim stays on.
+    sys.modules["atom.rollout.weight_updater"] = None
+    try:
+        if mod.atom_routes_fused_experts():
+            raise AssertionError("no ATOM must not look like a capable one")
+    finally:
+        sys.modules.pop("atom.rollout.weight_updater", None)
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

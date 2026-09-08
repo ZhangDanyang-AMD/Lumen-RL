@@ -300,6 +300,7 @@ class ATOMRayServer:
 
         from lumenrl.engine.inference.atom_moe_weight_sync import (
             assert_bucket_fully_applied,
+            atom_routes_fused_experts,
             fused_expert_renames,
             relayout_fused_experts,
             rename_bucket_meta,
@@ -371,11 +372,15 @@ class ATOMRayServer:
                     per_gpu_ipc_handles = {gpu_idx: reduce_tensor(buf) for gpu_idx, buf in per_gpu_buffers.items()}
 
                 # transformers-5.x ships MoE experts as fused tensors under names
-                # ATOM's updater cannot resolve, and its unquantized MoE path
-                # keeps those buffers in an aiter-shuffled layout that nothing
-                # re-establishes after an update. Both are handled in the
-                # staging buffer, before the runner reads it.
-                renames = fused_expert_renames(bucket_meta)
+                # an older ATOM's updater cannot resolve, and its unquantized MoE
+                # path keeps those buffers in an aiter-shuffled layout that
+                # nothing re-establishes after an update. Both are handled in the
+                # staging buffer, before the runner reads it -- unless the ATOM
+                # in this process does it itself, in which case the trainer's
+                # names go through untouched.
+                renames = {} if atom_routes_fused_experts() else fused_expert_renames(
+                    bucket_meta
+                )
                 if renames:
                     require_unsharded_experts(
                         self.engine_kwargs.get("tensor_parallel_size", 1),
@@ -437,6 +442,7 @@ class ATOMRayServer:
     def _update_weights_from_shm_sync(self, version: int | None = None) -> None:
         from lumenrl.engine.inference.atom_moe_weight_sync import (
             assert_bucket_fully_applied,
+            atom_routes_fused_experts,
             fused_expert_renames,
         )
         from lumenrl.engine.inference.bucketed_weight_transfer import check_bucket_version
@@ -454,12 +460,15 @@ class ATOMRayServer:
                 metadata = socket.recv_pyobj()
                 check_bucket_version(metadata, version)
                 bucket_meta, _used_bytes = self._bucket_meta(metadata["bucket_meta"])
-                if fused_expert_renames(bucket_meta):
-                    # The IPC path rewrites fused expert names and re-establishes
-                    # ATOM's shuffled layout in a staging buffer it owns. Here the
-                    # segment belongs to the sender and lives in host memory, where
-                    # aiter's shuffle does not run, so there is nowhere to do the
-                    # same work. Refuse rather than repeat the silent-skip bug.
+                if fused_expert_renames(bucket_meta) and not atom_routes_fused_experts():
+                    # An older ATOM needs the fused names rewritten and its
+                    # shuffled layout re-established, which the IPC path does in
+                    # a staging buffer it owns. Here the segment belongs to the
+                    # sender and lives in host memory, where aiter's shuffle does
+                    # not run, so there is nowhere to do the same work. Refuse
+                    # rather than repeat the silent-skip bug. An ATOM that routes
+                    # the fused names itself does the layout on the device, after
+                    # the copy, so this transport is fine there.
                     raise RuntimeError(
                         "ATOM rollout of a fused-expert MoE model needs the CUDA-IPC "
                         "weight transport; set use_shm=false. See "
