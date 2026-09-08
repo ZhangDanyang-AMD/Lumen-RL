@@ -836,8 +836,16 @@ class RLTrainer:
             "update_weights_ipc_send", bucket_size_mb=bmb, use_shm=use_shm,
             version=version,
         )
-        ray.get(send)
-        ray.get(recv)
+        # Join as they finish rather than senders-then-receivers. The two sides
+        # are a ZMQ REQ/REP pair, so a receiver that raises leaves its socket
+        # closed with the sender parked in recv() forever: waiting on the
+        # senders first turns any receiver-side error into a silent hang that
+        # only a stack dump explains. Taking whichever finishes first re-raises
+        # the real exception within a bucket's time.
+        pending = list(send) + list(recv)
+        while pending:
+            done, pending = ray.wait(pending, num_returns=1)
+            ray.get(done)
         # 3) wake KV cache so the next rollout can run.
         if sleeping:
             rollout_engine.wake(tags=["kv_cache"])

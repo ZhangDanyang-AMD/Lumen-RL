@@ -264,6 +264,17 @@ class ATOMRayServer:
         job_id = os.environ.get("LUMEN_RAY_JOB_ID", "0")
         return f"ipc:///tmp/lumen-colocate-zmq-{job_id}-replica-{replica_rank}-rank-0.sock"
 
+    def _counts_are_exact(self) -> bool:
+        """Whether ATOM's per-bucket ``updated`` can be compared for equality.
+
+        Only on a BF16 rollout. With online quantization on, a fused parameter's
+        shards accumulate in a staging buffer and are requantized when the last
+        one arrives, so ATOM counts one update for the group and nothing for the
+        shards ahead of it -- a bucket that ends mid-group reports fewer updates
+        than it holds, with nothing wrong. See assert_bucket_fully_applied.
+        """
+        return not (self.engine_kwargs.get("online_quant_config") or {})
+
     @staticmethod
     def _bucket_meta(raw_bucket_meta: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], int]:
         bucket_meta: dict[str, dict[str, Any]] = {}
@@ -400,7 +411,9 @@ class ATOMRayServer:
                     bucket_meta=rename_bucket_meta(bucket_meta, renames),
                     is_last=is_last,
                 )
-                assert_bucket_fully_applied(responses, bucket_meta, context="ipc")
+                assert_bucket_fully_applied(
+                    responses, bucket_meta, context="ipc", exact=self._counts_are_exact()
+                )
                 stats["buckets"] += 1
                 stats["weights"] += len(bucket_meta)
                 stats["experts"] += len(renames)
@@ -458,7 +471,9 @@ class ATOMRayServer:
                     bucket_meta=bucket_meta,
                     is_last=bool(metadata["is_last"]),
                 )
-                assert_bucket_fully_applied(responses, bucket_meta, context="shm")
+                assert_bucket_fully_applied(
+                    responses, bucket_meta, context="shm", exact=self._counts_are_exact()
+                )
                 socket.send(b"")
                 if metadata["is_last"]:
                     break

@@ -237,6 +237,28 @@ def test_coverage_rejects_a_partially_applied_bucket():
     assert_bucket_fully_applied([{"cmd": "x", "result": True}], bucket)
 
 
+def test_coverage_tolerates_a_short_count_when_shards_accumulate():
+    """An FP8 rollout under-reports and it is not a fault.
+
+    ATOM accumulates the shards of a fused parameter and requantizes on the
+    last one, so q/k/v_proj count as one update and the two before it as none.
+    A bucket ending mid-group then reports fewer updates than it holds. This is
+    what deadlocked example 4 -- the receiver raised, its socket closed, and the
+    sender sat in recv() forever.
+    """
+    bucket = _moe_bucket()
+    short = [{"cmd": "x", "result": len(bucket) - 11}] * 8
+
+    assert_bucket_fully_applied(short, bucket, exact=False)
+
+    try:
+        assert_bucket_fully_applied(short, bucket, exact=True)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("a BF16 rollout must still be held to exact counts")
+
+
 def test_coverage_modes_are_configurable():
     bucket = _moe_bucket()
     short = [{"cmd": "x", "result": 0}]

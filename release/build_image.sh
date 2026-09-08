@@ -17,13 +17,23 @@ TAG=${TAG:-lumenrl:release-$(date +%Y%m%d)}
 ARCH=${PYTORCH_ROCM_ARCH:-gfx950}
 WITH_MEGATRON=${WITH_MEGATRON:-1}
 
+# Resolve the branch to the SHA it points at right now, and hand the Dockerfile
+# that instead of the branch name. Not a change of policy -- the image still
+# tracks the tip -- but the layer that clones Lumen-RL is cached on the build
+# args, so passing a branch name means a second build on the same machine
+# silently re-uses the clone from the first one and ships whatever the tip was
+# back then. GitHub serves a --depth 1 fetch of a reachable SHA, which is how
+# the three upstreams below are already taken.
+LUMENRL_REF=$(git ls-remote "$LUMENRL_REPO" "refs/heads/$LUMENRL_BRANCH" | cut -f1)
+[ -n "$LUMENRL_REF" ] || { echo "cannot resolve $LUMENRL_BRANCH on $LUMENRL_REPO" >&2; exit 1; }
+
 echo "==> building $TAG"
 echo "    base        $BASE_IMAGE"
 echo "    arch        $ARCH"
 echo "    aiter       $AITER_BRANCH @ $AITER_SHA"
 echo "    Lumen       $LUMEN_BRANCH @ $LUMEN_SHA"
 echo "    ATOM        $ATOM_BRANCH @ $ATOM_SHA"
-echo "    Lumen-RL    $LUMENRL_BRANCH (tip, not pinned)"
+echo "    Lumen-RL    $LUMENRL_BRANCH @ $LUMENRL_REF (tip as of now, not pinned)"
 echo "    megatron    $WITH_MEGATRON"
 
 # Context is release/ itself, not the repo root: the image clones its own copies
@@ -33,7 +43,7 @@ docker build -f Dockerfile -t "$TAG" \
   --build-arg BASE_IMAGE="$BASE_IMAGE" \
   --build-arg PYTORCH_ROCM_ARCH="$ARCH" \
   --build-arg LUMENRL_REPO="$LUMENRL_REPO" \
-  --build-arg LUMENRL_BRANCH="$LUMENRL_BRANCH" \
+  --build-arg LUMENRL_BRANCH="$LUMENRL_REF" \
   --build-arg LUMEN_REPO="$LUMEN_REPO" \
   --build-arg LUMEN_BRANCH="$LUMEN_BRANCH" \
   --build-arg LUMEN_SHA="$LUMEN_SHA" \
