@@ -24,6 +24,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # with. Change Lumen-RL, run again -- no rebuild, no new tag.
 LUMENRL_SRC="${LUMENRL_SRC:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 
+# ATOM_SRC does the same for ATOM, and is empty by default because ATOM is one
+# of the three trees the reference values are pinned to. Setting it is for
+# A/B-ing an ATOM branch; the numbers it produces are not comparable with
+# §8.5.1 and the launcher says so on every run.
+ATOM_SRC="${ATOM_SRC:-}"
+
 # Set DOCKER="sudo docker" if your user is not in the docker group.
 DOCKER_CLI="${DOCKER:-docker}"
 read -r -a DOCKER <<<"$DOCKER_CLI"
@@ -151,6 +157,9 @@ ENVIRONMENT
   LUMENRL_SRC the Lumen-RL checkout to mount into the container as the code
               that runs. Default is the checkout holding this script,
               $LUMENRL_SRC
+  ATOM_SRC    an ATOM checkout to mount in place of the image's. Unset by
+              default: ATOM is pinned by versions.env and is part of what the
+              reference values mean, so this is for A/B work only.
   CONTAINER   default $CONTAINER
   DOCKER      docker CLI to use, e.g. DOCKER="sudo docker" if your user is not
               in the docker group. Default $DOCKER_CLI
@@ -436,6 +445,12 @@ src_dirty=""
 git -C "$LUMENRL_SRC" diff --quiet 2>/dev/null || src_dirty=" (uncommitted changes)"
 echo "   code   $LUMENRL_SRC @ $src_rev$src_dirty"
 echo "   image  $IMAGE"
+if [ -n "$ATOM_SRC" ]; then
+  atom_rev="$(git -C "$ATOM_SRC" rev-parse --short HEAD 2>/dev/null || echo '?')"
+  echo "   ATOM   $ATOM_SRC @ $atom_rev"
+  echo "   WARNING: ATOM is not the tree the reference values were measured on."
+  echo "            A PASS or FAIL against them says nothing on its own."
+fi
 
 command -v "${DOCKER[0]}" >/dev/null || die "'${DOCKER[*]}' not found on this host. Set DOCKER='sudo docker' if needed."
 
@@ -506,6 +521,7 @@ create_container() {
     --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --shm-size 64G \
     -v "$DATA_ROOT":"$DATA_ROOT" -e DATA_ROOT="$DATA_ROOT" \
     -v "$LUMENRL_SRC":"$RL_ROOT_IN_IMAGE/Lumen-RL" \
+    ${ATOM_SRC:+-v "$ATOM_SRC":"$RL_ROOT_IN_IMAGE/ATOM"} \
     "$IMAGE" sleep infinity >/dev/null
 }
 
@@ -518,9 +534,11 @@ mounted_src=""
 if "${DOCKER[@]}" container inspect "$CONTAINER" >/dev/null 2>&1; then
   mounted_src="$("${DOCKER[@]}" container inspect "$CONTAINER" \
     --format "{{range .Mounts}}{{if eq .Destination \"$RL_ROOT_IN_IMAGE/Lumen-RL\"}}{{.Source}}{{end}}{{end}}" 2>/dev/null || true)"
+  mounted_atom="$("${DOCKER[@]}" container inspect "$CONTAINER" \
+    --format "{{range .Mounts}}{{if eq .Destination \"$RL_ROOT_IN_IMAGE/ATOM\"}}{{.Source}}{{end}}{{end}}" 2>/dev/null || true)"
   mounted_img="$("${DOCKER[@]}" container inspect "$CONTAINER" --format '{{.Config.Image}}' 2>/dev/null || true)"
-  if [ "$mounted_src" != "$LUMENRL_SRC" ] || [ "$mounted_img" != "$IMAGE" ]; then
-    echo "   container $CONTAINER was built from ${mounted_img:-?} with code ${mounted_src:-<none, baked copy>}; recreating"
+  if [ "$mounted_src" != "$LUMENRL_SRC" ] || [ "$mounted_atom" != "$ATOM_SRC" ] || [ "$mounted_img" != "$IMAGE" ]; then
+    echo "   container $CONTAINER was built from ${mounted_img:-?} with code ${mounted_src:-<none, baked copy>}, ATOM ${mounted_atom:-<image>}; recreating"
     "${DOCKER[@]}" rm -f "$CONTAINER" >/dev/null
     create_container
     echo "   container $CONTAINER created"

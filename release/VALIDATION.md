@@ -133,3 +133,32 @@ being rebuilt after the container was recreated, the same effect on a smaller sc
   confirmed against the local image, but no run started from a cold pull.
 - **Cold `docker pull` duration is network-bound** and not quoted; §8.3.2 gives the
   download size instead.
+- **Two changes landed after these measurements**, both inert against the pinned
+  ATOM: `ATOM_SRC` in the launcher, which is empty by default, and a
+  `true_vocab_size` engine kwarg alongside the environment variable the pinned
+  ATOM reads. ATOM filters engine kwargs against its `Config` dataclass fields
+  and the pinned build has no such field, so it drops the kwarg — verified
+  directly. The references stand.
+
+## A/B against a rebased ATOM branch
+
+The three ATOM examples were re-run against a cleaned-up ATOM branch mounted
+over the image's copy (`ATOM_SRC`), to check that reorganising that work changed
+no numbers. One run each, against the references above.
+
+| ex | reference (runs) | rebased ATOM | delta |
+|---|---|---|---|
+| 4 | 0.00287 (3, ±31%) | 0.00229 | −20% |
+| 5 | 0.000930 (1) | 0.000948 | +2% |
+| 9 | 0.00138 (3, ±6%) | 0.00160 | +16% |
+
+All three PASS, all `skipped=0`, and per-step time is unchanged (63.5 s against
+64.3 s on example 9). Examples 4 and 5 sit inside the reference spread.
+
+**Example 9 lands 12% above the highest of its three reference runs, and that is
+not explained.** No code path in the branch should reach it: the routed-expert
+routing only triggers on per-expert names, and this stack renames the fused ones
+upstream of ATOM. The most likely reading is that three samples underestimate
+the spread — the one reference run that was also a cold start after a container
+recreate, like this one, was itself the highest of the three. Recorded rather
+than resolved; it did not warrant more machine time at the tolerances in use.

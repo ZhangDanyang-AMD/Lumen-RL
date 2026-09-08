@@ -628,6 +628,15 @@ class ATOMReplicaManager:
                     env_vars[key] = os.environ[key]
 
             engine_kwargs = self._engine_kwargs_for_replica(r, job_id)
+            if true_vocab_size is not None:
+                # Belt and braces across two ATOM generations. The pinned build
+                # reads LUMENRL_ATOM_TRUE_VOCAB_SIZE from the environment above;
+                # newer ones take Config.true_vocab_size and no longer look at
+                # the env var. ATOM filters engine kwargs against the Config
+                # dataclass fields and drops the rest, so the build that does not
+                # know the field ignores this line rather than failing on it --
+                # and the mask cannot go quiet just because the pin moved.
+                engine_kwargs.setdefault("true_vocab_size", int(true_vocab_size))
             if disable_custom_ar in ("1", "true", "True"):
                 engine_kwargs.setdefault(
                     "runner_qualname",
