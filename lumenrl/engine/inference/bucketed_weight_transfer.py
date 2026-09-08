@@ -141,10 +141,16 @@ class BucketedWeightSender:
         bucket_size_mb: int = 512,
         use_shm: bool = False,
         version: int | None = None,
+        min_bucket_bytes: int = 0,
     ):
+        # ``min_bucket_bytes`` raises the bucket above the configured size so a
+        # receiver that needs one stable buffer per update cycle can be given a
+        # bucket that holds the largest single tensor. Left at 0, the bucket is
+        # exactly the configured size and oversized tensors go out one at a
+        # time through _direct_send_large_weight.
         self.zmq_handle = zmq_handle
         self.bucket_size_mb = bucket_size_mb
-        self.bucket_size = int(bucket_size_mb) << 20
+        self.bucket_size = max(int(bucket_size_mb) << 20, int(min_bucket_bytes))
         self.use_shm = use_shm
         self.version = version
 

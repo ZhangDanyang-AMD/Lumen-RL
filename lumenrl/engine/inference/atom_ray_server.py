@@ -332,6 +332,17 @@ class ATOMRayServer:
                     if meta.get("handle") is not None
                 }
                 if used_bytes > bucket_size:
+                    # Only the first bucket may grow the staging buffers: the
+                    # runner has not mapped anything yet, so it picks up the new
+                    # handles. Later on it is still holding the first mapping and
+                    # would read a short, stale view of a fresh allocation.
+                    if stats["buckets"] > 0:
+                        raise RuntimeError(
+                            f"bucket needs {used_bytes} B but the staging buffer is "
+                            f"{bucket_size} B and ATOM's runner has already mapped it; "
+                            "the sender must size its bucket to the largest tensor "
+                            "(see LumenActorWorker.update_weights_ipc_send)"
+                        )
                     del per_gpu_buffers
                     del per_gpu_ipc_handles
                     bucket_size = used_bytes

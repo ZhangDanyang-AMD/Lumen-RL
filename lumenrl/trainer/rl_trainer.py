@@ -505,6 +505,29 @@ class RLTrainer:
             weight_backend,
         )
 
+    def _release_actor_cached_memory(self) -> None:
+        """Drop the actors' cached-but-unused device memory before an ATOM replica
+        sizes its KV cache.
+
+        ATOM subtracts everything the driver reports as occupied on the device
+        (``non_torch``) from ``gpu_memory_utilization x total``, so the post-shard
+        allocator cache of a colocated FSDP2 actor -- 113.6 GiB for
+        Qwen3-30B-A3B -- would otherwise be charged against the KV budget and
+        drive it negative. vLLM only charges its own increments, which is why
+        this is needed on the ATOM path alone.
+        """
+        if self._actor_wg is None:
+            return
+        stats = self._actor_wg.execute_all_sync("free_cached_memory")
+        freed_gb = sum(
+            (s.get("reserved_before_bytes", 0.0) - s.get("reserved_after_bytes", 0.0))
+            for s in stats
+        ) / (1 << 30)
+        logger.info(
+            "Released actor allocator cache before ATOM rollout: %.2f GiB over %d ranks.",
+            freed_gb, len(stats),
+        )
+
     def _setup_ray_atom_rollout(self, model_name: str, vcfg: Any, atom_cfg: Any) -> None:
         """Build colocated ATOM rollout replicas + client on the Ray controller path."""
         from lumenrl.engine.inference.atom_ray_server import ATOMReplicaManager
@@ -1165,6 +1188,7 @@ class RLTrainer:
             self._setup_ray_vllm_rollout(model_name, vcfg)
             self._atom_engine = None
         elif self._ray_use_atom:
+            self._release_actor_cached_memory()
             self._setup_ray_atom_rollout(model_name, vcfg, atom_cfg)
             self._atom_engine = None
         else:
