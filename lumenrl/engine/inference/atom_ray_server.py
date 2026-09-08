@@ -287,6 +287,13 @@ class ATOMRayServer:
 
         from atom.rollout.weight_sync import rebuild_ipc_handle
 
+        from lumenrl.engine.inference.atom_moe_weight_sync import (
+            assert_bucket_fully_applied,
+            fused_expert_renames,
+            relayout_fused_experts,
+            rename_bucket_meta,
+            require_unsharded_experts,
+        )
         from lumenrl.engine.inference.bucketed_weight_transfer import check_bucket_version
 
         ctx = zmq.Context()
@@ -310,7 +317,7 @@ class ATOMRayServer:
                 for gpu_idx in range(num_gpus)
             }
             per_gpu_ipc_handles = {gpu_idx: reduce_tensor(buf) for gpu_idx, buf in per_gpu_buffers.items()}
-            stats = {"buckets": 0, "weights": 0}
+            stats = {"buckets": 0, "weights": 0, "experts": 0}
 
             while True:
                 metadata = socket.recv_pyobj()
@@ -352,6 +359,18 @@ class ATOMRayServer:
                     }
                     per_gpu_ipc_handles = {gpu_idx: reduce_tensor(buf) for gpu_idx, buf in per_gpu_buffers.items()}
 
+                # transformers-5.x ships MoE experts as fused tensors under names
+                # ATOM's updater cannot resolve, and its unquantized MoE path
+                # keeps those buffers in an aiter-shuffled layout that nothing
+                # re-establishes after an update. Both are handled in the
+                # staging buffer, before the runner reads it.
+                renames = fused_expert_renames(bucket_meta)
+                if renames:
+                    require_unsharded_experts(
+                        self.engine_kwargs.get("tensor_parallel_size", 1),
+                        self.engine_kwargs.get("enable_expert_parallel", False),
+                    )
+
                 for gpu_idx, dst in per_gpu_buffers.items():
                     for name, tensor in direct_tensors.items():
                         meta = raw_bucket_meta[name]
@@ -364,20 +383,34 @@ class ATOMRayServer:
                     if not direct_tensors:
                         dst[:used_bytes].copy_(ipc_buffer[:used_bytes], non_blocking=True)
                     torch.cuda.synchronize(gpu_idx)
+                    # After the copy: this rewrites the staged bytes, so it must
+                    # not race the fill, and each per-GPU buffer needs its own
+                    # pass because the runners read them independently. The
+                    # device context is for the aiter kernels behind the shuffle,
+                    # which launch on the current device, not the tensor's.
+                    if renames:
+                        with torch.cuda.device(gpu_idx):
+                            relayout_fused_experts(dst, bucket_meta, renames)
+                            torch.cuda.synchronize(gpu_idx)
 
-                self.engine.core_mgr.broadcast_utility_command_sync(
+                responses = self.engine.core_mgr.broadcast_utility_command_sync(
                     "update_weights_ipc",
                     ipc_handle=None,
                     ipc_handles=per_gpu_ipc_handles,
-                    bucket_meta=bucket_meta,
+                    bucket_meta=rename_bucket_meta(bucket_meta, renames),
                     is_last=is_last,
                 )
+                assert_bucket_fully_applied(responses, bucket_meta, context="ipc")
                 stats["buckets"] += 1
                 stats["weights"] += len(bucket_meta)
+                stats["experts"] += len(renames)
                 socket.send(b"")
                 if is_last:
                     break
-            logger.info("ATOM online weight reload: buckets=%d weights=%d", stats["buckets"], stats["weights"])
+            logger.info(
+                "ATOM online weight reload: buckets=%d weights=%d fused_experts=%d",
+                stats["buckets"], stats["weights"], stats["experts"],
+            )
         finally:
             socket.close()
             ctx.term()
@@ -389,6 +422,10 @@ class ATOMRayServer:
             torch.cuda.empty_cache()
 
     def _update_weights_from_shm_sync(self, version: int | None = None) -> None:
+        from lumenrl.engine.inference.atom_moe_weight_sync import (
+            assert_bucket_fully_applied,
+            fused_expert_renames,
+        )
         from lumenrl.engine.inference.bucketed_weight_transfer import check_bucket_version
 
         ctx = zmq.Context()
@@ -404,12 +441,24 @@ class ATOMRayServer:
                 metadata = socket.recv_pyobj()
                 check_bucket_version(metadata, version)
                 bucket_meta, _used_bytes = self._bucket_meta(metadata["bucket_meta"])
-                self.engine.core_mgr.broadcast_utility_command_sync(
+                if fused_expert_renames(bucket_meta):
+                    # The IPC path rewrites fused expert names and re-establishes
+                    # ATOM's shuffled layout in a staging buffer it owns. Here the
+                    # segment belongs to the sender and lives in host memory, where
+                    # aiter's shuffle does not run, so there is nowhere to do the
+                    # same work. Refuse rather than repeat the silent-skip bug.
+                    raise RuntimeError(
+                        "ATOM rollout of a fused-expert MoE model needs the CUDA-IPC "
+                        "weight transport; set use_shm=false. See "
+                        "lumenrl/engine/inference/atom_moe_weight_sync.py."
+                    )
+                responses = self.engine.core_mgr.broadcast_utility_command_sync(
                     "update_weights_shm",
                     shm_name=shm.name,
                     bucket_meta=bucket_meta,
                     is_last=bool(metadata["is_last"]),
                 )
+                assert_bucket_fully_applied(responses, bucket_meta, context="shm")
                 socket.send(b"")
                 if metadata["is_last"]:
                     break
