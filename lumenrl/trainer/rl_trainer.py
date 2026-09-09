@@ -450,7 +450,10 @@ class RLTrainer:
             enable_sleep_mode=bool(vcfg.enable_sleep_mode),
             disable_log_stats=True,
         )
-        if str(vcfg.moe_backend) != "auto":
+        # "" and "auto" both mean "leave vLLM's own default": vLLM validates this
+        # against its backend list and rejects either, so forwarding one fails the
+        # rollout with ``moe_backend='' is not supported for unquantized MoE``.
+        if str(vcfg.moe_backend) not in ("auto", ""):
             engine_kwargs["moe_backend"] = str(vcfg.moe_backend)
         if str(vcfg.linear_backend) != "auto":
             engine_kwargs["linear_backend"] = str(vcfg.linear_backend)

@@ -259,7 +259,6 @@ class VLLMConfig:
     dtype: str = "bfloat16"
     enforce_eager: bool = True
     disable_custom_all_reduce: bool = False
-    moe_backend: str = "auto"
     linear_backend: str = "auto"
     enable_chunked_prefill: bool = True
     enable_prefix_caching: bool = False
@@ -269,9 +268,10 @@ class VLLMConfig:
     trust_remote_code: bool = True
     # Rollout quantization: "" / "fp8" / "fp8_per_block" (vLLM `quantization=`)
     quantization: str = ""
-    # vLLM `moe_backend=`. "" leaves vLLM's own default. DeepSeek-V4 on gfx950 must
-    # pass "triton": the default auto-selects AITER and dies in the first forward at
-    # `moe_sorting_opus_fwd`, and "triton_unfused" is FP4-only and raises ValueError.
+    # vLLM `moe_backend=`. "" and "auto" both leave vLLM's own default -- neither is
+    # forwarded, because vLLM rejects both as backend names. DeepSeek-V4 on gfx950
+    # must pass "triton": the default auto-selects AITER and dies in the first forward
+    # at `moe_sorting_opus_fwd`, and "triton_unfused" is FP4-only and raises ValueError.
     moe_backend: str = ""
     # When True, vLLM returns per-token rollout log-probs needed for TIS / MIS
     # rollout correction (verl: actor_rollout_ref.rollout.calculate_log_probs).
