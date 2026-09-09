@@ -29,8 +29,8 @@ from lumenrl.core.protocol import DataProto
 from lumenrl.engine.training import dsv4_megatron_bridge as dsv4
 from lumenrl.engine.training.base_engine import EngineRegistry
 from lumenrl.engine.training.megatron_base_engine import MegatronBaseEngine
+from lumenrl.engine.training.model_registry import MODEL_REGISTRY, hf_num_experts
 from lumenrl.engine.training.qwen3_megatron_bridge import (
-    Qwen3Dims,
     hf_to_megatron,
     load_hf_safetensors,
     megatron_to_hf,
@@ -38,11 +38,14 @@ from lumenrl.engine.training.qwen3_megatron_bridge import (
 from lumenrl.engine.training.qwen3moe_megatron_bridge import (
     _expert_local_index,
     _non_expert_hf_to_megatron,
-    build_moe_dims,
     hf_expert_fc1,
     hf_expert_fc2,
     megatron_to_hf_moe,
 )
+
+# Registers the ModelSpec entries on MODEL_REGISTRY. Imported for the
+# side effect; resolution order is defined there, not here.
+from lumenrl.engine.training import model_specs  # noqa: F401
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LUMENRL_LOGGING_LEVEL", "INFO"))
@@ -267,8 +270,9 @@ class MegatronNativeEngine(MegatronBaseEngine):
         # heterogeneous attention, and hash routing on the first layers. It also
         # ships block-quantized FP8 weights that the HF-safetensors bridge cannot
         # read. Everything DSv4-specific lives in ``dsv4_megatron_bridge``.
-        self._is_dsv4 = dsv4.is_dsv4(hf)
-        if self._is_dsv4 and self._dynamic_batch:
+        self._spec = MODEL_REGISTRY.resolve(hf, ec)
+        self._is_dsv4 = self._spec.name == "deepseek_v4"
+        if not self._spec.caps.supports_dynamic_batch and self._dynamic_batch:
             # See ``_dsv4_check_topology``: DSv4 attention derives token positions
             # from the tensor length alone, so bin-packing several sequences into
             # one microbatch would have them read as one long sequence.
@@ -281,11 +285,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
         # ---- MoE detection: HF config declares routed experts (Qwen3-MoE etc.) ----
         # Any of these HF keys marks a MoE model; an explicit engine_config
         # ``num_experts`` overrides. dense models keep every ``moe_*`` off.
-        hf_num_experts = (
-            hf.get("num_experts") or hf.get("n_routed_experts") or hf.get("num_local_experts")
-        )
-        cfg_num_experts = ec.get("num_experts")
-        num_experts = int(cfg_num_experts or hf_num_experts or 0)
+        num_experts = int(ec.get("num_experts") or hf_num_experts(hf) or 0)
         self._is_moe = num_experts > 1
         self._num_experts = num_experts
         # R3 routing replay (opt-in): record router logits in the old-logprob
@@ -306,13 +306,11 @@ class MegatronNativeEngine(MegatronBaseEngine):
             )
 
         moe_kwargs: dict = {}
-        if self._is_dsv4:
-            # ``build_moe_dims`` and the ``Qwen3Dims`` twin below both read HF keys
-            # DSv4 does not have. Its dims are only consumed by the HF weight
-            # bridge (load + rollout weight sync), and DSv4 uses neither yet.
-            self._dims = None
-        elif self._is_moe:
-            self._dims = build_moe_dims(hf)
+        # Dims come from the resolved spec. DSv4 declares ``build_dims=None``
+        # because its block-quantized FP8 weights are unreadable by the HF
+        # safetensors bridge, which is the only consumer of dims.
+        self._dims = self._spec.build_dims(hf) if self._spec.build_dims else None
+        if self._is_moe and not self._is_dsv4:
             moe_ffn = self._dims.moe_ffn
             topk = int(ec.get("moe_router_topk") or hf.get("num_experts_per_tok") or 2)
             shared_ffn = int(
@@ -330,17 +328,13 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 expert_tensor_parallel_size=etp,
                 moe_permute_fusion=bool(ec.get("moe_permute_fusion", False)),
             )
-            # Qwen3-MoE routing = softmax(all) -> top-k -> renormalize top-k
-            # (HF ``norm_topk_prob=True``). That is mathematically identical to
-            # Megatron's ``moe_router_pre_softmax=False`` (top-k of logits, then a
-            # softmax over ONLY the top-k logits -> already sums to 1), because the
-            # full-softmax denominator cancels under renormalization. Using
-            # ``pre_softmax=True`` instead would leave the gate weights un-renormalized
-            # (sum<1) and diverge from vLLM -> large rollout/train log-prob mismatch.
+            # Routing conventions belong to the architecture, so the default comes
+            # from the spec (see ``model_specs`` for why Qwen3-MoE wants
+            # ``moe_router_pre_softmax=False``). engine_config still overrides.
             pre_softmax = ec.get("moe_router_pre_softmax")
-            moe_kwargs["moe_router_pre_softmax"] = (
-                False if pre_softmax is None else bool(pre_softmax)
-            )
+            if pre_softmax is None:
+                pre_softmax = self._spec.routing_defaults.get("moe_router_pre_softmax", False)
+            moe_kwargs["moe_router_pre_softmax"] = bool(pre_softmax)
             if ec.get("moe_router_score_function"):
                 moe_kwargs["moe_router_score_function"] = str(ec.get("moe_router_score_function"))
             if ec.get("moe_router_dtype"):
@@ -351,12 +345,6 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 moe_kwargs["moe_router_bias_update_rate"] = float(ec.get("moe_router_bias_update_rate"))
             if shared_ffn > 0:
                 moe_kwargs["moe_shared_expert_intermediate_size"] = shared_ffn
-        else:
-            self._dims = Qwen3Dims(
-                num_layers=hf["num_hidden_layers"], hidden=hf["hidden_size"],
-                num_heads=hf["num_attention_heads"], num_kv_groups=hf["num_key_value_heads"],
-                head_dim=head_dim, ffn=hf["intermediate_size"], vocab=hf["vocab_size"],
-            )
 
         recompute_kwargs: dict = {}
         rc_gran = ec.get("recompute_granularity") or None
