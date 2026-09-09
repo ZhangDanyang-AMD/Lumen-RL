@@ -34,6 +34,15 @@ QWEN3_MOE_CFG = {
 }
 
 
+def _all_specs():
+    """The registered specs, by identity rather than by name lookup."""
+    return [MODEL_REGISTRY.resolve(cfg, ec) for cfg, ec in (
+        ({"architectures": ["DeepseekV4ForCausalLM"], "model_type": "deepseek_v4"}, {}),
+        (QWEN3_MOE_CFG, {}),
+        (QWEN3_DENSE_CFG, {}),
+    )]
+
+
 # --- helpers -----------------------------------------------------------------
 
 @pytest.mark.parametrize(
@@ -139,3 +148,54 @@ def test_caps_defaults_are_the_permissive_ones():
     assert caps.supports_hf_bridge is True
     assert caps.supports_dynamic_batch is True
     assert caps.has_experts is False
+
+
+# --- capabilities and hooks (phase 2) ----------------------------------------
+
+def test_dsv4_declares_the_capabilities_the_engine_used_to_hard_code():
+    """Each of these replaced an ``if self._is_dsv4`` at a call site."""
+    spec = next(s for s in _all_specs() if s.name == "deepseek_v4")
+    caps = spec.caps
+    assert caps.supports_hf_bridge is False          # dist-checkpoint load + sync
+    assert caps.supports_dynamic_batch is False      # attention ignores cu_seqlens
+    assert caps.builds_own_config is True            # heterogeneous layers
+    assert caps.requires_pipeline_forward is True    # topology check before forward
+    assert caps.packed_stream_is_single_sequence is True
+
+
+def test_generic_families_take_the_generic_paths():
+    for name in ("qwen3_moe", "qwen3_dense"):
+        spec = next(s for s in _all_specs() if s.name == name)
+        assert spec.caps.supports_hf_bridge is True
+        assert spec.caps.supports_dynamic_batch is True
+        assert spec.caps.builds_own_config is False
+        assert spec.caps.requires_pipeline_forward is False
+        assert spec.build_config is None, f"{name} must use the generic builder"
+        assert spec.build_layer_spec is None
+        assert spec.sequence_alignment is None
+
+
+def test_dsv4_supplies_construction_hooks():
+    spec = next(s for s in _all_specs() if s.name == "deepseek_v4")
+    assert spec.build_config is not None
+    assert spec.build_layer_spec is not None
+    assert spec.sequence_alignment is not None
+
+
+def test_resolve_has_experts_honours_the_config_override():
+    """Replaces the engine's inline ``num_experts > 1``."""
+    dense = MODEL_REGISTRY.resolve(QWEN3_DENSE_CFG, {})
+    assert dense.resolve_has_experts(QWEN3_DENSE_CFG, {}) is False
+    assert dense.resolve_has_experts(QWEN3_DENSE_CFG, {"num_experts": 8}) is True
+
+    moe = MODEL_REGISTRY.resolve(QWEN3_MOE_CFG, {})
+    assert moe.resolve_has_experts(QWEN3_MOE_CFG, {}) is True
+    assert moe.resolve_has_experts(QWEN3_MOE_CFG, {"num_experts": 1}) is False
+
+
+def test_caps_defaults_stay_permissive_for_new_families():
+    """A new ModelSpec must opt in to special paths, never inherit them."""
+    caps = ModelCaps()
+    assert caps.builds_own_config is False
+    assert caps.requires_pipeline_forward is False
+    assert caps.packed_stream_is_single_sequence is False

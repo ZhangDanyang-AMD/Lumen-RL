@@ -57,8 +57,27 @@ DSV4 = MODEL_REGISTRY.register(
             has_experts=True,
             supports_hf_bridge=False,
             supports_dynamic_batch=False,
+            builds_own_config=True,
+            # Its topology check must run before every forward, and the generic
+            # non-pipelined shortcut cannot host it.
+            requires_pipeline_forward=True,
+            packed_stream_is_single_sequence=True,
         ),
         build_dims=None,
+        # Resolved at call time, not import time: the DSv4 construction functions
+        # ship with the DSv4 branch (``dev/vllm-fsdp-dapo`` / ``dev/OPD``), while
+        # ``main`` carries only the call sites. Binding them eagerly here would make
+        # importing this module fail on ``main`` for every model, so the indirection
+        # is deliberate and should stay even after the branches converge.
+        #
+        # build_config: field-for-field equal to what Megatron's own parser produces
+        #   from miles' deepseek-v4-flash.sh, the config every existing DSv4
+        #   numerical reference was measured on.
+        # build_layer_spec: heterogeneous per layer (sliding / compressed+indexed /
+        #   hyper-compressed), so no block-spec builder can produce it.
+        build_config=lambda *a, **kw: dsv4.build_dsv4_config(*a, **kw),
+        build_layer_spec=lambda *a, **kw: dsv4.build_dsv4_spec(*a, **kw),
+        sequence_alignment=lambda tfcfg: dsv4.sequence_alignment(tfcfg),
     )
 )
 

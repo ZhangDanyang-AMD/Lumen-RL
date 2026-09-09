@@ -59,23 +59,40 @@ def resolve_head_dim(hf: Mapping[str, Any]) -> int:
 class ModelCaps:
     """What the engine may do with this family.
 
-    These replace questions the engine currently asks about itself. ``has_experts``
-    is the old ``_is_moe``; the other two record why DSv4 takes different paths
-    rather than leaving that knowledge in an ``if`` at the call site.
+    Each field replaces a question the engine used to answer by testing which
+    model it was holding. The point is that a new architecture declares its
+    answers here instead of adding another ``if`` at every call site.
     """
 
+    # Routed experts. Kept as a declared default; the live value comes from
+    # ``ModelSpec.has_experts`` because engine_config can override the count.
     has_experts: bool = False
-    # DSv4 ships block-quantized FP8 weights the HF-safetensors bridge cannot read,
-    # so it supplies no dims and neither loads nor weight-syncs through that path.
+    # Weights load and weight-sync through the HF safetensors bridge. DSv4 ships
+    # block-quantized FP8 the bridge cannot read, so it supplies no dims and takes
+    # a dist-checkpoint path in both directions.
     supports_hf_bridge: bool = True
-    # DSv4 attention derives token positions from the tensor length alone, so
-    # bin-packing several sequences into one microbatch reads as one long sequence.
+    # Several sequences may be bin-packed into one microbatch. DSv4 attention
+    # derives token positions from the tensor length alone, so a packed microbatch
+    # would read as one long sequence.
     supports_dynamic_batch: bool = True
+    # The family supplies its own TransformerConfig and layer spec (``build_config``
+    # / ``build_layer_spec``) rather than the generic TE block spec.
+    builds_own_config: bool = False
+    # Forward must always go through the pipeline path, even at PP=CP=1.
+    requires_pipeline_forward: bool = False
+    # The model reads a packed stream as a single sequence (ignores cu_seqlens),
+    # which constrains sequence alignment and CP microbatch layout.
+    packed_stream_is_single_sequence: bool = False
 
 
 @dataclass(frozen=True)
 class ModelSpec:
-    """How to recognise one model family and what the engine needs from it."""
+    """How to recognise one model family and what the engine needs from it.
+
+    The optional callables are hooks: ``None`` means "use the engine's generic
+    path". A family that needs a bespoke construction supplies one instead of the
+    engine growing a branch for it.
+    """
 
     name: str
     detect: Callable[[Mapping[str, Any], Mapping[str, Any]], bool]
@@ -86,6 +103,24 @@ class ModelSpec:
     # Routing conventions that belong to the architecture rather than to the run.
     # engine_config still overrides these; they are the family's default.
     routing_defaults: Mapping[str, Any] = field(default_factory=dict)
+    # ``(hf, ec, **parallel) -> TransformerConfig`` for a family the generic
+    # builder cannot describe.
+    build_config: Optional[Callable[..., Any]] = None
+    # ``(tfcfg, ec) -> ModuleSpec`` for a family whose layers are heterogeneous.
+    build_layer_spec: Optional[Callable[..., Any]] = None
+    # ``(tfcfg) -> int`` extra sequence-length alignment the family requires.
+    sequence_alignment: Optional[Callable[[Any], int]] = None
+    # Live expert check. Defaults to the declared cap ORed with the effective
+    # expert count, so engine_config's ``num_experts`` override still decides.
+    has_experts: Optional[Callable[[Mapping[str, Any], Mapping[str, Any]], bool]] = None
+
+    def resolve_has_experts(
+        self, hf: Mapping[str, Any], ec: Mapping[str, Any]
+    ) -> bool:
+        """Whether this run has routed experts, honouring the config override."""
+        if self.has_experts is not None:
+            return bool(self.has_experts(hf, ec))
+        return int(ec.get("num_experts") or hf_num_experts(hf) or 0) > 1
 
 
 class ModelRegistry:

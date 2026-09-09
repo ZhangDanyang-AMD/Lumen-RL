@@ -29,7 +29,11 @@ from lumenrl.core.protocol import DataProto
 from lumenrl.engine.training import dsv4_megatron_bridge as dsv4
 from lumenrl.engine.training.base_engine import EngineRegistry
 from lumenrl.engine.training.megatron_base_engine import MegatronBaseEngine
-from lumenrl.engine.training.model_registry import MODEL_REGISTRY, hf_num_experts
+from lumenrl.engine.training.model_registry import (
+    MODEL_REGISTRY,
+    ModelCaps,
+    hf_num_experts,
+)
 from lumenrl.engine.training.qwen3_megatron_bridge import (
     hf_to_megatron,
     load_hf_safetensors,
@@ -196,11 +200,16 @@ class MegatronNativeEngine(MegatronBaseEngine):
     aware) and HF weight I/O (TE-named bridge) differ.
     """
 
-    # DeepSeek-V4 takes a separate construction and weight path; see
-    # ``dsv4_megatron_bridge``. Class-level so the forward-side dispatch is
-    # answerable before ``initialize`` has run.
-    _is_dsv4 = False
+    # Resolved in ``initialize`` from the HF config; see ``model_registry``.
+    # Class-level so the forward-side dispatch is answerable before it has run --
+    # ``_caps`` falls back to the permissive defaults until then.
+    _spec = None
     _dsv4_align = 1
+
+    @property
+    def _caps(self):
+        """Capabilities of the resolved family, or the defaults pre-``initialize``."""
+        return self._spec.caps if self._spec is not None else ModelCaps()
 
     def initialize(self) -> None:
         from megatron.core import parallel_state as mpu
@@ -271,8 +280,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
         # ships block-quantized FP8 weights that the HF-safetensors bridge cannot
         # read. Everything DSv4-specific lives in ``dsv4_megatron_bridge``.
         self._spec = MODEL_REGISTRY.resolve(hf, ec)
-        self._is_dsv4 = self._spec.name == "deepseek_v4"
-        if not self._spec.caps.supports_dynamic_batch and self._dynamic_batch:
+        if not self._caps.supports_dynamic_batch and self._dynamic_batch:
             # See ``_dsv4_check_topology``: DSv4 attention derives token positions
             # from the tensor length alone, so bin-packing several sequences into
             # one microbatch would have them read as one long sequence.
@@ -286,7 +294,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
         # Any of these HF keys marks a MoE model; an explicit engine_config
         # ``num_experts`` overrides. dense models keep every ``moe_*`` off.
         num_experts = int(ec.get("num_experts") or hf_num_experts(hf) or 0)
-        self._is_moe = num_experts > 1
+        self._is_moe = self._spec.resolve_has_experts(hf, ec)
         self._num_experts = num_experts
         # R3 routing replay (opt-in): record router logits in the old-logprob
         # forward, replay in the update. Only meaningful for MoE.
@@ -310,7 +318,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
         # because its block-quantized FP8 weights are unreadable by the HF
         # safetensors bridge, which is the only consumer of dims.
         self._dims = self._spec.build_dims(hf) if self._spec.build_dims else None
-        if self._is_moe and not self._is_dsv4:
+        if self._is_moe and self._caps.supports_hf_bridge:
             moe_ffn = self._dims.moe_ffn
             topk = int(ec.get("moe_router_topk") or hf.get("num_experts_per_tok") or 2)
             shared_ffn = int(
@@ -353,21 +361,19 @@ class MegatronNativeEngine(MegatronBaseEngine):
             recompute_kwargs["recompute_method"] = ec.get("recompute_method") or "uniform"
             recompute_kwargs["recompute_num_layers"] = int(ec.get("recompute_num_layers") or 1)
 
-        if self._is_dsv4:
-            # Field-for-field equal to what Megatron's own parser produces from
-            # miles' deepseek-v4-flash.sh, which is the config every existing DSv4
-            # numerical reference was measured on.
+        if self._spec.build_config is not None:
             det = ec.get("deterministic_mode")
-            tfcfg = dsv4.build_dsv4_config(
+            tfcfg = self._spec.build_config(
                 hf, ec, tp=tp, pp=pp, cp=cp, ep=ep, etp=etp, sp=sp,
                 # Unset means "the model family decides", and DSv4 decides on:
                 # non-deterministic forwards disagree with themselves on ~1.6% of
                 # argmaxes, swamping the train/rollout gap DAPO measures.
                 deterministic=True if det is None else bool(det),
             )
-            if tfcfg.deterministic_mode:
+            if getattr(tfcfg, "deterministic_mode", False):
                 dsv4.enable_deterministic_mode()
-            self._dsv4_align = dsv4.sequence_alignment(tfcfg)
+            if self._spec.sequence_alignment is not None:
+                self._dsv4_align = self._spec.sequence_alignment(tfcfg)
         else:
             tfcfg = TransformerConfig(
                 num_layers=hf["num_hidden_layers"], hidden_size=hf["hidden_size"],
@@ -393,10 +399,8 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 **recompute_kwargs,
             )
 
-        if self._is_dsv4:
-            # Heterogeneous per layer (sliding / compressed+indexed /
-            # hyper-compressed), so no block-spec builder can produce it.
-            spec = dsv4.build_dsv4_spec(
+        if self._spec.build_layer_spec is not None:
+            spec = self._spec.build_layer_spec(
                 tfcfg, dsa_topk_backend=str(ec.get("dsa_topk_backend", "torch")),
             )
         elif self._is_moe:
@@ -425,7 +429,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
             parallel_output=False,
         )
 
-        if self._is_dsv4:
+        if not self._caps.supports_hf_bridge:
             # DSv4 weights come from a torch_dist checkpoint converted offline
             # (native FP8 -> bf16 HF -> torch_dist), because the released
             # checkpoint is block-quantized FP8. ``dist_checkpointing.load``
@@ -470,7 +474,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
             self.module = model.cuda()
         self._tfcfg = tfcfg
 
-        if self._is_moe and not self._is_dsv4 and self._rank() == 0:
+        if self._is_moe and self._caps.supports_hf_bridge and self._rank() == 0:
             # Surface MoE + Expert-Parallel topology to the run log (stdout is
             # forwarded by Ray). Evidence of expert sharding / EP group width.
             print(
@@ -988,7 +992,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
         """
         assert self.module is not None
         _mem_diag_note("weight_sync gather begin")
-        if self._is_dsv4:
+        if not self._caps.supports_hf_bridge:
             # The gather is shared: DSv4's grouped experts carry the same Megatron
             # names Qwen3-MoE does. Only the naming on the way out differs, and it
             # has to land on the DSv4 *checkpoint* names, because the rollout side
@@ -1113,10 +1117,10 @@ class MegatronNativeEngine(MegatronBaseEngine):
         #     and under CP additionally ``seqlen % (ratio*2) == 0``, while RL
         #     sequence lengths are whatever the rollout produced.
         align = self._tp if (self._sp and self._tp > 1) else 1
-        if self._is_dsv4:
+        if self._spec.sequence_alignment is not None:
             align = math.lcm(align, self._dsv4_align * (2 if self._cp > 1 else 1))
 
-        cp_contiguous = self._is_dsv4 and self._cp > 1
+        cp_contiguous = self._caps.packed_stream_is_single_sequence and self._cp > 1
         if cp_contiguous and len(ids_list) > 1:
             # DSv4 reads the packed stream as ONE sequence (it ignores
             # cu_seqlens), which is why enable_dynamic_batch is forced off and
@@ -1454,7 +1458,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
             )
 
     def engine_update_policy(self, batch):
-        if self._is_dsv4:
+        if self._caps.requires_pipeline_forward:
             self._dsv4_check_topology()
             return self._pp_update_policy(batch)
         if self._pp == 1 and self._cp == 1 and not getattr(self, "_is_moe", False):
@@ -1625,7 +1629,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
         return metrics
 
     def engine_compute_log_probs(self, batch):
-        if self._is_dsv4:
+        if self._caps.requires_pipeline_forward:
             self._dsv4_check_topology()
             return self._pp_compute_log_probs(batch)
         if self._pp == 1 and self._cp == 1 and not getattr(self, "_is_moe", False):
