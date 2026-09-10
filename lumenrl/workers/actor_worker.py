@@ -340,7 +340,12 @@ class LumenActorWorker(BaseWorker):
     def _build_optimizer_config(self, policy: dict) -> dict[str, Any]:
         lr = float(policy.get("learning_rate", policy.get("lr", 1e-6)))
         cfg = {
-            "optimizer": str(policy.get("optimizer_type", "adamw")).lower(),
+            # `optimizer_type` is the name this dict is read under everywhere:
+            # PolicyConfig sets it, OptimizerConfig declares it, and the FSDP2
+            # engine selects on `cfg.optimizer_type`. Megatron's own
+            # OptimizerConfig spells it `optimizer`, which is a translation the
+            # Megatron adapters do at their own boundary.
+            "optimizer_type": str(policy.get("optimizer_type", "adamw")).lower(),
             "lr": lr,
             "weight_decay": float(policy.get("weight_decay", 0.01)),
             "clip_grad": float(policy.get("max_grad_norm", 1.0)),
