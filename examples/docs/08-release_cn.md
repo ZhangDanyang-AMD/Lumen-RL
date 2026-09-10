@@ -15,7 +15,7 @@
 ```bash
 git clone https://github.com/ZhangDanyang-AMD/Lumen-RL.git && cd Lumen-RL
 export DATA_ROOT=/path/to/data
-docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260908
+docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260910
 bash release/run_example.sh 1 --check
 ```
 
@@ -46,7 +46,7 @@ overlong 奖励缓冲、TIS rollout 修正。
 
 ```bash
 docker run --rm --entrypoint /bin/bash \
-  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260908 \
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260910 \
   -lc 'ls /opt/lumenrl/aiter-jit/*.so | wc -l'     # 16
 ```
 
@@ -66,8 +66,8 @@ bash release/run_example.sh 1 --check        # 直接跑改动；不重建镜像
 editable 安装有个路径可指，挂载把它盖住了。每次运行都会打印用的是哪份代码、哪个 commit：
 
 ```
-   code   /path/to/Lumen-RL @ f4439f3
-   image  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260908
+   code   /path/to/Lumen-RL @ 8ca6bdd
+   image  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260910
 ```
 
 两点需要知道：
@@ -93,16 +93,24 @@ Lumen-RL 是本仓库，**镜像完全不固定它**——跑的是你 checkout 
 | Lumen-RL | `ZhangDanyang-AMD/Lumen-RL` | `dev/dapo_release` | 你的 checkout（挂载，不固定） |
 | Lumen | `ZhangDanyang-AMD/Lumen` | `amd-atom-rollout` | `e6379cbd9057` |
 | aiter | `ZhangDanyang-AMD/aiter` | `lumen/moe` | `4ebe6d69c7f4` |
-| ATOM | `ROCm/ATOM` | `refs/pull/2028/head` | `28721a5094b9` |
+| ATOM | `ROCm/ATOM` | `refs/pull/2028/head` | `d6b9e147cbf6` |
 | composable_kernel | aiter submodule | — | `af9e1d1f1ae3` |
 
 ATOM 钉的是上游 [ROCm/ATOM PR #2028](https://github.com/ROCm/ATOM/pull/2028)
-的 head。该 PR **截至 2026-09-07 尚未合并**，所以这里钉的是 PR head 而非 main 上的提交；
+的 head。该 PR **截至 2026-09-10 尚未合并**，所以这里钉的是 PR head 而非 main 上的提交；
 它可按 SHA 取到，`release/Dockerfile` 就是这么做的。
 
-⚠️ 自行替换 ATOM 时注意：ATOM rollout **依赖** Lumen-RL 侧 `atom_ray_server.py` 里的
-`cudagraph_mode=FULL`（本镜像已包含）。缺了它，rollout 会在第一次 CUDA graph replay 时
-让全部 worker 崩在 `Input addresses for cudagraphs are different during replay`。
+⚠️ 自行替换 ATOM 时注意：no-eager 的 ATOM rollout **依赖**两项由 Lumen-RL 侧
+`atom_ray_server.py` 主动给出、而非从 ATOM 继承的设置：
+
+- `compilation_config.cudagraph_mode=FULL`。缺了它，rollout 会在第一次 CUDA graph replay 时
+  让全部 worker 崩在 `Input addresses for cudagraphs are different during replay`。
+- `sleep_keeps_memory_resident=true`。缺了它，ATOM 每次 wake 都会重新推算 KV 块数，并把同卡上
+  colocated 训练侧的显存计入预算；例子 9 于是要到一个负数大小的池子，八个副本全部崩在
+  `resume_memory`。8B 的例子扛得住，代价是每步多付一次 graph 重捕获——所以「释放式」的 ATOM
+  在例子 4/5 上只是变慢，在例子 9 上是直接坏掉。
+
+两项对早于这些字段的 ATOM 构建都是空操作，同一份代码因此也能服务旧的 pin。
 机理见 [`release/versions.env`](../../release/versions.env) 的注释。
 
 底座镜像 `vllm/vllm-openai-rocm:v0.23.0`，另加 `flydsl 0.3.2`、`megatron-core 0.18.2`、
@@ -252,7 +260,7 @@ rocm-smi --showmeminfo vram | grep -i used      # 宿主机上直接可用
 ### 8.4.2 获取镜像
 
 ```bash
-docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260908
+docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260910
 ```
 
 也可以自行构建，下面就是全部步骤：
@@ -351,7 +359,7 @@ docker run -d --name lumenrl-release \
   --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --shm-size 64G \
   -v "$DATA_ROOT":"$DATA_ROOT" -e DATA_ROOT="$DATA_ROOT" \
   -v "$PWD":/opt/lumenrl/Lumen-RL \
-  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260908 sleep infinity
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260910 sleep infinity
 ```
 
 第二个挂载是代码（§8.1.1），`$PWD` 是这份 checkout 的根目录。不挂它，容器跑的就是镜像里
@@ -395,7 +403,7 @@ LUMENRL_SRC=/other/Lumen-RL bash release/run_example.sh <N>
 ```bash
 docker run -d --name lumenrl-dev ... \
   -v "$PWD/ATOM":/opt/lumenrl/ATOM \
-  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260908 sleep infinity
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260910 sleep infinity
 ```
 
 然后 `CONTAINER=lumenrl-dev bash release/run_example.sh <N>`。但与 Lumen-RL 不同，
@@ -473,27 +481,30 @@ bash release/run_example.sh 1 --check-only --log $DATA_ROOT/logs/example-1-xxx.l
 
 ### 8.5.1 参考值表
 
-**测量条件**：8x MI355X（gfx950），镜像 `dapo-gfx950-rocm7.2.3-260908`
-（digest `sha256:41eeaf8d5db5…`）+ Lumen-RL `f4439f3`——两者都要记，原因见 §8.1.1；
+**测量条件**：8x MI355X（gfx950），镜像 `dapo-gfx950-rocm7.2.3-260910`
+（digest `sha256:cc18a3f5ce16…`）+ Lumen-RL `8ca6bdd`——两者都要记，原因见 §8.1.1；
 命令即 `bash release/run_example.sh <N>`（等价于 §8.2.2 的整行参数），
 **`seed=10086`**（`run_dapo.sh` 内固定），取**第 1 步**（`step=1`）的指标。
 
 | # | config（`examples/DAPO/configs/`） | steps | resp | 日志时间跨度 | `rollout_corr/k3_kl` | `entropy` | `rollout_corr/kl`（有符号） | 实测次数 |
 |---|---|---|---|---|---|---|---|---|
-| 1 | `dapo_qwen3_8b_ray_vllm_smoke.yaml` | 3 | 512 | 170 s | **0.00106** ±30% | **0.582** ±25% | 0.00106 | 1 |
+| 1 | `dapo_qwen3_8b_ray_vllm_smoke.yaml` | 3 | 512 | 144 s | **0.00106** ±30% | **0.582** ±25% | 0.00106 | 1 |
 | 2 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` | 3 | 512 | 129 s | **0.00498** ±30% | **0.784** ±25% | 0.00538 | 1 |
-| 3 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml`（`TRAIN_FP8=1`） | 3 | 512 | 140 s | **0.00404** ±30% | **0.832** ±25% | 0.00419 | 1 |
-| 4 | `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` | 3 | 4096 | 559–629 s | **0.00287** ±50% | **0.540** ±50% | 0.00288 | 3 |
-| 5 | `dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml` | 1 | 4096 | 408 s | **0.000930** ±50% | **0.568** ±50% | 0.000880 | 1 |
-| 6 | `dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml` | 3 | 4096 | 1202 s | **0.00158** ±50% | **0.679** ±60% | 0.00154 | 1 |
-| 7 | `dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml` | 3 | 4096 | 501 s | **0.00158** ±50% | **0.660** ±60% | 0.00188 | 1 |
-| 9 | `dapo_qwen3moe_a3b_ray_atom_bf16_4k_smoke.yaml` | 3 | 4096 | 557–684 s | **0.00138** ±50% | **0.692** ±60% | 0.00138 | 3 |
+| 3 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml`（`TRAIN_FP8=1`） | 3 | 512 | 142 s | **0.00404** ±30% | **0.832** ±25% | 0.00419 | 1 |
+| 4 | `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` | 3 | 4096 | 508 s | **0.00287** ±50% | **0.540** ±50% | 0.00288 | 3 |
+| 5 | `dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml` | 1 | 4096 | 402 s | **0.000930** ±50% | **0.568** ±50% | 0.000880 | 1 |
+| 6 | `dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml` | 3 | 4096 | 523 s | **0.00158** ±50% | **0.679** ±60% | 0.00154 | 1 |
+| 7 | `dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml` | 3 | 4096 | 499 s | **0.00158** ±50% | **0.660** ±60% | 0.00188 | 1 |
+| 9 | `dapo_qwen3moe_a3b_ray_atom_bf16_4k_smoke.yaml` | 3 | 4096 | 579 s | **0.00138** ±50% | **0.692** ±60% | 0.00138 | 3 |
 
 粗体两列带容差的即 `--check` 判定 PASS / FAIL 的两项，参考值是「实测次数」列那么多遍的均值。
+时间跨度那一列是本镜像每个例子各跑一遍的实测值。
 
-参考值全部测自上表所述的这一个镜像。**共实测 12 次**（例子 4、9 各三遍，其余各一遍），
-**退出码全部为 0**，四类错误计数**全部为 0**，每个权重同步 bucket 都是 `skipped=0`，
-`--check` **12/12 PASS**。逐次原始记录与容差推导见
+参考值是在上一版镜像 `260908` 上、**共 12 遍**实测标定的均值（例子 4、9 各三遍，其余各一遍）。
+本镜像与本提交随后每个例子各跑一遍：**8/8 退出码为 0**，四类错误计数**全部为 0**，
+每个权重同步 bucket 都是 `skipped=0`，`--check` **8/8 PASS**，且 `k3_kl` 与上表每个参考值
+的偏差都在 **±8.2%** 之内。因此参考值原样保留，而不是用单次实测替换。
+逐次原始记录、容差推导，以及两版镜像之间变了什么，见
 [`VALIDATION.md`](../../release/VALIDATION.md)。
 
 「实测次数」为 1 的例子，参考值就是那一次的实测值，容差取所在组的下限。
@@ -503,10 +514,10 @@ bash release/run_example.sh 1 --check-only --log $DATA_ROOT/logs/example-1-xxx.l
 **例子 9 对例子 6——换 rollout 引擎的代价。** 同模型、同训练配置，把 vLLM 换成 ATOM：
 `k3_kl` 是 0.00138 对 0.00158，即 ATOM **低** 12%，落在例子 9 自身 ±6% 抖动的两倍之内，
 更远在 ±50% 容差之内。**换 rollout 引擎并没有可测量地改变 train / rollout 对齐程度。**
-真正变的是时间：每步 64.3 s 对 117.3 s，ATOM 每步快约 1.8 倍；代价在 setup——
-热态 390 s，当天首次（aiter JIT 缓存被重置过）514 s。所以 3 步的 smoke 看端到端会觉得
-ATOM 更慢，而真正长跑该看的是每步耗时。例子 6 这次 1202 s 的跨度不是反例：
-那一遍付了 57 GB checkpoint 的首次冷读，例子 7 随后就从 page cache 白拿了（501 s）。
+真正变的是时间：每步 56.7 s 对 106.7 s，ATOM 每步快约 1.9 倍；代价在 setup——
+409 s 对 203 s，花在 torch.compile 与捕获 CUDA graph 上。所以 3 步的 smoke 看端到端会觉得
+ATOM 更慢（579 s 对 523 s），而真正长跑该看的是每步耗时。例子 7 是同一个 vLLM rollout
+配 Megatron actor，落在同一量级，每步 103.0 s。
 
 **时间跨度不设容差、不参与判定**：它是训练日志首末时间戳之差，受 kernel 缓存冷热影响，
 同一机器同一镜像上偏差可达 ±15%，只作耗时量级参考。启动器报的端到端墙钟比它多
@@ -608,6 +619,23 @@ ImportError: Unsupported `flydsl` version: expected >=`0.2.4`, got `0.1.8`.
 
 **9. FP8 训练发散**（entropy 极低 / `grad_norm` 与 `rollout_corr/kl` 都是 1e4 量级）：
 见 [6. 排障](06-troubleshooting_cn.md)。
+
+**10. 权重同步后 wake 时 KV 池算出负数**，说明 ATOM rollout 在 sleep 时释放了显存、
+而不是保持常驻。只有 MoE 那个例子会中，而且是在第 0 步已经成功之后：
+
+```
+ATOM/atom/rollout/memory_manager.py:137  resume_memory
+AssertionError: Not enough memory for KV cache with block size(16). At least 1 block
+  (1.50MB) is required, but available_for_kv=-30805.98MB (budget=86.40GB,
+   peak_torch=57.68GB, non_torch=52.88GB, safety=5.76GB, free=177.39GB)
+```
+
+ATOM 每次 wake 都按「`gpu_memory_utilization x total` 减去卡上其它一切已占显存」
+重新推算块数，这里的 `non_torch` 就是同卡上的训练侧——第一次优化器步之后那是 52 GB
+活着的状态。`free=177.39GB` 是关键线索：显存是有的，只是记在了别人账上。
+调大 `gpu_memory_utilization` 不是解法，释放 actor 的分配器缓存也不是——那只让
+`non_torch` 少 0.6 GB。正解是让池子常驻，也就是 §8.1.2 里第二项设置做的事；
+如果你用的是自己的 ATOM 分支，请确认 `sleep_keeps_memory_resident` 能传到它。
 
 ---
 

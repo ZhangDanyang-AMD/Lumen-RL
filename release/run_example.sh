@@ -33,7 +33,7 @@ ATOM_SRC="${ATOM_SRC:-}"
 # Set DOCKER="sudo docker" if your user is not in the docker group.
 DOCKER_CLI="${DOCKER:-docker}"
 read -r -a DOCKER <<<"$DOCKER_CLI"
-IMAGE="${IMAGE:-zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260908}"
+IMAGE="${IMAGE:-zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260910}"
 CONTAINER="${CONTAINER:-lumenrl-release}"
 RL_ROOT_IN_IMAGE="${RL_ROOT_IN_IMAGE:-/opt/lumenrl}"
 RUN_DAPO="$RL_ROOT_IN_IMAGE/Lumen-RL/examples/DAPO/run_dapo.sh"

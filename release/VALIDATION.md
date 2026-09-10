@@ -5,13 +5,14 @@ Measurement record behind the reference table in
 
 | | |
 |---|---|
-| Image | `zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260908`, digest `sha256:41eeaf8d5db5…` |
-| Lumen-RL | `f4439f3` on `dev/dapo_release`, bind-mounted from a checkout — **not** taken from the image, see §8.1.1 |
+| Image | `zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260910`, digest `sha256:cc18a3f5ce16…` |
+| Lumen-RL | `8ca6bdd` on `dev/dapo_release`, bind-mounted from a checkout — **not** taken from the image, see §8.1.1 |
+| | The tree also carried the `release/` and `examples/docs/` changes that the commit adding this record then made (this image tag, this ATOM SHA, this file). Nothing the trainer imports, so the runs are `8ca6bdd`'s. |
 | Hardware | one node, 8x MI355X (gfx950), whole-node allocation |
 | Command | `bash release/run_example.sh <N> --check` |
 | Seed | `10086`, fixed inside `run_dapo.sh` |
 | Metrics read at | step 1 (`step=1`) |
-| Date | 2026-09-08 |
+| Date | 2026-09-10 |
 | Stack in image | `vllm 0.23.0`, `flydsl 0.3.2`, `transformers 5.12.0`, `aiter` resolving to `/opt/lumenrl/aiter/` |
 
 **A result is identified by the image digest and the Lumen-RL commit together.** The
@@ -22,143 +23,129 @@ Every run prints both, and the launcher recreates its container when either chan
 All 8 cards were at the ~298 MB idle baseline before each run, and the launcher
 restarts the container between runs.
 
-## Image build
+## What this round changed
 
-`docker build` has no GPUs, so aiter's JIT kernels are baked in afterwards.
+Two things at once, which is why every example was re-run rather than the ATOM ones:
 
-| stage | duration | result |
-|---|---|---|
-| `build_image.sh` | 11 min | four source trees cloned at the SHAs in `versions.env` |
-| `precompile_kernels.sh` | 8 min | 5 of 16 aiter kernel objects |
-| warm example 4, then `docker commit` | 21 min | 1240 s for a 1-step example 4, PASS, 16/16 objects afterwards |
+- **ATOM moved to the current head of PR #2028**, `28721a5094b9` → `d6b9e147cbf6`.
+- **Lumen-RL was rebased onto `main`** (`7545e2b` → `3d736a2`), which is 12 commits of
+  framework change under the same examples.
 
-The second bake stage is not optional: the synthetic warmup reaches 5 objects, and
-example 4 is the only path wide enough to pull in the remaining 11, being ATOM FP8
-rollout plus FSDP2 FP8 training.
+## Image build: this image was not built, it was re-pinned
 
-`build_image.sh` resolves `LUMENRL_BRANCH` to the SHA it points at and passes that to
-the Dockerfile. The clone layer is cached on the build args, so passing a branch name
-meant a second build on the same machine silently re-used the first build's clone and
-shipped whatever the tip was back then.
+ATOM is only put on `PYTHONPATH` — there is no `pip install` and nothing is compiled —
+so the tree was replaced the way `release/Dockerfile` creates it (`git init`, fetch the
+SHA, `checkout FETCH_HEAD`) inside a container off `260908`, and the result committed.
+That takes 18 s and reuses the baked aiter kernels, against ~40 min for a rebuild.
+The push uploaded one layer; every other layer was already in the registry.
 
-Checks on the published image: the three upstream trees at the SHAs in `versions.env`,
-16 baked kernel objects, both MoE ATOM configs present, and no `DATA_ROOT` baked into
-the environment. Run the launcher from the `release/` directory of a checkout, not from
-inside the image.
+`docker commit` restores `ENTRYPOINT`, `CMD` and `WORKDIR` explicitly, and the
+entrypoint's own version report was checked against `versions.env` afterwards:
+
+```
+Lumen-RL    f4439f38b5dd      <- the baked fallback copy, not what runs
+Lumen       e6379cbd9057
+aiter       4ebe6d69c7f4
+ATOM        d6b9e147cbf6
+```
+
+⚠️ The baked Lumen-RL copy is the tip `dev/dapo_release` had at build time and is now
+an orphaned SHA, because the branch was rebased after the image was made. It only
+exists so the editable install has a path to point at; `run_example.sh` mounts over it.
+A bare `docker run` without that mount lands on pre-rebase code.
 
 ## Runs
 
 `span` is the first-to-last timestamp in the trainer log. `errors` is the combined
 count of `Traceback`, `OutOfMemory`, `CUDA error` and `HSA_STATUS`. `skipped` is the
-number of weight-sync buckets that did not account for every tensor in them; examples
-on the vLLM path emit no such line and count as 0. Examples 4 and 9 are the ones
-sampled repeatedly.
+number of weight-sync buckets that did not account for every tensor in them, out of
+`buckets` total; examples on the vLLM path emit no such line and count 0 of 0.
 
-| ex | span | exit | errors | skipped | `rollout_corr/k3_kl` | `entropy` | `rollout_corr/kl` | `ppl_ratio` | `response_length/mean` |
+| ex | span | exit | errors | skipped / buckets | `rollout_corr/k3_kl` | `entropy` | `rollout_corr/kl` | `ppl_ratio` | `response_length/mean` |
 |---|---|---|---|---|---|---|---|---|---|
-| 1 | 170 s | 0 | 0 | 0 | 0.00105635 | 0.581662 | 0.00105897 | 1.00013 | 411.20 |
-| 2 | 129 s | 0 | 0 | 0 | 0.00498006 | 0.784457 | 0.00537692 | 1.00808 | 414.66 |
-| 3 | 140 s | 0 | 0 | 0 | 0.00403682 | 0.831763 | 0.00419250 | 1.01128 | 418.32 |
-| 4 | 564 s | 0 | 0 | 0 | 0.00243338 | 0.493383 | 0.00309054 | 1.00306 | 734.66 |
-| 4 | 559 s | 0 | 0 | 0 | 0.00241102 | 0.521360 | 0.00210570 | 1.00272 | 780.14 |
-| 4 | 629 s | 0 | 0 | 0 | 0.00376739 | 0.605261 | 0.00342991 | 1.00196 | 687.64 |
-| 5 | 408 s | 0 | 0 | 0 | 0.000929704 | 0.567738 | 0.000880022 | 1.00119 | 719.95 |
-| 6 | 1202 s | 0 | 0 | 0 | 0.00157877 | 0.679286 | 0.00153856 | 1.00147 | 807.45 |
-| 7 | 501 s | 0 | 0 | 0 | 0.00157938 | 0.660039 | 0.00188473 | 1.00270 | 790.08 |
-| 9 | 684 s | 0 | 0 | 0 | 0.00142840 | 0.671092 | 0.00119565 | 1.00099 | 757.06 |
-| 9 | 562 s | 0 | 0 | 0 | 0.00129423 | 0.608896 | 0.00128308 | 1.00155 | 734.99 |
-| 9 | 557 s | 0 | 0 | 0 | 0.00142258 | 0.797094 | 0.00164708 | 1.00175 | 744.15 |
+| 1 | 144 s | 0 | 0 | 0 / 0 | 0.00110113 | 0.654183 | 0.000999021 | 1.00089 | 407.33 |
+| 2 | 129 s | 0 | 0 | 0 / 0 | 0.00517972 | 0.782929 | 0.00507141 | 1.00427 | 425.63 |
+| 3 | 142 s | 0 | 0 | 0 / 0 | 0.00396365 | 0.806861 | 0.00371948 | 1.00568 | 434.39 |
+| 4 | 508 s | 0 | 0 | 0 / 336 | 0.00310421 | 0.631050 | 0.00364320 | 1.00406 | 803.36 |
+| 5 | 402 s | 0 | 0 | 0 / 112 | 0.000955007 | 0.618662 | 0.000948457 | 1.00109 | 736.41 |
+| 6 | 523 s | 0 | 0 | 0 / 0 | 0.00154296 | 0.720107 | 0.00151181 | 1.00167 | 812.75 |
+| 7 | 499 s | 0 | 0 | 0 / 0 | 0.00145876 | 0.744816 | 0.00155241 | 1.00135 | 753.10 |
+| 9 | 579 s | 0 | 0 | 0 / 2352 | 0.00143179 | 0.564593 | 0.00150571 | 1.00186 | 851.48 |
 
-**12/12 exited 0 with zero error lines and zero skipped buckets, and `--check` is
-12/12 PASS.**
+**8/8 exited 0 with zero error lines and zero skipped buckets, and `--check` is
+8/8 PASS.**
 
-## References and tolerances
+## The references were not re-measured, they were re-confirmed
 
-| ex | runs | `k3_kl` | spread | `entropy` | spread | `kl` |
-|---|---|---|---|---|---|---|
-| 1 | 1 | 0.00106 | — | 0.582 | — | 0.00106 |
-| 2 | 1 | 0.00498 | — | 0.784 | — | 0.00538 |
-| 3 | 1 | 0.00404 | — | 0.832 | — | 0.00419 |
-| 4 | 3 | 0.00287 | ±31% | 0.540 | ±12% | 0.00288 |
-| 5 | 1 | 0.000930 | — | 0.568 | — | 0.000880 |
-| 6 | 1 | 0.00158 | — | 0.679 | — | 0.00154 |
-| 7 | 1 | 0.00158 | — | 0.660 | — | 0.00188 |
-| 9 | 3 | 0.00138 | ±6% | 0.692 | ±15% | 0.00138 |
+| ex | reference (runs, image `260908`) | this round | delta | tolerance |
+|---|---|---|---|---|
+| 1 | 0.00106 (1) | 0.00110113 | +3.9% | ±30% |
+| 2 | 0.00498 (1) | 0.00517972 | +4.0% | ±30% |
+| 3 | 0.00404 (1) | 0.00396365 | −1.9% | ±30% |
+| 4 | 0.00287 (3) | 0.00310421 | +8.2% | ±50% |
+| 5 | 0.000930 (1) | 0.000955007 | +2.7% | ±50% |
+| 6 | 0.00158 (1) | 0.00154296 | −2.3% | ±50% |
+| 7 | 0.00158 (1) | 0.00145876 | −7.7% | ±50% |
+| 9 | 0.00138 (3) | 0.00143179 | +3.8% | ±50% |
 
-Each reference is the mean over that example's runs on this image. The tolerance is a
-per-group floor: `k3_kl` 30% at 512 tokens and 50% at 4096; `entropy` 25% at 512, 50%
-at 4096, 60% for the three MoE examples. Example 4 has the widest spread and uses 62%
-of its band, so the floors carry the observed spread with margin.
+`k3_kl` lands within ±8.2% on all eight, against tolerances of 30–50%, so **the
+references in `run_example.sh` and §8.5.1 are left exactly as they were.** They are
+means over the 12 runs on the previous image; replacing a 3-run mean with one run on
+this image would be a worse estimator, not a fresher one, and example 4 is the standing
+argument for that — its three runs came in at 0.00241, 0.00243 and 0.00377, so any one
+of them alone would misjudge the others.
 
-**Example 4 is the argument against tightening the floors to a single run.** Its three
-runs came in at 0.00241, 0.00243 and 0.00377. Either of the first two, taken alone as
-the reference, would put the third outside a ±50% band — a reproduction that is in fact
-correct would be reported as a regression.
+`entropy` moves more, from −18.4% (example 9) to +16.9% (example 4), and stays inside
+its bands. That is the metric the chapter already describes as a coarse batch-level
+sanity check on a 4k run; the eight `k3_kl` figures are what say the stack reproduces.
 
-## Example 9 against example 6
+**No example changed which side of a tolerance it is on, in either metric.** ATOM
+moving one PR head and the framework gaining 12 commits of `main` did not move a
+published number out of band.
 
-The two differ only in the rollout engine, so subtracting them is meaningful.
+## Four defects on `main` that this sweep found
 
-| | example 6 (vLLM) | example 9 (ATOM) |
+The first pass of the sweep failed five of the eight examples. None of the causes were
+in the release path; all four were latent on `main` and are fixed in the commits above
+this record.
+
+| examples | symptom | cause |
 |---|---|---|
-| `k3_kl` | 0.00158 | 0.00138 (−12%) |
-| per step | 117.3 s | 64.3 s (1.8x faster) |
-| setup | 884 s | 514 s cold, 388–390 s warm |
+| 1, 2, 3, 5, 6 | `TypeError: OptimizerConfig.__init__() got an unexpected keyword argument 'optimizer'` | the shared `optimizer_config` dict carried Megatron's spelling of the field, which the FSDP2 dataclass does not declare |
+| 6, 7 | `ValueError: moe_backend='' is not supported for unquantized MoE` | `VLLMConfig` declared `moe_backend` twice; the second declaration replaced the `"auto"` default the trainer's guard checks for |
+| 7 | `AttributeError: module 'lumenrl.engine.training.dsv4_megatron_bridge' has no attribute 'is_dsv4'` | dropped when that module was rewritten, while `MegatronNativeEngine` still calls it for every model |
+| 7 | `RuntimeError: The size of tensor a (4254) must match the size of tensor b (4255)` | the position-bucket diagnostic subtracted three tensors that share a frame but not a width |
 
-`k3_kl` moves by less than example 9's own run-to-run spread doubled, so **replacing
-the rollout engine does not measurably change train/rollout alignment**. The per-step
-figure is the real difference and the reason a long run favours ATOM; a 3-step smoke
-does not, because setup dominates it.
+The fifth failure was the ATOM re-pin itself and is the reason
+`sleep_keeps_memory_resident` is now pinned: see `versions.env` and §8.1.2. Example 9
+reached step 0, synced weights with `skipped=0`, and then aborted all eight replicas in
+`resume_memory` with a negative KV pool, because ATOM now re-derives the block count on
+every wake and the colocated trainer is 52 GB of the budget it subtracts.
 
-Example 6's 884 s setup is not a fair comparison point: that single run paid the first
-read of the 57 GB checkpoint, which example 7 then got from page cache and finished
-setup in 191 s. Example 9's own cold/warm gap (514 s vs 389 s) is aiter's JIT cache
-being rebuilt after the container was recreated, the same effect on a smaller scale.
+⚠️ **Releasing the actors' allocator cache before the wake does not fix that** — it was
+tried and moves `non_torch` by 0.6 GB, because after an optimizer step that memory is
+live state rather than cache. Only keeping the pool resident works.
 
 ## Limits of this record
 
-- **Examples 1, 2, 3, 5, 6 and 7 have one sample each**, so their references are a
-  single measurement and the spread column is empty. The tolerances are the group
-  floors rather than something these runs established. Example 5 had three samples on
-  the previous image and does not here.
-- **Example 6 has one sample and an unrepresentative span**, for the page-cache reason
-  above. Its metrics are unaffected; only the timing is.
+- **One sample per example this round.** The per-example spread is inherited from the
+  12 runs on `260908`, not re-established here; this round tests whether the published
+  references still hold, which is a weaker claim than establishing them.
+- **Examples 1, 2, 3 and 6 were run at `8ca6bdd`, as were 4, 5, 7 and 9**, but in two
+  batches — 4/5/7/9 first, then 1/2/3/6 — so page-cache state differs between them.
+  It affects `span`, not the metrics.
+- **`span` is not a benchmark.** It is dominated by how warm the kernel and page caches
+  are. Example 6's 523 s here against 1202 s on `260908` is that single earlier run
+  paying the first read of the 57 GB checkpoint, not a speedup.
 - **Long runs were not carried to completion.** Only the smoke configs ran. `--longrun`
   is exercised by `--dry-run`, which selects the right yaml, sets `STEPS=1000` and
-  handles a missing wandb key. This includes example 9's new
-  `dapo_qwen3moe_a3b_ray_atom_bf16_longrun.yaml`.
+  handles a missing wandb key.
 - **Logging to a real wandb project was not exercised**, only the no-key path.
 - **gfx942 was not tried.** This image is built for gfx950.
-- **The from-scratch `docker pull` path was not re-timed.** The published digest was
-  confirmed against the local image, but no run started from a cold pull.
-- **Cold `docker pull` duration is network-bound** and not quoted; §8.3.2 gives the
-  download size instead.
-- **Two changes landed after these measurements**, both inert against the pinned
-  ATOM: `ATOM_SRC` in the launcher, which is empty by default, and a
-  `true_vocab_size` engine kwarg alongside the environment variable the pinned
-  ATOM reads. ATOM filters engine kwargs against its `Config` dataclass fields
-  and the pinned build has no such field, so it drops the kwarg — verified
-  directly. The references stand.
-
-## A/B against a rebased ATOM branch
-
-The three ATOM examples were re-run against a cleaned-up ATOM branch mounted
-over the image's copy (`ATOM_SRC`), to check that reorganising that work changed
-no numbers. One run each, against the references above.
-
-| ex | reference (runs) | rebased ATOM | delta |
-|---|---|---|---|
-| 4 | 0.00287 (3, ±31%) | 0.00229 | −20% |
-| 5 | 0.000930 (1) | 0.000948 | +2% |
-| 9 | 0.00138 (3, ±6%) | 0.00160 | +16% |
-
-All three PASS, all `skipped=0`, and per-step time is unchanged (63.5 s against
-64.3 s on example 9). Examples 4 and 5 sit inside the reference spread.
-
-**Example 9 lands 12% above the highest of its three reference runs, and that is
-not explained.** No code path in the branch should reach it: the routed-expert
-routing only triggers on per-expert names, and this stack renames the fused ones
-upstream of ATOM. The most likely reading is that three samples underestimate
-the spread — the one reference run that was also a cold start after a container
-recreate, like this one, was itself the highest of the three. Recorded rather
-than resolved; it did not warrant more machine time at the tolerances in use.
+- **The from-scratch `docker pull` path was not re-timed.** The pushed digest was
+  confirmed against the local image and the manifest read back from the registry, but
+  no run started from a cold pull.
+- **`sleep_keeps_memory_resident` was not measured against releasing on the 8B
+  examples.** Both work there; the pin is justified by example 9, where releasing does
+  not, and by it being the behaviour the previous ATOM had unconditionally. What the
+  per-step cost of a graph recapture actually is on 4 and 5 was not quantified.

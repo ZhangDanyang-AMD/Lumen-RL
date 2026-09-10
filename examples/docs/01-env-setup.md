@@ -45,7 +45,7 @@ git clone -b lumen/triton_kernels https://github.com/ZhangDanyang-AMD/aiter.git
 # ATOM (examples 4, 5) is pinned at the head of upstream ROCm/ATOM PR #2028; see
 # chapter 8 §8.1.1. The PR is unmerged, so take it by SHA rather than by branch:
 git init ATOM && git -C ATOM remote add origin https://github.com/ROCm/ATOM.git
-git -C ATOM fetch --depth 1 origin 28721a5094b9753b9d5a7c68abcceec928bb1bfb
+git -C ATOM fetch --depth 1 origin d6b9e147cbf66e0e5dcfa0ee5fdcf06aa256fc95
 git -C ATOM checkout FETCH_HEAD
 
 # aiter's JIT needs composable_kernel. Without it, examples 3/4/5 fail to find
@@ -64,7 +64,7 @@ git -c http.version=HTTP/1.1 clone --depth 1 --single-branch -b dev/vllm-fsdp-da
 git -c http.version=HTTP/1.1 clone --depth 1 --single-branch -b amd-atom-rollout     "$GHP/ZhangDanyang-AMD/Lumen.git"
 git -c http.version=HTTP/1.1 clone --depth 1 --single-branch -b lumen/triton_kernels "$GHP/ZhangDanyang-AMD/aiter.git"
 git init ATOM && git -C ATOM remote add origin "$GHP/ROCm/ATOM.git"
-git -C ATOM -c http.version=HTTP/1.1 fetch --depth 1 origin 28721a5094b9753b9d5a7c68abcceec928bb1bfb
+git -C ATOM -c http.version=HTTP/1.1 fetch --depth 1 origin d6b9e147cbf66e0e5dcfa0ee5fdcf06aa256fc95
 git -C ATOM checkout FETCH_HEAD
 
 cd "$RL_ROOT/aiter"
