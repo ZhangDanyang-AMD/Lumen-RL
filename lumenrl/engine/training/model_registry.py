@@ -110,6 +110,12 @@ class ModelSpec:
     build_layer_spec: Optional[Callable[..., Any]] = None
     # ``(tfcfg) -> int`` extra sequence-length alignment the family requires.
     sequence_alignment: Optional[Callable[[Any], int]] = None
+    # ``(engine) -> Iterable[(name, tensor)]`` -- the rollout-ready weight stream.
+    # Which parameter gather to use and how to rename on the way out are both
+    # family decisions, so they travel together in one hook rather than as two
+    # branches in the engine. The engine passes itself because the gathers are its
+    # own helpers; specs live in the same package, so this coupling stays internal.
+    export_weights: Optional[Callable[[Any], Any]] = None
     # Live expert check. Defaults to the declared cap ORed with the effective
     # expert count, so engine_config's ``num_experts`` override still decides.
     has_experts: Optional[Callable[[Mapping[str, Any], Mapping[str, Any]], bool]] = None

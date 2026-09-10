@@ -199,3 +199,77 @@ def test_caps_defaults_stay_permissive_for_new_families():
     assert caps.builds_own_config is False
     assert caps.requires_pipeline_forward is False
     assert caps.packed_stream_is_single_sequence is False
+
+
+# --- weight export hook (phase 3) --------------------------------------------
+
+def test_every_family_supplies_a_weight_exporter():
+    """The engine calls ``spec.export_weights(self)`` unconditionally now.
+
+    A spec without one would raise TypeError at the first rollout weight sync,
+    which is far from where the mistake was made.
+    """
+    for spec in _all_specs():
+        assert spec.export_weights is not None, f"{spec.name} has no exporter"
+        assert callable(spec.export_weights)
+
+
+def test_exporters_are_distinct_per_family():
+    """DSv4 renames to checkpoint names, MoE and dense use different gathers."""
+    exporters = {s.name: s.export_weights for s in _all_specs()}
+    assert len({id(f) for f in exporters.values()}) == 3
+
+
+def test_dense_exporter_uses_the_plain_gather_and_te_naming(monkeypatch):
+    """Pin the wiring without needing real tensors: patch the bridge, check inputs."""
+    from lumenrl.engine.training import model_specs as ms
+
+    seen = {}
+
+    def fake_megatron_to_hf(named, dims, te=False):
+        seen["gather"] = named
+        seen["te"] = te
+        return iter(())
+
+    monkeypatch.setattr(ms, "megatron_to_hf", fake_megatron_to_hf)
+
+    sentinel = object()
+
+    class FakeEngine:
+        _dims = None
+
+        def _full_megatron_named_params(self):
+            return sentinel
+
+        def _full_megatron_named_params_moe(self):
+            raise AssertionError("dense must not use the MoE gather")
+
+    list(ms._export_dense(FakeEngine()))
+    assert seen["gather"] is sentinel
+    assert seen["te"] is True
+
+
+def test_moe_exporter_uses_the_moe_gather(monkeypatch):
+    from lumenrl.engine.training import model_specs as ms
+
+    seen = {}
+
+    def fake_megatron_to_hf_moe(named, dims):
+        seen["gather"] = named
+        return iter(())
+
+    monkeypatch.setattr(ms, "megatron_to_hf_moe", fake_megatron_to_hf_moe)
+
+    sentinel = object()
+
+    class FakeEngine:
+        _dims = None
+
+        def _full_megatron_named_params(self):
+            raise AssertionError("MoE must not use the plain gather")
+
+        def _full_megatron_named_params_moe(self):
+            return sentinel
+
+    list(ms._export_moe(FakeEngine()))
+    assert seen["gather"] is sentinel

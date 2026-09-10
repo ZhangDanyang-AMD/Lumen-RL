@@ -8,6 +8,7 @@ catch-all.
 
 from __future__ import annotations
 
+import itertools
 from typing import Any, Mapping
 
 from lumenrl.engine.training import dsv4_megatron_bridge as dsv4
@@ -18,8 +19,11 @@ from lumenrl.engine.training.model_registry import (
     hf_num_experts,
     resolve_head_dim,
 )
-from lumenrl.engine.training.qwen3_megatron_bridge import Qwen3Dims
-from lumenrl.engine.training.qwen3moe_megatron_bridge import build_moe_dims
+from lumenrl.engine.training.qwen3_megatron_bridge import Qwen3Dims, megatron_to_hf
+from lumenrl.engine.training.qwen3moe_megatron_bridge import (
+    build_moe_dims,
+    megatron_to_hf_moe,
+)
 
 
 def _effective_num_experts(hf: Mapping[str, Any], ec: Mapping[str, Any]) -> int:
@@ -29,6 +33,27 @@ def _effective_num_experts(hf: Mapping[str, Any], ec: Mapping[str, Any]) -> int:
     dense checkpoint can be driven down the MoE path and vice versa.
     """
     return int(ec.get("num_experts") or hf_num_experts(hf) or 0)
+
+
+def _export_dsv4(engine):
+    """DSv4 gathers like Qwen3-MoE but must land on the *checkpoint* names.
+
+    The rollout side feeds these straight to vLLM's own ``load_weights``, so the
+    renaming, not the gather, is what differs.
+    """
+    named = itertools.chain(
+        engine._full_megatron_named_params_moe(),
+        engine._dsv4_router_bias_buffers(),
+    )
+    return dsv4.megatron_to_dsv4_native(named)
+
+
+def _export_moe(engine):
+    return megatron_to_hf_moe(engine._full_megatron_named_params_moe(), engine._dims)
+
+
+def _export_dense(engine):
+    return megatron_to_hf(engine._full_megatron_named_params(), engine._dims, te=True)
 
 
 def _dense_dims(hf: Mapping[str, Any]) -> Qwen3Dims:
@@ -78,6 +103,7 @@ DSV4 = MODEL_REGISTRY.register(
         build_config=lambda *a, **kw: dsv4.build_dsv4_config(*a, **kw),
         build_layer_spec=lambda *a, **kw: dsv4.build_dsv4_spec(*a, **kw),
         sequence_alignment=lambda tfcfg: dsv4.sequence_alignment(tfcfg),
+        export_weights=_export_dsv4,
     )
 )
 
@@ -96,6 +122,7 @@ QWEN3_MOE = MODEL_REGISTRY.register(
         caps=ModelCaps(has_experts=True),
         build_dims=build_moe_dims,
         routing_defaults={"moe_router_pre_softmax": False},
+        export_weights=_export_moe,
     )
 )
 
@@ -109,5 +136,6 @@ QWEN3_DENSE = MODEL_REGISTRY.register(
         detect=lambda hf, ec: True,
         caps=ModelCaps(has_experts=False),
         build_dims=_dense_dims,
+        export_weights=_export_dense,
     )
 )

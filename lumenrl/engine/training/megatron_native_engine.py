@@ -15,7 +15,6 @@ are reconstructed with a differentiable CP all-reduce.
 
 from __future__ import annotations
 
-import itertools
 import json
 import logging
 import math
@@ -37,14 +36,12 @@ from lumenrl.engine.training.model_registry import (
 from lumenrl.engine.training.qwen3_megatron_bridge import (
     hf_to_megatron,
     load_hf_safetensors,
-    megatron_to_hf,
 )
 from lumenrl.engine.training.qwen3moe_megatron_bridge import (
     _expert_local_index,
     _non_expert_hf_to_megatron,
     hf_expert_fc1,
     hf_expert_fc2,
-    megatron_to_hf_moe,
 )
 
 # Registers the ModelSpec entries on MODEL_REGISTRY. Imported for the
@@ -992,20 +989,9 @@ class MegatronNativeEngine(MegatronBaseEngine):
         """
         assert self.module is not None
         _mem_diag_note("weight_sync gather begin")
-        if not self._caps.supports_hf_bridge:
-            # The gather is shared: DSv4's grouped experts carry the same Megatron
-            # names Qwen3-MoE does. Only the naming on the way out differs, and it
-            # has to land on the DSv4 *checkpoint* names, because the rollout side
-            # feeds them to vLLM's own ``load_weights``.
-            named = itertools.chain(
-                self._full_megatron_named_params_moe(),
-                self._dsv4_router_bias_buffers(),
-            )
-            gen = dsv4.megatron_to_dsv4_native(named)
-        elif getattr(self, "_is_moe", False):
-            gen = megatron_to_hf_moe(self._full_megatron_named_params_moe(), self._dims)
-        else:
-            gen = megatron_to_hf(self._full_megatron_named_params(), self._dims, te=True)
+        # Which gather to use and how to rename on the way out are one decision,
+        # owned by the family. See ``model_specs`` for the three implementations.
+        gen = self._spec.export_weights(self)
         return _mem_diag_stream("weight_sync gather", gen), None
 
     def is_mp_src_rank_with_outputs(self) -> bool:
