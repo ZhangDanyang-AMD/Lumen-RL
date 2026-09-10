@@ -21,6 +21,7 @@ except ModuleNotFoundError:
 
 import lumenrl.engine.training  # noqa: F401 - populate EngineRegistry
 from lumenrl.algorithms.loss_functions import asymmetric_clip_loss
+from lumenrl.core.config import OptimizerConfig
 from lumenrl.core.protocol import DataProto
 from lumenrl.engine.training import megatron_engine, megatron_lumen_dsv4_engine
 from lumenrl.engine.training.base_engine import EngineRegistry
@@ -381,8 +382,12 @@ def test_actor_optimizer_config_propagates_optimizer_type() -> None:
         {"optimizer_type": "sgd", "sgd_momentum": 0.0}
     )
 
-    assert config["optimizer"] == "sgd"
+    assert config["optimizer_type"] == "sgd"
     assert config["sgd_momentum"] == 0.0
+
+    # The same dict is what the FSDP2 engine builds its OptimizerConfig from, so
+    # every key in it has to be a field on that dataclass.
+    assert OptimizerConfig(**config).optimizer_type == "sgd"
 
 
 def test_rdma_weight_sync_releases_cuda_cache_before_gather(monkeypatch) -> None:

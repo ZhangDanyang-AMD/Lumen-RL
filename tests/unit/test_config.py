@@ -71,6 +71,21 @@ def test_vllm_prefix_cache_schema_parity() -> None:
         assert config_type().enable_prefix_caching is False
 
 
+def test_vllm_backend_defaults_are_the_leave_it_to_vllm_sentinel() -> None:
+    # A second `moe_backend: str = ""` further down the same dataclass silently
+    # replaced this default, and the trainer only skips "auto" -- so every MoE
+    # config that does not name a backend asked vLLM for one called "", which an
+    # unquantized MoE model rejects. One declaration, one default.
+    for config_type in (CoreVLLMConfig, TrainingVLLMConfig):
+        names = [field.name for field in fields(config_type)]
+        assert len(names) == len(set(names)), (
+            f"{config_type.__module__}.{config_type.__name__} declares a field twice: "
+            f"{sorted({n for n in names if names.count(n) > 1})}"
+        )
+    assert CoreVLLMConfig().moe_backend == "auto"
+    assert CoreVLLMConfig().linear_backend == "auto"
+
+
 def test_from_yaml() -> None:
     assert GRPO_YAML.is_file(), f"Missing fixture config: {GRPO_YAML}"
     cfg = LumenRLConfig.from_yaml(GRPO_YAML)

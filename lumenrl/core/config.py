@@ -53,13 +53,14 @@ class OptimizerConfig:
     total_training_steps: int = 1000
     min_lr_ratio: float = 0.0
     num_cycles: float = 0.5
-    # Mirror of the same three fields on PolicyConfig, which is where configs
+    # Mirror of the same four fields on PolicyConfig, which is where configs
     # set them. ``actor_worker._build_optimizer_config`` forwards them here for
     # the Megatron engines to read; declaring them keeps the FSDP2 path, which
     # builds this dataclass from that same dict, from rejecting them.
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95
     adam_eps: float = 1e-8
+    sgd_momentum: float = 0.0
 
 
 @dataclass
@@ -259,6 +260,11 @@ class VLLMConfig:
     dtype: str = "bfloat16"
     enforce_eager: bool = True
     disable_custom_all_reduce: bool = False
+    # vLLM `moe_backend=` / `linear_backend=`. "auto" (or "") leaves vLLM's own
+    # selection and is not passed through. DeepSeek-V4 on gfx950 must pass
+    # "triton": vLLM's own selection picks AITER and dies in the first forward at
+    # `moe_sorting_opus_fwd`, and "triton_unfused" is FP4-only and raises
+    # ValueError.
     moe_backend: str = "auto"
     linear_backend: str = "auto"
     enable_chunked_prefill: bool = True
@@ -269,10 +275,6 @@ class VLLMConfig:
     trust_remote_code: bool = True
     # Rollout quantization: "" / "fp8" / "fp8_per_block" (vLLM `quantization=`)
     quantization: str = ""
-    # vLLM `moe_backend=`. "" leaves vLLM's own default. DeepSeek-V4 on gfx950 must
-    # pass "triton": the default auto-selects AITER and dies in the first forward at
-    # `moe_sorting_opus_fwd`, and "triton_unfused" is FP4-only and raises ValueError.
-    moe_backend: str = ""
     # When True, vLLM returns per-token rollout log-probs needed for TIS / MIS
     # rollout correction (verl: actor_rollout_ref.rollout.calculate_log_probs).
     calculate_log_probs: bool = False

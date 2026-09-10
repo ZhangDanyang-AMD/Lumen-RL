@@ -60,16 +60,13 @@ during initialization`。这条只是症状，**一定要往上读 replica 侧�
 
   `/tmp/aiter_configs` 本身也要清：不清的话 aiter 会静默沿用上一次的合并调优配置。
 
-**例子 5 能跑起来但 `rollout_corr/kl` 高了约 7 倍。** 这与上面的崩溃是两件事，而且不触发
-失败判据——exit 0，生成侧健康（`reward/accuracy` 0.17、`ppo_kl` ≈ 0、`grad_norm` 0.76、
-零次 `kept 0/`、零次 `finished with reason max`）。只有训练与 rollout 的 log-prob 差距不对：
-两次分别测到 0.0074 和 0.0077，而此前同一配置实测是 0.00085~0.00111、§4.7 的期望是 ~0.001。
-同一套栈上例子 4 也偏高（0.0051 和 0.0089，期望 ~0.004）。
+**例子 5 能跑起来但 `rollout_corr/kl` 明显偏高。** 这与上面的崩溃是两件事，而且不触发
+失败判据——exit 0，生成侧健康（`ppo_kl` ≈ 0、零次 `kept 0/`、零次
+`finished with reason max`），只有训练与 rollout 的 log-prob 差距不对。
 
-例子 5 存在的意义正是回答"差距来自 FP8 还是 ATOM 对齐"，而它**高于**例子 4 就说明答案是
-对齐而不是量化。文档点名的首要嫌疑在 ATOM `7173f5b` 上不成立——那里
-`atom/model_ops/layernorm.py` 的两个调用点都已经传了 `use_model_sensitive_rmsnorm=1`。
-所以遇到这个现象不必再去核那个开关，问题在别处，值得向上游反馈。
+例子 5 存在的意义正是回答「差距来自 FP8 还是 ATOM 对齐」：它**高于**例子 4 就说明答案是
+对齐而不是量化。这时不必再去核 `use_model_sensitive_rmsnorm`——本发布钉的 ATOM 在
+`atom/model_ops/layernorm.py` 的两个调用点都已经传了它。问题在别处，值得向上游反馈。
 
 **ATOM rollout 退化**（`MODE=atomfp8` / `atombf16` 时 `filter_groups: kept 0/96` +
 `Rollout reward: accuracy=0.0000` + 日志大量 `finished with reason max`、无 `eos`）：

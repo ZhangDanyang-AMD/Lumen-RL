@@ -15,6 +15,13 @@
 **一句话复现**：设路径变量 -> clone 仓库 -> 起容器装依赖 ->（FP8 才需要）打 patch ->
 下模型和数据 -> smoke -> `docker exec -d` 起长跑。
 
+> ⚡ **不想从源码搭？** 例子 1–7 和 9 有一条用**已发布容器镜像**的快速路径：镜像里软件栈已固定、
+> kernel 已烘好，每个例子一条命令，还能自动比对参考值判 PASS/FAIL。
+> 见 [**8. 用发布镜像跑八个例子**](docs/08-release_cn.md)——
+> 从 `git clone` 到第一个例子出结论只要四条命令，本页 1–4 章可以整段跳过。
+> 镜像提供环境、把你的 checkout 挂进去当代码，所以**改 Lumen-RL 不需要重建镜像**；
+> 只有换模型或跑双节点（例子 8）才需要下面这条从零搭的路。
+
 ---
 
 ## 已跑通的例子
@@ -29,9 +36,13 @@
 | 6 | MoE FSDP2 | Qwen3-30B-A3B-Base | Lumen FSDP2，BF16 | vLLM / BF16 | 同上 | 同上 | `MODE=bf16` + MoE config |
 | 7 | MoE Megatron EP=8 | Qwen3-30B-A3B-Base | **Megatron-Native**，TP=PP=CP=1，EP=8，DP=8 | vLLM / BF16 | 同上 | 同上 | `MODE=bf16` + Megatron config |
 | 8 | MoE 双节点 RDMA | Qwen3-30B-A3B | **Megatron-Native**，TP=4，EP=8 | vLLM TP=2 x 4 / BF16 | 2x 8x MI308X（gfx942） | `qwen3-30b-a3b:rollout` + `trainer` | [训推分离部署指南](docs/07-disaggregated-rdma_cn.md) |
+| 9 | MoE ATOM BF16 | Qwen3-30B-A3B-Base | Lumen FSDP2，BF16 | **ATOM** / BF16 | 8x MI355X（gfx950） | `vllm/vllm-openai-rocm:v0.23.0` | `MODE=atombf16` + MoE config |
 
 例子 1-7 在 **8x MI355X** 和 **8x MI325X** 上都跑通过：smoke + 长跑，exit 0、无 Traceback、
 无 OOM、无 `HSA_STATUS`，权重同步覆盖率断言全过，收尾后显存回到约 298 MB/卡的空闲基线。
+
+例子 9 是把例子 6 的 rollout 从 vLLM 换成 ATOM，只在 **8x MI355X** 上跑过；
+它是唯一一个让 MoE 专家权重走 ATOM 权重同步这条路的例子。
 
 例子 8 在 **2x 8x MI308X** 上运行训推分离部署：节点 1 Megatron 训练，节点 2 vLLM rollout，
 通过 RCCL/RoCE GPU Direct RDMA 权重同步（9-rank 进程组）。完整部署流程见
@@ -104,3 +115,7 @@ sudo docker exec "$CONTAINER" bash -lc \
 | 5 | [多节点 RDMA](docs/05-multinode-rdma_cn.md) | RDMA 预检、启动/checkpoint 验证、基线（仅双节点） |
 | 6 | [排障](docs/06-troubleshooting_cn.md) | 所有已知故障模式及修复 |
 | 7 | [训推分离双节点 RDMA](docs/07-disaggregated-rdma_cn.md) | 完整部署：Megatron 训练 + vLLM rollout，RDMA 权重同步，从零搭建 |
+| 8 | [**用发布镜像跑八个例子**](docs/08-release_cn.md) | ⚡ **快速路径，可替代 1–4 章**：`docker pull` + 一条命令跑例子 1–7 和 9，自带清场、日志、指标比对（`--check`）、参考值与容差 |
+
+第 1–7 章是**从源码搭一套**，第 8 章是**用已发布的镜像**。两条路跑的是同一批例子
+（第 8 章的 1–7 和 9 就是上面表里的同号例子），指标可以互相对照；例子 8（双节点）只有第 7 章覆盖。

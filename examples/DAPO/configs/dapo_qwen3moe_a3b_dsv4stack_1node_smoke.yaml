@@ -1,0 +1,174 @@
+# Qwen3-30B-A3B on the DSv4 STACK: same infrastructure, ordinary MoE model.
+#
+# Diagnostic, not a training recipe. It answers one question that neither of the
+# existing lines can: which of DSv4's problems belong to the DSv4 *model* and
+# which belong to the stack it runs on?
+#
+# DSv4 and Qwen3-MoE do not currently share a Megatron. ray_env_dsv4_primus.sh
+# puts ~/dsv4/mhc_probe/megatron_dsv4 first on PYTHONPATH, so DSv4 resolves
+# megatron.core to a patched 0.16.0rc0 fork while every Qwen3 config gets the
+# 0.18.2 in the shared NFS tree (docs/agent/dsv4_agent.md 3.6). Run this one WITH
+# the DSv4 env and the DSv4 topology, and the only remaining difference is the
+# model itself.
+#
+#   RAY=1 DETACH=1 STEPS=3 \
+#   CFG=examples/DAPO/configs/dapo_qwen3moe_a3b_dsv4stack_1node_smoke.yaml \
+#     bash scripts/primus/run_dsv4_dapo_1node.sh
+#
+# Derived from dapo_qwen3moe_a3b_ray_megatron_smoke.yaml. Every deviation below
+# moves a knob TOWARD the DSv4 configuration; nothing is tuned for speed.
+#
+#   seq 2048 -> 4096                 the requested 4k
+#   rollout TP 1 -> 8                DSv4 always runs TP=8 (TP=1 memory-faults on
+#                                    gfx950 for DSv4, 4.4). It also puts the run
+#                                    on the replicas<workers branch that
+#                                    _ipc_endpoints_match_actors now routes to
+#                                    CUDA-IPC -- this config and the DSv4 ones are
+#                                    the only two families that branch touches.
+#   moe_backend -> triton            required for DSv4: aiter and auto both die on
+#                                    API drift (7.3)
+#   deterministic_mode -> true       DSv4 needs it; asserts unless NCCL_ALGO=Ring,
+#                                    which ray_env_dsv4_primus.sh sets
+#   enable_dynamic_batch -> false    DSv4 cannot use packed-thd dynamic batching,
+#                                    so leaving it on would exercise a path DSv4
+#                                    never takes
+#   gpu_memory_utilization 0.40 ->   at TP=8 the 30B weights are ~7.5 GB/GPU; 0.40
+#     0.15                           would reserve 115 GB and squeeze EP=8 training
+#
+# EP=8 / TP=1 / PP=1 / CP=1 is already DSv4's single-node topology, so the
+# training-side parallelism is unchanged from the Qwen3 smoke.
+#
+# ⚠️ AITER ends up OFF here, and so does it for DSv4. ray_env_dsv4_primus.sh
+# exports VLLM_ROCM_USE_AITER=1, but run_dapo.sh runs afterwards and its MODE=bf16
+# branch unconditionally resets it to 0. That makes this run faithful to what
+# DSv4 actually executes rather than to what 7.3 documents -- which is the point.
+#
+# Judge the rollout by rollout_corr/kl: Qwen3-30B-A3B sits near 8.4e-4
+# (examples/docs/07) to 1.7e-3 (5.1). A value in that band means the DSv4 stack
+# is not distorting an ordinary MoE; a wild one indicts the stack, not the model.
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    actor:
+      num_workers: 8
+      dispatch_mode: dp_compute_proto
+
+policy:
+  model_name: "${oc.env:DATA_ROOT}/models/Qwen3-30B-A3B-Base"
+  training_backend: megatron_native
+  generation_backend: vllm
+  max_total_sequence_length: 4096
+  max_response_length: 1024
+  train_global_batch_size: 128         # 8 prompts x 16 generations
+  gen_batch_size: 24                   # over-sample prompts/round for filter_groups
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 4096
+  learning_rate: 1.0e-6
+  lr_warmup_steps: 10
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  training:
+    optimizer_dtype: bf16
+    megatron_cfg:
+      use_distributed_optimizer: true
+      # DSv4's single-node topology, unchanged from the Qwen3 smoke.
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      context_parallel_size: 1
+      expert_model_parallel_size: 8
+      moe_grouped_gemm: false             # CUTLASS grouped_gemm unavailable on ROCm
+      moe_aux_loss_coeff: 0.0
+      moe_router_dtype: fp32
+      deterministic_mode: true
+      log_probs_chunk_size: 1024
+      enable_dynamic_batch: false
+    fsdp_cfg:
+      param_offload: false
+      optimizer_offload: false
+  generation:
+    vllm_cfg:
+      transport: ray_http
+      ray_http_start_server: false
+      tensor_parallel_size: 8
+      moe_backend: triton
+      gpu_memory_utilization: 0.15
+      max_model_len: 4096
+      dtype: bfloat16
+      enforce_eager: true
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 4096
+      max_num_seqs: 64
+      quantization: ""
+      calculate_log_probs: true
+      enable_sleep_mode: false
+      update_weights_bucket_megabytes: 512
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+
+algorithm:
+  name: dapo
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  loss_agg_mode: token-mean
+  dapo:
+    num_generations: 16
+    kl_coeff: 0.0
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 10.0
+    dynamic_sampling: true
+    token_level_pg: true
+    overlong_reward_shaping: true
+    max_resp_len: 1024
+    filter_groups:
+      enable: true
+      metric: acc
+      max_num_gen_batches: 10
+    overlong_buffer:
+      enable: true
+      len: 512
+      penalty_factor: 1.0
+      log: false
+
+reward:
+  type: function
+  function: lumenrl.rewards.math_reward.dapo_math_reward
+  dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet"
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+    rollout_is_batch_normalize: false
+
+val_dataset: ""
+val_steps: 0
+val_batch_size: 0
+eval:
+  enabled: false
+  num_samples: 0
+
+checkpointing:
+  checkpoint_dir: ""
+  save_steps: 1000
+  save_total_limit: 0
+  resume: false
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 3
+seed: 10086

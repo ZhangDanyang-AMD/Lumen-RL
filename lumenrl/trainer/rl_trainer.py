@@ -450,9 +450,12 @@ class RLTrainer:
             enable_sleep_mode=bool(vcfg.enable_sleep_mode),
             disable_log_stats=True,
         )
-        if str(vcfg.moe_backend) != "auto":
+        # "" is the same sentinel as "auto": both mean "let vLLM select". Passing
+        # "" through reaches vLLM as an explicit request for a backend named "",
+        # which an unquantized MoE model rejects outright.
+        if str(vcfg.moe_backend) not in ("auto", ""):
             engine_kwargs["moe_backend"] = str(vcfg.moe_backend)
-        if str(vcfg.linear_backend) != "auto":
+        if str(vcfg.linear_backend) not in ("auto", ""):
             engine_kwargs["linear_backend"] = str(vcfg.linear_backend)
         if bool(getattr(self.config.moe.r3, "enabled", False)):
             # Patched vLLM/MILES captures [seq_len-1, num_layers, top_k]
@@ -503,6 +506,29 @@ class RLTrainer:
             mgr.num_replicas, tp,
             colocation_wg is not self._actor_wg,
             weight_backend,
+        )
+
+    def _release_actor_cached_memory(self) -> None:
+        """Drop the actors' cached-but-unused device memory before an ATOM replica
+        sizes its KV cache.
+
+        ATOM subtracts everything the driver reports as occupied on the device
+        (``non_torch``) from ``gpu_memory_utilization x total``, so the post-shard
+        allocator cache of a colocated FSDP2 actor -- 113.6 GiB for
+        Qwen3-30B-A3B -- would otherwise be charged against the KV budget and
+        drive it negative. vLLM only charges its own increments, which is why
+        this is needed on the ATOM path alone.
+        """
+        if self._actor_wg is None:
+            return
+        stats = self._actor_wg.execute_all_sync("free_cached_memory")
+        freed_gb = sum(
+            (s.get("reserved_before_bytes", 0.0) - s.get("reserved_after_bytes", 0.0))
+            for s in stats
+        ) / (1 << 30)
+        logger.info(
+            "Released actor allocator cache before ATOM rollout: %.2f GiB over %d ranks.",
+            freed_gb, len(stats),
         )
 
     def _setup_ray_atom_rollout(self, model_name: str, vcfg: Any, atom_cfg: Any) -> None:
@@ -730,6 +756,29 @@ class RLTrainer:
             "top_k": int(getattr(ecfg, "top_k", -1)),
         }
 
+    def _ipc_endpoints_match_actors(self, mgr) -> bool:
+        """Can every actor find an IPC peer sitting on its own GPU?
+
+        The sender addresses ``replica rank//TP, tp-rank rank%TP``
+        (``actor_worker.update_weights_ipc_send``), so what matters is whether
+        the rollout side publishes a socket per TP worker:
+
+        * vLLM's ``vLLMColocateWorkerExtension._get_zmq_handle`` keys on
+          ``self.local_rank``, so a TP=N replica exposes N endpoints and any
+          ``replicas * TP == actors`` layout pairs up one-to-one.
+        * ATOM's ``ATOMRayServer._get_zmq_handle`` is hardcoded to ``rank-0``,
+          i.e. one endpoint per replica whatever TP is, so only TP=1 works
+          there. That single-backend limitation used to gate both engines,
+          which silently sent every TP>1 vLLM run down the safetensors path --
+          54.8 GB through /dev/shm per step on the 4-layer DSv4 slice.
+        """
+        workers = int(self._actor_wg.num_workers)
+        replicas = int(getattr(mgr, "num_replicas", 0) or 0)
+        if replicas == workers:
+            return True
+        tp = int(getattr(mgr, "tensor_parallel_size", 1) or 1)
+        return bool(getattr(self, "_ray_use_vllm", False)) and replicas * tp == workers
+
     def _sync_weights_ipc(self) -> None:
         """verl-aligned weight sync: wake weights -> ZMQ IPC -> wake KV cache.
 
@@ -737,8 +786,9 @@ class RLTrainer:
         concurrently: each actor all-gathers its full BF16 weights and streams
         them over CUDA IPC to its own replica's socket.
 
-        When ATOM TP > 1 (fewer replicas than actors), falls back to a
-        safetensors-on-disk path: actors export HF weights, ATOM reloads.
+        When the rollout engine cannot expose one IPC endpoint per actor, falls
+        back to a safetensors-on-disk path: actors export HF weights, the engine
+        reloads. See ``_ipc_endpoints_match_actors`` for when that applies.
         """
         import ray
 
@@ -760,7 +810,7 @@ class RLTrainer:
             )
 
         separated = getattr(self, "_rollout_wg", None) is not None
-        if separated or mgr.num_replicas < self._actor_wg.num_workers:
+        if separated or not self._ipc_endpoints_match_actors(mgr):
             if LUMENRL_DEBUG:
                 logger.info("[DBG] _sync_weights_ipc: separated=%s replicas=%d workers=%d, using safetensors",
                             separated, mgr.num_replicas, self._actor_wg.num_workers)
@@ -774,16 +824,31 @@ class RLTrainer:
 
         rollout_engine = self._ray_vllm_engine
 
+        # Same numbering as the RDMA path, so a mismatch between the two ends is
+        # an error here instead of a slow train/rollout divergence later.
+        version = int(self.global_step) + 1
+
         # 1) wake weight memory before loading (only when sleep is in use).
         if sleeping:
             rollout_engine.wake(tags=["weights"])
         # 2) start receivers + senders concurrently, then join both.
-        recv = [s.update_weights_from_ipc.remote(use_shm) for s in mgr.servers]
+        recv = [
+            s.update_weights_from_ipc.remote(use_shm, version) for s in mgr.servers
+        ]
         send = self._actor_wg.execute_all_async(
-            "update_weights_ipc_send", bucket_size_mb=bmb, use_shm=use_shm
+            "update_weights_ipc_send", bucket_size_mb=bmb, use_shm=use_shm,
+            version=version,
         )
-        ray.get(send)
-        ray.get(recv)
+        # Join as they finish rather than senders-then-receivers. The two sides
+        # are a ZMQ REQ/REP pair, so a receiver that raises leaves its socket
+        # closed with the sender parked in recv() forever: waiting on the
+        # senders first turns any receiver-side error into a silent hang that
+        # only a stack dump explains. Taking whichever finishes first re-raises
+        # the real exception within a bucket's time.
+        pending = list(send) + list(recv)
+        while pending:
+            done, pending = ray.wait(pending, num_returns=1)
+            ray.get(done)
         # 3) wake KV cache so the next rollout can run.
         if sleeping:
             rollout_engine.wake(tags=["kv_cache"])
@@ -1134,6 +1199,7 @@ class RLTrainer:
             self._setup_ray_vllm_rollout(model_name, vcfg)
             self._atom_engine = None
         elif self._ray_use_atom:
+            self._release_actor_cached_memory()
             self._setup_ray_atom_rollout(model_name, vcfg, atom_cfg)
             self._atom_engine = None
         else:
@@ -3722,6 +3788,22 @@ class RLTrainer:
         bucket_edges: tuple[int, ...] = (128, 512, 1024, 2048, 4096),
     ) -> dict[str, float]:
         """Measure rollout/train drift in response-relative position buckets."""
+        # These three share a frame -- entry i scores token i+1 -- but not
+        # necessarily a width: the mask and the rollout log-probs are built
+        # pre-shifted at S-1, while a Megatron actor pads old_log_probs out to the
+        # full S. `rollout_correction._clean_batch_logprobs` states the contract
+        # and takes the common width; so does this, being a second reader of the
+        # same three tensors. Positions count from the left, so trimming the tail
+        # only drops columns no bucket could have compared.
+        width = min(
+            old_log_probs.shape[-1],
+            rollout_log_probs.shape[-1],
+            response_mask.shape[-1],
+        )
+        old_log_probs = old_log_probs[..., :width]
+        rollout_log_probs = rollout_log_probs[..., :width]
+        response_mask = response_mask[..., :width]
+
         mask = response_mask.bool()
         positions = response_mask.long().cumsum(dim=-1) - 1
         delta = rollout_log_probs.float() - old_log_probs.float()

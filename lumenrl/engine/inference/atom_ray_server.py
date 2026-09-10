@@ -46,6 +46,8 @@ class ATOMRayServer:
         kwargs.setdefault("model", self.model_name)
         kwargs.setdefault("master_addr", self._get_node_ip())
         kwargs.setdefault("port", self._get_free_port())
+        self._pin_cudagraph_mode(kwargs)
+        self._pin_sleep_keeps_memory_resident(kwargs)
         self.engine = AsyncLLMEngine(**kwargs)
         logger.info(
             "ATOMRayServer[%d]: AsyncLLMEngine ready (master=%s:%s online_quant=%s).",
@@ -55,6 +57,97 @@ class ATOMRayServer:
             kwargs.get("online_quant_config"),
         )
         return True
+
+    @staticmethod
+    def _is_no_eager(kwargs: dict[str, Any]) -> bool:
+        """Will this rollout run torch.compile and capture CUDA graphs?
+
+        Both pins below apply exactly here and nowhere else, so they ask once:
+        graphs that are captured but released on sleep, or memory kept resident
+        with no graphs to protect, is neither of the two configurations the
+        reference values were measured in.
+        """
+        comp_cfg = kwargs.get("compilation_config") or {}
+        level = int(comp_cfg.get("level", 0) or 0)
+        return level > 0 or not bool(kwargs.get("enforce_eager", True))
+
+    def _pin_cudagraph_mode(self, kwargs: dict[str, Any]) -> None:
+        """Choose ATOM's CUDA-graph strategy for a no-eager rollout.
+
+        Only applies once torch.compile is on (``enforce_eager=false`` or
+        ``compilation_config.level>0``). ATOM leaves ``cudagraph_mode`` unset and
+        then defaults it to PIECEWISE, which gives every compiled dense piece its
+        own graph and asserts that the piece's inputs keep their capture-time
+        addresses. The attention between two pieces runs eager and allocates its
+        output afresh each call, so the very first replay aborts all rollout
+        workers with "Input addresses for cudagraphs are different during
+        replay". FULL captures the whole forward instead and has no such
+        boundary.
+
+        Override with ``atom_cfg.engine_kwargs.compilation_config.cudagraph_mode``.
+        ATOM builds that pin the mode themselves still win — this only supplies a
+        value.
+        """
+        if not self._is_no_eager(kwargs):
+            return
+
+        comp_cfg = dict(kwargs.get("compilation_config") or {})
+        level = int(comp_cfg.get("level", 0) or 0)
+        mode = comp_cfg.get("cudagraph_mode") or "FULL"
+        if isinstance(mode, str):
+            from atom.config import CUDAGraphMode
+
+            try:
+                mode = CUDAGraphMode[mode.upper()]
+            except KeyError as exc:
+                supported = ", ".join(m.name for m in CUDAGraphMode)
+                raise ValueError(
+                    f"unknown ATOM cudagraph_mode {mode!r}; supported: {supported}"
+                ) from exc
+
+        comp_cfg["cudagraph_mode"] = mode
+        kwargs["compilation_config"] = comp_cfg
+        logger.info(
+            "ATOMRayServer[%d]: no-eager rollout with compilation level=%d, "
+            "cudagraph_mode=%s",
+            self.replica_rank,
+            level,
+            getattr(mode, "name", mode),
+        )
+
+    def _pin_sleep_keeps_memory_resident(self, kwargs: dict[str, Any]) -> None:
+        """Keep a no-eager rollout's weights and KV pool allocated across sleep.
+
+        This is the behaviour the release measurements were taken against: ATOM
+        up to `28721a50` kept both resident in no-eager mode unconditionally,
+        because a decode graph captures the base address of the KV pool and
+        recapturing on wake faults. `ROCm/ATOM#2028` turned that into
+        `Config.sleep_keeps_memory_resident`, defaulting to release, so leaving it
+        unset silently changes what a colocated ATOM rollout does at every step.
+
+        Releasing is not merely slower here, it does not work: ATOM re-derives the
+        KV block count on each wake as `gpu_memory_utilization x total` minus
+        everything resident on the card, and after the first optimizer step the
+        colocated trainer is 52 GB of that. Qwen3-30B-A3B (example 9) then asks
+        for a negative pool and all eight replicas assert in `resume_memory`. The
+        8B examples have the headroom to survive it, and merely pay the recapture.
+
+        No-op on the older pin: ATOM filters engine kwargs against its `Config`
+        fields, and a build without this one drops the kwarg. It also has no
+        effect under `enforce_eager`, where there are no graphs to keep valid, so
+        this only supplies a value where `_pin_cudagraph_mode` supplies one too.
+
+        Override with `atom_cfg.engine_kwargs.sleep_keeps_memory_resident`.
+        """
+        if not self._is_no_eager(kwargs):
+            return
+
+        kwargs.setdefault("sleep_keeps_memory_resident", True)
+        logger.info(
+            "ATOMRayServer[%d]: sleep_keeps_memory_resident=%s",
+            self.replica_rank,
+            kwargs["sleep_keeps_memory_resident"],
+        )
 
     @staticmethod
     def _get_node_ip() -> str:
@@ -203,19 +296,32 @@ class ATOMRayServer:
             })
         return results
 
-    async def update_weights_from_ipc(self, use_shm: bool = False) -> bool:
+    async def update_weights_from_ipc(
+        self, use_shm: bool = False, version: int | None = None
+    ) -> bool:
         if self.engine is None:
             raise RuntimeError("ATOMRayServer.launch() must be called before weight sync.")
         if use_shm:
-            self._update_weights_from_shm_sync()
+            self._update_weights_from_shm_sync(version)
         else:
-            self._update_weights_from_ipc_sync()
+            self._update_weights_from_ipc_sync(version)
         return True
 
     def _get_zmq_handle(self) -> str:
         replica_rank = os.environ.get("LUMEN_REPLICA_RANK", "0")
         job_id = os.environ.get("LUMEN_RAY_JOB_ID", "0")
         return f"ipc:///tmp/lumen-colocate-zmq-{job_id}-replica-{replica_rank}-rank-0.sock"
+
+    def _counts_are_exact(self) -> bool:
+        """Whether ATOM's per-bucket ``updated`` can be compared for equality.
+
+        Only on a BF16 rollout. With online quantization on, a fused parameter's
+        shards accumulate in a staging buffer and are requantized when the last
+        one arrives, so ATOM counts one update for the group and nothing for the
+        shards ahead of it -- a bucket that ends mid-group reports fewer updates
+        than it holds, with nothing wrong. See assert_bucket_fully_applied.
+        """
+        return not (self.engine_kwargs.get("online_quant_config") or {})
 
     @staticmethod
     def _bucket_meta(raw_bucket_meta: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], int]:
@@ -235,10 +341,20 @@ class ATOMRayServer:
             used_bytes = max(used_bytes, offset + nbytes)
         return bucket_meta, used_bytes
 
-    def _update_weights_from_ipc_sync(self) -> None:
+    def _update_weights_from_ipc_sync(self, version: int | None = None) -> None:
         from torch.multiprocessing.reductions import reduce_tensor
 
         from atom.rollout.weight_sync import rebuild_ipc_handle
+
+        from lumenrl.engine.inference.atom_moe_weight_sync import (
+            assert_bucket_fully_applied,
+            atom_routes_fused_experts,
+            fused_expert_renames,
+            relayout_fused_experts,
+            rename_bucket_meta,
+            require_unsharded_experts,
+        )
+        from lumenrl.engine.inference.bucketed_weight_transfer import check_bucket_version
 
         ctx = zmq.Context()
         socket = ctx.socket(zmq.REP)
@@ -261,10 +377,11 @@ class ATOMRayServer:
                 for gpu_idx in range(num_gpus)
             }
             per_gpu_ipc_handles = {gpu_idx: reduce_tensor(buf) for gpu_idx, buf in per_gpu_buffers.items()}
-            stats = {"buckets": 0, "weights": 0}
+            stats = {"buckets": 0, "weights": 0, "experts": 0}
 
             while True:
                 metadata = socket.recv_pyobj()
+                check_bucket_version(metadata, version)
                 raw_bucket_meta = metadata["bucket_meta"]
                 is_last = bool(metadata["is_last"])
                 bucket_meta, used_bytes = self._bucket_meta(raw_bucket_meta)
@@ -282,6 +399,17 @@ class ATOMRayServer:
                     if meta.get("handle") is not None
                 }
                 if used_bytes > bucket_size:
+                    # Only the first bucket may grow the staging buffers: the
+                    # runner has not mapped anything yet, so it picks up the new
+                    # handles. Later on it is still holding the first mapping and
+                    # would read a short, stale view of a fresh allocation.
+                    if stats["buckets"] > 0:
+                        raise RuntimeError(
+                            f"bucket needs {used_bytes} B but the staging buffer is "
+                            f"{bucket_size} B and ATOM's runner has already mapped it; "
+                            "the sender must size its bucket to the largest tensor "
+                            "(see LumenActorWorker.update_weights_ipc_send)"
+                        )
                     del per_gpu_buffers
                     del per_gpu_ipc_handles
                     bucket_size = used_bytes
@@ -290,6 +418,22 @@ class ATOMRayServer:
                         for gpu_idx in range(num_gpus)
                     }
                     per_gpu_ipc_handles = {gpu_idx: reduce_tensor(buf) for gpu_idx, buf in per_gpu_buffers.items()}
+
+                # transformers-5.x ships MoE experts as fused tensors under names
+                # an older ATOM's updater cannot resolve, and its unquantized MoE
+                # path keeps those buffers in an aiter-shuffled layout that
+                # nothing re-establishes after an update. Both are handled in the
+                # staging buffer, before the runner reads it -- unless the ATOM
+                # in this process does it itself, in which case the trainer's
+                # names go through untouched.
+                renames = {} if atom_routes_fused_experts() else fused_expert_renames(
+                    bucket_meta
+                )
+                if renames:
+                    require_unsharded_experts(
+                        self.engine_kwargs.get("tensor_parallel_size", 1),
+                        self.engine_kwargs.get("enable_expert_parallel", False),
+                    )
 
                 for gpu_idx, dst in per_gpu_buffers.items():
                     for name, tensor in direct_tensors.items():
@@ -303,20 +447,36 @@ class ATOMRayServer:
                     if not direct_tensors:
                         dst[:used_bytes].copy_(ipc_buffer[:used_bytes], non_blocking=True)
                     torch.cuda.synchronize(gpu_idx)
+                    # After the copy: this rewrites the staged bytes, so it must
+                    # not race the fill, and each per-GPU buffer needs its own
+                    # pass because the runners read them independently. The
+                    # device context is for the aiter kernels behind the shuffle,
+                    # which launch on the current device, not the tensor's.
+                    if renames:
+                        with torch.cuda.device(gpu_idx):
+                            relayout_fused_experts(dst, bucket_meta, renames)
+                            torch.cuda.synchronize(gpu_idx)
 
-                self.engine.core_mgr.broadcast_utility_command_sync(
+                responses = self.engine.core_mgr.broadcast_utility_command_sync(
                     "update_weights_ipc",
                     ipc_handle=None,
                     ipc_handles=per_gpu_ipc_handles,
-                    bucket_meta=bucket_meta,
+                    bucket_meta=rename_bucket_meta(bucket_meta, renames),
                     is_last=is_last,
+                )
+                assert_bucket_fully_applied(
+                    responses, bucket_meta, context="ipc", exact=self._counts_are_exact()
                 )
                 stats["buckets"] += 1
                 stats["weights"] += len(bucket_meta)
+                stats["experts"] += len(renames)
                 socket.send(b"")
                 if is_last:
                     break
-            logger.info("ATOM online weight reload: buckets=%d weights=%d", stats["buckets"], stats["weights"])
+            logger.info(
+                "ATOM online weight reload: buckets=%d weights=%d fused_experts=%d",
+                stats["buckets"], stats["weights"], stats["experts"],
+            )
         finally:
             socket.close()
             ctx.term()
@@ -327,7 +487,14 @@ class ATOMRayServer:
             torch.cuda.ipc_collect()
             torch.cuda.empty_cache()
 
-    def _update_weights_from_shm_sync(self) -> None:
+    def _update_weights_from_shm_sync(self, version: int | None = None) -> None:
+        from lumenrl.engine.inference.atom_moe_weight_sync import (
+            assert_bucket_fully_applied,
+            atom_routes_fused_experts,
+            fused_expert_renames,
+        )
+        from lumenrl.engine.inference.bucketed_weight_transfer import check_bucket_version
+
         ctx = zmq.Context()
         socket = ctx.socket(zmq.REP)
         socket.setsockopt(zmq.LINGER, 0)
@@ -339,12 +506,30 @@ class ATOMRayServer:
             shm = shared_memory.SharedMemory(name=comm_metadata["name"])
             while True:
                 metadata = socket.recv_pyobj()
+                check_bucket_version(metadata, version)
                 bucket_meta, _used_bytes = self._bucket_meta(metadata["bucket_meta"])
-                self.engine.core_mgr.broadcast_utility_command_sync(
+                if fused_expert_renames(bucket_meta) and not atom_routes_fused_experts():
+                    # An older ATOM needs the fused names rewritten and its
+                    # shuffled layout re-established, which the IPC path does in
+                    # a staging buffer it owns. Here the segment belongs to the
+                    # sender and lives in host memory, where aiter's shuffle does
+                    # not run, so there is nowhere to do the same work. Refuse
+                    # rather than repeat the silent-skip bug. An ATOM that routes
+                    # the fused names itself does the layout on the device, after
+                    # the copy, so this transport is fine there.
+                    raise RuntimeError(
+                        "ATOM rollout of a fused-expert MoE model needs the CUDA-IPC "
+                        "weight transport; set use_shm=false. See "
+                        "lumenrl/engine/inference/atom_moe_weight_sync.py."
+                    )
+                responses = self.engine.core_mgr.broadcast_utility_command_sync(
                     "update_weights_shm",
                     shm_name=shm.name,
                     bucket_meta=bucket_meta,
                     is_last=bool(metadata["is_last"]),
+                )
+                assert_bucket_fully_applied(
+                    responses, bucket_meta, context="shm", exact=self._counts_are_exact()
                 )
                 socket.send(b"")
                 if metadata["is_last"]:
@@ -500,6 +685,15 @@ class ATOMReplicaManager:
                     env_vars[key] = os.environ[key]
 
             engine_kwargs = self._engine_kwargs_for_replica(r, job_id)
+            if true_vocab_size is not None:
+                # Belt and braces across two ATOM generations. The pinned build
+                # reads LUMENRL_ATOM_TRUE_VOCAB_SIZE from the environment above;
+                # newer ones take Config.true_vocab_size and no longer look at
+                # the env var. ATOM filters engine kwargs against the Config
+                # dataclass fields and drops the rest, so the build that does not
+                # know the field ignores this line rather than failing on it --
+                # and the mask cannot go quiet just because the pin moved.
+                engine_kwargs.setdefault("true_vocab_size", int(true_vocab_size))
             if disable_custom_ar in ("1", "true", "True"):
                 engine_kwargs.setdefault(
                     "runner_qualname",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import re
@@ -339,7 +340,12 @@ class LumenActorWorker(BaseWorker):
     def _build_optimizer_config(self, policy: dict) -> dict[str, Any]:
         lr = float(policy.get("learning_rate", policy.get("lr", 1e-6)))
         cfg = {
-            "optimizer": str(policy.get("optimizer_type", "adamw")).lower(),
+            # `optimizer_type` is the name this dict is read under everywhere:
+            # PolicyConfig sets it, OptimizerConfig declares it, and the FSDP2
+            # engine selects on `cfg.optimizer_type`. Megatron's own
+            # OptimizerConfig spells it `optimizer`, which is a translation the
+            # Megatron adapters do at their own boundary.
+            "optimizer_type": str(policy.get("optimizer_type", "adamw")).lower(),
             "lr": lr,
             "weight_decay": float(policy.get("weight_decay", 0.01)),
             "clip_grad": float(policy.get("max_grad_norm", 1.0)),
@@ -740,6 +746,25 @@ class LumenActorWorker(BaseWorker):
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
         return True
+
+    def free_cached_memory(self) -> dict[str, float]:
+        """Give the allocator's unused cached segments back to the driver.
+
+        FSDP2 sharding frees the pre-shard full-precision weights, but they stay
+        in the caching allocator until the first micro-batch calls
+        ``empty_cache()``. A colocated rollout engine that budgets its KV cache
+        from ``mem_get_info`` sees that cache as occupied, so it has to be
+        returned before the engine is created.
+        """
+        if not torch.cuda.is_available():
+            return {"reserved_before_bytes": 0.0, "reserved_after_bytes": 0.0}
+        before = float(torch.cuda.memory_reserved())
+        gc.collect()
+        torch.cuda.empty_cache()
+        return {
+            "reserved_before_bytes": before,
+            "reserved_after_bytes": float(torch.cuda.memory_reserved()),
+        }
 
     def get_memory_stats(self) -> dict[str, float]:
         """Return current-step peak memory counters for this actor rank."""
@@ -1431,8 +1456,21 @@ class LumenActorWorker(BaseWorker):
                 torch.distributed.destroy_process_group(checkpoint_group)
         return global_step
 
+    @staticmethod
+    def _sent_nbytes(param: torch.Tensor, keep_fp32: bool) -> int:
+        """Bytes ``update_weights_ipc_send`` puts on the wire for one parameter.
+
+        Mirrors the FP32 -> BF16 cast below; ``numel()`` on a DTensor is already
+        the global count, which is what the receiver sees.
+        """
+        itemsize = param.element_size()
+        if param.dtype == torch.float32 and not keep_fp32:
+            itemsize = torch.bfloat16.itemsize
+        return itemsize * param.numel()
+
     def update_weights_ipc_send(
         self, bucket_size_mb: int = 512, use_shm: bool = False,
+        version: int | None = None,
     ) -> bool:
         """Stream full (all-gathered) BF16 weights to the colocated vLLM replica.
 
@@ -1483,8 +1521,23 @@ class LumenActorWorker(BaseWorker):
                     full = full.to("cuda", non_blocking=True)
                 yield name, full
 
+        # ATOM's ModelRunner opens the staging buffer once per update cycle and
+        # holds that mapping until the last bucket, so the bucket must be able to
+        # hold the largest single tensor -- growing it mid-cycle would leave the
+        # runner reading through a stale, shorter mapping. Qwen3-30B-A3B's fused
+        # expert weight is 768 MiB, past the 512 MiB default. vLLM re-opens per
+        # bucket and needs no such floor.
+        min_bucket_bytes = 0
+        if str(get_nested_config(
+            self.config, "policy", "generation_backend", default="",
+        ) or "") == "atom":
+            min_bucket_bytes = max(
+                (self._sent_nbytes(p, keep_fp32) for _, p in params), default=0,
+            )
+
         sender = BucketedWeightSender(
-            zmq_handle=handle, bucket_size_mb=int(bucket_size_mb), use_shm=bool(use_shm)
+            zmq_handle=handle, bucket_size_mb=int(bucket_size_mb), use_shm=bool(use_shm),
+            version=version, min_bucket_bytes=min_bucket_bytes,
         )
         asyncio.run(sender.async_send_weights(_gen()))
         return True
