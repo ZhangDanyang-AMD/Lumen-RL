@@ -49,6 +49,17 @@ def _export_dsv4(engine):
     return dsv4.megatron_to_dsv4_native(named)
 
 
+def _export_dsv3(engine):
+    """MLA export. The router bias is a buffer, so it is chained in
+    explicitly -- DeepSeek's noaux_tc top-k reads it, and a rollout without
+    it selects different experts than the trainer did."""
+    named = itertools.chain(
+        engine._full_megatron_named_params_moe(),
+        dsv3.dsv3_router_bias_buffers(engine.module),
+    )
+    return dsv3.megatron_to_hf_dsv3(named)
+
+
 def _export_moe(engine):
     return megatron_to_hf_moe(engine._full_megatron_named_params_moe(), engine._dims)
 
@@ -122,9 +133,6 @@ DSV3 = MODEL_REGISTRY.register(
             has_experts=True,
             # Construction needs MLATransformerConfig, not TransformerConfig.
             builds_own_config=True,
-            # No weight bridge yet -- see export_weights below. The HF-bridge
-            # capability stays True because the intent is to use it once written;
-            # what is missing is the MLA mapping, not the mechanism.
             supports_hf_bridge=True,
         ),
         build_dims=dsv3.build_dsv3_dims,
@@ -134,7 +142,7 @@ DSV3 = MODEL_REGISTRY.register(
         # ``multi_latent_attention`` is set on the config.
         build_layer_spec=None,
         routing_defaults={"moe_router_pre_softmax": False},
-        export_weights=dsv3.export_weights_not_implemented,
+        export_weights=_export_dsv3,
     )
 )
 

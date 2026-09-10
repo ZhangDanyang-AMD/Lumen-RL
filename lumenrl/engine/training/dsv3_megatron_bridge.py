@@ -15,13 +15,10 @@ Routing also differs: DeepSeek uses a sigmoid score function with the
 ``noaux_tc`` bias-corrected top-k and a routed scaling factor, where Qwen3-MoE
 uses softmax with no bias.
 
-Scope note: the **weight bridge is not implemented here yet**. The config and
-layer spec are enough to construct the model, which is what the registry entry
-needs to exist and be tested; HF<->Megatron weight conversion for MLA (q/kv
-LoRA projections against ``linear_q_down_proj`` / ``linear_q_up_proj`` /
-``linear_kv_down_proj`` / ``linear_kv_up_proj``) plus 256-384 routed experts and
-the shared expert is a separate, larger piece of work. ``export_weights``
-raises until it lands, rather than silently shipping wrong tensors.
+The weight bridge below was written against a constructed model's real
+parameter names rather than from the HF/Megatron docs, because two mappings
+are not guessable: the LoRA layernorms are fused into the up-projections, and
+the post-attention norm is spelled differently on dense and MoE layers.
 """
 
 from __future__ import annotations
@@ -34,7 +31,15 @@ import torch.nn.functional as F
 
 from lumenrl.engine.training.qwen3_megatron_bridge import Qwen3Dims
 
-__all__ = ["DSV3Dims", "is_dsv3", "build_dsv3_dims", "build_dsv3_config"]
+__all__ = [
+    "DSV3Dims",
+    "is_dsv3",
+    "build_dsv3_dims",
+    "build_dsv3_config",
+    "megatron_to_hf_dsv3",
+    "hf_to_dsv3_megatron",
+    "dsv3_router_bias_buffers",
+]
 
 _ARCHITECTURES = {"DeepseekV3ForCausalLM"}
 
@@ -191,6 +196,12 @@ def build_dsv3_config(
         layernorm_epsilon=float(hf.get("rms_norm_eps", 1e-6)),
         hidden_dropout=0.0,
         attention_dropout=0.0,
+        # DeepSeek normalises both LoRA latents (HF q_a_layernorm /
+        # kv_a_layernorm). Megatron creates them only under qk_layernorm, and
+        # fuses them into the up-projections as ``layer_norm_weight``. Without
+        # this the model simply has no such parameters and the checkpoint's
+        # norms would have nowhere to load.
+        qk_layernorm=True,
         bf16=True,
         params_dtype=torch.bfloat16,
         pipeline_dtype=torch.bfloat16,
@@ -215,17 +226,205 @@ def build_dsv3_config(
     )
 
 
-def export_weights_not_implemented(engine):  # noqa: ARG001
-    """Placeholder until the MLA weight bridge lands.
 
-    Raising here is deliberate. The alternative -- falling back to the Qwen3
-    exporter -- would stream tensors whose names do not match MLA's parameter
-    set, and the rollout would silently run on a partly-uninitialised model.
+# =============================== weight bridge ===============================
+#
+# Name mapping, verified against a constructed model rather than assumed. The
+# non-obvious parts:
+#
+#   * The LoRA layernorms are FUSED into the up-projections by TE and surface as
+#     ``linear_q_up_proj.layer_norm_weight`` / ``linear_kv_up_proj.layer_norm_weight``,
+#     not as separate ``q_layernorm`` / ``kv_layernorm`` modules.
+#   * A dense layer's post-attention norm is fused into ``mlp.linear_fc1`` as
+#     ``layer_norm_weight``, while a MoE layer keeps a standalone
+#     ``pre_mlp_layernorm``. Same HF key, two Megatron spellings.
+#   * gate_proj and up_proj are concatenated into one ``linear_fc1`` along dim 0.
+#   * The router bias is a BUFFER (``mlp.router.expert_bias``), so it never
+#     appears in ``named_parameters()`` and has to be gathered separately.
+
+import re  # noqa: E402
+
+_LAYER_RE = re.compile(r"^decoder\.layers\.(\d+)\.(.+)$")
+_GROUPED_EXPERT_RE = re.compile(r"^mlp\.experts\.linear_fc([12])\.weight(\d+)$")
+_SEQUENTIAL_EXPERT_RE = re.compile(
+    r"^mlp\.experts\.local_experts\.(\d+)\.linear_fc([12])\.weight$"
+)
+
+# Megatron attention name -> HF attention name. Straight renames only.
+_ATTN_MAP = {
+    "self_attention.linear_q_down_proj.weight": "self_attn.q_a_proj.weight",
+    "self_attention.linear_q_up_proj.weight": "self_attn.q_b_proj.weight",
+    "self_attention.linear_q_up_proj.layer_norm_weight": "self_attn.q_a_layernorm.weight",
+    "self_attention.linear_kv_down_proj.weight": "self_attn.kv_a_proj_with_mqa.weight",
+    "self_attention.linear_kv_up_proj.weight": "self_attn.kv_b_proj.weight",
+    "self_attention.linear_kv_up_proj.layer_norm_weight": "self_attn.kv_a_layernorm.weight",
+    "self_attention.linear_proj.weight": "self_attn.o_proj.weight",
+    "input_layernorm.weight": "input_layernorm.weight",
+    # Both spellings of the post-attention norm collapse to the same HF key.
+    "pre_mlp_layernorm.weight": "post_attention_layernorm.weight",
+    "mlp.linear_fc1.layer_norm_weight": "post_attention_layernorm.weight",
+    "mlp.router.weight": "mlp.gate.weight",
+    "mlp.router.expert_bias": "mlp.gate.e_score_correction_bias",
+}
+
+_TOP_LEVEL_MAP = {
+    "embedding.word_embeddings.weight": "model.embed_tokens.weight",
+    "decoder.final_layernorm.weight": "model.norm.weight",
+    "output_layer.weight": "lm_head.weight",
+}
+
+
+def _strip_module_prefix(name: str) -> str:
+    for pre in ("module.module.", "module."):
+        if name.startswith(pre):
+            return name[len(pre):]
+    return name
+
+
+def _split_gate_up(t: torch.Tensor):
+    """``linear_fc1`` is [gate; up] concatenated on dim 0."""
+    gate, up = t.chunk(2, dim=0)
+    return gate.contiguous(), up.contiguous()
+
+
+def megatron_to_hf_dsv3(named_params):
+    """Yield ``(hf_name, tensor)`` from GLOBAL-indexed Megatron named params.
+
+    Mirrors ``megatron_to_hf_moe``'s contract: expert params carry GLOBAL expert
+    indices and layers GLOBAL layer numbers, so EP/PP relabelling happens in the
+    caller. Router-bias buffers may be chained in by the caller; they are handled
+    here like any other named tensor.
     """
-    raise NotImplementedError(
-        "DeepSeek-V3 weight export is not implemented yet. The model can be "
-        "constructed (config + layer spec), but HF<->Megatron conversion for the "
-        "MLA projections (linear_q_down_proj / linear_q_up_proj / "
-        "linear_kv_down_proj / linear_kv_up_proj) and the routed + shared experts "
-        "still has to be written. See dsv3_megatron_bridge."
-    )
+    for raw, t in named_params:
+        name = _strip_module_prefix(raw)
+
+        top = _TOP_LEVEL_MAP.get(name)
+        if top is not None:
+            yield top, t
+            continue
+
+        m = _LAYER_RE.match(name)
+        if not m:
+            continue
+        layer, rest = int(m.group(1)), m.group(2)
+        hp = f"model.layers.{layer}."
+
+        direct = _ATTN_MAP.get(rest)
+        if direct is not None:
+            yield hp + direct, t
+            continue
+
+        # dense MLP
+        if rest == "mlp.linear_fc1.weight":
+            gate, up = _split_gate_up(t)
+            yield hp + "mlp.gate_proj.weight", gate
+            yield hp + "mlp.up_proj.weight", up
+            continue
+        if rest == "mlp.linear_fc2.weight":
+            yield hp + "mlp.down_proj.weight", t
+            continue
+
+        # shared expert
+        if rest == "mlp.shared_experts.linear_fc1.weight":
+            gate, up = _split_gate_up(t)
+            yield hp + "mlp.shared_experts.gate_proj.weight", gate
+            yield hp + "mlp.shared_experts.up_proj.weight", up
+            continue
+        if rest == "mlp.shared_experts.linear_fc2.weight":
+            yield hp + "mlp.shared_experts.down_proj.weight", t
+            continue
+
+        # routed experts, grouped (``weight{E}``) or sequential (``local_experts.{E}``)
+        gm = _GROUPED_EXPERT_RE.match(rest)
+        if gm:
+            fc, e = gm.group(1), int(gm.group(2))
+        else:
+            sm = _SEQUENTIAL_EXPERT_RE.match(rest)
+            if not sm:
+                continue
+            e, fc = int(sm.group(1)), sm.group(2)
+        ep_ = f"{hp}mlp.experts.{e}."
+        if fc == "1":
+            gate, up = _split_gate_up(t)
+            yield ep_ + "gate_proj.weight", gate
+            yield ep_ + "up_proj.weight", up
+        else:
+            yield ep_ + "down_proj.weight", t
+
+
+def hf_to_dsv3_megatron(hf_state, d: DSV3Dims, use_grouped_mlp: bool = True):
+    """Inverse of :func:`megatron_to_hf_dsv3` at TP=PP=EP=1.
+
+    Returns ``{megatron_name: tensor}``. Sharded topologies slice this the same
+    way the Qwen3 path does; keeping the whole-model conversion separate from the
+    sharding keeps both testable.
+    """
+    hf = {_strip_module_prefix(k): v for k, v in hf_state.items()}
+    meg: dict[str, torch.Tensor] = {}
+
+    for meg_name, hf_name in _TOP_LEVEL_MAP.items():
+        if hf_name in hf:
+            meg[meg_name] = hf[hf_name]
+
+    dense_layers = d.first_k_dense_replace
+    for layer in range(d.num_layers):
+        hp = f"model.layers.{layer}."
+        mp = f"decoder.layers.{layer}."
+        is_moe = layer >= dense_layers
+
+        for meg_suffix, hf_suffix in _ATTN_MAP.items():
+            # post-attention norm has two Megatron spellings; pick by layer type
+            if meg_suffix == "pre_mlp_layernorm.weight" and not is_moe:
+                continue
+            if meg_suffix == "mlp.linear_fc1.layer_norm_weight" and is_moe:
+                continue
+            if meg_suffix.startswith("mlp.router") and not is_moe:
+                continue
+            src = hp + hf_suffix
+            if src in hf:
+                meg[mp + meg_suffix] = hf[src]
+
+        if not is_moe:
+            g, u = hp + "mlp.gate_proj.weight", hp + "mlp.up_proj.weight"
+            if g in hf and u in hf:
+                meg[mp + "mlp.linear_fc1.weight"] = torch.cat([hf[g], hf[u]], dim=0)
+            if hp + "mlp.down_proj.weight" in hf:
+                meg[mp + "mlp.linear_fc2.weight"] = hf[hp + "mlp.down_proj.weight"]
+            continue
+
+        if d.n_shared_experts > 0:
+            g = hp + "mlp.shared_experts.gate_proj.weight"
+            u = hp + "mlp.shared_experts.up_proj.weight"
+            if g in hf and u in hf:
+                meg[mp + "mlp.shared_experts.linear_fc1.weight"] = torch.cat(
+                    [hf[g], hf[u]], dim=0
+                )
+            dn = hp + "mlp.shared_experts.down_proj.weight"
+            if dn in hf:
+                meg[mp + "mlp.shared_experts.linear_fc2.weight"] = hf[dn]
+
+        for e in range(d.num_experts):
+            ep_ = f"{hp}mlp.experts.{e}."
+            g, u, dn = ep_ + "gate_proj.weight", ep_ + "up_proj.weight", ep_ + "down_proj.weight"
+            if g not in hf or u not in hf:
+                continue
+            fc1 = torch.cat([hf[g], hf[u]], dim=0)
+            if use_grouped_mlp:
+                meg[f"{mp}mlp.experts.linear_fc1.weight{e}"] = fc1
+                meg[f"{mp}mlp.experts.linear_fc2.weight{e}"] = hf[dn]
+            else:
+                meg[f"{mp}mlp.experts.local_experts.{e}.linear_fc1.weight"] = fc1
+                meg[f"{mp}mlp.experts.local_experts.{e}.linear_fc2.weight"] = hf[dn]
+
+    return meg
+
+
+def dsv3_router_bias_buffers(module):
+    """Router bias lives in a buffer, so ``named_parameters()`` never yields it.
+
+    DeepSeek's noaux_tc top-k reads this bias, so a rollout that never receives
+    it selects different experts than the trainer did.
+    """
+    for name, buf in module.named_buffers():
+        if name.endswith("mlp.router.expert_bias"):
+            yield name, buf

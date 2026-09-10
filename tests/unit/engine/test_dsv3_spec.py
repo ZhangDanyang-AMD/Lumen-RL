@@ -139,17 +139,42 @@ def test_engine_config_overrides_win_over_hf():
     assert cfg.moe_aux_loss_coeff == pytest.approx(0.01)
 
 
-# --- the deliberate gap --------------------------------------------------------
+# --- weight export -------------------------------------------------------------
 
-def test_weight_export_raises_rather_than_shipping_wrong_tensors():
-    """The MLA weight bridge is not written yet.
+def test_export_uses_the_mla_bridge_and_includes_the_router_bias():
+    """DSv3 must not fall back to the Qwen3 exporter.
 
-    Falling back to the Qwen3 exporter would stream names that do not exist on
-    an MLA model, and the rollout would run on a partly-uninitialised policy.
+    Qwen3 names do not exist on an MLA model, so that fallback would leave the
+    rollout on a partly-uninitialised policy. The router bias is a buffer and has
+    to be chained in explicitly; without it, noaux_tc selects different experts
+    on the rollout side than the trainer used.
     """
     spec = MODEL_REGISTRY.resolve(K2, {})
-    with pytest.raises(NotImplementedError, match="weight export is not implemented"):
-        spec.export_weights(object())
+    seen = {}
+
+    class FakeEngine:
+        module = object()
+        _dims = None
+
+        def _full_megatron_named_params_moe(self):
+            seen["gather"] = "moe"
+            return iter(())
+
+        def _full_megatron_named_params(self):
+            raise AssertionError("DSv3 must use the MoE gather")
+
+    import lumenrl.engine.training.model_specs as ms
+
+    orig = dsv3.dsv3_router_bias_buffers
+    try:
+        dsv3.dsv3_router_bias_buffers = lambda mod: iter(())  # type: ignore[assignment]
+        ms.dsv3.dsv3_router_bias_buffers = dsv3.dsv3_router_bias_buffers
+        list(spec.export_weights(FakeEngine()))
+    finally:
+        dsv3.dsv3_router_bias_buffers = orig  # type: ignore[assignment]
+        ms.dsv3.dsv3_router_bias_buffers = orig
+
+    assert seen["gather"] == "moe"
 
 
 def test_dsv3_uses_the_stock_te_layer_spec():
