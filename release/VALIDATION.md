@@ -123,8 +123,11 @@ reached step 0, synced weights with `skipped=0`, and then aborted all eight repl
 every wake and the colocated trainer is 52 GB of the budget it subtracts.
 
 ⚠️ **Releasing the actors' allocator cache before the wake does not fix that** — it was
-tried and moves `non_torch` by 0.6 GB, because after an optimizer step that memory is
-live state rather than cache. Only keeping the pool resident works.
+tried and moves `non_torch` by 0.6 GB. `non_torch` is derived from device-used, and on
+this ROCm version freed memory is not returned to the driver, so `empty_cache()` barely
+moves it; the behaviour is version-dependent and some ROCm versions do return it. This
+is the same effect §8.6.1 documents as a card still holding ~90.9 GB after a clean run.
+Only keeping the pool resident works.
 
 ## Limits of this record
 

@@ -630,11 +630,14 @@ AssertionError: Not enough memory for KV cache with block size(16). At least 1 b
    peak_torch=57.68GB, non_torch=52.88GB, safety=5.76GB, free=177.39GB)
 ```
 
-ATOM 每次 wake 都按「`gpu_memory_utilization x total` 减去卡上其它一切已占显存」
-重新推算块数，这里的 `non_torch` 就是同卡上的训练侧——第一次优化器步之后那是 52 GB
-活着的状态。`free=177.39GB` 是关键线索：显存是有的，只是记在了别人账上。
+ATOM 每次 wake 都按「`gpu_memory_utilization x total` 减去整卡报告为已占用的显存」
+重新推算块数，这里的 `non_torch` 就是节点上的其余部分——主要是同卡上的训练侧。
+`free=177.39GB` 是关键线索：显存是有的，只是没算在 rollout 引擎账上。
+
 调大 `gpu_memory_utilization` 不是解法，释放 actor 的分配器缓存也不是——那只让
-`non_torch` 少 0.6 GB。正解是让池子常驻，也就是 §8.1.2 里第二项设置做的事；
+`non_torch` 少 0.6 GB，因为 `non_torch` 是从「整卡已占用」推出来的，而这个平台不会把
+freed 的显存归还给驱动（与上面第 1 条同源，且与版本相关——有些 ROCm 版本是会归还的）。
+正解是让池子常驻，也就是 §8.1.2 里第二项设置做的事；
 如果你用的是自己的 ATOM 分支，请确认 `sleep_keeps_memory_resident` 能传到它。
 
 ---

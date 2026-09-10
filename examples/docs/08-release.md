@@ -709,12 +709,16 @@ AssertionError: Not enough memory for KV cache with block size(16). At least 1 b
 ```
 
 ATOM re-derives the block count on every wake as `gpu_memory_utilization x total` minus
-everything resident on the card, and `non_torch` here is the colocated trainer, which
-after the first optimizer step is 52 GB of live state. `free=177.39GB` is the tell: the
-memory exists, it is charged to someone else. Raising `gpu_memory_utilization` is not the
-fix and neither is freeing the actors' allocator cache — that moves `non_torch` by
-0.6 GB. Keep the pool resident, which is what §8.1.2's second setting does; if you are
-on your own ATOM branch, check that `sleep_keeps_memory_resident` reaches it.
+everything the card reports as in use, and `non_torch` here is the rest of the node —
+mostly the colocated trainer. `free=177.39GB` is the tell: the memory exists, it is just
+not credited to the rollout engine.
+
+Raising `gpu_memory_utilization` is not the fix, and neither is freeing the actors'
+allocator cache — that moves `non_torch` by 0.6 GB, because `non_torch` is derived from
+device-used and this platform does not return freed memory to the driver (the same
+effect as item 1 above, and version-dependent — some ROCm versions do return it). Keep
+the pool resident, which is what §8.1.2's second setting does; if you are on your own
+ATOM branch, check that `sleep_keeps_memory_resident` reaches it.
 
 ---
 
