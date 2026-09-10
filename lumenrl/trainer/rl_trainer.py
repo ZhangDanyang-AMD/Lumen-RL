@@ -3788,6 +3788,22 @@ class RLTrainer:
         bucket_edges: tuple[int, ...] = (128, 512, 1024, 2048, 4096),
     ) -> dict[str, float]:
         """Measure rollout/train drift in response-relative position buckets."""
+        # These three share a frame -- entry i scores token i+1 -- but not
+        # necessarily a width: the mask and the rollout log-probs are built
+        # pre-shifted at S-1, while a Megatron actor pads old_log_probs out to the
+        # full S. `rollout_correction._clean_batch_logprobs` states the contract
+        # and takes the common width; so does this, being a second reader of the
+        # same three tensors. Positions count from the left, so trimming the tail
+        # only drops columns no bucket could have compared.
+        width = min(
+            old_log_probs.shape[-1],
+            rollout_log_probs.shape[-1],
+            response_mask.shape[-1],
+        )
+        old_log_probs = old_log_probs[..., :width]
+        rollout_log_probs = rollout_log_probs[..., :width]
+        response_mask = response_mask[..., :width]
+
         mask = response_mask.bool()
         positions = response_mask.long().cumsum(dim=-1) - 1
         delta = rollout_log_probs.float() - old_log_probs.float()
