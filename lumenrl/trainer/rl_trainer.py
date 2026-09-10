@@ -450,9 +450,12 @@ class RLTrainer:
             enable_sleep_mode=bool(vcfg.enable_sleep_mode),
             disable_log_stats=True,
         )
-        if str(vcfg.moe_backend) != "auto":
+        # "" is the same sentinel as "auto": both mean "let vLLM select". Passing
+        # "" through reaches vLLM as an explicit request for a backend named "",
+        # which an unquantized MoE model rejects outright.
+        if str(vcfg.moe_backend) not in ("auto", ""):
             engine_kwargs["moe_backend"] = str(vcfg.moe_backend)
-        if str(vcfg.linear_backend) != "auto":
+        if str(vcfg.linear_backend) not in ("auto", ""):
             engine_kwargs["linear_backend"] = str(vcfg.linear_backend)
         if bool(getattr(self.config.moe.r3, "enabled", False)):
             # Patched vLLM/MILES captures [seq_len-1, num_layers, top_k]
