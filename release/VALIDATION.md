@@ -6,7 +6,7 @@ Measurement record behind the reference table in
 | | |
 |---|---|
 | Image | `zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260910`, digest `sha256:cc18a3f5ce16…` |
-| Lumen-RL | `8ca6bdd` on `dev/dapo_release`, bind-mounted from a checkout — **not** taken from the image, see §8.1.1 |
+| Lumen-RL | `8ca6bdd` on `dev/dapo_release`, bind-mounted from a checkout — **not** taken from the image |
 | | The tree also carried the `release/` and `examples/docs/` changes that the commit adding this record then made (this image tag, this ATOM SHA, this file). Nothing the trainer imports, so the runs are `8ca6bdd`'s. |
 | Hardware | one node, 8x MI355X (gfx950), whole-node allocation |
 | Command | `bash release/run_example.sh <N> --check` |
@@ -117,7 +117,7 @@ this record.
 | 7 | `RuntimeError: The size of tensor a (4254) must match the size of tensor b (4255)` | the position-bucket diagnostic subtracted three tensors that share a frame but not a width |
 
 The fifth failure was the ATOM re-pin itself and is the reason
-`sleep_keeps_memory_resident` is now pinned: see `versions.env` and §8.1.2. Example 9
+`sleep_keeps_memory_resident` is now pinned: see `versions.env` and §8.1.1. Example 9
 reached step 0, synced weights with `skipped=0`, and then aborted all eight replicas in
 `resume_memory` with a negative KV pool, because ATOM now re-derives the block count on
 every wake and the colocated trainer is 52 GB of the budget it subtracts.

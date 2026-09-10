@@ -21,9 +21,9 @@ bash release/run_example.sh 1 --check
 
 四条命令跑完第一个例子并自动判定结果是否正确。换例子只改最后那个数字。
 
-**改代码不需要离开这一章。** 镜像提供环境，刚 clone 的这份代码提供 Lumen-RL 本身，
-以 bind-mount 的方式盖在镜像里那份之上。改 `lumenrl/`，再跑同一条命令，跑的就是改动后的
-代码——见 §8.1.1。
+镜像提供环境，刚 clone 的这份 checkout 提供代码。启动器会把它挂进容器，所以改完
+`lumenrl/` 再跑同一条命令，跑的就是改动后的代码——不重建镜像，不换 tag。
+`LUMENRL_SRC=/other/checkout` 可以跑别处的代码。
 
 ---
 
@@ -50,43 +50,11 @@ docker run --rm --entrypoint /bin/bash \
   -lc 'ls /opt/lumenrl/aiter-jit/*.so | wc -l'     # 16
 ```
 
-### 8.1.1 镜像是环境，你的 checkout 是代码
-
-`run_example.sh` 会把它自己所在的这份 checkout 挂到容器里的
-`/opt/lumenrl/Lumen-RL`。所以镜像固定的是那些构建代价大、又容易配错的东西——aiter、
-Lumen、ATOM、Megatron/Apex/TE，以及编译好的 kernel——而 Lumen-RL 本身来自你的工作区：
-
-```bash
-vim lumenrl/trainer/rl_trainer.py
-bash release/run_example.sh 1 --check        # 直接跑改动；不重建镜像，不换 tag
-```
-
-这不是「多出一份可能和镜像不一致的副本」。你本来就得有这份 checkout 才能拿到
-`run_example.sh`，所以挂载它恰恰是**消除**版本漂移的手段：镜像里那份的存在意义只是让
-editable 安装有个路径可指，挂载把它盖住了。每次运行都会打印用的是哪份代码、哪个 commit：
-
-```
-   code   /path/to/Lumen-RL @ 8ca6bdd
-   image  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260910
-```
-
-两点需要知道：
-
-- **一个结果由镜像 digest \*和\* commit 共同确定**，不是只看镜像。§8.5.1 两个都记了，
-  你也应该两个都记。
-- **容器记着自己的挂载。** bind-mount 在容器创建时就定死了，所以把 `LUMENRL_SRC` 指到
-  别处、或者容器是旧版启动器建的，`run_example.sh` 会**删掉重建**容器而不是重启它，
-  并且会在日志里说明。
-
-要跑别处的代码，设 `LUMENRL_SRC=/other/checkout`。
-
-只有下面三个上游之一变动、或系统级依赖变化时才需要重建镜像。**Lumen-RL 的改动永远不需要。**
-
-### 8.1.2 版本固定
+### 8.1.1 版本固定
 
 复现一个结果依赖下面三个上游仓库，它们**不能各自独立升级**，所以都按 commit 固定。
-Lumen-RL 是本仓库，**镜像完全不固定它**——跑的是你 checkout 里的版本，见 §8.1.1。
-镜像里那份只是兜底，不是实际运行的代码。
+Lumen-RL **不由镜像固定**——跑的是你 checkout 里的版本，因此**一个结果由镜像 digest
+\*和\* Lumen-RL commit 共同确定**。每次运行都会把两者打印出来。
 
 | 组件 | 仓库 | 分支 | Commit |
 |---|---|---|---|
@@ -100,18 +68,11 @@ ATOM 钉的是上游 [ROCm/ATOM PR #2028](https://github.com/ROCm/ATOM/pull/2028
 的 head。该 PR **截至 2026-09-10 尚未合并**，所以这里钉的是 PR head 而非 main 上的提交；
 它可按 SHA 取到，`release/Dockerfile` 就是这么做的。
 
-⚠️ 自行替换 ATOM 时注意：no-eager 的 ATOM rollout **依赖**两项由 Lumen-RL 侧
-`atom_ray_server.py` 主动给出、而非从 ATOM 继承的设置：
-
-- `compilation_config.cudagraph_mode=FULL`。缺了它，rollout 会在第一次 CUDA graph replay 时
-  让全部 worker 崩在 `Input addresses for cudagraphs are different during replay`。
-- `sleep_keeps_memory_resident=true`。缺了它，ATOM 每次 wake 都会重新推算 KV 块数，并把同卡上
-  colocated 训练侧的显存计入预算；例子 9 于是要到一个负数大小的池子，八个副本全部崩在
-  `resume_memory`。8B 的例子扛得住，代价是每步多付一次 graph 重捕获——所以「释放式」的 ATOM
-  在例子 4/5 上只是变慢，在例子 9 上是直接坏掉。
-
-两项对早于这些字段的 ATOM 构建都是空操作，同一份代码因此也能服务旧的 pin。
-机理见 [`release/versions.env`](../../release/versions.env) 的注释。
+⚠️ **自行替换 ATOM 需要两项由 Lumen-RL 主动给出、而非从 ATOM 继承的引擎设置**：
+`compilation_config.cudagraph_mode=FULL` 与 `sleep_keeps_memory_resident=true`。
+缺了它们，no-eager 的 ATOM rollout 会崩——分别崩在第一次 CUDA graph replay
+和权重同步后的第一次 wake。两项对早于这些字段的 ATOM 构建都是空操作。
+具体的报错形态与原因见 [`release/versions.env`](../../release/versions.env) 的注释。
 
 底座镜像 `vllm/vllm-openai-rocm:v0.23.0`，另加 `flydsl 0.3.2`、`megatron-core 0.18.2`、
 ROCm Apex `daed8525`、ROCm TransformerEngine `6e541a10`。
@@ -212,20 +173,13 @@ disaggregated RDMA 部署，需要 2×8 张 gfx942，本镜像不覆盖它，见
 | 冷拉取耗时 | **85 s** |
 | 镜像解包后占盘 | **47.3 GB** |
 
-⚠️ **只 `pull` 发布镜像时，`docker system df -v` 会把 47.3 GB 全部记成「独有」。**
-只有本机同时存在底座镜像 `vllm/vllm-openai-rocm:v0.23.0`，它才拆成
-「共享 46.7 GB + 独有 607.7 MB」。照本章走的读者看到的是前者，不是表错了。
-
-冷拉取那 85 s 是清空全部本地镜像与 build cache 后实测一次的结果，
-**强依赖网络**（约合 139 MB/s），换机器不可移植；可移植的是 11.8 GB 这个下载量。
+冷拉取那 85 s **强依赖网络**（约合 139 MB/s），换机器不可移植；
+可移植的是 11.8 GB 这个下载量。
 
 **建议预留**：镜像 60 GB（解包 47.3 GB + 压缩层 11.8 GB 留在 content store）
 + 模型与数据 74 GB ≈ **134 GB**。八个例子都是 smoke，不写 checkpoint。
 若要长跑（`--longrun`）另需 checkpoint 空间——30B-A3B 的一份 FSDP2 checkpoint
 （fp32 权重 + optimizer）约 342 GB，`save_total_limit` 决定同时保留几份。
-
-> 用 `docker system df -v` 核对上表时**按 IMAGE ID 匹配，不要按 REPOSITORY/TAG 匹配**：
-> 同一镜像本地可能挂着别的 tag。取 ID：`docker image inspect <tag> --format '{{.Id}}'`。
 
 ### 8.3.3 模型与数据
 
@@ -362,7 +316,7 @@ docker run -d --name lumenrl-release \
   zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260910 sleep infinity
 ```
 
-第二个挂载是代码（§8.1.1），`$PWD` 是这份 checkout 的根目录。不挂它，容器跑的就是镜像里
+第二个挂载是代码，`$PWD` 是这份 checkout 的根目录。不挂它，容器跑的就是镜像里
 烤进去的那份——只要你改过任何东西，那就是另一个 commit 了。
 
 日志路径固定：
@@ -391,7 +345,7 @@ $DATA_ROOT/logs/example-<N>-<时间戳>.launcher.log  # 包装层输出与退出
 | `WANDB_API_KEY` | 仅 `--longrun` 需要 |
 | `STALL_LIMIT` | 日志静默多少秒判定卡死，默认 2400 |
 
-跑自己的 Lumen-RL 不需要任何额外操作——那本来就是默认行为，见 §8.1.1。要跑**另一份**
+跑自己的 Lumen-RL 不需要任何额外操作——那本来就是默认行为。要跑**另一份**
 checkout（不是启动器所在的那份）：
 
 ```bash
@@ -498,49 +452,35 @@ bash release/run_example.sh 1 --check-only --log $DATA_ROOT/logs/example-1-xxx.l
 | 9 | `dapo_qwen3moe_a3b_ray_atom_bf16_4k_smoke.yaml` | 3 | 4096 | 579 s | **0.00138** ±50% | **0.692** ±60% | 0.00138 | 3 |
 
 粗体两列带容差的即 `--check` 判定 PASS / FAIL 的两项，参考值是「实测次数」列那么多遍的均值。
-时间跨度那一列是本镜像每个例子各跑一遍的实测值。
+**时间跨度那一列不设容差、不参与判定**——它是本镜像每个例子各跑一遍的实测值，
+受缓存冷热影响，同一机器上偏差可达 ±15%。启动器报的端到端墙钟比它多约 20–35 s。
 
-参考值是在上一版镜像 `260908` 上、**共 12 遍**实测标定的均值（例子 4、9 各三遍，其余各一遍）。
-本镜像与本提交随后每个例子各跑一遍：**8/8 退出码为 0**，四类错误计数**全部为 0**，
+**本镜像与本提交的结果：8/8 退出码为 0**，四类错误计数**全部为 0**，
 每个权重同步 bucket 都是 `skipped=0`，`--check` **8/8 PASS**，且 `k3_kl` 与上表每个参考值
-的偏差都在 **±8.2%** 之内。因此参考值原样保留，而不是用单次实测替换。
-逐次原始记录、容差推导，以及两版镜像之间变了什么，见
-[`VALIDATION.md`](../../release/VALIDATION.md)。
-
-「实测次数」为 1 的例子，参考值就是那一次的实测值，容差取所在组的下限。
-例子 4 正是「不能按单次实测收紧容差」的理由：它三遍分别是 0.00241、0.00243、0.00377，
-用前两遍中任意一遍单独作参考值，第三遍都会掉出 ±50% 区间之外。
+的偏差都在 **±8.2%** 之内。参考值本身是 12 遍实测的均值，原样保留。
+逐次原始记录与容差推导见 [`VALIDATION.md`](../../release/VALIDATION.md)。
 
 **例子 9 对例子 6——换 rollout 引擎的代价。** 同模型、同训练配置，把 vLLM 换成 ATOM：
-`k3_kl` 是 0.00138 对 0.00158，即 ATOM **低** 12%，落在例子 9 自身 ±6% 抖动的两倍之内，
-更远在 ±50% 容差之内。**换 rollout 引擎并没有可测量地改变 train / rollout 对齐程度。**
-真正变的是时间：每步 56.7 s 对 106.7 s，ATOM 每步快约 1.9 倍；代价在 setup——
-409 s 对 203 s，花在 torch.compile 与捕获 CUDA graph 上。所以 3 步的 smoke 看端到端会觉得
-ATOM 更慢（579 s 对 523 s），而真正长跑该看的是每步耗时。例子 7 是同一个 vLLM rollout
-配 Megatron actor，落在同一量级，每步 103.0 s。
-
-**时间跨度不设容差、不参与判定**：它是训练日志首末时间戳之差，受 kernel 缓存冷热影响，
-同一机器同一镜像上偏差可达 ±15%，只作耗时量级参考。启动器报的端到端墙钟比它多
-约 20–35 s（容器重启、显存探测与判定）。
+`k3_kl` 是 0.00138 对 0.00158，远在容差之内，
+**换 rollout 引擎并没有可测量地改变 train / rollout 对齐程度。**
+真正变的是时间：每步 56.7 s 对 106.7 s，快约 1.9 倍；代价是 setup 409 s 对 203 s。
+所以 3 步的 smoke 看端到端会觉得 ATOM 更慢（579 s 对 523 s），而真正长跑该看的是每步耗时。
+例子 7 是同一个 vLLM rollout 配 Megatron actor，每步 103.0 s。
 
 ### 8.5.2 判据
 
-- **`rollout_corr/k3_kl` 是主判据**，容差 512 组（例子 1/2/3）±30%、4096 组（例子 4–7 和 9）±50%。
-  它是 train / rollout 分布差异的 k3 估计量，非负且不会正负抵消，比 `entropy` 稳得多，
-  是判断复现是否成功的首选指标。多采样的两个例子实测抖动为例子 4 ±31%、例子 9 ±6%。
-- **`entropy` 是第二判据**，容差 512 组 ±25%、4096 组 ±50%、
+- **`rollout_corr/k3_kl` 是主判据**——容差 512 组（例子 1/2/3）±30%、
+  4096 组（例子 4–7 和 9）±50%。它非负，且比 `entropy` 稳得多，是判断复现是否成功的首选指标。
+- **`entropy` 是第二判据**——容差 512 组 ±25%、4096 组 ±50%、
   MoE 三个例子（6、7、9）±60%。它是 `filter_groups` 筛选后那一批序列上的均值，
-  样本少、方差大，**MoE 上尤其不稳（实测跨度 0.512–1.030，即 ±47%）**，
-  所以判 MoE 复现请以 `k3_kl` 为准。
-- **`rollout_corr/kl` 只作数量级判据**：它是有符号均值，对称分歧会相互抵消，
-  同一命令重复运行可相差 2.8 倍，因此只检查实测绝对值是否落在参考值的 1/10–10 倍之间。
-  **高出一个数量级才算异常**，最常见原因是某一侧未启用 model-sensitive RMSNorm。
+  方差大，MoE 上尤其不稳。**判 MoE 复现请以 `k3_kl` 为准。**
+- **`rollout_corr/kl` 只作数量级判据**：它是有符号均值，所以只检查实测绝对值是否落在
+  参考值的 1/10–10 倍之间。**高出一个数量级才算异常**，
+  最常见原因是某一侧未启用 model-sensitive RMSNorm。
 - **`rollout_corr/ppl_ratio` 仅供参考**，不参与判定。
-- **每个权重同步 bucket 都必须 `skipped=0`。** 这是上面四个错误计数替代不了的一条。
+- **每个权重同步 bucket 都必须 `skipped=0`。** 这是上面四个错误计数替代不了的一条：
   rollout 引擎如果悄悄漏更新了一部分权重，进程照样 `exit=0`、每一步照样打日志、
-  什么都不抛——它只是在拿一半新一半旧的权重做生成，表现出来像是精度慢慢变差，
-  而不像故障。这事真发生过：一次 ATOM MoE rollout 每个 replica 每次同步都丢掉全部 96 个
-  routed expert 权重，整轮 2304 次，而四项计数全过。从日志里这样读：
+  什么都不抛，表现出来像是精度慢慢变差，而不像故障。
 
   ```bash
   grep -oE 'bucket done - updated=[0-9]+, skipped=[0-9]+' <log> | sort | uniq -c
@@ -548,11 +488,6 @@ ATOM 更慢（579 s 对 523 s），而真正长跑该看的是每步耗时。例
 
   健康的运行每一行都是 `skipped=0`。例子 1、2、3、6、7 走 vLLM 路径，
   根本不打这种行，同样算干净。
-
-两个 8B BF16 rollout（例子 1 的 0.00106、例子 5 的 0.000930）落在 1e-3 附近；
-三个 FP8 的（0.00498 / 0.00404 / 0.00287）是其 3–5 倍，这是量化的代价，属正常。
-三个 MoE（0.00158 / 0.00158 / 0.00138）介于两者之间，且彼此接近，
-说明 FSDP2、Megatron 与 ATOM rollout 在这个模型上给出的 train / rollout 对齐水平相当。
 
 > 指标对不上时**先确认跑的是否为同一条 config**：
 > `grep -m1 'CONFIG=' $DATA_ROOT/logs/example-<N>-*.launcher.log`
@@ -563,8 +498,8 @@ ATOM 更慢（579 s 对 523 s），而真正长跑该看的是每步耗时。例
 
 ## 8.6 问题处理
 
-**1. 运行结束后显存不自动释放。** smoke 正常结束后每张卡可能仍占着约 90.9 GB
-（实测 89960382464–90905997312 B）：Ray worker 已退出，但显存未归还，且容器内看不到对应进程。
+**1. 运行结束后显存不自动释放。** smoke 正常结束后每张卡可能仍占着约 90.9 GB：
+Ray worker 已退出，但显存没有归还给驱动。
 两次运行之间重启容器，否则下一次运行的 KV cache 预算会被压低。启动器每次启动前都会做这件事。
 
 ```bash
@@ -590,15 +525,12 @@ watch -n 30 'ls -l $DATA_ROOT/logs/example-4-xxx.log'
 **4. `docker restart` 会终止 `--detach` 起的任务。** 启动器在重启前会先检查上一次的日志
 是否仍在增长，若在增长则拒绝启动并说明处置方式；`--force` 表示强制终止。
 
-**5. 日志中出现 `waiting for baton release` 不是卡死。** 8 个训练 actor 在等其中一个完成
-JIT 编译，靠锁串行。发布镜像已预编译全部 kernel，正常不会出现；若挂载了自己的
-aiter 源码则可能出现。启动器的 `STALL_LIMIT`（默认 2400 秒无新日志才放弃）为此留了余量。
+**5. 日志中出现 `waiting for baton release` 不是卡死。** 8 个训练 actor 在排队等其中一个
+完成 JIT 编译。发布镜像已预编译全部 kernel，正常不会出现；若挂载了自己的 aiter 源码则可能出现。
 
-**6. `filter_groups round N` 不是每个例子都有。** 该日志行只在启用动态采样的 config 上出现。
-**例子 2、3 不会打印它**——它们共用的 config 显式设置了
-`dynamic_sampling: false` + `filter_groups.enable: false`（`max_response_length: 512`
-下 base 模型很少做完一道题，开启动态采样会筛掉所有 group）。
-这不是故障：两者都会跑完 3 步、指标齐全、`--check` 通过。
+**6. `filter_groups round N` 不是每个例子都有。** 该日志行只在启用动态采样的 config 上出现，
+**例子 2、3 关掉了它**——`max_response_length: 512` 下 base 模型很少做完一道题，
+开启动态采样会筛掉所有 group。两者仍会跑完 3 步并通过 `--check`。
 
 **7. 覆盖 `aiter` 源码时必须同时更换 `AITER_JIT_DIR`。** 已编译的 kernel 与产生它的 aiter
 revision 绑定，复用旧目录会在 import 阶段失败，且报错既不提 aiter 也不提分支：
@@ -630,14 +562,10 @@ AssertionError: Not enough memory for KV cache with block size(16). At least 1 b
    peak_torch=57.68GB, non_torch=52.88GB, safety=5.76GB, free=177.39GB)
 ```
 
-ATOM 每次 wake 都按「`gpu_memory_utilization x total` 减去整卡报告为已占用的显存」
-重新推算块数，这里的 `non_torch` 就是节点上的其余部分——主要是同卡上的训练侧。
-`free=177.39GB` 是关键线索：显存是有的，只是没算在 rollout 引擎账上。
-
-调大 `gpu_memory_utilization` 不是解法，释放 actor 的分配器缓存也不是——那只让
-`non_torch` 少 0.6 GB，因为 `non_torch` 是从「整卡已占用」推出来的，而这个平台不会把
-freed 的显存归还给驱动（与上面第 1 条同源，且与版本相关——有些 ROCm 版本是会归还的）。
-正解是让池子常驻，也就是 §8.1.2 里第二项设置做的事；
+`non_torch` 是节点上的其余部分，主要是同卡上的训练侧；`free=177.39GB` 是关键线索：
+显存是有的，只是没算在 rollout 引擎账上。调大 `gpu_memory_utilization` 不是解法，
+释放 actor 的分配器缓存也不是——原因见上面第 1 条。
+**正解是让池子常驻，也就是 §8.1.1 里第二项设置做的事**；
 如果你用的是自己的 ATOM 分支，请确认 `sleep_keeps_memory_resident` 能传到它。
 
 ---
