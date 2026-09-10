@@ -86,7 +86,13 @@ JOBS = [
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
 
 def doc2len(doc) -> int:
-    return len(tokenizer.apply_chat_template(doc[PROMPT_KEY], add_generation_prompt=True, tokenize=True))
+    # transformers 4.x 返回扁平的 token id 列表；5.x 返回 BatchEncoding，
+    # 此时 len() 数的是 dict 的 2 个 key 而不是 token 数，过滤会完全失效。
+    enc = tokenizer.apply_chat_template(doc[PROMPT_KEY], add_generation_prompt=True, tokenize=True)
+    ids = enc["input_ids"] if hasattr(enc, "keys") else enc
+    if ids and isinstance(ids[0], (list, tuple)):
+        ids = ids[0]
+    return len(ids)
 
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
