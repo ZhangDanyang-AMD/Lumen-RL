@@ -362,6 +362,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
             det = ec.get("deterministic_mode")
             tfcfg = self._spec.build_config(
                 hf, ec, tp=tp, pp=pp, cp=cp, ep=ep, etp=etp, sp=sp,
+                max_tokens_per_gpu=self._max_tokens_per_gpu,
                 # Unset means "the model family decides", and DSv4 decides on:
                 # non-deterministic forwards disagree with themselves on ~1.6% of
                 # argmaxes, swamping the train/rollout gap DAPO measures.

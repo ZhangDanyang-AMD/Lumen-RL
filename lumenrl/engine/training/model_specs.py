@@ -2,8 +2,8 @@
 
 Kept separate from ``model_registry`` so the registry stays free of bridge
 imports and can be unit-tested on its own. Import order in this file is the
-resolution order: DSv4 first (most specific), then MoE, then the dense
-catch-all.
+resolution order, most specific first: DSv4, then the DeepSeek-V3 family,
+then any other config declaring routed experts, then the dense catch-all.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from __future__ import annotations
 import itertools
 from typing import Any, Mapping
 
+from lumenrl.engine.training import dsv3_megatron_bridge as dsv3
 from lumenrl.engine.training import dsv4_megatron_bridge as dsv4
 from lumenrl.engine.training.model_registry import (
     MODEL_REGISTRY,
@@ -104,6 +105,36 @@ DSV4 = MODEL_REGISTRY.register(
         build_layer_spec=lambda *a, **kw: dsv4.build_dsv4_spec(*a, **kw),
         sequence_alignment=lambda tfcfg: dsv4.sequence_alignment(tfcfg),
         export_weights=_export_dsv4,
+    )
+)
+
+
+# --- DeepSeek-V3 family (V3 / V3.1 / R1, and the Kimi K2 line) ---------------
+# Registered before qwen3_moe: a DSv3 config declares routed experts, so the
+# generic MoE entry would otherwise claim it and build a plain TransformerConfig
+# with fused QKV -- wrong for MLA. Detection is on ``architectures`` so DSv4,
+# which also has MLA fields, is not caught here (it is matched earlier anyway).
+DSV3 = MODEL_REGISTRY.register(
+    ModelSpec(
+        name="deepseek_v3",
+        detect=lambda hf, ec: dsv3.is_dsv3(hf),
+        caps=ModelCaps(
+            has_experts=True,
+            # Construction needs MLATransformerConfig, not TransformerConfig.
+            builds_own_config=True,
+            # No weight bridge yet -- see export_weights below. The HF-bridge
+            # capability stays True because the intent is to use it once written;
+            # what is missing is the MLA mapping, not the mechanism.
+            supports_hf_bridge=True,
+        ),
+        build_dims=dsv3.build_dsv3_dims,
+        build_config=dsv3.build_dsv3_config,
+        # MLA is a parameter of the stock TE builder, so no custom layer spec:
+        # the engine's generic MoE branch produces the right thing once
+        # ``multi_latent_attention`` is set on the config.
+        build_layer_spec=None,
+        routing_defaults={"moe_router_pre_softmax": False},
+        export_weights=dsv3.export_weights_not_implemented,
     )
 )
 
