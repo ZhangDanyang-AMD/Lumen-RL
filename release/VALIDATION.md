@@ -149,3 +149,10 @@ live state rather than cache. Only keeping the pool resident works.
   examples.** Both work there; the pin is justified by example 9, where releasing does
   not, and by it being the behaviour the previous ATOM had unconditionally. What the
   per-step cost of a graph recapture actually is on 4 and 5 was not quantified.
+- **The pin sidesteps the KV budget problem rather than fixing it.** The `non_torch`
+  figure that makes the budget negative is itself drift in ROCm/ATOM `main` between the
+  PR's merge base and `8938787d`: a separate A/B on `main` plus only the `n>1` fan-out
+  fix reproduces `non_torch=52.88GB` and `available_for_kv=-29.93GB`, i.e. the same
+  numbers with the whole MoE weight-sync path out of the picture. So an ATOM that
+  releases will keep needing the pin until that is found, and finding it is upstream
+  work this record does not cover. Reproduction worktrees are kept outside git.
