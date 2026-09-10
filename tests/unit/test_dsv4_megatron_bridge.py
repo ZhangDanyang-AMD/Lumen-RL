@@ -239,3 +239,13 @@ def test_ep_rank_loads_global_experts_into_local_slots_without_remapping_hash_id
         megatron["decoder.layers.0.mlp.router.tid2eid"],
         checkpoint["model.layers.0.mlp.topk.tid2eid"],
     )
+
+
+def test_is_dsv4_recognises_both_spellings_and_rejects_qwen3():
+    # MegatronNativeEngine calls this for every model it builds, so it has to
+    # answer for a non-DSv4 config too rather than not exist.
+    assert dsv4_bridge.is_dsv4({"model_type": "deepseek_v4"})
+    assert dsv4_bridge.is_dsv4({"architectures": ["DeepseekV4ForCausalLM"]})
+    assert not dsv4_bridge.is_dsv4({"model_type": "qwen3_moe"})
+    assert not dsv4_bridge.is_dsv4({"architectures": ["Qwen3MoeForCausalLM"]})
+    assert not dsv4_bridge.is_dsv4({})
