@@ -47,6 +47,7 @@ class ATOMRayServer:
         kwargs.setdefault("master_addr", self._get_node_ip())
         kwargs.setdefault("port", self._get_free_port())
         self._pin_cudagraph_mode(kwargs)
+        self._pin_sleep_keeps_memory_resident(kwargs)
         self.engine = AsyncLLMEngine(**kwargs)
         logger.info(
             "ATOMRayServer[%d]: AsyncLLMEngine ready (master=%s:%s online_quant=%s).",
@@ -56,6 +57,19 @@ class ATOMRayServer:
             kwargs.get("online_quant_config"),
         )
         return True
+
+    @staticmethod
+    def _is_no_eager(kwargs: dict[str, Any]) -> bool:
+        """Will this rollout run torch.compile and capture CUDA graphs?
+
+        Both pins below apply exactly here and nowhere else, so they ask once:
+        graphs that are captured but released on sleep, or memory kept resident
+        with no graphs to protect, is neither of the two configurations the
+        reference values were measured in.
+        """
+        comp_cfg = kwargs.get("compilation_config") or {}
+        level = int(comp_cfg.get("level", 0) or 0)
+        return level > 0 or not bool(kwargs.get("enforce_eager", True))
 
     def _pin_cudagraph_mode(self, kwargs: dict[str, Any]) -> None:
         """Choose ATOM's CUDA-graph strategy for a no-eager rollout.
@@ -74,11 +88,11 @@ class ATOMRayServer:
         ATOM builds that pin the mode themselves still win — this only supplies a
         value.
         """
-        comp_cfg = dict(kwargs.get("compilation_config") or {})
-        level = int(comp_cfg.get("level", 0) or 0)
-        if level <= 0 and bool(kwargs.get("enforce_eager", True)):
+        if not self._is_no_eager(kwargs):
             return
 
+        comp_cfg = dict(kwargs.get("compilation_config") or {})
+        level = int(comp_cfg.get("level", 0) or 0)
         mode = comp_cfg.get("cudagraph_mode") or "FULL"
         if isinstance(mode, str):
             from atom.config import CUDAGraphMode
@@ -99,6 +113,40 @@ class ATOMRayServer:
             self.replica_rank,
             level,
             getattr(mode, "name", mode),
+        )
+
+    def _pin_sleep_keeps_memory_resident(self, kwargs: dict[str, Any]) -> None:
+        """Keep a no-eager rollout's weights and KV pool allocated across sleep.
+
+        This is the behaviour the release measurements were taken against: ATOM
+        up to `28721a50` kept both resident in no-eager mode unconditionally,
+        because a decode graph captures the base address of the KV pool and
+        recapturing on wake faults. `ROCm/ATOM#2028` turned that into
+        `Config.sleep_keeps_memory_resident`, defaulting to release, so leaving it
+        unset silently changes what a colocated ATOM rollout does at every step.
+
+        Releasing is not merely slower here, it does not work: ATOM re-derives the
+        KV block count on each wake as `gpu_memory_utilization x total` minus
+        everything resident on the card, and after the first optimizer step the
+        colocated trainer is 52 GB of that. Qwen3-30B-A3B (example 9) then asks
+        for a negative pool and all eight replicas assert in `resume_memory`. The
+        8B examples have the headroom to survive it, and merely pay the recapture.
+
+        No-op on the older pin: ATOM filters engine kwargs against its `Config`
+        fields, and a build without this one drops the kwarg. It also has no
+        effect under `enforce_eager`, where there are no graphs to keep valid, so
+        this only supplies a value where `_pin_cudagraph_mode` supplies one too.
+
+        Override with `atom_cfg.engine_kwargs.sleep_keeps_memory_resident`.
+        """
+        if not self._is_no_eager(kwargs):
+            return
+
+        kwargs.setdefault("sleep_keeps_memory_resident", True)
+        logger.info(
+            "ATOMRayServer[%d]: sleep_keeps_memory_resident=%s",
+            self.replica_rank,
+            kwargs["sleep_keeps_memory_resident"],
         )
 
     @staticmethod
