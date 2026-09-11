@@ -147,6 +147,42 @@ def build_dsv3_config(
     moe_ffn = int(ec.get("moe_ffn_hidden_size") or hf.get("moe_intermediate_size") or 0)
     n_shared = int(hf.get("n_shared_experts") or 0)
 
+    # --- RoPE ---------------------------------------------------------------
+    # MLATransformerConfig's defaults happen to BE DeepSeek-V3's YaRN values
+    # (yarn / factor 40 / beta 32,1 / theta 10000), so relying on them looks
+    # correct on V3 and silently mis-positions every token on anything else:
+    # Kimi K2 uses theta 50000, factor 32, beta_fast 1.
+    #
+    # ``mscale_all_dim`` is wrong even for V3. Megatron defaults it to 0.0 while
+    # every shipped DeepSeek config says 1.0, and MLASelfAttention derives
+    # ``softmax_scale = _yarn_get_mscale(factor, mscale_all_dim)**2 / sqrt(qk_dim)``
+    # from it -- unconditionally, whatever rope_type is. At factor 40 that is
+    # 1.3689**2 vs 1.0, so the attention temperature is off by ~1.87x.
+    rope_scaling = dict(hf.get("rope_scaling") or {})
+    rope: dict[str, Any] = {"rotary_base": float(hf.get("rope_theta") or 10000.0)}
+    if rope_scaling:
+        kind = str(rope_scaling.get("type") or rope_scaling.get("rope_type") or "yarn")
+        if kind != "yarn":
+            raise ValueError(
+                f"DSv3 rope_scaling type {kind!r} is not supported; MLA offers "
+                "'rope' and 'yarn' only"
+            )
+        rope.update(
+            rope_type="yarn",
+            rotary_scaling_factor=float(rope_scaling["factor"]),
+            original_max_position_embeddings=int(
+                rope_scaling.get("original_max_position_embeddings", 4096)
+            ),
+            beta_fast=float(rope_scaling.get("beta_fast", 32.0)),
+            beta_slow=float(rope_scaling.get("beta_slow", 1.0)),
+            mscale=float(rope_scaling.get("mscale", 1.0)),
+            mscale_all_dim=float(rope_scaling.get("mscale_all_dim", 0.0)),
+        )
+    else:
+        # No scaling: plain RoPE, and a unit scaling factor so the softmax_scale
+        # above collapses to the standard 1/sqrt(qk_dim).
+        rope.update(rope_type="rope", rotary_scaling_factor=1.0, mscale_all_dim=0.0)
+
     moe: dict[str, Any] = {}
     if num_experts > 1:
         moe = dict(
@@ -180,6 +216,26 @@ def build_dsv3_config(
             # ``norm_topk_prob`` -- see the Qwen3-MoE note in ``model_specs``.
             moe_router_pre_softmax=bool(ec.get("moe_router_pre_softmax") or False),
         )
+        # DeepSeek restricts top-k to the best ``topk_group`` of ``n_group``
+        # expert groups (node-limited routing). V3/R1 ship 8/4; without this the
+        # router is free to pick across all groups and selects experts the
+        # reference never would. K2's 1/1 is a no-op, and Megatron rejects
+        # num_groups=1, so only wire it up when it actually constrains.
+        n_group = int(ec.get("moe_router_num_groups") or hf.get("n_group") or 0)
+        if n_group > 1:
+            moe["moe_router_num_groups"] = n_group
+            moe["moe_router_group_topk"] = int(
+                ec.get("moe_router_group_topk") or hf.get("topk_group") or n_group
+            )
+        # Megatron's sigmoid router always renormalises the top-k probabilities
+        # (moe_utils: ``probs = scores / scores.sum()`` when topk > 1), which is
+        # norm_topk_prob=True. There is no switch for the other case, so refuse
+        # it rather than train with silently rescaled routing weights.
+        if not bool(hf.get("norm_topk_prob", True)):
+            raise ValueError(
+                "norm_topk_prob=False is not supported: Megatron's sigmoid router "
+                "renormalises the top-k probabilities unconditionally"
+            )
         if n_shared > 0:
             moe["moe_shared_expert_intermediate_size"] = moe_ffn * n_shared
 
@@ -218,6 +274,7 @@ def build_dsv3_config(
         qk_head_dim=int(hf["qk_nope_head_dim"]),
         qk_pos_emb_head_dim=int(hf["qk_rope_head_dim"]),
         v_head_dim=int(hf["v_head_dim"]),
+        **rope,
         # Matches the generic path: alltoall is also the only dispatcher that
         # passes config validation under variable_seq_lengths.
         moe_token_dispatcher_type="alltoall",
