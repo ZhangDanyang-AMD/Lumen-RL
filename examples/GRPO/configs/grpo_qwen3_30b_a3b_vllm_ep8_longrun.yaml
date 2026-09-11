@@ -80,6 +80,9 @@ policy:
       num_experts: 128
       moe_grouped_gemm: false             # grouped_gemm (CUTLASS) unavailable on ROCm; use SequentialMLP
       moe_token_dispatcher_type: alltoall # Variable-length packed batches require uneven EP token splits
+      moe_flex_dispatcher_backend: mori
+      moe_mori_max_tokens_per_rank: null
+      moe_mori_kernel_type: null
       use_distributed_optimizer: true
       grad_reduce_in_fp32: true            # MILES: --accumulate-allreduce-grads-in-fp32
       attention_softmax_in_fp32: true      # MILES train/infer numerical alignment

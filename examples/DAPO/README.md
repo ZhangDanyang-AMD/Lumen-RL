@@ -77,6 +77,32 @@ LOG="$DATA_ROOT/logs/dapo-smoke-megatron-native.log" \
 bash "$S"
 ```
 
+Qwen3-30B-A3B MoE + Megatron-Native EP=8, with MORI flex dispatch.
+
+Megatron Core's flex token dispatcher uses MORI (`moe_token_dispatcher_type=flex`,
+`moe_flex_dispatcher_backend=mori`; it `import`s the `mori` package). Install
+MORI and use it through that Megatron Core backend — either the installed
+`megatron.core` on `PYTHONPATH`, or a source tree:
+
+```bash
+# MORI: https://github.com/ROCm/mori  (must be importable: import mori)
+# Optional: pin a Megatron-LM / Megatron Core tree instead of the pip package
+# export MEGATRON_PATH=/path/to/Megatron-LM
+export MODEL_PATH="$DATA_ROOT/models/Qwen3-30B-A3B-Base"
+CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3moe_a3b_ray_megatron_smoke.yaml \
+STEPS=2 \
+MODE=bf16 \
+ENABLE_MORI=true \
+LOG="$DATA_ROOT/logs/dapo-smoke-moe-mori.log" \
+bash "$S"
+```
+
+`ENABLE_MORI=true` sets `moe_token_dispatcher_type=flex` and
+`moe_flex_dispatcher_backend=mori`. If `MEGATRON_PATH` is set it is prepended
+to `PYTHONPATH`; otherwise actors use the installed `megatron.core`. The engine
+sets `moe_mori_max_tokens_per_rank` from `max_tokens_per_gpu` (Megatron's
+`validate_args` is not used).
+
 ## Long run
 
 ```bash

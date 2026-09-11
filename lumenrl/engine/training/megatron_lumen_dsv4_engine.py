@@ -48,6 +48,7 @@ from lumenrl.engine.training.megatron_engine import (
     _gather_with_stride,
     _shard_with_stride,
 )
+from lumenrl.engine.training.megatron_base_engine import moe_dispatcher_kwargs
 from lumenrl.engine.training.qwen3_megatron_bridge import load_hf_safetensors
 
 logger = logging.getLogger(__name__)
@@ -713,7 +714,6 @@ class MegatronLumenDSV4Engine(MegatronEngine):
                 moe_ffn_hidden_size=moe_ffn if moe_ffn > 0 else hf.get("intermediate_size", 2048),
                 moe_router_topk=moe_topk,
                 moe_grouped_gemm=bool(ec.get("moe_grouped_gemm", False)),
-                moe_token_dispatcher_type=str(ec.get("moe_token_dispatcher_type", "alltoall")),
                 expert_model_parallel_size=ep,
                 moe_enable_routing_replay=self._r3_enabled,
             )
@@ -773,6 +773,13 @@ class MegatronLumenDSV4Engine(MegatronEngine):
             dsa_indexer_n_heads=int(ec.get("dsa_indexer_n_heads") or hf.get("index_n_heads") or hf.get("dsa_indexer_n_heads", 64)),
             dsa_indexer_head_dim=int(ec.get("dsa_indexer_head_dim") or hf.get("index_head_dim") or hf.get("dsa_indexer_head_dim", 128)),
             dsa_indexer_topk=int(ec.get("dsa_indexer_topk") or hf.get("index_topk") or hf.get("dsa_indexer_topk", 512)),
+            **moe_dispatcher_kwargs(
+                ec,
+                tp=tp,
+                cp=cp,
+                sp=bool(ec.get("sequence_parallel", False)),
+                max_tokens_per_gpu=int(ec.get("max_tokens_per_gpu") or 0),
+            ),
             **recompute_kwargs,
             **moe_kwargs,
             **pp_kwargs,
