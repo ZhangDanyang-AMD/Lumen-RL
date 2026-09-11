@@ -35,6 +35,20 @@ from lumenrl.engine.training.qwen3_megatron_bridge import (
 # Odd layers 3,5,...,41: ratio=128 (HCA -- compressor only, no indexer)
 DSV4_FLASH_COMPRESS_RATIOS: list[int] = [0, 0] + [4, 128] * 20 + [0]  # 43 values
 
+MODEL_TYPE = "deepseek_v4"
+
+
+def is_dsv4(hf: dict) -> bool:
+    """Does this HF config describe a DeepSeek-V4 model?
+
+    ``MegatronNativeEngine.__init__`` asks this of every model it builds, so a
+    Qwen3 run reaches it too: it is how the engine decides whether to take the
+    DSv4 path in this module at all.
+    """
+    if str(hf.get("model_type", "")) == MODEL_TYPE:
+        return True
+    return any("DeepseekV4" in a for a in hf.get("architectures", []))
+
 
 def is_dsv4(hf: dict) -> bool:
     """True when ``config.json`` is a DeepSeek-V4 family (MLA + hyper-connections)."""

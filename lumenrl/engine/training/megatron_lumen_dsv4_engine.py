@@ -1010,7 +1010,9 @@ class MegatronLumenDSV4Engine(MegatronEngine):
         )
         print(startup_message, file=sys.stderr, flush=True)
         logger.info(startup_message)
-        optimizer_name = str(oc.get("optimizer", "adam")).lower()
+        optimizer_name = str(
+            oc.get("optimizer_type", oc.get("optimizer", "adam"))
+        ).lower()
         if optimizer_name == "adamw":
             optimizer_name = "adam"
         opt_cfg = OptimizerConfig(

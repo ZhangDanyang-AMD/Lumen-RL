@@ -28,7 +28,7 @@
 #
 #   LUMENRL_MEM_DIAG=1 RAY=1 DETACH=1 STEPS=2 \
 #   CFG=examples/DAPO/configs/dapo_dsv4_flash_ray_vllm_megatron_1node_shortsmoke.yaml \
-#     bash ~/4node/07_dsv4_megatron_1node.sh
+#     bash <your single-node launcher>
 #
 # Everything not mentioned above is copied from
 # dapo_dsv4_flash_ray_vllm_megatron_1node_smoke.yaml; see that file's header for
@@ -53,7 +53,7 @@ controller:
       dispatch_mode: dp_compute_proto
 
 policy:
-  model_name: "/mnt/m2m_nobackup/xysheng/models/dsv4-L4-bf16-native"
+  model_name: "${oc.env:DATA_ROOT}/models/dsv4-L4-bf16-native"
   training_backend: megatron_native
   generation_backend: vllm
   max_total_sequence_length: 1280       # 1024 prompt budget + 256 response
@@ -78,7 +78,7 @@ policy:
       pipeline_model_parallel_size: 1
       context_parallel_size: 1
       expert_model_parallel_size: 8
-      dist_checkpoint_path: "/mnt/m2m_nobackup/xysheng/models/dsv4-L4_torch_dist"
+      dist_checkpoint_path: "${oc.env:DATA_ROOT}/models/dsv4-L4_torch_dist"
       # ⚠️ Both off ON PURPOSE, and both differ from the 4-node shortsmoke.
       # probe_63 builds neither, and an unmatched knob here would be indis-
       # tinguishable from the ~89 GB being hunted. Turning them on is a

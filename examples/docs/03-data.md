@@ -89,7 +89,13 @@ JOBS = [
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
 
 def doc2len(doc) -> int:
-    return len(tokenizer.apply_chat_template(doc[PROMPT_KEY], add_generation_prompt=True, tokenize=True))
+    # transformers 4.x returns a flat list of token ids; 5.x returns a BatchEncoding,
+    # where len() counts the dict keys (2) instead of the tokens and filters nothing.
+    enc = tokenizer.apply_chat_template(doc[PROMPT_KEY], add_generation_prompt=True, tokenize=True)
+    ids = enc["input_ids"] if hasattr(enc, "keys") else enc
+    if ids and isinstance(ids[0], (list, tuple)):
+        ids = ids[0]
+    return len(ids)
 
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)

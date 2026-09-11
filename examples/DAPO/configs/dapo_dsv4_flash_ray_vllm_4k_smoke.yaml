@@ -49,7 +49,7 @@ controller:
       process_on_nodes: [8, 8, 8, 8]
 
 policy:
-  model_name: "/mnt/m2m_nobackup/xysheng/models/dsv4-native-L4"
+  model_name: "${oc.env:DATA_ROOT}/models/dsv4-native-L4"
   training_backend: fsdp2
   generation_backend: vllm
   max_total_sequence_length: 6144       # 2048 prompt budget + 4096 response

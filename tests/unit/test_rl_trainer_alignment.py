@@ -278,3 +278,26 @@ def test_response_position_metrics_isolate_late_token_drift(old_seq_len: int) ->
     assert got["rollout_corr/pos_0_1/kl"] == pytest.approx(0.35)
     assert got["rollout_corr/pos_2_3/tokens"] == 2
     assert got["rollout_corr/pos_2_3/kl"] == pytest.approx(0.35)
+
+
+def test_response_position_metrics_take_the_common_width() -> None:
+    # A Megatron actor pads old_log_probs out to the full sequence width while
+    # the mask and the rollout log-probs are built pre-shifted one narrower, so
+    # the two arrive with different widths and the same frame. Reading them
+    # without lining them up raised
+    #   RuntimeError: The size of tensor a (4254) must match the size of tensor
+    #                 b (4255) at non-singleton dimension 1
+    # on example 7 after the first step's rollout.
+    rollout_logp = torch.tensor([[0.0, 0.1, 0.2, 0.3, 0.4]])
+    response_mask = torch.tensor([[0, 1, 1, 1, 1]])
+    padded_old_logp = torch.zeros(1, 6)
+
+    got = RLTrainer._mismatch_by_response_position(
+        padded_old_logp, rollout_logp, response_mask
+    )
+    same_width = RLTrainer._mismatch_by_response_position(
+        padded_old_logp[:, :5], rollout_logp, response_mask
+    )
+
+    assert got == same_width
+    assert got["rollout_corr/pos_0_127/tokens"] == 4.0

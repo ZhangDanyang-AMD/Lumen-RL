@@ -17,7 +17,7 @@
 #     PP because mHC's layer_post returns a view and a synthetic PP=2 probe
 #     silently changed the loss. See _dsv4_check_topology.
 # Despite the name this is also the multi-node recipe: nothing here depends on
-# the node count, so ~/4node/08_dsv4_megatron_multinode.sh reuses the file as-is
+# the node count, so your multi-node launcher reuses the file as-is
 # and injects cluster.num_nodes, controller.ray.actor.num_workers and
 # controller.ray.actor.process_on_nodes on the command line, all derived from its
 # node list. Validated at 2 nodes / 16 GPUs (EP=8, DP=2): 3 steps, exit 0,
@@ -68,7 +68,7 @@ policy:
   # BF16 but renamed into DeepSeek-HF form, which vLLM's DSv4 loader rejects
   # ("KeyError: 'layers.0.input_layernorm.weight'"). The trainer reads only
   # config.json from here and takes its weights from dist_checkpoint_path.
-  model_name: "/mnt/m2m_nobackup/xysheng/models/dsv4-L4-bf16-native"
+  model_name: "${oc.env:DATA_ROOT}/models/dsv4-L4-bf16-native"
   training_backend: megatron_native
   generation_backend: vllm
   max_total_sequence_length: 6144       # 2048 prompt budget + 4096 response
@@ -93,7 +93,7 @@ policy:
       expert_model_parallel_size: 8
       # Offline-converted weights; dist_checkpointing.load reshards them to this
       # topology on the way in.
-      dist_checkpoint_path: "/mnt/m2m_nobackup/xysheng/models/dsv4-L4_torch_dist"
+      dist_checkpoint_path: "${oc.env:DATA_ROOT}/models/dsv4-L4_torch_dist"
       # Bitwise reproducibility. Without it ~1.6% of argmaxes flip run to run,
       # which is larger than the train/rollout gap DAPO is trying to measure.
       # Needs NCCL_ALGO=Ring in the environment, which ray_env_dsv4.sh sets.
