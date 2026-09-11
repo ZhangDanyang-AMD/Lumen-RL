@@ -1,8 +1,11 @@
-"""DeepSeek-V3 family registry entry.
+"""DeepSeek-V3 family registry entry, config building, and rope/routing.
 
 Values are the real ``moonshotai/Kimi-K2-Base`` config, which reports
 ``DeepseekV3ForCausalLM`` -- one entry serves DeepSeek V3 / V3.1 / R1 and the
-whole Kimi K2 line.
+whole Kimi K2 line. The V3/R1 variant is expressed as an overlay on it, so both
+fixtures stay tied to published configs rather than to invented values; that
+matters here because the bug these tests pin came from fields a synthetic
+fixture simply does not have.
 """
 
 import pytest
@@ -11,7 +14,7 @@ from lumenrl.engine.training import dsv3_megatron_bridge as dsv3
 from lumenrl.engine.training import model_specs  # noqa: F401  (registers specs)
 from lumenrl.engine.training.model_registry import MODEL_REGISTRY
 
-# Real Kimi-K2-Base values.
+# Real Kimi-K2-Base values, rope and expert grouping included.
 K2 = {
     "architectures": ["DeepseekV3ForCausalLM"],
     "num_hidden_layers": 61,
@@ -35,6 +38,27 @@ K2 = {
     "topk_method": "noaux_tc",
     "scoring_func": "sigmoid",
     "norm_topk_prob": True,
+    "rope_theta": 50000.0,
+    "rope_scaling": {
+        "beta_fast": 1.0, "beta_slow": 1.0, "factor": 32.0, "mscale": 1.0,
+        "mscale_all_dim": 1.0, "original_max_position_embeddings": 4096,
+        "type": "yarn",
+    },
+    "n_group": 1,
+    "topk_group": 1,
+}
+
+# Real DeepSeek-V3 / R1 values for the fields where it differs from K2.
+V3 = {
+    **K2,
+    "rope_theta": 10000,
+    "rope_scaling": {
+        "beta_fast": 32, "beta_slow": 1, "factor": 40, "mscale": 1.0,
+        "mscale_all_dim": 1.0, "original_max_position_embeddings": 4096,
+        "type": "yarn",
+    },
+    "n_group": 8,
+    "topk_group": 4,
 }
 
 
@@ -137,6 +161,89 @@ def test_engine_config_overrides_win_over_hf():
     assert cfg.moe_router_topk == 4
     assert cfg.moe_grouped_gemm is False
     assert cfg.moe_aux_loss_coeff == pytest.approx(0.01)
+
+
+# --- rope ---------------------------------------------------------------------
+#
+# MLATransformerConfig's defaults happen to BE DeepSeek-V3's YaRN values, which
+# makes a builder that ignores rope_scaling look correct on V3 and quietly wrong
+# everywhere else. One default is wrong even on V3: mscale_all_dim.
+#
+# Measured on the real bzantium/tiny-deepseek-v3 checkpoint in fp32, leaving
+# these at Megatron's defaults gave 11.4% mean relative logit error and 71.9%
+# top-1 agreement against the HF reference; reading them from the config gives
+# 1.4e-6 and 100%. See test_dsv3_gpu.py.
+
+def test_yarn_parameters_are_read_from_rope_scaling():
+    cfg = dsv3.build_dsv3_config(V3, {})
+    assert cfg.rope_type == "yarn"
+    assert cfg.rotary_base == pytest.approx(10000.0)
+    assert cfg.rotary_scaling_factor == pytest.approx(40.0)
+    assert cfg.original_max_position_embeddings == 4096
+    assert (cfg.beta_fast, cfg.beta_slow) == (pytest.approx(32.0), pytest.approx(1.0))
+
+
+def test_mscale_all_dim_is_taken_from_the_config_not_the_default():
+    """The one default that is wrong even for DeepSeek-V3.
+
+    ``MLASelfAttention`` derives ``softmax_scale`` from it as
+    ``_yarn_get_mscale(factor, mscale_all_dim)**2 / sqrt(qk_dim)`` -- and does so
+    whatever ``rope_type`` is. Megatron defaults to 0.0, every shipped DeepSeek
+    config says 1.0, and at factor 40 that is a 1.87x error in the attention
+    temperature.
+    """
+    assert dsv3.build_dsv3_config(V3, {}).mscale_all_dim == pytest.approx(1.0)
+
+
+def test_kimi_k2_does_not_inherit_deepseek_v3s_rope():
+    """K2 differs from the Megatron defaults on three values at once."""
+    cfg = dsv3.build_dsv3_config(K2, {})
+    assert cfg.rotary_base == pytest.approx(50000.0)         # default 10000
+    assert cfg.rotary_scaling_factor == pytest.approx(32.0)  # default 40
+    assert cfg.beta_fast == pytest.approx(1.0)               # default 32
+
+
+def test_no_rope_scaling_means_plain_rope_and_a_unit_softmax_scale():
+    """Without scaling, the default 'yarn' would apply a factor-40 stretch."""
+    cfg = dsv3.build_dsv3_config({k: v for k, v in V3.items() if k != "rope_scaling"}, {})
+    assert cfg.rope_type == "rope"
+    assert cfg.rotary_scaling_factor == pytest.approx(1.0)
+    assert cfg.mscale_all_dim == pytest.approx(0.0)
+
+
+def test_unsupported_rope_scaling_is_refused():
+    """MLA implements 'rope' and 'yarn'; anything else would be silently ignored."""
+    with pytest.raises(ValueError, match="rope_scaling"):
+        dsv3.build_dsv3_config({**V3, "rope_scaling": {"type": "linear", "factor": 4}}, {})
+
+
+# --- node-limited expert routing ----------------------------------------------
+
+def test_expert_groups_are_wired_from_n_group_and_topk_group():
+    """V3/R1 restrict top-k to 4 of 8 groups; ignoring that changes the experts."""
+    cfg = dsv3.build_dsv3_config(V3, {})
+    assert (cfg.moe_router_num_groups, cfg.moe_router_group_topk) == (8, 4)
+
+
+def test_a_single_expert_group_is_left_unset():
+    """K2 ships n_group=1, which constrains nothing and which Megatron rejects."""
+    cfg = dsv3.build_dsv3_config(K2, {})
+    assert cfg.moe_router_num_groups is None
+    assert cfg.moe_router_group_topk is None
+
+
+def test_engine_config_can_override_the_groups():
+    cfg = dsv3.build_dsv3_config(
+        V3, {"moe_router_num_groups": 4, "moe_router_group_topk": 2}
+    )
+    assert (cfg.moe_router_num_groups, cfg.moe_router_group_topk) == (4, 2)
+
+
+def test_norm_topk_prob_false_is_refused():
+    """Megatron's sigmoid router renormalises unconditionally, so there is no way
+    to honour norm_topk_prob=False -- refuse rather than rescale silently."""
+    with pytest.raises(ValueError, match="norm_topk_prob"):
+        dsv3.build_dsv3_config({**V3, "norm_topk_prob": False}, {})
 
 
 # --- weight export -------------------------------------------------------------
