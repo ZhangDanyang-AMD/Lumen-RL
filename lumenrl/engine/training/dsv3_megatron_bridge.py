@@ -1,24 +1,17 @@
 """DeepSeek-V3 family support for the Megatron training path.
 
-Covers every checkpoint that reports ``DeepseekV3ForCausalLM`` -- DeepSeek V3 /
-V3.1 / R1 and the Kimi K2 line, which reuses the same architecture class.
+Covers every checkpoint reporting ``DeepseekV3ForCausalLM``: DeepSeek V3 / V3.1 /
+R1 and the Kimi K2 line.
 
-What makes this family different from Qwen3-MoE is **MLA**: queries and
-key/values go through low-rank projections rather than a single fused QKV, so
-the attention block has a different parameter set and Megatron needs
-``MLATransformerConfig`` instead of ``TransformerConfig``. Megatron-core 0.18.2
-implements MLA natively (``MLASelfAttention``, and ``multi_latent_attention``
-is a parameter of the TE layer-spec builder), so this is configuration rather
-than new modules.
+Two differences from Qwen3-MoE. **MLA** -- q and kv go through low-rank
+projections instead of one fused QKV, so the attention parameter set differs and
+Megatron needs ``MLATransformerConfig``. Megatron-core 0.18.2 implements MLA
+natively, so this is configuration, not new modules. **Routing** -- sigmoid
+scoring with the ``noaux_tc`` bias-corrected top-k and a routed scaling factor,
+where Qwen3-MoE uses plain softmax.
 
-Routing also differs: DeepSeek uses a sigmoid score function with the
-``noaux_tc`` bias-corrected top-k and a routed scaling factor, where Qwen3-MoE
-uses softmax with no bias.
-
-The weight bridge below was written against a constructed model's real
-parameter names rather than from the HF/Megatron docs, because two mappings
-are not guessable: the LoRA layernorms are fused into the up-projections, and
-the post-attention norm is spelled differently on dense and MoE layers.
+The weight bridge was written against a constructed model's real parameter names,
+because two mappings are not guessable from the docs.
 """
 
 from __future__ import annotations
@@ -148,16 +141,14 @@ def build_dsv3_config(
     n_shared = int(hf.get("n_shared_experts") or 0)
 
     # --- RoPE ---------------------------------------------------------------
-    # MLATransformerConfig's defaults happen to BE DeepSeek-V3's YaRN values
-    # (yarn / factor 40 / beta 32,1 / theta 10000), so relying on them looks
-    # correct on V3 and silently mis-positions every token on anything else:
-    # Kimi K2 uses theta 50000, factor 32, beta_fast 1.
+    # MLATransformerConfig's defaults happen to BE DeepSeek-V3's YaRN values, so
+    # ignoring rope_scaling looks correct on V3 and mis-positions every token
+    # elsewhere (K2: theta 50000, factor 32, beta_fast 1).
     #
-    # ``mscale_all_dim`` is wrong even for V3. Megatron defaults it to 0.0 while
-    # every shipped DeepSeek config says 1.0, and MLASelfAttention derives
-    # ``softmax_scale = _yarn_get_mscale(factor, mscale_all_dim)**2 / sqrt(qk_dim)``
-    # from it -- unconditionally, whatever rope_type is. At factor 40 that is
-    # 1.3689**2 vs 1.0, so the attention temperature is off by ~1.87x.
+    # ``mscale_all_dim`` is wrong even for V3: Megatron defaults 0.0, every
+    # shipped config says 1.0, and MLASelfAttention derives softmax_scale from it
+    # unconditionally. At factor 40 that is a ~1.87x error in attention
+    # temperature -- measured 11.4% mean logit error, 71.9% top-1 agreement.
     rope_scaling = dict(hf.get("rope_scaling") or {})
     rope: dict[str, Any] = {"rotary_base": float(hf.get("rope_theta") or 10000.0)}
     if rope_scaling:
@@ -216,37 +207,27 @@ def build_dsv3_config(
             # ``norm_topk_prob`` -- see the Qwen3-MoE note in ``model_specs``.
             moe_router_pre_softmax=bool(ec.get("moe_router_pre_softmax") or False),
         )
-        # Two knobs the generic MoE path in ``megatron_native_engine`` honours.
-        # Building the config here means anything not forwarded is silently
-        # dropped, and both of these matter more for DeepSeek than for Qwen3-MoE:
-        #
-        #   moe_router_dtype -- an fp32 router keeps top-k selection stable, which
-        #     is the whole point of the knob (the Qwen3-MoE configs set fp32 for
-        #     "lower train/rollout mismatch"). DeepSeek picks experts through a
-        #     sigmoid plus the noaux_tc bias, so a bf16 router flipping a marginal
-        #     expert changes which experts run and widens the rollout gap.
-        #   moe_router_bias_update_rate -- the update rate for that noaux_tc bias.
-        #     It only does anything when ``moe_router_enable_expert_bias`` is set,
-        #     which this path sets and the Qwen3 path does not.
+        # Knobs the generic MoE path honours; building the config here means
+        # anything not forwarded is silently dropped. Both matter more for
+        # DeepSeek: an fp32 router keeps top-k stable, and sigmoid + noaux_tc
+        # makes a flipped marginal expert change which experts run. The bias
+        # update rate only applies when expert bias is on, which is this path.
         if ec.get("moe_router_dtype"):
             moe["moe_router_dtype"] = str(ec["moe_router_dtype"])
         if ec.get("moe_router_bias_update_rate") is not None:
             moe["moe_router_bias_update_rate"] = float(ec["moe_router_bias_update_rate"])
-        # DeepSeek restricts top-k to the best ``topk_group`` of ``n_group``
-        # expert groups (node-limited routing). V3/R1 ship 8/4; without this the
-        # router is free to pick across all groups and selects experts the
-        # reference never would. K2's 1/1 is a no-op, and Megatron rejects
-        # num_groups=1, so only wire it up when it actually constrains.
+        # Node-limited routing: top-k restricted to the best ``topk_group`` of
+        # ``n_group`` groups (V3/R1 ship 8/4). Unset, the router ranges over all
+        # groups. K2's 1/1 constrains nothing and Megatron rejects num_groups=1.
         n_group = int(ec.get("moe_router_num_groups") or hf.get("n_group") or 0)
         if n_group > 1:
             moe["moe_router_num_groups"] = n_group
             moe["moe_router_group_topk"] = int(
                 ec.get("moe_router_group_topk") or hf.get("topk_group") or n_group
             )
-        # Megatron's sigmoid router always renormalises the top-k probabilities
-        # (moe_utils: ``probs = scores / scores.sum()`` when topk > 1), which is
-        # norm_topk_prob=True. There is no switch for the other case, so refuse
-        # it rather than train with silently rescaled routing weights.
+        # Megatron's sigmoid router always renormalises the top-k probabilities,
+        # i.e. norm_topk_prob=True, with no switch for the other case. Refuse
+        # rather than train with silently rescaled routing weights.
         if not bool(hf.get("norm_topk_prob", True)):
             raise ValueError(
                 "norm_topk_prob=False is not supported: Megatron's sigmoid router "
@@ -268,11 +249,9 @@ def build_dsv3_config(
         layernorm_epsilon=float(hf.get("rms_norm_eps", 1e-6)),
         hidden_dropout=0.0,
         attention_dropout=0.0,
-        # DeepSeek normalises both LoRA latents (HF q_a_layernorm /
-        # kv_a_layernorm). Megatron creates them only under qk_layernorm, and
-        # fuses them into the up-projections as ``layer_norm_weight``. Without
-        # this the model simply has no such parameters and the checkpoint's
-        # norms would have nowhere to load.
+        # DeepSeek normalises both LoRA latents (q_a_layernorm / kv_a_layernorm).
+        # Megatron creates them only under qk_layernorm, fused into the
+        # up-projections; without this the checkpoint's norms have nowhere to go.
         qk_layernorm=True,
         bf16=True,
         params_dtype=torch.bfloat16,
@@ -302,18 +281,14 @@ def build_dsv3_config(
 
 # =============================== weight bridge ===============================
 #
-# Name mapping, verified against a constructed model rather than assumed. The
-# non-obvious parts:
+# Name mapping verified against a constructed model, not assumed. Non-obvious:
 #
-#   * The LoRA layernorms are FUSED into the up-projections by TE and surface as
-#     ``linear_q_up_proj.layer_norm_weight`` / ``linear_kv_up_proj.layer_norm_weight``,
-#     not as separate ``q_layernorm`` / ``kv_layernorm`` modules.
-#   * A dense layer's post-attention norm is fused into ``mlp.linear_fc1`` as
-#     ``layer_norm_weight``, while a MoE layer keeps a standalone
-#     ``pre_mlp_layernorm``. Same HF key, two Megatron spellings.
-#   * gate_proj and up_proj are concatenated into one ``linear_fc1`` along dim 0.
-#   * The router bias is a BUFFER (``mlp.router.expert_bias``), so it never
-#     appears in ``named_parameters()`` and has to be gathered separately.
+#   * LoRA layernorms are FUSED into the up-projections as ``layer_norm_weight``,
+#     not separate ``q_layernorm`` / ``kv_layernorm`` modules.
+#   * The post-attention norm has two Megatron spellings for one HF key: fused
+#     into ``mlp.linear_fc1`` on dense layers, ``pre_mlp_layernorm`` on MoE.
+#   * gate_proj and up_proj concatenate into ``linear_fc1`` along dim 0.
+#   * The router bias is a BUFFER, absent from ``named_parameters()``.
 
 import re  # noqa: E402
 

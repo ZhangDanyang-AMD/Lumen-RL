@@ -1,9 +1,8 @@
 """The registered :class:`ModelSpec` entries.
 
-Kept separate from ``model_registry`` so the registry stays free of bridge
-imports and can be unit-tested on its own. Import order in this file is the
-resolution order, most specific first: DSv4, then the DeepSeek-V3 family,
-then any other config declaring routed experts, then the dense catch-all.
+Separate from ``model_registry`` so the registry carries no bridge imports.
+Registration order is resolution order, most specific first: DSv4, DeepSeek-V3,
+any other config with routed experts, dense catch-all.
 """
 
 from __future__ import annotations
@@ -28,20 +27,13 @@ from lumenrl.engine.training.qwen3moe_megatron_bridge import (
 
 
 def _effective_num_experts(hf: Mapping[str, Any], ec: Mapping[str, Any]) -> int:
-    """Expert count after the engine_config override.
-
-    An explicit ``num_experts`` in engine_config wins over the HF config, so a
-    dense checkpoint can be driven down the MoE path and vice versa.
-    """
+    """Expert count after the engine_config override, which wins over HF."""
     return int(ec.get("num_experts") or hf_num_experts(hf) or 0)
 
 
 def _export_dsv4(engine):
-    """DSv4 gathers like Qwen3-MoE but must land on the *checkpoint* names.
-
-    The rollout side feeds these straight to vLLM's own ``load_weights``, so the
-    renaming, not the gather, is what differs.
-    """
+    """Gathers like Qwen3-MoE but renames to the DSv4 *checkpoint* names, which
+    the rollout feeds straight to vLLM's ``load_weights``."""
     named = itertools.chain(
         engine._full_megatron_named_params_moe(),
         engine._dsv4_router_bias_buffers(),
@@ -50,9 +42,8 @@ def _export_dsv4(engine):
 
 
 def _export_dsv3(engine):
-    """MLA export. The router bias is a buffer, so it is chained in
-    explicitly -- DeepSeek's noaux_tc top-k reads it, and a rollout without
-    it selects different experts than the trainer did."""
+    """MLA export. The router bias is a buffer, so it is chained in explicitly:
+    noaux_tc top-k reads it, and a rollout without it picks other experts."""
     named = itertools.chain(
         engine._full_megatron_named_params_moe(),
         dsv3.dsv3_router_bias_buffers(engine.module),
@@ -81,11 +72,9 @@ def _dense_dims(hf: Mapping[str, Any]) -> Qwen3Dims:
 
 
 # --- DeepSeek-V4 -------------------------------------------------------------
-# MLA head geometry, a 4-D hyper-connection residual stream, per-layer
-# heterogeneous attention and hash routing on the first layers -- none of which
-# the generic TransformerConfig path can describe. Its block-quantized FP8
-# weights are also unreadable by the HF-safetensors bridge, so it carries no
-# dims: ``build_dims`` is None rather than a stub that would fail later.
+# 4-D hyper-connection residual stream, heterogeneous attention per layer, hash
+# routing on the first layers: nothing the generic config path can describe. Its
+# block-quantized FP8 is also unreadable by the HF bridge, hence build_dims=None.
 DSV4 = MODEL_REGISTRY.register(
     ModelSpec(
         name="deepseek_v4",
@@ -100,30 +89,24 @@ DSV4 = MODEL_REGISTRY.register(
             packed_stream_is_single_sequence=True,
         ),
         build_dims=None,
-        # Resolved at call time, not import time: the DSv4 construction functions
-        # ship with the DSv4 branch (``dev/vllm-fsdp-dapo`` / ``dev/OPD``), while
-        # ``main`` carries only the call sites. Binding them eagerly here would make
-        # importing this module fail on ``main`` for every model, so the indirection
-        # is deliberate and should stay even after the branches converge.
-        #
-        # build_config: field-for-field equal to what Megatron's own parser produces
-        #   from miles' deepseek-v4-flash.sh, the config every existing DSv4
-        #   numerical reference was measured on.
-        # build_layer_spec: heterogeneous per layer (sliding / compressed+indexed /
-        #   hyper-compressed), so no block-spec builder can produce it.
+        # Lazy on purpose: these functions ship with the DSv4 branch, not main,
+        # so binding them at import time would break this module for every model.
+        # build_config matches what Megatron's parser produces from
+        # deepseek-v4-flash.sh, the config the DSv4 references were measured on.
         build_config=lambda *a, **kw: dsv4.build_dsv4_config(*a, **kw),
         build_layer_spec=lambda *a, **kw: dsv4.build_dsv4_spec(*a, **kw),
         sequence_alignment=lambda tfcfg: dsv4.sequence_alignment(tfcfg),
+        # Refuses the topologies DSv4 gets wrong; see _dsv4_check_topology.
+        pre_forward_check=lambda engine: engine._dsv4_check_topology(),
         export_weights=_export_dsv4,
     )
 )
 
 
 # --- DeepSeek-V3 family (V3 / V3.1 / R1, and the Kimi K2 line) ---------------
-# Registered before qwen3_moe: a DSv3 config declares routed experts, so the
-# generic MoE entry would otherwise claim it and build a plain TransformerConfig
-# with fused QKV -- wrong for MLA. Detection is on ``architectures`` so DSv4,
-# which also has MLA fields, is not caught here (it is matched earlier anyway).
+# Before qwen3_moe: a DSv3 config declares routed experts, so the generic entry
+# would claim it and build a plain TransformerConfig with fused QKV -- wrong for
+# MLA. Detects on ``architectures``, not MLA fields, which DSv4 also has.
 DSV3 = MODEL_REGISTRY.register(
     ModelSpec(
         name="deepseek_v3",
@@ -135,9 +118,7 @@ DSV3 = MODEL_REGISTRY.register(
         ),
         build_dims=dsv3.build_dsv3_dims,
         build_config=dsv3.build_dsv3_config,
-        # MLA is a parameter of the stock TE builder, so no custom layer spec:
-        # the engine's generic MoE branch produces the right thing once
-        # ``multi_latent_attention`` is set on the config.
+        # MLA is a parameter of the stock TE builder, so no custom layer spec.
         build_layer_spec=None,
         routing_defaults={"moe_router_pre_softmax": False},
         export_weights=_export_dsv3,
@@ -146,12 +127,10 @@ DSV3 = MODEL_REGISTRY.register(
 
 
 # --- Qwen3-MoE (and any config declaring routed experts) ---------------------
-# Qwen3-MoE routing = softmax(all) -> top-k -> renormalize top-k (HF
-# ``norm_topk_prob=True``), which is mathematically identical to Megatron's
-# ``moe_router_pre_softmax=False``: top-k of logits then a softmax over only the
-# top-k, already summing to 1, because the full-softmax denominator cancels under
-# renormalization. ``pre_softmax=True`` would leave gate weights un-renormalized
-# (sum<1) and diverge from vLLM -> large rollout/train log-prob mismatch.
+# HF ``norm_topk_prob=True`` (softmax -> top-k -> renormalize) is identical to
+# Megatron's ``moe_router_pre_softmax=False``, since the full-softmax denominator
+# cancels under renormalization. ``True`` would leave gate weights summing to <1
+# and diverge from vLLM -- a large rollout/train log-prob gap.
 QWEN3_MOE = MODEL_REGISTRY.register(
     ModelSpec(
         name="qwen3_moe",
@@ -164,8 +143,7 @@ QWEN3_MOE = MODEL_REGISTRY.register(
 
 
 # --- Dense catch-all ---------------------------------------------------------
-# Standard GQA + SwiGLU decoder. Last so it only sees configs nothing else
-# claimed; resolve() raises if this entry is ever removed.
+# GQA + SwiGLU. Last, so it only sees what nothing else claimed.
 QWEN3_DENSE = MODEL_REGISTRY.register(
     ModelSpec(
         name="qwen3_dense",

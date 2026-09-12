@@ -274,3 +274,30 @@ def test_moe_exporter_uses_the_moe_gather(monkeypatch):
 
     list(ms._export_moe(FakeEngine()))
     assert seen["gather"] is sentinel
+
+
+def test_the_pipeline_forward_check_is_a_spec_hook_not_a_dsv4_call():
+    """The engine must not name a family in its forward path.
+
+    It used to call ``_dsv4_check_topology()`` directly under the generic
+    ``requires_pipeline_forward`` cap, so a second family needing a pipeline
+    forward would have inherited DSv4's topology check -- or had to edit the
+    engine, which is what the registry exists to avoid.
+    """
+    import inspect
+
+    from lumenrl.engine.training.megatron_native_engine import MegatronNativeEngine
+
+    for fn in ("engine_update_policy", "engine_compute_log_probs"):
+        src = inspect.getsource(getattr(MegatronNativeEngine, fn))
+        assert "pre_forward_check" in src, f"{fn} does not use the hook"
+        assert "_dsv4_check_topology()" not in src, (
+            f"{fn} still calls DSv4's check by name"
+        )
+
+    dsv4 = next(s for s in _all_specs() if s.name == "deepseek_v4")
+    assert dsv4.pre_forward_check is not None, "DSv4 must declare the check"
+    # Every other family opts out, so none of them inherits it.
+    assert [s.name for s in _all_specs() if s.pre_forward_check is not None] == [
+        "deepseek_v4"
+    ]

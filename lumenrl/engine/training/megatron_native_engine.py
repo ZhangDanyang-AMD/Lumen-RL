@@ -197,9 +197,8 @@ class MegatronNativeEngine(MegatronBaseEngine):
     aware) and HF weight I/O (TE-named bridge) differ.
     """
 
-    # Resolved in ``initialize`` from the HF config; see ``model_registry``.
-    # Class-level so the forward-side dispatch is answerable before it has run --
-    # ``_caps`` falls back to the permissive defaults until then.
+    # Resolved in ``initialize``; class-level so forward-side dispatch is
+    # answerable before then, with ``_caps`` falling back to the defaults.
     _spec = None
     _dsv4_align = 1
 
@@ -311,9 +310,8 @@ class MegatronNativeEngine(MegatronBaseEngine):
             )
 
         moe_kwargs: dict = {}
-        # Dims come from the resolved spec. DSv4 declares ``build_dims=None``
-        # because its block-quantized FP8 weights are unreadable by the HF
-        # safetensors bridge, which is the only consumer of dims.
+        # Dims come from the spec. DSv4 declares None: its block-quantized FP8 is
+        # unreadable by the HF bridge, the only consumer of dims.
         self._dims = self._spec.build_dims(hf) if self._spec.build_dims else None
         if self._is_moe and self._caps.supports_hf_bridge:
             moe_ffn = self._dims.moe_ffn
@@ -333,9 +331,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 expert_tensor_parallel_size=etp,
                 moe_permute_fusion=bool(ec.get("moe_permute_fusion", False)),
             )
-            # Routing conventions belong to the architecture, so the default comes
-            # from the spec (see ``model_specs`` for why Qwen3-MoE wants
-            # ``moe_router_pre_softmax=False``). engine_config still overrides.
+            # Architecture-level default from the spec; engine_config overrides.
             pre_softmax = ec.get("moe_router_pre_softmax")
             if pre_softmax is None:
                 pre_softmax = self._spec.routing_defaults.get("moe_router_pre_softmax", False)
@@ -476,11 +472,9 @@ class MegatronNativeEngine(MegatronBaseEngine):
             # Surface MoE + Expert-Parallel topology to the run log (stdout is
             # forwarded by Ray). Evidence of expert sharding / EP group width.
             #
-            # Read from the BUILT config, not from ``moe_kwargs``. A family with
-            # ``build_config`` (DSv3) never receives moe_kwargs, so printing those
-            # would report the generic path's intent while the model was built from
-            # something else -- a diagnostic that lies exactly where someone looks
-            # to confirm their routing config took effect.
+            # From the BUILT config, not moe_kwargs: a ``build_config`` family
+            # never receives those, so printing them would report the generic
+            # path's intent while the model came from somewhere else.
             print(
                 f"[MegatronNativeEngine] MoE+EP spec: "
                 f"num_experts={getattr(tfcfg, 'num_moe_experts', num_experts)} "
@@ -1455,8 +1449,9 @@ class MegatronNativeEngine(MegatronBaseEngine):
             )
 
     def engine_update_policy(self, batch):
+        if self._spec.pre_forward_check is not None:
+            self._spec.pre_forward_check(self)
         if self._caps.requires_pipeline_forward:
-            self._dsv4_check_topology()
             return self._pp_update_policy(batch)
         if self._pp == 1 and self._cp == 1 and not getattr(self, "_is_moe", False):
             return super().engine_update_policy(batch)
@@ -1626,8 +1621,9 @@ class MegatronNativeEngine(MegatronBaseEngine):
         return metrics
 
     def engine_compute_log_probs(self, batch):
+        if self._spec.pre_forward_check is not None:
+            self._spec.pre_forward_check(self)
         if self._caps.requires_pipeline_forward:
-            self._dsv4_check_topology()
             return self._pp_compute_log_probs(batch)
         if self._pp == 1 and self._cp == 1 and not getattr(self, "_is_moe", False):
             return super().engine_compute_log_probs(batch)
