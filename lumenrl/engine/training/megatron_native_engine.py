@@ -475,15 +475,25 @@ class MegatronNativeEngine(MegatronBaseEngine):
         if self._is_moe and self._caps.supports_hf_bridge and self._rank() == 0:
             # Surface MoE + Expert-Parallel topology to the run log (stdout is
             # forwarded by Ray). Evidence of expert sharding / EP group width.
+            #
+            # Read from the BUILT config, not from ``moe_kwargs``. A family with
+            # ``build_config`` (DSv3) never receives moe_kwargs, so printing those
+            # would report the generic path's intent while the model was built from
+            # something else -- a diagnostic that lies exactly where someone looks
+            # to confirm their routing config took effect.
             print(
-                f"[MegatronNativeEngine] MoE+EP spec: num_experts={num_experts} "
-                f"topk={moe_kwargs.get('moe_router_topk')} moe_ffn={self._dims.moe_ffn} | "
+                f"[MegatronNativeEngine] MoE+EP spec: "
+                f"num_experts={getattr(tfcfg, 'num_moe_experts', num_experts)} "
+                f"topk={getattr(tfcfg, 'moe_router_topk', None)} "
+                f"moe_ffn={getattr(tfcfg, 'moe_ffn_hidden_size', None)} | "
                 f"tp={tp} pp={pp} cp={cp} EP={ep} etp={etp} -> "
                 f"local_experts/rank={num_experts // ep} | "
-                f"grouped_gemm={moe_kwargs.get('moe_grouped_gemm')} "
-                f"router_dtype={moe_kwargs.get('moe_router_dtype')} "
-                f"pre_softmax={moe_kwargs.get('moe_router_pre_softmax')} "
-                f"aux_loss_coeff={moe_kwargs.get('moe_aux_loss_coeff')}",
+                f"grouped_gemm={getattr(tfcfg, 'moe_grouped_gemm', None)} "
+                f"router_dtype={getattr(tfcfg, 'moe_router_dtype', None)} "
+                f"score_fn={getattr(tfcfg, 'moe_router_score_function', None)} "
+                f"pre_softmax={getattr(tfcfg, 'moe_router_pre_softmax', None)} "
+                f"expert_bias={getattr(tfcfg, 'moe_router_enable_expert_bias', None)} "
+                f"aux_loss_coeff={getattr(tfcfg, 'moe_aux_loss_coeff', None)}",
                 flush=True,
             )
 

@@ -239,6 +239,33 @@ def test_engine_config_can_override_the_groups():
     assert (cfg.moe_router_num_groups, cfg.moe_router_group_topk) == (4, 2)
 
 
+def test_router_dtype_and_bias_update_rate_are_forwarded():
+    """Knobs the generic MoE path honours must not be dropped by this one.
+
+    Building the config here rather than in the engine means anything not
+    explicitly forwarded is silently lost, and these two matter more for DeepSeek
+    than for Qwen3-MoE:
+
+    * ``moe_router_dtype`` -- an fp32 router keeps top-k selection stable. The
+      Qwen3-MoE configs set it for exactly that reason, and DeepSeek selects via
+      sigmoid plus the noaux_tc bias, so a flipped marginal expert changes which
+      experts run.
+    * ``moe_router_bias_update_rate`` -- the update rate for that noaux_tc bias,
+      which only does anything because this path enables the bias at all.
+    """
+    cfg = dsv3.build_dsv3_config(
+        V3, {"moe_router_dtype": "fp32", "moe_router_bias_update_rate": 0.001}
+    )
+    assert cfg.moe_router_dtype == "fp32"
+    assert cfg.moe_router_bias_update_rate == pytest.approx(0.001)
+
+
+def test_router_knobs_are_left_at_megatron_defaults_when_unset():
+    """Absent from engine_config must mean untouched, not coerced."""
+    cfg = dsv3.build_dsv3_config(V3, {})
+    assert cfg.moe_router_dtype is None
+
+
 def test_norm_topk_prob_false_is_refused():
     """Megatron's sigmoid router renormalises unconditionally, so there is no way
     to honour norm_topk_prob=False -- refuse rather than rescale silently."""

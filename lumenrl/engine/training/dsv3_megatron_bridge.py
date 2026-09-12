@@ -216,6 +216,22 @@ def build_dsv3_config(
             # ``norm_topk_prob`` -- see the Qwen3-MoE note in ``model_specs``.
             moe_router_pre_softmax=bool(ec.get("moe_router_pre_softmax") or False),
         )
+        # Two knobs the generic MoE path in ``megatron_native_engine`` honours.
+        # Building the config here means anything not forwarded is silently
+        # dropped, and both of these matter more for DeepSeek than for Qwen3-MoE:
+        #
+        #   moe_router_dtype -- an fp32 router keeps top-k selection stable, which
+        #     is the whole point of the knob (the Qwen3-MoE configs set fp32 for
+        #     "lower train/rollout mismatch"). DeepSeek picks experts through a
+        #     sigmoid plus the noaux_tc bias, so a bf16 router flipping a marginal
+        #     expert changes which experts run and widens the rollout gap.
+        #   moe_router_bias_update_rate -- the update rate for that noaux_tc bias.
+        #     It only does anything when ``moe_router_enable_expert_bias`` is set,
+        #     which this path sets and the Qwen3 path does not.
+        if ec.get("moe_router_dtype"):
+            moe["moe_router_dtype"] = str(ec["moe_router_dtype"])
+        if ec.get("moe_router_bias_update_rate") is not None:
+            moe["moe_router_bias_update_rate"] = float(ec["moe_router_bias_update_rate"])
         # DeepSeek restricts top-k to the best ``topk_group`` of ``n_group``
         # expert groups (node-limited routing). V3/R1 ship 8/4; without this the
         # router is free to pick across all groups and selects experts the

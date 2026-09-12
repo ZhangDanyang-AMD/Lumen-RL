@@ -71,13 +71,15 @@ def test_resolve_head_dim_falls_back_to_hidden_over_heads():
 def test_dense_config_resolves_to_dense_spec():
     spec = MODEL_REGISTRY.resolve(QWEN3_DENSE_CFG, {})
     assert spec.name == "qwen3_dense"
-    assert spec.caps.has_experts is False
+    # Asserted through resolve_has_experts, not a declared flag: the expert check
+    # is keyed on the effective count so engine_config can still override it.
+    assert spec.resolve_has_experts(QWEN3_DENSE_CFG, {}) is False
 
 
 def test_moe_config_resolves_to_moe_spec():
     spec = MODEL_REGISTRY.resolve(QWEN3_MOE_CFG, {})
     assert spec.name == "qwen3_moe"
-    assert spec.caps.has_experts is True
+    assert spec.resolve_has_experts(QWEN3_MOE_CFG, {}) is True
 
 
 def test_engine_config_num_experts_override_promotes_dense_to_moe():
@@ -147,7 +149,6 @@ def test_caps_defaults_are_the_permissive_ones():
     caps = ModelCaps()
     assert caps.supports_hf_bridge is True
     assert caps.supports_dynamic_batch is True
-    assert caps.has_experts is False
 
 
 # --- capabilities and hooks (phase 2) ----------------------------------------

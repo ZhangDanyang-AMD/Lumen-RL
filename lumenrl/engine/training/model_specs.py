@@ -91,7 +91,6 @@ DSV4 = MODEL_REGISTRY.register(
         name="deepseek_v4",
         detect=lambda hf, ec: dsv4.is_dsv4(hf),
         caps=ModelCaps(
-            has_experts=True,
             supports_hf_bridge=False,
             supports_dynamic_batch=False,
             builds_own_config=True,
@@ -130,7 +129,6 @@ DSV3 = MODEL_REGISTRY.register(
         name="deepseek_v3",
         detect=lambda hf, ec: dsv3.is_dsv3(hf),
         caps=ModelCaps(
-            has_experts=True,
             # Construction needs MLATransformerConfig, not TransformerConfig.
             builds_own_config=True,
             supports_hf_bridge=True,
@@ -158,7 +156,6 @@ QWEN3_MOE = MODEL_REGISTRY.register(
     ModelSpec(
         name="qwen3_moe",
         detect=lambda hf, ec: _effective_num_experts(hf, ec) > 1,
-        caps=ModelCaps(has_experts=True),
         build_dims=build_moe_dims,
         routing_defaults={"moe_router_pre_softmax": False},
         export_weights=_export_moe,
@@ -173,7 +170,6 @@ QWEN3_DENSE = MODEL_REGISTRY.register(
     ModelSpec(
         name="qwen3_dense",
         detect=lambda hf, ec: True,
-        caps=ModelCaps(has_experts=False),
         build_dims=_dense_dims,
         export_weights=_export_dense,
     )

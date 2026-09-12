@@ -64,9 +64,6 @@ class ModelCaps:
     answers here instead of adding another ``if`` at every call site.
     """
 
-    # Routed experts. Kept as a declared default; the live value comes from
-    # ``ModelSpec.has_experts`` because engine_config can override the count.
-    has_experts: bool = False
     # Weights load and weight-sync through the HF safetensors bridge. DSv4 ships
     # block-quantized FP8 the bridge cannot read, so it supplies no dims and takes
     # a dist-checkpoint path in both directions.
@@ -116,14 +113,21 @@ class ModelSpec:
     # branches in the engine. The engine passes itself because the gathers are its
     # own helpers; specs live in the same package, so this coupling stays internal.
     export_weights: Optional[Callable[[Any], Any]] = None
-    # Live expert check. Defaults to the declared cap ORed with the effective
-    # expert count, so engine_config's ``num_experts`` override still decides.
+    # Override the expert check for a family whose config does not state the count
+    # in any spelling ``hf_num_experts`` knows. ``None`` uses the count, which is
+    # what every current family wants.
     has_experts: Optional[Callable[[Mapping[str, Any], Mapping[str, Any]], bool]] = None
 
     def resolve_has_experts(
         self, hf: Mapping[str, Any], ec: Mapping[str, Any]
     ) -> bool:
-        """Whether this run has routed experts, honouring the config override."""
+        """Whether this run has routed experts, honouring the config override.
+
+        Deliberately keyed on the effective COUNT rather than on a per-family
+        declaration: engine_config's ``num_experts`` can turn a dense checkpoint
+        into a MoE run and back, so a static flag would be wrong half the time.
+        This is byte-for-byte the condition the engine used before the registry.
+        """
         if self.has_experts is not None:
             return bool(self.has_experts(hf, ec))
         return int(ec.get("num_experts") or hf_num_experts(hf) or 0) > 1
