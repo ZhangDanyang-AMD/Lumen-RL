@@ -28,6 +28,7 @@ from lumenrl.algorithms.loss_functions import (
     asymmetric_clip_loss,
     kl_penalty,
     policy_gradient_loss,
+    reduce_reported_loss,
     sft_loss,
 )
 from lumenrl.utils.checkpoint import (
@@ -730,14 +731,7 @@ class LumenActorWorker(BaseWorker):
         for k, v in output.get("metrics", {}).items():
             metrics[k] = (sum(v) / len(v)) if isinstance(v, list) and v else float(v)
         if "loss" in output:
-            lv = output["loss"]
-            if isinstance(lv, list) and lv:
-                if str(batch.meta.get("algorithm", "")).lower() == AlgorithmName.GRPO.value:
-                    metrics["loss"] = float(sum(lv))
-                else:
-                    metrics["loss"] = sum(lv) / len(lv)
-            else:
-                metrics["loss"] = float(lv)
+            metrics["loss"] = reduce_reported_loss(output["loss"])
         metrics["lr"] = self._engine.lr_scheduler_step()
         return metrics
 
