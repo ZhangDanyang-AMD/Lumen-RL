@@ -15,7 +15,6 @@ are reconstructed with a differentiable CP all-reduce.
 
 from __future__ import annotations
 
-import itertools
 import json
 import logging
 import math
@@ -29,20 +28,25 @@ from lumenrl.core.protocol import DataProto
 from lumenrl.engine.training import dsv4_megatron_bridge as dsv4
 from lumenrl.engine.training.base_engine import EngineRegistry
 from lumenrl.engine.training.megatron_base_engine import MegatronBaseEngine
+from lumenrl.engine.training.model_registry import (
+    MODEL_REGISTRY,
+    ModelCaps,
+    hf_num_experts,
+)
 from lumenrl.engine.training.qwen3_megatron_bridge import (
-    Qwen3Dims,
     hf_to_megatron,
     load_hf_safetensors,
-    megatron_to_hf,
 )
 from lumenrl.engine.training.qwen3moe_megatron_bridge import (
     _expert_local_index,
     _non_expert_hf_to_megatron,
-    build_moe_dims,
     hf_expert_fc1,
     hf_expert_fc2,
-    megatron_to_hf_moe,
 )
+
+# Registers the ModelSpec entries on MODEL_REGISTRY. Imported for the
+# side effect; resolution order is defined there, not here.
+from lumenrl.engine.training import model_specs  # noqa: F401
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LUMENRL_LOGGING_LEVEL", "INFO"))
@@ -193,11 +197,15 @@ class MegatronNativeEngine(MegatronBaseEngine):
     aware) and HF weight I/O (TE-named bridge) differ.
     """
 
-    # DeepSeek-V4 takes a separate construction and weight path; see
-    # ``dsv4_megatron_bridge``. Class-level so the forward-side dispatch is
-    # answerable before ``initialize`` has run.
-    _is_dsv4 = False
+    # Resolved in ``initialize``; class-level so forward-side dispatch is
+    # answerable before then, with ``_caps`` falling back to the defaults.
+    _spec = None
     _dsv4_align = 1
+
+    @property
+    def _caps(self):
+        """Capabilities of the resolved family, or the defaults pre-``initialize``."""
+        return self._spec.caps if self._spec is not None else ModelCaps()
 
     def initialize(self) -> None:
         from megatron.core import parallel_state as mpu
@@ -267,8 +275,8 @@ class MegatronNativeEngine(MegatronBaseEngine):
         # heterogeneous attention, and hash routing on the first layers. It also
         # ships block-quantized FP8 weights that the HF-safetensors bridge cannot
         # read. Everything DSv4-specific lives in ``dsv4_megatron_bridge``.
-        self._is_dsv4 = dsv4.is_dsv4(hf)
-        if self._is_dsv4 and self._dynamic_batch:
+        self._spec = MODEL_REGISTRY.resolve(hf, ec)
+        if not self._caps.supports_dynamic_batch and self._dynamic_batch:
             # See ``_dsv4_check_topology``: DSv4 attention derives token positions
             # from the tensor length alone, so bin-packing several sequences into
             # one microbatch would have them read as one long sequence.
@@ -281,12 +289,8 @@ class MegatronNativeEngine(MegatronBaseEngine):
         # ---- MoE detection: HF config declares routed experts (Qwen3-MoE etc.) ----
         # Any of these HF keys marks a MoE model; an explicit engine_config
         # ``num_experts`` overrides. dense models keep every ``moe_*`` off.
-        hf_num_experts = (
-            hf.get("num_experts") or hf.get("n_routed_experts") or hf.get("num_local_experts")
-        )
-        cfg_num_experts = ec.get("num_experts")
-        num_experts = int(cfg_num_experts or hf_num_experts or 0)
-        self._is_moe = num_experts > 1
+        num_experts = int(ec.get("num_experts") or hf_num_experts(hf) or 0)
+        self._is_moe = self._spec.resolve_has_experts(hf, ec)
         self._num_experts = num_experts
         # R3 routing replay (opt-in): record router logits in the old-logprob
         # forward, replay in the update. Only meaningful for MoE.
@@ -306,13 +310,10 @@ class MegatronNativeEngine(MegatronBaseEngine):
             )
 
         moe_kwargs: dict = {}
-        if self._is_dsv4:
-            # ``build_moe_dims`` and the ``Qwen3Dims`` twin below both read HF keys
-            # DSv4 does not have. Its dims are only consumed by the HF weight
-            # bridge (load + rollout weight sync), and DSv4 uses neither yet.
-            self._dims = None
-        elif self._is_moe:
-            self._dims = build_moe_dims(hf)
+        # Dims come from the spec. DSv4 declares None: its block-quantized FP8 is
+        # unreadable by the HF bridge, the only consumer of dims.
+        self._dims = self._spec.build_dims(hf) if self._spec.build_dims else None
+        if self._is_moe and self._caps.supports_hf_bridge:
             moe_ffn = self._dims.moe_ffn
             topk = int(ec.get("moe_router_topk") or hf.get("num_experts_per_tok") or 2)
             shared_ffn = int(
@@ -330,17 +331,11 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 expert_tensor_parallel_size=etp,
                 moe_permute_fusion=bool(ec.get("moe_permute_fusion", False)),
             )
-            # Qwen3-MoE routing = softmax(all) -> top-k -> renormalize top-k
-            # (HF ``norm_topk_prob=True``). That is mathematically identical to
-            # Megatron's ``moe_router_pre_softmax=False`` (top-k of logits, then a
-            # softmax over ONLY the top-k logits -> already sums to 1), because the
-            # full-softmax denominator cancels under renormalization. Using
-            # ``pre_softmax=True`` instead would leave the gate weights un-renormalized
-            # (sum<1) and diverge from vLLM -> large rollout/train log-prob mismatch.
+            # Architecture-level default from the spec; engine_config overrides.
             pre_softmax = ec.get("moe_router_pre_softmax")
-            moe_kwargs["moe_router_pre_softmax"] = (
-                False if pre_softmax is None else bool(pre_softmax)
-            )
+            if pre_softmax is None:
+                pre_softmax = self._spec.routing_defaults.get("moe_router_pre_softmax", False)
+            moe_kwargs["moe_router_pre_softmax"] = bool(pre_softmax)
             if ec.get("moe_router_score_function"):
                 moe_kwargs["moe_router_score_function"] = str(ec.get("moe_router_score_function"))
             if ec.get("moe_router_dtype"):
@@ -351,12 +346,6 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 moe_kwargs["moe_router_bias_update_rate"] = float(ec.get("moe_router_bias_update_rate"))
             if shared_ffn > 0:
                 moe_kwargs["moe_shared_expert_intermediate_size"] = shared_ffn
-        else:
-            self._dims = Qwen3Dims(
-                num_layers=hf["num_hidden_layers"], hidden=hf["hidden_size"],
-                num_heads=hf["num_attention_heads"], num_kv_groups=hf["num_key_value_heads"],
-                head_dim=head_dim, ffn=hf["intermediate_size"], vocab=hf["vocab_size"],
-            )
 
         recompute_kwargs: dict = {}
         rc_gran = ec.get("recompute_granularity") or None
@@ -365,21 +354,20 @@ class MegatronNativeEngine(MegatronBaseEngine):
             recompute_kwargs["recompute_method"] = ec.get("recompute_method") or "uniform"
             recompute_kwargs["recompute_num_layers"] = int(ec.get("recompute_num_layers") or 1)
 
-        if self._is_dsv4:
-            # Field-for-field equal to what Megatron's own parser produces from
-            # miles' deepseek-v4-flash.sh, which is the config every existing DSv4
-            # numerical reference was measured on.
+        if self._spec.build_config is not None:
             det = ec.get("deterministic_mode")
-            tfcfg = dsv4.build_dsv4_config(
+            tfcfg = self._spec.build_config(
                 hf, ec, tp=tp, pp=pp, cp=cp, ep=ep, etp=etp, sp=sp,
+                max_tokens_per_gpu=self._max_tokens_per_gpu,
                 # Unset means "the model family decides", and DSv4 decides on:
                 # non-deterministic forwards disagree with themselves on ~1.6% of
                 # argmaxes, swamping the train/rollout gap DAPO measures.
                 deterministic=True if det is None else bool(det),
             )
-            if tfcfg.deterministic_mode:
+            if getattr(tfcfg, "deterministic_mode", False):
                 dsv4.enable_deterministic_mode()
-            self._dsv4_align = dsv4.sequence_alignment(tfcfg)
+            if self._spec.sequence_alignment is not None:
+                self._dsv4_align = self._spec.sequence_alignment(tfcfg)
         else:
             tfcfg = TransformerConfig(
                 num_layers=hf["num_hidden_layers"], hidden_size=hf["hidden_size"],
@@ -405,10 +393,8 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 **recompute_kwargs,
             )
 
-        if self._is_dsv4:
-            # Heterogeneous per layer (sliding / compressed+indexed /
-            # hyper-compressed), so no block-spec builder can produce it.
-            spec = dsv4.build_dsv4_spec(
+        if self._spec.build_layer_spec is not None:
+            spec = self._spec.build_layer_spec(
                 tfcfg, dsa_topk_backend=str(ec.get("dsa_topk_backend", "torch")),
             )
         elif self._is_moe:
@@ -437,7 +423,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
             parallel_output=False,
         )
 
-        if self._is_dsv4:
+        if not self._caps.supports_hf_bridge:
             # DSv4 weights come from a torch_dist checkpoint converted offline
             # (native FP8 -> bf16 HF -> torch_dist), because the released
             # checkpoint is block-quantized FP8. ``dist_checkpointing.load``
@@ -482,18 +468,26 @@ class MegatronNativeEngine(MegatronBaseEngine):
             self.module = model.cuda()
         self._tfcfg = tfcfg
 
-        if self._is_moe and not self._is_dsv4 and self._rank() == 0:
+        if self._is_moe and self._caps.supports_hf_bridge and self._rank() == 0:
             # Surface MoE + Expert-Parallel topology to the run log (stdout is
             # forwarded by Ray). Evidence of expert sharding / EP group width.
+            #
+            # From the BUILT config, not moe_kwargs: a ``build_config`` family
+            # never receives those, so printing them would report the generic
+            # path's intent while the model came from somewhere else.
             print(
-                f"[MegatronNativeEngine] MoE+EP spec: num_experts={num_experts} "
-                f"topk={moe_kwargs.get('moe_router_topk')} moe_ffn={self._dims.moe_ffn} | "
+                f"[MegatronNativeEngine] MoE+EP spec: "
+                f"num_experts={getattr(tfcfg, 'num_moe_experts', num_experts)} "
+                f"topk={getattr(tfcfg, 'moe_router_topk', None)} "
+                f"moe_ffn={getattr(tfcfg, 'moe_ffn_hidden_size', None)} | "
                 f"tp={tp} pp={pp} cp={cp} EP={ep} etp={etp} -> "
                 f"local_experts/rank={num_experts // ep} | "
-                f"grouped_gemm={moe_kwargs.get('moe_grouped_gemm')} "
-                f"router_dtype={moe_kwargs.get('moe_router_dtype')} "
-                f"pre_softmax={moe_kwargs.get('moe_router_pre_softmax')} "
-                f"aux_loss_coeff={moe_kwargs.get('moe_aux_loss_coeff')}",
+                f"grouped_gemm={getattr(tfcfg, 'moe_grouped_gemm', None)} "
+                f"router_dtype={getattr(tfcfg, 'moe_router_dtype', None)} "
+                f"score_fn={getattr(tfcfg, 'moe_router_score_function', None)} "
+                f"pre_softmax={getattr(tfcfg, 'moe_router_pre_softmax', None)} "
+                f"expert_bias={getattr(tfcfg, 'moe_router_enable_expert_bias', None)} "
+                f"aux_loss_coeff={getattr(tfcfg, 'moe_aux_loss_coeff', None)}",
                 flush=True,
             )
 
@@ -1000,20 +994,9 @@ class MegatronNativeEngine(MegatronBaseEngine):
         """
         assert self.module is not None
         _mem_diag_note("weight_sync gather begin")
-        if self._is_dsv4:
-            # The gather is shared: DSv4's grouped experts carry the same Megatron
-            # names Qwen3-MoE does. Only the naming on the way out differs, and it
-            # has to land on the DSv4 *checkpoint* names, because the rollout side
-            # feeds them to vLLM's own ``load_weights``.
-            named = itertools.chain(
-                self._full_megatron_named_params_moe(),
-                self._dsv4_router_bias_buffers(),
-            )
-            gen = dsv4.megatron_to_dsv4_native(named)
-        elif getattr(self, "_is_moe", False):
-            gen = megatron_to_hf_moe(self._full_megatron_named_params_moe(), self._dims)
-        else:
-            gen = megatron_to_hf(self._full_megatron_named_params(), self._dims, te=True)
+        # Which gather to use and how to rename on the way out are one decision,
+        # owned by the family. See ``model_specs`` for the three implementations.
+        gen = self._spec.export_weights(self)
         return _mem_diag_stream("weight_sync gather", gen), None
 
     def is_mp_src_rank_with_outputs(self) -> bool:
@@ -1125,10 +1108,10 @@ class MegatronNativeEngine(MegatronBaseEngine):
         #     and under CP additionally ``seqlen % (ratio*2) == 0``, while RL
         #     sequence lengths are whatever the rollout produced.
         align = self._tp if (self._sp and self._tp > 1) else 1
-        if self._is_dsv4:
+        if self._spec.sequence_alignment is not None:
             align = math.lcm(align, self._dsv4_align * (2 if self._cp > 1 else 1))
 
-        cp_contiguous = self._is_dsv4 and self._cp > 1
+        cp_contiguous = self._caps.packed_stream_is_single_sequence and self._cp > 1
         if cp_contiguous and len(ids_list) > 1:
             # DSv4 reads the packed stream as ONE sequence (it ignores
             # cu_seqlens), which is why enable_dynamic_batch is forced off and
@@ -1466,8 +1449,9 @@ class MegatronNativeEngine(MegatronBaseEngine):
             )
 
     def engine_update_policy(self, batch):
-        if self._is_dsv4:
-            self._dsv4_check_topology()
+        if self._spec.pre_forward_check is not None:
+            self._spec.pre_forward_check(self)
+        if self._caps.requires_pipeline_forward:
             return self._pp_update_policy(batch)
         if self._pp == 1 and self._cp == 1 and not getattr(self, "_is_moe", False):
             return super().engine_update_policy(batch)
@@ -1637,8 +1621,9 @@ class MegatronNativeEngine(MegatronBaseEngine):
         return metrics
 
     def engine_compute_log_probs(self, batch):
-        if self._is_dsv4:
-            self._dsv4_check_topology()
+        if self._spec.pre_forward_check is not None:
+            self._spec.pre_forward_check(self)
+        if self._caps.requires_pipeline_forward:
             return self._pp_compute_log_probs(batch)
         if self._pp == 1 and self._cp == 1 and not getattr(self, "_is_moe", False):
             return super().engine_compute_log_probs(batch)
