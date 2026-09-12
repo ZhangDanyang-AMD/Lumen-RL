@@ -24,6 +24,7 @@ from lumenrl.algorithms.loss_functions import (
     asymmetric_clip_loss,
     kl_penalty,
     policy_gradient_loss,
+    reduce_reported_loss,
 )
 from lumenrl.core.protocol import DataProto
 from lumenrl.core.types import AlgorithmName
@@ -506,11 +507,10 @@ class MegatronBaseEngine(BaseEngine):
         grad_norm = self._optimizer_step()
         lr = self._sched_step()
         metrics = {
-            "loss": (
-                loss_accum
-                if algo_name == AlgorithmName.GRPO.value
-                else loss_accum / max(1, n_rows)
-            ),
+            # ``loss_accum`` is the sum over rows, each already globally
+            # normalized by agg_loss. See reduce_reported_loss for why this must
+            # not be divided by the row count.
+            "loss": reduce_reported_loss(loss_accum),
             "lr": lr,
             "grad_norm": grad_norm,
         }
