@@ -242,6 +242,32 @@ class MegatronNativeEngine(MegatronBaseEngine):
     _spec = None
     _dsv4_align = 1
 
+    @staticmethod
+    def _fp8_kwargs(ec, num_layers: int, pp: int) -> dict:
+        """TransformerConfig FP8 fields for this run, or ``{}`` for BF16.
+
+        ``{}`` is load-bearing: a BF16 run must produce exactly the config it did
+        before FP8 existed, so nothing is set unless FP8 is actually requested.
+        """
+        from lumenrl.quantization.fp8_config import FP8Config, megatron_fp8_kwargs
+
+        precision = str(ec.get("fp8_precision") or "").strip()
+        if not precision:
+            return {}
+        cfg = FP8Config(
+            precision=precision,
+            recipe=str(ec.get("fp8_recipe") or "blockwise"),
+            num_first_layers_in_bf16=int(ec.get("fp8_num_first_layers_in_bf16") or 0),
+            num_last_layers_in_bf16=int(ec.get("fp8_num_last_layers_in_bf16") or 0),
+        )
+        kwargs = megatron_fp8_kwargs(cfg, num_layers=num_layers, pp_size=pp)
+        if kwargs:
+            logger.info(
+                "MegatronNativeEngine: FP8 training enabled -- %s",
+                " ".join(f"{k}={v}" for k, v in kwargs.items()),
+            )
+        return kwargs
+
     @property
     def _caps(self):
         """Capabilities of the resolved family, or the defaults pre-``initialize``."""
@@ -359,6 +385,11 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 "(packed thd padded to multiple of TP).", tp,
             )
 
+        # ---- FP8 training (B1) ----
+        # Was hard-coded bf16. The mapping lives in quantization/fp8_config so the
+        # engine never interprets a recipe name; {} here means BF16 exactly as before.
+        fp8_kwargs = self._fp8_kwargs(ec, num_layers=int(hf["num_hidden_layers"]), pp=pp)
+
         moe_kwargs: dict = {}
         # Dims come from the spec. DSv4 declares None: its block-quantized FP8 is
         # unreadable by the HF bridge, the only consumer of dims.
@@ -433,6 +464,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 normalization="RMSNorm", layernorm_epsilon=hf.get("rms_norm_eps", 1e-6),
                 qk_layernorm=True, hidden_dropout=0.0, attention_dropout=0.0,
                 bf16=True, params_dtype=torch.bfloat16, pipeline_dtype=torch.bfloat16,
+                **fp8_kwargs,
                 tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp,
                 context_parallel_size=cp, sequence_parallel=sp,
                 use_cpu_initialization=True,

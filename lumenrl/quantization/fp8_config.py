@@ -60,3 +60,58 @@ class FP8Config:
         )
         logger.debug("Built FP8Config: %s", cfg)
         return cfg
+
+
+def megatron_fp8_kwargs(cfg: FP8Config, num_layers: int, pp_size: int = 1) -> dict:
+    """Map :class:`FP8Config` onto ``TransformerConfig``'s FP8 fields.
+
+    Returns ``{}`` when FP8 is off, so the caller can splat it unconditionally and
+    a BF16 run is bit-for-bit the configuration it was before.
+
+    Kept here rather than in the engine so there is one place that decides what an
+    "AMD FP8 recipe" means for Megatron -- the seam B2's numerics spec will govern.
+
+    Blockwise (TE ``Float8BlockScaling``) is the default because it is the format
+    the DeepSeek-family checkpoints ship in: ``quant_method=fp8, fmt=e4m3,
+    weight_block_size=[128,128]``. Training in the checkpoint's own scaling scheme
+    avoids a conversion nobody has specified.
+
+    Deliberately NOT set here:
+      * amax history / compute algo -- delayed scaling only; blockwise and
+        tensorwise derive scales per block or per tensor each step, and RL
+        recalibrates every step anyway because the policy weights move.
+      * ``fp8_param`` -- storing FP8 master weights is a separate decision from
+        computing in FP8, and Megatron rejects it without ``fp8`` set.
+    """
+    if not cfg.is_fp8_enabled():
+        return {}
+
+    p = cfg.precision.lower().strip()
+    fmt = "hybrid" if "hybrid" in p or "e5m2" in p else "e4m3"
+
+    kwargs: dict = {"fp8": fmt, "fp8_recipe": cfg.recipe}
+
+    # Layer keep-outs. The lm_head BF16 keep-out exists because of an AITER
+    # blockscale INT32 overflow (vocab ~152k x hidden -> garbage logits -> policy
+    # collapse); B4 is the fix that would retire it.
+    start = int(cfg.num_first_layers_in_bf16 or 0)
+    end = int(cfg.num_last_layers_in_bf16 or 0)
+    if start or end:
+        if cfg.recipe == "delayed":
+            raise ValueError(
+                "fp8_recipe='delayed' cannot keep first/last layers in BF16 "
+                "(Megatron rejects the combination); use blockwise or tensorwise."
+            )
+        per_stage = max(1, num_layers // max(1, pp_size))
+        for name, v in (("num_first_layers_in_bf16", start), ("num_last_layers_in_bf16", end)):
+            if v > per_stage:
+                raise ValueError(
+                    f"{name}={v} exceeds layers per pipeline stage ({per_stage}); "
+                    f"num_layers={num_layers} pp={pp_size}"
+                )
+        kwargs.update(
+            first_last_layers_bf16=True,
+            num_layers_at_start_in_bf16=start,
+            num_layers_at_end_in_bf16=end,
+        )
+    return kwargs
