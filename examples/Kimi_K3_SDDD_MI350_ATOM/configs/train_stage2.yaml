@@ -20,11 +20,11 @@ policy:
   # Aligned with Jim's TorchSpec-derived cached-on-policy recipe. 8192 retains
   # 98.7% of the measured regenerated dataset while keeping prefill memory below
   # the 16384-token worst case.
-  max_total_sequence_length: 8192
+  max_total_sequence_length: 32768
   # Keep this optimizer block as a unit: it is the TorchSpec reference recipe.
   train_global_batch_size: 128
   train_micro_batch_size: 1
-  learning_rate: 5.0e-5
+  learning_rate: 4.2e-5
   weight_decay: 0.0
   max_grad_norm: 1.0
   # /!\ Not 0. gen-3 ran a single epoch with min_lr 0, so cosine took the lr to
@@ -33,9 +33,11 @@ policy:
   # appended. This run decays only as far as a three-epoch cosine would have by
   # the end of its first epoch: decay_ratio = (1 - 0.04*3) / (3 - 0.04*3)
   # = 0.3056, coeff = 0.5*(1 + cos(0.3056*pi)) = 0.7868, so 0.7868 * 5e-5.
-  min_lr: 3.93e-5
+  min_lr: 1.0e-5
   warmup_ratio: 0.04
-  lr_decay_style: cosine
+  lr_decay_style: WSD
+  wsd_decay_ratio: 0.0504
+  wsd_decay_style: cosine
 
 algorithm:
   name: spec_distill
@@ -97,13 +99,27 @@ algorithm:
     # and prefix caching must remain disabled because extraction is keyed by
     # request and a later write would overwrite an earlier partial span.
     atom:
-      max_model_len: 8192
+      max_model_len: 32768
       # There is no decode sweep. At this window, 32 slots avoids over-allocating
       # K3's recurrent state while still allowing concurrent prefill requests.
-      max_num_seqs: 32
+      # /!\ 32 -> 24 是为了绕开一个确定可复现的挂死，不是为了省显存。
+      # 现象：训练五次全部精确停在 step 41570，teacher 的 extract_hidden 600s 超时。
+      # 卡死前最后一批在三次失败里逐字相同 —— "18 reqs, 26800 new tokens" —— 之后
+      # 日志刷出 16 条
+      #   FlyDSL kernel 'flydsl_gemm2_abf16_wbf16_bf16_t32x64x256_split_k7_...gfx950'
+      #   from tuned config is not recognized by the current catalog
+      # 然后 8 个 TP rank 全卡在集合通信里。失败的 run 必有这 16 条、成功的 run
+      # 必定 0 条，一一对应。aiter 在这个 GEMM 形状上从调优表查到一个当前 catalog
+      # 不认识的 kernel，回退时死锁。
+      # 排除过的：不是机器（我一度误判成 043 坏了，白换一轮），也不是数据
+      # （那几批 max 25,629 / sum 31 万，比跑通过的 T=28,999 / 37 万还小）。
+      # 改 max_num_seqs 会改变调度器的批组成，从而躲开那个形状。
+      # /!\ 不要改 max_num_batched_tokens 去躲 —— 它必须 >= max_model_len，
+      # 而 enable_chunked_prefill 是 false，调小会让长序列没法一次 prefill。
+      max_num_seqs: 24
       # Exactly one full sequence per scheduler step; lowering this silently
       # truncates captured hidden states.
-      max_num_batched_tokens: 8192
+      max_num_batched_tokens: 32768
       enable_prefix_caching: false
       enable_chunked_prefill: false
       gpu_memory_utilization: 0.90
@@ -178,7 +194,7 @@ mooncake:
   # replica at stream_prefetch_batches=8. Host RAM is 2.8 TB and the segment is
   # only touched lazily. The launcher overrides this per role; draft ranks get a
   # small segment because they only read.
-  global_segment_size: 128GB
+  global_segment_size: 256GB
   # Staging buffer for the largest per-sequence payload, about 672 MiB at 8192
   # tokens x (5 aux + 1 final) x 7168 x bf16.
   local_buffer_size: 8GB
@@ -243,7 +259,7 @@ reward:
   # assertions. Overlong rows are not filtered here: max_prompt_tokens 0 with
   # drop_overlong makes them a drop at the 8192 window, which is the only
   # end-to-end verified path and follows the window if it ever changes.
-  dataset: /shared_nfs/jimguo12/lumenrl/datasets/gen5_nine_plus_kimimtp/train.jsonl
+  dataset: /shared_nfs/jimguo12/lumenrl/datasets/gen6/train.jsonl
 
 eval:
   enabled: true
@@ -259,18 +275,27 @@ eval:
   # because of memory. Must stay a multiple of world_size * micro_batch_size.
   num_samples: 128
   micro_batch_size: 2
-  # One slice only: the tail of this run's own training set.
+  # 两把尺子，同时监控。这是 gen-5 用一整轮训练换来的教训：
   #
-  # gen-4 also carried gen-3's 128 rows as a fixed `eval_old` yardstick, for two
-  # reasons that both belong to a continued run: it made the AL directly
-  # comparable to gen-3's recorded 1.617, and at lr=0 it verified the weight
-  # import bit-for-bit. gen-5 starts from scratch, so there is no import to
-  # verify and no earlier curve this one continues.
+  # gen-5 只留了"自己训练集尾部"这一把，而那份语料 74.8% 是多语种，于是训练侧
+  # eval AL 涨了 37% 而服务端 MT-Bench 只涨 4%（兑现率从 89.9% 掉到 69.5%）。
+  # 整轮训练没有任何信号能提示服务端的真实位置，直到跑完做 benchmark 才知道。
   #
-  # /!\ What that costs: this slice is the tail of a corpus that is ~75%
-  # multilingual, so its AL is not comparable with gen-3's 1.617 or gen-4's
-  # 2.017, and it is a weak predictor for the four English serving benchmarks.
-  # The serving benchmark is the judge either way -- see GEN4_RUNBOOK 7.4.
+  #   eval/*      —— 本轮训练集尾部 128 行（新分布：多语种 12.3%、编程 20%）
+  #   eval_gen5/* —— gen-5 那 128 行原样搬过来，固定不动的尺子
+  #
+  # eval_gen5 的两个作用都只有续训才有：
+  #   1. AL 与 gen-5 曲线上记录的 2.767 直接可比 —— 换了语料就等于换了基准，
+  #      两代之间不可比，曾经有人因此把"数据更多更好的一轮 AL 更低"当成退化去查
+  #   2. 开训前用 lr=0 跑两步，它的 AL 必须和 gen-5 记录的逐位一致 —— 一次验完
+  #      权重导入、teacher hidden state、eval 分片三条链路（花 12 分钟，挡住的
+  #      错误值好几天）
+  #
+  # /!\ 切片的指纹里 dataset_rows_after_preprocess 必须是 5011091，和 gen-5
+  # 训练时的存活行数一致；不一致说明取的不是同一批行，尺子就白搭了。
+  extra_slices:
+    - path: /shared_nfs/jimguo12/lumenrl/eval/gen5_tail_128.pt
+      prefix: eval_gen5
 
 checkpointing:
   # The multinode launcher overrides this onto shared persistent storage.
@@ -327,14 +352,14 @@ logger:
 # discounting repeated data by half it lands near 3.61, which closes the gap to
 # the reference draft measured on the same machine from 5.4% to 2.6%.
 #
-# The sampler walks (step * bs) % _trainable_len, so steps 39148..78295 make a
-# second pass over the same rows in the same order, and _trainable_len keeps the
-# wrap away from the eval tail. min_lr 3.93e-5 is what makes appending an epoch
-# legitimate at all -- see the note on it in the policy block.
+# 采样器走 (step * bs) % _trainable_len。从 39148 起的 9878 步正好覆盖
+# 9878 x 128 = 1,264,384 个位置，等于对 1,264,628 行做一次完整的 pass（起点不是
+# 第 0 行而是 (39148*128) % 1264500 = 1,217,444，绕回来照样每行只看一次），
+# 而 _trainable_len 保证回绕落不到 eval 尾部。
 #
 # /!\ Re-measure the per-epoch figure whenever the staged dataset changes. This
 # number also bounds the sampler away from the eval tail (_trainable_len), so one
 # that is too large makes the run train on its own eval slice -- a bug that shows
 # up as eval metrics suddenly improving, and it has bitten this project before.
-num_training_steps: 78296
+num_training_steps: 49026
 seed: 42

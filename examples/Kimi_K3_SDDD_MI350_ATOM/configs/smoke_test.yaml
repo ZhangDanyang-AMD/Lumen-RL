@@ -75,10 +75,12 @@ algorithm:
       index_cache_dtype: fp8
       enforce_eager: true
   draft:
-    # Same import path as train.yaml: the smoke run is where a broken tensor
-    # mapping should surface, not a 37-hour training run.
-    from_scratch: false
-    resume_from: /shared_nfs/jimguo12/lumenrl/drafts/off_policy_k3_draft
+    # Same as train.yaml. gen-5 trains from scratch, so there is no weight import
+    # to validate here; what the smoke still has to prove is that eight ranks can
+    # hold the six-million-row token cache and that a randomly initialised draft
+    # produces finite losses on step 0.
+    from_scratch: true
+    resume_from: null
     num_layers: 5
     num_heads: 64
     num_kv_heads: 64
@@ -135,9 +137,12 @@ dataset:
   chat_template: kimi-k3
   last_turn_loss_only: "true"
   min_loss_tokens: 14
-  # Must equal train.yaml: the worker count is part of the token cache key, so a
-  # different value makes the smoke run build a cache the real run then ignores.
-  num_preprocess_workers: 96
+  # Must equal train.yaml. num_workers is in fact *not* part of the cache key
+  # (the key is dataset path/size/mtime, tokenizer, max_length, chat_template,
+  # last_turn_loss_only, min_loss_tokens, split, PARSER_VERSION, drop_overlong,
+  # max_prompt_tokens, thinking) -- but keeping the two files identical is how
+  # you avoid having to remember which fields do count.
+  num_preprocess_workers: 120
   cache_dir: /dev/shm/lumenrl_cache
   # These fields must match train.yaml so smoke validates the same token cache.
   drop_overlong: true
@@ -158,14 +163,15 @@ eval:
   # Must be a multiple of world_size * micro_batch_size = 16.
   num_samples: 16
   micro_batch_size: 2
-  extra_slices:
-    - path: /shared_nfs/jimguo12/lumenrl/eval/gen3_old_128.pt
-      prefix: eval_old
+  # No extra_slices, matching train.yaml. gen-5 trains from scratch, so gen-3's
+  # fixed slice has nothing to anchor.
 
 reward:
   type: function
   function: math_reward
-  dataset: /shared_nfs/jimguo12/lumenrl/datasets/nine_category/train.jsonl
+  # Must equal train.yaml: the path is in the token cache key, so pointing the
+  # smoke run at a different file makes it warm a cache the real run discards.
+  dataset: /shared_nfs/jimguo12/lumenrl/datasets/gen5_nine_plus_kimimtp/train.jsonl
 
 checkpointing:
   checkpoint_dir: /dev/shm/checkpoints/kimi_k3_dspark_atom_smoke
