@@ -18,6 +18,7 @@ import logging
 import multiprocessing as mp
 import os
 
+import numpy as np
 import torch
 from tqdm import tqdm
 
@@ -168,13 +169,18 @@ def _tokenize_single(messages):
         loss_mask = loss_mask[:usable]
 
     packed = pack_loss_mask(loss_mask)
+    # int32 ndarray, not list[int]. Every rank keeps the whole preprocessed set
+    # resident, and a Python int costs 28 B plus an 8 B slot against 4 B here.
+    # At 5M rows x ~2k tokens that is 365 GB per rank -- 2.9 TB across the eight
+    # draft ranks, past the 2.8 TB the node has. The vocabulary is 163840, so
+    # int32 is lossless. Consumers go through torch.as_tensor(..., torch.long).
     result = {
-        "input_ids": input_ids.tolist(),
+        "input_ids": input_ids.to(torch.int32).numpy(),
         "packed_loss_mask": serialize_packed_loss_mask(packed),
         "formatted_prompt": formatted_text,
     }
     if prompt_ids is not None:
-        result["prompt_ids"] = prompt_ids.tolist()
+        result["prompt_ids"] = prompt_ids.to(torch.int32).numpy()
     return result
 
 
@@ -202,7 +208,12 @@ def _drop_out_of_vocab_samples(data: list, tokenizer_path: str) -> list:
             ids = item.get(field)
             if ids is None:
                 continue
-            bad.update(i for i in ids if i < 0 or i >= limit)
+            # Vectorised because this walks every token of every row: the
+            # element-wise generator it replaces is 10^10 comparisons at 5M rows.
+            arr = np.asarray(ids)
+            out = arr[(arr < 0) | (arr >= limit)]
+            if out.size:
+                bad.update(int(i) for i in np.unique(out))
         if bad:
             for i in bad:
                 offenders[i] = offenders.get(i, 0) + 1
