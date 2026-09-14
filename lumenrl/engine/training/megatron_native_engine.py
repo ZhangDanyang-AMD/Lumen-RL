@@ -1346,6 +1346,13 @@ class MegatronNativeEngine(MegatronBaseEngine):
         align = self._tp if (self._sp and self._tp > 1) else 1
         if self._spec.sequence_alignment is not None:
             align = math.lcm(align, self._dsv4_align * (2 if self._cp > 1 else 1))
+        if getattr(self._tfcfg, "fp8", None):
+            # TE refuses an unaligned token count outright (assert_dim_for_fp8_exec).
+            # Pretraining never trips this because its [seq, mbs] is fixed; an RL
+            # token count is whatever the rollout produced.
+            from megatron.core.fp8_utils import get_fp8_align_size
+
+            align = math.lcm(align, get_fp8_align_size(self._tfcfg.fp8_recipe))
 
         cp_contiguous = self._caps.packed_stream_is_single_sequence and self._cp > 1
         if cp_contiguous and len(ids_list) > 1:
