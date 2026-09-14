@@ -70,9 +70,11 @@ export LUMENRL_TEACHER_MOONCAKE_SEGMENT_POOL_SIZE="${LUMENRL_TEACHER_MOONCAKE_SE
 export LUMENRL_TEACHER_MOONCAKE_SEGMENT_SIZE="${LUMENRL_TEACHER_MOONCAKE_SEGMENT_SIZE:-128GB}"
 export LUMENRL_TEACHER_MOONCAKE_POOL_WAIT_SECONDS="${LUMENRL_TEACHER_MOONCAKE_POOL_WAIT_SECONDS:-300}"
 
-CONFIG="${REPO_ROOT}/examples/Kimi_K3_SDDD_MI350_ATOM/configs/train.yaml"
+# 用 CONFIG_NAME 换配置文件（默认还是 train.yaml，不改变原有行为）。
+# gen-6 的续训用 train_stage2.yaml：CONFIG_NAME=train_stage2.yaml
+CONFIG="${REPO_ROOT}/examples/Kimi_K3_SDDD_MI350_ATOM/configs/${CONFIG_NAME:-train.yaml}"
 if [[ "${SMOKE_TEST}" == "1" ]]; then
-    CONFIG="${REPO_ROOT}/examples/Kimi_K3_SDDD_MI350_ATOM/configs/smoke_test.yaml"
+    CONFIG="${REPO_ROOT}/examples/Kimi_K3_SDDD_MI350_ATOM/configs/${SMOKE_CONFIG_NAME:-smoke_test.yaml}"
 fi
 
 for required in "${MODEL_PATH}" "${DATASET_PATH}" "${REPO_ROOT}"; do

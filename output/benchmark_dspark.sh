@@ -43,6 +43,13 @@ NUM_SPEC="${NUM_SPEC:-7}"
 # recipes/Kimi-K3.md and recipes/DSpark.md both serve K3 with fp8 KV.
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-3600}"
+# 16384 covers twelve of the reference card's thirteen benchmarks. The
+# exception is SPEED-Bench throughput_16k, whose inputs average 10.4k tokens and
+# reach 22.5k, so it needs a 32768 window and a batched-token budget above its
+# longest prompt -- chunked prefill is off, so a prompt larger than
+# max_num_batched_tokens cannot be scheduled at all.
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-16384}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-10240}"
 
 QUESTION_SETS="${QUESTION_SETS:-mtbench:${BENCH_DIR}/mt_bench_question.jsonl}"
 
@@ -54,6 +61,7 @@ echo "=== benchmark_dspark: $LABEL ==="
 echo "  target : $TARGET_MODEL"
 echo "  draft  : $DRAFT_DIR"
 echo "  kv     : $KV_CACHE_DTYPE"
+echo "  window : $MAX_MODEL_LEN (batched tokens $MAX_NUM_BATCHED_TOKENS)"
 python3 -m json.tool "$DRAFT_DIR/config.json" | grep -E 'rope|mscale' || true
 
 docker rm -f "$CONTAINER" >/dev/null 2>&1
@@ -108,9 +116,9 @@ docker run -d --name "$CONTAINER" \
     --kv_cache_dtype "$KV_CACHE_DTYPE" \
     -tp 8 \
     --trust-remote-code \
-    --max-model-len 16384 \
+    --max-model-len "$MAX_MODEL_LEN" \
     --max-num-seqs "${MAX_NUM_SEQS:-8}" \
-    --max-num-batched-tokens 10240 \
+    --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
     --gpu-memory-utilization 0.93 \
     --block-size 128 \
     --no-enable_prefix_caching \
