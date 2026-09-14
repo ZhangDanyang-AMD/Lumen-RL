@@ -260,13 +260,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
             num_first_layers_in_bf16=int(ec.get("fp8_num_first_layers_in_bf16") or 0),
             num_last_layers_in_bf16=int(ec.get("fp8_num_last_layers_in_bf16") or 0),
         )
-        kwargs = megatron_fp8_kwargs(cfg, num_layers=num_layers, pp_size=pp)
-        if kwargs:
-            logger.info(
-                "MegatronNativeEngine: FP8 training enabled -- %s",
-                " ".join(f"{k}={v}" for k, v in kwargs.items()),
-            )
-        return kwargs
+        return megatron_fp8_kwargs(cfg, num_layers=num_layers, pp_size=pp)
 
     @property
     def _caps(self):
@@ -561,6 +555,31 @@ class MegatronNativeEngine(MegatronBaseEngine):
             del meg_state
             self.module = model.cuda()
         self._tfcfg = tfcfg
+
+        if fp8_kwargs:
+            # TE resolves the recipe at the first forward, so an unsupported one
+            # (blockwise has no ROCm GEMM as of TE 2.15) kills the run minutes in.
+            # Ask up front, via Megatron's own string -> recipe mapping.
+            try:
+                from megatron.core.fp8_utils import get_fp8_recipe
+                from transformer_engine.pytorch.quantization import check_recipe_support
+            except ImportError:
+                pass  # best-effort: TE still raises at the first forward
+            else:
+                try:
+                    check_recipe_support(get_fp8_recipe(tfcfg))
+                except RuntimeError as e:
+                    raise RuntimeError(
+                        f"fp8_recipe={fp8_kwargs.get('fp8_recipe')!r} is not usable on "
+                        f"this build: {e}"
+                    ) from e
+            if self._rank() == 0:
+                # print, not logger: Ray forwards worker stdout, not log records.
+                print(
+                    "[MegatronNativeEngine] FP8 training enabled: "
+                    + " ".join(f"{k}={v}" for k, v in fp8_kwargs.items()),
+                    flush=True,
+                )
 
         if self._is_moe and self._caps.supports_hf_bridge and self._rank() == 0:
             # Surface MoE + Expert-Parallel topology to the run log (stdout is
