@@ -100,6 +100,57 @@ class _TeacherPrefetcher:
         self._worker.join(timeout=5)
 
 
+class _DisaggRowFetcher:
+    """Pull one teacher batch's rows out of Mooncake on a background thread.
+
+    Same shape as ``_TeacherPrefetcher`` and for the same reason: a daemon thread
+    plus two queues, so an exception on the main thread cannot leave a
+    non-daemon worker holding the interpreter open inside a Mooncake get that
+    only unblocks after ``get_retry_max_wait_seconds``.
+
+    Receives land on **CPU**, never the GPU. Touching the device from this thread
+    while the training thread is in a kernel produces VM_L2_PROTECTION_FAULT on
+    ROCm/MI350; the main thread does every ``.to(device)``.
+
+    Queue depth is one. The point is to overlap one fetch with one training step,
+    and a deeper queue would hold more teacher batches in Mooncake segments,
+    which is exactly what the segment barrier in the training loop exists to
+    bound.
+    """
+
+    def __init__(self, trainer: "SpecDistillTrainer") -> None:
+        self._trainer = trainer
+        self._req_queue: queue.Queue[Any] = queue.Queue()
+        self._res_queue: queue.Queue[Any] = queue.Queue(maxsize=1)
+        self._worker = threading.Thread(
+            target=self._loop, daemon=True, name="disagg-row-fetcher",
+        )
+        self._worker.start()
+
+    def _loop(self) -> None:
+        while True:
+            manifest = self._req_queue.get()
+            if manifest is _PREFETCH_SENTINEL:
+                break
+            try:
+                self._res_queue.put(self._trainer._load_disagg_rows(manifest))
+            except BaseException as exc:  # noqa: BLE001 - re-raised in get()
+                self._res_queue.put(exc)
+
+    def submit(self, manifest: dict[str, Any]) -> None:
+        self._req_queue.put(manifest)
+
+    def get(self) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor, torch.Tensor]:
+        item = self._res_queue.get()
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    def stop(self) -> None:
+        self._req_queue.put(_PREFETCH_SENTINEL)
+        self._worker.join(timeout=5)
+
+
 _SHM_SLOTS = 3
 _SHM_POLL_MS = 0.001
 _SHM_TIMEOUT = float(os.environ.get("LUMENRL_SHM_TIMEOUT", "1800"))
@@ -323,6 +374,9 @@ class SpecDistillTrainer:
         self._optimizer: torch.optim.Optimizer | None = None
         self._tokenizer: Any = None
         self._dataset: Any = None
+        # Once per run, not once per step: a mask/hidden-state width disagreement
+        # would otherwise print 39k times.
+        self._warned_mask_wider: bool = False
 
         self._is_distributed: bool = torch.distributed.is_initialized()
         self._rank: int = (
@@ -1649,8 +1703,7 @@ class SpecDistillTrainer:
                             'generate_mode="generate" requires '
                             "dataset.max_prompt_tokens > 0 so prompt_ids exist."
                         )
-                    if isinstance(ids, list):
-                        ids = torch.tensor(ids, dtype=torch.long)
+                    ids = torch.as_tensor(ids, dtype=torch.long)
                     attn = torch.ones(len(ids), dtype=torch.long)
                     # Placeholder: the real loss mask is only knowable once the
                     # response exists, and is rebuilt in _build_eval_teacher_cache.
@@ -1658,9 +1711,11 @@ class SpecDistillTrainer:
                     cache.append((ids.unsqueeze(0), attn.unsqueeze(0), lm.unsqueeze(0)))
                     continue
 
-                ids = item["input_ids"]
-                if isinstance(ids, list):
-                    ids = torch.tensor(ids, dtype=torch.long)
+                # as_tensor rather than an isinstance(list) guard: the cache now
+                # stores int32 ndarrays, and one that slipped through unconverted
+                # would reach F.embedding as the wrong dtype. No-op on a long
+                # tensor, so it also accepts caches written by the old code.
+                ids = torch.as_tensor(item["input_ids"], dtype=torch.long)
                 ids = ids[:max_len - 1]
                 lm = unpack_loss_mask(item["packed_loss_mask"])
                 lm = lm[:len(ids)]
@@ -2191,9 +2246,7 @@ class SpecDistillTrainer:
             batch_loss_masks = []
             for idx in indices:
                 item = self._preprocessed[idx]
-                ids = item["input_ids"]
-                if isinstance(ids, list):
-                    ids = torch.tensor(ids, dtype=torch.long)
+                ids = torch.as_tensor(item["input_ids"], dtype=torch.long)
                 lm = unpack_loss_mask(item["packed_loss_mask"])
                 if len(lm) > len(ids):
                     lm = lm[:len(ids)]
@@ -2206,9 +2259,7 @@ class SpecDistillTrainer:
                     replacement = (idx + bs) % ds_len
                     for _ in range(ds_len):
                         r_item = self._preprocessed[replacement]
-                        r_ids = r_item["input_ids"]
-                        if isinstance(r_ids, list):
-                            r_ids = torch.tensor(r_ids, dtype=torch.long)
+                        r_ids = torch.as_tensor(r_item["input_ids"], dtype=torch.long)
                         r_lm = unpack_loss_mask(r_item["packed_loss_mask"])
                         if len(r_lm) > len(r_ids):
                             r_lm = r_lm[:len(r_ids)]
@@ -2363,8 +2414,7 @@ class SpecDistillTrainer:
                     "so that prompt_ids are precomputed; the cached dataset has none. "
                     "Set it and let the tokenize cache rebuild."
                 )
-            if isinstance(ids, list):
-                ids = torch.tensor(ids, dtype=torch.long)
+            ids = torch.as_tensor(ids, dtype=torch.long)
             batch.append(ids)
 
         pad_id = self._tokenizer.pad_token_id or 0
@@ -3821,20 +3871,26 @@ class SpecDistillTrainer:
             raise RuntimeError(f"remote ATOM teacher failed: {payload['error']}")
         return payload["manifest"]
 
-    def _load_disaggregated_rank_batch(
+    def _load_disagg_rows(
         self,
         manifest: dict[str, Any],
         rows: list[int] | None = None,
-    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
-        """Fetch this draft rank's disjoint rows from one teacher batch.
+    ) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor, torch.Tensor]:
+        """Fetch this draft rank's disjoint rows, each at its own length.
 
         ``rows`` defaults to the ``rank::world_size`` stride. Eval passes
         contiguous blocks instead so that a rank's micro-batches are consecutive
         slice rows, matching how the single-node trainer grouped them.
+
+        No padding happens here, and that is the point. Padding every row up to
+        the batch width cost more than the network did: measured mean row length
+        is 2035 tokens against a batch width of ~7600, so three quarters of every
+        copy was padding that ``_streaming_disaggregated_train`` then sliced back
+        off before the forward pass. Callers that genuinely need one rectangular
+        tensor go through ``_collate_disagg_rows``.
         """
         keys = manifest["mooncake_keys"]
         seq_lens = manifest["sequence_lengths"]
-        full_ids = manifest["input_ids"]
         attention_mask = manifest["attention_mask"]
         loss_mask = manifest["loss_mask"]
         batch_size = len(keys)
@@ -3845,13 +3901,10 @@ class SpecDistillTrainer:
             )
         if rows is None:
             rows = list(range(self._rank, batch_size, self._world_size))
-        total_len = int(full_ids.shape[1])
         hidden_dim = int(manifest["hidden_dim"])
         hidden_width = int(manifest["num_aux_layers"]) * hidden_dim
 
-        hidden_rows = []
-        id_rows = []
-        last_rows = []
+        fetched: list[dict[str, torch.Tensor]] = []
         for row in rows:
             seq_len = int(seq_lens[row])
             output = self._disagg_mooncake_store.get(
@@ -3868,27 +3921,100 @@ class SpecDistillTrainer:
                 },
                 device=torch.device("cpu"),
             )
-            hidden_rows.append(F.pad(output.hidden_states, (0, 0, 0, total_len - seq_len)))
-            id_rows.append(F.pad(output.input_ids, (0, total_len - seq_len)))
-            last_rows.append(
-                F.pad(output.last_hidden_states, (0, 0, 0, total_len - seq_len))
-            )
+            fetched.append({
+                "hidden_states": output.hidden_states,
+                "input_ids": output.input_ids,
+                "last_hidden_states": output.last_hidden_states,
+            })
             self._disagg_mooncake_store.remove_eagle3_tensors(
                 keys[row], has_last_hidden_states=True, has_target=False,
             )
 
-        hidden_states = torch.stack(hidden_rows)
-        input_ids = torch.stack(id_rows)
-        teacher_data = {
-            "hidden_states": hidden_states,
-            "token_embeds": hidden_states[:, :, :hidden_dim].clone(),
-            "input_ids": input_ids,
+        return fetched, attention_mask[rows].contiguous(), loss_mask[rows].contiguous()
+
+    @staticmethod
+    def _collate_disagg_rows(
+        fetched: list[dict[str, torch.Tensor]],
+        width: int | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Pad rows to a common width and stack them into one micro-batch.
+
+        ``width`` defaults to the longest row present, which is what a
+        micro-batch wants; eval passes the manifest width so its cached tensors
+        keep the shape the single-node trainer produced.
+        """
+        if not fetched:
+            raise ValueError("no rows to collate")
+        if width is None:
+            width = max(int(r["input_ids"].shape[0]) for r in fetched)
+
+        # The common case at micro_batch 1: one row, already the right width.
+        # unsqueeze is a view, so this path copies nothing at all, where
+        # torch.stack on a single row would still copy the full 131 MiB.
+        if len(fetched) == 1 and int(fetched[0]["input_ids"].shape[0]) == width:
+            row = fetched[0]
+            return {
+                "hidden_states": row["hidden_states"].unsqueeze(0),
+                "input_ids": row["input_ids"].unsqueeze(0),
+                "last_hidden_states": row["last_hidden_states"].unsqueeze(0),
+            }
+
+        hidden_rows, id_rows, last_rows = [], [], []
+        for r in fetched:
+            seq_len = int(r["input_ids"].shape[0])
+            if seq_len > width:
+                raise ValueError(f"row of {seq_len} tokens exceeds width {width}")
+            gap = width - seq_len
+            hidden_rows.append(
+                F.pad(r["hidden_states"], (0, 0, 0, gap)) if gap else r["hidden_states"]
+            )
+            id_rows.append(F.pad(r["input_ids"], (0, gap)) if gap else r["input_ids"])
+            last_rows.append(
+                F.pad(r["last_hidden_states"], (0, 0, 0, gap)) if gap
+                else r["last_hidden_states"]
+            )
+
+        # No "token_embeds" key. The ATOM and vLLM engines both publish the first
+        # aux layer under that name as an "embed proxy", and cloning it here cost
+        # 1.75 GiB of memcpy per rank per step -- but _train_step_dspark ignores
+        # it and recomputes F.embedding(input_ids, embed_w) from the teacher's
+        # frozen embedding table. Anything that does read the key (the Eagle3
+        # step) must therefore not be routed through here.
+        return {
+            "hidden_states": torch.stack(hidden_rows),
+            "input_ids": torch.stack(id_rows),
             "last_hidden_states": torch.stack(last_rows),
         }
-        return teacher_data, attention_mask[rows].contiguous(), loss_mask[rows].contiguous()
+
+    def _load_disaggregated_rank_batch(
+        self,
+        manifest: dict[str, Any],
+        rows: list[int] | None = None,
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
+        """One rectangular batch padded to the manifest width. Used by eval."""
+        fetched, attention_mask, loss_mask = self._load_disagg_rows(manifest, rows)
+        width = int(manifest["input_ids"].shape[1])
+        return self._collate_disagg_rows(fetched, width), attention_mask, loss_mask
 
     def _streaming_disaggregated_train(self) -> None:
         """Continuously overlap four remote on-policy teachers with draft FSDP."""
+        # /!\ Resume leaves the draft on the CPU. `_resume_from_checkpoint`
+        # offloads it deliberately -- the teacher is already resident by then and
+        # Adam's moments on top of it would OOM the card -- and relies on the
+        # caller moving it back. Only `_batch_alternating_train` did, because
+        # that path offloads and reloads every round anyway. This path keeps the
+        # draft resident and never had a reason to call the onload, so a resumed
+        # run died on the first matmul with "mat2 is on cpu, different from other
+        # tensors on cuda:N" out of `fc`. It stayed hidden until gen-6: gen-5
+        # trained from scratch, so the resume branch found no checkpoint and the
+        # offload never ran.
+        if self._draft_model is not None and any(
+            p.device.type == "cpu" for p in self._draft_model.parameters()
+        ):
+            logger.info("[rank %d] draft is on CPU after resume; moving it to %s",
+                        self._rank, self._device)
+            self._load_draft_to_gpu()
+
         if self._rank == 0:
             for cb in self.callbacks:
                 cb.on_train_begin(self)
@@ -3907,6 +4033,39 @@ class SpecDistillTrainer:
                 pending[step] = self._submit_disaggregated_teacher_batch(step)
         next_submit_step = min(total_steps, start_step + depth)
 
+        # One background thread pulls the next step's rows out of Mooncake while
+        # this step trains. The fetch is network plus host copies -- about 4 s
+        # against ~4.8 s of draft compute -- so it hides almost entirely, and
+        # timing/fetch_wait_s says whether it actually did.
+        #
+        # Only the Mooncake get and the host copies leave the main thread. Every
+        # collective stays on it, in the same order on every rank: the manifest
+        # broadcast, the segment barrier, the metric all-reduce. Issuing
+        # collectives from two threads against one process group is how you get a
+        # hang whose only symptom is a watchdog timeout with no stack.
+        # LUMENRL_DISAGG_PREFETCH=0 falls back to fetching inline.
+        fetcher = (
+            _DisaggRowFetcher(self)
+            if os.environ.get("LUMENRL_DISAGG_PREFETCH", "1") != "0"
+            else None
+        )
+        manifests: dict[int, dict[str, Any]] = {}
+
+        def _receive_and_start(step_idx: int) -> None:
+            """Broadcast one manifest, then queue its fetch on the worker."""
+            ready_ref = None
+            if self._rank == 0:
+                # Consume in dataset order. Pairing whichever teacher finishes
+                # first with this optimizer step would train on the wrong rows.
+                ready_ref = pending.pop(step_idx)
+            man = self._receive_disaggregated_manifest(ready_ref)
+            manifests[step_idx] = man
+            if fetcher is not None:
+                fetcher.submit(man)
+
+        if start_step < total_steps:
+            _receive_and_start(start_step)
+
         for step in range(start_step, total_steps):
             self.global_step = step
             if self._rank == 0:
@@ -3914,25 +4073,30 @@ class SpecDistillTrainer:
                     cb.on_step_begin(self, step)
             step_start = time.time()
 
-            ready_ref = None
-            if self._rank == 0:
-                # Consume in dataset order. Pairing whichever teacher finishes
-                # first with this optimizer step would train on the wrong rows.
-                ready_ref = pending.pop(step)
-            manifest = self._receive_disaggregated_manifest(ready_ref)
+            manifest = manifests.pop(step)
+            if fetcher is not None:
+                fetched, attention_mask, loss_mask = fetcher.get()
+            else:
+                fetched, attention_mask, loss_mask = self._load_disagg_rows(manifest)
+            fetch_wait = time.time() - step_start
 
-            teacher_data, attention_mask, loss_mask = (
-                self._load_disaggregated_rank_batch(manifest)
-            )
             if self._is_distributed:
                 # Every rank owns different keys. Do not let the teacher write a
                 # third batch into a segment until all ranks removed the oldest.
+                # This has to sit after the fetch above and before the next one is
+                # queued below, which is the same ordering as the inline version.
                 torch.distributed.barrier()
             if self._rank == 0 and next_submit_step < total_steps:
                 pending[next_submit_step] = self._submit_disaggregated_teacher_batch(
                     next_submit_step
                 )
                 next_submit_step += 1
+
+            # Queue the next step's fetch before training rather than after, so
+            # it runs underneath the draft's forward and backward.
+            if step + 1 < total_steps:
+                _receive_and_start(step + 1)
+
             teacher_time = time.time() - step_start
             local_batch = int(attention_mask.shape[0])
             configured_mb = int(
@@ -3957,17 +4121,35 @@ class SpecDistillTrainer:
             for index, (lo, hi) in enumerate(chunks):
                 if use_grad_sync:
                     self._draft_model.set_requires_gradient_sync(index == len(chunks) - 1)
-                mb_teacher = {key: value[lo:hi] for key, value in teacher_data.items()}
+                # Collate here, not at fetch time: this micro-batch only needs to
+                # be as wide as its own longest row, whereas the manifest width is
+                # the whole global batch's. At micro_batch 1 that makes the pad a
+                # no-op and the stack a view.
+                mb_teacher = self._collate_disagg_rows(fetched[lo:hi])
+                width = int(mb_teacher["input_ids"].shape[1])
                 mb_mask = attention_mask[lo:hi]
                 mb_loss_mask = loss_mask[lo:hi]
-                actual_len = max(1, int(mb_mask.sum(dim=-1).max().item()))
-                mb_teacher = {
-                    key: value[:, :actual_len].contiguous()
-                    if value.dim() >= 2 else value
-                    for key, value in mb_teacher.items()
-                }
+                # The masks still arrive at full manifest width. Clamp to the rows
+                # we actually hold: a mask claiming more real tokens than the
+                # teacher published would mean truncated hidden states, so warn
+                # rather than let the shapes disagree downstream.
+                mask_len = int(mb_mask.sum(dim=-1).max().item())
+                if mask_len > width and not self._warned_mask_wider:
+                    self._warned_mask_wider = True
+                    logger.warning(
+                        "[rank %d] step %d: attention_mask claims %d tokens but the "
+                        "teacher published %d; hidden states look truncated",
+                        self._rank, step, mask_len, width,
+                    )
+                actual_len = max(1, min(mask_len, width))
                 mb_mask = mb_mask[:, :actual_len].contiguous()
                 mb_loss_mask = mb_loss_mask[:, :actual_len].contiguous()
+                if actual_len < width:
+                    mb_teacher = {
+                        key: value[:, :actual_len].contiguous()
+                        if value.dim() >= 2 else value
+                        for key, value in mb_teacher.items()
+                    }
                 if draft_type == "dspark":
                     result = self._train_step_dspark(
                         mb_teacher, mb_mask, mb_loss_mask,
@@ -3995,8 +4177,18 @@ class SpecDistillTrainer:
                     "lr": self._optimizer.get_learning_rate(),
                     "timing/step_s": time.time() - step_start,
                     "timing/teacher_s": teacher_time,
+                    # How much of the fetch the prefetch thread failed to hide.
+                    # Near zero means the overlap is working; if it climbs to the
+                    # old teacher_s the teacher, not the fetch, is the bottleneck.
+                    "timing/fetch_wait_s": fetch_wait,
                     "timing/train_s": time.time() - train_start,
+                    # Manifest width, i.e. the longest row in the global batch --
+                    # kept for comparability with the runs that padded every row
+                    # to it. row_max_len is what this rank actually copies now.
                     "seq/max_len": int(attention_mask.shape[1]),
+                    "seq/row_max_len": max(
+                        int(r["input_ids"].shape[0]) for r in fetched
+                    ),
                     "teacher/replica": float(manifest["replica_index"]),
                 }
             )
@@ -4013,6 +4205,8 @@ class SpecDistillTrainer:
             for cb in self.callbacks:
                 cb.on_step_end(self, step, metrics)
 
+        if fetcher is not None:
+            fetcher.stop()
         if self._rank == 0:
             for cb in self.callbacks:
                 cb.on_train_end(self)
