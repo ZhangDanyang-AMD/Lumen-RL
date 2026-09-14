@@ -93,9 +93,7 @@ def main() -> int:
     lengths = []
     for idx in range(n - a.num_samples, n):
         item = data[idx]
-        ids = item["input_ids"]
-        if isinstance(ids, list):
-            ids = torch.tensor(ids, dtype=torch.long)
+        ids = torch.as_tensor(item["input_ids"], dtype=torch.long)
         ids = ids[: a.max_length - 1]
         lm = unpack_loss_mask(item["packed_loss_mask"])[: len(ids)]
         if len(lm) < len(ids):
