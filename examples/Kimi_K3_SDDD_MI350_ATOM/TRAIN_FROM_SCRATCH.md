@@ -138,6 +138,21 @@ hidden state 走 **Mooncake，协议必须是 TCP，不要 RDMA**。
 2. **`/health` 返回 200 但请求全挂。** API 前端和 engine core 是两个进程。
 3. **一个 teacher 副本先慢下来，几小时后才彻底不响应。** 见 9.3，这是最贵的一种。
 
+**另外两件会让"重启"失效的事：**
+
+/!\ **worker 进程会活得比父进程久。** 杀掉训练容器之后 GPU 上还挂着孤儿进程，下一次
+启动就会撞到"显存被占"。启动脚本要带 EXIT trap：
+
+```bash
+trap 'pkill -f AsyncLLMEngine; pkill -f EngineCore; pkill -f atom_teacher; pkill -f mooncake_master' EXIT
+```
+
+/!\ **调度器的 epilog 会直接删掉容器，那不是 crash，所以 `--restart=on-failure` 不
+触发。** 节点被标记故障、作业被回收时，容器和 `/dev/shm` 一起消失。要在登录节点上
+另起一个看守：容器不在 `running`/`restarting`/`created` 里就带 `resume` 重新起，
+并且**先检查最新 checkpoint 是不是已经到了目标步数**——否则会把一个已经跑完的 run
+重新拉起来。
+
 ---
 
 ## 2. 镜像：这一节跳过去，后面全是白费
@@ -190,12 +205,23 @@ teacher 要加载 20 分钟才会暴露）：
 - `run_model` 存在
 - `calculate_eagle3_buffer_size` 仍接受 `num_aux_layers`
 
-### 2.3 五台机器必须跑同一份镜像
+### 2.3 /!\ 启动容器前要清 aiter 的 JIT 锁
+
+aiter 会在首次用到某个 kernel 时 JIT 编译，锁文件落在 `/tmp`。上一次运行留下的
+陈旧锁会让**首次编译直接死锁**——没有报错，就是不往下走。
+
+```bash
+rm -rf /tmp/*aiter* /tmp/*hiprtc* 2>/dev/null || true
+```
+
+把这条放进启动脚本，每次起容器前无条件跑。
+
+### 2.4 五台机器必须跑同一份镜像
 
 一台 build 完之后 `docker save` / `docker load` 分发，**不要每台各自 build**——
 基础镜像可能在两次 pull 之间漂了。
 
-### 2.4 /!\ 一个不能漏的环境变量
+### 2.5 /!\ 一个不能漏的环境变量
 
 **`PYTORCH_CUDA_ALLOC_CONF` 必须是空的。**
 
@@ -803,6 +829,10 @@ export MOONCAKE_DEVICE_NAME=          # /!\ 空值时不要下发这个 override
 
 `local_buffer_size: 8GB` 不用改（32768 单序列是 2.7 GiB）。
 
+Mooncake master 由 rank 0 起，端口在 **51000–52000** 和 **8100–9100** 两个区间里
+自动挑——排查端口冲突时要连这两段一起看。它在 Phase 切换期间必须保持运行，即使
+teacher engine 已经 tear down。
+
 ### 8.4 /!\ eval 必须用两把尺子
 
 **这是用一整轮训练换来的教训。** 某一轮只留了"自己训练集尾部"这一把尺子，而那份
@@ -860,7 +890,33 @@ eval:
 **真正可靠的检查点是"跑完第一个 epoch 就导出、benchmark 一次"。** 5 天的训练里
 花 2 小时确认方向，比跑完才发现便宜得多。
 
-### 8.6 吞吐参考
+### 8.6 /!\ `training_backend: fsdp2` 是骗人的，draft 实际不分片
+
+配置里写的是 `fsdp2`，但训练器会自己判断能不能跳过分片：
+
+```python
+_SKIP_FSDP_MAX_GPU_GB = 80.0     # bf16 权重 + fp32 master + Adam m/v = 14 B/param
+
+est_gpu_gb = num_params * 14.0 / (1024 ** 3)
+if est_gpu_gb < 80.0 and not has_dropout:
+    # 走 torch.distributed._composable.replicate，不是 FSDP2
+```
+
+draft 是 2,387,907,841 个可训练参数 × 14 B = **31.1 GiB < 80 GiB**，而且没有
+Dropout，所以**永远走 `replicate`（DDP 式的梯度全归约），每个 rank 持有完整副本**。
+
+开训后日志里应该看到的是这一行，而不是 FSDP 的分片信息：
+
+```
+Using composable replicate for gradient sync (2387907841 params)
+```
+
+**为什么要知道这件事**：DDP 的梯度桶约 **4.45 GiB**，它是 Phase 切换后 trainer 残留
+显存（约 13.6 GiB）的最大一块，而那 13.6 GiB 会被 ATOM 重复计费进它自己的 KV
+预算——就是排错表里 `InsufficientPoolBudget` 那一行的来源。把 draft 换大（超过
+80 GiB）会自动切回 FSDP2，显存画像会完全不同。
+
+### 8.7 吞吐参考
 
 | | 8192 窗口 | **32768 窗口** |
 |---|---|---|
@@ -1294,7 +1350,7 @@ DSparkProposer aux capture on target layers: (2, 23, 47, 71, 89)
 | 一堆 `bgemm_internal_cublaslt error ... Will attempt to recover` | hipBLASLt 在某些形状上失败后回退 cublas | **噪音**，结果是对的，统计错误数时要排除 |
 | `FlyDSL kernel ... not recognized by the current catalog; falling back` | aiter 调优表条目当前内核目录认不出 | **同样是噪音**（9.3 末） |
 | `No available memory for the cache blocks` | KV 预算不够 | 确认没有别的进程占卡；降 `max_num_seqs` |
-| 加载完只剩 175 GiB 可用显存（应约 265） | `PYTORCH_CUDA_ALLOC_CONF` 漏进容器了 | `docker inspect` 确认它为空（2.4） |
+| 加载完只剩 175 GiB 可用显存（应约 265） | `PYTORCH_CUDA_ALLOC_CONF` 漏进容器了 | `docker inspect` 确认它为空（2.5） |
 | `N 行 prompt 超过 max_prompt_tokens` 启动即退 | 生成侧默认 14304 是给 16384 窗口的 | 32768 窗口传 `--max-prompt-tokens 32224` |
 | 训练启动时节点内存爆掉 | `input_ids` 存成 `list[int]`，36 字节/token | 改 int32 ndarray（7.3） |
 | `'BF16Optimizer' object is not iterable` | torch 的 `get_optimizer_state_dict` 只接受 `torch.optim.Optimizer` | 非分片时直接用 `opt.state_dict()` |
