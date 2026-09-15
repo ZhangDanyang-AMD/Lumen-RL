@@ -42,7 +42,12 @@ CFG_DIR="examples/DAPO/configs"
 # GPU is considered idle below this many bytes of VRAM in use. The MI355X
 # baseline measured on an empty node is ~298 MB per card; 2 GB leaves room for
 # other tenants' bookkeeping without hiding a leaked 90 GB engine.
-IDLE_VRAM_BYTES=2147483648
+# Overridable: on a shared node a small co-tenant on one card (a few GB out of
+# 288) leaves far more headroom than any example needs, but trips this check.
+# The only other way past it is --force, which also removes other containers
+# built from this image -- i.e. someone else's run. Raising the threshold is the
+# narrow escape hatch; --force is not.
+IDLE_VRAM_BYTES="${IDLE_VRAM_BYTES:-2147483648}"
 
 # Seconds without a new log line before the foreground follower gives up.
 STALL_LIMIT_DEFAULT=2400
@@ -168,6 +173,11 @@ ENVIRONMENT
   WANDB_API_KEY  only needed with --longrun.
   EXTRA_OVERRIDE  extra Hydra overrides, space separated, appended verbatim,
                   e.g. EXTRA_OVERRIDE='logger.wandb_enabled=false policy.learning_rate=1e-6'
+  MEGATRON_PATH   Megatron source tree to import ahead of the image's pip
+                  megatron-core. Required for the MORI flex dispatcher, which
+                  needs the ROCm fork (core_r0.18.0_rocm); upstream has no
+                  moe_mori_max_tokens_per_rank. Must be visible in the
+                  container, e.g. \$DATA_ROOT/megatron-rocm.
 EOF
 }
 
@@ -374,6 +384,12 @@ DOCKER_ENV=(
 if [ -n "$EXTRA_ENV" ]; then
   for kv in $EXTRA_ENV; do DOCKER_ENV+=(-e "$kv"); done
 fi
+# MEGATRON_PATH pins a Megatron source tree ahead of the image's pip
+# megatron-core (run_dapo.sh prepends it to PYTHONPATH). The MORI flex
+# dispatcher needs the ROCm fork: upstream megatron-core has no
+# moe_mori_max_tokens_per_rank, so a flex run dies at config construction.
+# Must be a path visible inside the container, e.g. under $DATA_ROOT.
+if [ -n "${MEGATRON_PATH:-}" ]; then DOCKER_ENV+=(-e "MEGATRON_PATH=$MEGATRON_PATH"); fi
 
 # wandb: smoke configs are wandb_enabled:false and need no account. Longrun
 # configs are wandb_enabled:true; without a key the run dies *after*
