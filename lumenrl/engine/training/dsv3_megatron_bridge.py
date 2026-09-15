@@ -147,8 +147,9 @@ def build_dsv3_config(
     """
     from megatron.core.transformer.transformer_config import MLATransformerConfig
 
+    from lumenrl.engine.training.megatron_base_engine import moe_dispatcher_kwargs
+
     del deterministic  # accepted for hook-signature parity; DSv3 has no such mode
-    del max_tokens_per_gpu  # only the flex/MORI dispatcher sizes a heap from it
     etp = etp or tp
 
     recompute: dict[str, Any] = {}
@@ -295,10 +296,13 @@ def build_dsv3_config(
         qk_pos_emb_head_dim=int(hf["qk_rope_head_dim"]),
         v_head_dim=int(hf["v_head_dim"]),
         **rope,
-        # Matches the generic path. Upstream rejects only ``allgather`` under
-        # variable_seq_lengths, so this is a choice rather than the only option;
-        # wiring it to moe_dispatcher_kwargs is tracked separately.
-        moe_token_dispatcher_type="alltoall",
+        # Through the same helper as the generic path, so DSv3 is not the one
+        # MoE family locked out of the flex/MORI dispatcher and the decision is
+        # not repeated per construction site. Upstream rejects only
+        # ``allgather`` under variable_seq_lengths, so flex is available here.
+        **moe_dispatcher_kwargs(
+            ec, tp=tp, cp=cp, sp=sp, max_tokens_per_gpu=max_tokens_per_gpu
+        ),
         **moe,
         **recompute,
     )

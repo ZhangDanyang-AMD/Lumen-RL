@@ -363,3 +363,89 @@ def test_shared_expert_size_honours_the_engine_config_override():
 def test_shared_expert_size_falls_back_to_the_hf_derived_value():
     cfg = dsv3.build_dsv3_config(K2, {})
     assert cfg.moe_shared_expert_intermediate_size == 2048 * 1  # moe_ffn * n_shared
+
+
+# --- review item 5: one dispatcher decision, shared with the generic path ---
+
+def _megatron_has_mori() -> bool:
+    """This image's Megatron 0.18.2 has moe_flex_dispatcher_backend but not the
+    MORI heap field, so the flex path needs a Megatron built with MORI support.
+    The generic path in megatron_native_engine fails identically without it --
+    DSv3 mirrors that rather than diverging."""
+    import dataclasses
+
+    from megatron.core.transformer.transformer_config import MLATransformerConfig
+
+    return any(
+        f.name == "moe_mori_max_tokens_per_rank"
+        for f in dataclasses.fields(MLATransformerConfig)
+    )
+
+
+def test_the_dispatcher_defaults_to_alltoall_as_before():
+    assert dsv3.build_dsv3_config(K2, {}).moe_token_dispatcher_type == "alltoall"
+
+
+def test_the_dispatcher_is_taken_from_engine_config_not_hardcoded():
+    """DSv3 was the one MoE family whose dispatcher could not be selected.
+
+    ``allgather`` is used here only because every Megatron build accepts it at
+    pp=1 (variable_seq_lengths is False there, so upstream's rejection of it
+    does not apply); the point under test is that the override reaches the
+    config at all, not this particular dispatcher.
+    """
+    cfg = dsv3.build_dsv3_config(K2, {"moe_token_dispatcher_type": "allgather"})
+    assert cfg.moe_token_dispatcher_type == "allgather"
+
+
+def test_the_heap_budget_is_no_longer_discarded():
+    """``max_tokens_per_gpu`` used to be ``del``-ed; it sizes the MORI heap.
+
+    Asserted on the shared helper, which is where the arithmetic lives and
+    which does not need a MORI-capable Megatron to exercise.
+    """
+    from lumenrl.engine.training.megatron_base_engine import moe_dispatcher_kwargs
+
+    kw = moe_dispatcher_kwargs(
+        {"moe_token_dispatcher_type": "flex"},
+        tp=2, cp=2, sp=True, max_tokens_per_gpu=8192,
+    )
+    assert kw["moe_mori_max_tokens_per_rank"] == 2048  # 8192 / cp=2 / tp=2
+
+
+@pytest.mark.skipif(not _megatron_has_mori(), reason="Megatron built without MORI")
+def test_flex_reaches_the_config_on_a_mori_capable_megatron():
+    cfg = dsv3.build_dsv3_config(
+        K2, {"moe_token_dispatcher_type": "flex"}, max_tokens_per_gpu=8192
+    )
+    assert cfg.moe_token_dispatcher_type == "flex"
+    assert cfg.moe_flex_dispatcher_backend == "mori"
+    assert cfg.moe_mori_max_tokens_per_rank == 8192
+
+
+def test_the_parallel_layout_and_budget_reach_the_shared_helper(monkeypatch):
+    """``build_dsv3_config`` must forward its own arguments, not placeholders.
+
+    Observed at the collaborator rather than on the built config because this
+    Megatron cannot construct a flex config at all (no MORI heap field), so the
+    forwarded budget is invisible in the result. The helper's return value is
+    irrelevant here -- only the call it receives is under test.
+    """
+    from lumenrl.engine.training import megatron_base_engine as mbe
+
+    seen = {}
+
+    def _spy(engine_config, *, tp, cp, sp, max_tokens_per_gpu=0):
+        seen.update(ec=dict(engine_config), tp=tp, cp=cp, sp=sp,
+                    max_tokens_per_gpu=max_tokens_per_gpu)
+        return {"moe_token_dispatcher_type": "alltoall"}
+
+    monkeypatch.setattr(mbe, "moe_dispatcher_kwargs", _spy)
+    dsv3.build_dsv3_config(
+        K2, {"moe_token_dispatcher_type": "flex"},
+        tp=2, cp=4, sp=True, max_tokens_per_gpu=8192,
+    )
+
+    assert seen["tp"] == 2 and seen["cp"] == 4 and seen["sp"] is True
+    assert seen["max_tokens_per_gpu"] == 8192, "the heap budget was dropped again"
+    assert seen["ec"]["moe_token_dispatcher_type"] == "flex"
