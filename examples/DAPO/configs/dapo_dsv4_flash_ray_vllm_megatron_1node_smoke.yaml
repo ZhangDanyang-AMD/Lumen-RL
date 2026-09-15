@@ -101,6 +101,10 @@ policy:
       # DSv4 has its own routing (sqrtsoftplus + expert bias + hash layers); the
       # rest of the MoE shape comes from the HF config.
       moe_grouped_gemm: true
+      moe_token_dispatcher_type: alltoall
+      moe_flex_dispatcher_backend: mori
+      moe_mori_max_tokens_per_rank: null
+      moe_mori_kernel_type: null
       moe_aux_loss_coeff: 0.0
       log_probs_chunk_size: 1024
       # See the header. Not a tuning choice.

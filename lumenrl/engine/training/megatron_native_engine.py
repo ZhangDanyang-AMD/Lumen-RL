@@ -28,7 +28,10 @@ import torch.nn.functional as F
 from lumenrl.core.protocol import DataProto
 from lumenrl.engine.training import dsv4_megatron_bridge as dsv4
 from lumenrl.engine.training.base_engine import EngineRegistry
-from lumenrl.engine.training.megatron_base_engine import MegatronBaseEngine
+from lumenrl.engine.training.megatron_base_engine import (
+    MegatronBaseEngine,
+    moe_dispatcher_kwargs,
+)
 from lumenrl.engine.training.qwen3_megatron_bridge import (
     Qwen3Dims,
     hf_to_megatron,
@@ -396,11 +399,14 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 use_cpu_initialization=True,
                 # PP: RL microbatches are variable-length (per-seq / packed thd), so
                 # the pipeline P2P must exchange tensor shapes dynamically instead of
-                # assuming a fixed [seq, mbs, hidden]. (alltoall MoE dispatcher just
-                # passes the dense-model config validation that rejects the default
-                # allgather dispatcher under variable_seq_lengths.)
+                # assuming a fixed [seq, mbs, hidden]. (alltoall / flex MoE
+                # dispatchers pass the dense-model config validation that rejects
+                # the default allgather dispatcher under variable_seq_lengths.)
                 variable_seq_lengths=(pp > 1),
-                moe_token_dispatcher_type="alltoall",
+                **moe_dispatcher_kwargs(
+                    ec, tp=tp, cp=cp, sp=sp,
+                    max_tokens_per_gpu=self._max_tokens_per_gpu,
+                ),
                 **moe_kwargs,
                 **recompute_kwargs,
             )
@@ -521,9 +527,22 @@ class MegatronNativeEngine(MegatronBaseEngine):
 
         oc = self.optimizer_config
         self._clip = float(oc.get("clip_grad", 1.0))
+        # A single monolithic coalesced all-gather of the whole param set can hit
+        # a pathological RCCL path. A finite ``bucket_size`` splits it into pipelined
+        # gathers, and ``overlap_param_gather`` defers those behind the next
+        # forward. Both default to the previous behaviour and are opt-in via
+        # megatron_cfg. ``overlap_param_gather`` requires ``overlap_grad_reduce``.
+        _bucket = ec.get("ddp_bucket_size", None)
+        self._overlap_grad_reduce = bool(ec.get("overlap_grad_reduce", False))
+        self._overlap_param_gather = bool(ec.get("overlap_param_gather", False))
+        if self._overlap_param_gather and not self._overlap_grad_reduce:
+            self._overlap_grad_reduce = True
         ddp_cfg = DistributedDataParallelConfig(
-            grad_reduce_in_fp32=True, overlap_grad_reduce=False,
-            use_distributed_optimizer=True, average_in_collective=True, bucket_size=None,
+            grad_reduce_in_fp32=True,
+            overlap_grad_reduce=self._overlap_grad_reduce,
+            overlap_param_gather=self._overlap_param_gather,
+            use_distributed_optimizer=True, average_in_collective=True,
+            bucket_size=(int(_bucket) if _bucket else None),
         )
         self._ddp = DDP(config=tfcfg, ddp_config=ddp_cfg, module=self.module)
 
