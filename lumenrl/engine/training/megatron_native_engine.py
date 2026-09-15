@@ -942,8 +942,11 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 dist.broadcast(t, src=src_global, group=pp_group)
                 yield k, t
 
-    def _dsv4_router_bias_buffers(self):
+    def _router_bias_buffers(self):
         """The aux-loss-free load-balancing bias, which is a buffer, not a param.
+
+        Shared by every family whose router carries one -- the Megatron
+        buffer name is the same -- so it must not be reached past.
 
         ``moe_router_enable_expert_bias`` updates it every step from the observed
         expert load, and the rollout's top-k uses it. Left out of the weight sync

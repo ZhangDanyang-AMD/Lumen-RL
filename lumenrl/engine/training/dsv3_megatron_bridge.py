@@ -66,6 +66,27 @@ class DSV3Dims(Qwen3Dims):
     routed_scaling_factor: float = 1.0
 
 
+def _require_q_lora_rank(hf: Mapping[str, Any]) -> int:
+    """The q LoRA rank, refusing the variants this bridge cannot express.
+
+    Megatron branches on ``q_lora_rank is None`` (``MLASelfAttention``; the
+    dataclass default is ``512``), so coercing a missing value to ``0`` takes
+    the LoRA branch and builds a rank-0 projection instead of the non-LoRA one.
+    Independently, ``_ATTN_MAP`` has no entry for ``linear_q_proj`` and
+    ``megatron_to_hf_dsv3`` skips names it does not recognise -- so that
+    variant's q projection would vanish from the weight sync silently. Both
+    failures are quiet, which is why this refuses rather than coerces.
+    """
+    q = hf.get("q_lora_rank")
+    if q is None or int(q) <= 0:
+        raise ValueError(
+            f"DSv3 with q_lora_rank={q!r} is not supported: Megatron branches on "
+            "`q_lora_rank is None`, so this would build a rank-0 q projection, "
+            "and the bridge has no mapping for `linear_q_proj`"
+        )
+    return int(q)
+
+
 def build_dsv3_dims(hf: Mapping[str, Any]) -> DSV3Dims:
     n_shared = int(hf.get("n_shared_experts") or 0)
     moe_ffn = int(hf.get("moe_intermediate_size") or 0)
@@ -81,7 +102,7 @@ def build_dsv3_dims(hf: Mapping[str, Any]) -> DSV3Dims:
         num_experts=int(hf.get("n_routed_experts") or 0),
         moe_ffn=moe_ffn,
         shared_expert_ffn=moe_ffn * n_shared,
-        q_lora_rank=int(hf.get("q_lora_rank") or 0),
+        q_lora_rank=_require_q_lora_rank(hf),
         kv_lora_rank=int(hf["kv_lora_rank"]),
         qk_nope_head_dim=int(hf["qk_nope_head_dim"]),
         qk_rope_head_dim=int(hf["qk_rope_head_dim"]),
@@ -234,7 +255,11 @@ def build_dsv3_config(
                 "renormalises the top-k probabilities unconditionally"
             )
         if n_shared > 0:
-            moe["moe_shared_expert_intermediate_size"] = moe_ffn * n_shared
+            # item 3: the generic path honours this override; computing it from
+            # the HF config alone would silently drop it.
+            moe["moe_shared_expert_intermediate_size"] = int(
+                ec.get("moe_shared_expert_intermediate_size") or moe_ffn * n_shared
+            )
 
     return MLATransformerConfig(
         num_layers=int(hf["num_hidden_layers"]),
@@ -264,14 +289,15 @@ def build_dsv3_config(
         variable_seq_lengths=(pp > 1),
         # --- MLA ---
         multi_latent_attention=True,
-        q_lora_rank=int(hf.get("q_lora_rank") or 0),
+        q_lora_rank=_require_q_lora_rank(hf),
         kv_lora_rank=int(hf["kv_lora_rank"]),
         qk_head_dim=int(hf["qk_nope_head_dim"]),
         qk_pos_emb_head_dim=int(hf["qk_rope_head_dim"]),
         v_head_dim=int(hf["v_head_dim"]),
         **rope,
-        # Matches the generic path: alltoall is also the only dispatcher that
-        # passes config validation under variable_seq_lengths.
+        # Matches the generic path. Upstream rejects only ``allgather`` under
+        # variable_seq_lengths, so this is a choice rather than the only option;
+        # wiring it to moe_dispatcher_kwargs is tracked separately.
         moe_token_dispatcher_type="alltoall",
         **moe,
         **recompute,

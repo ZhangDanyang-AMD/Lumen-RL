@@ -36,17 +36,22 @@ def _export_dsv4(engine):
     the rollout feeds straight to vLLM's ``load_weights``."""
     named = itertools.chain(
         engine._full_megatron_named_params_moe(),
-        engine._dsv4_router_bias_buffers(),
+        engine._router_bias_buffers(),
     )
     return dsv4.megatron_to_dsv4_native(named)
 
 
 def _export_dsv3(engine):
     """MLA export. The router bias is a buffer, so it is chained in explicitly:
-    noaux_tc top-k reads it, and a rollout without it picks other experts."""
+    noaux_tc top-k reads it, and a rollout without it picks other experts.
+
+    Via the engine, not the bridge's raw walker: the engine helper renumbers
+    stage-local layers to global ones and broadcasts across PP. At PP=1 the two
+    agree; above it the raw walker yields colliding local names and omits every
+    layer outside the publishing rank's stage."""
     named = itertools.chain(
         engine._full_megatron_named_params_moe(),
-        dsv3.dsv3_router_bias_buffers(engine.module),
+        engine._router_bias_buffers(),
     )
     return dsv3.megatron_to_hf_dsv3(named)
 

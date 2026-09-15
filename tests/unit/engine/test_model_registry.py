@@ -35,12 +35,14 @@ QWEN3_MOE_CFG = {
 
 
 def _all_specs():
-    """The registered specs, by identity rather than by name lookup."""
-    return [MODEL_REGISTRY.resolve(cfg, ec) for cfg, ec in (
-        ({"architectures": ["DeepseekV4ForCausalLM"], "model_type": "deepseek_v4"}, {}),
-        (QWEN3_MOE_CFG, {}),
-        (QWEN3_DENSE_CFG, {}),
-    )]
+    """Every registered spec.
+
+    From the registry rather than a hand-written list of configs: the previous
+    list omitted deepseek_v3, so the "every family" tests silently skipped the
+    family this branch adds -- which is how the DSv3 exporter reached the raw
+    bias walker instead of the engine's PP-aware one.
+    """
+    return MODEL_REGISTRY.specs
 
 
 # --- helpers -----------------------------------------------------------------
@@ -215,10 +217,25 @@ def test_every_family_supplies_a_weight_exporter():
         assert callable(spec.export_weights)
 
 
+def test_every_registered_family_is_covered_by_these_tests():
+    """The per-family tests must not silently skip a newly registered family.
+
+    A hand-written list of configs did skip deepseek_v3, so the "every family"
+    assertions never saw it -- which is how its exporter reached the bridge's
+    raw bias walker instead of the engine's PP-aware one. Naming the family
+    here is the part that fails if the list stops being registry-derived.
+    """
+    covered = {s.name for s in _all_specs()}
+    assert covered == set(MODEL_REGISTRY.names)
+    for family in ("deepseek_v4", "deepseek_v3", "qwen3_moe", "qwen3_dense"):
+        assert family in covered, f"{family} is not covered by the per-family tests"
+
+
 def test_exporters_are_distinct_per_family():
     """DSv4 renames to checkpoint names, MoE and dense use different gathers."""
-    exporters = {s.name: s.export_weights for s in _all_specs()}
-    assert len({id(f) for f in exporters.values()}) == 3
+    specs = _all_specs()
+    exporters = {s.name: s.export_weights for s in specs}
+    assert len({id(f) for f in exporters.values()}) == len(specs)
 
 
 def test_dense_exporter_uses_the_plain_gather_and_te_naming(monkeypatch):

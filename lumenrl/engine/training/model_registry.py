@@ -147,6 +147,11 @@ class ModelRegistry:
         )
 
     @property
+    def specs(self) -> list[ModelSpec]:
+        """Every registered spec, so "for each family" tests cover new ones."""
+        return list(self._specs)
+
+    @property
     def names(self) -> list[str]:
         return [s.name for s in self._specs]
 
