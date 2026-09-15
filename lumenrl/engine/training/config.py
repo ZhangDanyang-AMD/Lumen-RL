@@ -173,6 +173,11 @@ class MegatronConfig:
     moe_aux_loss_coeff: float = 0.0                       # 0 keeps RL loss unchanged
     moe_router_bias_update_rate: Optional[float] = None
     moe_token_dispatcher_type: str = "alltoall"
+    # Flex dispatcher backend when ``moe_token_dispatcher_type`` is ``flex``.
+    # ``mori`` matches Megatron-LM ``ENABLE_MORI=true``.
+    moe_flex_dispatcher_backend: Optional[str] = None  # "deepep" | "hybridep" | "mori"
+    moe_mori_max_tokens_per_rank: Optional[int] = None
+    moe_mori_kernel_type: Optional[str] = None
     moe_permute_fusion: bool = False
     # Distributed optimizer: shard FP32 master + Adam state across DP ranks.
     use_distributed_optimizer: bool = True
