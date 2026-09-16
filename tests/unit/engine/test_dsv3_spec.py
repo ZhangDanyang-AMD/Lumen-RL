@@ -317,7 +317,7 @@ def test_dsv3_uses_the_stock_te_layer_spec():
     assert MODEL_REGISTRY.resolve(K2, {}).build_layer_spec is None
 
 
-# --- review items 2 and 3 --------------------------------------------------
+# --- unsupported variants and dropped engine_config knobs -------------------
 
 def test_a_missing_q_lora_rank_is_refused_not_coerced_to_zero():
     """Megatron branches on ``q_lora_rank is None``, so ``or 0`` is not a no-op.
@@ -365,7 +365,7 @@ def test_shared_expert_size_falls_back_to_the_hf_derived_value():
     assert cfg.moe_shared_expert_intermediate_size == 2048 * 1  # moe_ffn * n_shared
 
 
-# --- review item 5: one dispatcher decision, shared with the generic path ---
+# --- one dispatcher decision, shared with the generic path ------------------
 
 def _megatron_has_mori() -> bool:
     """This image's Megatron 0.18.2 has moe_flex_dispatcher_backend but not the

@@ -256,8 +256,8 @@ def build_dsv3_config(
                 "renormalises the top-k probabilities unconditionally"
             )
         if n_shared > 0:
-            # item 3: the generic path honours this override; computing it from
-            # the HF config alone would silently drop it.
+            # The generic path honours this override; computing it from the HF
+            # config alone would silently drop it.
             moe["moe_shared_expert_intermediate_size"] = int(
                 ec.get("moe_shared_expert_intermediate_size") or moe_ffn * n_shared
             )
