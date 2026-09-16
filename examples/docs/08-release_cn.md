@@ -89,46 +89,20 @@ print(aiter.__file__)"'
 
 期望 `0.23.0 0.3.2 5.12.0`，且 `aiter` 解析到 `/opt/lumenrl/aiter/` 下。
 
-### 8.1.2 Megatron：镜像自带的版本跑不了 MORI dispatcher
+### 8.1.2 MORI-EP 需要 Megatron ROCm fork
 
-`release/Dockerfile` 从 PyPI 安装 `megatron-core`，也就是 **NVIDIA 上游版本**。
-§8.5.1 的全部参考值都是在它上面测的；八个示例也都只用默认的 `alltoall`
-MoE token dispatcher，因此对示例而言它是正确的。
-
-但它跑不了 MORI flex dispatcher。上游声明为
-
-```python
-moe_flex_dispatcher_backend: Literal['deepep', 'hybridep'] = "deepep"
-```
-
-既没有 `mori` 这一取值，也没有 `moe_mori_max_tokens_per_rank` 字段，所以一旦选了
-`moe_token_dispatcher_type=flex`，会在构造 config 时就报
-`TypeError: got an unexpected keyword argument 'moe_mori_max_tokens_per_rank'`，
-根本走不到 dispatcher 自己的 `ValueError: Invalid backend: mori`。
-
-MORI 需要 **ROCm fork** 的 `core_r0.18.0_rocm` 分支：它在上面那个 `Literal` 里加了
-`'mori'`，并补上了 heap 字段。用源码树的方式固定，不要覆盖镜像里的包：
+镜像里的 `megatron-core` 是 NVIDIA 上游版本，不带 MORI 后端。八个示例用不到它——
+它们都走默认的 `alltoall` dispatcher。要用 `moe_token_dispatcher_type=flex` + `mori`，
+改为固定 fork：
 
 ```bash
-git clone --depth 1 --single-branch --branch core_r0.18.0_rocm \
+git clone --depth 1 -b core_r0.18.0_rocm \
   https://github.com/ROCm/Megatron-LM.git "$DATA_ROOT/megatron-rocm"
 
 MEGATRON_PATH=$DATA_ROOT/megatron-rocm bash release/run_example.sh 7 --check
 ```
 
-该路径必须在**容器内**可见，所以上面放在 `$DATA_ROOT` 下；`run_dapo.sh` 会把它前置到
-`PYTHONPATH`，Ray actor 才会一起导入。确认实际加载的是哪一棵树——fork 的版本号带
-commit 后缀，PyPI 的不带：
-
-```bash
-docker exec lumenrl-release bash -lc 'python3 -c "
-import megatron.core as m, inspect
-print(m.__version__, inspect.getsourcefile(m).split(\"/megatron/core\")[0])"'
-```
-
-输出 `0.18.0+9784f40 /data/rl_data/megatron-rocm` 就是 fork；若是 `dist-packages`
-下的 `0.18.2`，那仍是镜像自带的上游版本。镜像里 `import mori` 本身已经可用，无需
-另行安装 MORI。
+`MEGATRON_PATH` 会被前置到 `PYTHONPATH`，因此该路径必须在容器内可见。
 
 ---
 
@@ -385,7 +359,7 @@ $DATA_ROOT/logs/example-<N>-<时间戳>.launcher.log  # 包装层输出与退出
 | `EXTRA_OVERRIDE` | 追加任意 Hydra override，空格分隔 |
 | `WANDB_API_KEY` | 仅 `--longrun` 需要 |
 | `STALL_LIMIT` | 日志静默多少秒判定卡死，默认 2400 |
-| `MEGATRON_PATH` | 优先于镜像内 `megatron-core` 导入的 Megatron 源码树；MORI flex dispatcher 必需，见 §8.1.2 |
+| `MEGATRON_PATH` | 优先于镜像内 `megatron-core` 导入的 Megatron 源码树；MORI-EP 需要，见 §8.1.2 |
 
 跑自己的 Lumen-RL 不需要任何额外操作——那本来就是默认行为。要跑**另一份**
 checkout（不是启动器所在的那份）：

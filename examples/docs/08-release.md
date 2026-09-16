@@ -97,47 +97,21 @@ print(aiter.__file__)"'
 
 Expect `0.23.0 0.3.2 5.12.0`, with `aiter` resolving under `/opt/lumenrl/aiter/`.
 
-### 8.1.2 Megatron: the image's copy cannot run the MORI dispatcher
+### 8.1.2 MORI-EP requires the Megatron ROCm fork
 
-`release/Dockerfile` installs `megatron-core` from PyPI, which is **NVIDIA upstream**.
-That is what every reference value in §8.5.1 was measured on, and it is correct for
-all eight examples, since they all run the default `alltoall` MoE token dispatcher.
-
-It cannot run the MORI flex dispatcher. Upstream declares
-
-```python
-moe_flex_dispatcher_backend: Literal['deepep', 'hybridep'] = "deepep"
-```
-
-with no `mori` member and no `moe_mori_max_tokens_per_rank` field, so selecting
-`moe_token_dispatcher_type=flex` fails at config construction with
-`TypeError: got an unexpected keyword argument 'moe_mori_max_tokens_per_rank'` —
-before the dispatcher's own `ValueError: Invalid backend: mori` is ever reached.
-
-MORI needs the **ROCm fork**, branch `core_r0.18.0_rocm`, which adds `'mori'` to that
-`Literal` and supplies the heap field. Pin it as a source tree rather than replacing the
-image's package:
+The image's `megatron-core` is NVIDIA upstream and has no MORI backend. The eight
+examples do not need it — they all use the default `alltoall` dispatcher. For
+`moe_token_dispatcher_type=flex` with `mori`, pin the fork instead:
 
 ```bash
-git clone --depth 1 --single-branch --branch core_r0.18.0_rocm \
+git clone --depth 1 -b core_r0.18.0_rocm \
   https://github.com/ROCm/Megatron-LM.git "$DATA_ROOT/megatron-rocm"
 
 MEGATRON_PATH=$DATA_ROOT/megatron-rocm bash release/run_example.sh 7 --check
 ```
 
-The path must be visible **inside** the container, which is why `$DATA_ROOT` is used
-above; `run_dapo.sh` prepends it to `PYTHONPATH` so Ray actors import it too. Verify
-which tree was picked up — the fork reports a commit suffix, PyPI does not:
-
-```bash
-docker exec lumenrl-release bash -lc 'python3 -c "
-import megatron.core as m, inspect
-print(m.__version__, inspect.getsourcefile(m).split(\"/megatron/core\")[0])"'
-```
-
-`0.18.0+9784f40 /data/rl_data/megatron-rocm` is the fork; a bare `0.18.2` under
-`dist-packages` is the image's upstream copy. `import mori` already succeeds in the
-image, so no separate MORI install is needed.
+`MEGATRON_PATH` is prepended to `PYTHONPATH`, so it must be visible inside the
+container.
 
 ---
 
@@ -412,7 +386,7 @@ $DATA_ROOT/logs/example-<N>-<timestamp>.launcher.log  # wrapper output and exit 
 | `EXTRA_OVERRIDE` | extra Hydra overrides, space separated |
 | `WANDB_API_KEY` | only needed with `--longrun` |
 | `STALL_LIMIT` | seconds of log silence before declaring a hang, default 2400 |
-| `MEGATRON_PATH` | Megatron source tree to import ahead of the image's `megatron-core`; required for the MORI flex dispatcher (see §8.1.2) |
+| `MEGATRON_PATH` | Megatron source tree to import ahead of the image's `megatron-core`; needed for MORI-EP (§8.1.2) |
 
 Running your own Lumen-RL needs nothing extra — that is the default. To run it from a
 *different* checkout than the one holding the launcher:
