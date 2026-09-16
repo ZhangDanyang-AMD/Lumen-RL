@@ -10,7 +10,7 @@ first.
 
 | | |
 |---|---|
-| Image | `zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260917`, digest `sha256:d09d40d203a8…` |
+| Image | `zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260917`, digest `sha256:51ecafa95d1a…` |
 | Lumen-RL | `e514596`, **from the image** — only `$DATA_ROOT` was mounted, so this is what a `docker pull` gets |
 | ATOM | `8b6d61392b06` on `main`, baked |
 | Hardware | one node, 8x MI355X (gfx950), whole-node allocation |

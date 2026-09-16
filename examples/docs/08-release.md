@@ -492,7 +492,7 @@ bash release/run_example.sh 1 --check-only --log $DATA_ROOT/logs/example-1-xxx.l
 ### 8.5.1 Reference values
 
 **Measurement conditions**: 8x MI355X (gfx950), image
-`dapo-gfx950-rocm7.2.3-260917` (digest `sha256:d09d40d203a8…`) with Lumen-RL at
+`dapo-gfx950-rocm7.2.3-260917` (digest `sha256:51ecafa95d1a…`) with Lumen-RL at
 `e514596` — both matter, see §8.1.1 — the command being
 `bash release/run_example.sh <N>` (equivalent to a full row of §8.2.2),
 **`seed=10086`** (fixed inside `run_dapo.sh`), and metrics read at **step 1**
