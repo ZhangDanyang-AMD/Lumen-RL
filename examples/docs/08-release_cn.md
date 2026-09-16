@@ -61,18 +61,23 @@ Lumen-RL **不由镜像固定**——跑的是你 checkout 里的版本，因此
 | Lumen-RL | `ZhangDanyang-AMD/Lumen-RL` | `dev/dapo_release` | 你的 checkout（挂载，不固定） |
 | Lumen | `ZhangDanyang-AMD/Lumen` | `amd-atom-rollout` | `e6379cbd9057` |
 | aiter | `ZhangDanyang-AMD/aiter` | `lumen/moe` | `4ebe6d69c7f4` |
-| ATOM | `ROCm/ATOM` | `refs/pull/2028/head` | `d6b9e147cbf6` |
+| ATOM | `ROCm/ATOM` | `main` | `8b6d61392b06` |
 | composable_kernel | aiter submodule | — | `af9e1d1f1ae3` |
 
-ATOM 钉的是上游 [ROCm/ATOM PR #2028](https://github.com/ROCm/ATOM/pull/2028)
-的 head。该 PR **截至 2026-09-10 尚未合并**，所以这里钉的是 PR head 而非 main 上的提交；
-它可按 SHA 取到，`release/Dockerfile` 就是这么做的。
+ATOM 钉在上游 `main` 上。[ROCm/ATOM PR #2028](https://github.com/ROCm/ATOM/pull/2028)
+已于 2026-09-16 squash 合入，`8b6d61392b06` 就是那个合入提交，所以这里钉的不再是
+PR head，而是 main 上的普通提交。
 
-⚠️ **自行替换 ATOM 需要两项由 Lumen-RL 主动给出、而非从 ATOM 继承的引擎设置**：
-`compilation_config.cudagraph_mode=FULL` 与 `sleep_keeps_memory_resident=true`。
-缺了它们，no-eager 的 ATOM rollout 会崩——分别崩在第一次 CUDA graph replay
-和权重同步后的第一次 wake。两项对早于这些字段的 ATOM 构建都是空操作。
+⚠️ **自行替换 ATOM 需要一项由 Lumen-RL 主动给出、而非从 ATOM 继承的引擎设置**：
+`compilation_config.cudagraph_mode=FULL`。缺了它，no-eager 的 ATOM rollout 会崩在
+第一次 CUDA graph replay。该项对早于这个字段的 ATOM 构建是空操作。
 具体的报错形态与原因见 [`release/versions.env`](../../release/versions.env) 的注释。
+
+sleep **不再钉**，跟随 ATOM 自己的默认，即释放 rollout 的权重、图和 KV 池。
+Lumen-RL 原先在这里强制 `sleep_keeps_memory_resident=true`，该 pin 已于 2026-09-16
+移除——它所防的那个故障在新旧两个 ATOM 版本上都没能复现。释放的代价是每步多一次图
+重捕获（实测约 1 秒/步，2–3%），并会把 `k3_kl` 抬高，例 5 的参考值正是因此重测的。
+见 [`release/VALIDATION.md`](../../release/VALIDATION.md)。
 
 底座镜像 `vllm/vllm-openai-rocm:v0.23.0`，另加 `flydsl 0.3.2`、`megatron-core 0.18.2`、
 ROCm Apex `daed8525`、ROCm TransformerEngine `6e541a10`。
@@ -446,12 +451,19 @@ bash release/run_example.sh 1 --check-only --log $DATA_ROOT/logs/example-1-xxx.l
 | 2 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` | 3 | 512 | 129 s | **0.00498** ±30% | **0.784** ±25% | 0.00538 | 1 |
 | 3 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml`（`TRAIN_FP8=1`） | 3 | 512 | 142 s | **0.00404** ±30% | **0.832** ±25% | 0.00419 | 1 |
 | 4 | `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` | 3 | 4096 | 508 s | **0.00287** ±50% | **0.540** ±50% | 0.00288 | 3 |
-| 5 | `dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml` | 1 | 4096 | 402 s | **0.000930** ±50% | **0.568** ±50% | 0.000880 | 1 |
+| 5 | `dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml` | 1 | 4096 | 395 s | **0.00143** ±50% | **0.677** ±50% | 0.00157 | 3 |
 | 6 | `dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml` | 3 | 4096 | 523 s | **0.00158** ±50% | **0.679** ±60% | 0.00154 | 1 |
 | 7 | `dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml` | 3 | 4096 | 499 s | **0.00158** ±50% | **0.660** ±60% | 0.00188 | 1 |
 | 9 | `dapo_qwen3moe_a3b_ray_atom_bf16_4k_smoke.yaml` | 3 | 4096 | 579 s | **0.00138** ±50% | **0.692** ±60% | 0.00138 | 3 |
 
 粗体两列带容差的即 `--check` 判定 PASS / FAIL 的两项，参考值是「实测次数」列那么多遍的均值。
+
+⚠️ **例 5 这一行于 2026-09-16 重测**，用的是 ATOM `8b6d61392b06` + 释放型 sleep（现在的默认）；
+其余各行仍是发布镜像上的实测值。释放每步多付一次图重捕获，会把三个 ATOM 例子的 `k3_kl`
+抬高约 11–43%。只有例 5 因此被顶出容差——它原来的参考值 `0.000930` 由单次运行定出，
+是全表基数最小的一个——所以只换了它。例 4 和例 9 同样上移，但离容差边界还有余量。
+实测记录见 [`VALIDATION.md`](../../release/VALIDATION.md)。
+
 **时间跨度那一列不设容差、不参与判定**——它是本镜像每个例子各跑一遍的实测值，
 受缓存冷热影响，同一机器上偏差可达 ±15%。启动器报的端到端墙钟比它多约 20–35 s。
 
@@ -506,7 +518,7 @@ Ray worker 已退出，但显存没有归还给驱动。
 docker restart lumenrl-release
 ```
 
-**2. 切换 ATOM 精度需清编译缓存。** torch inductor 缓存不按运行隔离，
+**2. 切换 ATOM 精度或模型都需清编译缓存。** torch inductor 缓存不按运行隔离，
 例子 4 之后直接跑例子 5（或反之）会在 AOTAutograd 处失败。
 启动器会记录上一次的 ATOM 精度，仅在精度改变时清理（`--keep-cache` 可关闭）。
 
@@ -514,6 +526,19 @@ docker restart lumenrl-release
 docker exec lumenrl-release bash -lc \
   'rm -rf /tmp/aiter_configs /tmp/atom_torch_compile_cache /tmp/torchinductor_root'
 ```
+
+⚠️ **会撞车的不只是精度。** ATOM 的缓存键只有 `mode/actor_id/replica/rank`，
+所以例 5 和例 9——同为 `atombf16`、模型不同——共用
+`/tmp/atom_torch_compile_cache/atombf16/…/backbone`。
+在例 5 之后跑例 9，会把 8B 的图拿去套 30B MoE，在引擎初始化阶段就挂：
+
+```
+assert_size_stride(arg2_1, (151936, 4096), (4096, 1))
+AssertionError: expected size 151936==151936, stride 2048==4096 at dim=0
+```
+
+4096 与 2048 正是两个模型的 hidden size。这个报错看着像引擎坏了而不像缓存过期，
+所以值得认一下。**自己手动驱动例子时，精度或模型只要有一项不同，中间就要清缓存。**
 
 **3. 判断长任务是否存活要看日志，不要用 `pgrep`。** `docker exec` 启动的进程与你的 shell
 不共享进程树，`pgrep` 跨会话恒返回 0。**看日志文件是否仍在增长**：
@@ -565,8 +590,13 @@ AssertionError: Not enough memory for KV cache with block size(16). At least 1 b
 `non_torch` 是节点上的其余部分，主要是同卡上的训练侧；`free=177.39GB` 是关键线索：
 显存是有的，只是没算在 rollout 引擎账上。调大 `gpu_memory_utilization` 不是解法，
 释放 actor 的分配器缓存也不是——原因见上面第 1 条。
-**正解是让池子常驻，也就是 §8.1.1 里第二项设置做的事**；
-如果你用的是自己的 ATOM 分支，请确认 `sleep_keeps_memory_resident` 能传到它。
+
+⚠️ **这个现象自 2026-09-16 起已无法复现**，为它而设的 `sleep_keeps_memory_resident=true`
+也已移除，sleep 现在默认释放。例 9 在 ATOM `8b6d61392b06` 上跑了两遍、在镜像里的旧 ATOM
+上跑了一遍，三次都是释放型 sleep，每次推导出的 KV 池都非负。这里仍然记着它，是因为那个
+余量一直很薄——池子当时是 −1435 MB 对 86 GB 预算，只差 1.7%——换个更大的模型或更胖的训练侧
+就可能把它带回来。真遇上了，`atom_cfg.engine_kwargs.sleep_keeps_memory_resident=true`
+依然可用、依然能让池子常驻，代价是 rollout 的显存在步与步之间不再归还。
 
 ---
 

@@ -6,6 +6,7 @@ An AMD native **Post-Training Framework for LLMs**, powered by [Lumen](https://g
 
 ## 📢 News
 
+- **[2026/09]** The ATOM-side fixes LumenRL's rollout depends on — FP8 expert weight synchronization and CUDA graph release across sleep/wake — are **merged into upstream [ROCm/ATOM](https://github.com/ROCm/ATOM) `main`** ([#2028](https://github.com/ROCm/ATOM/pull/2028)), so ATOM is now pinned to a main commit instead of a PR head
 - **[2026/07]** LumenRL now supports **MoE RL training (Qwen3-30B-A3B)** — fused routing + aux loss, R3 router alignment for stable MoE RL training
 - **[2026/07]** LumenRL now supports **Megatron-Core training backend** — TP/EP/DP parallelism with distributed optimizer and sequence parallelism
 - **[2026/07]** LumenRL now supports **training-inference separation** — decoupled training and inference onto independent GPU groups for improved resource utilization
