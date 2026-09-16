@@ -97,6 +97,22 @@ print(aiter.__file__)"'
 
 Expect `0.23.0 0.3.2 5.12.0`, with `aiter` resolving under `/opt/lumenrl/aiter/`.
 
+### 8.1.2 MORI-EP requires the Megatron ROCm fork
+
+The image's `megatron-core` is NVIDIA upstream and has no MORI backend. The eight
+examples do not need it — they all use the default `alltoall` dispatcher. For
+`moe_token_dispatcher_type=flex` with `mori`, pin the fork instead:
+
+```bash
+git clone --depth 1 -b core_r0.18.0_rocm \
+  https://github.com/ROCm/Megatron-LM.git "$DATA_ROOT/megatron-rocm"
+
+MEGATRON_PATH=$DATA_ROOT/megatron-rocm bash release/run_example.sh 7 --check
+```
+
+`MEGATRON_PATH` is prepended to `PYTHONPATH`, so it must be visible inside the
+container.
+
 ---
 
 ## 8.2 The eight examples
@@ -370,6 +386,7 @@ $DATA_ROOT/logs/example-<N>-<timestamp>.launcher.log  # wrapper output and exit 
 | `EXTRA_OVERRIDE` | extra Hydra overrides, space separated |
 | `WANDB_API_KEY` | only needed with `--longrun` |
 | `STALL_LIMIT` | seconds of log silence before declaring a hang, default 2400 |
+| `MEGATRON_PATH` | Megatron source tree to import ahead of the image's `megatron-core`; needed for MORI-EP (§8.1.2) |
 
 Running your own Lumen-RL needs nothing extra — that is the default. To run it from a
 *different* checkout than the one holding the launcher:
