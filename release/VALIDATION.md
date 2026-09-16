@@ -6,7 +6,105 @@ first.
 
 ---
 
+# 2026-09-17 — image `260917`: ATOM main baked in, measured with nothing mounted
+
+| | |
+|---|---|
+| Image | `zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260917`, digest `sha256:d09d40d203a8…` |
+| Lumen-RL | `e514596`, **from the image** — only `$DATA_ROOT` was mounted, so this is what a `docker pull` gets |
+| ATOM | `8b6d61392b06` on `main`, baked |
+| Hardware | one node, 8x MI355X (gfx950), whole-node allocation |
+| Command | `run_dapo.sh` from the image, judged with `run_example.sh <N> --check-only` |
+| Seed | `10086` | 
+| Metrics read at | step 1 (`step=1`) |
+
+## How the image was made, and why not with `build_image.sh`
+
+ATOM is a source tree on `PYTHONPATH` — no `pip install`, nothing compiled, not even in
+the image's `ENV PYTHONPATH` (`run_dapo.sh` adds it at runtime). So re-pinning it is a
+file replacement: a container off `260910`, ATOM re-created the way `release/Dockerfile`
+does it (`git init`, fetch the SHA, `checkout FETCH_HEAD`), then `docker commit`. **28 s
+to build, 20 s to push** — one new layer — against ~60 min for a full rebuild. Entrypoint,
+cmd and workdir are restored explicitly on the commit.
+
+Two things came along with it:
+
+- **The baked Lumen-RL is `e514596`**, the rebased checkout, rather than the branch tip
+  `build_image.sh` would have resolved. That is what made a no-mounts run meaningful.
+- **24 aiter kernels instead of 16.** The published image bakes 16; running the examples
+  needs 24, and the other 8 JIT-compile on first use. That is not new and not
+  ATOM-specific — a container on the *old* image with the *old* ATOM also ends at 22 —
+  but it undercuts the image's "no first-run compilation" claim, so the 8 were taken
+  from a container that had built them in real runs and committed too. Verified: a run
+  on `260917` compiles **zero** kernels and the count stays at 24.
+
+## Runs
+
+`skipped` is weight-sync buckets that did not account for every tensor, out of `buckets`.
+
+| ex | span | exit | errors | skipped / buckets | `rollout_corr/k3_kl` | `entropy` | `rollout_corr/kl` | `ppl_ratio` |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 163 s | 0 | 0 | 0 / 0 | 0.0010942 | 0.624976 | 0.0010722 | 1.00085 |
+| 2 | 127 s | 0 | 0 | 0 / 0 | 0.0048248 | 0.770634 | 0.00473415 | 1.00397 |
+| 3 | 137 s | 0 | 0 | 0 / 0 | 0.00355718 | 0.799204 | 0.00317713 | 1.00518 |
+| 4 | 472 s | 0 | 0 | 0 / 336 | 0.00287993 | 0.477497 | 0.00268712 | 1.00198 |
+| 5 | 412 s | 0 | 0 | 0 / 112 | 0.000739239 | 0.360857 | 0.000607351 | 1.00126 |
+| 5 | 375 s | 0 | 0 | 0 / 112 | 0.00102973 | 0.660954 | 0.00124422 | 0.997257 |
+| 5 | 377 s | 0 | 0 | 0 / 112 | 0.00090947 | 0.566824 | 0.000815409 | 1.00206 |
+| 5 | 375 s | 0 | 0 | 0 / 112 | 0.00106485 | 0.870339 | 0.00104208 | 1.0003 |
+| 6 | 527 s | 0 | 0 | 0 / 0 | 0.00147054 | 0.679457 | 0.00168567 | 1.00143 |
+| 7 | 496 s | 0 | 0 | 0 / 0 | 0.00154856 | 0.57809 | 0.0012452 | 1.00072 |
+| 9 | 575 s | 0 | 0 | 0 / 2352 | 0.00151614 | 0.605641 | 0.00125785 | 1.00158 |
+
+**11/11 exit 0, zero error lines, zero skipped buckets, `--check` 11/11 PASS.**
+
+## Example 5's reference, and a conclusion the round before got wrong
+
+The previous round replaced example 5's `k3_kl` reference with `0.00143`, from three runs
+that came in at 0.00133–0.00151, and read the gap from the old single-run `0.000930` as a
+systematic shift caused by releasing sleep. **Four runs on this image average 0.000936**
+— within 1% of the value that was replaced — and include a 0.000739. The three-run
+cluster was luck, and "the spread within a mode is ±6%" was an artifact of it.
+
+So `k3_kl` goes back to essentially where it was, now with four samples behind it. What
+genuinely needed changing is `entropy`: the four runs span 0.361 to 0.870, and the old
+`0.568` fails the high end at +53%. It becomes the 4-run mean `0.615` at the ±60% floor
+the MoE examples already use, which the observed −41% / +42% fits with margin.
+
+The same correction applies to examples 4 and 9: the previous round measured them 11%
+above their references under releasing sleep and called it a shift. On this image example
+4 lands at **+0.3%** and example 9 at **+9.9%**. Releasing sleep does not move these
+metrics; three samples of a 4096-token example do not describe it.
+
+| ex | reference (runs) | this round | delta | tolerance |
+|---|---|---|---|---|
+| 1 | 0.00106 (1) | 0.0010942 | +3.2% | ±30% |
+| 2 | 0.00498 (1) | 0.0048248 | −3.1% | ±30% |
+| 3 | 0.00404 (1) | 0.00355718 | −12.0% | ±30% |
+| 4 | 0.00287 (3) | 0.00287993 | +0.3% | ±50% |
+| 5 | **0.000936 (4, new)** | 0.000739–0.00106 | −21% / +14% | ±50% |
+| 6 | 0.00158 (1) | 0.00147054 | −6.9% | ±50% |
+| 7 | 0.00158 (1) | 0.00154856 | −2.0% | ±50% |
+| 9 | 0.00138 (3) | 0.00151614 | +9.9% | ±50% |
+
+## Limits of this record
+
+- **The image was committed, not built.** Faithful for ATOM, which is not compiled, but
+  it is not reproducible from `Dockerfile` + `versions.env` alone. A full
+  `build_image.sh` against this pin has not been done.
+- **The baked Lumen-RL `e514596` is not pushed**, so the image carries a SHA that does
+  not exist on the remote. `run_example.sh` mounts over it anyway.
+- **One sample each for examples 1, 2, 3, 4, 6, 7 and 9**, four for example 5. Example
+  5's history is the argument for treating any single-run reference as provisional.
+- **Long runs, wandb, gfx942 and a cold `docker pull` were not exercised.**
+
+---
+
 # 2026-09-16 — ATOM re-pinned to `main`, and sleep no longer pinned resident
+
+> ⚠️ Two conclusions below were corrected by the 2026-09-17 round: that releasing sleep
+> shifts `k3_kl` upward, and the example 5 reference of `0.00143` it led to. Both came
+> from three runs that happened to cluster. The rest of the round stands.
 
 | | |
 |---|---|

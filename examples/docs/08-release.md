@@ -17,7 +17,7 @@ nodes (example 8, see [chapter 7](07-disaggregated-rdma.md)).
 ```bash
 git clone https://github.com/ZhangDanyang-AMD/Lumen-RL.git && cd Lumen-RL
 export DATA_ROOT=/path/to/data
-docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260910
+docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260917
 bash release/run_example.sh 1 --check
 ```
 
@@ -50,7 +50,7 @@ spends no time compiling them:
 
 ```bash
 docker run --rm --entrypoint /bin/bash \
-  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260910 \
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260917 \
   -lc 'ls /opt/lumenrl/aiter-jit/*.so | wc -l'     # 16
 ```
 
@@ -82,10 +82,9 @@ the field. What the failure looks like and why is in the comments of
 
 Sleep is **not** pinned: it follows ATOM's own default, which releases the rollout's
 weights, graphs and KV pool. Lumen-RL used to force `sleep_keeps_memory_resident=true`
-here; that pin was removed on 2026-09-16 after the failure it guarded against turned out
-not to reproduce on either ATOM version. Releasing costs one graph recapture per step
-(measured at ~1 s/step, 2–3%) and shifts `k3_kl` upward — example 5's reference value was
-re-measured because of it. See [`release/VALIDATION.md`](../../release/VALIDATION.md).
+here; that pin was removed on 2026-09-16 after the failure it guarded against stopped
+reproducing. Releasing costs one graph recapture per step, about 1 s (2–3%), and does
+not move the published metrics.
 
 Base image `vllm/vllm-openai-rocm:v0.23.0`, plus `flydsl 0.3.2`,
 `megatron-core 0.18.2`, ROCm Apex `daed8525`, ROCm TransformerEngine `6e541a10`.
@@ -255,7 +254,7 @@ start if any card is above 2 GB and prints what to do about it; `--force` skips 
 ### 8.4.2 Get the image
 
 ```bash
-docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260910
+docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260917
 ```
 
 You can also build it yourself; these are all the steps:
@@ -360,7 +359,7 @@ docker run -d --name lumenrl-release \
   --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --shm-size 64G \
   -v "$DATA_ROOT":"$DATA_ROOT" -e DATA_ROOT="$DATA_ROOT" \
   -v "$PWD":/opt/lumenrl/Lumen-RL \
-  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260910 sleep infinity
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260917 sleep infinity
 ```
 
 The second mount is the code, with `$PWD` being the root of this checkout. Leave it out
@@ -406,7 +405,7 @@ The other three trees are editable installs too, so the same mount works for the
 ```bash
 docker run -d --name lumenrl-dev ... \
   -v "$PWD/ATOM":/opt/lumenrl/ATOM \
-  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260910 sleep infinity
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260917 sleep infinity
 ```
 
 then `CONTAINER=lumenrl-dev bash release/run_example.sh <N>`. Unlike Lumen-RL, those
@@ -493,8 +492,8 @@ bash release/run_example.sh 1 --check-only --log $DATA_ROOT/logs/example-1-xxx.l
 ### 8.5.1 Reference values
 
 **Measurement conditions**: 8x MI355X (gfx950), image
-`dapo-gfx950-rocm7.2.3-260910` (digest `sha256:cc18a3f5ce16…`) with Lumen-RL at
-`8ca6bdd` — both matter, see §8.1.1 — the command being
+`dapo-gfx950-rocm7.2.3-260917` (digest `sha256:d09d40d203a8…`) with Lumen-RL at
+`e514596` — both matter, see §8.1.1 — the command being
 `bash release/run_example.sh <N>` (equivalent to a full row of §8.2.2),
 **`seed=10086`** (fixed inside `run_dapo.sh`), and metrics read at **step 1**
 (`step=1`).
@@ -505,7 +504,7 @@ bash release/run_example.sh 1 --check-only --log $DATA_ROOT/logs/example-1-xxx.l
 | 2 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` | 3 | 512 | 129 s | **0.00498** ±30% | **0.784** ±25% | 0.00538 | 1 |
 | 3 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` (`TRAIN_FP8=1`) | 3 | 512 | 142 s | **0.00404** ±30% | **0.832** ±25% | 0.00419 | 1 |
 | 4 | `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` | 3 | 4096 | 508 s | **0.00287** ±50% | **0.540** ±50% | 0.00288 | 3 |
-| 5 | `dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml` | 1 | 4096 | 395 s | **0.00143** ±50% | **0.677** ±50% | 0.00157 | 3 |
+| 5 | `dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml` | 1 | 4096 | 385 s | **0.000936** ±50% | **0.615** ±60% | 0.000927 | 4 |
 | 6 | `dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml` | 3 | 4096 | 523 s | **0.00158** ±50% | **0.679** ±60% | 0.00154 | 1 |
 | 7 | `dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml` | 3 | 4096 | 499 s | **0.00158** ±50% | **0.660** ±60% | 0.00188 | 1 |
 | 9 | `dapo_qwen3moe_a3b_ray_atom_bf16_4k_smoke.yaml` | 3 | 4096 | 579 s | **0.00138** ±50% | **0.692** ±60% | 0.00138 | 3 |
@@ -513,23 +512,19 @@ bash release/run_example.sh 1 --check-only --log $DATA_ROOT/logs/example-1-xxx.l
 The two bold columns with tolerances are what `--check` turns into PASS / FAIL; each
 reference is the mean over the number of runs in the `runs` column.
 
-⚠️ **Example 5's row was re-measured on 2026-09-16** against ATOM `8b6d61392b06` with
-sleep releasing, which is now the default; every other row is still the released image's.
-Releasing costs a graph recapture per step and moves `k3_kl` up by roughly 11–43% on the
-three ATOM examples. Only example 5 was pushed out of band by it — its old reference,
-`0.000930` from a single run, is the smallest base in the table — so only it was
-replaced. Examples 4 and 9 shift too and still pass with room to spare. The measurement
-is in [`VALIDATION.md`](../../release/VALIDATION.md).
+⚠️ **Example 5's row was re-measured over four runs on 2026-09-17**, because one run
+does not describe it: the four span `k3_kl` 0.000739–0.00106 and `entropy` 0.361–0.870.
+`k3_kl` landed within 1% of the single run it replaces; `entropy` is why the row moved,
+since the old 0.568 fails the high end. It takes the ±60% floor the MoE examples use.
+Every other row is unchanged and was re-confirmed on this image.
 
-**The span column
-carries no tolerance and is not part of the verdict** — it is this image's single run per
-example, is dominated by how warm the caches are, and has been measured up to ±15% apart
-on the same machine. The launcher's end-to-end wall clock is 20–35 s longer.
+**The span column carries no tolerance and is not part of the verdict** — it is
+dominated by how warm the caches are and has been measured up to ±15% apart on the same
+machine. The launcher's end-to-end wall clock is 20–35 s longer.
 
-**Result on this image and this commit: 8/8 exit code 0**, all four error counts
-**zero**, every weight-sync bucket at `skipped=0`, `--check` **8/8 PASS**, with `k3_kl`
-within **±8.2%** of every reference above. The references themselves are means over 12
-runs and were left unchanged. The per-run record and the tolerance derivation are in
+**Result on this image: 8/8 exit code 0**, all four error counts **zero**, every
+weight-sync bucket at `skipped=0`, `--check` **8/8 PASS**, with `k3_kl` within **±12%**
+of every reference above. The per-run record is in
 [`VALIDATION.md`](../../release/VALIDATION.md).
 
 **Example 9 versus example 6 — what the rollout engine costs.** Same model, same
@@ -595,19 +590,13 @@ docker exec lumenrl-release bash -lc \
   'rm -rf /tmp/aiter_configs /tmp/atom_torch_compile_cache /tmp/torchinductor_root'
 ```
 
-⚠️ **Precision is not the only thing that collides.** ATOM keys the cache by
-`mode/actor_id/replica/rank` and nothing else, so example 5 and example 9 — both
-`atombf16`, different models — share `/tmp/atom_torch_compile_cache/atombf16/…/backbone`.
-Running 9 after 5 replays the 8B graph against the 30B MoE and dies during engine init:
-
-```
-assert_size_stride(arg2_1, (151936, 4096), (4096, 1))
-AssertionError: expected size 151936==151936, stride 2048==4096 at dim=0
-```
-
-4096 and 2048 are the two models' hidden sizes. It reads like a corrupt engine rather
-than a stale cache, so it is worth recognising. **If you drive the examples yourself,
-clear the caches between every pair that differs in either precision or model.**
+⚠️ **The model collides too, not just the precision.** ATOM keys the cache by
+`mode/actor_id/replica/rank` and nothing else, so examples 5 and 9 — both `atombf16`,
+different models — share one cache directory. Running 9 after 5 replays the 8B graph
+against the 30B MoE and dies during engine init with
+`assert_size_stride ... stride 2048==4096` (the two hidden sizes). It reads like a
+corrupt engine rather than a stale cache. **Driving the examples yourself, clear the
+caches between every pair that differs in precision or model.**
 
 **3. Judge a long run's liveness from the log, not with `pgrep`.** Processes started via
 `docker exec` do not share a process tree with your shell, so `pgrep` returns 0 across
@@ -668,15 +657,10 @@ the tell: the memory exists, it is just not credited to the rollout engine. Rais
 `gpu_memory_utilization` does not fix it and neither does freeing the actors' allocator
 cache — item 1 above is why.
 
-⚠️ **This stopped reproducing on 2026-09-16** and the workaround it motivated
-(`sleep_keeps_memory_resident=true`) has been removed; sleep now releases by default.
-Example 9 was run twice on ATOM `8b6d61392b06` and once on the image's older ATOM with
-sleep releasing, and all three derived a non-negative pool every time. The failure mode
-is documented here because the margin was always thin — the pool came out at −1435 MB
-against an 86 GB budget, 1.7% — so a bigger model or a fatter trainer could bring it
-back. If you meet it, `atom_cfg.engine_kwargs.sleep_keeps_memory_resident=true` is still
-accepted and still keeps the pool resident, at the price of the rollout's memory never
-being returned between steps.
+⚠️ **This stopped reproducing on 2026-09-16** and the pin it motivated is gone; sleep
+releases by default. It is kept here because the margin was thin — the pool came out at
+−1435 MB against an 86 GB budget — so a bigger model could bring it back. If it does,
+`atom_cfg.engine_kwargs.sleep_keeps_memory_resident=true` still keeps the pool resident.
 
 ---
 

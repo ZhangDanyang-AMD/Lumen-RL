@@ -33,7 +33,7 @@ ATOM_SRC="${ATOM_SRC:-}"
 # Set DOCKER="sudo docker" if your user is not in the docker group.
 DOCKER_CLI="${DOCKER:-docker}"
 read -r -a DOCKER <<<"$DOCKER_CLI"
-IMAGE="${IMAGE:-zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260910}"
+IMAGE="${IMAGE:-zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260917}"
 CONTAINER="${CONTAINER:-lumenrl-release}"
 RL_ROOT_IN_IMAGE="${RL_ROOT_IN_IMAGE:-/opt/lumenrl}"
 RUN_DAPO="$RL_ROOT_IN_IMAGE/Lumen-RL/examples/DAPO/run_dapo.sh"
@@ -84,13 +84,13 @@ STALL_LIMIT_DEFAULT=2400
 #   examples 1, 2, 3 (512 tokens)   one run each
 #   example 4 (4096)  three runs    k3_kl +-31%, entropy +-12%
 #   example 9 (4096)  three runs    k3_kl +-6%,  entropy +-15%
-#   example 5 (4096)  three runs    k3_kl +-6%,  entropy +-4%
+#   example 5 (4096)  four runs     k3_kl -21/+14%, entropy -41/+42%
 #   examples 6, 7 (4096)            one run each
 #
 # The tolerance is a per-group floor: k3_kl 30% at 512 and 50% at 4096; entropy
-# 25% at 512, 50% at 4096, 60% for the three MoE examples. Example 4, the widest
-# path and the one with the largest spread, uses 62% of its band, so the floors
-# carry the observed spread with margin.
+# 25% at 512, 50% at 4096, 60% for the three MoE examples and for example 5.
+# Example 4, the widest path and the one with the largest spread, uses 62% of
+# its band, so the floors carry the observed spread with margin.
 #
 # Example 4 is why the floors are not tightened to what a single run suggests:
 # its three runs came in at 0.00241, 0.00243 and 0.00377. Either of the first
@@ -103,26 +103,24 @@ STALL_LIMIT_DEFAULT=2400
 # Every reference below is the mean over that example's runs on the released
 # image, and all 12 of those runs pass against this table.
 #
-# Example 5 is the one exception, and the reason is worth keeping. Its numbers
-# were re-measured on 2026-09-16 against ATOM main 8b6d6139 with sleep RELEASING,
-# which is now the default (release/versions.env explains why the resident pin
-# went away). Releasing costs a graph recapture per step, and that moves k3_kl:
-# three resident-sleep runs of example 5 average 0.00100 and three releasing runs
-# average 0.00143, a 43% step that ate most of the +-50% band around the old
-# 0.000930 reference and failed the check twice out of three. The spread WITHIN
-# each mode is small (+-6%), so this is a shift, not jitter, and the honest fix
-# is a reference measured in the configuration the image actually ships.
-# Examples 4 and 9 shift the same way and by a similar fraction, but their
-# references sit far enough from the band edge to absorb it (measured under
-# releasing sleep: example 4 0.00364 against 0.00287, example 9 0.00151 and
-# 0.00172 against 0.00138), so they are left at their released-image values
-# rather than re-measured from two runs.
+# Example 5 is the exception: re-measured on 2026-09-17 over four runs on image
+# 260917, because one run is not enough for it. Its k3_kl mean landed at
+# 0.000936, within 1% of the single-run 0.000930 it replaces -- the value was
+# right, the confidence in it was not. Entropy is what actually needed the work:
+# four runs span 0.361 to 0.870, so the old 0.568 reference fails the high end
+# at +53%. It moves to the 4-run mean with the 60% floor the MoE examples use.
+#
+# Worth recording because it nearly went the other way: three runs taken the day
+# before, on a pre-rebase tree, clustered at 0.00133-0.00151 and read as a
+# systematic shift caused by releasing sleep. Four runs on the shipped image
+# average 0.000936 and include a 0.000739, so that cluster was luck. Three
+# samples of this example do not establish a spread.
 declare -A EX
 EX[1]='8B BF16 baseline|bf16|0|dapo_qwen3_8b_ray_vllm_smoke.yaml|dapo_qwen3_8b_ray_vllm_longrun.yaml|3|Qwen3-8B-Base||512|0.00106|0.582|0.00106|0.30|0.25'
 EX[2]='8B FP8 rollout|fp8|0|dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml|dapo_qwen3_8b_ray_vllm_fp8_longrun.yaml|3|Qwen3-8B-Base||512|0.00498|0.784|0.00538|0.30|0.25'
 EX[3]='8B FP8 end-to-end|fp8|1|dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml|dapo_qwen3_8b_ray_vllm_fp8_longrun.yaml|3|Qwen3-8B-Base||512|0.00404|0.832|0.00419|0.30|0.25'
 EX[4]='8B ATOM FP8|atomfp8|1|dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml|dapo_qwen3_8b_ray_atom_fp8_longrun.yaml|3|Qwen3-8B-Base||4096|0.00287|0.540|0.00288|0.50|0.50'
-EX[5]='8B ATOM BF16|atombf16|0|dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml|dapo_qwen3_8b_ray_atom_bf16_longrun.yaml|1|Qwen3-8B-Base||4096|0.00143|0.677|0.00157|0.50|0.50'
+EX[5]='8B ATOM BF16|atombf16|0|dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml|dapo_qwen3_8b_ray_atom_bf16_longrun.yaml|1|Qwen3-8B-Base||4096|0.000936|0.615|0.000927|0.50|0.60'
 EX[6]='MoE FSDP2|bf16|0|dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml|dapo_qwen3moe_a3b_ray_vllm_verlref_longrun.yaml|3|Qwen3-30B-A3B-Base|LUMENRL_FP32_MOE_ROUTER=0|4096|0.00158|0.679|0.00154|0.50|0.60'
 EX[7]='MoE Megatron EP=8|bf16|0|dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml|dapo_qwen3moe_a3b_ray_megatron_verlref_4k_longrun.yaml|3|Qwen3-30B-A3B-Base|LUMENRL_FP32_MOE_ROUTER=0|4096|0.00158|0.660|0.00188|0.50|0.60'
 EX[9]='MoE ATOM BF16|atombf16|0|dapo_qwen3moe_a3b_ray_atom_bf16_4k_smoke.yaml|dapo_qwen3moe_a3b_ray_atom_bf16_longrun.yaml|3|Qwen3-30B-A3B-Base|LUMENRL_FP32_MOE_ROUTER=0|4096|0.00138|0.692|0.00138|0.50|0.60'
