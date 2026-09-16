@@ -27,10 +27,25 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
 from typing import Any, Optional
 from uuid import uuid4
 
 logger = logging.getLogger(__name__)
+# A Ray actor configures no logging at all, so records fall through to
+# `logging.lastResort`, which drops anything below WARNING. Everything
+# this module says at INFO -- including the KV pool each engine actually
+# got, the number that makes `gpu_memory_utilization` comparable between
+# engines -- was being thrown away. Setting the level is not enough on its
+# own; the records need somewhere to go. Ray relays actor stderr to the
+# driver, so a stream handler is all it takes, and the guard keeps the
+# driver process (where the root logger is already configured) from
+# printing everything twice.
+logger.setLevel(os.getenv("LUMENRL_LOGGING_LEVEL", "INFO"))
+if not logger.handlers and not logging.getLogger().handlers:
+    _h = logging.StreamHandler(sys.stderr)
+    _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(_h)
 
 _VLLM_RUNTIME_ENV_KEYS = (
     "NCCL_IB_DISABLE",
@@ -83,6 +98,32 @@ class VLLMRayServer:
         self._http_task = None
         self._http_ready = False
 
+    def _log_kv_pool(self) -> None:
+        """Say how many KV blocks this engine actually got.
+
+        vLLM prints this at INFO and the harness captures only WARNING, so the
+        number never reaches the run log -- which makes `gpu_memory_utilization`
+        look comparable across engines when it is not. The two arms derive their
+        pools from different baselines, so the same 0.30 can buy one engine
+        several times the KV of the other, and the only honest way to compare a
+        rollout's speed is to compare the pools rather than the knob.
+        """
+        try:
+            cache = self.engine.vllm_config.cache_config
+            blocks = cache.num_gpu_blocks
+            logger.info(
+                "VLLMRayServer[%d]: kv pool = %s blocks x %s tokens = %s tokens "
+                "(gpu_memory_utilization=%s)",
+                self.replica_rank,
+                blocks,
+                cache.block_size,
+                (blocks or 0) * cache.block_size,
+                self.engine_kwargs.get("gpu_memory_utilization"),
+            )
+        except Exception:  # noqa: BLE001 -- diagnostics must never fail a launch
+            logger.debug("VLLMRayServer[%d]: kv pool size unavailable",
+                         self.replica_rank, exc_info=True)
+
     async def launch(self) -> bool:
         """Build the AsyncLLM engine (and optional HTTP server)."""
         from vllm.engine.arg_utils import AsyncEngineArgs
@@ -104,6 +145,7 @@ class VLLMRayServer:
                     self.replica_rank, self.engine_kwargs.get("seed"))
         self.engine = AsyncLLM.from_engine_args(args)
         logger.info("VLLMRayServer[%d]: AsyncLLM ready.", self.replica_rank)
+        self._log_kv_pool()
 
         # verl-aligned: mask OOV/padded logits at engine init (critical for online
         # FP8 rollout where the requantized lm_head can otherwise emit garbage after

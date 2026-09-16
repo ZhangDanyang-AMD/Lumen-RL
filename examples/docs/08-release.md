@@ -66,20 +66,26 @@ image digest *and* the Lumen-RL commit**. Every run prints both.
 | Lumen-RL | `ZhangDanyang-AMD/Lumen-RL` | `dev/dapo_release` | your checkout (mounted, not pinned) |
 | Lumen | `ZhangDanyang-AMD/Lumen` | `amd-atom-rollout` | `e6379cbd9057` |
 | aiter | `ZhangDanyang-AMD/aiter` | `lumen/moe` | `4ebe6d69c7f4` |
-| ATOM | `ROCm/ATOM` | `refs/pull/2028/head` | `d6b9e147cbf6` |
+| ATOM | `ROCm/ATOM` | `main` | `8b6d61392b06` |
 | composable_kernel | aiter submodule | — | `af9e1d1f1ae3` |
 
-ATOM is pinned at the head of upstream
-[ROCm/ATOM PR #2028](https://github.com/ROCm/ATOM/pull/2028), which is **not merged as
-of 2026-09-10**, so this is a PR head rather than a commit on main. It is fetchable by
-SHA, which is how `release/Dockerfile` takes it.
+ATOM is pinned on upstream `main`.
+[ROCm/ATOM PR #2028](https://github.com/ROCm/ATOM/pull/2028) was squash-merged on
+2026-09-16 and `8b6d61392b06` is that merge commit, so the pin is an ordinary commit on
+main rather than the PR head it used to be.
 
-⚠️ **Swapping ATOM yourself needs two engine settings that Lumen-RL supplies rather
-than inherit**: `compilation_config.cudagraph_mode=FULL` and
-`sleep_keeps_memory_resident=true`. Without them a no-eager ATOM rollout aborts — on the
-first CUDA graph replay and on the first wake after a weight sync respectively. Both are
-inert on ATOM builds that predate the fields. What the failures look like and why is in
-the comments of [`release/versions.env`](../../release/versions.env).
+⚠️ **Swapping ATOM yourself needs one engine setting that Lumen-RL supplies rather
+than inherit**: `compilation_config.cudagraph_mode=FULL`. Without it a no-eager ATOM
+rollout aborts on the first CUDA graph replay. It is inert on ATOM builds that predate
+the field. What the failure looks like and why is in the comments of
+[`release/versions.env`](../../release/versions.env).
+
+Sleep is **not** pinned: it follows ATOM's own default, which releases the rollout's
+weights, graphs and KV pool. Lumen-RL used to force `sleep_keeps_memory_resident=true`
+here; that pin was removed on 2026-09-16 after the failure it guarded against turned out
+not to reproduce on either ATOM version. Releasing costs one graph recapture per step
+(measured at ~1 s/step, 2–3%) and shifts `k3_kl` upward — example 5's reference value was
+re-measured because of it. See [`release/VALIDATION.md`](../../release/VALIDATION.md).
 
 Base image `vllm/vllm-openai-rocm:v0.23.0`, plus `flydsl 0.3.2`,
 `megatron-core 0.18.2`, ROCm Apex `daed8525`, ROCm TransformerEngine `6e541a10`.
@@ -499,13 +505,23 @@ bash release/run_example.sh 1 --check-only --log $DATA_ROOT/logs/example-1-xxx.l
 | 2 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` | 3 | 512 | 129 s | **0.00498** ±30% | **0.784** ±25% | 0.00538 | 1 |
 | 3 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` (`TRAIN_FP8=1`) | 3 | 512 | 142 s | **0.00404** ±30% | **0.832** ±25% | 0.00419 | 1 |
 | 4 | `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` | 3 | 4096 | 508 s | **0.00287** ±50% | **0.540** ±50% | 0.00288 | 3 |
-| 5 | `dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml` | 1 | 4096 | 402 s | **0.000930** ±50% | **0.568** ±50% | 0.000880 | 1 |
+| 5 | `dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml` | 1 | 4096 | 395 s | **0.00143** ±50% | **0.677** ±50% | 0.00157 | 3 |
 | 6 | `dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml` | 3 | 4096 | 523 s | **0.00158** ±50% | **0.679** ±60% | 0.00154 | 1 |
 | 7 | `dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml` | 3 | 4096 | 499 s | **0.00158** ±50% | **0.660** ±60% | 0.00188 | 1 |
 | 9 | `dapo_qwen3moe_a3b_ray_atom_bf16_4k_smoke.yaml` | 3 | 4096 | 579 s | **0.00138** ±50% | **0.692** ±60% | 0.00138 | 3 |
 
 The two bold columns with tolerances are what `--check` turns into PASS / FAIL; each
-reference is the mean over the number of runs in the `runs` column. **The span column
+reference is the mean over the number of runs in the `runs` column.
+
+⚠️ **Example 5's row was re-measured on 2026-09-16** against ATOM `8b6d61392b06` with
+sleep releasing, which is now the default; every other row is still the released image's.
+Releasing costs a graph recapture per step and moves `k3_kl` up by roughly 11–43% on the
+three ATOM examples. Only example 5 was pushed out of band by it — its old reference,
+`0.000930` from a single run, is the smallest base in the table — so only it was
+replaced. Examples 4 and 9 shift too and still pass with room to spare. The measurement
+is in [`VALIDATION.md`](../../release/VALIDATION.md).
+
+**The span column
 carries no tolerance and is not part of the verdict** — it is this image's single run per
 example, is dominated by how warm the caches are, and has been measured up to ±15% apart
 on the same machine. The launcher's end-to-end wall clock is 20–35 s longer.
@@ -569,15 +585,29 @@ smaller KV cache budget. The launcher does this before every run.
 docker restart lumenrl-release
 ```
 
-**2. Switching ATOM precision requires clearing the compile caches.** The torch inductor
-cache is not isolated per run, so going from example 4 straight to example 5 (or back)
-fails in AOTAutograd. The launcher records the previous ATOM precision and clears only
-when it changed (`--keep-cache` disables this).
+**2. Switching ATOM precision *or model* requires clearing the compile caches.** The
+torch inductor cache is not isolated per run, so going from example 4 straight to
+example 5 (or back) fails in AOTAutograd. The launcher records the previous ATOM
+precision and clears only when it changed (`--keep-cache` disables this).
 
 ```bash
 docker exec lumenrl-release bash -lc \
   'rm -rf /tmp/aiter_configs /tmp/atom_torch_compile_cache /tmp/torchinductor_root'
 ```
+
+⚠️ **Precision is not the only thing that collides.** ATOM keys the cache by
+`mode/actor_id/replica/rank` and nothing else, so example 5 and example 9 — both
+`atombf16`, different models — share `/tmp/atom_torch_compile_cache/atombf16/…/backbone`.
+Running 9 after 5 replays the 8B graph against the 30B MoE and dies during engine init:
+
+```
+assert_size_stride(arg2_1, (151936, 4096), (4096, 1))
+AssertionError: expected size 151936==151936, stride 2048==4096 at dim=0
+```
+
+4096 and 2048 are the two models' hidden sizes. It reads like a corrupt engine rather
+than a stale cache, so it is worth recognising. **If you drive the examples yourself,
+clear the caches between every pair that differs in either precision or model.**
 
 **3. Judge a long run's liveness from the log, not with `pgrep`.** Processes started via
 `docker exec` do not share a process tree with your shell, so `pgrep` returns 0 across
@@ -636,9 +666,17 @@ AssertionError: Not enough memory for KV cache with block size(16). At least 1 b
 `non_torch` is the rest of the node, mostly the colocated trainer, and `free=177.39GB` is
 the tell: the memory exists, it is just not credited to the rollout engine. Raising
 `gpu_memory_utilization` does not fix it and neither does freeing the actors' allocator
-cache — item 1 above is why. **Keep the pool resident, which is what §8.1.1's second
-setting does**; on your own ATOM branch, check that `sleep_keeps_memory_resident` reaches
-it.
+cache — item 1 above is why.
+
+⚠️ **This stopped reproducing on 2026-09-16** and the workaround it motivated
+(`sleep_keeps_memory_resident=true`) has been removed; sleep now releases by default.
+Example 9 was run twice on ATOM `8b6d61392b06` and once on the image's older ATOM with
+sleep releasing, and all three derived a non-negative pool every time. The failure mode
+is documented here because the margin was always thin — the pool came out at −1435 MB
+against an 86 GB budget, 1.7% — so a bigger model or a fatter trainer could bring it
+back. If you meet it, `atom_cfg.engine_kwargs.sleep_keeps_memory_resident=true` is still
+accepted and still keeps the pool resident, at the price of the rollout's memory never
+being returned between steps.
 
 ---
 

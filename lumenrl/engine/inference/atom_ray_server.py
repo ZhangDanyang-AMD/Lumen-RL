@@ -13,6 +13,7 @@ import gc
 import logging
 import os
 import socket
+import sys
 from multiprocessing import shared_memory
 from typing import Any, Optional
 from uuid import uuid4
@@ -21,6 +22,20 @@ import torch
 import zmq
 
 logger = logging.getLogger(__name__)
+# A Ray actor configures no logging at all, so records fall through to
+# `logging.lastResort`, which drops anything below WARNING. Everything
+# this module says at INFO -- including the KV pool each engine actually
+# got, the number that makes `gpu_memory_utilization` comparable between
+# engines -- was being thrown away. Setting the level is not enough on its
+# own; the records need somewhere to go. Ray relays actor stderr to the
+# driver, so a stream handler is all it takes, and the guard keeps the
+# driver process (where the root logger is already configured) from
+# printing everything twice.
+logger.setLevel(os.getenv("LUMENRL_LOGGING_LEVEL", "INFO"))
+if not logger.handlers and not logging.getLogger().handlers:
+    _h = logging.StreamHandler(sys.stderr)
+    _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(_h)
 
 
 class ATOMRayServer:
@@ -38,6 +53,9 @@ class ATOMRayServer:
         self.replica_rank = int(replica_rank)
         self.base_seed = base_seed
         self.engine = None
+        # ATOM's preemption counter is cumulative; keep the last reading so
+        # each batch can report its own.
+        self._preemptions_seen = 0
 
     async def launch(self) -> bool:
         from atom.rollout.async_engine import AsyncLLMEngine
@@ -47,7 +65,6 @@ class ATOMRayServer:
         kwargs.setdefault("master_addr", self._get_node_ip())
         kwargs.setdefault("port", self._get_free_port())
         self._pin_cudagraph_mode(kwargs)
-        self._pin_sleep_keeps_memory_resident(kwargs)
         self.engine = AsyncLLMEngine(**kwargs)
         logger.info(
             "ATOMRayServer[%d]: AsyncLLMEngine ready (master=%s:%s online_quant=%s).",
@@ -62,10 +79,8 @@ class ATOMRayServer:
     def _is_no_eager(kwargs: dict[str, Any]) -> bool:
         """Will this rollout run torch.compile and capture CUDA graphs?
 
-        Both pins below apply exactly here and nowhere else, so they ask once:
-        graphs that are captured but released on sleep, or memory kept resident
-        with no graphs to protect, is neither of the two configurations the
-        reference values were measured in.
+        `_pin_cudagraph_mode` applies exactly here and nowhere else: under
+        `enforce_eager` there are no graphs for a cudagraph_mode to describe.
         """
         comp_cfg = kwargs.get("compilation_config") or {}
         level = int(comp_cfg.get("level", 0) or 0)
@@ -113,40 +128,6 @@ class ATOMRayServer:
             self.replica_rank,
             level,
             getattr(mode, "name", mode),
-        )
-
-    def _pin_sleep_keeps_memory_resident(self, kwargs: dict[str, Any]) -> None:
-        """Keep a no-eager rollout's weights and KV pool allocated across sleep.
-
-        This is the behaviour the release measurements were taken against: ATOM
-        up to `28721a50` kept both resident in no-eager mode unconditionally,
-        because a decode graph captures the base address of the KV pool and
-        recapturing on wake faults. `ROCm/ATOM#2028` turned that into
-        `Config.sleep_keeps_memory_resident`, defaulting to release, so leaving it
-        unset silently changes what a colocated ATOM rollout does at every step.
-
-        Releasing is not merely slower here, it does not work: ATOM re-derives the
-        KV block count on each wake as `gpu_memory_utilization x total` minus
-        everything resident on the card, and after the first optimizer step the
-        colocated trainer is 52 GB of that. Qwen3-30B-A3B (example 9) then asks
-        for a negative pool and all eight replicas assert in `resume_memory`. The
-        8B examples have the headroom to survive it, and merely pay the recapture.
-
-        No-op on the older pin: ATOM filters engine kwargs against its `Config`
-        fields, and a build without this one drops the kwarg. It also has no
-        effect under `enforce_eager`, where there are no graphs to keep valid, so
-        this only supplies a value where `_pin_cudagraph_mode` supplies one too.
-
-        Override with `atom_cfg.engine_kwargs.sleep_keeps_memory_resident`.
-        """
-        if not self._is_no_eager(kwargs):
-            return
-
-        kwargs.setdefault("sleep_keeps_memory_resident", True)
-        logger.info(
-            "ATOMRayServer[%d]: sleep_keeps_memory_resident=%s",
-            self.replica_rank,
-            kwargs["sleep_keeps_memory_resident"],
         )
 
     @staticmethod
@@ -283,8 +264,11 @@ class ATOMRayServer:
             return self.engine.generate(grouped_prompts, params, request_ids=request_ids)
 
         outs = await asyncio.get_event_loop().run_in_executor(None, _generate_blocking)
+        self._log_kv_pressure()
         results: list[dict[str, Any]] = []
         expanded_prompts = [p for p, n in zip(grouped_prompts, grouped_counts) for _ in range(n)]
+        if os.environ.get("LUMENRL_ATOM_CHECK_ALIGNMENT"):
+            self._audit_alignment(expanded_prompts, outs)
         for p_ids, out in zip(expanded_prompts, outs):
             token_ids = list(out.get("token_ids", [])) if isinstance(out, dict) else []
             logprobs = out.get("logprobs") if isinstance(out, dict) else None
@@ -295,6 +279,91 @@ class ATOMRayServer:
                 "logprobs": [float(x) for x in logprobs] if logprobs is not None else None,
             })
         return results
+
+    def _log_kv_pressure(self) -> None:
+        """Report how hard this batch leaned on the KV pool.
+
+        `timing_s/agent_loop/num_preempted` in the trainer metrics is a vLLM
+        agent-loop counter that nothing on the ATOM path ever writes, so it
+        reads 0 no matter what ATOM did -- which is how thousands of preemptions
+        per step went unnoticed while the rollout quality fell over. ATOM keeps
+        the real number; this is the one place that asks for it.
+
+        Preemption is recompute: the sequence gives back the KV for everything
+        it has generated so far and forwards the whole context again. A pool
+        that cannot hold `max_num_seqs` sequences at their real length pays that
+        repeatedly, so this is also the first number to look at when generation
+        is slower than it should be.
+        """
+        try:
+            stats = self.engine.get_metrics_statistics()
+        except Exception:  # noqa: BLE001 -- diagnostics must never fail a step
+            logger.debug("ATOM[%d]: KV pressure stats unavailable", self.replica_rank,
+                         exc_info=True)
+            return
+        total = stats.get("kv_blocks_total") or 0
+        preempt = int(stats.get("preemptions") or 0)
+        delta = preempt - self._preemptions_seen
+        self._preemptions_seen = preempt
+        logger.info(
+            "ATOM[%d] kv: blocks=%s used=%s (%.0f%%) preemptions=+%d (total %d)",
+            self.replica_rank,
+            total,
+            stats.get("kv_blocks_used"),
+            100.0 * float(stats.get("kv_cache_usage_ratio") or 0.0),
+            delta,
+            preempt,
+        )
+
+    def _audit_alignment(self, expanded_prompts: list[list[int]], outs: list) -> None:
+        """Check that result i really was decoded against prompt i.
+
+        ``generate_batch`` pairs ATOM's results with its own prompt list by
+        position. ATOM now echoes the prompt each sequence actually used, so
+        the pairing can be verified instead of assumed.
+
+        Off unless ``LUMENRL_ATOM_CHECK_ALIGNMENT`` is set: it indexes every
+        prompt in the batch, which is 768 per replica on the MoE rollout, and
+        it has never once fired. Kept because the question it answers -- "did
+        the engine hand back someone else's completion?" -- is the first one
+        worth asking when generations look swapped, and it is the only way to
+        separate that from the KV-level cross-talk that looks identical from
+        the outside.
+        """
+        n_out = len(outs)
+        n_want = len(expanded_prompts)
+        # Where each distinct prompt sits in the list we sent.
+        where: dict[tuple, list[int]] = {}
+        for i, p_ids in enumerate(expanded_prompts):
+            where.setdefault(tuple(p_ids), []).append(i)
+
+        bad = 0
+        shifts: dict[Any, int] = {}
+        examples: list[tuple] = []
+        for i, (p_ids, out) in enumerate(zip(expanded_prompts, outs)):
+            got = out.get("prompt_token_ids") if isinstance(out, dict) else None
+            if got is None:
+                logger.warning("ATOM[%d] align-audit: engine did not echo prompts.", self.replica_rank)
+                return
+            if list(got) == list(p_ids):
+                continue
+            bad += 1
+            # Which slot did this response actually belong to? A constant
+            # offset means outputs are shifted (something went missing); a
+            # scattered spread means they came back permuted.
+            homes = where.get(tuple(got))
+            delta = min((h - i for h in homes), key=abs) if homes else "unsent"
+            shifts[delta] = shifts.get(delta, 0) + 1
+            if len(examples) < 3:
+                examples.append((i, delta))
+        healthy = bad == 0 and n_out == n_want
+        logger.log(
+            logging.INFO if healthy else logging.WARNING,
+            "ATOM[%d] align-audit: returned=%d expected=%d mismatched=%d "
+            "offset_histogram=%s examples(idx,offset)=%s",
+            self.replica_rank, n_out, n_want, bad,
+            sorted(shifts.items(), key=lambda kv: -kv[1])[:8], examples,
+        )
 
     async def update_weights_from_ipc(
         self, use_shm: bool = False, version: int | None = None
@@ -674,6 +743,7 @@ class ATOMReplicaManager:
             if dynamo_required:
                 env_vars["TORCHDYNAMO_DISABLE"] = "0"
             for key in (
+                "LUMENRL_ATOM_CHECK_ALIGNMENT",
                 "ATOM_ISOLATE_TORCH_COMPILE_CACHE",
                 "ATOM_LOG_LEVEL",
                 "ATOM_USE_TORCH_RMSNORM",

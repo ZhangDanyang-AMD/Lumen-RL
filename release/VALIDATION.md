@@ -1,7 +1,158 @@
 # LumenRL release validation
 
 Measurement record behind the reference table in
-[`examples/docs/08-release.md`](../examples/docs/08-release.md) §8.5.1.
+[`examples/docs/08-release.md`](../examples/docs/08-release.md) §8.5.1. Newest round
+first.
+
+---
+
+# 2026-09-16 — ATOM re-pinned to `main`, and sleep no longer pinned resident
+
+| | |
+|---|---|
+| Image | `zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260910`, digest `sha256:cc18a3f5ce16…` — **unchanged**; ATOM was bind-mounted over, not rebuilt |
+| ATOM | `8b6d61392b0690ff338b6ccd6b864a63ecaf45c3` on `main`, bind-mounted at `/opt/lumenrl/ATOM` |
+| Lumen-RL | `d6005c0` on `dev/dapo_release`, bind-mounted |
+| Hardware | one node, 8x MI355X (gfx950), whole-node allocation |
+| Command | `run_dapo.sh` directly (§8.4.5 manual path), judged with `run_example.sh <N> --check-only` |
+| Seed | `10086`, fixed inside `run_dapo.sh` |
+| Metrics read at | step 1 (`step=1`) |
+| Date | 2026-09-16 |
+
+## What this round changed
+
+- **ATOM moved from the PR head to main**, `d6b9e147cbf6` → `8b6d61392b06`. PR #2028 was
+  squash-merged on 2026-09-16, so the pin is now an ordinary commit on `main`. The
+  difference is not only the squash: main had advanced 33 commits past the PR's rebase
+  base, so this round measures our changes *plus* that advance.
+- **`_pin_sleep_keeps_memory_resident` was removed**, so sleep follows ATOM's default and
+  releases. The reason is below.
+
+The image itself was not rebuilt for this round — ATOM is only put on `PYTHONPATH`, so a
+bind mount is faithful. A rebuild against this pin is the next step, and until it lands
+the published image still carries `d6b9e147cbf6`.
+
+## The pin was removed because the failure it guarded against does not exist
+
+`versions.env` justified `sleep_keeps_memory_resident=true` with "example 9 aborts all
+eight replicas in `resume_memory` with a negative KV pool". That **did not reproduce**,
+on either ATOM:
+
+| | example 9, releasing sleep | result |
+|---|---|---|
+| ATOM `8b6d61392b06` (this pin) | run 1 | exit 0, `--check` PASS |
+| ATOM `8b6d61392b06` | run 2 | exit 0, `--check` PASS |
+| ATOM `d6b9e147cbf6` (image) | 2026-09-16, earlier | exit 0, `--check` PASS |
+
+Every run released and recaptured 24 / 24 times (8 replicas x 3 steps) and derived
+`available_for_kv < 0` exactly **zero** times. A VRAM sampler at 2 s resolution shows the
+8-card total falling from a ~1137 GB peak into the single digits inside each sleep
+window, so the release is real and not merely reported.
+
+Why the original observation stood is not established. Lumen-RL moved from `8ca6bdd` to
+`d6005c0` in between, and the margin was always thin (−1435 MB against an 86 GB budget,
+1.7%), so it may have been a genuine edge that the framework drifted off. **The honest
+statement is that the documented symptom cannot be produced today**, which is not a
+reason to keep a pin.
+
+What the PR *did* fix is the PIECEWISE half, which no example exercises: probe-to-probe,
+the old ATOM released 0 graphs and faulted on wake, the new one releases 1332 and
+survives two sleep/wake cycles. PIECEWISE still cannot run the RL loop at all — 8/8
+replicas abort on the first replay — which is why `_pin_cudagraph_mode` stays.
+
+## Runs
+
+`span` is the first-to-last timestamp in the trainer log. `errors` is the combined count
+of `Traceback`, `OutOfMemory`, `CUDA error` and `HSA_STATUS`. `skipped` is the number of
+weight-sync buckets that did not account for every tensor, out of `buckets` total.
+
+| ex | sleep | span | exit | errors | skipped / buckets | `rollout_corr/k3_kl` | `entropy` | `rollout_corr/kl` | `ppl_ratio` | `response_length/mean` |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | — | 157 s | 0 | 0 | 0 / 0 | 0.00117866 | 0.674346 | 0.000978041 | 1.00022 | 413.78 |
+| 2 | — | 127 s | 0 | 0 | 0 / 0 | 0.00510776 | 0.780022 | 0.00492439 | 1.00414 | 426.86 |
+| 3 | — | 137 s | 0 | 0 | 0 / 0 | 0.00368384 | 0.766134 | 0.00325046 | 1.00524 | 425.45 |
+| 4 | resident | 472 s | 0 | 0 | 0 / 336 | 0.00328873 | 0.707288 | 0.00331959 | 0.999701 | 703.13 |
+| 4 | releasing | 475 s | 0 | 0 | 0 / 336 | 0.00364331 | 0.654406 | 0.00308988 | 0.996492 | 860.22 |
+| 5 | resident | 397 s | 0 | 0 | 0 / 112 | 0.00110076 | 0.629561 | 0.00108828 | 1.00193 | 721.11 |
+| 5 | resident | 375 s | 0 | 0 | 0 / 112 | 0.000894251 | 0.452552 | 0.000821423 | 1.00002 | 660.13 |
+| 5 | releasing | 380 s | 0 | 0 | 0 / 112 | 0.00150943 | 0.648098 | 0.00168579 | 1.00545 | 865.63 |
+| 5 | releasing | 403 s | 0 | 0 | 0 / 112 | 0.00143788 | 0.699219 | 0.00124357 | 1.00108 | 763.63 |
+| 5 | releasing | 402 s | 0 | 0 | 0 / 112 | 0.00133292 | 0.683473 | 0.00178288 | 1.00224 | 828.23 |
+| 6 | — | 523 s | 0 | 0 | 0 / 0 | 0.00146238 | 0.566913 | 0.00157363 | 1.00187 | 676.14 |
+| 7 | — | 507 s | 0 | 0 | 0 / 0 | 0.00150788 | 0.736595 | 0.00144256 | 1.00165 | 689.78 |
+| 9 | resident | 678 s | 0 | 0 | 0 / 2352 | 0.00145721 | 0.745864 | 0.00101772 | 1.00229 | 813.55 |
+| 9 | releasing | 570 s | 0 | 0 | 0 / 2352 | 0.00150982 | 0.778577 | 0.00140162 | 1.00151 | 846.41 |
+| 9 | releasing | 572 s | 0 | 0 | 0 / 2352 | 0.0017224 | 0.858394 | 0.00155727 | 1.00177 | 758.70 |
+
+**15/15 exited 0 with zero error lines and zero skipped buckets.** Example 9's expert
+relayout reported `12288 expert slices across 96 fused buffers` x 24, identical to the
+image's ATOM.
+
+## Example 5's reference was re-measured; the other seven were re-confirmed
+
+Releasing sleep shifts `k3_kl` upward on all three ATOM examples, by roughly the same
+fraction:
+
+| ex | resident | releasing | shift |
+|---|---|---|---|
+| 4 | 0.00328873 | 0.00364331 | +11% |
+| 5 | 0.00100 (mean of 2) | 0.00143 (mean of 3) | +43% |
+| 9 | 0.00145721 | 0.00162 (mean of 2) | +11% |
+
+Only example 5 was pushed out of band by it: its reference was `0.000930` from a single
+run, the smallest base in the table, so +43% consumed most of a ±50% tolerance and two of
+the three releasing runs failed `--check`. The spread *within* each mode is ±6%, so this
+is a shift and not jitter, and **example 5's reference is now the 3-run releasing mean**:
+`k3_kl 0.00143`, `entropy 0.677`, `kl 0.00157`. All five example-5 runs of this round,
+in both sleep modes, pass against it.
+
+Examples 4 and 9 shift the same way but sit far enough inside their bands to absorb it
+(+26.9% and +24.8% of a ±50% tolerance), so their references are **left alone** rather
+than replaced by a 1- or 2-run mean — the same argument the previous round made.
+
+| ex | reference (runs) | this round | delta | tolerance | verdict |
+|---|---|---|---|---|---|
+| 1 | 0.00106 (1) | 0.00117866 | +11.2% | ±30% | PASS |
+| 2 | 0.00498 (1) | 0.00510776 | +2.6% | ±30% | PASS |
+| 3 | 0.00404 (1) | 0.00368384 | −8.8% | ±30% | PASS |
+| 4 | 0.00287 (3) | 0.00364331 | +26.9% | ±50% | PASS |
+| 5 | **0.00143 (3, new)** | 0.00143788 | +0.6% | ±50% | PASS |
+| 6 | 0.00158 (1) | 0.00146238 | −7.4% | ±50% | PASS |
+| 7 | 0.00158 (1) | 0.00150788 | −4.6% | ±50% | PASS |
+| 9 | 0.00138 (3) | 0.0017224 | +24.8% | ±50% | PASS |
+
+## What releasing costs
+
+One graph recapture per step, and it is cheaper than feared. Per-step `timing_s/step`:
+
+| ex | resident | releasing | delta |
+|---|---|---|---|
+| 9 | 64.0 / 46.7 / 49.3 | 65.5 / 47.1 / 51.5 and 64.2 / 47.9 / 50.0 | +1.1 s/step (+2%) |
+| 4 | 50.0 / 33.2 / 35.8 | 51.2 / 35.4 / 35.9 | +1.1 s/step (+3%) |
+
+## Limits of this record
+
+- **The image was not rebuilt.** Everything here is ATOM bind-mounted into the `260910`
+  image. A build against `8b6d61392b06`, and a re-run of the three ATOM examples on it
+  with no mounts, is still owed.
+- **Lumen-RL's tree was not clean.** `d6005c0` plus four uncommitted files: the two MoE
+  ATOM configs at `gpu_memory_utilization=0.45` instead of 0.30, and KV-pressure and
+  alignment diagnostics in the two Ray servers. The previous round's ATOM numbers were
+  taken on the same tree, so the comparison holds, but these are not `d6005c0`'s numbers.
+- **One sample for examples 1, 2, 3, 6, 7 and for each of 4 and 9's two sleep modes.**
+  Only example 5 has three per mode.
+- **Compile caches must be cleared between models, not just between modes.** ATOM keys
+  its torch.compile cache by `mode/actor_id/replica/rank` with no model identity, so an
+  8B graph is happily reused for the 30B MoE and dies in `assert_size_stride` with
+  `stride 2048==4096`. Three example-9 runs were lost to this before it was spotted;
+  §8.6.2 documents the mode rule but not the model rule.
+- **PIECEWISE was not re-probed on this ATOM.** The new-vs-old graph-release comparison
+  quoted above was measured on the pre-merge branch, whose content is identical to this
+  commit for the files in question but was not re-run here.
+
+---
+
+# 2026-09-10 — ATOM re-pinned to the head of PR #2028
 
 | | |
 |---|---|
@@ -116,6 +267,10 @@ this record.
 | 7 | `AttributeError: module 'lumenrl.engine.training.dsv4_megatron_bridge' has no attribute 'is_dsv4'` | dropped when that module was rewritten, while `MegatronNativeEngine` still calls it for every model |
 | 7 | `RuntimeError: The size of tensor a (4254) must match the size of tensor b (4255)` | the position-bucket diagnostic subtracted three tensors that share a frame but not a width |
 
+⚠️ **Superseded on 2026-09-16.** The fifth failure below is the one that stopped
+reproducing; the pin it motivated has since been removed. The paragraph is kept as
+written because it is what was observed at the time. See the 2026-09-16 round.
+
 The fifth failure was the ATOM re-pin itself and is the reason
 `sleep_keeps_memory_resident` is now pinned: see `versions.env` and §8.1.1. Example 9
 reached step 0, synced weights with `skipped=0`, and then aborted all eight replicas in
@@ -152,6 +307,8 @@ Only keeping the pool resident works.
   examples.** Both work there; the pin is justified by example 9, where releasing does
   not, and by it being the behaviour the previous ATOM had unconditionally. What the
   per-step cost of a graph recapture actually is on 4 and 5 was not quantified.
+  *(2026-09-16: both were measured. Releasing works on example 9 too, and costs about
+  1 s/step. The pin is gone.)*
 - **The pin sidesteps the KV budget problem rather than fixing it.** The `non_torch`
   figure that makes the budget negative is itself drift in ROCm/ATOM `main` between the
   PR's merge base and `8938787d`: a separate A/B on `main` plus only the `n>1` fan-out

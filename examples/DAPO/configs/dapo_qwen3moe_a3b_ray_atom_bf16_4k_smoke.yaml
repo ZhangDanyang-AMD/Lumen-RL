@@ -70,7 +70,35 @@ policy:
       transport: ray_http
       tensor_parallel_size: 1
       kv_cache_dtype: bf16
-      gpu_memory_utilization: 0.30
+      # A throughput knob. It was briefly believed to be a correctness one, and
+      # the record of why is worth keeping.
+      #
+      # ATOM sizes its KV pool as `utilization x total` MINUS everything already
+      # resident -- the full 30B of BF16 weights (57.5GB), non-torch (16.5GB)
+      # and a safety margin. 0.30 leaves 6.85GB, i.e. 4675 blocks, to back the
+      # 256 concurrent sequences `vllm_cfg.max_num_seqs` promises; 0.45 leaves
+      # 50.05GB / 34164 blocks. Admission does not bridge that gap -- with
+      # prefix caching off `can_allocate` only checks that the PROMPT fits and
+      # reserves nothing for decode -- so at 0.30 all 256 are admitted and the
+      # pool is exhausted a few hundred tokens in, and the scheduler falls back
+      # on preemption: ~2600 of them per replica per step, against zero at 0.45.
+      #
+      # That should have cost only time, and did not, because two bugs sat on
+      # ATOM's preempt/recompute path (both fixed in `atom/model_engine/
+      # scheduler.py`): the deferred-output EOS placeholder was left in the
+      # token stream, and a chunked recompute was judged finished at
+      # `num_prompt_tokens`. 6144 requests at 0.30 scored 0.0449 accuracy with
+      # 47.4% unparseable answers against vLLM's 0.1090 / 21.6%. `--check` never
+      # saw it: it reads rollout_corr/k3_kl and entropy, and both stay in
+      # tolerance while the generations rot.
+      #
+      # With those fixed, 0.30 costs only what it should. Measured at 6144
+      # requests / max_num_seqs=256, one step:
+      #   0.30  0.1055 / 22.5% / gen 177.2s
+      #   0.45  0.1073 / 23.4% / gen 108.6s
+      #   vLLM at the same 0.45: 0.1113 / 20.2% / gen 151.2s
+      # So this stays at 0.45 for the 1.6x, not because 0.30 is unsafe.
+      gpu_memory_utilization: 0.45
       enable_prefix_caching: false
       online_quant_config: {}
     vllm_cfg:
