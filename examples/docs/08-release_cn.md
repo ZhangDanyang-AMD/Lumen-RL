@@ -89,6 +89,21 @@ print(aiter.__file__)"'
 
 期望 `0.23.0 0.3.2 5.12.0`，且 `aiter` 解析到 `/opt/lumenrl/aiter/` 下。
 
+### 8.1.2 MORI-EP 需要 Megatron ROCm fork
+
+镜像里的 `megatron-core` 是 NVIDIA 上游版本，不带 MORI 后端。八个示例用不到它——
+它们都走默认的 `alltoall` dispatcher。要用 `moe_token_dispatcher_type=flex` + `mori`，
+改为固定 fork：
+
+```bash
+git clone --depth 1 -b core_r0.18.0_rocm \
+  https://github.com/ROCm/Megatron-LM.git "$DATA_ROOT/megatron-rocm"
+
+MEGATRON_PATH=$DATA_ROOT/megatron-rocm bash release/run_example.sh 7 --check
+```
+
+`MEGATRON_PATH` 会被前置到 `PYTHONPATH`，因此该路径必须在容器内可见。
+
 ---
 
 ## 8.2 八个例子
@@ -344,6 +359,7 @@ $DATA_ROOT/logs/example-<N>-<时间戳>.launcher.log  # 包装层输出与退出
 | `EXTRA_OVERRIDE` | 追加任意 Hydra override，空格分隔 |
 | `WANDB_API_KEY` | 仅 `--longrun` 需要 |
 | `STALL_LIMIT` | 日志静默多少秒判定卡死，默认 2400 |
+| `MEGATRON_PATH` | 优先于镜像内 `megatron-core` 导入的 Megatron 源码树；MORI-EP 需要，见 §8.1.2 |
 
 跑自己的 Lumen-RL 不需要任何额外操作——那本来就是默认行为。要跑**另一份**
 checkout（不是启动器所在的那份）：

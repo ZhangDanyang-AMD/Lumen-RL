@@ -106,8 +106,12 @@ export USE_ROCM_AITER_ROPE_BACKEND=0
 export VLLM_USE_V1=1 VLLM_ENABLE_V1_MULTIPROCESSING=1 VLLM_LOGGING_LEVEL=WARN
 export ATOM_DISABLE_VLLM_PLUGIN=1
 
-# PYTHONPATH
-export PYTHONPATH="$LUMENRL_DIR:$AITER_DIR:$LUMEN_DIR:$ATOM_DIR:${PYTHONPATH:-}"
+# PYTHONPATH (optional MEGATRON_PATH first so actors import that megatron.core)
+_PP="$LUMENRL_DIR:$AITER_DIR:$LUMEN_DIR:$ATOM_DIR:${PYTHONPATH:-}"
+if [ -n "${MEGATRON_PATH:-}" ]; then
+  _PP="$MEGATRON_PATH:$_PP"
+fi
+export PYTHONPATH="$_PP"
 
 # The cached ROCm flash-attn wheel contains the older 21-argument native
 # varlen ABI while its Python wrapper includes the newer trailing num_splits.
@@ -186,6 +190,16 @@ sleep 8
 # Launch training
 # ═══════════════════════════════════════════════════════════════════════
 EXTRA_OVERRIDES=()
+# Same flags as Megatron-LM examples/qwen3/train_qwen3.sh ENABLE_MORI=true.
+if [ "${ENABLE_MORI:-false}" = "true" ] || [ "${ENABLE_MORI:-0}" = "1" ]; then
+  export MORI_SHMEM_LOG_LEVEL="${MORI_SHMEM_LOG_LEVEL:-INFO}"
+  echo "[INFO] MORI EP: MORI_SHMEM_MODE=${MORI_SHMEM_MODE:-}"
+  echo "[INFO] MORI EP: MORI_SHMEM_LOG_LEVEL=${MORI_SHMEM_LOG_LEVEL}"
+  EXTRA_OVERRIDES+=(
+    policy.training.megatron_cfg.moe_token_dispatcher_type=flex
+    policy.training.megatron_cfg.moe_flex_dispatcher_backend=mori
+  )
+fi
 if [ -n "${WANDB_RUN_NAME:-}" ]; then
   EXTRA_OVERRIDES+=("logger.wandb.name=$WANDB_RUN_NAME")
 fi
