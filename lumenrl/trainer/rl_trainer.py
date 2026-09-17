@@ -25,6 +25,7 @@ import torch
 import lumenrl.algorithms  # noqa: F401  — populate ALGORITHM_REGISTRY
 from lumenrl.core.config import LumenRLConfig
 from lumenrl.core.protocol import DataProto
+from lumenrl.moe.r3_scope import assert_supported_r3_config
 from lumenrl.core.registry import ALGORITHM_REGISTRY
 from lumenrl.controller import DispatchMode, RayCluster, RayWorkerGroup, create_fused_worker_cls
 from lumenrl.controller.dispatch import dispatch_proto
@@ -93,6 +94,8 @@ class RLTrainer:
     """
 
     def __init__(self, config: LumenRLConfig) -> None:
+        if bool(getattr(getattr(config.moe, "r3", None), "enabled", False)):
+            assert_supported_r3_config(config)
         self.config = config
         self.global_step: int = 0
         self.last_metrics: dict[str, float] = {}
@@ -3830,6 +3833,37 @@ class RLTrainer:
             start = end
         return metrics
 
+    @staticmethod
+    def _r3_verify_old_vs_rollout(
+        old_log_probs: torch.Tensor,
+        rollout_log_probs: torch.Tensor,
+        response_mask: torch.Tensor,
+    ) -> dict[str, float]:
+        """Same-weight train vs rollout gap (before the optimizer step).
+
+        ``old_log_probs`` is the actor forward on the rollout sequences;
+        ``rollout_log_probs`` is the sampler. Signed KL can cancel expert flips;
+        ``abs_diff`` and ``frac_abs_gt_0.1`` are the R3 telltales.
+        """
+        width = min(
+            old_log_probs.shape[-1],
+            rollout_log_probs.shape[-1],
+            response_mask.shape[-1],
+        )
+        mask = response_mask[..., :width].bool()
+        if int(mask.sum().item()) == 0:
+            return {}
+        delta = (
+            rollout_log_probs[..., :width].float() - old_log_probs[..., :width].float()
+        )[mask]
+        abs_d = delta.abs()
+        return {
+            "r3_verify/tokens": float(delta.numel()),
+            "r3_verify/kl": float(delta.mean()),
+            "r3_verify/abs_diff": float(abs_d.mean()),
+            "r3_verify/frac_abs_gt_0.1": float((abs_d > 0.1).float().mean()),
+        }
+
     def _update_actor_with_ray(self, batch: DataProto) -> dict[str, float]:
         if self._actor_wg is None:
             raise RuntimeError("Ray actor worker group is not initialized.")
@@ -4155,6 +4189,20 @@ class RLTrainer:
             _position_mismatch_metrics = {}
             _rlp_ray = batch.tensors.get("rollout_log_probs", batch.tensors.get("fp8_logprobs"))
             _rc_want_ray = (_rc_cfg_ray.rollout_is or _rc_cfg_ray.rollout_rs or _bypass_ray) and "old_log_probs" in batch.tensors and _rlp_ray is not None
+            _r3_verify_metrics: dict[str, float] = {}
+            if "old_log_probs" in batch.tensors and _rlp_ray is not None:
+                _r3_verify_metrics = self._r3_verify_old_vs_rollout(
+                    batch.tensors["old_log_probs"], _rlp_ray, response_mask,
+                )
+                if self._rank == 0 and _r3_verify_metrics:
+                    logger.info(
+                        "[step=%d] r3_verify tokens=%d kl=%.6g abs_diff=%.6g frac_abs_gt_0.1=%.6g",
+                        step,
+                        int(_r3_verify_metrics["r3_verify/tokens"]),
+                        _r3_verify_metrics["r3_verify/kl"],
+                        _r3_verify_metrics["r3_verify/abs_diff"],
+                        _r3_verify_metrics["r3_verify/frac_abs_gt_0.1"],
+                    )
             if _rc_want_ray:
                 from lumenrl.algorithms.rollout_correction import compute_rollout_correction_and_add_to_batch
                 batch, _rc_metrics_ray = compute_rollout_correction_and_add_to_batch(batch, _rc_cfg_ray)
@@ -4201,6 +4249,8 @@ class RLTrainer:
                 metrics.update(_rc_metrics_ray)
             if _position_mismatch_metrics:
                 metrics.update(_position_mismatch_metrics)
+            if _r3_verify_metrics:
+                metrics.update(_r3_verify_metrics)
 
             total_tok = int(seq_mask.sum().item())
             prompt_tok = int(sum(prompt_lengths))

@@ -36,6 +36,7 @@ from lumenrl.utils.checkpoint import (
     run_checkpoint_phase,
 )
 from lumenrl.core.protocol import DataProto
+from lumenrl.moe.r3_scope import assert_supported_r3, r3_fields_from_config
 from lumenrl.core.types import AlgorithmName, TrainingBackend
 from lumenrl.engine.training.base_engine import BaseEngine, EngineRegistry
 
@@ -261,6 +262,21 @@ class LumenActorWorker(BaseWorker):
             if not isinstance(r3_cfg, dict):
                 from dataclasses import asdict, is_dataclass
                 r3_cfg = asdict(r3_cfg) if is_dataclass(r3_cfg) else dict(vars(r3_cfg))
+            r3_enabled = bool(
+                r3_cfg.get("enabled", False) or meg_cfg.get("r3_enabled", False)
+            )
+            r3_en, r3_mode, r3_gen = r3_fields_from_config(self.config)
+            if r3_enabled or r3_en:
+                assert_supported_r3(
+                    replay_mode=r3_mode,
+                    generation_backend=r3_gen
+                    or str(
+                        get_nested_config(
+                            self.config, "policy", "generation_backend", default=""
+                        )
+                        or ""
+                    ),
+                )
             return {
                 "tensor_model_parallel_size": meg_cfg.get("tensor_model_parallel_size") or meg_cfg.get("tensor_parallel_size", 1),
                 "pipeline_model_parallel_size": meg_cfg.get("pipeline_model_parallel_size") or meg_cfg.get("pipeline_parallel_size", 1),
@@ -284,13 +300,8 @@ class LumenActorWorker(BaseWorker):
                 "moe_mori_max_tokens_per_rank": meg_cfg.get("moe_mori_max_tokens_per_rank"),
                 "moe_mori_kernel_type": meg_cfg.get("moe_mori_kernel_type"),
                 "moe_permute_fusion": meg_cfg.get("moe_permute_fusion", False),
-                "r3_enabled": bool(
-                    get_nested_config(self.config, "moe", "r3", "enabled", default=False)
-                    or meg_cfg.get("r3_enabled", False)
-                ),
-                "moe_enable_routing_replay": bool(
-                    get_nested_config(self.config, "moe", "r3", "enabled", default=False)
-                ),
+                "r3_enabled": r3_enabled,
+                "moe_enable_routing_replay": r3_enabled,
                 "param_offload": meg_cfg.get("param_offload", False),
                 "optimizer_cpu_offload": meg_cfg.get("optimizer_cpu_offload", meg_cfg.get("optimizer_offload", False)),
                 "optimizer_offload_fraction": meg_cfg.get("optimizer_offload_fraction", 1.0),

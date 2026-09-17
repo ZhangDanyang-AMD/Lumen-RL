@@ -120,8 +120,8 @@ quantization:
 moe:
   r3:
     enabled: true
-    record_router_logits: true
-    replay_mode: distribution
+    record_router_logits: false
+    replay_mode: hard_assignment
 
 reward:
   type: function

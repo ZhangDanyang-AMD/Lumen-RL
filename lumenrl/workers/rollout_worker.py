@@ -14,6 +14,7 @@ from lumenrl.core.protocol import DataProto
 from lumenrl.engine.inference.atom_engine import AtomEngine
 from lumenrl.engine.inference.kv_cache import FP8KVCacheManager
 from lumenrl.moe.r3_manager import R3Manager
+from lumenrl.moe.r3_scope import assert_supported_r3
 
 logger = logging.getLogger(__name__)
 
@@ -49,8 +50,13 @@ class AtomRolloutWorker(BaseWorker):
         r3_cfg = R3Config(
             enabled=bool(moe.get("enabled", False)),
             record_router_logits=bool(moe.get("record_router_logits", True)),
-            replay_mode=str(moe.get("replay_mode", "soft")),
+            replay_mode=str(moe.get("replay_mode", "hard_assignment")),
         )
+        if r3_cfg.enabled:
+            assert_supported_r3(
+                replay_mode=r3_cfg.replay_mode,
+                generation_backend=str(policy.get("generation_backend", "") or ""),
+            )
         self._r3 = R3Manager(r3_cfg)
         self._log.info("AtomRolloutWorker: engine ready for %s", model_name)
 
