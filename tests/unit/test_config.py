@@ -201,6 +201,7 @@ def test_moe_config_values() -> None:
     assert cfg.moe.r3.enabled is False
     assert cfg.moe.r3.record_router_logits is False
     assert cfg.moe.r3.replay_mode == "hard_assignment"
+    assert cfg.moe.r3.print_train_rollout_mismatch is False
 
     schema = OmegaConf.structured(LumenRLConfig)
     assert OmegaConf.select(schema, "moe.r3.enabled") is not None

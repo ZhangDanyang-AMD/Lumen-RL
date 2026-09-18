@@ -663,6 +663,9 @@ class R3Config:
     # so only ~4% of tokens route identically through all 48 layers, and forcing
     # the gate to fp32 on both sides measured as no improvement at all.
     rollout_replay: bool = False
+    # Print ``r3_verify/*`` (same-weight train vs rollout log-prob mismatch).
+    # Off by default; independent of ``enabled``.
+    print_train_rollout_mismatch: bool = False
 
 
 @dataclass

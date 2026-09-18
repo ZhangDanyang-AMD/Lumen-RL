@@ -25,7 +25,6 @@ import torch
 import lumenrl.algorithms  # noqa: F401  — populate ALGORITHM_REGISTRY
 from lumenrl.core.config import LumenRLConfig
 from lumenrl.core.protocol import DataProto
-from lumenrl.moe.r3_scope import assert_supported_r3_config
 from lumenrl.core.registry import ALGORITHM_REGISTRY
 from lumenrl.controller import DispatchMode, RayCluster, RayWorkerGroup, create_fused_worker_cls
 from lumenrl.controller.dispatch import dispatch_proto
@@ -94,8 +93,6 @@ class RLTrainer:
     """
 
     def __init__(self, config: LumenRLConfig) -> None:
-        if bool(getattr(getattr(config.moe, "r3", None), "enabled", False)):
-            assert_supported_r3_config(config)
         self.config = config
         self.global_step: int = 0
         self.last_metrics: dict[str, float] = {}
@@ -605,6 +602,13 @@ class RLTrainer:
         moe = getattr(self.config, "moe", None)
         r3 = getattr(moe, "r3", None) if moe is not None else None
         return bool(getattr(r3, "rollout_replay", False))
+
+    @property
+    def _r3_print_train_rollout_mismatch(self) -> bool:
+        """Whether to print same-weight train vs rollout log-prob mismatch."""
+        moe = getattr(self.config, "moe", None)
+        r3 = getattr(moe, "r3", None) if moe is not None else None
+        return bool(getattr(r3, "print_train_rollout_mismatch", False))
 
     def _rollout_with_ray_vllm(
         self, prompts: list[str], num_generations: int, sampling_params: dict[str, Any] | None = None,
@@ -4190,7 +4194,7 @@ class RLTrainer:
             _rlp_ray = batch.tensors.get("rollout_log_probs", batch.tensors.get("fp8_logprobs"))
             _rc_want_ray = (_rc_cfg_ray.rollout_is or _rc_cfg_ray.rollout_rs or _bypass_ray) and "old_log_probs" in batch.tensors and _rlp_ray is not None
             _r3_verify_metrics: dict[str, float] = {}
-            if "old_log_probs" in batch.tensors and _rlp_ray is not None:
+            if self._r3_print_train_rollout_mismatch and "old_log_probs" in batch.tensors and _rlp_ray is not None:
                 _r3_verify_metrics = self._r3_verify_old_vs_rollout(
                     batch.tensors["old_log_probs"], _rlp_ray, response_mask,
                 )
