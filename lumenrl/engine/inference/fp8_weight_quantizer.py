@@ -104,6 +104,7 @@ def _scale_name_for_weight(name: str) -> str:
 def _per_block_cast_to_fp8(
     tensor: torch.Tensor,
     block_size: tuple[int, int] = (128, 128),
+    pow2_scales: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Cast a BF16/FP32 tensor to FP8 e4m3 with per-block scaling.
 
@@ -140,6 +141,12 @@ def _per_block_cast_to_fp8(
     # Per-block amax in bf16 -> FP32 scale (only the scale grid is FP32, not the full tensor)
     amax = blocks.abs().amax(dim=(2, 3)).float().clamp(min=1e-12)  # (bm, bn) FP32
     scale = amax / FP8_MAX
+    if pow2_scales:
+        # Round the dequant multiplier UP to a power of two, matching TE. TE's
+        # compute_scale_from_amax() truncates the mantissa of FP8_MAX/amax, so its
+        # reciprocal -- the scale_inv the GEMM consumes -- is rounded up. ceil here,
+        # not round-to-nearest, or roughly half the blocks disagree with TE by 2x.
+        scale = torch.exp2(torch.ceil(torch.log2(scale)))
     weight_scale_inv = scale.to(torch.float32)
 
     # Quantize: divide in bf16 then cast (avoids full FP32 copy)
@@ -156,6 +163,7 @@ def _per_block_cast_to_fp8(
 def quantize_weights_fp8_per_block(
     weights: Iterable[tuple[str, torch.Tensor]],
     block_size: tuple[int, int] = (128, 128),
+    pow2_scales: bool = False,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Wrap a BF16 weight generator to yield FP8-quantized weights.
 
@@ -173,7 +181,9 @@ def quantize_weights_fp8_per_block(
         if _should_quantize(name) and tensor.ndim == 2 and tensor.is_floating_point():
             if not tensor.is_cuda:
                 tensor = tensor.cuda()
-            fp8_weight, scale_inv = _per_block_cast_to_fp8(tensor, block_size)
+            fp8_weight, scale_inv = _per_block_cast_to_fp8(
+                tensor, block_size, pow2_scales=pow2_scales
+            )
             yield name, fp8_weight
             scale_name = _scale_name_for_weight(name)
             yield scale_name, scale_inv

@@ -22,9 +22,17 @@ def fp8_e4m3_max() -> float:
 
 
 def _round_scale_pow2(scale: Tensor) -> Tensor:
-    """Map scales to the nearest power-of-two (IEEE-style exponent-only scaling)."""
+    """Round scales UP to a power of two (IEEE-style exponent-only scaling).
+
+    Must be ceil, not round-to-nearest, to agree with TransformerEngine: TE's
+    compute_scale_from_amax() truncates the mantissa of FP8_MAX/amax, so the
+    reciprocal it hands the GEMM -- the dequant multiplier, which is what ``scale``
+    is here -- is rounded up. Round-to-nearest disagrees with TE on roughly half of
+    all blocks, by exactly one power of two, and vLLM/SGLang also use ceil
+    (exp2(ceil(log2(s)))). See test_round_scale_pow2_rounds_up.
+    """
     log2 = torch.log2(scale.clamp(min=torch.finfo(scale.dtype).tiny))
-    return torch.pow(2.0, torch.round(log2))
+    return torch.pow(2.0, torch.ceil(log2))
 
 
 class WeightQuantizer:
