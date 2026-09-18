@@ -77,6 +77,23 @@ def _is_rocm() -> bool:
     return hasattr(torch.version, "hip") and torch.version.hip is not None
 
 
+def _is_fp8_fnuz() -> bool:
+    """True only where the platform FP8 format is e4m3*fnuz* (gfx942 and earlier).
+
+    Not all of ROCm is fnuz: gfx950 (MI355X) uses OCP e4m3 with max 448, the same
+    format as CUDA. Gating on "is ROCm" quantised gfx950 weights as fnuz with a
+    224 cap -- a 2x-too-small range, and a different format from the one TE and
+    vLLM use on that arch.
+    """
+    if not _is_rocm():
+        return False
+    try:
+        arch = torch.cuda.get_device_properties(0).gcnArchName
+    except Exception:
+        return False
+    return any(a in arch for a in ("gfx940", "gfx941", "gfx942"))
+
+
 def _scale_name_for_weight(name: str) -> str:
     if not name.endswith(".weight"):
         raise ValueError(f"FP8 scale source must end with '.weight': {name}")
@@ -99,7 +116,7 @@ def _per_block_cast_to_fp8(
     M, N = tensor.shape
     block_m, block_n = block_size
 
-    fp8_dtype = torch.float8_e4m3fnuz if _is_rocm() else torch.float8_e4m3fn
+    fp8_dtype = torch.float8_e4m3fnuz if _is_fp8_fnuz() else torch.float8_e4m3fn
     if fp8_dtype is torch.float8_e4m3fnuz:
         # Match vLLM.utils.deep_gemm.get_fp8_min_max(). PyTorch reports
         # +/-240 for fnuz, but vLLM uses +/-224 on ROCm for accuracy.

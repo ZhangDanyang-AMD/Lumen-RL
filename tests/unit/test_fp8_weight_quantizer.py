@@ -41,7 +41,9 @@ def test_per_block_quantizer_returns_vllm_dequant_scale(monkeypatch) -> None:
 
 
 def test_rocm_per_block_quantizer_casts_directly_to_fnuz(monkeypatch) -> None:
-    monkeypatch.setattr(quantizer, "_is_rocm", lambda: True)
+    # Patch the fnuz predicate, not _is_rocm: not all of ROCm is fnuz (gfx950 is OCP
+    # e4m3). See test_gfx950_per_block_quantizer_uses_ocp_e4m3 below.
+    monkeypatch.setattr(quantizer, "_is_fp8_fnuz", lambda: True)
     weight = torch.tensor(
         [[-4.0, -2.0], [1.0, 3.0]],
         dtype=torch.float32,
@@ -92,3 +94,22 @@ def test_quantizer_skips_redhat_non_fp8_weights(name: str) -> None:
 def test_training_quantizer_skips_dsv4_indexer_score_projection() -> None:
     name = "model.layers.2.self_attn.indexer.weights_proj.weight"
     assert training_quantizer._should_quantize(name) is False
+
+
+def test_gfx950_per_block_quantizer_uses_ocp_e4m3(monkeypatch) -> None:
+    """On ROCm arches that are not fnuz (gfx950/MI355X) the format is OCP e4m3, max 448.
+
+    Gating on "is ROCm" quantised gfx950 weights as fnuz with a 224 cap, a different
+    format and a 2x-too-small range versus what TE and vLLM use on that arch.
+    """
+    monkeypatch.setattr(quantizer, "_is_rocm", lambda: True)
+    monkeypatch.setattr(quantizer, "_is_fp8_fnuz", lambda: False)
+    weight = torch.tensor([[-4.0, -2.0], [1.0, 3.0]], dtype=torch.float32)
+
+    fp8_weight, weight_scale_inv = quantizer._per_block_cast_to_fp8(
+        weight, block_size=(2, 2)
+    )
+
+    assert fp8_weight.dtype == torch.float8_e4m3fn
+    expected_scale = weight.abs().max() / torch.finfo(torch.float8_e4m3fn).max
+    assert weight_scale_inv.item() == pytest.approx(expected_scale.item())
