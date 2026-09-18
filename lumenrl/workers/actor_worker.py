@@ -1153,7 +1153,15 @@ class LumenActorWorker(BaseWorker):
             from lumenrl.engine.inference.fp8_weight_quantizer import (
                 quantize_weights_fp8_per_block,
             )
-            params = quantize_weights_fp8_per_block(params)
+            params = quantize_weights_fp8_per_block(
+                params,
+                pow2_scales=bool(
+                    get_nested_config(
+                        self.config, "quantization", "rollout",
+                        "use_weight_pow2_scale", default=False,
+                    )
+                ),
+            )
             if integrity_enabled:
                 params = require_finite_stream(params, stage="fp8_quantize")
 

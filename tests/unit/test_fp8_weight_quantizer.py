@@ -113,3 +113,23 @@ def test_gfx950_per_block_quantizer_uses_ocp_e4m3(monkeypatch) -> None:
     assert fp8_weight.dtype == torch.float8_e4m3fn
     expected_scale = weight.abs().max() / torch.finfo(torch.float8_e4m3fn).max
     assert weight_scale_inv.item() == pytest.approx(expected_scale.item())
+
+
+def test_pow2_scales_round_up_not_to_nearest() -> None:
+    """pow2_scales must round the dequant multiplier UP, to match TE.
+
+    TE's compute_scale_from_amax() truncates the mantissa of FP8_MAX/amax, so the
+    reciprocal it hands the GEMM is rounded up. Round-to-nearest would disagree with
+    TE on roughly half of all blocks, by exactly one power of two.
+    """
+    weight = torch.zeros(2, 2, dtype=torch.float32)
+    weight[0, 0] = 3.0  # amax/448 lands strictly between two powers of two
+
+    _, continuous = quantizer._per_block_cast_to_fp8(weight, (2, 2), pow2_scales=False)
+    _, pow2 = quantizer._per_block_cast_to_fp8(weight, (2, 2), pow2_scales=True)
+
+    # exactly a power of two, and >= the continuous scale (rounded up, never down)
+    mant = pow2.view(torch.int32) & 0x007FFFFF
+    assert int(mant.abs().sum()) == 0
+    assert (pow2 >= continuous).all()
+    assert torch.allclose(pow2, torch.exp2(torch.ceil(torch.log2(continuous))))
