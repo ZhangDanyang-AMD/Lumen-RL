@@ -295,10 +295,20 @@ class MegatronNativeEngine(MegatronBaseEngine):
         num_experts = int(ec.get("num_experts") or hf_num_experts(hf) or 0)
         self._is_moe = self._spec.resolve_has_experts(hf, ec)
         self._num_experts = num_experts
-        # R3 routing replay (opt-in): record router logits in the old-logprob
-        # forward, replay in the update. Only meaningful for MoE.
-        self._r3_enabled = bool(ec.get("r3_enabled", False)) and self._is_moe
-        self._r3_store: dict[int, list] = {}
+        # R3: replay vLLM rollout expert ids through Megatron-Core RouterReplay
+        # on every log-prob and update forward. Only meaningful for MoE.
+        self._r3_enabled = self._is_moe and bool(
+            ec.get("r3_enabled", False) or ec.get("moe_enable_routing_replay", False)
+        )
+        self._r3_batch_routes = None
+        self._r3_append = False
+        self._r3_layer_indices: list[int] | None = None
+        if self._r3_enabled and (ec.get("recompute_granularity") or None):
+            raise RuntimeError(
+                "MegatronNativeEngine R3 cannot use activation recomputation yet: "
+                "checkpointed forwards would replay the latest microbatch's "
+                "expert ids. Unset recompute_granularity while moe.r3.enabled."
+            )
 
         # Megatron hard-requires sequence parallelism when MoE and TP are both on
         # (the MoE token dispatcher assumes SP-scattered activations under TP).
@@ -349,6 +359,8 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 moe_kwargs["moe_router_bias_update_rate"] = float(ec.get("moe_router_bias_update_rate"))
             if shared_ffn > 0:
                 moe_kwargs["moe_shared_expert_intermediate_size"] = shared_ffn
+            if self._r3_enabled:
+                moe_kwargs["moe_enable_routing_replay"] = True
 
         recompute_kwargs: dict = {}
         rc_gran = ec.get("recompute_granularity") or None
@@ -371,6 +383,8 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 dsv4.enable_deterministic_mode()
             if self._spec.sequence_alignment is not None:
                 self._dsv4_align = self._spec.sequence_alignment(tfcfg)
+            if self._r3_enabled:
+                tfcfg.moe_enable_routing_replay = True
         else:
             tfcfg = TransformerConfig(
                 num_layers=hf["num_hidden_layers"], hidden_size=hf["hidden_size"],
@@ -413,6 +427,11 @@ class MegatronNativeEngine(MegatronBaseEngine):
             # TransformerEngine spec: fused TELayerNormColumnParallelLinear +
             # TEDotProductAttention (CK/aotriton fused attn), TE RMSNorm.
             spec = get_gpt_layer_with_transformer_engine_spec(qk_layernorm=True)
+
+        if self._r3_enabled:
+            from lumenrl.engine.training.megatron_r3_replay import clear_stale_instances
+
+            clear_stale_instances()
 
         model = GPTModel(
             config=tfcfg, transformer_layer_spec=spec, vocab_size=hf["vocab_size"],
@@ -493,7 +512,8 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 f"score_fn={getattr(tfcfg, 'moe_router_score_function', None)} "
                 f"pre_softmax={getattr(tfcfg, 'moe_router_pre_softmax', None)} "
                 f"expert_bias={getattr(tfcfg, 'moe_router_enable_expert_bias', None)} "
-                f"aux_loss_coeff={getattr(tfcfg, 'moe_aux_loss_coeff', None)}",
+                f"aux_loss_coeff={getattr(tfcfg, 'moe_aux_loss_coeff', None)} "
+                f"r3={self._r3_enabled}",
                 flush=True,
             )
 
@@ -1091,7 +1111,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
             mbs.append({"rows": [rows[j] for j in bin_rows], "ids_list": ids_list})
         return mbs
 
-    def _pp_forward_model(self, model, ids_list):
+    def _pp_forward_model(self, model, mb):
         """Pack full sequences into this rank's ``thd`` token stream.
 
         Two CP layouts, because the two attention implementations want different
@@ -1120,6 +1140,8 @@ class MegatronNativeEngine(MegatronBaseEngine):
         from megatron.core import parallel_state as mpu
         from megatron.core.packed_seq_params import PackedSeqParams
 
+        ids_list = mb["ids_list"]
+        rows = mb.get("rows") or []
         cp_rank = mpu.get_context_parallel_rank()
 
         # Token-count alignment, computed BEFORE the CP split because under the
@@ -1229,6 +1251,37 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 )
                 self._pad_logged = True
         tokens = torch.cat(local_ids, dim=0).view(1, local_total)
+        if self._r3_enabled:
+            from lumenrl.engine.training.megatron_r3_replay import (
+                install_replay,
+                local_router_layer_indices,
+                pack_microbatch_routes,
+            )
+
+            if self._r3_batch_routes is None:
+                raise RuntimeError(
+                    "moe.r3.enabled=true but this forward has no rollout routes."
+                )
+            # Ask Megatron which global MoE layers this rank owns (read off the
+            # constructed routers' layer_number)
+            if self._r3_layer_indices is None:
+                self._r3_layer_indices = local_router_layer_indices(self.module)
+            layer_tensors = pack_microbatch_routes(
+                self._r3_batch_routes,
+                rows,
+                int(tokens.shape[-1]),
+                num_experts=self._num_experts,
+                layer_indices=self._r3_layer_indices,
+                cp_size=self._cp,
+                cp_rank=cp_rank,
+                cp_contiguous=cp_contiguous,
+                align=align,
+                tp_size=self._tp,
+                tp_rank=mpu.get_tensor_model_parallel_rank(),
+                sequence_parallel=self._sp,
+            )
+            layer_tensors = [t.to(device=tokens.device) for t in layer_tensors]
+            install_replay(layer_tensors, append=self._r3_append)
         # For RoPE + packed thd, Megatron derives positions from cu_seqlens and
         # CP rank; explicit position_ids are neither needed nor consumed.
         cu = torch.tensor(local_offsets, dtype=torch.int32, device=tokens.device) * self._cp
@@ -1526,7 +1579,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
 
         def forward_step(di, model, *args, **kwargs):
             mb = next(di[0] if isinstance(di, list) else di)
-            out, layouts = self._pp_forward_model(model, mb["ids_list"])
+            out, layouts = self._pp_forward_model(model, mb)
 
             def loss_func(output_tensor):
                 # reshape by ACTUAL length: under SP the packed stream is padded to
@@ -1576,19 +1629,25 @@ class MegatronNativeEngine(MegatronBaseEngine):
             return out, loss_func
 
         fwd_bwd = get_forward_backward_func()
-        # R3: replay the router logits recorded during the old-logprob forward so
-        # the importance ratio reflects only weight changes, not router drift.
-        from contextlib import nullcontext
-        if self._r3_enabled and self._r3_store:
-            from lumenrl.moe.moe_utils import megatron_replay_router_logits
-            r3_ctx = megatron_replay_router_logits(self.module, self._r3_store)
-        else:
-            r3_ctx = nullcontext()
-        with r3_ctx:
+        from lumenrl.engine.training.megatron_r3_replay import (
+            clear_replay,
+            routes_from_batch,
+        )
+
+        if self._r3_enabled:
+            self._r3_batch_routes = routes_from_batch(batch)
+            self._r3_append = True
+            clear_replay()
+        try:
             losses = fwd_bwd(
                 forward_step_func=forward_step, data_iterator=[data_iter], model=[self._ddp],
                 num_microbatches=num_mb, seq_length=1, micro_batch_size=1, forward_only=False,
             )
+        finally:
+            if self._r3_enabled:
+                clear_replay()
+                self._r3_batch_routes = None
+                self._r3_append = False
 
         _mem_diag_end("update")
         update_successful, grad_norm, _ = self.optimizer.step()
@@ -1679,7 +1738,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
 
             def forward_step(di, model, *args, **kwargs):
                 mb = next(di[0] if isinstance(di, list) else di)
-                out, layouts = self._pp_forward_model(model, mb["ids_list"])
+                out, layouts = self._pp_forward_model(model, mb)
 
                 def collect(output_tensor, non_loss_data=True):
                     lt = output_tensor.logits if hasattr(output_tensor, "logits") else output_tensor
@@ -1699,21 +1758,27 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 return out, collect
 
             fwd_bwd = get_forward_backward_func()
-            # R3: record this (old-logprob) forward's router logits so the update
-            # can replay the identical routing. Reset the per-step store first.
-            from contextlib import nullcontext
+            from lumenrl.engine.training.megatron_r3_replay import (
+                clear_replay,
+                routes_from_batch,
+            )
+
             if self._r3_enabled:
-                from lumenrl.moe.moe_utils import megatron_record_router_logits
-                self._r3_store = {}
-                r3_ctx = megatron_record_router_logits(self.module, self._r3_store)
-            else:
-                r3_ctx = nullcontext()
-            with torch.no_grad(), r3_ctx:
-                data_store = fwd_bwd(
-                    forward_step_func=forward_step, data_iterator=[data_iter], model=[self.module],
-                    num_microbatches=num_mb, seq_length=1, micro_batch_size=1,
-                    forward_only=True, collect_non_loss_data=True,
-                )
+                self._r3_batch_routes = routes_from_batch(batch)
+                self._r3_append = False
+                clear_replay()
+            try:
+                with torch.no_grad():
+                    data_store = fwd_bwd(
+                        forward_step_func=forward_step, data_iterator=[data_iter], model=[self.module],
+                        num_microbatches=num_mb, seq_length=1, micro_batch_size=1,
+                        forward_only=True, collect_non_loss_data=True,
+                    )
+            finally:
+                if self._r3_enabled:
+                    clear_replay()
+                    self._r3_batch_routes = None
+                    self._r3_append = False
             # ``data_store`` is populated on the last stage only.
             for res in data_store:
                 for (r, start, L, tok_lp, ent) in res:

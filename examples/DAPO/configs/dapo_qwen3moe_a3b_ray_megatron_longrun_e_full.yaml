@@ -98,7 +98,7 @@ moe:
   r3:
     enabled: false
     record_router_logits: true
-    replay_mode: distribution
+    replay_mode: hard_assignment
 
 algorithm:
   name: dapo

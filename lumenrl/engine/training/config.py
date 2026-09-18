@@ -598,9 +598,11 @@ class QuantizationConfig:
 
 @dataclass
 class R3Config:
+    # Production R3 is vLLM + hard_assignment only. ``assert_supported_r3``
+    # fail-closes ATOM backends and replay_mode=distribution.
     enabled: bool = False
-    record_router_logits: bool = True
-    replay_mode: str = "distribution"
+    record_router_logits: bool = False
+    replay_mode: str = "hard_assignment"
     # Rollout Routing Replay (arXiv 2510.11370): take the top-k expert ids the
     # ROLLOUT engine actually selected and replay them in the training forward
     # and backward, instead of re-deriving routing from the trainer's own
@@ -613,6 +615,9 @@ class R3Config:
     # so only ~4% of tokens route identically through all 48 layers, and forcing
     # the gate to fp32 on both sides measured as no improvement at all.
     rollout_replay: bool = False
+    # Print ``r3_verify/*`` (same-weight train vs rollout log-prob mismatch).
+    # Off by default; independent of ``enabled``.
+    print_train_rollout_mismatch: bool = False
 
 
 @dataclass
@@ -900,6 +905,20 @@ class LumenRLConfig:
     val_dataset: str = ""
     val_steps: int = 0        # validate every N steps; 0 = no validation
     val_batch_size: int = 16
+
+    def __post_init__(self) -> None:
+        # Fail-close unsupported R3 combinations at construction. Reuses the
+        # single source of truth in ``r3_scope`` (imported directly, not via
+        # ``lumenrl.moe``, to avoid cycling through ``R3Manager``). Runs on
+        # ``OmegaConf.to_object`` too, so ``from_yaml`` needs no extra check.
+        if not self.moe.r3.enabled:
+            return
+        from lumenrl.moe.r3_scope import assert_supported_r3
+
+        assert_supported_r3(
+            replay_mode=self.moe.r3.replay_mode,
+            generation_backend=self.policy.generation_backend,
+        )
 
     @classmethod
     def from_yaml(cls, path: str | Path, overrides: list[str] | None = None) -> "LumenRLConfig":

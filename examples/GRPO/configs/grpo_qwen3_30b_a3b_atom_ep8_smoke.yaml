@@ -126,9 +126,10 @@ quantization:
 
 moe:
   r3:
-    enabled: true
-    record_router_logits: true
-    replay_mode: distribution
+    # ATOM + R3 is fail-closed; vLLM hard_assignment is the production path.
+    enabled: false
+    record_router_logits: false
+    replay_mode: hard_assignment
 
 reward:
   type: function
