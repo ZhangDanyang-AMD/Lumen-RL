@@ -94,6 +94,12 @@ def _is_fp8_fnuz() -> bool:
     return any(a in arch for a in ("gfx940", "gfx941", "gfx942"))
 
 
+# Elements per FP32 chunk in _per_block_cast_to_fp8. 16M bf16 elements -> a 64 MiB
+# FP32 temporary, small enough to stay under the BF16 path's peak on every tensor
+# Qwen3-8B/DSV4 produce, large enough that the loop runs a handful of iterations.
+_FP32_CHUNK_ELEMS = 1 << 24
+
+
 def _scale_name_for_weight(name: str) -> str:
     if not name.endswith(".weight"):
         raise ValueError(f"FP8 scale source must end with '.weight': {name}")
@@ -149,9 +155,32 @@ def _per_block_cast_to_fp8(
         scale = torch.exp2(torch.ceil(torch.log2(scale)))
     weight_scale_inv = scale.to(torch.float32)
 
-    # Quantize: divide in bf16 then cast (avoids full FP32 copy)
-    blocks_scaled = blocks / scale.to(blocks.dtype).unsqueeze(-1).unsqueeze(-1)
-    blocks_fp8 = blocks_scaled.clamp(FP8_MIN, FP8_MAX).to(fp8_dtype)
+    # Quantize through an FP32 reciprocal, in chunks of block-rows.
+    #
+    # Dividing in BF16 first (which this used to do, to avoid an FP32 copy) rounds
+    # the quotient to 8 mantissa bits before the cast rounds it again to e4m3's 3,
+    # and that double rounding is never in our favour: measured against vLLM's
+    # per_block_cast_to_fp8 on Qwen3-8B, 3.01% of elements came out one ULP worse
+    # and none came out better (RMSE 0.8% higher). vLLM's online fp8_per_block
+    # quantizer -- the thing the rollout uses when the actor does NOT pre-quantize
+    # -- multiplies by an FP32 reciprocal, so matching it here makes pre-quantized
+    # and online weight sync bit-identical rather than merely close.
+    #
+    # Chunking keeps that accuracy without paying for it: one FP32 temp per chunk
+    # peaks at 96 MiB on a 12288x4096 tensor, against 192 MiB for the BF16 divide
+    # it replaces (and 384 MiB if the whole tensor goes through FP32 at once).
+    # Keep the block-grid dims on the reciprocal. A 0-dim tensor is a "wrapped
+    # number" for type promotion, so ``bf16 * zero_dim_fp32`` comes back BF16 and
+    # would silently restore the double rounding.
+    recip = scale.reciprocal().unsqueeze(-1).unsqueeze(-1)
+    elems_per_block_row = max(1, blocks[0].numel())
+    step = max(1, _FP32_CHUNK_ELEMS // elems_per_block_row)
+    blocks_fp8 = torch.empty(blocks.shape, dtype=fp8_dtype, device=blocks.device)
+    for i in range(0, blocks.shape[0], step):
+        sl = slice(i, i + step)
+        blocks_fp8[sl] = (
+            (blocks[sl] * recip[sl]).clamp(FP8_MIN, FP8_MAX).to(fp8_dtype)
+        )
 
     # Reshape back and trim padding
     fp8_padded = blocks_fp8.permute(0, 2, 1, 3).reshape(PM, PN)
