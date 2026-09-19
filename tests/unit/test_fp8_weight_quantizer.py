@@ -133,3 +133,70 @@ def test_pow2_scales_round_up_not_to_nearest() -> None:
     assert int(mant.abs().sum()) == 0
     assert (pow2 >= continuous).all()
     assert torch.allclose(pow2, torch.exp2(torch.ceil(torch.log2(continuous))))
+
+
+def test_per_block_cast_rounds_through_fp32_not_bf16(monkeypatch) -> None:
+    """The cast must not double-round through BF16.
+
+    Dividing by the scale in BF16 rounds the quotient to 8 mantissa bits before the
+    e4m3 cast rounds it again to 3. That is never closer to the original than a
+    single rounding out of FP32, and it made pre-quantized weight sync disagree with
+    vLLM's online ``per_block_cast_to_fp8`` on 3.01% of Qwen3-8B's elements. Pin the
+    FP32 path: with it, the two are bit-identical.
+    """
+    monkeypatch.setattr(quantizer, "_is_fp8_fnuz", lambda: False)
+    torch.manual_seed(0)
+    weight = torch.randn(128, 128).to(torch.bfloat16)
+
+    fp8_weight, scale_inv = quantizer._per_block_cast_to_fp8(
+        weight,
+        block_size=(128, 128),
+    )
+
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    scale = scale_inv.reshape(())
+    # .float() explicitly: a 0-dim tensor is a "wrapped number" for type promotion,
+    # so ``bf16_tensor * zero_dim_fp32`` yields BF16 and would quietly re-introduce
+    # the double rounding this test exists to catch. The implementation is safe
+    # because its reciprocal always carries the (bm, bn, 1, 1) block-grid shape.
+    expected = (
+        (weight.float() * scale.reciprocal())
+        .clamp(-fp8_max, fp8_max)
+        .to(torch.float8_e4m3fn)
+    )
+    assert torch.equal(fp8_weight.view(torch.uint8), expected.view(torch.uint8))
+
+    # The fixture has to actually exercise the difference, or this test passes
+    # for the wrong reason.
+    bf16_divide = (
+        (weight / scale.to(weight.dtype))
+        .clamp(-fp8_max, fp8_max)
+        .to(torch.float8_e4m3fn)
+    )
+    assert bf16_divide.dtype == torch.float8_e4m3fn
+    differing = int(
+        (bf16_divide.view(torch.uint8) != expected.view(torch.uint8)).sum()
+    )
+    assert differing > 0, "fixture no longer triggers the double rounding"
+
+    # Every one of those differences is a loss for the BF16 divide, never a gain.
+    original = weight.float()
+    err_fp32 = (expected.float() * scale - original).abs()
+    err_bf16 = (bf16_divide.float() * scale - original).abs()
+    assert float(err_fp32.pow(2).mean()) < float(err_bf16.pow(2).mean())
+    assert bool((err_fp32 <= err_bf16).all())
+
+
+def test_per_block_cast_chunking_does_not_change_the_result(monkeypatch) -> None:
+    """The FP32 chunk size is a memory knob, not a numerics knob."""
+    monkeypatch.setattr(quantizer, "_is_fp8_fnuz", lambda: False)
+    torch.manual_seed(1)
+    weight = torch.randn(384, 256).to(torch.bfloat16)
+
+    whole, whole_scale = quantizer._per_block_cast_to_fp8(weight)
+    # One block-row per chunk instead of all of them at once.
+    monkeypatch.setattr(quantizer, "_FP32_CHUNK_ELEMS", 1)
+    chunked, chunked_scale = quantizer._per_block_cast_to_fp8(weight)
+
+    assert torch.equal(whole.view(torch.uint8), chunked.view(torch.uint8))
+    assert torch.equal(whole_scale, chunked_scale)
