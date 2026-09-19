@@ -26,7 +26,12 @@ import lumenrl.algorithms  # noqa: F401  — populate ALGORITHM_REGISTRY
 from lumenrl.core.config import LumenRLConfig
 from lumenrl.core.protocol import DataProto
 from lumenrl.core.registry import ALGORITHM_REGISTRY
-from lumenrl.controller import DispatchMode, RayCluster, RayWorkerGroup, create_fused_worker_cls
+from lumenrl.controller import (
+    DispatchMode,
+    RayCluster,
+    RayWorkerGroup,
+    create_fused_worker_cls,
+)
 from lumenrl.controller.dispatch import dispatch_proto
 from lumenrl.engine.training.base_engine import BaseEngine, EngineRegistry
 from lumenrl.quantization.rollout_correction import apply_rollout_correction
@@ -59,14 +64,16 @@ def _response_token_ids(
         return sequence[:0]
     response_start = int(real_positions[0].item()) + int(prompt_length)
     real_end = int(real_positions[-1].item()) + 1
-    return sequence[min(response_start, real_end):real_end]
+    return sequence[min(response_start, real_end) : real_end]
 
 
 def _format_chat_prompt(tokenizer: Any, messages: list[dict[str, Any]]) -> str:
     """Format chat messages without silently dropping model turn markers."""
     if getattr(tokenizer, "chat_template", None):
         return tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
         )
 
     convert_token = getattr(tokenizer, "convert_tokens_to_ids", None)
@@ -81,7 +88,9 @@ def _format_chat_prompt(tokenizer: Any, messages: list[dict[str, Any]]) -> str:
             return encode_messages(messages, thinking_mode="thinking")
 
     return tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True,
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
     )
 
 
@@ -112,9 +121,13 @@ class RLTrainer:
         self._use_vllm: bool = self._gen_backend == "vllm"
         _vcfg = config.policy.generation.vllm_cfg
         # Keep one vLLM resident per GPU and update weights in place (no rebuild).
-        self._vllm_persistent: bool = self._use_vllm and bool(getattr(_vcfg, "persistent", True))
+        self._vllm_persistent: bool = self._use_vllm and bool(
+            getattr(_vcfg, "persistent", True)
+        )
         # Each rank generates its own shard of the batch on its local GPU.
-        self._vllm_dp: bool = self._use_vllm and bool(getattr(_vcfg, "data_parallel_rollout", True))
+        self._vllm_dp: bool = self._use_vllm and bool(
+            getattr(_vcfg, "data_parallel_rollout", True)
+        )
         # ``_use_atom`` is kept as the "external colocated inference engine" flag
         # (offload optimizer during rollout, sleep engine during training,
         # safetensors weight sync). Both ATOM and vanilla vLLM use this path.
@@ -122,8 +135,7 @@ class RLTrainer:
         # Ray controller orchestration path is opt-in via config/env/ray address.
         self._use_ray_controller: bool = (
             bool(getattr(config.controller.ray, "enabled", False))
-            or
-            os.environ.get("LUMENRL_USE_RAY_CONTROLLER", "0") == "1"
+            or os.environ.get("LUMENRL_USE_RAY_CONTROLLER", "0") == "1"
             or bool(getattr(config.cluster, "ray_address", None))
         )
         self._critic_worker: Any = None
@@ -132,7 +144,9 @@ class RLTrainer:
         self._actor_wg: RayWorkerGroup | None = None
         self._ref_wg: RayWorkerGroup | None = None
         self._actor_mp: int = 1  # Megatron model-parallel size (TP*PP*CP)
-        self._actor_dp_size: int = 0  # data-parallel size (0 => not queried; fallback below)
+        self._actor_dp_size: int = (
+            0  # data-parallel size (0 => not queried; fallback below)
+        )
         self._ray_dispatch_state: dict[str, Any] = {}
         self._profiler: DistProfiler | None = None
         self._prev_step_profile: bool = False
@@ -150,9 +164,13 @@ class RLTrainer:
         self._last_weight_sync_metrics: dict[str, float] = {}
         self._is_distributed: bool = torch.distributed.is_initialized()
         self._rank: int = torch.distributed.get_rank() if self._is_distributed else 0
-        self._world_size: int = torch.distributed.get_world_size() if self._is_distributed else 1
+        self._world_size: int = (
+            torch.distributed.get_world_size() if self._is_distributed else 1
+        )
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        self._device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+        self._device = torch.device(
+            f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
+        )
 
     def setup(self) -> None:
         """Initialize models, optimizer, dataset, and algorithm."""
@@ -176,14 +194,18 @@ class RLTrainer:
         quant["fused_mlp"] = tq.fused_mlp
         quant["fused_rope"] = tq.fused_rope
 
-        optimizer_dtype_str = getattr(self.config.policy.training, "optimizer_dtype", "bf16")
+        optimizer_dtype_str = getattr(
+            self.config.policy.training, "optimizer_dtype", "bf16"
+        )
         lr = getattr(self.config.policy, "learning_rate", 1e-6)
         self._base_lr = lr
         self._lr_warmup_steps = getattr(self.config.policy, "lr_warmup_steps", 10)
         self._param_offload = False
 
         fsdp_cfg_dict: dict = {}
-        if hasattr(self.config.policy, "training") and hasattr(self.config.policy.training, "fsdp_cfg"):
+        if hasattr(self.config.policy, "training") and hasattr(
+            self.config.policy.training, "fsdp_cfg"
+        ):
             _fc = self.config.policy.training.fsdp_cfg
             if isinstance(_fc, dict):
                 fsdp_cfg_dict = _fc
@@ -198,8 +220,13 @@ class RLTrainer:
                 f"got {backend_str!r}."
             )
 
-        logger.info("[rank %d] Building actor model via Engine layer: %s (backend=%s, optimizer_dtype=%s)",
-                    self._rank, model_name, backend_key, optimizer_dtype_str)
+        logger.info(
+            "[rank %d] Building actor model via Engine layer: %s (backend=%s, optimizer_dtype=%s)",
+            self._rank,
+            model_name,
+            backend_key,
+            optimizer_dtype_str,
+        )
 
         # Mixed-precision training (verl-aligned): the optimizer keeps FP32
         # master weights so that small Adam updates (lr ~1e-6) accumulate
@@ -225,7 +252,9 @@ class RLTrainer:
             "lr": lr,
             "weight_decay": getattr(self.config.policy, "weight_decay", 0.01),
             "clip_grad": getattr(self.config.policy, "max_grad_norm", 1.0),
-            "lr_scheduler_type": getattr(self.config.policy, "lr_decay_style", "cosine"),
+            "lr_scheduler_type": getattr(
+                self.config.policy, "lr_decay_style", "cosine"
+            ),
             "lr_warmup_steps": self._lr_warmup_steps,
             "lr_warmup_steps_ratio": getattr(self.config.policy, "warmup_ratio", 0.0),
             "total_training_steps": int(self.config.num_training_steps),
@@ -252,7 +281,9 @@ class RLTrainer:
 
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        self._tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            model_name, trust_remote_code=True
+        )
         if self._tokenizer.pad_token is None:
             self._tokenizer.pad_token = self._tokenizer.eos_token
         self._tokenizer.padding_side = "left"
@@ -267,8 +298,12 @@ class RLTrainer:
             kl_coeff = self.config.algorithm.ppo.kl_coeff
 
         if kl_coeff > 0.0:
-            logger.info("[rank %d] Loading reference model (kl_coeff=%.4f): %s",
-                        self._rank, kl_coeff, model_name)
+            logger.info(
+                "[rank %d] Loading reference model (kl_coeff=%.4f): %s",
+                self._rank,
+                kl_coeff,
+                model_name,
+            )
             self._ref_model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 torch_dtype=torch.bfloat16,
@@ -286,6 +321,7 @@ class RLTrainer:
 
         if self._use_vllm:
             from lumenrl.engine.inference.vllm_engine import VLLMEngine
+
             vllm_cfg = self.config.policy.generation.vllm_cfg
             # verl alignment: seed the rollout engine with the top-level seed when
             # the config doesn't override it, so vLLM sampling is reproducible and
@@ -295,30 +331,40 @@ class RLTrainer:
             self._atom_engine = VLLMEngine(config=vllm_cfg, model_name=model_name)
             logger.info(
                 "[rank %d] vLLM engine configured (lazy init on first rollout, "
-                "calculate_log_probs=%s).", self._rank, vllm_cfg.calculate_log_probs,
+                "calculate_log_probs=%s).",
+                self._rank,
+                vllm_cfg.calculate_log_probs,
             )
         elif self._use_atom:
             from lumenrl.engine.inference.atom_engine import AtomEngine
+
             atom_cfg = self.config.policy.generation.atom_cfg
             self._atom_engine = AtomEngine(config=atom_cfg, model_name=model_name)
-            logger.info("[rank %d] ATOM engine configured (lazy init on first rollout).", self._rank)
+            logger.info(
+                "[rank %d] ATOM engine configured (lazy init on first rollout).",
+                self._rank,
+            )
 
         self._load_dataset()
 
         # ---- Validation dataset ----
-        val_path = getattr(self.config, 'val_dataset', '')
+        val_path = getattr(self.config, "val_dataset", "")
         if val_path:
             self._load_val_dataset(val_path)
 
         if not self.callbacks:
-            self.callbacks.append(LoggingCallback(interval=max(1, self.config.logger.log_interval)))
+            self.callbacks.append(
+                LoggingCallback(interval=max(1, self.config.logger.log_interval))
+            )
 
         # ---- Critic worker (value model for PPO/GAE) ----
-        if getattr(self.config, 'critic', None) and self.config.critic.enabled:
+        if getattr(self.config, "critic", None) and self.config.critic.enabled:
             from lumenrl.workers import CriticWorker
+
             critic_config_dict = {
                 "critic": {
-                    "model_name": self.config.critic.model_name or self.config.policy.model_name,
+                    "model_name": self.config.critic.model_name
+                    or self.config.policy.model_name,
                     "training_backend": self.config.critic.training_backend,
                     "learning_rate": self.config.critic.learning_rate,
                     "weight_decay": self.config.critic.weight_decay,
@@ -326,12 +372,19 @@ class RLTrainer:
                     "value_clip_ratio": self.config.critic.value_clip_ratio,
                 },
                 "policy": {
-                    "model_name": self.config.critic.model_name or self.config.policy.model_name,
-                    "training": vars(self.config.policy.training) if hasattr(self.config.policy.training, '__dict__') else {},
-                    "seed": getattr(self.config, 'seed', 42),
+                    "model_name": self.config.critic.model_name
+                    or self.config.policy.model_name,
+                    "training": (
+                        vars(self.config.policy.training)
+                        if hasattr(self.config.policy.training, "__dict__")
+                        else {}
+                    ),
+                    "seed": getattr(self.config, "seed", 42),
                 },
             }
-            self._critic_worker = CriticWorker(self._rank, self._world_size, critic_config_dict)
+            self._critic_worker = CriticWorker(
+                self._rank, self._world_size, critic_config_dict
+            )
             self._critic_worker.init_model()
             logger.info("[rank %d] CriticWorker initialized.", self._rank)
 
@@ -347,14 +400,19 @@ class RLTrainer:
             _kl_coef = algo_cfg.ppo.kl_coeff
         if _kl_coef > 0.0 and algo_cfg.use_kl_in_reward:
             from lumenrl.algorithms.kl_controller import get_kl_controller
+
             self._kl_ctrl = get_kl_controller(
                 kl_ctrl_type=algo_cfg.kl_ctrl_type,
                 kl_coef=_kl_coef,
                 target_kl=algo_cfg.kl_target,
                 horizon=algo_cfg.kl_horizon,
             )
-            logger.info("[rank %d] KL controller: type=%s, coef=%.4f, use_kl_in_reward=True",
-                        self._rank, algo_cfg.kl_ctrl_type, _kl_coef)
+            logger.info(
+                "[rank %d] KL controller: type=%s, coef=%.4f, use_kl_in_reward=True",
+                self._rank,
+                algo_cfg.kl_ctrl_type,
+                _kl_coef,
+            )
 
         self._resume_step = 0
         if getattr(self.config.checkpointing, "resume", True):
@@ -363,11 +421,20 @@ class RLTrainer:
         if self._is_distributed:
             torch.distributed.barrier()
 
-        logger.info("[rank %d] RLTrainer.setup complete: algo=%s, model=%s, world_size=%d, atom=%s, resume_step=%d",
-                     self._rank, self.config.algorithm.name, model_name, self._world_size, self._use_atom, self._resume_step)
+        logger.info(
+            "[rank %d] RLTrainer.setup complete: algo=%s, model=%s, world_size=%d, atom=%s, resume_step=%d",
+            self._rank,
+            self.config.algorithm.name,
+            model_name,
+            self._world_size,
+            self._use_atom,
+            self._resume_step,
+        )
         self._init_profiler()
 
-    def _rendezvous_ray_group(self, wg: "RayWorkerGroup", timeout_s: int = 7200) -> None:
+    def _rendezvous_ray_group(
+        self, wg: "RayWorkerGroup", timeout_s: int = 7200
+    ) -> None:
         """Form a cross-actor torch.distributed group so FSDP2 shards + syncs grads.
 
         verl-aligned: pick the master address from actor rank 0's node plus a
@@ -405,7 +472,9 @@ class RLTrainer:
         ray.get(refs)
         logger.info(
             "Ray rendezvous complete: %d distributed actors on %s:%s.",
-            n, master_addr, master_port,
+            n,
+            master_addr,
+            master_port,
         )
 
     def _compute_actor_mp(self) -> int:
@@ -425,7 +494,11 @@ class RLTrainer:
             return 1
         try:
             meg = self.config.policy.training.megatron_cfg
-            tp = int(getattr(meg, "tensor_model_parallel_size", None) or getattr(meg, "tensor_parallel_size", 1) or 1)
+            tp = int(
+                getattr(meg, "tensor_model_parallel_size", None)
+                or getattr(meg, "tensor_parallel_size", 1)
+                or 1
+            )
             pp = int(getattr(meg, "pipeline_model_parallel_size", 1) or 1)
             cp = int(getattr(meg, "context_parallel_size", 1) or 1)
         except Exception:
@@ -480,7 +553,9 @@ class RLTrainer:
 
         colocation_wg = getattr(self, "_rollout_wg", None) or self._actor_wg
         if colocation_wg is not self._actor_wg:
-            logger.info("vLLM replicas will be placed on rollout workers (separation mode).")
+            logger.info(
+                "vLLM replicas will be placed on rollout workers (separation mode)."
+            )
         mgr = VLLMReplicaManager(
             colocation_wg,
             model_name,
@@ -493,7 +568,9 @@ class RLTrainer:
         mgr.create()
         self._ray_rollout_mgr = mgr
         self._ray_vllm_engine = VLLMHttpEngine(
-            mgr, sleep_level=int(vcfg.sleep_level), enable_sleep=bool(vcfg.enable_sleep_mode),
+            mgr,
+            sleep_level=int(vcfg.sleep_level),
+            enable_sleep=bool(vcfg.enable_sleep_mode),
         )
         weight_backend = str(getattr(self.config.weight_sync, "backend", "auto"))
         if weight_backend == "rdma":
@@ -509,7 +586,8 @@ class RLTrainer:
             )
         logger.info(
             "Ray vLLM rollout ready: %d replicas (TP=%d, separation=%s, weight_sync=%s).",
-            mgr.num_replicas, tp,
+            mgr.num_replicas,
+            tp,
             colocation_wg is not self._actor_wg,
             weight_backend,
         )
@@ -534,16 +612,21 @@ class RLTrainer:
         ) / (1 << 30)
         logger.info(
             "Released actor allocator cache before ATOM rollout: %.2f GiB over %d ranks.",
-            freed_gb, len(stats),
+            freed_gb,
+            len(stats),
         )
 
-    def _setup_ray_atom_rollout(self, model_name: str, vcfg: Any, atom_cfg: Any) -> None:
+    def _setup_ray_atom_rollout(
+        self, model_name: str, vcfg: Any, atom_cfg: Any
+    ) -> None:
         """Build colocated ATOM rollout replicas + client on the Ray controller path."""
         from lumenrl.engine.inference.atom_ray_server import ATOMReplicaManager
         from lumenrl.engine.inference.vllm_http_engine import VLLMHttpEngine
 
         seed = self.config.seed if getattr(vcfg, "seed", None) is None else vcfg.seed
-        max_model_len = getattr(atom_cfg, "max_model_len", None) or getattr(vcfg, "max_model_len", None)
+        max_model_len = getattr(atom_cfg, "max_model_len", None) or getattr(
+            vcfg, "max_model_len", None
+        )
         quant_cfg = getattr(atom_cfg, "online_quant_config", None)
         vllm_quant = str(getattr(vcfg, "quantization", "") or "")
         if quant_cfg is None and vllm_quant in {"fp8_per_block", "per_block_fp8"}:
@@ -553,14 +636,22 @@ class RLTrainer:
             model=model_name,
             tensor_parallel_size=int(getattr(atom_cfg, "tensor_parallel_size", 1) or 1),
             data_parallel_size=int(getattr(atom_cfg, "data_parallel_size", 1) or 1),
-            enable_expert_parallel=int(getattr(atom_cfg, "expert_parallel_size", 1) or 1) > 1,
-            gpu_memory_utilization=float(getattr(atom_cfg, "gpu_memory_utilization", None) or vcfg.gpu_memory_utilization),
+            enable_expert_parallel=int(
+                getattr(atom_cfg, "expert_parallel_size", 1) or 1
+            )
+            > 1,
+            gpu_memory_utilization=float(
+                getattr(atom_cfg, "gpu_memory_utilization", None)
+                or vcfg.gpu_memory_utilization
+            ),
             max_num_batched_tokens=int(vcfg.max_num_batched_tokens),
             max_num_seqs=int(vcfg.max_num_seqs),
             enforce_eager=bool(vcfg.enforce_eager),
             trust_remote_code=bool(vcfg.trust_remote_code),
             enable_chunked_prefill=bool(vcfg.enable_chunked_prefill),
-            enable_prefix_caching=bool(getattr(atom_cfg, "enable_prefix_caching", False)),
+            enable_prefix_caching=bool(
+                getattr(atom_cfg, "enable_prefix_caching", False)
+            ),
         )
         kv_cache_dtype = str(getattr(atom_cfg, "kv_cache_dtype", "auto") or "auto")
         if kv_cache_dtype != "auto":
@@ -576,7 +667,9 @@ class RLTrainer:
 
         colocation_wg = getattr(self, "_rollout_wg", None) or self._actor_wg
         if colocation_wg is not self._actor_wg:
-            logger.info("ATOM replicas will be placed on rollout workers (separation mode).")
+            logger.info(
+                "ATOM replicas will be placed on rollout workers (separation mode)."
+            )
         mgr = ATOMReplicaManager(
             colocation_wg,
             model_name,
@@ -587,13 +680,31 @@ class RLTrainer:
         mgr.create()
         self._ray_rollout_mgr = mgr
         self._ray_vllm_engine = VLLMHttpEngine(
-            mgr, sleep_level=int(vcfg.sleep_level), enable_sleep=bool(vcfg.enable_sleep_mode),
+            mgr,
+            sleep_level=int(vcfg.sleep_level),
+            enable_sleep=bool(vcfg.enable_sleep_mode),
         )
+        weight_backend = str(getattr(self.config.weight_sync, "backend", "auto"))
+        if weight_backend == "rdma":
+            # Built once at startup and held for the run: the RCCL group is
+            # persistent, so per-step sync is a broadcast rather than a
+            # rendezvous. Mirrors _setup_ray_vllm_rollout.
+            rdma_cfg = self.config.weight_sync.rdma
+            group_name = f"lumen-atom-rdma-weights-{os.getpid()}"
+            mgr.init_rdma_weight_group(
+                self._actor_wg,
+                interface=str(rdma_cfg.interface),
+                hca=str(rdma_cfg.hca),
+                require_rdma=bool(rdma_cfg.require_rdma),
+                timeout_s=int(self.config.weight_sync.timeout_s),
+                group_name=group_name,
+            )
         logger.info(
-            "Ray ATOM rollout ready: %d colocated replicas (TP=%d, online_quant=%s, ZMQ IPC weight sync).",
+            "Ray ATOM rollout ready: %d colocated replicas (TP=%d, online_quant=%s, weight_sync=%s).",
             mgr.num_replicas,
             int(engine_kwargs["tensor_parallel_size"]),
             engine_kwargs.get("online_quant_config"),
+            weight_backend,
         )
 
     @property
@@ -604,7 +715,10 @@ class RLTrainer:
         return bool(getattr(r3, "rollout_replay", False))
 
     def _rollout_with_ray_vllm(
-        self, prompts: list[str], num_generations: int, sampling_params: dict[str, Any] | None = None,
+        self,
+        prompts: list[str],
+        num_generations: int,
+        sampling_params: dict[str, Any] | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -627,8 +741,7 @@ class RLTrainer:
         # ``rollout_replay``. Both consume the same per-completion expert ids,
         # so retain the ragged payload for either mode.
         want_r3 = bool(
-            getattr(self.config.moe.r3, "enabled", False)
-            or self._r3_rollout_replay
+            getattr(self.config.moe.r3, "enabled", False) or self._r3_rollout_replay
         )
 
         # Send pre-tokenized prompt_token_ids (verl's token-in path), NOT the
@@ -652,9 +765,15 @@ class RLTrainer:
             )["input_ids"]
             expanded.extend([list(ids)] * num_generations)
 
-        sp = dict(sampling_params) if sampling_params is not None else self._ray_sampling_params(want_lp)
+        sp = (
+            dict(sampling_params)
+            if sampling_params is not None
+            else self._ray_sampling_params(want_lp)
+        )
         if getattr(self._ray_vllm_engine, "_sleeping", False):
-            logger.info("Ray rollout engine sleeping before generation; refreshing weights before wake.")
+            logger.info(
+                "Ray rollout engine sleeping before generation; refreshing weights before wake."
+            )
             self._sync_weights_ipc()
         results = self._ray_vllm_engine.generate_tokens(expanded, sp)
 
@@ -735,7 +854,9 @@ class RLTrainer:
         """Sampling params matching _rollout_with_vllm for cross-transport parity."""
         vcfg = self.config.policy.generation.vllm_cfg
         algo_name = self.config.algorithm.name.lower()
-        max_total = int(getattr(self.config.policy, "max_total_sequence_length", 0) or 0)
+        max_total = int(
+            getattr(self.config.policy, "max_total_sequence_length", 0) or 0
+        )
         max_resp = int(getattr(self.config.policy, "max_response_length", 0) or 0)
         max_tok = max_resp if max_resp > 0 else max(128, max_total // 2)
         sp: dict[str, Any] = {
@@ -754,7 +875,9 @@ class RLTrainer:
         """Validation sampling params, independently configurable from rollout."""
         ecfg = self.config.eval
         max_resp = int(getattr(self.config.policy, "max_response_length", 0) or 0)
-        max_total = int(getattr(self.config.policy, "max_total_sequence_length", 0) or 0)
+        max_total = int(
+            getattr(self.config.policy, "max_total_sequence_length", 0) or 0
+        )
         return {
             "max_tokens": max_resp if max_resp > 0 else max(128, max_total // 2),
             "temperature": float(getattr(ecfg, "temperature", 0.0)),
@@ -818,8 +941,12 @@ class RLTrainer:
         separated = getattr(self, "_rollout_wg", None) is not None
         if separated or not self._ipc_endpoints_match_actors(mgr):
             if LUMENRL_DEBUG:
-                logger.info("[DBG] _sync_weights_ipc: separated=%s replicas=%d workers=%d, using safetensors",
-                            separated, mgr.num_replicas, self._actor_wg.num_workers)
+                logger.info(
+                    "[DBG] _sync_weights_ipc: separated=%s replicas=%d workers=%d, using safetensors",
+                    separated,
+                    mgr.num_replicas,
+                    self._actor_wg.num_workers,
+                )
             self._sync_weights_safetensors(mgr)
             return
 
@@ -838,11 +965,11 @@ class RLTrainer:
         if sleeping:
             rollout_engine.wake(tags=["weights"])
         # 2) start receivers + senders concurrently, then join both.
-        recv = [
-            s.update_weights_from_ipc.remote(use_shm, version) for s in mgr.servers
-        ]
+        recv = [s.update_weights_from_ipc.remote(use_shm, version) for s in mgr.servers]
         send = self._actor_wg.execute_all_async(
-            "update_weights_ipc_send", bucket_size_mb=bmb, use_shm=use_shm,
+            "update_weights_ipc_send",
+            bucket_size_mb=bmb,
+            use_shm=use_shm,
             version=version,
         )
         # Join as they finish rather than senders-then-receivers. The two sides
@@ -896,7 +1023,7 @@ class RLTrainer:
         )
         self._last_weight_sync_integrity = [
             result.get("integrity")
-            for result in results[len(send_refs):]
+            for result in results[len(send_refs) :]
             if isinstance(result, dict)
         ]
         sender = next(
@@ -955,8 +1082,13 @@ class RLTrainer:
         export_meta = export_results[0]
 
         orig = Path(self.config.policy.model_name)
-        for fname in ["config.json", "tokenizer_config.json", "tokenizer.json",
-                      "special_tokens_map.json", "generation_config.json"]:
+        for fname in [
+            "config.json",
+            "tokenizer_config.json",
+            "tokenizer.json",
+            "special_tokens_map.json",
+            "generation_config.json",
+        ]:
             src = orig / fname
             if src.exists():
                 shutil.copy2(str(src), str(sync_dir / fname))
@@ -1021,7 +1153,9 @@ class RLTrainer:
                     f"got {rdma_cfg.gdr_mode!r}"
                 )
         if RayCluster is None or RayWorkerGroup is None:
-            raise RuntimeError("Ray controller modules are unavailable in this environment.")
+            raise RuntimeError(
+                "Ray controller modules are unavailable in this environment."
+            )
         if not self._use_atom:
             raise NotImplementedError(
                 "Ray controller path currently requires policy.generation_backend in {atom, vllm}."
@@ -1034,7 +1168,9 @@ class RLTrainer:
 
         model_name = self.config.policy.model_name
         cfg_dict = self._to_plain_dict(self.config)
-        default_workers = max(1, self.config.cluster.num_nodes * self.config.cluster.gpus_per_node)
+        default_workers = max(
+            1, self.config.cluster.num_nodes * self.config.cluster.gpus_per_node
+        )
         ray_cfg = self.config.controller.ray
 
         self._ray_cluster = RayCluster(self.config.cluster)
@@ -1050,8 +1186,12 @@ class RLTrainer:
             kl_coeff = self.config.algorithm.ppo.kl_coeff
         actor_role = ray_cfg.actor
         ref_role = ray_cfg.ref
-        actor_workers = actor_role.num_workers if actor_role.num_workers > 0 else default_workers
-        ref_workers = ref_role.num_workers if ref_role.num_workers > 0 else default_workers
+        actor_workers = (
+            actor_role.num_workers if actor_role.num_workers > 0 else default_workers
+        )
+        ref_workers = (
+            ref_role.num_workers if ref_role.num_workers > 0 else default_workers
+        )
         actor_pool_name = ray_cfg.topology_map.get("actor", "actor")
         ref_pool_name = ray_cfg.topology_map.get("ref", "ref")
 
@@ -1068,6 +1208,7 @@ class RLTrainer:
         self._rollout_wg = None
         if rollout_role.num_workers > 0:
             from lumenrl.workers.base_worker import RolloutPlacementWorker
+
             rollout_pool = self._ray_cluster.create_pool(
                 "rollout",
                 num_gpus=rollout_role.num_workers,
@@ -1091,7 +1232,9 @@ class RLTrainer:
         use_ref = kl_coeff > 0.0
         if ray_cfg.fuse_actor_ref and use_ref:
             if ref_workers != actor_workers:
-                raise ValueError("controller.ray.fuse_actor_ref requires actor/ref num_workers to match.")
+                raise ValueError(
+                    "controller.ray.fuse_actor_ref requires actor/ref num_workers to match."
+                )
             fused_cls = create_fused_worker_cls(
                 {"actor": LumenActorWorker, "ref": RefPolicyWorker},
                 name="ActorRefFusedWorker",
@@ -1111,9 +1254,7 @@ class RLTrainer:
             self._ref_wg = spawned["ref"]
             self._actor_wg.call_all(
                 "init_model",
-                forward_only=(
-                    os.environ.get("LUMENRL_FORWARD_ONLY_INIT", "0") == "1"
-                ),
+                forward_only=(os.environ.get("LUMENRL_FORWARD_ONLY_INIT", "0") == "1"),
             )
             self._ref_wg.call_all("init_model")
             self._actor_wg.setup_dispatch_collect_info()
@@ -1131,9 +1272,7 @@ class RLTrainer:
             self._rendezvous_ray_group(self._actor_wg)
             self._actor_wg.call_all(
                 "init_model",
-                forward_only=(
-                    os.environ.get("LUMENRL_FORWARD_ONLY_INIT", "0") == "1"
-                ),
+                forward_only=(os.environ.get("LUMENRL_FORWARD_ONLY_INIT", "0") == "1"),
             )
             self._actor_wg.setup_dispatch_collect_info()
 
@@ -1150,7 +1289,9 @@ class RLTrainer:
             actor_role.mesh_mapping = mesh
             logger.info(
                 "Megatron model-parallel=%d: actor DP=%d, mesh_mapping=%s",
-                self._actor_mp, self._actor_dp_size, mesh,
+                self._actor_mp,
+                self._actor_dp_size,
+                mesh,
             )
 
         self._try_resume_ray_checkpoint()
@@ -1190,15 +1331,23 @@ class RLTrainer:
             return
 
         from transformers import AutoTokenizer
-        self._tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            model_name, trust_remote_code=True
+        )
         if self._tokenizer.pad_token is None:
             self._tokenizer.pad_token = self._tokenizer.eos_token
         self._tokenizer.padding_side = "left"
 
         vcfg = self.config.policy.generation.vllm_cfg
         atom_cfg = self.config.policy.generation.atom_cfg
-        self._ray_use_vllm = self._use_vllm and str(getattr(vcfg, "transport", "fifo")) == "ray_http"
-        self._ray_use_atom = self._gen_backend == "atom" and str(getattr(atom_cfg, "transport", "fifo")) == "ray_http"
+        self._ray_use_vllm = (
+            self._use_vllm and str(getattr(vcfg, "transport", "fifo")) == "ray_http"
+        )
+        self._ray_use_atom = (
+            self._gen_backend == "atom"
+            and str(getattr(atom_cfg, "transport", "fifo")) == "ray_http"
+        )
         self._ray_rollout_mgr = None
         self._ray_vllm_engine = None
         if self._ray_use_vllm:
@@ -1210,6 +1359,7 @@ class RLTrainer:
             self._atom_engine = None
         else:
             from lumenrl.engine.inference.atom_engine import AtomEngine
+
             self._atom_engine = AtomEngine(config=atom_cfg, model_name=model_name)
         if os.environ.get("LUMENRL_SKIP_DATASET_INIT", "0") == "1":
             logger.info("Diagnostic setup: skipped train and validation datasets")
@@ -1217,12 +1367,14 @@ class RLTrainer:
         self._load_dataset()
 
         # ---- Validation dataset ----
-        val_path = getattr(self.config, 'val_dataset', '')
+        val_path = getattr(self.config, "val_dataset", "")
         if val_path:
             self._load_val_dataset(val_path)
 
         if not self.callbacks:
-            self.callbacks.append(LoggingCallback(interval=max(1, self.config.logger.log_interval)))
+            self.callbacks.append(
+                LoggingCallback(interval=max(1, self.config.logger.log_interval))
+            )
         logger.info(
             "RLTrainer.setup (ray-controller) complete: algo=%s, model=%s, actor_workers=%d, ref=%s, resume_step=%d",
             self.config.algorithm.name,
@@ -1289,15 +1441,21 @@ class RLTrainer:
 
         if os.path.isfile(dataset_path) or os.path.isdir(dataset_path):
             if dataset_path.endswith(".parquet"):
-                self._dataset = load_dataset("parquet", data_files=dataset_path, split="train")
+                self._dataset = load_dataset(
+                    "parquet", data_files=dataset_path, split="train"
+                )
             elif dataset_path.endswith(".jsonl") or dataset_path.endswith(".json"):
-                self._dataset = load_dataset("json", data_files=dataset_path, split="train")
+                self._dataset = load_dataset(
+                    "json", data_files=dataset_path, split="train"
+                )
             else:
                 self._dataset = load_dataset(dataset_path, split="train")
         else:
             self._dataset = load_dataset(dataset_path, split="train")
 
-        logger.info("Loaded dataset: %d samples from %s", len(self._dataset), dataset_path)
+        logger.info(
+            "Loaded dataset: %d samples from %s", len(self._dataset), dataset_path
+        )
         self._build_prompt_permutation()
 
     def _build_prompt_permutation(self) -> None:
@@ -1314,11 +1472,19 @@ class RLTrainer:
         if self._dataset is None:
             return
         reward_cfg = getattr(self.config, "reward", None)
-        do_shuffle = bool(getattr(reward_cfg, "shuffle", True)) if reward_cfg is not None else True
+        do_shuffle = (
+            bool(getattr(reward_cfg, "shuffle", True))
+            if reward_cfg is not None
+            else True
+        )
         if not do_shuffle:
             logger.info("Prompt shuffle disabled; reading dataset sequentially.")
             return
-        seed = getattr(reward_cfg, "shuffle_seed", None) if reward_cfg is not None else None
+        seed = (
+            getattr(reward_cfg, "shuffle_seed", None)
+            if reward_cfg is not None
+            else None
+        )
         if seed is None:
             seed = int(getattr(self.config, "seed", 42))
         n = len(self._dataset)
@@ -1327,7 +1493,9 @@ class RLTrainer:
         self._prompt_perm = torch.randperm(n, generator=gen).tolist()
         logger.info(
             "Built verl-equivalent prompt shuffle: N=%d seed=%d first8=%s",
-            n, int(seed), self._prompt_perm[:8],
+            n,
+            int(seed),
+            self._prompt_perm[:8],
         )
 
     def _load_val_dataset(self, path: str) -> None:
@@ -1336,7 +1504,9 @@ class RLTrainer:
 
         if os.path.isfile(path) or os.path.isdir(path):
             if path.endswith(".parquet"):
-                self._val_dataset = load_dataset("parquet", data_files=path, split="train")
+                self._val_dataset = load_dataset(
+                    "parquet", data_files=path, split="train"
+                )
             elif path.endswith((".jsonl", ".json")):
                 self._val_dataset = load_dataset("json", data_files=path, split="train")
             else:
@@ -1344,7 +1514,11 @@ class RLTrainer:
         else:
             self._val_dataset = load_dataset(path, split="train")
 
-        logger.info("Loaded validation dataset: %d samples from %s", len(self._val_dataset), path)
+        logger.info(
+            "Loaded validation dataset: %d samples from %s",
+            len(self._val_dataset),
+            path,
+        )
 
     def _try_resume_checkpoint(self) -> None:
         """Load model + optimizer state from the latest checkpoint if available."""
@@ -1353,7 +1527,11 @@ class RLTrainer:
         ckpt_dir = self.config.checkpointing.checkpoint_dir
         latest = CheckpointManager.get_latest(ckpt_dir)
         if latest is None:
-            logger.info("[rank %d] No checkpoint found in %s; training from scratch.", self._rank, ckpt_dir)
+            logger.info(
+                "[rank %d] No checkpoint found in %s; training from scratch.",
+                self._rank,
+                ckpt_dir,
+            )
             return
 
         logger.info("[rank %d] Resuming from checkpoint: %s", self._rank, latest)
@@ -1379,12 +1557,17 @@ class RLTrainer:
                         set_optimizer_state_dict,
                         StateDictOptions,
                     )
+
                     opts = StateDictOptions(full_state_dict=True)
                     set_model_state_dict(self._actor_model, model_sd, options=opts)
                     logger.info("[rank %d] Restored FSDP2 model state.", self._rank)
                 except Exception as exc:
-                    logger.warning("[rank %d] FSDP2 set_model_state_dict failed (%s); "
-                                   "trying load_state_dict.", self._rank, exc)
+                    logger.warning(
+                        "[rank %d] FSDP2 set_model_state_dict failed (%s); "
+                        "trying load_state_dict.",
+                        self._rank,
+                        exc,
+                    )
                     self._actor_model.load_state_dict(model_sd, strict=False)
             else:
                 self._actor_model.load_state_dict(model_sd, strict=False)
@@ -1398,38 +1581,66 @@ class RLTrainer:
                         set_optimizer_state_dict,
                         StateDictOptions,
                     )
+
                     opts = StateDictOptions(full_state_dict=True)
                     set_optimizer_state_dict(
-                        self._actor_model, self._optimizer, opt_sd, options=opts,
+                        self._actor_model,
+                        self._optimizer,
+                        opt_sd,
+                        options=opts,
                     )
                     logger.info("[rank %d] Restored FSDP2 optimizer state.", self._rank)
                 except Exception as exc:
-                    logger.warning("[rank %d] FSDP2 set_optimizer_state_dict failed (%s); "
-                                   "trying load_state_dict.", self._rank, exc)
+                    logger.warning(
+                        "[rank %d] FSDP2 set_optimizer_state_dict failed (%s); "
+                        "trying load_state_dict.",
+                        self._rank,
+                        exc,
+                    )
                     try:
                         self._optimizer.load_state_dict(opt_sd)
                     except Exception:
-                        logger.warning("[rank %d] Optimizer state restore failed; using fresh optimizer.", self._rank)
+                        logger.warning(
+                            "[rank %d] Optimizer state restore failed; using fresh optimizer.",
+                            self._rank,
+                        )
             else:
                 try:
                     self._optimizer.load_state_dict(opt_sd)
                     logger.info("[rank %d] Restored optimizer state.", self._rank)
                 except Exception:
-                    logger.warning("[rank %d] Optimizer state restore failed; using fresh optimizer.", self._rank)
+                    logger.warning(
+                        "[rank %d] Optimizer state restore failed; using fresh optimizer.",
+                        self._rank,
+                    )
 
         # Restore FP32 master weights (bf16 optimizer) and LR scheduler position
         # if the checkpoint carried them; without this a bf16-optimizer resume
         # would reinitialise the master copy and drift from the saved model.
         fp32_params = payload.get("fp32_params")
-        if fp32_params and self._optimizer is not None and hasattr(self._optimizer, "fp32_params"):
+        if (
+            fp32_params
+            and self._optimizer is not None
+            and hasattr(self._optimizer, "fp32_params")
+        ):
             try:
                 for dst, src in zip(self._optimizer.fp32_params, fp32_params):
                     dst.data.copy_(src.to(dst.data.device, dtype=dst.data.dtype))
-                logger.info("[rank %d] Restored %d FP32 master params.", self._rank, len(fp32_params))
+                logger.info(
+                    "[rank %d] Restored %d FP32 master params.",
+                    self._rank,
+                    len(fp32_params),
+                )
             except Exception as exc:
-                logger.warning("[rank %d] FP32 master restore failed (%s).", self._rank, exc)
+                logger.warning(
+                    "[rank %d] FP32 master restore failed (%s).", self._rank, exc
+                )
         sched_epoch = payload.get("scheduler_last_epoch")
-        if sched_epoch is not None and self._optimizer is not None and hasattr(self._optimizer, "scheduler"):
+        if (
+            sched_epoch is not None
+            and self._optimizer is not None
+            and hasattr(self._optimizer, "scheduler")
+        ):
             try:
                 self._optimizer.scheduler.last_epoch = int(sched_epoch)
             except Exception:
@@ -1437,7 +1648,11 @@ class RLTrainer:
 
         del payload
         gc.collect()
-        logger.info("[rank %d] Resume complete. Will start from step %d.", self._rank, self._resume_step)
+        logger.info(
+            "[rank %d] Resume complete. Will start from step %d.",
+            self._rank,
+            self._resume_step,
+        )
 
     def _find_latest_ray_checkpoint(self) -> tuple[int, str] | None:
         ckpt_dir = Path(self.config.checkpointing.checkpoint_dir)
@@ -1457,7 +1672,7 @@ class RLTrainer:
             if not child.is_dir() or not child.name.startswith("global_step_"):
                 continue
             try:
-                step = int(child.name[len("global_step_"):])
+                step = int(child.name[len("global_step_") :])
             except ValueError:
                 continue
             actor_dir = child / "actor"
@@ -1474,8 +1689,10 @@ class RLTrainer:
         latest = self._find_latest_ray_checkpoint()
         if latest is None:
             self._resume_step = 0
-            logger.info("No Ray checkpoint found in %s; training from scratch.",
-                        self.config.checkpointing.checkpoint_dir)
+            logger.info(
+                "No Ray checkpoint found in %s; training from scratch.",
+                self.config.checkpointing.checkpoint_dir,
+            )
             return
         step, actor_dir = latest
         logger.info("Resuming Ray actor checkpoint from %s (step=%d).", actor_dir, step)
@@ -1540,12 +1757,16 @@ class RLTrainer:
         prompt_messages = None
         if isinstance(prompt_raw, list):
             prompt_messages = prompt_raw
-            prompt_text = "\n".join(m.get("content", "") for m in prompt_raw if isinstance(m, dict))
+            prompt_text = "\n".join(
+                m.get("content", "") for m in prompt_raw if isinstance(m, dict)
+            )
         elif isinstance(prompt_raw, str) and prompt_raw.startswith("["):
             try:
                 msgs = _json.loads(prompt_raw)
                 prompt_messages = msgs if isinstance(msgs, list) else None
-                prompt_text = "\n".join(m.get("content", "") for m in msgs if isinstance(m, dict))
+                prompt_text = "\n".join(
+                    m.get("content", "") for m in msgs if isinstance(m, dict)
+                )
             except (_json.JSONDecodeError, TypeError):
                 prompt_text = prompt_raw
         else:
@@ -1589,7 +1810,9 @@ class RLTrainer:
 
         return prompt_text, str(gt)
 
-    def _tokenize_prompts(self, prompts: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
+    def _tokenize_prompts(
+        self, prompts: list[str]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Tokenize prompts to input_ids and attention_mask."""
         max_prompt_len = min(self.config.policy.max_total_sequence_length // 2, 1024)
         encoding = self._tokenizer(
@@ -1610,7 +1833,12 @@ class RLTrainer:
         reserved = torch.cuda.memory_reserved(0) / 1e9
         logger.info(
             "GPU-MEM [step=%d phase=%s] alloc=%.1fGB reserved=%.1fGB free=%.1fGB/%.1fGB",
-            step, phase, alloc, reserved, free / 1e9, total / 1e9,
+            step,
+            phase,
+            alloc,
+            reserved,
+            free / 1e9,
+            total / 1e9,
         )
 
     def _offload_optimizer_to_cpu(self) -> None:
@@ -1668,7 +1896,11 @@ class RLTrainer:
 
         # Non-persistent path frees the engine before gathering weights; the
         # persistent path keeps it resident and reloads in place at the end.
-        if not self._vllm_persistent and self._rank == 0 and not self._atom_engine._sleeping:
+        if (
+            not self._vllm_persistent
+            and self._rank == 0
+            and not self._atom_engine._sleeping
+        ):
             self._atom_engine.sleep_inprocess()
             logger.info("Weight sync: inference engine released (in-process sleep).")
 
@@ -1681,9 +1913,12 @@ class RLTrainer:
             return
         torch.cuda.empty_cache()
 
-        sync_dir = Path(os.environ.get(
-            "LUMENRL_WEIGHT_SYNC_DIR", "/dev/shm/lumenrl_weight_sync",
-        ))
+        sync_dir = Path(
+            os.environ.get(
+                "LUMENRL_WEIGHT_SYNC_DIR",
+                "/dev/shm/lumenrl_weight_sync",
+            )
+        )
 
         total_bytes = 0
         if self._rank == 0:
@@ -1719,9 +1954,15 @@ class RLTrainer:
             )
 
             orig = Path(self.config.policy.model_name)
-            for fname in ["config.json", "tokenizer_config.json", "tokenizer.json",
-                          "special_tokens_map.json", "generation_config.json",
-                          "vocab.json", "merges.txt"]:
+            for fname in [
+                "config.json",
+                "tokenizer_config.json",
+                "tokenizer.json",
+                "special_tokens_map.json",
+                "generation_config.json",
+                "vocab.json",
+                "merges.txt",
+            ]:
                 src = orig / fname
                 if src.exists():
                     shutil.copy2(str(src), str(sync_dir / fname))
@@ -1729,7 +1970,10 @@ class RLTrainer:
             save_time = time.time() - t0
             logger.info(
                 "Weight sync: saved %d params to %s in %.1fs (%.1f GB)",
-                len(cpu_state), sync_dir, save_time, total_bytes / 1e9,
+                len(cpu_state),
+                sync_dir,
+                save_time,
+                total_bytes / 1e9,
             )
 
             logger.info("Weight sync: weights written to %s.", sync_dir)
@@ -1750,7 +1994,8 @@ class RLTrainer:
                     self._atom_engine.reload_weights(str(sync_dir))
                 except Exception as exc:
                     logger.warning(
-                        "Weight sync: in-place reload failed (%s); forcing rebuild next gen.", exc,
+                        "Weight sync: in-place reload failed (%s); forcing rebuild next gen.",
+                        exc,
                     )
                     self._atom_engine.sleep()
             if self._is_distributed:
@@ -1780,7 +2025,10 @@ class RLTrainer:
             # Master weights are FP32; the rollout engine (vLLM) runs bf16, so
             # downcast here to halve the sync payload and match its dtype.
             # (Set LUMENRL_SYNC_FP32=1 to keep FP32, e.g. for weight-delta debug.)
-            if full.dtype == torch.float32 and os.environ.get("LUMENRL_SYNC_FP32") != "1":
+            if (
+                full.dtype == torch.float32
+                and os.environ.get("LUMENRL_SYNC_FP32") != "1"
+            ):
                 full = full.to(torch.bfloat16)
             cpu_state[name] = full.cpu().contiguous()
         return cpu_state
@@ -1810,11 +2058,13 @@ class RLTrainer:
         # (response_length/max stuck ~2700 vs verl ~8192 on identical seed/data).
         _vcfg = getattr(self.config.policy.generation, "vllm_cfg", None)
         if _vcfg is not None:
-            sp.update({
-                "temperature": float(getattr(_vcfg, "temperature", 1.0) or 1.0),
-                "top_p": float(getattr(_vcfg, "top_p", 1.0) or 1.0),
-                "top_k": int(getattr(_vcfg, "top_k", -1)),
-            })
+            sp.update(
+                {
+                    "temperature": float(getattr(_vcfg, "temperature", 1.0) or 1.0),
+                    "top_p": float(getattr(_vcfg, "top_p", 1.0) or 1.0),
+                    "top_k": int(getattr(_vcfg, "top_k", -1)),
+                }
+            )
         elif algo_name == "dapo":
             sp.update({"temperature": 1.0, "top_p": 1.0})
         elif algo_name == "grpo":
@@ -1829,11 +2079,15 @@ class RLTrainer:
 
         if os.environ.get("LUMENRL_DRY_RUN") == "1":
             target_len = int(os.environ.get("LUMENRL_DRY_RUN_RESP_LEN", "100"))
-            mock_resp = ("Step: think carefully about this problem. " * (target_len // 7 + 1))[:target_len * 4] + " The answer is \\boxed{42}."
+            mock_resp = (
+                "Step: think carefully about this problem. " * (target_len // 7 + 1)
+            )[: target_len * 4] + " The answer is \\boxed{42}."
             response_texts = [mock_resp] * len(expanded_prompts)
             full_texts = [p + mock_resp for p in expanded_prompts]
             encoding = self._tokenizer(
-                full_texts, padding=True, truncation=True,
+                full_texts,
+                padding=True,
+                truncation=True,
                 max_length=self.config.policy.max_total_sequence_length,
                 return_tensors="pt",
             )
@@ -1841,7 +2095,9 @@ class RLTrainer:
             seq_mask = encoding["attention_mask"].to(self._device)
             if self._is_distributed:
                 torch.distributed.barrier()
-                shape_tensor = torch.tensor(list(sequences.shape), device=self._device, dtype=torch.long)
+                shape_tensor = torch.tensor(
+                    list(sequences.shape), device=self._device, dtype=torch.long
+                )
                 torch.distributed.broadcast(shape_tensor, src=0)
                 torch.distributed.broadcast(sequences, src=0)
                 torch.distributed.broadcast(seq_mask, src=0)
@@ -1853,16 +2109,22 @@ class RLTrainer:
 
         if self._rank == 0:
             if self._atom_engine._sleeping:
-                model_path = self._atom_engine._weight_dir or self._atom_engine._model_name
-                self._atom_engine._send_cmd({
-                    "cmd": "wake",
-                    "model_path": model_path,
-                })
+                model_path = (
+                    self._atom_engine._weight_dir or self._atom_engine._model_name
+                )
+                self._atom_engine._send_cmd(
+                    {
+                        "cmd": "wake",
+                        "model_path": model_path,
+                    }
+                )
                 self._atom_engine._sleeping = False
                 logger.info("AtomEngine: woke in-process with %s", model_path)
-            elif not getattr(self._atom_engine, '_initialized', False):
+            elif not getattr(self._atom_engine, "_initialized", False):
                 self._atom_engine.wake()
-            response_texts = self._atom_engine.generate(expanded_prompts, sampling_params=sp)
+            response_texts = self._atom_engine.generate(
+                expanded_prompts, sampling_params=sp
+            )
 
             full_texts = [p + r for p, r in zip(expanded_prompts, response_texts)]
             encoding = self._tokenizer(
@@ -1880,12 +2142,16 @@ class RLTrainer:
 
         if self._is_distributed:
             torch.distributed.barrier()
-            shape_tensor = torch.tensor(list(sequences.shape), device=self._device, dtype=torch.long)
+            shape_tensor = torch.tensor(
+                list(sequences.shape), device=self._device, dtype=torch.long
+            )
             torch.distributed.broadcast(shape_tensor, src=0)
             if self._rank != 0:
                 sequences = torch.zeros(
-                    int(shape_tensor[0]), int(shape_tensor[1]),
-                    dtype=torch.long, device=self._device,
+                    int(shape_tensor[0]),
+                    int(shape_tensor[1]),
+                    dtype=torch.long,
+                    device=self._device,
                 )
                 seq_mask = torch.zeros_like(sequences)
             torch.distributed.broadcast(sequences, src=0)
@@ -1949,7 +2215,9 @@ class RLTrainer:
             elif not getattr(eng, "_initialized", False):
                 eng.wake()
 
-        def _build(results: list[dict]) -> tuple[torch.Tensor, torch.Tensor, list[int], torch.Tensor | None]:
+        def _build(
+            results: list[dict],
+        ) -> tuple[torch.Tensor, torch.Tensor, list[int], torch.Tensor | None]:
             """Left-pad vLLM token outputs into (sequences, mask, plens, rollout_lp)."""
             seqs: list[list[int]] = []
             lps: list[list[float]] = []
@@ -1971,14 +2239,18 @@ class RLTrainer:
             B = len(seqs)
             sequences = torch.full((B, S), pad_id, dtype=torch.long)
             seq_mask = torch.zeros((B, S), dtype=torch.long)
-            rlp = torch.zeros((B, max(1, S - 1)), dtype=torch.float32) if want_lp else None
+            rlp = (
+                torch.zeros((B, max(1, S - 1)), dtype=torch.float32)
+                if want_lp
+                else None
+            )
             # LEFT-pad (real tokens at the right end) to match pack_sequences /
             # unpack_log_probs / _build_response_mask.
             for i, s in enumerate(seqs):
                 L = len(s)
                 off = S - L
-                sequences[i, off:off + L] = torch.tensor(s, dtype=torch.long)
-                seq_mask[i, off:off + L] = 1
+                sequences[i, off : off + L] = torch.tensor(s, dtype=torch.long)
+                seq_mask[i, off : off + L] = 1
                 if want_lp:
                     plen = plens[i]
                     for j, lp in enumerate(lps[i]):
@@ -1986,7 +2258,9 @@ class RLTrainer:
                         if 0 <= idx < rlp.shape[1]:
                             rlp[i, idx] = lp
             return (
-                sequences.to(self._device), seq_mask.to(self._device), plens,
+                sequences.to(self._device),
+                seq_mask.to(self._device),
+                plens,
                 (rlp.to(self._device) if rlp is not None else None),
             )
 
@@ -2001,21 +2275,29 @@ class RLTrainer:
             _wake()
             if local_prompts:
                 results = self._atom_engine.generate_with_logprobs(
-                    local_prompts, sampling_params=sp, want_logprobs=want_lp,
+                    local_prompts,
+                    sampling_params=sp,
+                    want_logprobs=want_lp,
                 )
                 lseq, lmask, lplens, llp = _build(results)
             else:
                 lseq = torch.zeros(0, 1, dtype=torch.long, device=self._device)
                 lmask = torch.zeros(0, 1, dtype=torch.long, device=self._device)
                 lplens = []
-                llp = torch.zeros(0, 1, dtype=torch.float32, device=self._device) if want_lp else None
+                llp = (
+                    torch.zeros(0, 1, dtype=torch.float32, device=self._device)
+                    if want_lp
+                    else None
+                )
             return self._allgather_vllm(lseq, lmask, llp, lplens, want_lp, pad_id)
 
         # ---- Single-GPU rollout: rank 0 generates, broadcast to all ranks. ----
         if self._rank == 0:
             _wake()
             results = self._atom_engine.generate_with_logprobs(
-                expanded_prompts, sampling_params=sp, want_logprobs=want_lp,
+                expanded_prompts,
+                sampling_params=sp,
+                want_logprobs=want_lp,
             )
             sequences, seq_mask, plens, rollout_lp = _build(results)
         else:
@@ -2028,19 +2310,30 @@ class RLTrainer:
             torch.distributed.barrier()
             meta_t = torch.tensor(
                 [sequences.shape[0], sequences.shape[1], 1 if want_lp else 0],
-                device=self._device, dtype=torch.long,
+                device=self._device,
+                dtype=torch.long,
             )
             torch.distributed.broadcast(meta_t, src=0)
             B, S, lp_flag = int(meta_t[0]), int(meta_t[1]), int(meta_t[2])
             if self._rank != 0:
                 sequences = torch.zeros(B, S, dtype=torch.long, device=self._device)
                 seq_mask = torch.zeros(B, S, dtype=torch.long, device=self._device)
-                rollout_lp = torch.zeros(B, max(1, S - 1), dtype=torch.float32, device=self._device) if lp_flag else None
+                rollout_lp = (
+                    torch.zeros(
+                        B, max(1, S - 1), dtype=torch.float32, device=self._device
+                    )
+                    if lp_flag
+                    else None
+                )
             torch.distributed.broadcast(sequences, src=0)
             torch.distributed.broadcast(seq_mask, src=0)
             if lp_flag:
                 torch.distributed.broadcast(rollout_lp, src=0)
-            plen_t = torch.tensor(plens, device=self._device, dtype=torch.long) if self._rank == 0 else torch.zeros(B, dtype=torch.long, device=self._device)
+            plen_t = (
+                torch.tensor(plens, device=self._device, dtype=torch.long)
+                if self._rank == 0
+                else torch.zeros(B, dtype=torch.long, device=self._device)
+            )
             if self._rank == 0 and plen_t.shape[0] != B:
                 plen_t = torch.zeros(B, dtype=torch.long, device=self._device)
             torch.distributed.broadcast(plen_t, src=0)
@@ -2066,6 +2359,7 @@ class RLTrainer:
         then trim per-rank counts and concat in rank order.
         """
         import torch.distributed as dist
+
         dev = self._device
         ws = self._world_size
 
@@ -2082,30 +2376,55 @@ class RLTrainer:
         max_n = max(counts) if counts else 0
         if max_n == 0:
             empty = torch.zeros(0, S, dtype=torch.long, device=dev)
-            return empty, empty.clone(), [], (torch.zeros(0, max(1, S - 1), device=dev) if want_lp else None)
+            return (
+                empty,
+                empty.clone(),
+                [],
+                (torch.zeros(0, max(1, S - 1), device=dev) if want_lp else None),
+            )
 
         def _lpad_cols(t: torch.Tensor, width: int, value) -> torch.Tensor:
             if t.shape[1] >= width:
                 return t
-            pad = torch.full((t.shape[0], width - t.shape[1]), value, dtype=t.dtype, device=t.device)
+            pad = torch.full(
+                (t.shape[0], width - t.shape[1]), value, dtype=t.dtype, device=t.device
+            )
             return torch.cat([pad, t], dim=1)
 
         def _pad_rows(t: torch.Tensor, rows: int) -> torch.Tensor:
             if t.shape[0] >= rows:
                 return t
-            pad = torch.zeros((rows - t.shape[0], t.shape[1]), dtype=t.dtype, device=t.device)
+            pad = torch.zeros(
+                (rows - t.shape[0], t.shape[1]), dtype=t.dtype, device=t.device
+            )
             return torch.cat([t, pad], dim=0)
 
         seq_pad = _pad_rows(_lpad_cols(lseq, S, pad_id), max_n)
         mask_pad = _pad_rows(_lpad_cols(lmask, S, 0), max_n)
         seq_g = [torch.zeros(max_n, S, dtype=torch.long, device=dev) for _ in range(ws)]
-        mask_g = [torch.zeros(max_n, S, dtype=torch.long, device=dev) for _ in range(ws)]
+        mask_g = [
+            torch.zeros(max_n, S, dtype=torch.long, device=dev) for _ in range(ws)
+        ]
         dist.all_gather(seq_g, seq_pad)
         dist.all_gather(mask_g, mask_pad)
 
         if want_lp:
-            lp_pad = _pad_rows(_lpad_cols(llp if llp is not None else torch.zeros(n_r, max(1, S - 1), device=dev), S - 1, 0.0), max_n)
-            lp_g = [torch.zeros(max_n, max(1, S - 1), dtype=torch.float32, device=dev) for _ in range(ws)]
+            lp_pad = _pad_rows(
+                _lpad_cols(
+                    (
+                        llp
+                        if llp is not None
+                        else torch.zeros(n_r, max(1, S - 1), device=dev)
+                    ),
+                    S - 1,
+                    0.0,
+                ),
+                max_n,
+            )
+            lp_g = [
+                torch.zeros(max_n, max(1, S - 1), dtype=torch.float32, device=dev)
+                for _ in range(ws)
+            ]
             dist.all_gather(lp_g, lp_pad)
 
         plen_local = torch.zeros(max_n, dtype=torch.long, device=dev)
@@ -2160,23 +2479,29 @@ class RLTrainer:
             rewards = rewards_t.to(self._device)
             accs = torch.tensor(
                 [1.0 if d["acc"] else 0.0 for d in details],
-                dtype=torch.float32, device=self._device,
+                dtype=torch.float32,
+                device=self._device,
             )
             acc_frac = float(accs.mean().item()) if N else 0.0
-            logger.info("Rollout reward: N=%d accuracy=%.4f mean=%.4f", N, acc_frac, float(rewards.mean().item()))
+            logger.info(
+                "Rollout reward: N=%d accuracy=%.4f mean=%.4f",
+                N,
+                acc_frac,
+                float(rewards.mean().item()),
+            )
             max_response_length = int(
                 getattr(self.config.policy, "max_response_length", 0) or 0
             )
-            cap_hits = sum(
-                length >= max_response_length
-                for length in response_lengths
-            ) if max_response_length > 0 else 0
-            invalid = sum(
-                detail.get("pred") == "[INVALID]" for detail in details
+            cap_hits = (
+                sum(length >= max_response_length for length in response_lengths)
+                if max_response_length > 0
+                else 0
             )
+            invalid = sum(detail.get("pred") == "[INVALID]" for detail in details)
             mean_length = (
                 sum(response_lengths) / len(response_lengths)
-                if response_lengths else 0.0
+                if response_lengths
+                else 0.0
             )
             logger.info(
                 "Rollout response diagnostics: tokens_mean=%.1f tokens_max=%d "
@@ -2207,9 +2532,19 @@ class RLTrainer:
         return rewards, responses, accs.tolist()
 
     def _collect_rollout_batch(
-        self, step: int, num_generations: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, list[int], torch.Tensor, list[str], list[str],
-               torch.Tensor | None, dict[str, list[Any]]]:
+        self,
+        step: int,
+        num_generations: int,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        list[int],
+        torch.Tensor,
+        list[str],
+        list[str],
+        torch.Tensor | None,
+        dict[str, list[Any]],
+    ]:
         """Generate the full (unsharded) rollout batch for one training step.
 
         Handles DAPO dynamic sampling (verl ``filter_groups``): when enabled,
@@ -2227,19 +2562,25 @@ class RLTrainer:
         pol = self.config.policy
         train_prompts = max(1, pol.train_global_batch_size // g)
         algo_lc = self.config.algorithm.name.lower()
-        fg = getattr(self.config.algorithm.dapo, "filter_groups", None) if algo_lc == "dapo" else None
+        fg = (
+            getattr(self.config.algorithm.dapo, "filter_groups", None)
+            if algo_lc == "dapo"
+            else None
+        )
         use_filter = bool(fg is not None and fg.enable)
 
-        gen_prompts = int(pol.gen_batch_size) if pol.gen_batch_size > 0 else train_prompts
+        gen_prompts = (
+            int(pol.gen_batch_size) if pol.gen_batch_size > 0 else train_prompts
+        )
         if not use_filter:
             gen_prompts = train_prompts
 
         def _one_round(prompts: list[str]):
             rag: dict[str, list[Any]] = {}
             if (
-                (getattr(self, "_ray_use_vllm", False) or getattr(self, "_ray_use_atom", False))
-                and self._ray_vllm_engine is not None
-            ):
+                getattr(self, "_ray_use_vllm", False)
+                or getattr(self, "_ray_use_atom", False)
+            ) and self._ray_vllm_engine is not None:
                 seqs, mask, plen, lp, rag = self._rollout_with_ray_vllm(prompts, g)
             elif self._use_vllm:
                 seqs, mask, plen, lp = self._rollout_with_vllm(prompts, g)
@@ -2257,19 +2598,37 @@ class RLTrainer:
             prompts, gts = self._get_prompts_range(self._prompt_cursor, gen_prompts)
             self._prompt_cursor += gen_prompts
             if LUMENRL_DEBUG:
-                logger.info("[DBG] _collect_rollout: no-filter path, %d prompts × %d gen", gen_prompts, g)
+                logger.info(
+                    "[DBG] _collect_rollout: no-filter path, %d prompts × %d gen",
+                    gen_prompts,
+                    g,
+                )
             seqs, mask, plen, lp, rag = _one_round(prompts)
             if LUMENRL_DEBUG:
-                logger.info("[DBG] _collect_rollout: seqs=%s mask=%s plen=%s lp=%s",
-                            list(seqs.shape), list(mask.shape), list(plen.shape) if hasattr(plen, 'shape') else len(plen),
-                            list(lp.shape) if lp is not None else None)
+                logger.info(
+                    "[DBG] _collect_rollout: seqs=%s mask=%s plen=%s lp=%s",
+                    list(seqs.shape),
+                    list(mask.shape),
+                    list(plen.shape) if hasattr(plen, "shape") else len(plen),
+                    list(lp.shape) if lp is not None else None,
+                )
             gts_exp = [gt for gt in gts for _ in range(g)]
-            rewards, responses, _accs = self._compute_rewards_full(seqs, mask, plen, gts_exp)
+            rewards, responses, _accs = self._compute_rewards_full(
+                seqs, mask, plen, gts_exp
+            )
             if LUMENRL_DEBUG:
-                _acc_mean = float(torch.tensor(_accs).float().mean()) if _accs is not None and len(_accs) > 0 else -1.0
-                logger.info("[DBG] _collect_rollout: rewards=%s  acc_mean=%.4f  nonzero_reward=%d/%d",
-                            list(rewards.shape), _acc_mean,
-                            int((rewards.abs() > 1e-8).sum()), rewards.numel())
+                _acc_mean = (
+                    float(torch.tensor(_accs).float().mean())
+                    if _accs is not None and len(_accs) > 0
+                    else -1.0
+                )
+                logger.info(
+                    "[DBG] _collect_rollout: rewards=%s  acc_mean=%.4f  nonzero_reward=%d/%d",
+                    list(rewards.shape),
+                    _acc_mean,
+                    int((rewards.abs() > 1e-8).sum()),
+                    rewards.numel(),
+                )
             return seqs, mask, plen, rewards, responses, gts_exp, lp, rag
 
         # Dynamic-sampling regeneration loop (verl filter_groups).
@@ -2284,9 +2643,8 @@ class RLTrainer:
         rounds = 0
         max_rounds = fg.max_num_gen_batches if fg.max_num_gen_batches > 0 else 10_000
         want_lp = (
-            (self._use_vllm or getattr(self, "_ray_use_atom", False))
-            and self.config.policy.generation.vllm_cfg.calculate_log_probs
-        )
+            self._use_vllm or getattr(self, "_ray_use_atom", False)
+        ) and self.config.policy.generation.vllm_cfg.calculate_log_probs
 
         while kept_prompts < train_prompts and rounds < max_rounds:
             rounds += 1
@@ -2294,7 +2652,9 @@ class RLTrainer:
             self._prompt_cursor += gen_prompts
             seqs, mask, plen, lp, rag = _one_round(prompts)
             gts_exp = [gt for gt in gts for _ in range(g)]
-            rewards, _responses, accs = self._compute_rewards_full(seqs, mask, plen, gts_exp)
+            rewards, _responses, accs = self._compute_rewards_full(
+                seqs, mask, plen, gts_exp
+            )
 
             uids = [i // g for i in range(seqs.shape[0])]
             keep_mask, kept_uids = filter_groups_keep_mask(accs, uids)
@@ -2313,11 +2673,18 @@ class RLTrainer:
             if self._rank == 0:
                 logger.info(
                     "[step %d] filter_groups round %d: kept %d/%d prompt groups (total %d/%d)",
-                    step, rounds, len(kept_uids), gen_prompts, kept_prompts, train_prompts,
+                    step,
+                    rounds,
+                    len(kept_uids),
+                    gen_prompts,
+                    kept_prompts,
+                    train_prompts,
                 )
 
         if not acc_rows:
-            raise RuntimeError("filter_groups collected no valid groups; check data difficulty / max_num_gen_batches.")
+            raise RuntimeError(
+                "filter_groups collected no valid groups; check data difficulty / max_num_gen_batches."
+            )
 
         # LEFT-pad every round to a common sequence length and concatenate.
         # Sequences are left-padded (real tokens at the right end), so widening
@@ -2327,14 +2694,20 @@ class RLTrainer:
 
         def _lpad(t: torch.Tensor, width: int, value: float) -> torch.Tensor:
             if t.shape[1] >= width:
-                return t[:, t.shape[1] - width:]
-            pad = torch.full((t.shape[0], width - t.shape[1]), value, dtype=t.dtype, device=t.device)
+                return t[:, t.shape[1] - width :]
+            pad = torch.full(
+                (t.shape[0], width - t.shape[1]), value, dtype=t.dtype, device=t.device
+            )
             return torch.cat([pad, t], dim=1)
 
         sequences = torch.cat([_lpad(t, S_max, pad_id) for t in acc_rows], dim=0)
         seq_mask = torch.cat([_lpad(t, S_max, 0) for t in acc_mask], dim=0)
         rewards = torch.cat(acc_rewards, dim=0)
-        rollout_lp = torch.cat([_lpad(t, S_max - 1, 0.0) for t in acc_lp], dim=0) if acc_lp else None
+        rollout_lp = (
+            torch.cat([_lpad(t, S_max - 1, 0.0) for t in acc_lp], dim=0)
+            if acc_lp
+            else None
+        )
 
         # Truncate to exactly train_prompts groups (whole groups of g rows each).
         keep_rows = train_prompts * g
@@ -2354,9 +2727,20 @@ class RLTrainer:
             for i in range(sequences.shape[0]):
                 plen = prompt_lengths[i] if i < len(prompt_lengths) else 0
                 response_ids = _response_token_ids(seq_cpu[i], mask_cpu[i], plen)
-                responses.append(self._tokenizer.decode(response_ids, skip_special_tokens=True))
+                responses.append(
+                    self._tokenizer.decode(response_ids, skip_special_tokens=True)
+                )
 
-        return sequences, seq_mask, prompt_lengths, rewards, responses, gts_exp, rollout_lp, ragged
+        return (
+            sequences,
+            seq_mask,
+            prompt_lengths,
+            rewards,
+            responses,
+            gts_exp,
+            rollout_lp,
+            ragged,
+        )
 
     def _set_reshard(self, reshard: bool) -> None:
         """Toggle FSDP2 reshard_after_forward on the actor model."""
@@ -2364,6 +2748,7 @@ class RLTrainer:
             return
         try:
             from lumenrl.engine.training.fsdp_backend import set_reshard_after_forward
+
             set_reshard_after_forward(self._actor_model, reshard)
         except Exception:
             pass
@@ -2407,9 +2792,14 @@ class RLTrainer:
 
         max_resp = self.config.policy.max_response_length
         if max_resp > 0:
-            max_gen = min(max_resp, self.config.policy.max_total_sequence_length - local_ids.shape[1])
+            max_gen = min(
+                max_resp,
+                self.config.policy.max_total_sequence_length - local_ids.shape[1],
+            )
         else:
-            max_gen = max(128, self.config.policy.max_total_sequence_length - local_ids.shape[1])
+            max_gen = max(
+                128, self.config.policy.max_total_sequence_length - local_ids.shape[1]
+            )
         gen_kwargs: dict[str, Any] = {
             "max_new_tokens": max_gen,
             "pad_token_id": self._tokenizer.pad_token_id,
@@ -2454,11 +2844,15 @@ class RLTrainer:
 
         if self._is_distributed and self._world_size > 1:
             sequences, seq_mask, prompt_lens = self._allgather_sequences(
-                local_seqs, mask_gpu, local_plens,
+                local_seqs,
+                mask_gpu,
+                local_plens,
             )
         else:
             sequences = local_seqs
-            seq_mask = torch.ones(sequences.shape, dtype=torch.long, device=sequences.device)
+            seq_mask = torch.ones(
+                sequences.shape, dtype=torch.long, device=sequences.device
+            )
             for i, plen in enumerate(local_plens):
                 seq_mask[i, :plen] = local_mask[i, :plen].to(sequences.device)
                 pad_id = self._tokenizer.pad_token_id
@@ -2486,11 +2880,14 @@ class RLTrainer:
             pad = torch.full(
                 (local_seqs.shape[0], global_max_len - local_seqs.shape[1]),
                 self._tokenizer.pad_token_id or 0,
-                dtype=local_seqs.dtype, device=local_seqs.device,
+                dtype=local_seqs.dtype,
+                device=local_seqs.device,
             )
             local_seqs = torch.cat([local_seqs, pad], dim=1)
 
-        local_count = torch.tensor([local_seqs.shape[0]], device=self._device, dtype=torch.long)
+        local_count = torch.tensor(
+            [local_seqs.shape[0]], device=self._device, dtype=torch.long
+        )
         counts_list = [torch.zeros_like(local_count) for _ in range(self._world_size)]
         torch.distributed.all_gather(counts_list, local_count)
         max_count = max(c.item() for c in counts_list)
@@ -2498,7 +2895,8 @@ class RLTrainer:
         if local_seqs.shape[0] < max_count:
             pad_rows = torch.zeros(
                 (max_count - local_seqs.shape[0], global_max_len),
-                dtype=local_seqs.dtype, device=local_seqs.device,
+                dtype=local_seqs.dtype,
+                device=local_seqs.device,
             )
             local_seqs = torch.cat([local_seqs, pad_rows], dim=0)
 
@@ -2513,8 +2911,12 @@ class RLTrainer:
 
         plens_tensor = torch.tensor(local_plens, device=self._device, dtype=torch.long)
         if plens_tensor.shape[0] < max_count:
-            plens_tensor = torch.nn.functional.pad(plens_tensor, (0, max_count - plens_tensor.shape[0]))
-        gathered_plens = [torch.zeros_like(plens_tensor) for _ in range(self._world_size)]
+            plens_tensor = torch.nn.functional.pad(
+                plens_tensor, (0, max_count - plens_tensor.shape[0])
+            )
+        gathered_plens = [
+            torch.zeros_like(plens_tensor) for _ in range(self._world_size)
+        ]
         torch.distributed.all_gather(gathered_plens, plens_tensor)
         for r, cnt in enumerate(counts_list):
             n = int(cnt.item())
@@ -2523,7 +2925,9 @@ class RLTrainer:
         sequences = torch.cat(all_seqs_list, dim=0)
 
         pad_id = self._tokenizer.pad_token_id
-        seq_mask = torch.ones(sequences.shape, dtype=torch.long, device=sequences.device)
+        seq_mask = torch.ones(
+            sequences.shape, dtype=torch.long, device=sequences.device
+        )
         for i, plen in enumerate(all_plens):
             plen = int(plen)
             if pad_id is not None:
@@ -2533,14 +2937,16 @@ class RLTrainer:
         return sequences, seq_mask, [int(p) for p in all_plens]
 
     @staticmethod
-    def _fused_token_log_probs(logits: torch.Tensor, target_ids: torch.Tensor) -> torch.Tensor:
+    def _fused_token_log_probs(
+        logits: torch.Tensor, target_ids: torch.Tensor
+    ) -> torch.Tensor:
         """Per-token log-probs via row-chunked log_softmax to bound peak memory.
 
         Uses F.log_softmax per sequence row, which avoids promoting the full
         [S, V] logit tensor to float32 and is numerically stable for bf16.
         Matches VERL's ``logprobs_from_logits_v2`` bf16 path.
         """
-        logits_shifted = logits[:, :-1]            # [B, S-1, V]  bf16 view
+        logits_shifted = logits[:, :-1]  # [B, S-1, V]  bf16 view
         targets = target_ids[:, 1:].unsqueeze(-1)  # [B, S-1, 1]
         lp_parts = []
         for i in range(logits_shifted.shape[0]):
@@ -2568,7 +2974,9 @@ class RLTrainer:
         and back to CPU afterward (for CPU-offloaded reference model).
         """
         from lumenrl.engine.training.packing import (
-            PackingContext, pack_sequences, packed_token_log_probs,
+            PackingContext,
+            pack_sequences,
+            packed_token_log_probs,
             unpack_log_probs,
         )
 
@@ -2584,7 +2992,9 @@ class RLTrainer:
         # Same sampling-temperature scaling as _train_step's log_probs, so that
         # old/ref log-probs and train log-probs share verl's div_(temperature)
         # convention and the importance ratio is unbiased.
-        _etemp = float(getattr(self.config.policy.generation.vllm_cfg, "temperature", 1.0) or 1.0)
+        _etemp = float(
+            getattr(self.config.policy.generation.vllm_cfg, "temperature", 1.0) or 1.0
+        )
 
         # Use _dynamic_mini_batches-style chunking by actual token count
         max_tok = int(self.config.policy.max_token_len_per_gpu)
@@ -2611,18 +3021,25 @@ class RLTrainer:
         real_chunk_count = len(chunks)
         if self._is_distributed and self._world_size > 1:
             import torch.distributed as dist
+
             count_t = torch.tensor([real_chunk_count], device=self._device)
             dist.all_reduce(count_t, op=dist.ReduceOp.MAX)
             global_max = int(count_t.item())
             while len(chunks) < global_max:
-                chunks.append(chunks[-1])  # dummy: reuse last chunk for FSDP2 collectives
+                chunks.append(
+                    chunks[-1]
+                )  # dummy: reuse last chunk for FSDP2 collectives
 
         with torch.no_grad():
             for ci, (cs, ce) in enumerate(chunks):
                 ids_chunk = sequences[cs:ce]
                 mask_chunk = attention_mask[cs:ce]
 
-                _tp = getattr(self._engine, "_tp_size", 1) if self._engine is not None else 1
+                _tp = (
+                    getattr(self._engine, "_tp_size", 1)
+                    if self._engine is not None
+                    else 1
+                )
                 packed = pack_sequences(ids_chunk, mask_chunk, tp_align=_tp)
                 with PackingContext(packed.cu_seqlens, packed.max_seqlen):
                     outputs = model(
@@ -2633,11 +3050,16 @@ class RLTrainer:
                     logits = outputs.logits if hasattr(outputs, "logits") else outputs
                     logits = logits.squeeze(0)
                     flat_lp = packed_token_log_probs(
-                        logits, packed.input_ids.squeeze(0), packed.cu_seqlens,
+                        logits,
+                        packed.input_ids.squeeze(0),
+                        packed.cu_seqlens,
                         temperature=_etemp,
                     )
                     token_lp = unpack_log_probs(
-                        flat_lp, packed.cu_seqlens, packed.seq_lens, S,
+                        flat_lp,
+                        packed.cu_seqlens,
+                        packed.seq_lens,
+                        S,
                     )
                     if ci < real_chunk_count:
                         all_log_probs.append(token_lp)
@@ -2690,7 +3112,10 @@ class RLTrainer:
         n_invalid = sum(1 for d in details if d.get("pred") == "[INVALID]")
         logger.info(
             "Reward breakdown: +1=%d, -1=%d, invalid_format=%d / %d total",
-            n_pos, n_neg, n_invalid, len(details),
+            n_pos,
+            n_neg,
+            n_invalid,
+            len(details),
         )
         for idx in range(min(2, len(responses), len(details))):
             tail = responses[idx][-400:]
@@ -2698,7 +3123,11 @@ class RLTrainer:
             gt = expanded_gts[idx] if idx < len(expanded_gts) else "?"
             logger.info(
                 "Sample[%d] reward=%.1f pred=%s gt=%s tail=...%s",
-                idx, rewards[idx].item(), pred, gt, repr(tail[-200:]),
+                idx,
+                rewards[idx].item(),
+                pred,
+                gt,
+                repr(tail[-200:]),
             )
 
         return rewards.to(self._device), responses
@@ -2720,21 +3149,30 @@ class RLTrainer:
         mask = attention_mask.clone()
         for i, plen in enumerate(prompt_lengths):
             # Find where actual tokens start (first 1 in attention_mask)
-            actual_start = int((attention_mask[i] == 1).nonzero(as_tuple=True)[0][0].item())
+            actual_start = int(
+                (attention_mask[i] == 1).nonzero(as_tuple=True)[0][0].item()
+            )
             # Prompt spans [actual_start, actual_start + plen)
-            mask[i, actual_start:actual_start + plen] = 0
+            mask[i, actual_start : actual_start + plen] = 0
         return mask[:, 1:]
 
     @torch.no_grad()
     def _packed_entropy_chunked(
-        self, sequences: torch.Tensor, attention_mask: torch.Tensor,
-        temperature: float, S: int,
+        self,
+        sequences: torch.Tensor,
+        attention_mask: torch.Tensor,
+        temperature: float,
+        S: int,
     ) -> torch.Tensor:
         """Per-token entropy [B, S-1] via the same chunked packed forward as
         :meth:`_compute_log_probs_for_model` (avoids OOM on the full vocab)."""
         from lumenrl.engine.training.packing import (
-            PackingContext, pack_sequences, packed_token_entropy, unpack_log_probs,
+            PackingContext,
+            pack_sequences,
+            packed_token_entropy,
+            unpack_log_probs,
         )
+
         self._actor_model.eval()
         max_tok = int(self.config.policy.max_token_len_per_gpu)
         seq_lens = attention_mask.sum(dim=1).long()
@@ -2755,22 +3193,31 @@ class RLTrainer:
         real = len(chunks)
         if self._is_distributed and self._world_size > 1:
             import torch.distributed as dist
+
             ct = torch.tensor([real], device=self._device)
             dist.all_reduce(ct, op=dist.ReduceOp.MAX)
             while len(chunks) < int(ct.item()):
                 chunks.append(chunks[-1])
         outs = []
         for ci, (cs, ce) in enumerate(chunks):
-            _tp = getattr(self._engine, "_tp_size", 1) if self._engine is not None else 1
-            packed = pack_sequences(sequences[cs:ce], attention_mask[cs:ce], tp_align=_tp)
+            _tp = (
+                getattr(self._engine, "_tp_size", 1) if self._engine is not None else 1
+            )
+            packed = pack_sequences(
+                sequences[cs:ce], attention_mask[cs:ce], tp_align=_tp
+            )
             with PackingContext(packed.cu_seqlens, packed.max_seqlen):
                 o = self._actor_model(
-                    input_ids=packed.input_ids, position_ids=packed.position_ids,
+                    input_ids=packed.input_ids,
+                    position_ids=packed.position_ids,
                     attention_mask=None,
                 )
                 logits = (o.logits if hasattr(o, "logits") else o).squeeze(0)
                 ef = packed_token_entropy(
-                    logits, packed.cu_seqlens, temperature=temperature, upcast=True,
+                    logits,
+                    packed.cu_seqlens,
+                    temperature=temperature,
+                    upcast=True,
                 )
                 eu = unpack_log_probs(ef, packed.cu_seqlens, packed.seq_lens, S)
                 if ci < real:
@@ -2811,13 +3258,15 @@ class RLTrainer:
         attn = torch.zeros((B, S), dtype=torch.long)
         for i, seq in enumerate(seqs):
             L = len(seq)
-            input_ids[i, S - L:] = torch.tensor(seq, dtype=torch.long)
-            attn[i, S - L:] = 1
+            input_ids[i, S - L :] = torch.tensor(seq, dtype=torch.long)
+            attn[i, S - L :] = 1
         prompt_lengths = [len(s["prompt_ids"]) for s in samples]
         input_ids = input_ids.to(self._device)
         attn = attn.to(self._device)
 
-        response_mask = self._build_response_mask(input_ids, attn, prompt_lengths)  # [B,S-1]
+        response_mask = self._build_response_mask(
+            input_ids, attn, prompt_lengths
+        )  # [B,S-1]
 
         verl_olp = torch.zeros((B, S - 1), dtype=torch.float32, device=self._device)
         verl_rolp = torch.zeros((B, S - 1), dtype=torch.float32, device=self._device)
@@ -2848,9 +3297,13 @@ class RLTrainer:
             seq_reward[i] = float(s["token_level_reward"])
             verl_adv_seq[i] = float(advt[0]) if advt else 0.0
 
-        _etemp = float(getattr(self.config.policy.generation.vllm_cfg, "temperature", 1.0) or 1.0)
+        _etemp = float(
+            getattr(self.config.policy.generation.vllm_cfg, "temperature", 1.0) or 1.0
+        )
         # Lumen forward on the EXACT verl sequences (all ranks participate).
-        lumen_olp = self._compute_log_probs_for_model(self._actor_model, input_ids, attn)
+        lumen_olp = self._compute_log_probs_for_model(
+            self._actor_model, input_ids, attn
+        )
         lumen_ent = self._packed_entropy_chunked(input_ids, attn, _etemp, S)
 
         if self._rank != 0:
@@ -2885,34 +3338,80 @@ class RLTrainer:
         Ntok = int(rm.sum().item())
         ris_arg = verl_ris if has_ris else None
         loss_lumenfwd = asymmetric_clip_loss(
-            lumen_olp, verl_olp, verl_adv, meta["clip_ratio_low"], meta["clip_ratio_high"],
-            mask=response_mask, clip_ratio_c=meta["clip_ratio_c"],
-            batch_num_tokens=Ntok, dp_size=1, rollout_is_weights=ris_arg,
+            lumen_olp,
+            verl_olp,
+            verl_adv,
+            meta["clip_ratio_low"],
+            meta["clip_ratio_high"],
+            mask=response_mask,
+            clip_ratio_c=meta["clip_ratio_c"],
+            batch_num_tokens=Ntok,
+            dp_size=1,
+            rollout_is_weights=ris_arg,
         ).item()
         loss_ratio1 = asymmetric_clip_loss(
-            verl_olp, verl_olp, verl_adv, meta["clip_ratio_low"], meta["clip_ratio_high"],
-            mask=response_mask, clip_ratio_c=meta["clip_ratio_c"],
-            batch_num_tokens=Ntok, dp_size=1, rollout_is_weights=ris_arg,
+            verl_olp,
+            verl_olp,
+            verl_adv,
+            meta["clip_ratio_low"],
+            meta["clip_ratio_high"],
+            mask=response_mask,
+            clip_ratio_c=meta["clip_ratio_c"],
+            batch_num_tokens=Ntok,
+            dp_size=1,
+            rollout_is_weights=ris_arg,
         ).item()
 
         log = logger.info
-        log("================ REPLAY COMPARE (verl seqs -> Lumen forward) ================")
-        log("samples=%d groups=%d g=%d S=%d resp_tokens=%d temp=%.3f", B, B // g, g, S, Ntok, _etemp)
-        log("[A] log_prob | Lumen mean=%.5f verl mean=%.5f MAE=%.5f max|d|=%.4f",
-            lumen_olp_mean, verl_olp_mean, lp_mae, lp_max)
-        log("[A] ratio exp(lumen-verl): mean=%.5f std=%.5f (==1.0 => forward identical)",
-            ratio_mean, ratio_std)
-        log("[B] entropy  | Lumen=%.5f  (compare to verl actor/entropy in verl log)", lumen_entropy)
-        log("[C] adv MAE vs verl dump: lumen-eps(1e-8)=%.6f  verl-eps(1e-6)=%.6f",
-            adv_mae_lumen, adv_mae_verleps)
+        log(
+            "================ REPLAY COMPARE (verl seqs -> Lumen forward) ================"
+        )
+        log(
+            "samples=%d groups=%d g=%d S=%d resp_tokens=%d temp=%.3f",
+            B,
+            B // g,
+            g,
+            S,
+            Ntok,
+            _etemp,
+        )
+        log(
+            "[A] log_prob | Lumen mean=%.5f verl mean=%.5f MAE=%.5f max|d|=%.4f",
+            lumen_olp_mean,
+            verl_olp_mean,
+            lp_mae,
+            lp_max,
+        )
+        log(
+            "[A] ratio exp(lumen-verl): mean=%.5f std=%.5f (==1.0 => forward identical)",
+            ratio_mean,
+            ratio_std,
+        )
+        log(
+            "[B] entropy  | Lumen=%.5f  (compare to verl actor/entropy in verl log)",
+            lumen_entropy,
+        )
+        log(
+            "[C] adv MAE vs verl dump: lumen-eps(1e-8)=%.6f  verl-eps(1e-6)=%.6f",
+            adv_mae_lumen,
+            adv_mae_verleps,
+        )
         log("[C] adv lumen[:6]=%s", [round(x, 4) for x in adv_lumen[:6].tolist()])
         log("[C] adv verl [:6]=%s", [round(x, 4) for x in verl_adv_seq[:6].tolist()])
-        log("[D] pg_loss  | Lumen-fwd=%.6f  ratio==1(adv+TIS+agg)=%.6f  (compare verl actor/pg_loss)",
-            loss_lumenfwd, loss_ratio1)
-        log("[*] rollout_is present=%s mean=%.5f | seq_reward mean=%.4f",
-            has_ris, (verl_ris[rm].mean().item() if has_ris else float("nan")),
-            seq_reward.mean().item())
-        log("============================================================================")
+        log(
+            "[D] pg_loss  | Lumen-fwd=%.6f  ratio==1(adv+TIS+agg)=%.6f  (compare verl actor/pg_loss)",
+            loss_lumenfwd,
+            loss_ratio1,
+        )
+        log(
+            "[*] rollout_is present=%s mean=%.5f | seq_reward mean=%.4f",
+            has_ris,
+            (verl_ris[rm].mean().item() if has_ris else float("nan")),
+            seq_reward.mean().item(),
+        )
+        log(
+            "============================================================================"
+        )
 
     def _update_lr(self, step: int) -> None:
         """Advance LR scheduler via Engine, falling back to manual warmup."""
@@ -2930,8 +3429,11 @@ class RLTrainer:
         (verl/utils/seqlen_balancing.py, verl/trainer/ppo/ray_trainer.py L1098-1165)
         """
         from lumenrl.utils.seqlen_balancing import (
-            calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance,
+            calculate_workload,
+            get_seqlen_balanced_partitions,
+            log_seqlen_unbalance,
         )
+
         mask = batch.tensors.get("response_mask", batch.tensors.get("attention_mask"))
         if mask is None:
             return {}
@@ -2940,7 +3442,9 @@ class RLTrainer:
         dp_size = self._world_size
         if batch.batch_size < dp_size:
             return {}
-        partitions = get_seqlen_balanced_partitions(workloads, dp_size, equal_size=False)
+        partitions = get_seqlen_balanced_partitions(
+            workloads, dp_size, equal_size=False
+        )
         stats = log_seqlen_unbalance(workloads, partitions, prefix="balance")
         my_indices = partitions[self._rank]
         perm = torch.tensor(my_indices, device=self._device, dtype=torch.long)
@@ -2999,8 +3503,11 @@ class RLTrainer:
             raise RuntimeError("setup() must be called first.")
 
         from lumenrl.engine.training.packing import (
-            PackingContext, pack_sequences, packed_token_log_probs,
-            packed_token_entropy, unpack_log_probs,
+            PackingContext,
+            pack_sequences,
+            packed_token_log_probs,
+            packed_token_entropy,
+            unpack_log_probs,
         )
 
         self._actor_model.train()
@@ -3047,10 +3554,15 @@ class RLTrainer:
             # matching verl's logits.div_(temperature) in _forward_micro_batch. It
             # must be applied identically to old/train/ref log-probs (see
             # _compute_log_probs_for_model) so the importance ratio stays correct.
-            _etemp = float(getattr(self.config.policy.generation.vllm_cfg, "temperature", 1.0) or 1.0)
+            _etemp = float(
+                getattr(self.config.policy.generation.vllm_cfg, "temperature", 1.0)
+                or 1.0
+            )
 
             flat_lp = packed_token_log_probs(
-                logits, packed.input_ids.squeeze(0), packed.cu_seqlens,
+                logits,
+                packed.input_ids.squeeze(0),
+                packed.cu_seqlens,
                 temperature=_etemp,
             )
             # Predictive entropy (metric only, detached) over response tokens.
@@ -3063,15 +3575,24 @@ class RLTrainer:
             # is the residual we previously saw — it is a reduction-precision
             # (not operator) difference.
             _entropy_mean = None
-            _entropy_sum = None   # token-weighted sum (for verl-aligned GLOBAL token-mean)
-            _entropy_tok = None   # response token count (excludes dummy/padding mini-batches)
+            _entropy_sum = (
+                None  # token-weighted sum (for verl-aligned GLOBAL token-mean)
+            )
+            _entropy_tok = (
+                None  # response token count (excludes dummy/padding mini-batches)
+            )
             try:
                 _ent_flat = packed_token_entropy(
-                    logits.detach(), packed.cu_seqlens,
-                    temperature=_etemp, upcast=True,
+                    logits.detach(),
+                    packed.cu_seqlens,
+                    temperature=_etemp,
+                    upcast=True,
                 )
                 _ent_unpacked = unpack_log_probs(
-                    _ent_flat, packed.cu_seqlens, packed.seq_lens, sequences.shape[1],
+                    _ent_flat,
+                    packed.cu_seqlens,
+                    packed.seq_lens,
+                    sequences.shape[1],
                 )
                 if _resp is not None:
                     _rm_e = _resp.to(dtype=_ent_unpacked.dtype)
@@ -3088,7 +3609,10 @@ class RLTrainer:
 
             # Unpack to [B, S-1] padded format (matches old_log_probs shape)
             token_log_probs = unpack_log_probs(
-                flat_lp, packed.cu_seqlens, packed.seq_lens, sequences.shape[1],
+                flat_lp,
+                packed.cu_seqlens,
+                packed.seq_lens,
+                sequences.shape[1],
             )
             batch.tensors["log_probs"] = token_log_probs
 
@@ -3153,12 +3677,22 @@ class RLTrainer:
         total_steps = int(self.config.num_training_steps)
         start_step = self._resume_step
         if start_step > 0:
-            logger.info("[rank %d] Skipping steps 0..%d (resuming from checkpoint).", self._rank, start_step - 1)
+            logger.info(
+                "[rank %d] Skipping steps 0..%d (resuming from checkpoint).",
+                self._rank,
+                start_step - 1,
+            )
 
         # Advance the dynamic-sampling prompt cursor to roughly where a resumed
         # run left off (per-round granularity; exact alignment isn't required).
-        _train_prompts = max(1, self.config.policy.train_global_batch_size // max(1, num_generations))
-        _gp = int(self.config.policy.gen_batch_size) if self.config.policy.gen_batch_size > 0 else _train_prompts
+        _train_prompts = max(
+            1, self.config.policy.train_global_batch_size // max(1, num_generations)
+        )
+        _gp = (
+            int(self.config.policy.gen_batch_size)
+            if self.config.policy.gen_batch_size > 0
+            else _train_prompts
+        )
         self._prompt_cursor = start_step * _gp
 
         # On resume, push the restored actor weights to the rollout engine BEFORE
@@ -3167,7 +3701,10 @@ class RLTrainer:
         # off-policy (mismatch_kl huge, is_weight≈0). Sets the engine's weight dir
         # so its first wake loads the resumed weights.
         if start_step > 0 and self._use_atom and self._atom_engine is not None:
-            logger.info("[rank %d] Resume: syncing restored weights to rollout engine before first rollout.", self._rank)
+            logger.info(
+                "[rank %d] Resume: syncing restored weights to rollout engine before first rollout.",
+                self._rank,
+            )
             self._sync_weights_to_atom()
 
         for step in range(start_step, total_steps):
@@ -3188,31 +3725,53 @@ class RLTrainer:
             # Full (unsharded) rollout batch. Handles DAPO dynamic sampling
             # (filter_groups) + rollout log-probs internally; rewards are
             # computed once on the full set so degenerate groups can be filtered.
-            (sequences, seq_mask, prompt_lengths, rewards_full,
-             responses_full, gts_exp_full, rollout_lp_full,
-             rollout_ragged) = self._collect_rollout_batch(
-                step, num_generations,
+            (
+                sequences,
+                seq_mask,
+                prompt_lengths,
+                rewards_full,
+                responses_full,
+                gts_exp_full,
+                rollout_lp_full,
+                rollout_ragged,
+            ) = self._collect_rollout_batch(
+                step,
+                num_generations,
             )
             gen_time = time.time() - t0
             if LUMENRL_DEBUG and self._rank == 0:
-                logger.info("[DBG] step %d rollout done: seqs=%s gen_time=%.1fs",
-                            step, list(sequences.shape), gen_time)
+                logger.info(
+                    "[DBG] step %d rollout done: seqs=%s gen_time=%.1fs",
+                    step,
+                    list(sequences.shape),
+                    gen_time,
+                )
             self._log_gpu_mem("post_gen", step)
 
             # Persistent vLLM stays resident across steps (memory coexists with
             # FSDP training); only the kill/sleep-based path frees after gen.
-            if self._use_atom and self._atom_engine is not None and not self._vllm_persistent:
+            if (
+                self._use_atom
+                and self._atom_engine is not None
+                and not self._vllm_persistent
+            ):
                 _engine_ranks = self._vllm_dp or self._rank == 0
                 if _engine_ranks and not self._atom_engine._sleeping:
                     self._atom_engine.sleep_inprocess()
-                    logger.info("Inference engine slept after generation — freeing GPU for training.")
+                    logger.info(
+                        "Inference engine slept after generation — freeing GPU for training."
+                    )
             if self._use_atom and self._is_distributed:
                 torch.distributed.barrier()
             torch.cuda.empty_cache()
             self._log_gpu_mem("post_atom_sleep", step)
 
-            prompt_tok = sum(int(p) for p in prompt_lengths) if num_generations > 0 else 0
-            gen_tokens = int(seq_mask.sum().item()) - prompt_tok if num_generations > 0 else 0
+            prompt_tok = (
+                sum(int(p) for p in prompt_lengths) if num_generations > 0 else 0
+            )
+            gen_tokens = (
+                int(seq_mask.sum().item()) - prompt_tok if num_generations > 0 else 0
+            )
 
             # Shard the (already full) sequence-level batch per rank for log-prob
             # computation and training. Every tensor/list below is sequence-level
@@ -3239,42 +3798,70 @@ class RLTrainer:
             _bypass_mode = getattr(_rc_cfg, "bypass_mode", False)
 
             if _bypass_mode and rollout_lp_full is not None:
-                old_log_probs = rollout_lp_full.to(self._device) if rollout_lp_full is not None else None
+                old_log_probs = (
+                    rollout_lp_full.to(self._device)
+                    if rollout_lp_full is not None
+                    else None
+                )
                 if old_log_probs is None:
                     raise ValueError(
                         "bypass_mode=True requires rollout_log_probs. "
                         "Set calculate_log_probs=true in vllm_cfg."
                     )
                 if self._rank == 0:
-                    logger.info("[step=%d] bypass_mode: using rollout_log_probs as old_log_probs", step)
+                    logger.info(
+                        "[step=%d] bypass_mode: using rollout_log_probs as old_log_probs",
+                        step,
+                    )
             else:
                 self._actor_model.eval()
                 old_log_probs = self._compute_log_probs_for_model(
-                    self._actor_model, sequences, seq_mask,
+                    self._actor_model,
+                    sequences,
+                    seq_mask,
                 )
 
             if step < 3 and self._rank == 0:
                 logger.info(
                     "NaN-DEBUG [step=%d post-rollout] old_log_probs: shape=%s nan=%d inf=%d "
                     "min=%.4f max=%.4f mean=%.4f",
-                    step, list(old_log_probs.shape),
+                    step,
+                    list(old_log_probs.shape),
                     old_log_probs.isnan().sum().item(),
                     old_log_probs.isinf().sum().item(),
-                    old_log_probs[~old_log_probs.isnan()].min().item() if not old_log_probs.isnan().all() else float("nan"),
-                    old_log_probs[~old_log_probs.isnan()].max().item() if not old_log_probs.isnan().all() else float("nan"),
-                    old_log_probs[~old_log_probs.isnan()].mean().item() if not old_log_probs.isnan().all() else float("nan"),
+                    (
+                        old_log_probs[~old_log_probs.isnan()].min().item()
+                        if not old_log_probs.isnan().all()
+                        else float("nan")
+                    ),
+                    (
+                        old_log_probs[~old_log_probs.isnan()].max().item()
+                        if not old_log_probs.isnan().all()
+                        else float("nan")
+                    ),
+                    (
+                        old_log_probs[~old_log_probs.isnan()].mean().item()
+                        if not old_log_probs.isnan().all()
+                        else float("nan")
+                    ),
                 )
                 logger.info(
                     "NaN-DEBUG [step=%d post-rollout] sequences: shape=%s, seq_mask: shape=%s, "
                     "seq_mask sum=%d, prompt_lengths=%s",
-                    step, list(sequences.shape), list(seq_mask.shape),
-                    seq_mask.sum().item(), prompt_lengths[:4],
+                    step,
+                    list(sequences.shape),
+                    list(seq_mask.shape),
+                    seq_mask.sum().item(),
+                    prompt_lengths[:4],
                 )
 
             t1 = time.time()
             if self._ref_model is not None:
                 ref_log_probs = self._compute_log_probs_for_model(
-                    self._ref_model, sequences, seq_mask, move_to_gpu=self._ref_on_cpu,
+                    self._ref_model,
+                    sequences,
+                    seq_mask,
+                    move_to_gpu=self._ref_on_cpu,
                 )
             else:
                 ref_log_probs = torch.zeros_like(old_log_probs)
@@ -3284,9 +3871,12 @@ class RLTrainer:
             rewards = rewards_full.to(self._device)
             responses = responses_full
 
-            response_mask = self._build_response_mask(sequences, seq_mask, prompt_lengths)
+            response_mask = self._build_response_mask(
+                sequences, seq_mask, prompt_lengths
+            )
             response_lengths = [
-                int(response_mask[i].sum().item()) for i in range(response_mask.shape[0])
+                int(response_mask[i].sum().item())
+                for i in range(response_mask.shape[0])
             ]
 
             _batch_tensors = {
@@ -3317,9 +3907,13 @@ class RLTrainer:
             # --- KL penalty in reward (verl/trainer/ppo/ray_trainer.py L1546-1553) ---
             kl_metrics = {}
             if self._kl_ctrl is not None:
-                from lumenrl.algorithms.kl_controller import apply_kl_penalty as _apply_kl
+                from lumenrl.algorithms.kl_controller import (
+                    apply_kl_penalty as _apply_kl,
+                )
+
                 batch, kl_metrics = _apply_kl(
-                    batch, kl_ctrl=self._kl_ctrl,
+                    batch,
+                    kl_ctrl=self._kl_ctrl,
                     kl_penalty_type=self.config.algorithm.kl_penalty,
                 )
 
@@ -3337,45 +3931,82 @@ class RLTrainer:
             # (training policy H(p)). Lets us check E[-rollout_logp] vs E[-old_logp]
             # vs mean(entropy) on identical tokens (verl baseline: all ≈ equal).
             if step == start_step and os.environ.get("LUMEN_DUMP_ROLLOUT"):
-                _etemp = float(getattr(self.config.policy.generation.vllm_cfg, "temperature", 1.0) or 1.0)
+                _etemp = float(
+                    getattr(self.config.policy.generation.vllm_cfg, "temperature", 1.0)
+                    or 1.0
+                )
                 _seqd = batch.tensors["input_ids"]
                 _amd = batch.tensors["attention_mask"]
                 # all ranks run the forward (FSDP collective)
-                _entd = self._packed_entropy_chunked(_seqd, _amd, _etemp, _seqd.shape[1])
+                _entd = self._packed_entropy_chunked(
+                    _seqd, _amd, _etemp, _seqd.shape[1]
+                )
                 try:
                     _rmd = batch.tensors["response_mask"].float()
-                    _perseq = (_entd * _rmd).sum(dim=1) / _rmd.sum(dim=1).clamp(min=1.0)  # [n]
+                    _perseq = (_entd * _rmd).sum(dim=1) / _rmd.sum(dim=1).clamp(
+                        min=1.0
+                    )  # [n]
                     _rlp = batch.tensors.get("rollout_log_probs")
                     _perseq_rlp = None
                     if _rlp is not None:
-                        _perseq_rlp = (_rlp * _rmd).sum(dim=1) / _rmd.sum(dim=1).clamp(min=1.0)
+                        _perseq_rlp = (_rlp * _rmd).sum(dim=1) / _rmd.sum(dim=1).clamp(
+                            min=1.0
+                        )
                     _dp = os.environ["LUMEN_DUMP_ROLLOUT"]
                     _base = _dp.rsplit(".", 1)[0]
-                    torch.save({
-                        "rank": self._rank,
-                        "perseq_entropy": _perseq.detach().float().cpu(),
-                        "perseq_rollout_logp": (_perseq_rlp.detach().float().cpu() if _perseq_rlp is not None else None),
-                        "resp_len": _rmd.sum(dim=1).detach().cpu(),
-                        "sequences": _seqd.detach().cpu(),
-                        "attention_mask": _amd.detach().cpu(),
-                        "prompt_lengths": torch.tensor(prompt_lengths, dtype=torch.long) if isinstance(prompt_lengths, list) else prompt_lengths,
-                    }, f"{_base}_rank{self._rank}.pt")
-                    logger.info("[LUMEN_DUMP] rank %d saved per-seq entropy dump", self._rank)
+                    torch.save(
+                        {
+                            "rank": self._rank,
+                            "perseq_entropy": _perseq.detach().float().cpu(),
+                            "perseq_rollout_logp": (
+                                _perseq_rlp.detach().float().cpu()
+                                if _perseq_rlp is not None
+                                else None
+                            ),
+                            "resp_len": _rmd.sum(dim=1).detach().cpu(),
+                            "sequences": _seqd.detach().cpu(),
+                            "attention_mask": _amd.detach().cpu(),
+                            "prompt_lengths": (
+                                torch.tensor(prompt_lengths, dtype=torch.long)
+                                if isinstance(prompt_lengths, list)
+                                else prompt_lengths
+                            ),
+                        },
+                        f"{_base}_rank{self._rank}.pt",
+                    )
+                    logger.info(
+                        "[LUMEN_DUMP] rank %d saved per-seq entropy dump", self._rank
+                    )
                 except Exception as _e:
                     logger.warning("[LUMEN_DUMP] failed: %s", _e)
 
             # --- Extended rollout correction: IS weights + rejection sampling ---
             _rc_metrics = {}
-            _rollout_lp = batch.tensors.get("rollout_log_probs", batch.tensors.get("fp8_logprobs"))
-            _rc_want = (_rc_cfg.rollout_is or _rc_cfg.rollout_rs or _bypass_mode) and "old_log_probs" in batch.tensors and _rollout_lp is not None
+            _rollout_lp = batch.tensors.get(
+                "rollout_log_probs", batch.tensors.get("fp8_logprobs")
+            )
+            _rc_want = (
+                (_rc_cfg.rollout_is or _rc_cfg.rollout_rs or _bypass_mode)
+                and "old_log_probs" in batch.tensors
+                and _rollout_lp is not None
+            )
             if _rc_want:
-                from lumenrl.algorithms.rollout_correction import compute_rollout_correction_and_add_to_batch
-                batch, _rc_metrics = compute_rollout_correction_and_add_to_batch(batch, _rc_cfg)
+                from lumenrl.algorithms.rollout_correction import (
+                    compute_rollout_correction_and_add_to_batch,
+                )
+
+                batch, _rc_metrics = compute_rollout_correction_and_add_to_batch(
+                    batch, _rc_cfg
+                )
 
             # --- Seqlen balanced partitioning ---
             # (verl/utils/seqlen_balancing.py, verl/trainer/ppo/ray_trainer.py L1098-1165)
             _balance_metrics = {}
-            if self.config.policy.balance_batch and self._is_distributed and self._world_size > 1:
+            if (
+                self.config.policy.balance_batch
+                and self._is_distributed
+                and self._world_size > 1
+            ):
                 _balance_metrics = self._balance_batch(batch)
 
             if self._use_atom and self._atom_engine is not None:
@@ -3400,13 +4031,13 @@ class RLTrainer:
             metrics_accum: dict[str, float] = {}
             step_count = 0
             nan_mb_count = 0
-            grad_norm = 0.0          # running SUM of per-optimizer-step grad norms
+            grad_norm = 0.0  # running SUM of per-optimizer-step grad norms
             mismatch_kl_initial: float | None = None
             nan_param_count = 0
             total_param_count = 0
             optimizer_steps = 0
 
-            accum_steps = 1   # set per-epoch below to len(mini_batches)
+            accum_steps = 1  # set per-epoch below to len(mini_batches)
             _dp_size = self._world_size if self._is_distributed else 1
             self._update_lr(step)
             _cur_lr = self._optimizer.param_groups[0]["lr"]
@@ -3418,7 +4049,11 @@ class RLTrainer:
             # update toward short sequences (later chunks get PPO-clipped after
             # the first step), which stalls response-length growth and learning.
             _resp_full = batch.tensors.get("response_mask")
-            _local_full = int(_resp_full.sum()) if _resp_full is not None else int(batch.tensors["attention_mask"].sum())
+            _local_full = (
+                int(_resp_full.sum())
+                if _resp_full is not None
+                else int(batch.tensors["attention_mask"].sum())
+            )
             if self._is_distributed:
                 _ft = torch.tensor(_local_full, device=self._device)
                 torch.distributed.all_reduce(_ft, op=torch.distributed.ReduceOp.SUM)
@@ -3428,7 +4063,9 @@ class RLTrainer:
 
             _fsdp_grad_sync = self._is_distributed and self._world_size > 1
             if _fsdp_grad_sync:
-                from lumenrl.engine.training.fsdp_backend import set_requires_gradient_sync
+                from lumenrl.engine.training.fsdp_backend import (
+                    set_requires_gradient_sync,
+                )
 
             _do_engine_step = self._engine is not None
 
@@ -3443,19 +4080,30 @@ class RLTrainer:
                 # FSDP2: all ranks MUST run the same number of forward/backward passes.
                 if self._is_distributed and self._world_size > 1:
                     import torch.distributed as dist
+
                     my_count = len(mini_batches)
                     count_t = torch.tensor([my_count], device=self._device)
                     dist.all_reduce(count_t, op=dist.ReduceOp.MAX)
                     global_max = int(count_t.item())
                     if my_count < global_max:
                         pad_batch = mini_batches[-1]
-                        dummy_tensors = {k: v.clone() for k, v in pad_batch.tensors.items()}
-                        dummy_tensors["response_mask"] = torch.zeros_like(dummy_tensors["response_mask"])
-                        dummy_mb = DataProto(tensors=dummy_tensors, meta=pad_batch.meta.copy())
+                        dummy_tensors = {
+                            k: v.clone() for k, v in pad_batch.tensors.items()
+                        }
+                        dummy_tensors["response_mask"] = torch.zeros_like(
+                            dummy_tensors["response_mask"]
+                        )
+                        dummy_mb = DataProto(
+                            tensors=dummy_tensors, meta=pad_batch.meta.copy()
+                        )
                         while len(mini_batches) < global_max:
                             mini_batches.append(dummy_mb)
-                        logger.info("[rank %d] Padded mini-batches: %d -> %d for FSDP2 sync",
-                                    self._rank, my_count, global_max)
+                        logger.info(
+                            "[rank %d] Padded mini-batches: %d -> %d for FSDP2 sync",
+                            self._rank,
+                            my_count,
+                            global_max,
+                        )
 
                 # ONE optimizer step per training step: accumulate over all
                 # mini-batches. Token-mean normalization uses the full-batch
@@ -3465,7 +4113,13 @@ class RLTrainer:
                 if self._rank == 0:
                     logger.info(
                         "[step %d epoch %d/%d] Training: %d mini-batches, accum_steps=%d, dp_size=%d, lr=%.2e",
-                        step, _epoch + 1, _ppo_epochs, len(mini_batches), accum_steps, _dp_size, _cur_lr,
+                        step,
+                        _epoch + 1,
+                        _ppo_epochs,
+                        len(mini_batches),
+                        accum_steps,
+                        _dp_size,
+                        _cur_lr,
                     )
 
                 for i, mini in enumerate(mini_batches):
@@ -3475,11 +4129,15 @@ class RLTrainer:
                         else:
                             self._optimizer.zero_grad(set_to_none=True)
                     cur_loss_scale = 1.0  # full-batch token-mean handles averaging
-                    is_last_in_group = (i + 1) % accum_steps == 0 or i == len(mini_batches) - 1
+                    is_last_in_group = (i + 1) % accum_steps == 0 or i == len(
+                        mini_batches
+                    ) - 1
                     if _fsdp_grad_sync:
                         set_requires_gradient_sync(self._actor_model, is_last_in_group)
                     m = self._train_step(
-                        mini, loss_scale=cur_loss_scale, dp_size=_dp_size,
+                        mini,
+                        loss_scale=cur_loss_scale,
+                        dp_size=_dp_size,
                     )
                     if m.get("loss") is not None and (m["loss"] != m["loss"]):
                         nan_mb_count += 1
@@ -3491,9 +4149,12 @@ class RLTrainer:
                             if _do_engine_step:
                                 _gn = self._engine.optimizer_step()
                             else:
-                                _gn = float(torch.nn.utils.clip_grad_norm_(
-                                    self._actor_model.parameters(), max_norm=1.0,
-                                ))
+                                _gn = float(
+                                    torch.nn.utils.clip_grad_norm_(
+                                        self._actor_model.parameters(),
+                                        max_norm=1.0,
+                                    )
+                                )
                                 if not torch.isfinite(torch.tensor(_gn)):
                                     self._optimizer.zero_grad(set_to_none=True)
                                 else:
@@ -3509,7 +4170,9 @@ class RLTrainer:
                             if p.grad.isnan().any():
                                 _nan_cnt += 1
                                 p.grad = torch.where(
-                                    p.grad.isnan(), torch.zeros_like(p.grad), p.grad,
+                                    p.grad.isnan(),
+                                    torch.zeros_like(p.grad),
+                                    p.grad,
                                 )
                     nan_param_count = max(nan_param_count, _nan_cnt)
                     total_param_count = _total_cnt
@@ -3517,9 +4180,12 @@ class RLTrainer:
                         if _do_engine_step:
                             _gn = self._engine.optimizer_step()
                         else:
-                            _gn = float(torch.nn.utils.clip_grad_norm_(
-                                self._actor_model.parameters(), max_norm=1.0,
-                            ))
+                            _gn = float(
+                                torch.nn.utils.clip_grad_norm_(
+                                    self._actor_model.parameters(),
+                                    max_norm=1.0,
+                                )
+                            )
                             if not torch.isfinite(torch.tensor(_gn)):
                                 self._optimizer.zero_grad(set_to_none=True)
                             else:
@@ -3541,21 +4207,30 @@ class RLTrainer:
             if _fsdp_grad_sync:
                 set_requires_gradient_sync(self._actor_model, True)
             if self._rank == 0:
-                logger.info("[step %d] Completed %d optimizer steps (%d epochs x mini-batches).",
-                            step, optimizer_steps, _ppo_epochs)
+                logger.info(
+                    "[step %d] Completed %d optimizer steps (%d epochs x mini-batches).",
+                    step,
+                    optimizer_steps,
+                    _ppo_epochs,
+                )
             train_time = time.time() - t2
             self._log_gpu_mem("post_train", step)
 
             # --- Critic: update value network ---
             if self._critic_worker is not None:
-                for _critic_epoch in range(getattr(self.config.critic, 'num_critic_epochs', 1)):
+                for _critic_epoch in range(
+                    getattr(self.config.critic, "num_critic_epochs", 1)
+                ):
                     critic_metrics = self._critic_worker.train_step(batch)
                 metrics_accum.update(critic_metrics)
 
             if nan_param_count > 0 and self._rank == 0:
                 logger.warning(
                     "[step %d] Zeroed NaN grads in %d/%d params, grad_norm=%.4f",
-                    step, nan_param_count, total_param_count, float(grad_norm),
+                    step,
+                    nan_param_count,
+                    total_param_count,
+                    float(grad_norm),
                 )
 
             denom = max(1, step_count)
@@ -3601,7 +4276,10 @@ class RLTrainer:
             # Comprehensive data metrics (verl/trainer/ppo/metric_utils.py L89-268)
             try:
                 from lumenrl.trainer.metric_utils import compute_data_metrics
-                _data_m = compute_data_metrics(batch, use_critic=self._critic_worker is not None)
+
+                _data_m = compute_data_metrics(
+                    batch, use_critic=self._critic_worker is not None
+                )
                 metrics.update(_data_m)
             except Exception:
                 pass
@@ -3621,8 +4299,11 @@ class RLTrainer:
                 # entropy: token-weighted GLOBAL token-mean across ranks (verl-aligned).
                 # all_reduce SUM of (sum, tok) then divide — NOT AVG of per-rank means,
                 # which is biased when ranks have different response-token counts.
-                _et = torch.tensor([_ent_sum_local, _ent_tok_local],
-                                   dtype=torch.float64, device=self._device)
+                _et = torch.tensor(
+                    [_ent_sum_local, _ent_tok_local],
+                    dtype=torch.float64,
+                    device=self._device,
+                )
                 torch.distributed.all_reduce(_et, op=torch.distributed.ReduceOp.SUM)
                 if float(_et[1].item()) > 0:
                     metrics["entropy"] = float(_et[0].item() / _et[1].item())
@@ -3635,12 +4316,14 @@ class RLTrainer:
                         op = torch.distributed.ReduceOp.MIN
                     else:
                         op = torch.distributed.ReduceOp.AVG
-                    t = torch.tensor(metrics[k], dtype=torch.float64, device=self._device)
+                    t = torch.tensor(
+                        metrics[k], dtype=torch.float64, device=self._device
+                    )
                     torch.distributed.all_reduce(t, op=op)
                     metrics[k] = float(t.item())
 
             # Validation
-            val_steps = getattr(self.config, 'val_steps', 0)
+            val_steps = getattr(self.config, "val_steps", 0)
             if val_steps > 0 and (step + 1) % val_steps == 0:
                 val_metrics = self.run_validation()
                 metrics.update(val_metrics)
@@ -3670,7 +4353,11 @@ class RLTrainer:
             for cb in self.callbacks:
                 cb.on_train_end(self)
 
-        logger.info("[rank %d] RLTrainer.train finished after %d steps.", self._rank, total_steps)
+        logger.info(
+            "[rank %d] RLTrainer.train finished after %d steps.",
+            self._rank,
+            total_steps,
+        )
 
     def _compute_log_probs_with_worker_group(
         self,
@@ -3708,7 +4395,11 @@ class RLTrainer:
                 )
             req_ragged["rollout_routing"] = list(rollout_routing)
         req = DataProto(tensors=req_tensors, meta=meta, ragged=req_ragged)
-        role_cfg = self.config.controller.ray.actor if role == "actor" else self.config.controller.ray.ref
+        role_cfg = (
+            self.config.controller.ray.actor
+            if role == "actor"
+            else self.config.controller.ray.ref
+        )
         out = wg.dispatch_and_call(
             "compute_log_probs",
             req,
@@ -3720,7 +4411,9 @@ class RLTrainer:
         elif "ref_log_probs" in out.tensors:
             logp = out["ref_log_probs"].to(self._device)
         else:
-            raise KeyError(f"Expected log_probs/ref_log_probs in worker output, got keys={list(out.tensors.keys())}")
+            raise KeyError(
+                f"Expected log_probs/ref_log_probs in worker output, got keys={list(out.tensors.keys())}"
+            )
         if want_entropy:
             ent = out.tensors.get("entropy")
             return logp, (ent.to(self._device) if ent is not None else None)
@@ -3913,7 +4606,7 @@ class RLTrainer:
         cur_reserved = max(float(s.get("reserved_bytes", 0.0)) for s in stats)
         cur_allocated = max(float(s.get("allocated_bytes", 0.0)) for s in stats)
         cpu_used = max(float(s.get("cpu_memory_used_bytes", 0.0)) for s in stats)
-        gb = 1024.0 ** 3
+        gb = 1024.0**3
         return {
             "mem/actor_max_reserved_gb": max_reserved / gb,
             "mem/actor_max_allocated_gb": max_allocated / gb,
@@ -3946,7 +4639,9 @@ class RLTrainer:
             - int(self.config.policy.max_response_length),
         )
         batch.meta["max_prompt_length"] = max_prompt_length
-        metrics.update(compute_data_metrics(batch, use_critic=self._critic_worker is not None))
+        metrics.update(
+            compute_data_metrics(batch, use_critic=self._critic_worker is not None)
+        )
         metrics.update(compute_timing_metrics(batch, timing_raw))
 
         cluster_gpus = max(
@@ -3972,9 +4667,7 @@ class RLTrainer:
         metrics.setdefault("perf/mfu/actor_infer", 0.0)
         metrics["train/num_gen_batches"] = 1.0
 
-        seq_lengths = [
-            float(p + r) for p, r in zip(prompt_lengths, response_lengths)
-        ]
+        seq_lengths = [float(p + r) for p, r in zip(prompt_lengths, response_lengths)]
         if seq_lengths:
             metrics["global_seqlen/max"] = max(seq_lengths)
             metrics["global_seqlen/min"] = min(seq_lengths)
@@ -4030,7 +4723,9 @@ class RLTrainer:
         if self._algorithm is None or self._actor_wg is None:
             raise RuntimeError("Call setup() before train().")
         if self._atom_engine is None and self._ray_vllm_engine is None:
-            raise RuntimeError("Ray controller path requires an ATOM or ray_http rollout engine.")
+            raise RuntimeError(
+                "Ray controller path requires an ATOM or ray_http rollout engine."
+            )
 
         for cb in self.callbacks:
             cb.on_train_begin(self)
@@ -4039,13 +4734,20 @@ class RLTrainer:
         total_steps = int(self.config.num_training_steps)
         start_step = self._resume_step
         use_ray_rollout = bool(
-            (getattr(self, "_ray_use_vllm", False) or getattr(self, "_ray_use_atom", False))
+            (
+                getattr(self, "_ray_use_vllm", False)
+                or getattr(self, "_ray_use_atom", False)
+            )
             and self._ray_vllm_engine is not None
         )
         if start_step > 0:
-            logger.info("Skipping global steps 1..%d (resuming from checkpoint).", start_step)
+            logger.info(
+                "Skipping global steps 1..%d (resuming from checkpoint).", start_step
+            )
             if use_ray_rollout:
-                logger.info("Resume: syncing restored actor weights to Ray rollout before first rollout.")
+                logger.info(
+                    "Resume: syncing restored actor weights to Ray rollout before first rollout."
+                )
                 self._sync_weights_ipc()
 
         for step in range(start_step, total_steps):
@@ -4062,14 +4764,23 @@ class RLTrainer:
             if use_ray_rollout:
                 # verl-aligned online rollout across colocated replicas, with
                 # DAPO filter_groups dynamic sampling handled in the collector.
-                (sequences, seq_mask, prompt_lengths, rewards, responses,
-                 ground_truths_expanded, rollout_lp,
-                 rollout_ragged) = self._collect_rollout_batch(step, num_generations)
+                (
+                    sequences,
+                    seq_mask,
+                    prompt_lengths,
+                    rewards,
+                    responses,
+                    ground_truths_expanded,
+                    rollout_lp,
+                    rollout_ragged,
+                ) = self._collect_rollout_batch(step, num_generations)
                 # free rollout KV so the FSDP training pass has GPU headroom.
                 self._ray_vllm_engine.sleep()
             else:
                 prompts, ground_truths = self._get_batch_prompts(step)
-                sequences, seq_mask, prompt_lengths = self._rollout_with_atom(prompts, num_generations)
+                sequences, seq_mask, prompt_lengths = self._rollout_with_atom(
+                    prompts, num_generations
+                )
                 rewards, responses = None, None
                 ground_truths_expanded = ground_truths * num_generations
                 rollout_ragged = {}
@@ -4083,10 +4794,16 @@ class RLTrainer:
                 old_log_probs = rollout_lp
                 entropy_full = None
                 if self._rank == 0:
-                    logger.info("[step=%d] bypass_mode (ray): using rollout_log_probs as old_log_probs", step)
+                    logger.info(
+                        "[step=%d] bypass_mode (ray): using rollout_log_probs as old_log_probs",
+                        step,
+                    )
             else:
                 old_log_probs, entropy_full = self._compute_log_probs_with_worker_group(
-                    self._actor_wg, sequences, role="actor", want_entropy=True,
+                    self._actor_wg,
+                    sequences,
+                    role="actor",
+                    want_entropy=True,
                     attention_mask=seq_mask,
                     rollout_routing=rollout_ragged.get("rollout_routing"),
                 )
@@ -4094,7 +4811,10 @@ class RLTrainer:
             ref_t0 = time.time()
             if self._ref_wg is not None:
                 ref_log_probs = self._compute_log_probs_with_worker_group(
-                    self._ref_wg, sequences, role="ref", attention_mask=seq_mask,
+                    self._ref_wg,
+                    sequences,
+                    role="ref",
+                    attention_mask=seq_mask,
                 )
             else:
                 ref_log_probs = torch.zeros_like(old_log_probs)
@@ -4103,11 +4823,20 @@ class RLTrainer:
             reward_t0 = time.time()
             if rewards is None:
                 rewards, responses = self._compute_rewards(
-                    sequences, seq_mask, prompt_lengths, ground_truths, num_generations,
+                    sequences,
+                    seq_mask,
+                    prompt_lengths,
+                    ground_truths,
+                    num_generations,
                 )
             reward_time = time.time() - reward_t0
-            response_mask = self._build_response_mask(sequences, seq_mask, prompt_lengths)
-            response_lengths = [int(response_mask[i].sum().item()) for i in range(response_mask.shape[0])]
+            response_mask = self._build_response_mask(
+                sequences, seq_mask, prompt_lengths
+            )
+            response_lengths = [
+                int(response_mask[i].sum().item())
+                for i in range(response_mask.shape[0])
+            ]
 
             tensors = {
                 "input_ids": sequences,
@@ -4131,7 +4860,10 @@ class RLTrainer:
                     # sampling temperature (logits.div_(temperature)); pass it so
                     # the worker applies the same convention as old/ref log-probs.
                     "temperature": float(
-                        getattr(self.config.policy.generation.vllm_cfg, "temperature", 1.0) or 1.0
+                        getattr(
+                            self.config.policy.generation.vllm_cfg, "temperature", 1.0
+                        )
+                        or 1.0
                     ),
                     # Keep packed training on the same MILES token budget as
                     # old-logprob inference. Without this, the engine falls
@@ -4153,11 +4885,22 @@ class RLTrainer:
             # --- Extended rollout correction: IS weights + RS (Ray path) ---
             _rc_metrics_ray = {}
             _position_mismatch_metrics = {}
-            _rlp_ray = batch.tensors.get("rollout_log_probs", batch.tensors.get("fp8_logprobs"))
-            _rc_want_ray = (_rc_cfg_ray.rollout_is or _rc_cfg_ray.rollout_rs or _bypass_ray) and "old_log_probs" in batch.tensors and _rlp_ray is not None
+            _rlp_ray = batch.tensors.get(
+                "rollout_log_probs", batch.tensors.get("fp8_logprobs")
+            )
+            _rc_want_ray = (
+                (_rc_cfg_ray.rollout_is or _rc_cfg_ray.rollout_rs or _bypass_ray)
+                and "old_log_probs" in batch.tensors
+                and _rlp_ray is not None
+            )
             if _rc_want_ray:
-                from lumenrl.algorithms.rollout_correction import compute_rollout_correction_and_add_to_batch
-                batch, _rc_metrics_ray = compute_rollout_correction_and_add_to_batch(batch, _rc_cfg_ray)
+                from lumenrl.algorithms.rollout_correction import (
+                    compute_rollout_correction_and_add_to_batch,
+                )
+
+                batch, _rc_metrics_ray = compute_rollout_correction_and_add_to_batch(
+                    batch, _rc_cfg_ray
+                )
                 _position_mismatch_metrics = self._mismatch_by_response_position(
                     old_log_probs,
                     _rlp_ray,
@@ -4176,7 +4919,8 @@ class RLTrainer:
                 # averaged across DP×CP, while the differentiable CP gather's
                 # backward SUM cancels the CP average) = pure DP width.
                 batch.meta["dp_size"] = int(
-                    self._actor_dp_size or (self._actor_wg.num_workers // max(1, self._actor_mp))
+                    self._actor_dp_size
+                    or (self._actor_wg.num_workers // max(1, self._actor_mp))
                 )
 
             # ---- train (worker-side PPO mini-batch loop; FSDP grad sync) ----
@@ -4212,13 +4956,21 @@ class RLTrainer:
             if gen_tokens > 0 and gen_time > 0:
                 metrics["throughput/gen_tok_per_s"] = gen_tokens / gen_time
             metrics["reward/mean"] = float(rewards.mean().item())
-            metrics["reward/accuracy"] = float(sum(1 for r in rewards if r > 0) / max(1, len(rewards)))
+            metrics["reward/accuracy"] = float(
+                sum(1 for r in rewards if r > 0) / max(1, len(rewards))
+            )
             metrics["seq/max_len"] = int(sequences.shape[1])
-            metrics["seq/mean_response_len"] = float(sum(response_lengths) / max(1, len(response_lengths)))
+            metrics["seq/mean_response_len"] = float(
+                sum(response_lengths) / max(1, len(response_lengths))
+            )
             # verl-aligned actor/entropy: token-weighted mean over response tokens.
             if entropy_full is not None:
                 _em = response_mask.to(entropy_full.device).to(entropy_full.dtype)
-                _ec = entropy_full[..., : _em.shape[-1]] if entropy_full.shape[-1] != _em.shape[-1] else entropy_full
+                _ec = (
+                    entropy_full[..., : _em.shape[-1]]
+                    if entropy_full.shape[-1] != _em.shape[-1]
+                    else entropy_full
+                )
                 _denom = float(_em.sum().item())
                 if _denom > 0:
                     metrics["entropy"] = float((_ec * _em).sum().item() / _denom)
@@ -4228,15 +4980,19 @@ class RLTrainer:
                         _neglp = float((-_olp * _em).sum().item() / _denom)
                         logger.info(
                             "ENT_DIAG step=%d resp_ent=%.3f all_ent=%.3f resp_neglogp=%.3f mask_tok=%d ent_max=%.2f",
-                            step, metrics["entropy"], float(entropy_full.mean().item()),
-                            _neglp, int(_denom), float(entropy_full.max().item()),
+                            step,
+                            metrics["entropy"],
+                            float(entropy_full.mean().item()),
+                            _neglp,
+                            int(_denom),
+                            float(entropy_full.max().item()),
                         )
 
             # ---- weight sync to rollout engine ----
             t_sync = time.time()
             if getattr(self.config.weight_sync, "enabled", True):
                 if use_ray_rollout:
-                    self._sync_weights_ipc()   # wake weights -> ZMQ IPC -> wake KV
+                    self._sync_weights_ipc()  # wake weights -> ZMQ IPC -> wake KV
                 else:
                     self._sync_rollout_weights()
             sync_time = time.time() - t_sync
@@ -4248,7 +5004,7 @@ class RLTrainer:
             # Validation uses the rollout engine too, so run it after the fresh
             # actor weights have been synced and sleep/wake has restored KV cache.
             val_t0 = time.time()
-            val_steps = getattr(self.config, 'val_steps', 0)
+            val_steps = getattr(self.config, "val_steps", 0)
             if val_steps > 0 and (step + 1) % val_steps == 0:
                 val_metrics = self.run_validation()
                 metrics.update(val_metrics)
@@ -4266,7 +5022,11 @@ class RLTrainer:
                 "step": time.time() - step_start,
             }
             self._add_verl_metrics(
-                metrics, batch, timing_raw, prompt_lengths, response_lengths,
+                metrics,
+                batch,
+                timing_raw,
+                prompt_lengths,
+                response_lengths,
             )
 
             self.last_metrics = metrics
@@ -4286,7 +5046,9 @@ class RLTrainer:
 
         for cb in self.callbacks:
             cb.on_train_end(self)
-        logger.info("RLTrainer.train (ray-controller) finished after %d steps.", total_steps)
+        logger.info(
+            "RLTrainer.train (ray-controller) finished after %d steps.", total_steps
+        )
 
     def _sync_rollout_weights(self) -> None:
         """Sync actor weights to ATOM rollout engine if configured."""
@@ -4325,12 +5087,19 @@ class RLTrainer:
             logger.info(
                 "[eval] step=%d: evaluating %d prompts x %d samples "
                 "(temperature=%.3g, top_p=%.3g, batch_size=%d)",
-                self.global_step + 1, num_samples, eval_n,
-                eval_sp["temperature"], eval_sp["top_p"], val_bs,
+                self.global_step + 1,
+                num_samples,
+                eval_n,
+                eval_sp["temperature"],
+                eval_sp["top_p"],
+                val_bs,
             )
 
         size_divisor = 1
-        if getattr(self, "_ray_vllm_engine", None) is not None and self._actor_wg is not None:
+        if (
+            getattr(self, "_ray_vllm_engine", None) is not None
+            and self._actor_wg is not None
+        ):
             size_divisor = max(1, int(self._actor_wg.num_workers))
 
         for start in range(0, num_samples, val_bs):
@@ -4360,11 +5129,15 @@ class RLTrainer:
             # the torchrun _rollout_phase fallback would crash).
             if getattr(self, "_ray_vllm_engine", None) is not None:
                 sequences, seq_mask, prompt_lengths, _, _ = self._rollout_with_ray_vllm(
-                    prompts, num_generations=eval_n, sampling_params=eval_sp,
+                    prompts,
+                    num_generations=eval_n,
+                    sampling_params=eval_sp,
                 )
             elif self._use_vllm and self._atom_engine is not None:
                 sequences, seq_mask, prompt_lengths, _ = self._rollout_with_vllm(
-                    prompts, num_generations=eval_n, eval_mode=True,
+                    prompts,
+                    num_generations=eval_n,
+                    eval_mode=True,
                 )
             elif self._use_atom and self._atom_engine is not None:
                 sequences, seq_mask, prompt_lengths = self._rollout_with_atom(
@@ -4390,14 +5163,20 @@ class RLTrainer:
             for i in range(seq_cpu.shape[0]):
                 plen = int(prompt_lengths[i]) if i < len(prompt_lengths) else 0
                 response_ids = _response_token_ids(seq_cpu[i], mask_cpu[i], plen)
-                responses.append(self._tokenizer.decode(response_ids, skip_special_tokens=True))
+                responses.append(
+                    self._tokenizer.decode(response_ids, skip_special_tokens=True)
+                )
             rewards_t, details = compute_math_reward(responses, ground_truths)
 
             all_scores.extend(rewards_t.tolist())
             all_acc.extend([1.0 if d["acc"] else 0.0 for d in details])
             all_responses.extend(responses)
-            response_mask = self._build_response_mask(sequences, seq_mask, prompt_lengths)
-            all_response_lengths.extend([int(x) for x in response_mask.sum(dim=-1).tolist()])
+            response_mask = self._build_response_mask(
+                sequences, seq_mask, prompt_lengths
+            )
+            all_response_lengths.extend(
+                [int(x) for x in response_mask.sum(dim=-1).tolist()]
+            )
 
         # Keep the Ray rollout lifecycle consistent across training and
         # validation: after any generation phase, release rollout-side KV/graphs
@@ -4411,7 +5190,11 @@ class RLTrainer:
 
         # Non-persistent path frees the eval vLLM (kill subprocess: reliable GPU
         # release on ROCm). Persistent path keeps the resident engine(s) alive.
-        if self._use_vllm and not self._vllm_persistent and self._atom_engine is not None:
+        if (
+            self._use_vllm
+            and not self._vllm_persistent
+            and self._atom_engine is not None
+        ):
             if self._vllm_dp or self._rank == 0:
                 try:
                     self._atom_engine.sleep()
@@ -4455,13 +5238,23 @@ class RLTrainer:
         if self._rank == 0:
             logger.info(
                 "[eval] step=%d acc=%.4f score_mean=%.4f resp_len=%.1f n=%d",
-                self.global_step + 1, metrics[f"val-core/acc/mean@{eval_n}"],
+                self.global_step + 1,
+                metrics[f"val-core/acc/mean@{eval_n}"],
                 metrics["val/score_mean"],
-                metrics["val/response_length_mean"], len(all_scores),
+                metrics["val/response_length_mean"],
+                len(all_scores),
             )
-            num_print = min(getattr(self.config.logger, "num_val_samples_to_print", 3), len(all_responses))
+            num_print = min(
+                getattr(self.config.logger, "num_val_samples_to_print", 3),
+                len(all_responses),
+            )
             for i in range(num_print):
-                logger.info("[eval] sample %d acc=%.0f resp=...%s", i, all_acc[i], repr(all_responses[i][-160:]))
+                logger.info(
+                    "[eval] sample %d acc=%.0f resp=...%s",
+                    i,
+                    all_acc[i],
+                    repr(all_responses[i][-160:]),
+                )
 
         return metrics
 
@@ -4474,9 +5267,8 @@ class RLTrainer:
             except Exception:
                 pass
             self._profiler = None
-        if (
-            self._ray_rollout_mgr is not None
-            and getattr(self._ray_rollout_mgr, "rdma_group_name", None)
+        if self._ray_rollout_mgr is not None and getattr(
+            self._ray_rollout_mgr, "rdma_group_name", None
         ):
             try:
                 self._ray_rollout_mgr.destroy_rdma_weight_group(self._actor_wg)

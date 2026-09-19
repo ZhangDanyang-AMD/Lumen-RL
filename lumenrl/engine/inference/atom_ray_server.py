@@ -664,6 +664,98 @@ class ATOMRayServer:
 
         return await asyncio.get_event_loop().run_in_executor(None, _blocking)
 
+    def rdma_preflight(self, interface: str, hca: str) -> dict[str, Any]:
+        """Fail now, loudly, if this container cannot do RDMA at all.
+
+        Without this the group still forms and the transfer still "works" --
+        over TCP, at a fraction of the bandwidth, with nothing in the logs
+        saying so. Checked before the rendezvous because a missing device here
+        would otherwise surface as all nine ranks hanging for the full timeout.
+        """
+        from pathlib import Path
+
+        uverbs = sorted(Path("/dev/infiniband").glob("uverbs*"))
+        if not uverbs or not (Path("/sys/class/infiniband") / hca).exists():
+            raise RuntimeError(
+                f"RDMA unavailable in ATOM rollout container: "
+                f"uverbs={[p.name for p in uverbs]}, hca={hca!r}"
+            )
+        if os.environ.get("NCCL_IB_DISABLE", "0") == "1":
+            raise RuntimeError("NCCL_IB_DISABLE=1 would force Socket transport")
+        return {
+            "replica": self.replica_rank,
+            "interface": interface,
+            "hca": hca,
+            "uverbs": len(uverbs),
+        }
+
+    async def init_rdma_weight_group(
+        self,
+        master_addr: str,
+        master_port: int,
+        base_rank: int,
+        world_size: int,
+        group_name: str,
+        timeout_s: int = 600,
+    ) -> bool:
+        """Join every rank of this replica to the trainer's broadcast group.
+
+        Rank 0 is the trainer; this replica occupies ``base_rank`` upward. The
+        per-rank offset is computed worker-side, since only the worker knows its
+        own TP rank and local DP rank.
+        """
+        await self.collective_rpc(
+            "init_rdma_weight_group",
+            kwargs={
+                "master_addr": master_addr,
+                "master_port": int(master_port),
+                "base_rank": int(base_rank),
+                "world_size": int(world_size),
+                "group_name": group_name,
+                "timeout_s": int(timeout_s),
+            },
+            timeout=float(timeout_s),
+        )
+        return True
+
+    async def receive_weights_rdma(
+        self,
+        group_name: str,
+        version: int,
+        verify_full_load: bool = True,
+        prequantized_fp8: bool = False,
+    ) -> Any:
+        """Receive one weight version into every rank of this replica."""
+        if prequantized_fp8:
+            # Rejected rather than ignored: silently dropping it would leave the
+            # trainer quantising and ATOM expecting BF16, which shows up as
+            # garbage output rather than an error.
+            raise NotImplementedError(
+                "ATOM's RDMA receive path is BF16-only; "
+                "weight_sync fp8 quantization on the trainer is not supported yet"
+            )
+        stats = await self.collective_rpc(
+            "receive_weights_rdma",
+            kwargs={
+                "group_name": group_name,
+                "version": int(version),
+                "verify_full_load": bool(verify_full_load),
+            },
+            # A weight stream is tens of GB; the default RPC budget is far too
+            # short for it.
+            timeout=float(os.environ.get("LUMENRL_RDMA_RECV_TIMEOUT_S", "1800")),
+        )
+        await self.reset_prefix_cache()
+        return stats
+
+    async def destroy_rdma_weight_group(self, group_name: str) -> bool:
+        if self.engine is None:
+            return True
+        await self.collective_rpc(
+            "destroy_rdma_weight_group", kwargs={"group_name": group_name}
+        )
+        return True
+
     async def reset_prefix_cache(self) -> bool:
         if self.engine is not None and hasattr(self.engine, "clear_kv_cache"):
             self.engine.clear_kv_cache()
@@ -763,6 +855,16 @@ class ATOMReplicaManager:
         self.base_seed = base_seed
         self.num_replicas = actor_wg.num_workers
         self.servers: list = []
+        # Retained rather than recomputed in create(): the RDMA rank striding
+        # needs both, and a replica running DP internally contributes
+        # tp * dp ranks to the group, not tp.
+        self.tensor_parallel_size = int(
+            self.engine_kwargs.get("tensor_parallel_size", 1) or 1
+        )
+        self.data_parallel_size = int(
+            self.engine_kwargs.get("data_parallel_size", 1) or 1
+        )
+        self.rdma_group_name: Optional[str] = None
 
     def create(self) -> None:
         import ray
@@ -998,6 +1100,170 @@ class ATOMReplicaManager:
         import ray
 
         return ray.get([s.get_capabilities.remote() for s in self.servers])
+
+    # ── RDMA weight transfer ──────────────────────────────────────────────
+    #
+    # Mirrors VLLMReplicaManager's interface exactly, so the backend-agnostic
+    # _sync_weights_rdma in the trainer drives either one unchanged.
+
+    @property
+    def _ranks_per_replica(self) -> int:
+        """Ranks one replica contributes to the weight group.
+
+        A replica running DP internally is several engines behind one actor
+        handle, and each of their TP ranks joins separately, so this is tp * dp
+        rather than tp. Getting it wrong shifts every later replica's base rank
+        and the rendezvous hangs with no useful error.
+        """
+        return self.tensor_parallel_size * self.data_parallel_size
+
+    def init_rdma_weight_group(
+        self,
+        actor_wg,
+        *,
+        interface: str,
+        hca: str,
+        require_rdma: bool,
+        timeout_s: int,
+        group_name: str,
+    ) -> dict[str, Any]:
+        """Build one persistent trainer + all-workers RCCL communicator."""
+        import ray
+
+        self._assert_workers_can_receive_rdma()
+
+        if require_rdma:
+            # Preflight everyone before anybody rendezvouses: a container
+            # missing its verbs device would otherwise park all ranks until the
+            # timeout, naming none of them.
+            checks = [actor_wg.call_single_async(0, "rdma_preflight", interface, hca)]
+            checks.extend(
+                server.rdma_preflight.remote(interface, hca) for server in self.servers
+            )
+            logger.info("ATOM RDMA preflight: %s", ray.get(checks))
+
+        rendezvous = actor_wg.execute_rank_zero_sync("get_rdma_rendezvous", interface)
+        master_addr = str(rendezvous["address"])
+        master_port = int(rendezvous["port"])
+        world_size = 1 + self.num_replicas * self._ranks_per_replica
+
+        # Trainer takes rank 0; replica r takes the block starting at
+        # 1 + r * ranks_per_replica. Every rank must call in or the rendezvous
+        # blocks, so these go out together and are joined as a set.
+        refs = [
+            actor_wg.call_single_async(
+                0,
+                "init_rdma_weight_group",
+                master_addr,
+                master_port,
+                world_size,
+                group_name,
+                timeout_s,
+            )
+        ]
+        for replica_rank, server in enumerate(self.servers):
+            refs.append(
+                server.init_rdma_weight_group.remote(
+                    master_addr,
+                    master_port,
+                    1 + replica_rank * self._ranks_per_replica,
+                    world_size,
+                    group_name,
+                    timeout_s,
+                )
+            )
+        ray.get(refs)
+
+        self.rdma_group_name = group_name
+        logger.info(
+            "ATOM RDMA weight group ready: %s master=%s:%d world=%d "
+            "(%d replicas x %d ranks + trainer)",
+            group_name,
+            master_addr,
+            master_port,
+            world_size,
+            self.num_replicas,
+            self._ranks_per_replica,
+        )
+        return {
+            "master_addr": master_addr,
+            "master_port": master_port,
+            "world_size": world_size,
+        }
+
+    def _assert_workers_can_receive_rdma(self) -> None:
+        """Refuse to build a group the workers cannot serve.
+
+        Uses ATOM's general capability negotiation rather than a bespoke
+        handshake. Checked before the rendezvous for the same reason as
+        preflight: afterwards the failure is a hang, not a message.
+        """
+        import ray
+
+        for replica_rank, server in enumerate(self.servers):
+            try:
+                caps = ray.get(server.get_capabilities.remote())
+            except Exception as exc:
+                raise RuntimeError(
+                    f"ATOM replica {replica_rank} could not report capabilities; "
+                    "the engine predates capability discovery, so its RDMA "
+                    "support cannot be confirmed"
+                ) from exc
+            if not caps.supports("rdma_weight_receive"):
+                partial = getattr(caps, "partial", lambda: ())()
+                hint = (
+                    f" (present on some ranks but not all: {sorted(partial)})"
+                    if "rdma_weight_receive" in partial
+                    else ""
+                )
+                raise RuntimeError(
+                    f"ATOM replica {replica_rank} does not support "
+                    f"rdma_weight_receive{hint}; every rank needs the receiver "
+                    "for the group to be usable"
+                )
+
+    def start_receive_weights_rdma(
+        self,
+        *,
+        version: int,
+        verify_full_load: bool,
+        prequantized_fp8: bool = False,
+    ) -> list:
+        """Arm every replica's receiver and return the refs un-awaited.
+
+        Deliberately not awaited here: all receivers and the trainer's sender
+        must sit inside the broadcast at once. Joining them in turn would park
+        the first receiver waiting for a sender that is itself waiting for this
+        call to return.
+        """
+        if not self.rdma_group_name:
+            raise RuntimeError("ATOM RDMA weight group has not been initialized")
+        return [
+            server.receive_weights_rdma.remote(
+                self.rdma_group_name,
+                int(version),
+                bool(verify_full_load),
+                bool(prequantized_fp8),
+            )
+            for server in self.servers
+        ]
+
+    def destroy_rdma_weight_group(self, actor_wg=None) -> None:
+        import ray
+
+        if not self.rdma_group_name:
+            return
+        refs = [
+            server.destroy_rdma_weight_group.remote(self.rdma_group_name)
+            for server in self.servers
+        ]
+        if actor_wg is not None:
+            refs.append(actor_wg.call_single_async(0, "destroy_rdma_weight_group"))
+        try:
+            ray.get(refs)
+        except Exception as exc:  # noqa: BLE001 - teardown must not mask the cause
+            logger.warning("ATOM RDMA group teardown failed: %s", exc)
+        self.rdma_group_name = None
 
     def reload_weights_from_path(self, weight_dir: str) -> None:
         import ray
