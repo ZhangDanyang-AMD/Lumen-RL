@@ -22,6 +22,7 @@ Only what ``fp8_per_block`` needs is ported here (no static-FP8
 from __future__ import annotations
 
 import hashlib
+import os
 import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -629,6 +630,37 @@ def prepare_prequantized_fp8_weights_for_loading(model) -> dict[str, int]:
     )
 
 
+def rollout_pow2_scales_enabled() -> bool:
+    """Whether to round rollout FP8 block scales to powers of two.
+
+    Matches TransformerEngine's force_pow_2_scales (TE's default), so the rollout and
+    the trainer quantise the same weights identically instead of only to ~1e-7. TE
+    rounds the dequant multiplier UP (it truncates the mantissa of FP8_MAX/amax), so
+    both sites here use exp2(ceil(log2(s))) -- the same convention vLLM/SGLang use.
+
+    Off by default; set LUMENRL_ROLLOUT_POW2_SCALES=1 to enable.
+    """
+    return os.environ.get("LUMENRL_ROLLOUT_POW2_SCALES", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _pow2_activation_quant_wrapper(orig):
+    """Force use_ue8m0=True on vLLM's per-token-group activation quantiser.
+
+    vLLM gates UE8M0 rounding on is_deep_gemm_e8m0_used(), which is False on ROCm
+    (DeepGEMM is CUDA-only), and _triton_per_token_group_quant_fp8_impl hardcodes
+    use_ue8m0=False. The rounding itself is platform-independent: the power-of-two
+    value goes into the ordinary fp32 scale tensor.
+    """
+
+    def wrapper(*args, **kwargs):
+        kwargs["use_ue8m0"] = True
+        return orig(*args, **kwargs)
+
+    return wrapper
+
+
 def process_fp8_weight_block_strategy_rocm_safe(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -652,6 +684,13 @@ def process_fp8_weight_block_strategy_rocm_safe(
             weight=weight, weight_scale=weight_scale
         )
 
+    if rollout_pow2_scales_enabled() and weight_scale.dtype == torch.float32:
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            requant_weight_ue8m0_inplace,
+        )
+
+        requant_weight_ue8m0_inplace(weight, weight_scale, block_size=(128, 128))
+
     weight = _maybe_pad_fp8_weight(weight)
     return weight, weight_scale
 
@@ -671,6 +710,23 @@ def apply_vllm_fp8_per_block_patches() -> None:
         "vllm.model_executor.layers.quantization.utils.fp8_utils.process_fp8_weight_block_strategy",
         "vllm.model_executor.kernels.linear.scaled_mm.BlockScaledMMLinearKernel.process_fp8_weight_block_strategy",
     ]
+    if rollout_pow2_scales_enabled():
+        # Activation scales too, or the two GEMM operands disagree.
+        try:
+            import vllm.model_executor.layers.quantization.utils.fp8_utils as _vf
+
+            patcher = patch.object(
+                _vf,
+                "per_token_group_quant_fp8",
+                _pow2_activation_quant_wrapper(_vf.per_token_group_quant_fp8),
+            )
+            patcher.start()
+            _PER_BLOCK_PATCHES.append(patcher)
+            print("[lumenrl] rollout pow-2 block scales: ENABLED (weights + activations)",
+                  flush=True)
+        except (AttributeError, ModuleNotFoundError) as exc:
+            logger.warning("skip pow-2 activation patch: %s", exc)
+
     applied = 0
     for target in targets:
         try:
@@ -680,7 +736,8 @@ def apply_vllm_fp8_per_block_patches() -> None:
             applied += 1
         except (AttributeError, ModuleNotFoundError) as exc:
             logger.warning("skip fp8_per_block patch %s: %s", target, exc)
-    logger.info("Applied vLLM fp8_per_block ROCm patches (%d/%d)", applied, len(targets))
+    print(f"[lumenrl] applied vLLM fp8_per_block ROCm patches ({applied}/{len(targets)}), "
+          f"pow2_scales={rollout_pow2_scales_enabled()}", flush=True)
 
 
 def prepare_online_quantized_weights_for_loading(model) -> None:
