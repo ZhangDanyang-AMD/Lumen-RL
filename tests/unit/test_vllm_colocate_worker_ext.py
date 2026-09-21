@@ -748,3 +748,105 @@ def test_rdma_online_prepare_error_still_finalizes_and_restores(monkeypatch):
         worker.receive_weights_rdma("group", version=4)
 
     assert events == ["snapshot", "prepare", "finalize", "restore"]
+
+
+def _prequantized_ipc_worker(monkeypatch, events, *, online_quant=True):
+    """Worker wired for update_weights_from_ipc with fakes for vLLM + transport."""
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
+
+        def load_weights(self, weights):
+            events.append("load")
+            loaded = set()
+            for name, tensor in weights:
+                loaded.add(name)
+                self.get_parameter(name).data.copy_(tensor)
+            return loaded
+
+    class Receiver:
+        def __init__(self, **kwargs):
+            pass
+
+        def receive_weights(self, on_bucket_received):
+            on_bucket_received([("attn", torch.tensor([3.0, 4.0]))])
+
+    fake_platforms = ModuleType("vllm.platforms")
+    fake_platforms.current_platform = SimpleNamespace(device_type="cpu")
+    fake_transfer = ModuleType("lumenrl.engine.inference.bucketed_weight_transfer")
+    fake_transfer.BucketedWeightReceiver = Receiver
+    fake_moe_sync = ModuleType("lumenrl.engine.inference.vllm_moe_weight_sync")
+    fake_moe_sync.FusedMoEWeightRouter = object
+    fake_moe_sync.assert_weight_sync_coverage = lambda *a, **k: events.append(
+        "coverage"
+    )
+    monkeypatch.setitem(sys.modules, "vllm", ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.platforms", fake_platforms)
+    monkeypatch.setitem(
+        sys.modules,
+        "lumenrl.engine.inference.bucketed_weight_transfer",
+        fake_transfer,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "lumenrl.engine.inference.vllm_moe_weight_sync",
+        fake_moe_sync,
+    )
+    monkeypatch.setattr(
+        fp8_utils, "is_online_quant_model", lambda config: online_quant
+    )
+    monkeypatch.setattr(
+        fp8_utils,
+        "prepare_prequantized_fp8_weights_for_loading",
+        lambda model: events.append("prepare_prequantized") or {"weights": 1},
+    )
+    monkeypatch.setattr(
+        fp8_utils,
+        "prepare_online_quantized_weights_for_loading",
+        lambda model: events.append("prepare_online"),
+    )
+    monkeypatch.setattr(
+        fp8_utils,
+        "finalize_online_quantized_weights_loading",
+        lambda model, config: events.append("finalize_online"),
+    )
+
+    worker = object.__new__(vLLMColocateWorkerExtension)
+    worker.local_rank = 0
+    worker.device = torch.device("cpu")
+    worker.model_runner = SimpleNamespace(
+        model=Model(),
+        vllm_config=SimpleNamespace(model_config=object()),
+    )
+    return worker
+
+
+def test_ipc_prequantized_fp8_skips_the_online_requant_lifecycle(monkeypatch) -> None:
+    """Re-quantizing weights that arrive already quantized would corrupt them."""
+    events: list[str] = []
+    worker = _prequantized_ipc_worker(monkeypatch, events)
+
+    summary = worker.update_weights_from_ipc(prequantized_fp8=True)
+
+    assert events == ["prepare_prequantized", "load", "coverage"]
+    assert "prepare_online" not in events
+    assert "finalize_online" not in events
+    assert summary["prequantized_fp8"] is True
+    assert summary["buckets"] == 1
+    assert summary["weights"] == 1
+    # The bucket really landed in the parameter.
+    torch.testing.assert_close(
+        worker.model_runner.model.attn.data, torch.tensor([3.0, 4.0])
+    )
+
+
+def test_ipc_prequantized_fp8_requires_an_online_quant_model(monkeypatch) -> None:
+    """A BF16 rollout has no FP8 parameters to write the stream into."""
+    events: list[str] = []
+    worker = _prequantized_ipc_worker(monkeypatch, events, online_quant=False)
+
+    with pytest.raises(RuntimeError, match="fp8_per_block"):
+        worker.update_weights_from_ipc(prequantized_fp8=True)
+    assert events == []

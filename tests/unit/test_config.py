@@ -156,7 +156,7 @@ def test_weight_sync_fp8_quantization_location_rejects_invalid_or_conflicting() 
             config.resolve_fp8_quantize()
 
 
-def test_weight_sync_fp8_location_requires_rdma_fp8_per_block_rollout() -> None:
+def test_weight_sync_fp8_location_requires_a_quantizing_backend_and_fp8_rollout() -> None:
     for config, rollout_quantization in (
         (
             WeightSyncConfig(
@@ -188,6 +188,15 @@ def test_weight_sync_fp8_location_accepts_valid_and_legacy_configs() -> None:
     WeightSyncConfig(
         backend="rdma",
         fp8_quantization_location="trainer",
+    ).validate_fp8_quantization_location("fp8_per_block")
+    # "auto" is the colocated CUDA-IPC path, which also quantizes on the trainer.
+    WeightSyncConfig(
+        backend="auto",
+        fp8_quantization_location="trainer",
+    ).validate_fp8_quantization_location("fp8_per_block")
+    WeightSyncConfig(
+        backend="auto",
+        fp8_quantize=True,
     ).validate_fp8_quantization_location("fp8_per_block")
     WeightSyncConfig(
         backend="rdma",
