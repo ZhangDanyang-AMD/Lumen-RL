@@ -440,6 +440,7 @@ class vLLMColocateWorkerExtension:
             dist.destroy_process_group(group)
         return True
 
+
     def update_weights_from_ipc(
         self,
         use_shm: bool = False,
@@ -520,8 +521,34 @@ class vLLMColocateWorkerExtension:
                 loaded.update(model.load_weights(weights) or ())
 
             receiver.receive_weights(on_bucket_received=_load_prequantized)
-            # Scale suffixes are on the coverage ignore list, so this checks the FP8
-            # .weight parameters; the scales arriving alongside them only add names.
+            # assert_weight_sync_coverage ignores *_scale_inv (a BF16 trainer never
+            # sends those, so vLLM derives them locally). Here the trainer DOES send
+            # them, and a silently dropped scale name leaves the rollout dequantizing
+            # fresh FP8 weights with the scales it computed at startup -- wrong, but
+            # only by a little, so it surfaces as drift rather than a crash. Verify
+            # them explicitly, the way the RDMA path does via streamed_scales=True.
+            from lumenrl.engine.inference.vllm_fp8_utils import (
+                TensorNameClass,
+                classify_tensor_name,
+            )
+
+            missing_scales = sorted(
+                name
+                for name, _ in model.named_parameters()
+                if name.endswith("weight_scale_inv")
+                and classify_tensor_name(name, streamed_scales=True)
+                is TensorNameClass.RELOADABLE
+                and name not in loaded
+            )
+            if missing_scales:
+                raise RuntimeError(
+                    "prequantized FP8 IPC sync loaded "
+                    f"{len(loaded)} names but left {len(missing_scales)} block-scale "
+                    "parameters untouched, so the rollout would dequantize new "
+                    "weights with stale scales: "
+                    f"{missing_scales[:8]}"
+                    f"{' ...' if len(missing_scales) > 8 else ''}"
+                )
             assert_weight_sync_coverage(
                 model, loaded, context="colocate-ipc-prequantized-fp8"
             )
