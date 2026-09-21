@@ -6,14 +6,14 @@ first.
 
 ---
 
-# 2026-09-21 — image `260921`: ATOM #2267, aiter rebased onto upstream, asm decode dodged
+# 2026-09-21 — image `260921b`: ATOM #2267, aiter rebased onto upstream, whole table re-measured
 
 | | |
 |---|---|
-| Image | `zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260921`, digest `sha256:de47df3cf5d2…` |
+| Image | `zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260921b`, digest `sha256:eede1d8fcdf5…` |
 | Lumen-RL | `7933758`, the parent of the commit this record ships in |
 | ATOM | `0795f0eae2d6` on `main` (PR #2267 merge), baked |
-| aiter | `c395c62886e2` on `lumen/moe`, rebased onto ROCm/aiter `main` `6a9a005b7`, baked |
+| aiter | `d6303e316f9e` on `lumen/moe`, rebased onto ROCm/aiter `main` `6a9a005b7`, baked |
 | Hardware | one node, 8x MI355X (gfx950), whole-node allocation |
 | Seed | `10086` |
 | Metrics read at | step 1 (`step=1`) |
@@ -29,65 +29,112 @@ size it slept at.
 ATOM imports `topk_select` from aiter at module scope in `atom/model_ops/sampler.py`
 (also `embed_head`, `rejection_sampler`, `model_runner_ext`), and that symbol arrives
 with ROCm/aiter#5499 — after the branch's old base, on which the rollout cannot import
-at all. The rebase crosses ROCm/aiter#5149, which reverted Triton modules Lumen needs;
-upstream has since re-landed most of them, and the 148 files plus
-`arch_info.is_cdna4` it has not are restored at their pre-revert content. None of the
-restored paths exists on `6a9a005b7`, so nothing upstream is overwritten. Checked by
-importing all 137 aiter modules the three repos reference: 134 succeed, and the 3 that
-do not were equally absent before the rebase and sit behind `try`/`except` probes.
+at all.
 
-**`ATOM_FORCE_ATTN_TRITON=1` on examples 4, 5 and 9.** ATOM's assembly paged-decode
-kernel returns finite but wrong output when a sequence's context occupies exactly 16
-pages with a partial last one. It is invisible in `abs_diff` and shows only in the
-quadratic `chi2_token`:
-
-| example 4, per step | `chi2_token` | `abs_diff` |
-|---|---|---|
-| without the variable | 0.147 / 0.0138 / **5761.69** | 0.0311 / 0.0370 / 0.0473 |
-| with it | 5.39 / 0.0411 / 0.113 | 0.0344 / 0.0391 / 0.0303 |
-
-ATOM's own fix (`fix/asm-paged-decode-partial-16th-page`) is not in the pinned commit.
+**`ATOM_FORCE_ATTN_TRITON=1` for every `atom*` `MODE`,** set in `run_dapo.sh` and listed
+again in the launcher's table. ATOM's assembly paged-decode kernel returns finite but
+wrong output when a sequence's context occupies exactly 16 pages with a partial last
+one. See below for what it does and does not move.
 
 **20 of the 25 baked aiter kernels were rebuilt.** 257 upstream commits changed the
 `csrc` behind them. One was loudly stale — `module_deepgemm_opus` lost
 `opus_gemm_a16w16_launch` when ROCm/aiter#4961 unified the OPUS GEMM interfaces, and
 example 9 aborted on it — but the rest are the greater hazard: same symbol, older
 kernel, no error. Examples 4 and 5 passed against the stale set, which is why "it still
-passes" was not accepted as evidence here. Rebuilding used the incremental object cache,
-7–47 s each except two CK blockscale modules at ~400 s.
+passes" was not accepted as evidence here.
+
+## The rebase broke Lumen's import surface, and a module-level check could not see it
+
+ROCm/aiter#5149 deleted the Triton tree #4978 added. Upstream re-landed most of it, and
+the first restore covered the 148 files plus `arch_info.is_cdna4` it had not. Three more
+files upstream re-landed **rewritten**, with the kernels Lumen imports renamed or
+dropped. The check used at the time — import all 137 aiter modules the three repos name
+— passes on those: the module imports and only the name is gone.
+
+It was not cosmetic. `lumen/ops/quantize/ops.py` guards that import with
+`except ModuleNotFoundError`, and a missing *name* raises plain `ImportError`, so
+`lumen.ops.quantize`, `lumen.quantize`, `lumen.ops.attention` and
+`lumen.kernels.attention.attention_impl` all stopped importing, and
+`lumenrl/tests/test_lumen_attn.py` failed at collection.
+
+The predicate that finds it resolves every `from aiter… import NAME` the three repos
+write, against the old branch as a baseline:
+
+| aiter | modules missing | names missing |
+|---|---|---|
+| `4ebe6d69c` (before the rebase) | 3 | 16 |
+| `c395c6288` (rebased, first try) | 3 | 12, **5 of them new** |
+| `d6303e316` (shipped) | 3 | 7 |
+
+The seven are a subset of the original sixteen, so there is no regression left, and nine
+names the old branch lacked — `topk_select` among them — now resolve. The three missing
+modules are the same on both and sit behind `try`/`except` probes.
+
+Restoring was additive rather than a revert of upstream's rewrite: upstream's public
+wrappers call the private kernels it renamed these to, so replacing the files wholesale
+would break those instead.
+
+⚠️ `import lumen.ops.quantize` on its own still raises a circular-import `ImportError`.
+That is **pre-existing** — identical on `260917` — and importing `lumen.quantize` first
+works on both. It is not from this round.
 
 ## Runs
 
-10 runs, all exit 0, all four error counts 0, every weight-sync bucket `skipped=0`,
-`--check` 10/10 PASS against the table in `08-release.md` §8.5.1.
+26 runs, all exit 0, all four error counts 0, every weight-sync bucket `skipped=0`,
+`--check` 26/26 PASS against the table in `08-release.md` §8.5.1.
 
-| # | span | `k3_kl` | Δ vs reference | `entropy` | `kl` |
-|---|---|---|---|---|---|
-| 1 | 191 s | 0.0011179 | +5.5% | 0.6143 | 0.00117633 |
-| 2 | 161 s | 0.00471458 | −5.3% | 0.794294 | 0.00432843 |
-| 3 | 161 s | 0.00480643 | +19.0% | 0.774225 | 0.00447058 |
-| 4 a | 492 s | 0.00459888 | +12.7% | 0.570037 | 0.00427408 |
-| 4 b | 552 s | 0.00338652 | −17.0% | 0.548062 | 0.00298126 |
-| 4 c | 471 s | 0.00426389 | +4.5% | 0.714157 | 0.00385979 |
-| 5 | 396 s | 0.000841038 | −10.1% | 0.531491 | 0.000893993 |
-| 6 | 562 s | 0.00136204 | −13.8% | 0.538206 | 0.00159133 |
-| 7 | 536 s | 0.00166141 | +5.2% | 0.631309 | 0.00155714 |
-| 9 | 587 s | 0.00157512 | +14.1% | 0.682081 | 0.00118207 |
+| # | n | `k3_kl` per run | mean | worst dev from mean |
+|---|---|---|---|---|
+| 1 | 3 | 0.0011179 / 0.00107158 / 0.00111735 | 0.00110 | 2.6% |
+| 2 | 3 | 0.00471458 / 0.00485167 / 0.00485262 | 0.00481 | 2.0% |
+| 3 | 3 | 0.00480643 / 0.00373042 / 0.00375428 | 0.00410 | 17.2% |
+| 4 | 5 | 0.00459888 / 0.00338652 / 0.00426389 / 0.00499343 / 0.00270809 | 0.00399 | 32.1% |
+| 5 | 3 | 0.000841038 / 0.00099301 / 0.0010288 | 0.000954 | 11.8% |
+| 6 | 3 | 0.00136204 / 0.00157178 / 0.00138287 | 0.00144 | 9.2% |
+| 7 | 3 | 0.00166141 / 0.00160454 / 0.00156759 | 0.00161 | 3.2% |
+| 9 | 3 | 0.00157512 / 0.00145847 / 0.00154193 | 0.00153 | 4.7% |
 
-Example 4's Δ is against its new reference; every other row is against the reference it
-already had.
+## The table was re-measured; the values did not need it, the spread did
 
-## Example 4's reference was re-measured; the other seven were re-confirmed
+Every reference moved by between **−8.9% and +10.5%**, so the new ATOM, the rebased
+aiter and this round's changes did not measurably alter train/rollout alignment. What
+three runs per example bought is the spread, which most rows had never had: from 2.0%
+(example 2) to 32.1% (example 4). Tolerances are unchanged.
 
-The Triton decode path moves example 4: three runs at 0.00339 / 0.00426 / 0.00460, mean
-**0.00408**, against the 0.00287 it replaces. The old reference rejects the high end at
-+60.2%, so this is a shift rather than spread — the three new runs deviate at most 17.0%
-from their own mean, which is tighter than the 0.00241 / 0.00243 / 0.00377 the old
-reference was built from. `entropy` moves with it to **0.611**.
+⚠️ **Example 4 is why single observations are not enough.** Its five runs span
+0.00271–0.00499, a factor of 1.8. Three consecutive runs mid-round read 0.00339 /
+0.00426 / 0.00460 against a 0.00287 reference, which looked like
+`ATOM_FORCE_ATTN_TRITON` shifting it systematically — and that is what an earlier draft
+of this record and of `versions.env` said. The fifth run came back at 0.00271, inside
+the old band, and the no-variable run on the same image was 0.00367, inside the
+with-variable range. **It is spread, not a shift, and the variable is not implicated.**
 
-Examples 5 and 9 gained one sample each, −10.1% and +14.1%. Replacing a 4-run and a
-3-run mean with a single observation is a worse estimator, so they keep their values —
-the same argument this record made in 2026-09-10.
+## What the decode override does and does not move
+
+Same image, same rebuilt kernels, only the variable differs.
+
+| example 4, `chi2_token` per step | step 1 | step 2 | step 3 |
+|---|---|---|---|
+| without | 0.147 | 0.0138 | **5761.69** |
+| with, run a | 5.39 | 0.0411 | 0.113 |
+| with, run b | 0.0152 | 0.135 | 0.112 |
+| with, run c | 4.31 | 0.00972 | 0.192 |
+
+`abs_diff` over the same steps is 0.0311–0.0473 without and 0.0259–0.0390 with — it does
+not move, which is the defect's signature and why `chi2_token` is the metric to judge it
+by.
+
+**It does not lower `k3_kl` here, and should not be expected to.** Example 5 went
+−12%, example 9 +15%, example 4 within its own spread; all noise at this sample size. At
+a 4k response the defect fires about once in nine steps, and the reference is read at
+step 1 while example 4's event was at step 3 — this table's metrics structurally cannot
+see it. The earlier report of the variable lowering KL was measured on the 30B MoE at a
+20K response, where `chi2_token` runs in the thousands and the defect fires often enough
+to dominate.
+
+⚠️ With the variable set, `chi2_token` is not uniformly small either: two of six step-1
+values are ~4–5 against ~0.01–0.15 for the clean ones. It dodges the catastrophic class,
+it does not make the rollout exact.
 
 ## Example 9's sleep path
 
@@ -97,14 +144,15 @@ three symptoms PR #2267 fixes, none of them present.
 
 ## Limits of this record
 
-- Examples 1, 2, 3, 5, 6, 7 and 9 have **one run each on this image**. Only example 4
-  has three, and only its reference was re-derived.
-- The `chi2_token` comparison for `ATOM_FORCE_ATTN_TRITON` is **one run either side** on
-  example 4. The direction is not in doubt — 5761.69 against a per-step maximum of 5.39
-  — but the magnitude is a single observation, and step 1 is *higher* with the variable
-  set (5.39 against 0.147), which one pair of runs cannot explain.
+- Three runs per example is enough to show a spread, not to bound one. Example 4 needed
+  five before its low end appeared.
+- The `chi2_token` comparison for `ATOM_FORCE_ATTN_TRITON` is **one run without the
+  variable against three with it**, on one example. The direction is not in doubt —
+  5761.69 against a maximum of 5.39 — but the magnitude rests on a single event.
 - The five kernels not rebuilt were judged unaffected by diffing their `csrc` sources,
   not by running anything that isolates them.
+- The seven aiter names still unresolved are unresolved on the old branch too; nothing
+  here shows they are unused, only that this round did not change them.
 - Reference values remain smoke-scale (1–3 steps). They say a stack reproduces, not that
   it trains well.
 

@@ -132,14 +132,14 @@ STALL_LIMIT_DEFAULT=2400
 # from 0.540. Examples 5 and 9 keep their references -- one new sample each,
 # -10.1% and +14.1%, is no reason to replace a 4-run and a 3-run mean.
 declare -A EX
-EX[1]='8B BF16 baseline|bf16|0|dapo_qwen3_8b_ray_vllm_smoke.yaml|dapo_qwen3_8b_ray_vllm_longrun.yaml|3|Qwen3-8B-Base||512|0.00106|0.582|0.00106|0.30|0.25'
-EX[2]='8B FP8 rollout|fp8|0|dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml|dapo_qwen3_8b_ray_vllm_fp8_longrun.yaml|3|Qwen3-8B-Base||512|0.00498|0.784|0.00538|0.30|0.25'
-EX[3]='8B FP8 end-to-end|fp8|1|dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml|dapo_qwen3_8b_ray_vllm_fp8_longrun.yaml|3|Qwen3-8B-Base||512|0.00404|0.832|0.00419|0.30|0.25'
-EX[4]='8B ATOM FP8|atomfp8|1|dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml|dapo_qwen3_8b_ray_atom_fp8_longrun.yaml|3|Qwen3-8B-Base|ATOM_FORCE_ATTN_TRITON=1|4096|0.00408|0.611|0.00371|0.50|0.50'
-EX[5]='8B ATOM BF16|atombf16|0|dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml|dapo_qwen3_8b_ray_atom_bf16_longrun.yaml|1|Qwen3-8B-Base|ATOM_FORCE_ATTN_TRITON=1|4096|0.000936|0.615|0.000927|0.50|0.60'
-EX[6]='MoE FSDP2|bf16|0|dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml|dapo_qwen3moe_a3b_ray_vllm_verlref_longrun.yaml|3|Qwen3-30B-A3B-Base|LUMENRL_FP32_MOE_ROUTER=0|4096|0.00158|0.679|0.00154|0.50|0.60'
-EX[7]='MoE Megatron EP=8|bf16|0|dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml|dapo_qwen3moe_a3b_ray_megatron_verlref_4k_longrun.yaml|3|Qwen3-30B-A3B-Base|LUMENRL_FP32_MOE_ROUTER=0|4096|0.00158|0.660|0.00188|0.50|0.60'
-EX[9]='MoE ATOM BF16|atombf16|0|dapo_qwen3moe_a3b_ray_atom_bf16_4k_smoke.yaml|dapo_qwen3moe_a3b_ray_atom_bf16_longrun.yaml|3|Qwen3-30B-A3B-Base|LUMENRL_FP32_MOE_ROUTER=0 ATOM_FORCE_ATTN_TRITON=1|4096|0.00138|0.692|0.00138|0.50|0.60'
+EX[1]='8B BF16 baseline|bf16|0|dapo_qwen3_8b_ray_vllm_smoke.yaml|dapo_qwen3_8b_ray_vllm_longrun.yaml|3|Qwen3-8B-Base||512|0.00110|0.628|0.00102|0.30|0.25'
+EX[2]='8B FP8 rollout|fp8|0|dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml|dapo_qwen3_8b_ray_vllm_fp8_longrun.yaml|3|Qwen3-8B-Base||512|0.00481|0.791|0.00467|0.30|0.25'
+EX[3]='8B FP8 end-to-end|fp8|1|dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml|dapo_qwen3_8b_ray_vllm_fp8_longrun.yaml|3|Qwen3-8B-Base||512|0.00410|0.790|0.00408|0.30|0.25'
+EX[4]='8B ATOM FP8|atomfp8|1|dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml|dapo_qwen3_8b_ray_atom_fp8_longrun.yaml|3|Qwen3-8B-Base|ATOM_FORCE_ATTN_TRITON=1|4096|0.00399|0.599|0.00374|0.50|0.50'
+EX[5]='8B ATOM BF16|atombf16|0|dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml|dapo_qwen3_8b_ray_atom_bf16_longrun.yaml|1|Qwen3-8B-Base|ATOM_FORCE_ATTN_TRITON=1|4096|0.000954|0.667|0.000899|0.50|0.60'
+EX[6]='MoE FSDP2|bf16|0|dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml|dapo_qwen3moe_a3b_ray_vllm_verlref_longrun.yaml|3|Qwen3-30B-A3B-Base|LUMENRL_FP32_MOE_ROUTER=0|4096|0.00144|0.620|0.00140|0.50|0.60'
+EX[7]='MoE Megatron EP=8|bf16|0|dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml|dapo_qwen3moe_a3b_ray_megatron_verlref_4k_longrun.yaml|3|Qwen3-30B-A3B-Base|LUMENRL_FP32_MOE_ROUTER=0|4096|0.00161|0.631|0.00161|0.50|0.60'
+EX[9]='MoE ATOM BF16|atombf16|0|dapo_qwen3moe_a3b_ray_atom_bf16_4k_smoke.yaml|dapo_qwen3moe_a3b_ray_atom_bf16_longrun.yaml|3|Qwen3-30B-A3B-Base|LUMENRL_FP32_MOE_ROUTER=0 ATOM_FORCE_ATTN_TRITON=1|4096|0.00153|0.683|0.00149|0.50|0.60'
 
 field() { echo "${EX[$1]}" | cut -d'|' -f"$2"; }
 

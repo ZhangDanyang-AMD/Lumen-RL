@@ -104,6 +104,14 @@ if [ "$MODE" = "atomfp8" ] || [ "$MODE" = "atom_fp8" ] || \
   # 表现为 ATOMRayServer 初始化阶段 SHUTDOWN。因此把 MODE 加进默认路径。
   export ATOM_ISOLATE_TORCH_COMPILE_CACHE=1
   export ATOM_TORCH_COMPILE_CACHE_ROOT="${ATOM_TORCH_COMPILE_CACHE_ROOT:-/tmp/atom_torch_compile_cache/$MODE}"
+  # ATOM 的汇编 paged-decode kernel 在一条序列的上下文恰好占满 16 页、最后一页不满时
+  # 返回有限但错误的结果，于是每次运行都有极少数 token 拿到任意 logprob。它躲得过
+  # mismatch/abs_diff（分歧 token 的数量与平均幅度都不变），只在二次型的
+  # mismatch/chi2_token 上现形：例子 4 第 3 步 5761.69，上一步 0.0138。改走 Triton。
+  # 设在这里而不是只设在 release/run_example.sh 的例子表里，是因为这条要求属于 ATOM
+  # 这条路径本身，不属于某几个例子编号——手工调 run_dapo.sh 的人同样漏不掉。
+  # ATOM 自己的修复进入所钉的 commit 后即可删除。
+  export ATOM_FORCE_ATTN_TRITON="${ATOM_FORCE_ATTN_TRITON:-1}"
   export VLLM_ROCM_USE_AITER=0 VLLM_ROCM_USE_AITER_MHA=0 VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=0 VLLM_ROCM_USE_AITER_LINEAR=0
   # Match the vLLM fp8 training-side configuration exactly: standard Lumen FP8
   # blockwise2d linear + norm, no HF attention patch and no rollout-specific

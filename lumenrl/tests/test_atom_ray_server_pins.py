@@ -12,6 +12,9 @@ once ATOM's own default (release) was measured to work: see
 
 from __future__ import annotations
 
+import inspect
+from pathlib import Path
+
 from lumenrl.engine.inference.atom_ray_server import ATOMRayServer
 
 
@@ -69,3 +72,41 @@ def test_the_shared_gate_reads_both_ways_of_asking_for_torch_compile() -> None:
         ({}, False),
     ):
         assert ATOMRayServer._is_no_eager(kwargs) is expected, kwargs
+
+
+def _run_dapo_atom_branch() -> str:
+    # The `if MODE = atomfp8|atombf16` block, up to the `fi` that closes it.
+    text = (Path(__file__).resolve().parents[2] / "examples/DAPO/run_dapo.sh").read_text()
+    start = text.index('if [ "$MODE" = "atomfp8" ]')
+    return text[start : text.index("\nfi\n", start)]
+
+
+def test_the_atom_branch_routes_decode_off_the_assembly_kernel() -> None:
+    # ATOM's assembly paged-decode kernel returns finite but wrong output when a
+    # sequence's context occupies exactly 16 pages with a partial last one. The
+    # damage is a handful of arbitrary logprobs per run, which mismatch/abs_diff
+    # cannot see and only the quadratic mismatch/chi2_token reports, so nothing
+    # fails loudly if this goes missing.
+    #
+    # It belongs to the ATOM path rather than to particular example numbers:
+    # release/run_example.sh lists it for examples 4, 5 and 9, but anyone
+    # invoking run_dapo.sh directly gets the same broken kernel, so the default
+    # is set here too.
+    branch = _run_dapo_atom_branch()
+    assert 'export ATOM_FORCE_ATTN_TRITON="${ATOM_FORCE_ATTN_TRITON:-1}"' in branch
+
+    # Overridable, so a measurement of the assembly path is still reachable.
+    assert "ATOM_FORCE_ATTN_TRITON=1\n" not in branch
+
+
+def test_the_replica_manager_forwards_the_decode_override_to_its_actors() -> None:
+    # Exporting it only matters if it crosses into the Ray actors: ATOM reads it
+    # inside the rollout worker, and an actor's environment comes from the
+    # runtime_env the replica manager builds, not from the trainer it forked
+    # from. The allow-list is what carries it across.
+    source = Path(inspect.getfile(ATOMRayServer)).read_text()
+    # The multi-line form; the single-line `for key in (...)` earlier in the
+    # file iterates sampling params and is a different list.
+    start = source.index("for key in (\n")
+    forwarded = source[start : source.index("):", start)]
+    assert '"ATOM_FORCE_ATTN_TRITON"' in forwarded

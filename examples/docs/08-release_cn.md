@@ -15,7 +15,7 @@
 ```bash
 git clone https://github.com/ZhangDanyang-AMD/Lumen-RL.git && cd Lumen-RL
 export DATA_ROOT=/path/to/data
-docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260921
+docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260921b
 bash release/run_example.sh 1 --check
 ```
 
@@ -46,7 +46,7 @@ overlong 奖励缓冲、TIS rollout 修正。
 
 ```bash
 docker run --rm --entrypoint /bin/bash \
-  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260921 \
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260921b \
   -lc 'ls /opt/lumenrl/aiter-jit/*.so | wc -l'     # 25
 ```
 
@@ -79,13 +79,16 @@ aiter 分支随之前移。新 ATOM 的 `atom/model_ops/sampler.py` 在模块顶
 
 - `compilation_config.cudagraph_mode=FULL`（引擎参数，`_pin_cudagraph_mode` 提供）。
   缺了它，no-eager 的 ATOM rollout 会崩在第一次 CUDA graph replay。
-- `ATOM_FORCE_ATTN_TRITON=1`（环境变量，启动器为例子 4、5、9 自动带上）。
-  ATOM 的汇编 paged-decode kernel 在一条序列的上下文恰好占满 16 页且最后一页不满时
-  返回**有限但错误**的结果，于是每次运行都有极少数 token 拿到任意 logprob。
+- `ATOM_FORCE_ATTN_TRITON=1`（环境变量，`run_dapo.sh` 对所有 `atom*` 的 `MODE` 默认置 1，
+  可传 `0` 覆盖）。ATOM 的汇编 paged-decode kernel 在一条序列的上下文恰好占满 16 页且
+  最后一页不满时返回**有限但错误**的结果，于是每次运行都有极少数 token 拿到任意 logprob。
   它**躲得过 `abs_diff`**——分歧 token 的数量与平均幅度都不变——只在二次型的
   `chi2_token` 上现形：例子 4 第 3 步实测 5761.69，而上一步是 0.0138，
-  同期 `abs_diff` 只从 0.0370 走到 0.0473。置上该变量后同一条配置三步为
-  5.39 / 0.0411 / 0.113。ATOM 自身的修复尚未进入所钉的提交，进了即可去掉。
+  同期 `abs_diff` 只从 0.0370 走到 0.0473。置上该变量后，同一条配置三遍九步的
+  `chi2_token` 最大值是 5.39。
+  ⚠️ **不要指望它改善 `k3_kl`。** 4k 响应下这个缺陷触发得很稀疏（九步一次），
+  而参考值读的是**第 1 步**，例子 4 那次事件在第 3 步——本表的指标在结构上就抓不到它。
+  判断这个变量是否生效要看 `chi2_token`。ATOM 自身的修复尚未进入所钉的提交，进了即可去掉。
 
 两项对早于相应字段的 ATOM 构建都是空操作。
 具体的报错形态与原因见 [`release/versions.env`](../../release/versions.env) 的注释。
@@ -250,7 +253,7 @@ rocm-smi --showmeminfo vram | grep -i used      # 宿主机上直接可用
 ### 8.4.2 获取镜像
 
 ```bash
-docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260921
+docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260921b
 ```
 
 也可以自行构建，下面就是全部步骤：
@@ -349,7 +352,7 @@ docker run -d --name lumenrl-release \
   --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --shm-size 64G \
   -v "$DATA_ROOT":"$DATA_ROOT" -e DATA_ROOT="$DATA_ROOT" \
   -v "$PWD":/opt/lumenrl/Lumen-RL \
-  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260921 sleep infinity
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260921b sleep infinity
 ```
 
 第二个挂载是代码，`$PWD` 是这份 checkout 的根目录。不挂它，容器跑的就是镜像里
@@ -394,7 +397,7 @@ LUMENRL_SRC=/other/Lumen-RL bash release/run_example.sh <N>
 ```bash
 docker run -d --name lumenrl-dev ... \
   -v "$PWD/ATOM":/opt/lumenrl/ATOM \
-  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260921 sleep infinity
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260921b sleep infinity
 ```
 
 然后 `CONTAINER=lumenrl-dev bash release/run_example.sh <N>`。但与 Lumen-RL 不同，
@@ -474,41 +477,43 @@ bash release/run_example.sh 1 --check-only --log $DATA_ROOT/logs/example-1-xxx.l
 
 ### 8.5.1 参考值表
 
-**测量条件**：8x MI355X（gfx950），镜像 `dapo-gfx950-rocm7.2.3-260921`
-（digest `sha256:de47df3cf5d2…`）+ Lumen-RL `7933758`——两者都要记，原因见 §8.1.1；
+**测量条件**：8x MI355X（gfx950），镜像 `dapo-gfx950-rocm7.2.3-260921b`
+（digest `sha256:eede1d8fcdf5…`）+ Lumen-RL `7933758`——两者都要记，原因见 §8.1.1；
 命令即 `bash release/run_example.sh <N>`（等价于 §8.2.2 的整行参数），
 **`seed=10086`**（`run_dapo.sh` 内固定），取**第 1 步**（`step=1`）的指标。
 
 | # | config（`examples/DAPO/configs/`） | steps | resp | 日志时间跨度 | `rollout_corr/k3_kl` | `entropy` | `rollout_corr/kl`（有符号） | 实测次数 |
 |---|---|---|---|---|---|---|---|---|
-| 1 | `dapo_qwen3_8b_ray_vllm_smoke.yaml` | 3 | 512 | 144 s | **0.00106** ±30% | **0.582** ±25% | 0.00106 | 1 |
-| 2 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` | 3 | 512 | 129 s | **0.00498** ±30% | **0.784** ±25% | 0.00538 | 1 |
-| 3 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml`（`TRAIN_FP8=1`） | 3 | 512 | 142 s | **0.00404** ±30% | **0.832** ±25% | 0.00419 | 1 |
-| 4 | `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` | 3 | 4096 | 505 s | **0.00408** ±50% | **0.611** ±50% | 0.00371 | 3 |
-| 5 | `dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml` | 1 | 4096 | 385 s | **0.000936** ±50% | **0.615** ±60% | 0.000927 | 4 |
-| 6 | `dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml` | 3 | 4096 | 523 s | **0.00158** ±50% | **0.679** ±60% | 0.00154 | 1 |
-| 7 | `dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml` | 3 | 4096 | 499 s | **0.00158** ±50% | **0.660** ±60% | 0.00188 | 1 |
-| 9 | `dapo_qwen3moe_a3b_ray_atom_bf16_4k_smoke.yaml` | 3 | 4096 | 579 s | **0.00138** ±50% | **0.692** ±60% | 0.00138 | 3 |
+| 1 | `dapo_qwen3_8b_ray_vllm_smoke.yaml` | 3 | 512 | 158 s | **0.00110** ±30% | **0.628** ±25% | 0.00102 | 3 |
+| 2 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` | 3 | 512 | 127 s | **0.00481** ±30% | **0.791** ±25% | 0.00467 | 3 |
+| 3 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml`（`TRAIN_FP8=1`） | 3 | 512 | 133 s | **0.00410** ±30% | **0.790** ±25% | 0.00408 | 3 |
+| 4 | `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` | 3 | 4096 | 467 s | **0.00399** ±50% | **0.599** ±50% | 0.00374 | 5 |
+| 5 | `dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml` | 1 | 4096 | 364 s | **0.000954** ±50% | **0.667** ±60% | 0.000899 | 3 |
+| 6 | `dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml` | 3 | 4096 | 524 s | **0.00144** ±50% | **0.620** ±60% | 0.00140 | 3 |
+| 7 | `dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml` | 3 | 4096 | 501 s | **0.00161** ±50% | **0.631** ±60% | 0.00161 | 3 |
+| 9 | `dapo_qwen3moe_a3b_ray_atom_bf16_4k_smoke.yaml` | 3 | 4096 | 542 s | **0.00153** ±50% | **0.683** ±60% | 0.00149 | 3 |
 
 粗体两列带容差的即 `--check` 判定 PASS / FAIL 的两项，参考值是「实测次数」列那么多遍的均值。
 
-⚠️ **例 4 这一行于 2026-09-21 用三次运行重标**：`ATOM_FORCE_ATTN_TRITON=1`（§8.1.1）
-把 decode 换到 Triton kernel，`k3_kl` 随之移到 0.00408（三次 0.00339 / 0.00426 / 0.00460），
-旧的 0.00287 会在高端判 FAIL；`entropy` 一并移到 0.611。三次相对新参考值的最大偏差是 17%。
-例 5 与例 9 各只多了一个样本（−10.1% 与 +14.1%），不足以替换一个四次均值和一个三次均值，
-故保留原值。
+⚠️ **整张表于 2026-09-21 在本镜像上重标**，每例三遍（例 4 五遍），此前多数行只有一个样本。
+`k3_kl` 相对旧参考值的位移全部在 **−8.9% ~ +10.5%** 之间——也就是说换 ATOM、换 aiter 与
+本轮的改动**没有可测量地改变 train / rollout 对齐程度**，重标是为了给出散布，不是为了追数值。
 
-⚠️ **例 5 这一行于 2026-09-17 用四次运行重测**，因为一次描述不了它：四次的 `k3_kl`
-跨度是 0.000739–0.00106，`entropy` 是 0.361–0.870。`k3_kl` 落在它所替换的那个单次值的
-1% 以内；真正需要改的是 `entropy`——旧的 0.568 会在高端判 FAIL。容差改用 MoE 例子的 ±60%。
-其余各行未变，并已在本镜像上复核。
+**散布才是重标的产物。** 同一例子各遍相对自己均值的最大偏差：例 2 是 2.0%，例 4 是 32.1%。
+容差未改动，26 次运行按本表全部 PASS。
+
+⚠️ **例 4 是其中最宽的一个，不要按单次实测收紧它的容差**：五遍分别是
+0.00271 / 0.00339 / 0.00426 / 0.00460 / 0.00499，跨度 1.8 倍。本轮之前它的参考值是 0.00287，
+中途一度有三遍偏高、看着像被 `ATOM_FORCE_ATTN_TRITON`（§8.1.1）系统性抬高，
+补到五遍后最低的一遍回到 0.00271，说明那是散布不是位移。
 
 **时间跨度那一列不设容差、不参与判定**——它受缓存冷热影响，
 同一机器上偏差可达 ±15%。启动器报的端到端墙钟比它多约 20–35 s。
 
-**本镜像上的结果：八个例子共 10 次运行，退出码全部为 0**，四类错误计数**全部为 0**，
-每个权重同步 bucket 都是 `skipped=0`，`--check` **10/10 PASS**，且 `k3_kl` 与上表每个参考值
-的偏差都在 **±19%** 之内。逐次原始记录见 [`VALIDATION.md`](../../release/VALIDATION.md)。
+**本镜像上的结果：八个例子共 26 次运行，退出码全部为 0**，四类错误计数**全部为 0**，
+每个权重同步 bucket 都是 `skipped=0`，`--check` **26/26 PASS**，且每一遍的 `k3_kl` 与其
+所属例子的参考值偏差都在 **±32.1%** 之内（最宽的是例 4，见上）。
+逐次原始记录见 [`VALIDATION.md`](../../release/VALIDATION.md)。
 
 **例子 9 对例子 6——换 rollout 引擎的代价。** 同模型、同训练配置，把 vLLM 换成 ATOM：
 `k3_kl` 是 0.00138 对 0.00158，远在容差之内，
