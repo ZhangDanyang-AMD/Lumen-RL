@@ -41,10 +41,10 @@ git clone -b dev/vllm-fsdp-dapo   https://github.com/ZhangDanyang-AMD/Lumen-RL.g
 git clone -b amd-atom-rollout     https://github.com/ZhangDanyang-AMD/Lumen.git
 git clone -b lumen/triton_kernels https://github.com/ZhangDanyang-AMD/aiter.git
 
-# ATOM（例子 4、5）钉在上游 ROCm/ATOM PR #2028 的 head 上，见第 8 章 §8.1.1。
-# PR 还没合并，所以按 SHA 取而不是按分支 clone：
+# ATOM（例子 4、5）钉在上游 ROCm/ATOM main 的一个提交上，见第 8 章 §8.1.1。
+# 按 SHA 取而不是按分支 clone，免得 main 往前走就悄悄换掉了你构建的东西：
 git init ATOM && git -C ATOM remote add origin https://github.com/ROCm/ATOM.git
-git -C ATOM fetch --depth 1 origin d6b9e147cbf66e0e5dcfa0ee5fdcf06aa256fc95
+git -C ATOM fetch --depth 1 origin 8b6d61392b0690ff338b6ccd6b864a63ecaf45c3
 git -C ATOM checkout FETCH_HEAD
 
 # aiter 的 JIT 依赖 composable_kernel，必须补齐，
@@ -62,7 +62,7 @@ git -c http.version=HTTP/1.1 clone --depth 1 --single-branch -b dev/vllm-fsdp-da
 git -c http.version=HTTP/1.1 clone --depth 1 --single-branch -b amd-atom-rollout     "$GHP/ZhangDanyang-AMD/Lumen.git"
 git -c http.version=HTTP/1.1 clone --depth 1 --single-branch -b lumen/triton_kernels "$GHP/ZhangDanyang-AMD/aiter.git"
 git init ATOM && git -C ATOM remote add origin "$GHP/ROCm/ATOM.git"
-git -C ATOM -c http.version=HTTP/1.1 fetch --depth 1 origin d6b9e147cbf66e0e5dcfa0ee5fdcf06aa256fc95
+git -C ATOM -c http.version=HTTP/1.1 fetch --depth 1 origin 8b6d61392b0690ff338b6ccd6b864a63ecaf45c3
 git -C ATOM checkout FETCH_HEAD
 
 cd "$RL_ROOT/aiter"

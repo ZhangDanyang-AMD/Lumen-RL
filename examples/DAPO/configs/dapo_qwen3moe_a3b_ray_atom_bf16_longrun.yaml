@@ -97,7 +97,28 @@ policy:
       transport: ray_http
       tensor_parallel_size: 1
       kv_cache_dtype: bf16
-      gpu_memory_utilization: 0.30
+      # 0.45, not the 0.30 the vLLM arm below uses -- see the 4k smoke config
+      # for the full account. In short: ATOM derives its KV pool as the
+      # utilization budget minus the resident 30B of weights, so 0.30 leaves
+      # 6.49GB (4433 blocks) to back a promised 256 concurrent sequences, and
+      # the scheduler preempts thousands of times per step to cope. This
+      # horizon felt it worst, because 20480-token responses need five times
+      # the KV of the 4k smoke: the 0.30 long run sat at 0.042-0.075 accuracy,
+      # 49-53% unparseable, pos_0_127/k3_kl climbing 0.165 -> 0.337, at 20-27
+      # min/step.
+      #
+      # Most of that was two bugs on the preempt/recompute path, since fixed
+      # (`atom/model_engine/scheduler.py`), so the setting is now about speed.
+      # The 60-step run at 0.45 went 0.1115 -> 0.4067 accuracy, 1318 -> 111
+      # unparseable of 6144, rollout_corr/k3_kl flat at ~0.0013, zero errors,
+      # 3-6 min/step -- tracking the vLLM baseline's quality (0.4172 / 100 at
+      # step 60) at roughly half its step time.
+      #
+      # Do not raise this further without re-checking headroom. The vLLM note
+      # below is a real warning: at 0.40 *that* engine died of allocator
+      # fragmentation 101 steps in. ATOM's ceiling is lower because sleep keeps
+      # its memory resident; measured peak here is ATOM ~124GB + trainer 76.9GB.
+      gpu_memory_utilization: 0.45
       enable_prefix_caching: false
       online_quant_config: {}
     vllm_cfg:

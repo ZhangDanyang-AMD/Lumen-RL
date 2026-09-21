@@ -17,7 +17,7 @@ nodes (example 8, see [chapter 7](07-disaggregated-rdma.md)).
 ```bash
 git clone https://github.com/ZhangDanyang-AMD/Lumen-RL.git && cd Lumen-RL
 export DATA_ROOT=/path/to/data
-docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260910
+docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260921b
 bash release/run_example.sh 1 --check
 ```
 
@@ -45,13 +45,13 @@ edit — no rebuild, no new tag. `LUMENRL_SRC=/other/checkout` runs code from el
 On the algorithm side: clip-higher + dual-clip + token-mean policy loss, dynamic
 sampling (`filter_groups`), an overlong reward buffer, and TIS rollout correction.
 
-All aiter kernels in the image are **already compiled** (16 objects), so the first run
+All aiter kernels in the image are **already compiled** (25 objects), so the first run
 spends no time compiling them:
 
 ```bash
 docker run --rm --entrypoint /bin/bash \
-  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260910 \
-  -lc 'ls /opt/lumenrl/aiter-jit/*.so | wc -l'     # 16
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260921b \
+  -lc 'ls /opt/lumenrl/aiter-jit/*.so | wc -l'     # 25
 ```
 
 ### 8.1.1 Pinned versions
@@ -65,21 +65,51 @@ image digest *and* the Lumen-RL commit**. Every run prints both.
 |---|---|---|---|
 | Lumen-RL | `ZhangDanyang-AMD/Lumen-RL` | `dev/dapo_release` | your checkout (mounted, not pinned) |
 | Lumen | `ZhangDanyang-AMD/Lumen` | `amd-atom-rollout` | `e6379cbd9057` |
-| aiter | `ZhangDanyang-AMD/aiter` | `lumen/moe` | `4ebe6d69c7f4` |
-| ATOM | `ROCm/ATOM` | `refs/pull/2028/head` | `d6b9e147cbf6` |
+| aiter | `ZhangDanyang-AMD/aiter` | `lumen/moe` | `c395c62886e2` |
+| ATOM | `ROCm/ATOM` | `main` | `0795f0eae2d6` |
 | composable_kernel | aiter submodule | — | `af9e1d1f1ae3` |
 
-ATOM is pinned at the head of upstream
-[ROCm/ATOM PR #2028](https://github.com/ROCm/ATOM/pull/2028), which is **not merged as
-of 2026-09-10**, so this is a PR head rather than a commit on main. It is fetchable by
-SHA, which is how `release/Dockerfile` takes it.
+ATOM is pinned on upstream `main`. `0795f0eae2d6` is the merge commit of
+[ROCm/ATOM PR #2267](https://github.com/ROCm/ATOM/pull/2267) (2026-09-20), which also
+carries the earlier [PR #2028](https://github.com/ROCm/ATOM/pull/2028). #2267 brings two
+rollout fixes: a CUDA graph capture no longer writes cache through the rows of the last
+served batch, and a wake rebuilds the KV pool at the size it slept at.
 
-⚠️ **Swapping ATOM yourself needs two engine settings that Lumen-RL supplies rather
-than inherit**: `compilation_config.cudagraph_mode=FULL` and
-`sleep_keeps_memory_resident=true`. Without them a no-eager ATOM rollout aborts — on the
-first CUDA graph replay and on the first wake after a weight sync respectively. Both are
-inert on ATOM builds that predate the fields. What the failures look like and why is in
-the comments of [`release/versions.env`](../../release/versions.env).
+The aiter branch moved with it. The new ATOM imports `topk_select` from aiter at module
+scope in `atom/model_ops/sampler.py`, and that symbol arrives with ROCm/aiter#5499 —
+later than the old base of `lumen/moe`, on which the ATOM rollout cannot load at all.
+`lumen/moe` is now rebased onto ROCm/aiter `main` `6a9a005b7`, with the Triton modules
+Lumen needs restored where upstream has not re-landed them.
+
+⚠️ **Swapping ATOM yourself needs two settings that Lumen-RL supplies rather than
+inherit**:
+
+- `compilation_config.cudagraph_mode=FULL` (engine kwarg, from `_pin_cudagraph_mode`).
+  Without it a no-eager ATOM rollout aborts on the first CUDA graph replay.
+- `ATOM_FORCE_ATTN_TRITON=1` (environment variable; `run_dapo.sh` defaults it to 1 for
+  every `atom*` `MODE`, and `0` turns it off). ATOM's assembly paged-decode kernel
+  returns **finite but wrong** output when a sequence's context occupies exactly 16 pages
+  with a partial last one, so a handful of tokens per run come back with an arbitrary
+  logprob. It **hides from `abs_diff`** — the number and average size of disagreeing
+  tokens do not move — and shows only in the quadratic `chi2_token`: example 4 step 3
+  measured 5761.69 against 0.0138 the step before, while `abs_diff` went 0.0370 → 0.0473.
+  With the variable set, the highest `chi2_token` over three runs and nine steps of the
+  same config is 5.39.
+  ⚠️ **Do not expect it to improve `k3_kl`.** At a 4k response the defect fires rarely —
+  once in those nine steps — and the reference is read at **step 1**, while example 4's
+  event was at step 3, so this table's metrics structurally cannot see it. Judge whether
+  the variable is working by `chi2_token`. ATOM's own fix is not in the pinned commit
+  yet; drop this once it is.
+
+Both are inert on ATOM builds that predate the corresponding field. What the failures
+look like and why is in the comments of
+[`release/versions.env`](../../release/versions.env).
+
+Sleep is **not** pinned: it follows ATOM's own default, which releases the rollout's
+weights, graphs and KV pool. Lumen-RL used to force `sleep_keeps_memory_resident=true`
+here; that pin was removed on 2026-09-16 after the failure it guarded against stopped
+reproducing. Releasing costs one graph recapture per step, about 1 s (2–3%), and does
+not move the published metrics.
 
 Base image `vllm/vllm-openai-rocm:v0.23.0`, plus `flydsl 0.3.2`,
 `megatron-core 0.18.2`, ROCm Apex `daed8525`, ROCm TransformerEngine `6e541a10`.
@@ -161,11 +191,11 @@ every column on the row has to be supplied.
 | 1 | `bf16` | `0` | `dapo_qwen3_8b_ray_vllm_smoke.yaml` | 3 | 512 | Qwen3-8B-Base | — |
 | 2 | `fp8` | `0` | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` | 3 | 512 | Qwen3-8B-Base | — |
 | 3 | `fp8` | `1` | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` | 3 | 512 | Qwen3-8B-Base | — |
-| 4 | `atomfp8` | `1` | `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` | 3 | 4096 | Qwen3-8B-Base | — |
-| 5 | `atombf16` | `0` | `dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml` | 1 | 4096 | Qwen3-8B-Base | — |
+| 4 | `atomfp8` | `1` | `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` | 3 | 4096 | Qwen3-8B-Base | `ATOM_FORCE_ATTN_TRITON=1` |
+| 5 | `atombf16` | `0` | `dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml` | 1 | 4096 | Qwen3-8B-Base | `ATOM_FORCE_ATTN_TRITON=1` |
 | 6 | `bf16` | `0` | `dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml` | 3 | 4096 | Qwen3-30B-A3B-Base | `LUMENRL_FP32_MOE_ROUTER=0` |
 | 7 | `bf16` | `0` | `dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml` | 3 | 4096 | Qwen3-30B-A3B-Base | `LUMENRL_FP32_MOE_ROUTER=0` |
-| 9 | `atombf16` | `0` | `dapo_qwen3moe_a3b_ray_atom_bf16_4k_smoke.yaml` | 3 | 4096 | Qwen3-30B-A3B-Base | `LUMENRL_FP32_MOE_ROUTER=0` |
+| 9 | `atombf16` | `0` | `dapo_qwen3moe_a3b_ray_atom_bf16_4k_smoke.yaml` | 3 | 4096 | Qwen3-30B-A3B-Base | `LUMENRL_FP32_MOE_ROUTER=0` `ATOM_FORCE_ATTN_TRITON=1` |
 
 > ⚠️ **`MODE` and `CONFIG_OVERRIDE` must be given as a pair.** Besides selecting
 > environment variables, `MODE` **appends a set of Hydra overrides**, and
@@ -191,7 +221,7 @@ any order.
 - Docker (if your user is not in the docker group, see the `DOCKER` variable in §8.4.4)
 
 > ⚠️ **This image only runs on gfx950.** TransformerEngine and Apex are compiled with
-> `NVTE_ROCM_ARCH=gfx950` / `PYTORCH_ROCM_ARCH=gfx950`, and the 16 aiter kernels
+> `NVTE_ROCM_ARCH=gfx950` / `PYTORCH_ROCM_ARCH=gfx950`, and the 25 aiter kernels
 > compiled into the image were built on gfx950. Those JIT artifacts do not carry an
 > architecture tag in their filenames, so on gfx942 (MI300X / MI308X / MI325X) they are
 > loaded as-is and fail at runtime instead of being rebuilt. For gfx942, build
@@ -249,7 +279,7 @@ start if any card is above 2 GB and prints what to do about it; `--force` skips 
 ### 8.4.2 Get the image
 
 ```bash
-docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260910
+docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260921b
 ```
 
 You can also build it yourself; these are all the steps:
@@ -263,7 +293,7 @@ TAG=lumenrl:release-$(date +%Y%m%d) bash release/precompile_kernels.sh
 `precompile_kernels.sh` needs a GPU: aiter kernels are only compiled on first use and
 `docker build` has no devices, so they have to be compiled in a container with cards
 attached and committed into the image. That script's synthetic warmup covers 5 of the
-16 kernels; see its header for how to cover all 16.
+25 kernels; see its header for how to cover all 25.
 
 ### 8.4.3 Prepare the data
 
@@ -354,7 +384,7 @@ docker run -d --name lumenrl-release \
   --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --shm-size 64G \
   -v "$DATA_ROOT":"$DATA_ROOT" -e DATA_ROOT="$DATA_ROOT" \
   -v "$PWD":/opt/lumenrl/Lumen-RL \
-  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260910 sleep infinity
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260921b sleep infinity
 ```
 
 The second mount is the code, with `$PWD` being the root of this checkout. Leave it out
@@ -400,7 +430,7 @@ The other three trees are editable installs too, so the same mount works for the
 ```bash
 docker run -d --name lumenrl-dev ... \
   -v "$PWD/ATOM":/opt/lumenrl/ATOM \
-  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260910 sleep infinity
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260921b sleep infinity
 ```
 
 then `CONTAINER=lumenrl-dev bash release/run_example.sh <N>`. Unlike Lumen-RL, those
@@ -410,8 +440,10 @@ Lumen or aiter is no longer comparable with §8.5.1.
 ### 8.4.5 The manual command, without the launcher
 
 Below is the complete command for example 1. For the other examples, replace `MODE`,
-`TRAIN_FP8`, `CONFIG_OVERRIDE`, `STEPS` and `MODEL_PATH` per the table in §8.2.2, and
-for examples 6, 7 and 9 add `-e LUMENRL_FP32_MOE_ROUTER=0`.
+`TRAIN_FP8`, `CONFIG_OVERRIDE`, `STEPS` and `MODEL_PATH` per the table in §8.2.2, then
+add the environment variables in that table's last column (`-e
+LUMENRL_FP32_MOE_ROUTER=0` for examples 6, 7 and 9, `-e ATOM_FORCE_ATTN_TRITON=1` for
+examples 4, 5 and 9).
 `bash release/run_example.sh <N> --dry-run` prints this command for any example.
 
 ```bash
@@ -487,33 +519,50 @@ bash release/run_example.sh 1 --check-only --log $DATA_ROOT/logs/example-1-xxx.l
 ### 8.5.1 Reference values
 
 **Measurement conditions**: 8x MI355X (gfx950), image
-`dapo-gfx950-rocm7.2.3-260910` (digest `sha256:cc18a3f5ce16…`) with Lumen-RL at
-`8ca6bdd` — both matter, see §8.1.1 — the command being
+`dapo-gfx950-rocm7.2.3-260921b` (digest `sha256:eede1d8fcdf5…`) with Lumen-RL at
+`22502fa` — both matter, see §8.1.1 — the command being
 `bash release/run_example.sh <N>` (equivalent to a full row of §8.2.2),
 **`seed=10086`** (fixed inside `run_dapo.sh`), and metrics read at **step 1**
 (`step=1`).
 
 | # | config (`examples/DAPO/configs/`) | steps | resp | trainer-log span | `rollout_corr/k3_kl` | `entropy` | `rollout_corr/kl` (signed) | runs |
 |---|---|---|---|---|---|---|---|---|
-| 1 | `dapo_qwen3_8b_ray_vllm_smoke.yaml` | 3 | 512 | 144 s | **0.00106** ±30% | **0.582** ±25% | 0.00106 | 1 |
-| 2 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` | 3 | 512 | 129 s | **0.00498** ±30% | **0.784** ±25% | 0.00538 | 1 |
-| 3 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` (`TRAIN_FP8=1`) | 3 | 512 | 142 s | **0.00404** ±30% | **0.832** ±25% | 0.00419 | 1 |
-| 4 | `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` | 3 | 4096 | 508 s | **0.00287** ±50% | **0.540** ±50% | 0.00288 | 3 |
-| 5 | `dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml` | 1 | 4096 | 402 s | **0.000930** ±50% | **0.568** ±50% | 0.000880 | 1 |
-| 6 | `dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml` | 3 | 4096 | 523 s | **0.00158** ±50% | **0.679** ±60% | 0.00154 | 1 |
-| 7 | `dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml` | 3 | 4096 | 499 s | **0.00158** ±50% | **0.660** ±60% | 0.00188 | 1 |
-| 9 | `dapo_qwen3moe_a3b_ray_atom_bf16_4k_smoke.yaml` | 3 | 4096 | 579 s | **0.00138** ±50% | **0.692** ±60% | 0.00138 | 3 |
+| 1 | `dapo_qwen3_8b_ray_vllm_smoke.yaml` | 3 | 512 | 158 s | **0.00110** ±30% | **0.628** ±25% | 0.00102 | 3 |
+| 2 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` | 3 | 512 | 127 s | **0.00481** ±30% | **0.791** ±25% | 0.00467 | 3 |
+| 3 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` (`TRAIN_FP8=1`) | 3 | 512 | 133 s | **0.00410** ±30% | **0.790** ±25% | 0.00408 | 3 |
+| 4 | `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` | 3 | 4096 | 467 s | **0.00399** ±50% | **0.599** ±50% | 0.00374 | 5 |
+| 5 | `dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml` | 1 | 4096 | 364 s | **0.000954** ±50% | **0.667** ±60% | 0.000899 | 3 |
+| 6 | `dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml` | 3 | 4096 | 524 s | **0.00144** ±50% | **0.620** ±60% | 0.00140 | 3 |
+| 7 | `dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml` | 3 | 4096 | 501 s | **0.00161** ±50% | **0.631** ±60% | 0.00161 | 3 |
+| 9 | `dapo_qwen3moe_a3b_ray_atom_bf16_4k_smoke.yaml` | 3 | 4096 | 542 s | **0.00153** ±50% | **0.683** ±60% | 0.00149 | 3 |
 
 The two bold columns with tolerances are what `--check` turns into PASS / FAIL; each
-reference is the mean over the number of runs in the `runs` column. **The span column
-carries no tolerance and is not part of the verdict** — it is this image's single run per
-example, is dominated by how warm the caches are, and has been measured up to ±15% apart
-on the same machine. The launcher's end-to-end wall clock is 20–35 s longer.
+reference is the mean over the number of runs in the `runs` column.
 
-**Result on this image and this commit: 8/8 exit code 0**, all four error counts
-**zero**, every weight-sync bucket at `skipped=0`, `--check` **8/8 PASS**, with `k3_kl`
-within **±8.2%** of every reference above. The references themselves are means over 12
-runs and were left unchanged. The per-run record and the tolerance derivation are in
+⚠️ **The whole table was re-measured on this image on 2026-09-21**, three runs per
+example and five for example 4, where most rows previously had one. Every `k3_kl` moved
+by between **−8.9% and +10.5%** against the reference it replaces — the new ATOM, the
+rebased aiter and this round's changes did not measurably alter train/rollout alignment.
+The point of re-measuring was the spread, not the values.
+
+**The spread is what the extra runs bought.** The worst deviation of any run from its
+own example's mean ranges from 2.0% (example 2) to 32.1% (example 4). Tolerances are
+unchanged, and all 26 runs pass against this table.
+
+⚠️ **Example 4 is the widest of them; do not tighten its tolerance to a single
+observation.** Its five runs are 0.00271 / 0.00339 / 0.00426 / 0.00460 / 0.00499, a
+factor of 1.8. Its reference before this round was 0.00287, and three runs mid-round sat
+high enough to look like a systematic shift from `ATOM_FORCE_ATTN_TRITON` (§8.1.1); the
+fifth run came back at 0.00271, which makes it spread rather than shift.
+
+**The span column carries no tolerance and is not part of the verdict** — it is
+dominated by how warm the caches are and has been measured up to ±15% apart on the same
+machine. The launcher's end-to-end wall clock is 20–35 s longer.
+
+**Result on this image: 26 runs over the eight examples, exit code 0 throughout**, all
+four error counts **zero**, every weight-sync bucket at `skipped=0`, `--check` **26/26
+PASS**, with every run's `k3_kl` within **±32.1%** of its example's reference — example
+4 being the widest, as above. The per-run record is in
 [`VALIDATION.md`](../../release/VALIDATION.md).
 
 **Example 9 versus example 6 — what the rollout engine costs.** Same model, same
@@ -569,15 +618,23 @@ smaller KV cache budget. The launcher does this before every run.
 docker restart lumenrl-release
 ```
 
-**2. Switching ATOM precision requires clearing the compile caches.** The torch inductor
-cache is not isolated per run, so going from example 4 straight to example 5 (or back)
-fails in AOTAutograd. The launcher records the previous ATOM precision and clears only
-when it changed (`--keep-cache` disables this).
+**2. Switching ATOM precision *or model* requires clearing the compile caches.** The
+torch inductor cache is not isolated per run, so going from example 4 straight to
+example 5 (or back) fails in AOTAutograd. The launcher records the previous ATOM
+precision and clears only when it changed (`--keep-cache` disables this).
 
 ```bash
 docker exec lumenrl-release bash -lc \
   'rm -rf /tmp/aiter_configs /tmp/atom_torch_compile_cache /tmp/torchinductor_root'
 ```
+
+⚠️ **The model collides too, not just the precision.** ATOM keys the cache by
+`mode/actor_id/replica/rank` and nothing else, so examples 5 and 9 — both `atombf16`,
+different models — share one cache directory. Running 9 after 5 replays the 8B graph
+against the 30B MoE and dies during engine init with
+`assert_size_stride ... stride 2048==4096` (the two hidden sizes). It reads like a
+corrupt engine rather than a stale cache. **Driving the examples yourself, clear the
+caches between every pair that differs in precision or model.**
 
 **3. Judge a long run's liveness from the log, not with `pgrep`.** Processes started via
 `docker exec` do not share a process tree with your shell, so `pgrep` returns 0 across
@@ -636,9 +693,12 @@ AssertionError: Not enough memory for KV cache with block size(16). At least 1 b
 `non_torch` is the rest of the node, mostly the colocated trainer, and `free=177.39GB` is
 the tell: the memory exists, it is just not credited to the rollout engine. Raising
 `gpu_memory_utilization` does not fix it and neither does freeing the actors' allocator
-cache — item 1 above is why. **Keep the pool resident, which is what §8.1.1's second
-setting does**; on your own ATOM branch, check that `sleep_keeps_memory_resident` reaches
-it.
+cache — item 1 above is why.
+
+⚠️ **This stopped reproducing on 2026-09-16** and the pin it motivated is gone; sleep
+releases by default. It is kept here because the margin was thin — the pool came out at
+−1435 MB against an 86 GB budget — so a bigger model could bring it back. If it does,
+`atom_cfg.engine_kwargs.sleep_keeps_memory_resident=true` still keeps the pool resident.
 
 ---
 
