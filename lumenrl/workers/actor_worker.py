@@ -1531,9 +1531,17 @@ class LumenActorWorker(BaseWorker):
 
     def update_weights_ipc_send(
         self, bucket_size_mb: int = 512, use_shm: bool = False,
-        version: int | None = None,
+        version: int | None = None, fp8_quantize: bool = False,
     ) -> dict[str, float]:
-        """Stream full (all-gathered) BF16 weights to the colocated vLLM replica.
+        """Stream full (all-gathered) weights to the colocated vLLM replica.
+
+        With ``fp8_quantize=True`` the weights are cast to FP8 e4m3 with
+        per-128x128-block scales before they go on the wire, the same as
+        ``send_weights_rdma`` does for the separated topology: roughly 42% fewer
+        bytes, and the rollout loads them directly instead of re-quantizing BF16.
+        Requires a vLLM ``fp8_per_block`` model on the receiving end, which
+        ``WeightSyncConfig.validate_fp8_quantization_location`` enforces.
+
 
         verl-aligned ZMQ CUDA-IPC weight sync. ``full_tensor()`` is an FSDP
         all-gather COLLECTIVE, so every actor must call this concurrently (the
@@ -1630,12 +1638,30 @@ class LumenActorWorker(BaseWorker):
         # ATOM's receive loop needs the whole bucket for its largest tensor
         # and one mapping per cycle, so it keeps the verl protocol.
         legacy = {"gc_collect": True, "double_buffer": False} if is_atom else {}
+
+        stream = _gen()
+        if fp8_quantize:
+            # After _gen(), not inside it: the quantizer needs the full (all-gathered),
+            # device-resident tensor that _gen() produces.
+            from lumenrl.engine.inference.fp8_weight_quantizer import (
+                quantize_weights_fp8_per_block,
+            )
+            stream = quantize_weights_fp8_per_block(
+                stream,
+                pow2_scales=bool(
+                    get_nested_config(
+                        self.config, "quantization", "rollout",
+                        "use_weight_pow2_scale", default=False,
+                    )
+                ),
+            )
+
         sender = BucketedWeightSender(
             zmq_handle=handle, bucket_size_mb=int(bucket_size_mb), use_shm=bool(use_shm),
             version=version, min_bucket_bytes=min_bucket_bytes, **legacy,
         )
         t_send = time.perf_counter()
-        asyncio.run(sender.async_send_weights(_gen()))
+        asyncio.run(sender.async_send_weights(stream))
         total_s = time.perf_counter() - t_send
         peak_alloc = 0.0
         if torch.cuda.is_available():

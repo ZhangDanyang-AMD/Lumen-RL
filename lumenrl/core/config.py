@@ -830,10 +830,11 @@ class WeightSyncConfig:
         if location is None and not self.fp8_quantize:
             return
         self.resolve_fp8_quantize()
-        if self.backend != "rdma":
+        if self.backend not in {"rdma", "auto"}:
             raise ValueError(
                 "weight_sync.fp8_quantization_location requires "
-                "weight_sync.backend='rdma'"
+                "weight_sync.backend='rdma' (separated) or 'auto' (colocated "
+                f"CUDA IPC), got {self.backend!r}"
             )
         if rollout_quantization != "fp8_per_block":
             raise ValueError(

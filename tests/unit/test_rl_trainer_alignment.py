@@ -301,3 +301,22 @@ def test_response_position_metrics_take_the_common_width() -> None:
 
     assert got == same_width
     assert got["rollout_corr/pos_0_127/tokens"] == 4.0
+
+
+def test_ipc_sync_refuses_fp8_quantize_on_the_safetensors_fallback() -> None:
+    """The fallback exports BF16 through disk and cannot honour fp8_quantize.
+
+    Degrading silently here would ship the rollout un-quantized weights while the
+    config said otherwise -- a train/rollout mismatch that shows up only as drift.
+    """
+    from lumenrl.core.config import WeightSyncConfig
+
+    stub = SimpleNamespace(
+        _ray_rollout_mgr=SimpleNamespace(num_replicas=4, servers=[]),
+        _actor_wg=SimpleNamespace(num_workers=8),
+        _rollout_wg=SimpleNamespace(),  # separated -> fallback
+        config=SimpleNamespace(weight_sync=WeightSyncConfig(fp8_quantize=True)),
+    )
+
+    with pytest.raises(RuntimeError, match="safetensors weight-sync fallback"):
+        RLTrainer._sync_weights_ipc(stub)

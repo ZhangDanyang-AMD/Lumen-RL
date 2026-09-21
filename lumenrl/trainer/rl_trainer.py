@@ -822,8 +822,21 @@ class RLTrainer:
                 "expected auto, shared_folder, or rdma"
             )
 
+        fp8_sync = self.config.weight_sync.resolve_fp8_quantize()
         separated = getattr(self, "_rollout_wg", None) is not None
         if separated or not self._ipc_endpoints_match_actors(mgr):
+            if fp8_sync:
+                # The safetensors fallback exports BF16 through disk and has no
+                # quantization hook, so honouring fp8_quantize here would silently
+                # mean "not quantized". Say so instead of degrading in silence.
+                raise RuntimeError(
+                    "weight_sync.fp8_quantize=true is not supported by the "
+                    "safetensors weight-sync fallback (separated="
+                    f"{separated}, replicas={mgr.num_replicas}, "
+                    f"actors={self._actor_wg.num_workers}). Use "
+                    "weight_sync.backend='rdma' for a separated topology, or a "
+                    "colocated topology with one replica per actor for CUDA IPC."
+                )
             if LUMENRL_DEBUG:
                 logger.info("[DBG] _sync_weights_ipc: separated=%s replicas=%d workers=%d, using safetensors",
                             separated, mgr.num_replicas, self._actor_wg.num_workers)
@@ -846,11 +859,12 @@ class RLTrainer:
             rollout_engine.wake(tags=["weights"])
         # 2) start receivers + senders concurrently, then join both.
         recv = [
-            s.update_weights_from_ipc.remote(use_shm, version) for s in mgr.servers
+            s.update_weights_from_ipc.remote(use_shm, version, fp8_sync)
+            for s in mgr.servers
         ]
         send = self._actor_wg.execute_all_async(
             "update_weights_ipc_send", bucket_size_mb=bmb, use_shm=use_shm,
-            version=version,
+            version=version, fp8_quantize=fp8_sync,
         )
         # Join as they finish rather than senders-then-receivers. The two sides
         # are a ZMQ REQ/REP pair, so a receiver that raises leaves its socket

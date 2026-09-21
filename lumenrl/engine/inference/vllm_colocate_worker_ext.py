@@ -444,8 +444,16 @@ class vLLMColocateWorkerExtension:
         self,
         use_shm: bool = False,
         version: int | None = None,
+        prequantized_fp8: bool = False,
     ) -> dict[str, object] | None:
-        """Receive bucketed weights over ZMQ IPC and load them into the model."""
+        """Receive bucketed weights over ZMQ IPC and load them into the model.
+
+        ``prequantized_fp8=True`` means the actor already quantized: the buckets
+        carry ``.weight`` in FP8 plus ``.weight_scale_inv``, so the online requant
+        lifecycle is skipped and the tensors are written straight into the model's
+        FP8 parameters -- the colocated twin of ``receive_weights_rdma``'s
+        prequantized branch.
+        """
         from vllm.platforms import current_platform
 
         from lumenrl.engine.inference.bucketed_weight_transfer import BucketedWeightReceiver
@@ -473,6 +481,57 @@ class vLLMColocateWorkerExtension:
             is_online_quant = is_online_quant_model(self.model_runner.vllm_config)
         except Exception as exc:  # pragma: no cover
             logger.warning("online-quant detection failed: %s", exc)
+
+        if prequantized_fp8:
+            if not is_online_quant:
+                raise RuntimeError(
+                    "prequantized FP8 IPC stream requires a vLLM "
+                    "fp8_per_block online-quantized model"
+                )
+            from lumenrl.engine.inference.vllm_fp8_utils import (
+                prepare_prequantized_fp8_weights_for_loading,
+            )
+
+            metadata = prepare_prequantized_fp8_weights_for_loading(model)
+            logger.warning(
+                "Restored prequantized FP8 loader metadata on local_rank=%d: %s",
+                self.local_rank,
+                metadata,
+            )
+            receiver = BucketedWeightReceiver(
+                zmq_handle=self._get_zmq_handle(),
+                device=self.device,
+                use_shm=use_shm,
+                expected_version=version,
+            )
+            stats = {"buckets": 0, "weights": 0}
+            loaded: set[str] = set()
+
+            def _load_prequantized(weights):
+                # No clone here, unlike the online branch below. That one clones
+                # because the layerwise reload DEFERS requant past the call and the
+                # receiver's tensors are views into an IPC buffer the sender
+                # overwrites. prepare_prequantized_fp8_weights_for_loading only
+                # restores parameter classes and loaders -- it installs no deferred
+                # reload -- so load_weights copies into the parameters during the
+                # call, exactly as the BF16 path does.
+                stats["buckets"] += 1
+                stats["weights"] += len(weights)
+                loaded.update(model.load_weights(weights) or ())
+
+            receiver.receive_weights(on_bucket_received=_load_prequantized)
+            # Scale suffixes are on the coverage ignore list, so this checks the FP8
+            # .weight parameters; the scales arriving alongside them only add names.
+            assert_weight_sync_coverage(
+                model, loaded, context="colocate-ipc-prequantized-fp8"
+            )
+            summary = {"prequantized_fp8": True, "online_quant": True, **stats}
+            logger.warning(
+                "IPC prequantized FP8 reload complete on local_rank=%d: %s",
+                self.local_rank,
+                summary,
+            )
+            return summary
 
         if is_online_quant:
             # verl-exact online per-block reload: initialize layerwise reload BEFORE
