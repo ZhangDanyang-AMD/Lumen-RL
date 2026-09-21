@@ -850,3 +850,41 @@ def test_ipc_prequantized_fp8_requires_an_online_quant_model(monkeypatch) -> Non
     with pytest.raises(RuntimeError, match="fp8_per_block"):
         worker.update_weights_from_ipc(prequantized_fp8=True)
     assert events == []
+
+
+def test_ipc_prequantized_fp8_rejects_silently_dropped_block_scales(monkeypatch) -> None:
+    """A dropped scale name means new weights dequantized with startup scales.
+
+    vLLM's load_weights skips names it does not recognise without raising, and
+    assert_weight_sync_coverage deliberately ignores *_scale_inv (a BF16 trainer
+    never sends them). When the trainer DOES send them, that combination would let
+    the rollout drift silently, so the prequantized branch checks them itself.
+    """
+    events: list[str] = []
+    worker = _prequantized_ipc_worker(monkeypatch, events)
+
+    # Give the model a block-scale parameter the loader will not claim.
+    model = worker.model_runner.model
+    model.register_parameter(
+        "weight_scale_inv", torch.nn.Parameter(torch.tensor([1.0]))
+    )
+
+    with pytest.raises(RuntimeError, match="stale scales"):
+        worker.update_weights_from_ipc(prequantized_fp8=True)
+
+
+def test_ipc_prequantized_fp8_accepts_loaded_block_scales(monkeypatch) -> None:
+    """The same model passes once the scale name comes back in the load manifest."""
+    events: list[str] = []
+    worker = _prequantized_ipc_worker(monkeypatch, events)
+    model = worker.model_runner.model
+    model.register_parameter(
+        "weight_scale_inv", torch.nn.Parameter(torch.tensor([1.0]))
+    )
+    real_load = model.load_weights
+    model.load_weights = lambda weights: (real_load(weights) or set()) | {
+        "weight_scale_inv"
+    }
+
+    summary = worker.update_weights_from_ipc(prequantized_fp8=True)
+    assert summary["prequantized_fp8"] is True
