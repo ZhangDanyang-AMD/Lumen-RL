@@ -6,6 +6,110 @@ first.
 
 ---
 
+# 2026-09-21 — image `260921`: ATOM #2267, aiter rebased onto upstream, asm decode dodged
+
+| | |
+|---|---|
+| Image | `zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260921`, digest `sha256:de47df3cf5d2…` |
+| Lumen-RL | working tree at the commit this record ships in |
+| ATOM | `0795f0eae2d6` on `main` (PR #2267 merge), baked |
+| aiter | `c395c62886e2` on `lumen/moe`, rebased onto ROCm/aiter `main` `6a9a005b7`, baked |
+| Hardware | one node, 8x MI355X (gfx950), whole-node allocation |
+| Seed | `10086` |
+| Metrics read at | step 1 (`step=1`) |
+
+## What this round changed
+
+**ATOM `8b6d61392b06` → `0795f0eae2d6`.** PR #2267 merged on 2026-09-20, bringing the
+two rollout fixes this line had been carrying out of tree: a capture no longer writes
+cache through the last served batch's rows, and a wake re-allocates the KV pool at the
+size it slept at.
+
+**aiter `lumen/moe` rebased onto ROCm/aiter `main` `6a9a005b7`.** Not optional: the new
+ATOM imports `topk_select` from aiter at module scope in `atom/model_ops/sampler.py`
+(also `embed_head`, `rejection_sampler`, `model_runner_ext`), and that symbol arrives
+with ROCm/aiter#5499 — after the branch's old base, on which the rollout cannot import
+at all. The rebase crosses ROCm/aiter#5149, which reverted Triton modules Lumen needs;
+upstream has since re-landed most of them, and the 148 files plus
+`arch_info.is_cdna4` it has not are restored at their pre-revert content. None of the
+restored paths exists on `6a9a005b7`, so nothing upstream is overwritten. Checked by
+importing all 137 aiter modules the three repos reference: 134 succeed, and the 3 that
+do not were equally absent before the rebase and sit behind `try`/`except` probes.
+
+**`ATOM_FORCE_ATTN_TRITON=1` on examples 4, 5 and 9.** ATOM's assembly paged-decode
+kernel returns finite but wrong output when a sequence's context occupies exactly 16
+pages with a partial last one. It is invisible in `abs_diff` and shows only in the
+quadratic `chi2_token`:
+
+| example 4, per step | `chi2_token` | `abs_diff` |
+|---|---|---|
+| without the variable | 0.147 / 0.0138 / **5761.69** | 0.0311 / 0.0370 / 0.0473 |
+| with it | 5.39 / 0.0411 / 0.113 | 0.0344 / 0.0391 / 0.0303 |
+
+ATOM's own fix (`fix/asm-paged-decode-partial-16th-page`) is not in the pinned commit.
+
+**20 of the 25 baked aiter kernels were rebuilt.** 257 upstream commits changed the
+`csrc` behind them. One was loudly stale — `module_deepgemm_opus` lost
+`opus_gemm_a16w16_launch` when ROCm/aiter#4961 unified the OPUS GEMM interfaces, and
+example 9 aborted on it — but the rest are the greater hazard: same symbol, older
+kernel, no error. Examples 4 and 5 passed against the stale set, which is why "it still
+passes" was not accepted as evidence here. Rebuilding used the incremental object cache,
+7–47 s each except two CK blockscale modules at ~400 s.
+
+## Runs
+
+10 runs, all exit 0, all four error counts 0, every weight-sync bucket `skipped=0`,
+`--check` 10/10 PASS against the table in `08-release.md` §8.5.1.
+
+| # | span | `k3_kl` | Δ vs reference | `entropy` | `kl` |
+|---|---|---|---|---|---|
+| 1 | 191 s | 0.0011179 | +5.5% | 0.6143 | 0.00117633 |
+| 2 | 161 s | 0.00471458 | −5.3% | 0.794294 | 0.00432843 |
+| 3 | 161 s | 0.00480643 | +19.0% | 0.774225 | 0.00447058 |
+| 4 a | 492 s | 0.00459888 | +12.7% | 0.570037 | 0.00427408 |
+| 4 b | 552 s | 0.00338652 | −17.0% | 0.548062 | 0.00298126 |
+| 4 c | 471 s | 0.00426389 | +4.5% | 0.714157 | 0.00385979 |
+| 5 | 396 s | 0.000841038 | −10.1% | 0.531491 | 0.000893993 |
+| 6 | 562 s | 0.00136204 | −13.8% | 0.538206 | 0.00159133 |
+| 7 | 536 s | 0.00166141 | +5.2% | 0.631309 | 0.00155714 |
+| 9 | 587 s | 0.00157512 | +14.1% | 0.682081 | 0.00118207 |
+
+Example 4's Δ is against its new reference; every other row is against the reference it
+already had.
+
+## Example 4's reference was re-measured; the other seven were re-confirmed
+
+The Triton decode path moves example 4: three runs at 0.00339 / 0.00426 / 0.00460, mean
+**0.00408**, against the 0.00287 it replaces. The old reference rejects the high end at
++60.2%, so this is a shift rather than spread — the three new runs deviate at most 17.0%
+from their own mean, which is tighter than the 0.00241 / 0.00243 / 0.00377 the old
+reference was built from. `entropy` moves with it to **0.611**.
+
+Examples 5 and 9 gained one sample each, −10.1% and +14.1%. Replacing a 4-run and a
+3-run mean with a single observation is a worse estimator, so they keep their values —
+the same argument this record made in 2026-09-10.
+
+## Example 9's sleep path
+
+48 releases and 48 resumes, balanced (8 replicas × 2 memory tags × 3 steps), zero
+negative KV-pool derivations, zero `Memory access fault`, zero `grad_norm=nan` — the
+three symptoms PR #2267 fixes, none of them present.
+
+## Limits of this record
+
+- Examples 1, 2, 3, 5, 6, 7 and 9 have **one run each on this image**. Only example 4
+  has three, and only its reference was re-derived.
+- The `chi2_token` comparison for `ATOM_FORCE_ATTN_TRITON` is **one run either side** on
+  example 4. The direction is not in doubt — 5761.69 against a per-step maximum of 5.39
+  — but the magnitude is a single observation, and step 1 is *higher* with the variable
+  set (5.39 against 0.147), which one pair of runs cannot explain.
+- The five kernels not rebuilt were judged unaffected by diffing their `csrc` sources,
+  not by running anything that isolates them.
+- Reference values remain smoke-scale (1–3 steps). They say a stack reproduces, not that
+  it trains well.
+
+---
+
 # 2026-09-17 — image `260917`: ATOM main baked in, measured with nothing mounted
 
 | | |

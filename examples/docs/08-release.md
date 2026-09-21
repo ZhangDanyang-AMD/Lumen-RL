@@ -17,7 +17,7 @@ nodes (example 8, see [chapter 7](07-disaggregated-rdma.md)).
 ```bash
 git clone https://github.com/ZhangDanyang-AMD/Lumen-RL.git && cd Lumen-RL
 export DATA_ROOT=/path/to/data
-docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260917
+docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260921
 bash release/run_example.sh 1 --check
 ```
 
@@ -45,13 +45,13 @@ edit — no rebuild, no new tag. `LUMENRL_SRC=/other/checkout` runs code from el
 On the algorithm side: clip-higher + dual-clip + token-mean policy loss, dynamic
 sampling (`filter_groups`), an overlong reward buffer, and TIS rollout correction.
 
-All aiter kernels in the image are **already compiled** (16 objects), so the first run
+All aiter kernels in the image are **already compiled** (25 objects), so the first run
 spends no time compiling them:
 
 ```bash
 docker run --rm --entrypoint /bin/bash \
-  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260917 \
-  -lc 'ls /opt/lumenrl/aiter-jit/*.so | wc -l'     # 16
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260921 \
+  -lc 'ls /opt/lumenrl/aiter-jit/*.so | wc -l'     # 25
 ```
 
 ### 8.1.1 Pinned versions
@@ -65,19 +65,39 @@ image digest *and* the Lumen-RL commit**. Every run prints both.
 |---|---|---|---|
 | Lumen-RL | `ZhangDanyang-AMD/Lumen-RL` | `dev/dapo_release` | your checkout (mounted, not pinned) |
 | Lumen | `ZhangDanyang-AMD/Lumen` | `amd-atom-rollout` | `e6379cbd9057` |
-| aiter | `ZhangDanyang-AMD/aiter` | `lumen/moe` | `4ebe6d69c7f4` |
-| ATOM | `ROCm/ATOM` | `main` | `8b6d61392b06` |
+| aiter | `ZhangDanyang-AMD/aiter` | `lumen/moe` | `c395c62886e2` |
+| ATOM | `ROCm/ATOM` | `main` | `0795f0eae2d6` |
 | composable_kernel | aiter submodule | — | `af9e1d1f1ae3` |
 
-ATOM is pinned on upstream `main`.
-[ROCm/ATOM PR #2028](https://github.com/ROCm/ATOM/pull/2028) was squash-merged on
-2026-09-16 and `8b6d61392b06` is that merge commit, so the pin is an ordinary commit on
-main rather than the PR head it used to be.
+ATOM is pinned on upstream `main`. `0795f0eae2d6` is the merge commit of
+[ROCm/ATOM PR #2267](https://github.com/ROCm/ATOM/pull/2267) (2026-09-20), which also
+carries the earlier [PR #2028](https://github.com/ROCm/ATOM/pull/2028). #2267 brings two
+rollout fixes: a CUDA graph capture no longer writes cache through the rows of the last
+served batch, and a wake rebuilds the KV pool at the size it slept at.
 
-⚠️ **Swapping ATOM yourself needs one engine setting that Lumen-RL supplies rather
-than inherit**: `compilation_config.cudagraph_mode=FULL`. Without it a no-eager ATOM
-rollout aborts on the first CUDA graph replay. It is inert on ATOM builds that predate
-the field. What the failure looks like and why is in the comments of
+The aiter branch moved with it. The new ATOM imports `topk_select` from aiter at module
+scope in `atom/model_ops/sampler.py`, and that symbol arrives with ROCm/aiter#5499 —
+later than the old base of `lumen/moe`, on which the ATOM rollout cannot load at all.
+`lumen/moe` is now rebased onto ROCm/aiter `main` `6a9a005b7`, with the Triton modules
+Lumen needs restored where upstream has not re-landed them.
+
+⚠️ **Swapping ATOM yourself needs two settings that Lumen-RL supplies rather than
+inherit**:
+
+- `compilation_config.cudagraph_mode=FULL` (engine kwarg, from `_pin_cudagraph_mode`).
+  Without it a no-eager ATOM rollout aborts on the first CUDA graph replay.
+- `ATOM_FORCE_ATTN_TRITON=1` (environment variable, which the launcher sets for
+  examples 4, 5 and 9). ATOM's assembly paged-decode kernel returns **finite but wrong**
+  output when a sequence's context occupies exactly 16 pages with a partial last one, so
+  a handful of tokens per run come back with an arbitrary logprob. It **hides from
+  `abs_diff`** — the number and average size of disagreeing tokens do not move — and
+  shows only in the quadratic `chi2_token`: example 4 step 3 measured 5761.69 against
+  0.0138 the step before, while `abs_diff` went 0.0370 → 0.0473. With the variable set,
+  the same config's three steps read 5.39 / 0.0411 / 0.113. ATOM's own fix is not in the
+  pinned commit yet; drop this once it is.
+
+Both are inert on ATOM builds that predate the corresponding field. What the failures
+look like and why is in the comments of
 [`release/versions.env`](../../release/versions.env).
 
 Sleep is **not** pinned: it follows ATOM's own default, which releases the rollout's
@@ -166,11 +186,11 @@ every column on the row has to be supplied.
 | 1 | `bf16` | `0` | `dapo_qwen3_8b_ray_vllm_smoke.yaml` | 3 | 512 | Qwen3-8B-Base | — |
 | 2 | `fp8` | `0` | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` | 3 | 512 | Qwen3-8B-Base | — |
 | 3 | `fp8` | `1` | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` | 3 | 512 | Qwen3-8B-Base | — |
-| 4 | `atomfp8` | `1` | `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` | 3 | 4096 | Qwen3-8B-Base | — |
-| 5 | `atombf16` | `0` | `dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml` | 1 | 4096 | Qwen3-8B-Base | — |
+| 4 | `atomfp8` | `1` | `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` | 3 | 4096 | Qwen3-8B-Base | `ATOM_FORCE_ATTN_TRITON=1` |
+| 5 | `atombf16` | `0` | `dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml` | 1 | 4096 | Qwen3-8B-Base | `ATOM_FORCE_ATTN_TRITON=1` |
 | 6 | `bf16` | `0` | `dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml` | 3 | 4096 | Qwen3-30B-A3B-Base | `LUMENRL_FP32_MOE_ROUTER=0` |
 | 7 | `bf16` | `0` | `dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml` | 3 | 4096 | Qwen3-30B-A3B-Base | `LUMENRL_FP32_MOE_ROUTER=0` |
-| 9 | `atombf16` | `0` | `dapo_qwen3moe_a3b_ray_atom_bf16_4k_smoke.yaml` | 3 | 4096 | Qwen3-30B-A3B-Base | `LUMENRL_FP32_MOE_ROUTER=0` |
+| 9 | `atombf16` | `0` | `dapo_qwen3moe_a3b_ray_atom_bf16_4k_smoke.yaml` | 3 | 4096 | Qwen3-30B-A3B-Base | `LUMENRL_FP32_MOE_ROUTER=0` `ATOM_FORCE_ATTN_TRITON=1` |
 
 > ⚠️ **`MODE` and `CONFIG_OVERRIDE` must be given as a pair.** Besides selecting
 > environment variables, `MODE` **appends a set of Hydra overrides**, and
@@ -196,7 +216,7 @@ any order.
 - Docker (if your user is not in the docker group, see the `DOCKER` variable in §8.4.4)
 
 > ⚠️ **This image only runs on gfx950.** TransformerEngine and Apex are compiled with
-> `NVTE_ROCM_ARCH=gfx950` / `PYTORCH_ROCM_ARCH=gfx950`, and the 16 aiter kernels
+> `NVTE_ROCM_ARCH=gfx950` / `PYTORCH_ROCM_ARCH=gfx950`, and the 25 aiter kernels
 > compiled into the image were built on gfx950. Those JIT artifacts do not carry an
 > architecture tag in their filenames, so on gfx942 (MI300X / MI308X / MI325X) they are
 > loaded as-is and fail at runtime instead of being rebuilt. For gfx942, build
@@ -254,7 +274,7 @@ start if any card is above 2 GB and prints what to do about it; `--force` skips 
 ### 8.4.2 Get the image
 
 ```bash
-docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260917
+docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260921
 ```
 
 You can also build it yourself; these are all the steps:
@@ -268,7 +288,7 @@ TAG=lumenrl:release-$(date +%Y%m%d) bash release/precompile_kernels.sh
 `precompile_kernels.sh` needs a GPU: aiter kernels are only compiled on first use and
 `docker build` has no devices, so they have to be compiled in a container with cards
 attached and committed into the image. That script's synthetic warmup covers 5 of the
-16 kernels; see its header for how to cover all 16.
+25 kernels; see its header for how to cover all 25.
 
 ### 8.4.3 Prepare the data
 
@@ -359,7 +379,7 @@ docker run -d --name lumenrl-release \
   --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --shm-size 64G \
   -v "$DATA_ROOT":"$DATA_ROOT" -e DATA_ROOT="$DATA_ROOT" \
   -v "$PWD":/opt/lumenrl/Lumen-RL \
-  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260917 sleep infinity
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260921 sleep infinity
 ```
 
 The second mount is the code, with `$PWD` being the root of this checkout. Leave it out
@@ -405,7 +425,7 @@ The other three trees are editable installs too, so the same mount works for the
 ```bash
 docker run -d --name lumenrl-dev ... \
   -v "$PWD/ATOM":/opt/lumenrl/ATOM \
-  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260917 sleep infinity
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260921 sleep infinity
 ```
 
 then `CONTAINER=lumenrl-dev bash release/run_example.sh <N>`. Unlike Lumen-RL, those
@@ -415,8 +435,10 @@ Lumen or aiter is no longer comparable with §8.5.1.
 ### 8.4.5 The manual command, without the launcher
 
 Below is the complete command for example 1. For the other examples, replace `MODE`,
-`TRAIN_FP8`, `CONFIG_OVERRIDE`, `STEPS` and `MODEL_PATH` per the table in §8.2.2, and
-for examples 6, 7 and 9 add `-e LUMENRL_FP32_MOE_ROUTER=0`.
+`TRAIN_FP8`, `CONFIG_OVERRIDE`, `STEPS` and `MODEL_PATH` per the table in §8.2.2, then
+add the environment variables in that table's last column (`-e
+LUMENRL_FP32_MOE_ROUTER=0` for examples 6, 7 and 9, `-e ATOM_FORCE_ATTN_TRITON=1` for
+examples 4, 5 and 9).
 `bash release/run_example.sh <N> --dry-run` prints this command for any example.
 
 ```bash
@@ -492,7 +514,7 @@ bash release/run_example.sh 1 --check-only --log $DATA_ROOT/logs/example-1-xxx.l
 ### 8.5.1 Reference values
 
 **Measurement conditions**: 8x MI355X (gfx950), image
-`dapo-gfx950-rocm7.2.3-260917` (digest `sha256:51ecafa95d1a…`) with Lumen-RL at
+`dapo-gfx950-rocm7.2.3-260921` (digest `sha256:de47df3cf5d2…`) with Lumen-RL at
 `e514596` — both matter, see §8.1.1 — the command being
 `bash release/run_example.sh <N>` (equivalent to a full row of §8.2.2),
 **`seed=10086`** (fixed inside `run_dapo.sh`), and metrics read at **step 1**
@@ -503,7 +525,7 @@ bash release/run_example.sh 1 --check-only --log $DATA_ROOT/logs/example-1-xxx.l
 | 1 | `dapo_qwen3_8b_ray_vllm_smoke.yaml` | 3 | 512 | 144 s | **0.00106** ±30% | **0.582** ±25% | 0.00106 | 1 |
 | 2 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` | 3 | 512 | 129 s | **0.00498** ±30% | **0.784** ±25% | 0.00538 | 1 |
 | 3 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` (`TRAIN_FP8=1`) | 3 | 512 | 142 s | **0.00404** ±30% | **0.832** ±25% | 0.00419 | 1 |
-| 4 | `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` | 3 | 4096 | 508 s | **0.00287** ±50% | **0.540** ±50% | 0.00288 | 3 |
+| 4 | `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` | 3 | 4096 | 505 s | **0.00408** ±50% | **0.611** ±50% | 0.00371 | 3 |
 | 5 | `dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml` | 1 | 4096 | 385 s | **0.000936** ±50% | **0.615** ±60% | 0.000927 | 4 |
 | 6 | `dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml` | 3 | 4096 | 523 s | **0.00158** ±50% | **0.679** ±60% | 0.00154 | 1 |
 | 7 | `dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml` | 3 | 4096 | 499 s | **0.00158** ±50% | **0.660** ±60% | 0.00188 | 1 |
@@ -511,6 +533,13 @@ bash release/run_example.sh 1 --check-only --log $DATA_ROOT/logs/example-1-xxx.l
 
 The two bold columns with tolerances are what `--check` turns into PASS / FAIL; each
 reference is the mean over the number of runs in the `runs` column.
+
+⚠️ **Example 4's row was re-measured over three runs on 2026-09-21**:
+`ATOM_FORCE_ATTN_TRITON=1` (§8.1.1) moves decode to the Triton kernel and `k3_kl` with
+it, to 0.00408 (0.00339 / 0.00426 / 0.00460), far enough that the old 0.00287 rejects
+the high end; `entropy` moves to 0.611. The worst of the three deviates 17% from the new
+reference. Examples 5 and 9 gained one sample each (−10.1% and +14.1%), which is not
+enough to replace a 4-run and a 3-run mean, so they keep their values.
 
 ⚠️ **Example 5's row was re-measured over four runs on 2026-09-17**, because one run
 does not describe it: the four span `k3_kl` 0.000739–0.00106 and `entropy` 0.361–0.870.
@@ -522,9 +551,9 @@ Every other row is unchanged and was re-confirmed on this image.
 dominated by how warm the caches are and has been measured up to ±15% apart on the same
 machine. The launcher's end-to-end wall clock is 20–35 s longer.
 
-**Result on this image: 8/8 exit code 0**, all four error counts **zero**, every
-weight-sync bucket at `skipped=0`, `--check` **8/8 PASS**, with `k3_kl` within **±12%**
-of every reference above. The per-run record is in
+**Result on this image: 10 runs over the eight examples, exit code 0 throughout**, all
+four error counts **zero**, every weight-sync bucket at `skipped=0`, `--check` **10/10
+PASS**, with `k3_kl` within **±19%** of every reference above. The per-run record is in
 [`VALIDATION.md`](../../release/VALIDATION.md).
 
 **Example 9 versus example 6 — what the rollout engine costs.** Same model, same

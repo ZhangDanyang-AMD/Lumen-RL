@@ -15,7 +15,7 @@
 ```bash
 git clone https://github.com/ZhangDanyang-AMD/Lumen-RL.git && cd Lumen-RL
 export DATA_ROOT=/path/to/data
-docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260917
+docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260921
 bash release/run_example.sh 1 --check
 ```
 
@@ -42,12 +42,12 @@ bash release/run_example.sh 1 --check
 算法侧：clip-higher + dual-clip + token-mean 策略损失、动态采样（`filter_groups`）、
 overlong 奖励缓冲、TIS rollout 修正。
 
-镜像里的 aiter kernel 已**全部预编译完成**（16 个对象），首次运行不会再花时间编译：
+镜像里的 aiter kernel 已**全部预编译完成**（25 个对象），首次运行不会再花时间编译：
 
 ```bash
 docker run --rm --entrypoint /bin/bash \
-  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260917 \
-  -lc 'ls /opt/lumenrl/aiter-jit/*.so | wc -l'     # 16
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260921 \
+  -lc 'ls /opt/lumenrl/aiter-jit/*.so | wc -l'     # 25
 ```
 
 ### 8.1.1 版本固定
@@ -60,17 +60,34 @@ Lumen-RL **不由镜像固定**——跑的是你 checkout 里的版本，因此
 |---|---|---|---|
 | Lumen-RL | `ZhangDanyang-AMD/Lumen-RL` | `dev/dapo_release` | 你的 checkout（挂载，不固定） |
 | Lumen | `ZhangDanyang-AMD/Lumen` | `amd-atom-rollout` | `e6379cbd9057` |
-| aiter | `ZhangDanyang-AMD/aiter` | `lumen/moe` | `4ebe6d69c7f4` |
-| ATOM | `ROCm/ATOM` | `main` | `8b6d61392b06` |
+| aiter | `ZhangDanyang-AMD/aiter` | `lumen/moe` | `c395c62886e2` |
+| ATOM | `ROCm/ATOM` | `main` | `0795f0eae2d6` |
 | composable_kernel | aiter submodule | — | `af9e1d1f1ae3` |
 
-ATOM 钉在上游 `main` 上。[ROCm/ATOM PR #2028](https://github.com/ROCm/ATOM/pull/2028)
-已于 2026-09-16 squash 合入，`8b6d61392b06` 就是那个合入提交，所以这里钉的不再是
-PR head，而是 main 上的普通提交。
+ATOM 钉在上游 `main` 上，`0795f0eae2d6` 是
+[ROCm/ATOM PR #2267](https://github.com/ROCm/ATOM/pull/2267) 的合入提交
+（2026-09-20），它之前的 [PR #2028](https://github.com/ROCm/ATOM/pull/2028) 也已在内。
+#2267 带来两项 rollout 修复：CUDA graph 捕获不再把 KV 写进上一批真实请求占用的行，
+以及唤醒时按休眠前的尺寸重建 KV 池。
 
-⚠️ **自行替换 ATOM 需要一项由 Lumen-RL 主动给出、而非从 ATOM 继承的引擎设置**：
-`compilation_config.cudagraph_mode=FULL`。缺了它，no-eager 的 ATOM rollout 会崩在
-第一次 CUDA graph replay。该项对早于这个字段的 ATOM 构建是空操作。
+aiter 分支随之前移。新 ATOM 的 `atom/model_ops/sampler.py` 在模块顶层
+`from aiter import topk_select`，而该符号出自 ROCm/aiter#5499，晚于 `lumen/moe`
+原来的基点，旧基点上 ATOM rollout 无法加载。`lumen/moe` 已 rebase 到 ROCm/aiter
+`main` `6a9a005b7`，并补回上游尚未重新落地、而 Lumen 需要的那部分 Triton 模块。
+
+⚠️ **自行替换 ATOM 需要两项由 Lumen-RL 主动给出、而非从 ATOM 继承的设置**：
+
+- `compilation_config.cudagraph_mode=FULL`（引擎参数，`_pin_cudagraph_mode` 提供）。
+  缺了它，no-eager 的 ATOM rollout 会崩在第一次 CUDA graph replay。
+- `ATOM_FORCE_ATTN_TRITON=1`（环境变量，启动器为例子 4、5、9 自动带上）。
+  ATOM 的汇编 paged-decode kernel 在一条序列的上下文恰好占满 16 页且最后一页不满时
+  返回**有限但错误**的结果，于是每次运行都有极少数 token 拿到任意 logprob。
+  它**躲得过 `abs_diff`**——分歧 token 的数量与平均幅度都不变——只在二次型的
+  `chi2_token` 上现形：例子 4 第 3 步实测 5761.69，而上一步是 0.0138，
+  同期 `abs_diff` 只从 0.0370 走到 0.0473。置上该变量后同一条配置三步为
+  5.39 / 0.0411 / 0.113。ATOM 自身的修复尚未进入所钉的提交，进了即可去掉。
+
+两项对早于相应字段的 ATOM 构建都是空操作。
 具体的报错形态与原因见 [`release/versions.env`](../../release/versions.env) 的注释。
 
 sleep **不再钉**，跟随 ATOM 自己的默认，即释放 rollout 的权重、图和 KV 池。
@@ -151,11 +168,11 @@ disaggregated RDMA 部署，需要 2×8 张 gfx942，本镜像不覆盖它，见
 | 1 | `bf16` | `0` | `dapo_qwen3_8b_ray_vllm_smoke.yaml` | 3 | 512 | Qwen3-8B-Base | — |
 | 2 | `fp8` | `0` | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` | 3 | 512 | Qwen3-8B-Base | — |
 | 3 | `fp8` | `1` | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` | 3 | 512 | Qwen3-8B-Base | — |
-| 4 | `atomfp8` | `1` | `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` | 3 | 4096 | Qwen3-8B-Base | — |
-| 5 | `atombf16` | `0` | `dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml` | 1 | 4096 | Qwen3-8B-Base | — |
+| 4 | `atomfp8` | `1` | `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` | 3 | 4096 | Qwen3-8B-Base | `ATOM_FORCE_ATTN_TRITON=1` |
+| 5 | `atombf16` | `0` | `dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml` | 1 | 4096 | Qwen3-8B-Base | `ATOM_FORCE_ATTN_TRITON=1` |
 | 6 | `bf16` | `0` | `dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml` | 3 | 4096 | Qwen3-30B-A3B-Base | `LUMENRL_FP32_MOE_ROUTER=0` |
 | 7 | `bf16` | `0` | `dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml` | 3 | 4096 | Qwen3-30B-A3B-Base | `LUMENRL_FP32_MOE_ROUTER=0` |
-| 9 | `atombf16` | `0` | `dapo_qwen3moe_a3b_ray_atom_bf16_4k_smoke.yaml` | 3 | 4096 | Qwen3-30B-A3B-Base | `LUMENRL_FP32_MOE_ROUTER=0` |
+| 9 | `atombf16` | `0` | `dapo_qwen3moe_a3b_ray_atom_bf16_4k_smoke.yaml` | 3 | 4096 | Qwen3-30B-A3B-Base | `LUMENRL_FP32_MOE_ROUTER=0` `ATOM_FORCE_ATTN_TRITON=1` |
 
 > ⚠️ **`MODE` 与 `CONFIG_OVERRIDE` 必须成对给出。** `MODE` 除了选择环境变量，还会**追加一批
 > Hydra override**，`CONFIG_OVERRIDE` 只替换 config 文件而不会取消这些追加项。
@@ -179,7 +196,7 @@ disaggregated RDMA 部署，需要 2×8 张 gfx942，本镜像不覆盖它，见
 - Docker（若当前用户不在 docker 组，见 §8.4.4 的 `DOCKER` 变量）
 
 > ⚠️ **本镜像仅能在 gfx950 上运行。** TransformerEngine 与 Apex 是以
-> `NVTE_ROCM_ARCH=gfx950` / `PYTORCH_ROCM_ARCH=gfx950` 编译的，预编译进镜像的 16 个
+> `NVTE_ROCM_ARCH=gfx950` / `PYTORCH_ROCM_ARCH=gfx950` 编译的，预编译进镜像的 25 个
 > aiter kernel 也是在 gfx950 上构建的。这些 JIT 产物的文件名不含架构标识，因此在
 > gfx942（MI300X / MI308X / MI325X）上会被直接加载并在运行期出错，而不会重新编译。
 > 需要 gfx942 请单独构建：`PYTORCH_ROCM_ARCH=gfx942 bash release/build_image.sh`。
@@ -233,7 +250,7 @@ rocm-smi --showmeminfo vram | grep -i used      # 宿主机上直接可用
 ### 8.4.2 获取镜像
 
 ```bash
-docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260917
+docker pull zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260921
 ```
 
 也可以自行构建，下面就是全部步骤：
@@ -246,7 +263,7 @@ TAG=lumenrl:release-$(date +%Y%m%d) bash release/precompile_kernels.sh
 
 `precompile_kernels.sh` 需要 GPU：aiter kernel 只在首次使用时编译，而 `docker build`
 没有设备可用，所以要用带卡的容器把它们编译好再提交进镜像。该脚本的合成 warmup 覆盖
-16 个 kernel 中的 5 个，覆盖全部 16 个的做法见脚本头部说明。
+25 个 kernel 中的 5 个，覆盖全部 25 个的做法见脚本头部说明。
 
 ### 8.4.3 准备数据
 
@@ -332,7 +349,7 @@ docker run -d --name lumenrl-release \
   --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --shm-size 64G \
   -v "$DATA_ROOT":"$DATA_ROOT" -e DATA_ROOT="$DATA_ROOT" \
   -v "$PWD":/opt/lumenrl/Lumen-RL \
-  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260917 sleep infinity
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260921 sleep infinity
 ```
 
 第二个挂载是代码，`$PWD` 是这份 checkout 的根目录。不挂它，容器跑的就是镜像里
@@ -377,7 +394,7 @@ LUMENRL_SRC=/other/Lumen-RL bash release/run_example.sh <N>
 ```bash
 docker run -d --name lumenrl-dev ... \
   -v "$PWD/ATOM":/opt/lumenrl/ATOM \
-  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260917 sleep infinity
+  zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260921 sleep infinity
 ```
 
 然后 `CONTAINER=lumenrl-dev bash release/run_example.sh <N>`。但与 Lumen-RL 不同，
@@ -386,7 +403,9 @@ docker run -d --name lumenrl-dev ... \
 ### 8.4.5 不用启动器的手工命令
 
 下面是例子 1 的完整命令。换其他例子时，按 §8.2.2 的表替换 `MODE`、`TRAIN_FP8`、
-`CONFIG_OVERRIDE`、`STEPS`、`MODEL_PATH`，例子 6、7、9 再追加 `-e LUMENRL_FP32_MOE_ROUTER=0`。
+`CONFIG_OVERRIDE`、`STEPS`、`MODEL_PATH`，再按该表的最后一列追加环境变量
+（例子 6、7、9 是 `-e LUMENRL_FP32_MOE_ROUTER=0`，例子 4、5、9 是
+`-e ATOM_FORCE_ATTN_TRITON=1`）。
 `bash release/run_example.sh <N> --dry-run` 会直接生成对应例子的这段命令。
 
 ```bash
@@ -455,8 +474,8 @@ bash release/run_example.sh 1 --check-only --log $DATA_ROOT/logs/example-1-xxx.l
 
 ### 8.5.1 参考值表
 
-**测量条件**：8x MI355X（gfx950），镜像 `dapo-gfx950-rocm7.2.3-260917`
-（digest `sha256:51ecafa95d1a…`）+ Lumen-RL `e514596`——两者都要记，原因见 §8.1.1；
+**测量条件**：8x MI355X（gfx950），镜像 `dapo-gfx950-rocm7.2.3-260921`
+（digest `sha256:de47df3cf5d2…`）+ Lumen-RL `e514596`——两者都要记，原因见 §8.1.1；
 命令即 `bash release/run_example.sh <N>`（等价于 §8.2.2 的整行参数），
 **`seed=10086`**（`run_dapo.sh` 内固定），取**第 1 步**（`step=1`）的指标。
 
@@ -465,13 +484,19 @@ bash release/run_example.sh 1 --check-only --log $DATA_ROOT/logs/example-1-xxx.l
 | 1 | `dapo_qwen3_8b_ray_vllm_smoke.yaml` | 3 | 512 | 144 s | **0.00106** ±30% | **0.582** ±25% | 0.00106 | 1 |
 | 2 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml` | 3 | 512 | 129 s | **0.00498** ±30% | **0.784** ±25% | 0.00538 | 1 |
 | 3 | `dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml`（`TRAIN_FP8=1`） | 3 | 512 | 142 s | **0.00404** ±30% | **0.832** ±25% | 0.00419 | 1 |
-| 4 | `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` | 3 | 4096 | 508 s | **0.00287** ±50% | **0.540** ±50% | 0.00288 | 3 |
+| 4 | `dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml` | 3 | 4096 | 505 s | **0.00408** ±50% | **0.611** ±50% | 0.00371 | 3 |
 | 5 | `dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml` | 1 | 4096 | 385 s | **0.000936** ±50% | **0.615** ±60% | 0.000927 | 4 |
 | 6 | `dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml` | 3 | 4096 | 523 s | **0.00158** ±50% | **0.679** ±60% | 0.00154 | 1 |
 | 7 | `dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml` | 3 | 4096 | 499 s | **0.00158** ±50% | **0.660** ±60% | 0.00188 | 1 |
 | 9 | `dapo_qwen3moe_a3b_ray_atom_bf16_4k_smoke.yaml` | 3 | 4096 | 579 s | **0.00138** ±50% | **0.692** ±60% | 0.00138 | 3 |
 
 粗体两列带容差的即 `--check` 判定 PASS / FAIL 的两项，参考值是「实测次数」列那么多遍的均值。
+
+⚠️ **例 4 这一行于 2026-09-21 用三次运行重标**：`ATOM_FORCE_ATTN_TRITON=1`（§8.1.1）
+把 decode 换到 Triton kernel，`k3_kl` 随之移到 0.00408（三次 0.00339 / 0.00426 / 0.00460），
+旧的 0.00287 会在高端判 FAIL；`entropy` 一并移到 0.611。三次相对新参考值的最大偏差是 17%。
+例 5 与例 9 各只多了一个样本（−10.1% 与 +14.1%），不足以替换一个四次均值和一个三次均值，
+故保留原值。
 
 ⚠️ **例 5 这一行于 2026-09-17 用四次运行重测**，因为一次描述不了它：四次的 `k3_kl`
 跨度是 0.000739–0.00106，`entropy` 是 0.361–0.870。`k3_kl` 落在它所替换的那个单次值的
@@ -481,9 +506,9 @@ bash release/run_example.sh 1 --check-only --log $DATA_ROOT/logs/example-1-xxx.l
 **时间跨度那一列不设容差、不参与判定**——它受缓存冷热影响，
 同一机器上偏差可达 ±15%。启动器报的端到端墙钟比它多约 20–35 s。
 
-**本镜像上的结果：8/8 退出码为 0**，四类错误计数**全部为 0**，
-每个权重同步 bucket 都是 `skipped=0`，`--check` **8/8 PASS**，且 `k3_kl` 与上表每个参考值
-的偏差都在 **±12%** 之内。逐次原始记录见 [`VALIDATION.md`](../../release/VALIDATION.md)。
+**本镜像上的结果：八个例子共 10 次运行，退出码全部为 0**，四类错误计数**全部为 0**，
+每个权重同步 bucket 都是 `skipped=0`，`--check` **10/10 PASS**，且 `k3_kl` 与上表每个参考值
+的偏差都在 **±19%** 之内。逐次原始记录见 [`VALIDATION.md`](../../release/VALIDATION.md)。
 
 **例子 9 对例子 6——换 rollout 引擎的代价。** 同模型、同训练配置，把 vLLM 换成 ATOM：
 `k3_kl` 是 0.00138 对 0.00158，远在容差之内，
