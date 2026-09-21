@@ -11,7 +11,7 @@ first.
 | | |
 |---|---|
 | Image | `zhangdanyangamd/lumen-rl:dapo-gfx950-rocm7.2.3-260921b`, digest `sha256:eede1d8fcdf5…` |
-| Lumen-RL | `7933758`, the parent of the commit this record ships in |
+| Lumen-RL | `22502fa`, the parent of the commit this record ships in |
 | ATOM | `0795f0eae2d6` on `main` (PR #2267 merge), baked |
 | aiter | `d6303e316f9e` on `lumen/moe`, rebased onto ROCm/aiter `main` `6a9a005b7`, baked |
 | Hardware | one node, 8x MI355X (gfx950), whole-node allocation |

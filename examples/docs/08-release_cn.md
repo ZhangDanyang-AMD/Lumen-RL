@@ -478,7 +478,7 @@ bash release/run_example.sh 1 --check-only --log $DATA_ROOT/logs/example-1-xxx.l
 ### 8.5.1 参考值表
 
 **测量条件**：8x MI355X（gfx950），镜像 `dapo-gfx950-rocm7.2.3-260921b`
-（digest `sha256:eede1d8fcdf5…`）+ Lumen-RL `7933758`——两者都要记，原因见 §8.1.1；
+（digest `sha256:eede1d8fcdf5…`）+ Lumen-RL `22502fa`——两者都要记，原因见 §8.1.1；
 命令即 `bash release/run_example.sh <N>`（等价于 §8.2.2 的整行参数），
 **`seed=10086`**（`run_dapo.sh` 内固定），取**第 1 步**（`step=1`）的指标。
 
