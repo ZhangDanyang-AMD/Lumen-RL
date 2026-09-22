@@ -150,7 +150,7 @@ class ATOMRolloutReplica(RolloutReplica):
         # need to release memory for the training engine.
         pass
 
-    async def abort_all_requests(self):
+    async def abort_all_requests(self, reject_request: bool = False):
         await asyncio.gather(*[s.wait_for_requests_to_drain.remote() for s in self.servers])
 
     async def resume_generation(self):

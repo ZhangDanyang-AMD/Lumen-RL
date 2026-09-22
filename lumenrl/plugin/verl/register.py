@@ -26,23 +26,20 @@ _registered = False
 class ATOMRolloutAdapter:
     """Thin verl ``BaseRollout`` adapter around ``ATOMReplicaManager``.
 
-    Weight sync is NOT implemented here — ATOM manages its own weight
-    lifecycle via ``sleep`` / ``wake_up`` / ``load_weights``.
-    ``update_weights`` is intentionally a no-op.
-
     The adapter is instantiated by verl's engine worker via the FQDN string
     stored in ``_ROLLOUT_REGISTRY``. verl resolves it with ``importlib`` and
     calls ``cls(config, model_config, device_mesh)``.
     """
 
     def __init__(self, config: Any, model_config: Any, device_mesh: Any, **kw: Any):
-        try:
+        import importlib.util
+
+        if importlib.util.find_spec("verl.workers.rollout.base"):
             from verl.workers.rollout.base import BaseRollout
 
             BaseRollout.__init__(self, config, model_config, device_mesh)
-        except ImportError:
-            pass
         self._manager = None
+        self._weight_version = 0
 
     def set_manager(self, manager: Any) -> None:
         """Inject the ``ATOMReplicaManager`` created by the trainer."""
@@ -58,7 +55,48 @@ class ATOMRolloutAdapter:
         wire_format: str = "named_tensors",
         **kw: Any,
     ) -> None:
-        logger.debug("ATOMRolloutAdapter.update_weights: no-op (ATOM-native sync).")
+        """Sync weights from verl's training engine to ATOM rollout servers.
+
+        Collects tensors from the generator, writes them to a temporary
+        safetensors directory, and calls ``reload_weights_from_path`` on
+        each ATOM server replica.
+        """
+        if self._manager is None or not self._manager.servers:
+            logger.debug("ATOMRolloutAdapter.update_weights: no manager/servers, skipping.")
+            return
+
+        import os
+        import tempfile
+
+        import ray
+        from safetensors.torch import save_file
+
+        self._weight_version += 1
+        weight_dir = os.path.join(
+            tempfile.gettempdir(),
+            f"lumenrl_verl_weights_v{self._weight_version:06d}",
+        )
+        os.makedirs(weight_dir, exist_ok=True)
+
+        state_dict = {}
+        for name, tensor in weights:
+            state_dict[name] = tensor.contiguous().cpu()
+
+        if not state_dict:
+            logger.warning("ATOMRolloutAdapter.update_weights: empty weight generator.")
+            return
+
+        save_file(state_dict, os.path.join(weight_dir, "model.safetensors"))
+        logger.info(
+            "ATOMRolloutAdapter.update_weights: saved %d params to %s",
+            len(state_dict), weight_dir,
+        )
+
+        ray.get([
+            s.reload_weights_from_path.remote(weight_dir)
+            for s in self._manager.servers
+        ])
+        logger.info("ATOMRolloutAdapter.update_weights: ATOM servers reloaded v%d.", self._weight_version)
 
     async def release(self) -> None:
         if self._manager is not None:
@@ -239,13 +277,16 @@ def _make_engine_classes():
         @staticmethod
         def _restore_standard_attention():
             """Undo LumenRL's varlen attention monkey-patch if installed."""
-            try:
+            import importlib.util
+
+            if not importlib.util.find_spec("lumenrl.engine.training.packing"):
+                return
+            from lumenrl.engine.training.packing import _original_attn_fn
+            if _original_attn_fn is None:
+                return
+            if importlib.util.find_spec("transformers.modeling_utils"):
                 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-                from lumenrl.engine.training.packing import _original_attn_fn
-                if _original_attn_fn is not None:
-                    ALL_ATTENTION_FUNCTIONS["sdpa"] = _original_attn_fn
-            except (ImportError, AttributeError):
-                pass
+                ALL_ATTENTION_FUNCTIONS["sdpa"] = _original_attn_fn
 
         @staticmethod
         def _flatten_output(output, original_data):
@@ -442,6 +483,22 @@ def _make_engine_classes():
             output = self._inner.forward_backward_batch(plain, *args, **kwargs)
             return self._flatten_output(output, data)
 
+        def get_per_tensor_param_shard(self, **kwargs):
+            if hasattr(self._inner, "get_per_tensor_param_shard"):
+                return self._inner.get_per_tensor_param_shard(**kwargs)
+            raise NotImplementedError(
+                "LumenRL FSDP2Engine does not implement get_per_tensor_param_shard yet. "
+                "Use checkpoint_engine.backend='naive' or 'nccl' instead of 'delta_sharded'."
+            )
+
+        def get_per_tensor_param_delta_shard(self, **kwargs):
+            if hasattr(self._inner, "get_per_tensor_param_delta_shard"):
+                return self._inner.get_per_tensor_param_delta_shard(**kwargs)
+            raise NotImplementedError(
+                "LumenRL FSDP2Engine does not implement get_per_tensor_param_delta_shard yet. "
+                "Use checkpoint_engine.backend='naive' or 'nccl' instead of 'delta_sharded'."
+            )
+
     # Dynamically add forwarding methods for all BaseEngine abstract methods
     for _mname in _delegate_methods:
         if _mname not in _LumenRLFSDP2Engine.__dict__:
@@ -491,23 +548,26 @@ def register() -> None:
 
     Called by verl's plugin auto-loader at ``import verl`` time.
     """
+    import importlib.util
+
     global _registered
     if _registered:
         return
     _registered = True
 
-    try:
+    # --- rollout registry (BaseRollout path) ---
+    if importlib.util.find_spec("verl.workers.rollout.base"):
         from verl.workers.rollout.base import _ROLLOUT_REGISTRY
 
         _ROLLOUT_REGISTRY[("atom", "async")] = (
             "lumenrl.plugin.verl.register.ATOMRolloutAdapter"
         )
         logger.info("lumenrl: registered ATOM rollout in verl._ROLLOUT_REGISTRY")
-    except ImportError:
-        logger.warning("lumenrl: verl.workers.rollout.base not importable; skipped rollout registration")
+    else:
+        logger.warning("lumenrl: verl.workers.rollout.base not found; skipped rollout registration")
 
-    # Also register in RolloutReplicaRegistry (used by v0 legacy trainer)
-    try:
+    # --- replica registry (RolloutReplica path, used by v0 legacy trainer) ---
+    if importlib.util.find_spec("verl.workers.rollout.replica"):
         from verl.workers.rollout.replica import RolloutReplicaRegistry
 
         def _load_atom():
@@ -516,11 +576,12 @@ def register() -> None:
 
         if "atom" not in RolloutReplicaRegistry._registry:
             RolloutReplicaRegistry.register("atom", _load_atom)
-            logger.info("lumenrl: registered ATOM in RolloutReplicaRegistry (v0 compat)")
-    except ImportError:
-        pass
+            logger.info("lumenrl: registered ATOM in RolloutReplicaRegistry")
+    else:
+        logger.warning("lumenrl: verl.workers.rollout.replica not found; skipped replica registration")
 
-    try:
+    # --- engine registry (FSDP2 / Megatron training engines) ---
+    if importlib.util.find_spec("verl.workers.engine.base"):
         from verl.workers.engine.base import EngineRegistry as VerlEngineRegistry
 
         FSDP2Cls, MegatronCls = _make_engine_classes()
@@ -538,8 +599,8 @@ def register() -> None:
             device=["cuda"],
         )(MegatronCls)
         logger.info("lumenrl: registered lumenrl_megatron in verl EngineRegistry")
-    except Exception as e:
-        logger.warning("lumenrl: engine registration failed: %s", e)
+    else:
+        logger.warning("lumenrl: verl.workers.engine.base not found; skipped engine registration")
 
 
 # Auto-register when this module is imported (verl's plugin loader calls

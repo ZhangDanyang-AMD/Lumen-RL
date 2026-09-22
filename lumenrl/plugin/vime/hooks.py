@@ -5,7 +5,8 @@ Usage — pass each function via its dotted import path::
     python train.py \\
       --custom-megatron-init-path  lumenrl.plugin.vime.hooks.custom_megatron_init \\
       --custom-model-provider-path lumenrl.plugin.vime.hooks.custom_model_provider \\
-      --rollout-function-path      lumenrl.plugin.vime.hooks.generate_rollout
+      --rollout-function-path      lumenrl.plugin.vime.hooks.generate_rollout \\
+      --custom-update-weight-post-write-path lumenrl.plugin.vime.hooks.custom_update_weight_post_write
 
 All logic is delegated to existing LumenRL modules.
 """
@@ -155,3 +156,35 @@ def generate_rollout(
 
     manager.sleep_all()
     return RolloutFnTrainOutput(samples=results)
+
+
+# ---------------------------------------------------------------------------
+# Hook 4: --custom-update-weight-post-write-path
+# Signature: (args, version_dir: str, rollout_engines: list) -> None
+# Called by UpdateWeightFromDisk / UpdateWeightFromDiskDelta after writing
+# HF weights to disk, before vllm/sglang engines reload.
+# ---------------------------------------------------------------------------
+
+def custom_update_weight_post_write(
+    args: Any,
+    version_dir: str,
+    rollout_engines: list,
+) -> None:
+    """Reload ATOM server weights from the newly written HF checkpoint.
+
+    vime's weight updater writes HF-format weights to ``version_dir``
+    then calls this hook on every rank.  Only rank 0 triggers the
+    ATOM reload (the servers themselves broadcast via their TP groups).
+    """
+    import torch.distributed as dist
+
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return
+
+    manager = getattr(args, "_lumenrl_atom_manager", None)
+    if manager is None:
+        logger.debug("lumenrl: custom_update_weight_post_write: no ATOM manager, skipping.")
+        return
+
+    manager.reload_weights_from_path(version_dir)
+    logger.info("lumenrl: ATOM weights reloaded from %s", version_dir)
