@@ -10,19 +10,13 @@ from __future__ import annotations
 import itertools
 from typing import Any, Mapping
 
-from lumenrl.engine.training import dsv3_megatron_bridge as dsv3
-from lumenrl.engine.training import dsv4_megatron_bridge as dsv4
+from lumenrl.engine.training.bridges import dsv3, dsv4, gpt
 from lumenrl.engine.training.model_registry import (
     MODEL_REGISTRY,
     ModelCaps,
     ModelSpec,
     hf_num_experts,
     resolve_head_dim,
-)
-from lumenrl.engine.training.qwen3_megatron_bridge import Qwen3Dims, megatron_to_hf
-from lumenrl.engine.training.qwen3moe_megatron_bridge import (
-    build_moe_dims,
-    megatron_to_hf_moe,
 )
 
 
@@ -53,19 +47,19 @@ def _export_dsv3(engine):
         engine._full_megatron_named_params_moe(),
         engine._router_bias_buffers(),
     )
-    return dsv3.megatron_to_hf_dsv3(named)
+    return dsv3.megatron_to_hf(named)
 
 
 def _export_moe(engine):
-    return megatron_to_hf_moe(engine._full_megatron_named_params_moe(), engine._dims)
+    return gpt.megatron_to_hf(engine._full_megatron_named_params_moe(), engine._dims)
 
 
 def _export_dense(engine):
-    return megatron_to_hf(engine._full_megatron_named_params(), engine._dims, te=True)
+    return gpt.megatron_to_hf(engine._full_megatron_named_params(), engine._dims)
 
 
-def _dense_dims(hf: Mapping[str, Any]) -> Qwen3Dims:
-    return Qwen3Dims(
+def _dense_dims(hf: Mapping[str, Any]) -> gpt.GPTDims:
+    return gpt.GPTDims(
         num_layers=hf["num_hidden_layers"],
         hidden=hf["hidden_size"],
         num_heads=hf["num_attention_heads"],
@@ -109,7 +103,7 @@ DSV4 = MODEL_REGISTRY.register(
 
 
 # --- DeepSeek-V3 family (V3 / V3.1 / R1, and the Kimi K2 line) ---------------
-# Before qwen3_moe: a DSv3 config declares routed experts, so the generic entry
+# Before gpt_moe: a DSv3 config declares routed experts, so the generic entry
 # would claim it and build a plain TransformerConfig with fused QKV -- wrong for
 # MLA. Detects on ``architectures``, not MLA fields, which DSv4 also has.
 DSV3 = MODEL_REGISTRY.register(
@@ -138,9 +132,9 @@ DSV3 = MODEL_REGISTRY.register(
 # and diverge from vLLM -- a large rollout/train log-prob gap.
 QWEN3_MOE = MODEL_REGISTRY.register(
     ModelSpec(
-        name="qwen3_moe",
+        name="gpt_moe",
         detect=lambda hf, ec: _effective_num_experts(hf, ec) > 1,
-        build_dims=build_moe_dims,
+        build_dims=gpt.build_moe_dims,
         routing_defaults={"moe_router_pre_softmax": False},
         export_weights=_export_moe,
     )
@@ -151,7 +145,7 @@ QWEN3_MOE = MODEL_REGISTRY.register(
 # GQA + SwiGLU. Last, so it only sees what nothing else claimed.
 QWEN3_DENSE = MODEL_REGISTRY.register(
     ModelSpec(
-        name="qwen3_dense",
+        name="gpt_dense",
         detect=lambda hf, ec: True,
         build_dims=_dense_dims,
         export_weights=_export_dense,

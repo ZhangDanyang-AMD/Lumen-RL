@@ -34,7 +34,7 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec 
 from megatron.core.models.gpt.gpt_model import GPTModel  # noqa: E402
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed  # noqa: E402
 
-from lumenrl.engine.training.dsv3_megatron_bridge import build_dsv3_config  # noqa: E402
+from lumenrl.engine.training.bridges.dsv3 import build_dsv3_config  # noqa: E402
 from lumenrl.engine.training.megatron_native_engine import (  # noqa: E402
     _pp_layer_offset,
     _to_global_key,

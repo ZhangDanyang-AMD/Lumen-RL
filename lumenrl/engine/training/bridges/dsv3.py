@@ -17,21 +17,31 @@ because two mappings are not guessable from the docs.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional
+from typing import Any, Iterable, Iterator, Mapping, Optional
 
 import torch
 import torch.nn.functional as F
 
-from lumenrl.engine.training.qwen3_megatron_bridge import Qwen3Dims
+from lumenrl.engine.training.bridges.core import (
+    TOP_LEVEL_RULES,
+    HfTensor,
+    WeightBridge,
+    gate_up,
+    rename,
+    routed_expert_rules,
+    strip_module_prefix,
+)
+from lumenrl.engine.training.bridges.gpt import GPTDims
 
 __all__ = [
     "DSV3Dims",
     "is_dsv3",
     "build_dsv3_dims",
     "build_dsv3_config",
-    "megatron_to_hf_dsv3",
-    "hf_to_dsv3_megatron",
-    "dsv3_router_bias_buffers",
+    "megatron_to_hf",
+    "hf_to_megatron",
+    "router_bias_buffers",
+    "DSV3",
 ]
 
 _ARCHITECTURES = {"DeepseekV3ForCausalLM"}
@@ -48,8 +58,8 @@ def is_dsv3(hf: Mapping[str, Any]) -> bool:
 
 
 @dataclass
-class DSV3Dims(Qwen3Dims):
-    """Qwen3Dims extended with the MLA and DeepSeek-MoE geometry.
+class DSV3Dims(GPTDims):
+    """GPTDims extended with the MLA and DeepSeek-MoE geometry.
 
     Follows ``DSV4Dims`` in extending the common dataclass so the shared
     non-attention parts of a bridge stay reusable.
@@ -73,9 +83,10 @@ def _require_q_lora_rank(hf: Mapping[str, Any]) -> int:
     dataclass default is ``512``), so coercing a missing value to ``0`` takes
     the LoRA branch and builds a rank-0 projection instead of the non-LoRA one.
     Independently, ``_ATTN_MAP`` has no entry for ``linear_q_proj`` and
-    ``megatron_to_hf_dsv3`` skips names it does not recognise -- so that
-    variant's q projection would vanish from the weight sync silently. Both
-    failures are quiet, which is why this refuses rather than coerces.
+    ``megatron_to_hf`` exports only names it has a rule for -- so that
+    variant's q projection would drop out of the weight sync with nothing but a
+    log warning. Both failures are quiet, which is why this refuses rather than
+    coerces.
     """
     q = hf.get("q_lora_rank")
     if q is None or int(q) <= 0:
@@ -320,15 +331,8 @@ def build_dsv3_config(
 #   * gate_proj and up_proj concatenate into ``linear_fc1`` along dim 0.
 #   * The router bias is a BUFFER, absent from ``named_parameters()``.
 
-import re  # noqa: E402
-
-_LAYER_RE = re.compile(r"^decoder\.layers\.(\d+)\.(.+)$")
-_GROUPED_EXPERT_RE = re.compile(r"^mlp\.experts\.linear_fc([12])\.weight(\d+)$")
-_SEQUENTIAL_EXPERT_RE = re.compile(
-    r"^mlp\.experts\.local_experts\.(\d+)\.linear_fc([12])\.weight$"
-)
-
-# Megatron attention name -> HF attention name. Straight renames only.
+# Megatron per-layer name -> HF per-layer name. Straight renames only; shared by
+# export (as rules) and load (inverted per layer type).
 _ATTN_MAP = {
     "self_attention.linear_q_down_proj.weight": "self_attn.q_a_proj.weight",
     "self_attention.linear_q_up_proj.weight": "self_attn.q_b_proj.weight",
@@ -351,93 +355,38 @@ _TOP_LEVEL_MAP = {
     "output_layer.weight": "lm_head.weight",
 }
 
+_LAYER = "decoder.layers.{L}."
+_HF = "model.layers.{L}."
 
-def _strip_module_prefix(name: str) -> str:
-    for pre in ("module.module.", "module."):
-        if name.startswith(pre):
-            return name[len(pre):]
-    return name
+DSV3 = WeightBridge("dsv3", [
+    *TOP_LEVEL_RULES,
+    *(rename(_LAYER + meg, _HF + hf) for meg, hf in _ATTN_MAP.items()),
+    gate_up(_LAYER + "mlp.linear_fc1.weight", _HF + "mlp."),
+    rename(_LAYER + "mlp.linear_fc2.weight", _HF + "mlp.down_proj.weight"),
+    gate_up(_LAYER + "mlp.shared_experts.linear_fc1.weight", _HF + "mlp.shared_experts."),
+    rename(_LAYER + "mlp.shared_experts.linear_fc2.weight", _HF + "mlp.shared_experts.down_proj.weight"),
+    *routed_expert_rules(),
+])
 
 
-def _split_gate_up(t: torch.Tensor):
-    """``linear_fc1`` is [gate; up] concatenated on dim 0."""
-    gate, up = t.chunk(2, dim=0)
-    return gate.contiguous(), up.contiguous()
+def megatron_to_hf(named_params: Iterable[tuple[str, torch.Tensor]]) -> Iterator[HfTensor]:
+    """Stream ``(hf_name, tensor)`` from GLOBAL-indexed Megatron named params.
 
-
-def megatron_to_hf_dsv3(named_params):
-    """Yield ``(hf_name, tensor)`` from GLOBAL-indexed Megatron named params.
-
-    Mirrors ``megatron_to_hf_moe``'s contract: expert params carry GLOBAL expert
-    indices and layers GLOBAL layer numbers, so EP/PP relabelling happens in the
-    caller. Router-bias buffers may be chained in by the caller; they are handled
-    here like any other named tensor.
+    Expert params carry GLOBAL expert indices and layers GLOBAL layer numbers,
+    so EP/PP relabelling happens in the caller. Router-bias buffers may be
+    chained in by the caller; they are handled like any other named tensor.
     """
-    for raw, t in named_params:
-        name = _strip_module_prefix(raw)
-
-        top = _TOP_LEVEL_MAP.get(name)
-        if top is not None:
-            yield top, t
-            continue
-
-        m = _LAYER_RE.match(name)
-        if not m:
-            continue
-        layer, rest = int(m.group(1)), m.group(2)
-        hp = f"model.layers.{layer}."
-
-        direct = _ATTN_MAP.get(rest)
-        if direct is not None:
-            yield hp + direct, t
-            continue
-
-        # dense MLP
-        if rest == "mlp.linear_fc1.weight":
-            gate, up = _split_gate_up(t)
-            yield hp + "mlp.gate_proj.weight", gate
-            yield hp + "mlp.up_proj.weight", up
-            continue
-        if rest == "mlp.linear_fc2.weight":
-            yield hp + "mlp.down_proj.weight", t
-            continue
-
-        # shared expert
-        if rest == "mlp.shared_experts.linear_fc1.weight":
-            gate, up = _split_gate_up(t)
-            yield hp + "mlp.shared_experts.gate_proj.weight", gate
-            yield hp + "mlp.shared_experts.up_proj.weight", up
-            continue
-        if rest == "mlp.shared_experts.linear_fc2.weight":
-            yield hp + "mlp.shared_experts.down_proj.weight", t
-            continue
-
-        # routed experts, grouped (``weight{E}``) or sequential (``local_experts.{E}``)
-        gm = _GROUPED_EXPERT_RE.match(rest)
-        if gm:
-            fc, e = gm.group(1), int(gm.group(2))
-        else:
-            sm = _SEQUENTIAL_EXPERT_RE.match(rest)
-            if not sm:
-                continue
-            e, fc = int(sm.group(1)), sm.group(2)
-        ep_ = f"{hp}mlp.experts.{e}."
-        if fc == "1":
-            gate, up = _split_gate_up(t)
-            yield ep_ + "gate_proj.weight", gate
-            yield ep_ + "up_proj.weight", up
-        else:
-            yield ep_ + "down_proj.weight", t
+    return DSV3.megatron_to_hf(named_params)
 
 
-def hf_to_dsv3_megatron(hf_state, d: DSV3Dims, use_grouped_mlp: bool = True):
-    """Inverse of :func:`megatron_to_hf_dsv3` at TP=PP=EP=1.
+def hf_to_megatron(hf_state, d: DSV3Dims, use_grouped_mlp: bool = True):
+    """Inverse of :func:`megatron_to_hf` at TP=PP=EP=1.
 
     Returns ``{megatron_name: tensor}``. Sharded topologies slice this the same
     way the Qwen3 path does; keeping the whole-model conversion separate from the
     sharding keeps both testable.
     """
-    hf = {_strip_module_prefix(k): v for k, v in hf_state.items()}
+    hf = {strip_module_prefix(k): v for k, v in hf_state.items()}
     meg: dict[str, torch.Tensor] = {}
 
     for meg_name, hf_name in _TOP_LEVEL_MAP.items():
@@ -497,7 +446,7 @@ def hf_to_dsv3_megatron(hf_state, d: DSV3Dims, use_grouped_mlp: bool = True):
     return meg
 
 
-def dsv3_router_bias_buffers(module):
+def router_bias_buffers(module) -> Iterator[HfTensor]:
     """Router bias lives in a buffer, so ``named_parameters()`` never yields it.
 
     DeepSeek's noaux_tc top-k reads this bias, so a rollout that never receives

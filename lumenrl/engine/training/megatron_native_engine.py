@@ -25,8 +25,19 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from lumenrl.core.protocol import DataProto
-from lumenrl.engine.training import dsv4_megatron_bridge as dsv4
 from lumenrl.engine.training.base_engine import EngineRegistry
+from lumenrl.engine.training.bridges import dsv4
+from lumenrl.engine.training.bridges.core import (
+    expert_local_index,
+    load_hf_safetensors,
+    relabel_expert_index,
+)
+from lumenrl.engine.training.bridges.gpt import (
+    hf_expert_fc1,
+    hf_expert_fc2,
+    hf_to_megatron,
+    non_expert_hf_to_megatron,
+)
 from lumenrl.engine.training.megatron_base_engine import (
     MegatronBaseEngine,
     moe_dispatcher_kwargs,
@@ -36,17 +47,6 @@ from lumenrl.engine.training.model_registry import (
     ModelCaps,
     hf_num_experts,
 )
-from lumenrl.engine.training.qwen3_megatron_bridge import (
-    hf_to_megatron,
-    load_hf_safetensors,
-)
-from lumenrl.engine.training.qwen3moe_megatron_bridge import (
-    _expert_local_index,
-    _non_expert_hf_to_megatron,
-    hf_expert_fc1,
-    hf_expert_fc2,
-)
-
 # Registers the ModelSpec entries on MODEL_REGISTRY. Imported for the
 # side effect; resolution order is defined there, not here.
 from lumenrl.engine.training import model_specs  # noqa: F401
@@ -277,7 +277,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
         # MLA head geometry, a 4-D hyper-connection residual stream, per-layer
         # heterogeneous attention, and hash routing on the first layers. It also
         # ships block-quantized FP8 weights that the HF-safetensors bridge cannot
-        # read. Everything DSv4-specific lives in ``dsv4_megatron_bridge``.
+        # read. Everything DSv4-specific lives in ``bridges.dsv4``.
         self._spec = MODEL_REGISTRY.resolve(hf, ec)
         if not self._caps.supports_dynamic_batch and self._dynamic_batch:
             # See ``_dsv4_check_topology``: DSv4 attention derives token positions
@@ -702,13 +702,13 @@ class MegatronNativeEngine(MegatronBaseEngine):
             )
         moe_ffn = d.moe_ffn
 
-        non_expert_full = _non_expert_hf_to_megatron(hf_state, d)
+        non_expert_full = non_expert_hf_to_megatron(hf_state, d)
         ssd = model.sharded_state_dict()
         offset = _pp_layer_offset(model)
 
         local_sd: dict = {}
         for name, p in model.named_parameters():
-            exp = _expert_local_index(name)
+            exp = expert_local_index(name)
             if exp is not None:
                 local_e, which_fc = exp
                 m = _LAYER_RE.search(name)
@@ -831,7 +831,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
         Non-expert params: TP all-gather (attention shards). Expert params:
         ETP-gather each local expert (fc1 gate/up column shards, fc2 row shards),
         then all-gather across the EP group with local->global expert relabel.
-        Expert names carry GLOBAL indices so ``megatron_to_hf_moe`` maps them
+        Expert names carry GLOBAL indices so ``bridges.gpt.megatron_to_hf`` maps them
         back to HF ``mlp.experts.{e}.*``.
 
         ⚠️ A generator, and every ``yield`` sits downstream of a collective, so
@@ -843,7 +843,6 @@ class MegatronNativeEngine(MegatronBaseEngine):
             ShardedTensor,
             ShardedTensorFactory,
         )
-        from lumenrl.engine.training.qwen3moe_megatron_bridge import _relabel_expert_index
 
         ep = mpu.get_expert_model_parallel_world_size()
         etp = mpu.get_expert_tensor_parallel_world_size()
@@ -860,7 +859,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
 
         for name, param in self.module.named_parameters():
             p = param.detach().contiguous()
-            exp = _expert_local_index(name)
+            exp = expert_local_index(name)
             if exp is None:
                 # ---- non-expert: TP all-gather ----
                 gkey = _to_global_key(name, offset)
@@ -924,13 +923,13 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 del g
             # ---- EP all-gather -> relabel local->global expert index ----
             if ep == 1:
-                yield _to_global_key(_relabel_expert_index(name, local_e), offset), p
+                yield _to_global_key(relabel_expert_index(name, local_e), offset), p
                 continue
             g = [torch.empty_like(p) for _ in range(ep)]
             dist.all_gather(g, p, group=ep_group)
             for j in range(ep):
                 global_e = j * num_local + local_e
-                gname = _to_global_key(_relabel_expert_index(name, global_e), offset)
+                gname = _to_global_key(relabel_expert_index(name, global_e), offset)
                 yield gname, g[j]
                 # The consumer has taken its copy. Dropping the reference here is
                 # what keeps the resident set at one all-gather instead of the

@@ -7,7 +7,7 @@ import pytest
 import torch
 
 import lumenrl.engine.training.megatron_lumen_dsv4_engine as dsv4_engine
-from lumenrl.engine.training.dsv4_megatron_bridge import DSV4Dims
+from lumenrl.engine.training.bridges.dsv4 import DSV4Dims
 from lumenrl.engine.training.megatron_engine import MegatronEngine
 from lumenrl.engine.training.megatron_lumen_dsv4_engine import (
     MegatronLumenDSV4Engine,
@@ -673,7 +673,7 @@ def test_get_per_tensor_param_pp_wraps_stream_with_default_barrier(monkeypatch):
         lockstep_calls.append((stream, synchronize))
         return original_lockstep_stream(stream, synchronize)
 
-    monkeypatch.setattr(dsv4_engine, "dsv4_megatron_to_hf", fake_convert)
+    monkeypatch.setattr(dsv4_engine.dsv4, "megatron_to_hf", fake_convert)
     monkeypatch.setattr(dsv4_engine, "_lockstep_stream", record_lockstep_stream)
     monkeypatch.setattr(dsv4_engine.dist, "barrier", fake_barrier)
     monkeypatch.setattr(
@@ -722,7 +722,7 @@ def test_get_per_tensor_param_pp_rejects_source_metadata_mismatch(monkeypatch):
         output[0] = value
         output[1] = (1, {})
 
-    monkeypatch.setattr(dsv4_engine, "dsv4_megatron_to_hf", fake_convert)
+    monkeypatch.setattr(dsv4_engine.dsv4, "megatron_to_hf", fake_convert)
     monkeypatch.setattr(
         dsv4_engine.dist,
         "get_process_group_ranks",
@@ -769,7 +769,7 @@ def test_get_per_tensor_param_pp_waits_for_broadcast_before_yield(monkeypatch):
         events.append(("broadcast", async_op))
         return FakeWork() if async_op else None
 
-    monkeypatch.setattr(dsv4_engine, "dsv4_megatron_to_hf", fake_convert)
+    monkeypatch.setattr(dsv4_engine.dsv4, "megatron_to_hf", fake_convert)
     monkeypatch.setattr(
         dsv4_engine.dist,
         "get_process_group_ranks",
@@ -801,7 +801,7 @@ def test_get_per_tensor_param_pp1_leaves_stream_unwrapped(monkeypatch):
     def fake_convert(mapping, *args, **kwargs):
         yield "tensor", torch.ones(1)
 
-    monkeypatch.setattr(dsv4_engine, "dsv4_megatron_to_hf", fake_convert)
+    monkeypatch.setattr(dsv4_engine.dsv4, "megatron_to_hf", fake_convert)
     monkeypatch.setattr(
         dsv4_engine,
         "_lockstep_stream",

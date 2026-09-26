@@ -28,7 +28,7 @@ from lumenrl.algorithms.loss_functions import (
 from lumenrl.core.protocol import DataProto
 from lumenrl.core.types import AlgorithmName
 from lumenrl.engine.training.base_engine import BaseEngine
-from lumenrl.engine.training.qwen3_megatron_bridge import Qwen3Dims
+from lumenrl.engine.training.bridges.gpt import GPTDims
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LUMENRL_LOGGING_LEVEL", "INFO"))
@@ -148,7 +148,7 @@ class MegatronBaseEngine(BaseEngine):
         self._ddp: Any = None                          # Megatron DistributedDataParallel wrapper
         self.optimizer: Any = None                     # Megatron distributed optimizer
         self.lr_scheduler: Any = None                  # Megatron OptimizerParamScheduler
-        self._dims: Qwen3Dims | None = None
+        self._dims: GPTDims | None = None
         self.mode: str | None = None
 
     # -- offload (Ray path: never offload) --
