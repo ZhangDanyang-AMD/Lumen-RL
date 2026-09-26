@@ -121,8 +121,8 @@ python3 -m pip install -v . --no-build-isolation'
 > **Never `pip install transformer_engine` from PyPI.** That installs the NVIDIA
 > build, which fails on import with an undefined symbol.
 
-> Do not install `megatron-bridge`. The Qwen3 HF <-> Megatron conversion is handled by
-> `lumenrl/engine/training/qwen3_megatron_bridge.py`.
+> Do not install `megatron-bridge`. The HF <-> Megatron weight conversion is handled by
+> `lumenrl/engine/training/bridges/`.
 
 ---
 
