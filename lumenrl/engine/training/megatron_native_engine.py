@@ -19,6 +19,9 @@ import json
 import logging
 import math
 import os
+from collections import deque
+from collections.abc import Iterator
+from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
@@ -190,6 +193,37 @@ def _to_global_key(key: str, offset: int) -> str:
     if not m:
         return key
     return f"{key[:m.start(2)]}{int(m.group(2)) + offset}{key[m.end(2):]}"
+
+
+@dataclass(frozen=True)
+class StageOutput:
+    """One tensor the stage gather will emit, described before any collective.
+
+    Ownership fields (``pp_stage``, ``ep_owner``, shard geometry) are unused by
+    the streaming export itself. They are the G11 manifest in embryo.
+    """
+
+    name: str
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    pp_stage: int
+    ep_owner: int | None
+    local_e: int | None
+    tp_split_dim: int | None
+    tp_size: int
+    etp_size: int
+    gate_up: bool
+
+
+@dataclass(frozen=True)
+class StageRecipe:
+    """How to gather one local Megatron parameter, and what comes out."""
+
+    local_name: str
+    kind: str
+    outputs: tuple[StageOutput, ...]
+    split_dim: int | None = None
+    which_fc: str | None = None
 
 
 class MegatronNativeEngine(MegatronBaseEngine):
@@ -747,96 +781,12 @@ class MegatronNativeEngine(MegatronBaseEngine):
         return local_sd
 
     # ---- weight sync: Megatron(TE) -> full (TP+PP gathered) named tensors ----
-    def _tp_gather_named_params(self) -> dict:
-        """All-gather this stage's params across the TP group -> full (unsharded-TP)
-        tensors keyed by GLOBAL layer name. Inverse of the TP part of
-        ``_shard_hf_for_mp`` (fc1 gate/up handled explicitly)."""
-        from megatron.core import parallel_state as mpu
-        from megatron.core.dist_checkpointing.mapping import (
-            ShardedTensor,
-            ShardedTensorFactory,
-        )
+    def _stage_plan(self) -> list[StageRecipe]:
+        """Describe this PP stage's gathered tensors without communicating.
 
-        tp = mpu.get_tensor_model_parallel_world_size()
-        ssd = self.module.sharded_state_dict()
-        offset = _pp_layer_offset(self.module)
-        ffn = self._dims.ffn
-        out: dict = {}
-        group = mpu.get_tensor_model_parallel_group() if tp > 1 else None
-        for name, p in self.module.named_parameters():
-            p = p.detach().contiguous()
-            gkey = _to_global_key(name, offset)
-            if tp == 1:
-                out[gkey] = p
-                continue
-            gathered = [torch.empty_like(p) for _ in range(tp)]
-            dist.all_gather(gathered, p, group=group)
-            st = ssd.get(name)
-            if isinstance(st, ShardedTensorFactory):
-                shard = ffn // tp
-                gate = torch.cat([g[:shard] for g in gathered], dim=0)
-                up = torch.cat([g[shard:] for g in gathered], dim=0)
-                full = torch.cat([gate, up], dim=0)
-            elif isinstance(st, ShardedTensor):
-                gshape = tuple(st.global_shape[st.prepend_axis_num:])
-                lshape = tuple(st.local_shape)
-                split_dim = next(
-                    (d for d in range(len(lshape)) if lshape[d] != gshape[d]), None
-                )
-                full = gathered[0] if split_dim is None else torch.cat(gathered, dim=split_dim)
-            else:
-                full = gathered[0]
-            out[gkey] = full
-        return out
-
-    def _full_megatron_named_params(self):
-        """Reconstruct the COMPLETE model as (global_name, tensor) on every rank.
-
-        Each colocated rollout replica is TP=1/PP=1 and needs the whole model, so
-        a TP/PP>1 actor rank must gather across both axes: first all-gather within
-        the TP group (``_tp_gather_named_params``), then broadcast each stage's
-        (disjoint) params across the PP group so every rank ends up holding all
-        layers. Must be called concurrently on all actors (collective)."""
-        from megatron.core import parallel_state as mpu
-
-        stage_params = self._tp_gather_named_params()
-        pp = mpu.get_pipeline_model_parallel_world_size()
-        if pp == 1:
-            return list(stage_params.items())
-
-        pp_group = mpu.get_pipeline_model_parallel_group()
-        pp_rank = mpu.get_pipeline_model_parallel_rank()
-        # exchange (key, shape, dtype) metadata so every rank joins each broadcast.
-        # The dtype travels as a torch.dtype: all_gather_object pickles, and torch
-        # dtypes pickle to the same singletons, so there is no name-keyed map that
-        # can be missing an entry. See the MoE twin of this loop.
-        meta_local = [(k, tuple(v.shape), v.dtype) for k, v in stage_params.items()]
-        gathered_meta: list = [None] * pp
-        dist.all_gather_object(gathered_meta, meta_local, group=pp_group)
-        out: dict = {}
-        for src in range(pp):
-            src_global = dist.get_global_rank(pp_group, src)
-            for (k, shape, dtype) in gathered_meta[src]:
-                if src == pp_rank:
-                    t = stage_params[k].contiguous()
-                else:
-                    t = torch.empty(shape, dtype=dtype, device="cuda")
-                dist.broadcast(t, src=src_global, group=pp_group)
-                out[k] = t
-        return list(out.items())
-
-    def _moe_stage_named_params(self):
-        """Yield this PP stage's params as (global_name, tensor), gathered.
-
-        Non-expert params: TP all-gather (attention shards). Expert params:
-        ETP-gather each local expert (fc1 gate/up column shards, fc2 row shards),
-        then all-gather across the EP group with local->global expert relabel.
-        Expert names carry GLOBAL indices so ``bridges.gpt.megatron_to_hf`` maps them
-        back to HF ``mlp.experts.{e}.*``.
-
-        ⚠️ A generator, and every ``yield`` sits downstream of a collective, so
-        the caller MUST drain it on every rank. Abandoning it part-way leaves
-        the ranks that kept going waiting in an all-gather that never completes.
+        Shapes come from local shards, ``sharded_state_dict()`` global shapes,
+        and the TP/ETP/EP factors. Dense models take only the non-expert
+        recipes (no name matches the expert pattern).
         """
         from megatron.core import parallel_state as mpu
         from megatron.core.dist_checkpointing.mapping import (
@@ -844,76 +794,172 @@ class MegatronNativeEngine(MegatronBaseEngine):
             ShardedTensorFactory,
         )
 
+        tp = mpu.get_tensor_model_parallel_world_size()
         ep = mpu.get_expert_model_parallel_world_size()
         etp = mpu.get_expert_tensor_parallel_world_size()
-        tp = mpu.get_tensor_model_parallel_world_size()
-        # Not ``self._dims.num_experts``: DSv4 has no Qwen3-shaped dims, and the
-        # two agree wherever both exist.
-        num_local = self._num_experts // ep
-
+        pp_rank = mpu.get_pipeline_model_parallel_rank()
+        num_local = self._num_experts // ep if ep else 0
         ssd = self.module.sharded_state_dict()
         offset = _pp_layer_offset(self.module)
-        tp_group = mpu.get_tensor_model_parallel_group() if tp > 1 else None
-        etp_group = mpu.get_expert_tensor_parallel_group() if etp > 1 else None
-        ep_group = mpu.get_expert_model_parallel_group() if ep > 1 else None
-
+        recipes: list[StageRecipe] = []
         for name, param in self.module.named_parameters():
-            p = param.detach().contiguous()
+            p = param.detach()
+            dtype = p.dtype
+            gkey = _to_global_key(name, offset)
             exp = expert_local_index(name)
             if exp is None:
-                # ---- non-expert: TP all-gather ----
-                gkey = _to_global_key(name, offset)
                 if tp == 1:
-                    yield gkey, p
+                    recipes.append(StageRecipe(
+                        local_name=name, kind="pass",
+                        outputs=(StageOutput(
+                            name=gkey, shape=tuple(p.shape), dtype=dtype,
+                            pp_stage=pp_rank, ep_owner=None, local_e=None,
+                            tp_split_dim=None, tp_size=tp, etp_size=etp,
+                            gate_up=False,
+                        ),),
+                    ))
                     continue
-                gathered = [torch.empty_like(p) for _ in range(tp)]
-                dist.all_gather(gathered, p, group=tp_group)
                 st = ssd.get(name)
                 if isinstance(st, ShardedTensorFactory):
-                    # SwiGLU fc1: Megatron fuses gate and up along dim 0, so each
-                    # rank holds [gate_shard ; up_shard] and a plain cat would
-                    # interleave them into [gate0, up0, gate1, up1]. Separate the
-                    # halves before concatenating. A factory is exactly how
-                    # Megatron marks that the checkpoint layout differs from the
-                    # runtime one, which is why it needs its own branch and why
-                    # matching only ShardedTensor silently shipped gathered[0]:
-                    # half-width shared-expert weights that vLLM rejected with
-                    # "load_merged_column_weight ... start out of range".
-                    #
-                    # ``p.shape[0] // 2`` rather than the dense path's
-                    # ``self._dims.ffn // tp``: same value, but DSv4 has no
-                    # Qwen3-shaped dims and leaves ``_dims`` None.
-                    sh = p.shape[0] // 2
-                    gate = torch.cat([g[:sh] for g in gathered], dim=0)
-                    up = torch.cat([g[sh:] for g in gathered], dim=0)
-                    yield gkey, torch.cat([gate, up], dim=0)
+                    shape = list(p.shape)
+                    shape[0] *= tp
+                    recipes.append(StageRecipe(
+                        local_name=name, kind="tp_factory",
+                        outputs=(StageOutput(
+                            name=gkey, shape=tuple(shape), dtype=dtype,
+                            pp_stage=pp_rank, ep_owner=None, local_e=None,
+                            tp_split_dim=0, tp_size=tp, etp_size=etp,
+                            gate_up=True,
+                        ),),
+                    ))
                 elif isinstance(st, ShardedTensor):
                     gshape = tuple(st.global_shape[st.prepend_axis_num:])
                     lshape = tuple(st.local_shape)
                     split_dim = next(
-                        (dd for dd in range(len(lshape)) if lshape[dd] != gshape[dd]), None
+                        (d for d in range(len(lshape)) if lshape[d] != gshape[d]),
+                        None,
                     )
-                    # split_dim None means genuinely replicated across TP. That is
-                    # common here and NOT a red flag: DSv4 replicates wq_a, wkv and
-                    # the indexer projections while still carrying Megatron's
-                    # ``tensor_model_parallel`` marker, so the marker cannot be used
-                    # to decide this -- only the shard metadata can.
-                    full = gathered[0] if split_dim is None else torch.cat(gathered, dim=split_dim)
-                    assert tuple(full.shape) == gshape, (
-                        f"TP gather rebuilt {name} as {tuple(full.shape)}, but its "
-                        f"shard metadata says the full tensor is {gshape}"
-                    )
-                    yield gkey, full
+                    recipes.append(StageRecipe(
+                        local_name=name, kind="tp_shard",
+                        split_dim=split_dim,
+                        outputs=(StageOutput(
+                            name=gkey, shape=gshape, dtype=dtype,
+                            pp_stage=pp_rank, ep_owner=None, local_e=None,
+                            tp_split_dim=split_dim, tp_size=tp, etp_size=etp,
+                            gate_up=False,
+                        ),),
+                    ))
                 else:
-                    yield gkey, gathered[0]
+                    recipes.append(StageRecipe(
+                        local_name=name, kind="tp_rep",
+                        outputs=(StageOutput(
+                            name=gkey, shape=tuple(p.shape), dtype=dtype,
+                            pp_stage=pp_rank, ep_owner=None, local_e=None,
+                            tp_split_dim=None, tp_size=tp, etp_size=etp,
+                            gate_up=False,
+                        ),),
+                    ))
                 continue
 
-            # ---- expert: ETP gather -> full local expert tensor ----
             local_e, which_fc = exp
+            shape = list(p.shape)
+            split_dim = 0 if which_fc == "1" else 1
+            if etp > 1:
+                shape[split_dim] *= etp
+            out_shape = tuple(shape)
+            outputs = []
+            for j in range(max(ep, 1)):
+                global_e = j * num_local + local_e
+                outputs.append(StageOutput(
+                    name=_to_global_key(relabel_expert_index(name, global_e), offset),
+                    shape=out_shape, dtype=dtype,
+                    pp_stage=pp_rank, ep_owner=j if ep > 1 else 0,
+                    local_e=local_e, tp_split_dim=split_dim,
+                    tp_size=tp, etp_size=etp, gate_up=(which_fc == "1"),
+                ))
+            recipes.append(StageRecipe(
+                local_name=name, kind="expert",
+                outputs=tuple(outputs), which_fc=which_fc,
+            ))
+        return recipes
+
+    def _stage_metadata(
+        self, recipes: list[StageRecipe] | None = None,
+    ) -> list[tuple[str, tuple[int, ...], torch.dtype]]:
+        """Flattened ``(name, shape, dtype)`` in the order ``_stage_named_params`` yields."""
+        return [
+            (o.name, o.shape, o.dtype)
+            for rec in (recipes if recipes is not None else self._stage_plan())
+            for o in rec.outputs
+        ]
+
+    def _stage_named_params(self, recipes: list[StageRecipe] | None = None):
+        """Yield this PP stage's params as (global_name, tensor), gathered.
+
+        Non-expert params: TP all-gather (attention shards). Expert params:
+        ETP-gather each local expert (fc1 gate/up column shards, fc2 row shards),
+        then all-gather across the EP group with local->global expert relabel.
+        Expert names carry GLOBAL indices so ``bridges.gpt.megatron_to_hf`` maps
+        them back to HF ``mlp.experts.{e}.*``.
+
+        ⚠️ A generator, and every ``yield`` sits downstream of a collective, so
+        the caller MUST drain it on every rank. Abandoning it part-way leaves
+        the ranks that kept going waiting in an all-gather that never completes.
+        """
+        from megatron.core import parallel_state as mpu
+
+        if recipes is None:
+            recipes = self._stage_plan()
+        tp = mpu.get_tensor_model_parallel_world_size()
+        ep = mpu.get_expert_model_parallel_world_size()
+        etp = mpu.get_expert_tensor_parallel_world_size()
+        tp_group = mpu.get_tensor_model_parallel_group() if tp > 1 else None
+        etp_group = mpu.get_expert_tensor_parallel_group() if etp > 1 else None
+        ep_group = mpu.get_expert_model_parallel_group() if ep > 1 else None
+
+        def _check(got_name, tensor, expected: StageOutput) -> None:
+            got = (got_name, tuple(tensor.shape), tensor.dtype)
+            want = (expected.name, expected.shape, expected.dtype)
+            if got != want:
+                raise AssertionError(
+                    f"stage plan predicted {want}, gather produced {got}"
+                )
+
+        for recipe, (name, param) in zip(
+            recipes, self.module.named_parameters(), strict=True,
+        ):
+            if recipe.local_name != name:
+                raise AssertionError(
+                    f"stage plan name {recipe.local_name!r} != parameter {name!r}"
+                )
+            p = param.detach().contiguous()
+            if recipe.kind == "pass":
+                _check(recipe.outputs[0].name, p, recipe.outputs[0])
+                yield recipe.outputs[0].name, p
+                continue
+            if recipe.kind in ("tp_factory", "tp_shard", "tp_rep"):
+                gathered = [torch.empty_like(p) for _ in range(tp)]
+                dist.all_gather(gathered, p, group=tp_group)
+                if recipe.kind == "tp_factory":
+                    sh = p.shape[0] // 2
+                    gate = torch.cat([g[:sh] for g in gathered], dim=0)
+                    up = torch.cat([g[sh:] for g in gathered], dim=0)
+                    full = torch.cat([gate, up], dim=0)
+                elif recipe.kind == "tp_shard":
+                    full = (
+                        gathered[0] if recipe.split_dim is None
+                        else torch.cat(gathered, dim=recipe.split_dim)
+                    )
+                else:
+                    full = gathered[0]
+                _check(recipe.outputs[0].name, full, recipe.outputs[0])
+                yield recipe.outputs[0].name, full
+                continue
+
             if etp > 1:
                 g = [torch.empty_like(p) for _ in range(etp)]
                 dist.all_gather(g, p, group=etp_group)
-                if which_fc == "1":
+                if recipe.which_fc == "1":
                     sh = p.shape[0] // 2
                     gate = torch.cat([x[:sh] for x in g], dim=0)
                     up = torch.cat([x[sh:] for x in g], dim=0)
@@ -921,20 +967,95 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 else:
                     p = torch.cat(g, dim=1)
                 del g
-            # ---- EP all-gather -> relabel local->global expert index ----
-            if ep == 1:
-                yield _to_global_key(relabel_expert_index(name, local_e), offset), p
+            if ep <= 1:
+                _check(recipe.outputs[0].name, p, recipe.outputs[0])
+                yield recipe.outputs[0].name, p
                 continue
             g = [torch.empty_like(p) for _ in range(ep)]
             dist.all_gather(g, p, group=ep_group)
-            for j in range(ep):
-                global_e = j * num_local + local_e
-                gname = _to_global_key(relabel_expert_index(name, global_e), offset)
-                yield gname, g[j]
-                # The consumer has taken its copy. Dropping the reference here is
-                # what keeps the resident set at one all-gather instead of the
-                # whole model: with EP=32 this list alone is 32x the local shard.
+            for j, expected in enumerate(recipe.outputs):
+                _check(expected.name, g[j], expected)
+                yield expected.name, g[j]
                 g[j] = None
+
+    def _full_named_params(self) -> Iterator[tuple[str, torch.Tensor]]:
+        """Stream the full model as (global_name, tensor) on every rank.
+
+        At PP=1 this is the stage gather. At PP>1 each rank publishes metadata
+        (no gather), then stages take turns broadcasting one tensor at a time.
+        A lookahead queue of this stage's gathered tensors, capped by
+        ``LUMENRL_SYNC_PREFETCH_MB`` (default 1024; 0 disables), is filled
+        while receiving earlier stages and topped up before each of this
+        stage's own broadcasts, so gathers are queued on the GPU ahead of the
+        consumer (e.g. while it waits on a bucket ack). Refills depend only on
+        this stage's tensor sizes, so every rank in the stage issues the same
+        collectives in the same order.
+        """
+        from megatron.core import parallel_state as mpu
+
+        pp = mpu.get_pipeline_model_parallel_world_size()
+        if pp == 1:
+            yield from self._stage_named_params()
+            return
+
+        pp_group = mpu.get_pipeline_model_parallel_group()
+        pp_rank = mpu.get_pipeline_model_parallel_rank()
+        recipes = self._stage_plan()
+        meta_local = self._stage_metadata(recipes)
+        gathered_meta: list = [None] * pp
+        dist.all_gather_object(gathered_meta, meta_local, group=pp_group)
+
+        budget = int(os.environ.get("LUMENRL_SYNC_PREFETCH_MB", "1024") or 0) << 20
+        own = self._stage_named_params(recipes)
+        queue: deque[tuple[str, torch.Tensor]] = deque()
+        queued_bytes = 0
+        own_exhausted = False
+
+        def _prefetch() -> None:
+            nonlocal queued_bytes, own_exhausted
+            if budget <= 0 or own_exhausted:
+                return
+            while queued_bytes < budget:
+                try:
+                    item = next(own)
+                except StopIteration:
+                    own_exhausted = True
+                    return
+                queue.append(item)
+                queued_bytes += item[1].numel() * item[1].element_size()
+
+        for src in range(pp):
+            src_global = dist.get_global_rank(pp_group, src)
+            if src != pp_rank:
+                _prefetch()
+            for (k, shape, dtype) in gathered_meta[src]:
+                if src == pp_rank:
+                    if queue:
+                        name, t = queue.popleft()
+                        queued_bytes -= t.numel() * t.element_size()
+                    else:
+                        name, t = next(own)
+                    _prefetch()
+                    t = t.contiguous()
+                    if (name, tuple(t.shape), t.dtype) != (k, tuple(shape), dtype):
+                        raise AssertionError(
+                            f"PP owner produced {(name, tuple(t.shape), t.dtype)}, "
+                            f"metadata said {(k, tuple(shape), dtype)}"
+                        )
+                else:
+                    t = torch.empty(shape, dtype=dtype, device="cuda")
+                dist.broadcast(t, src=src_global, group=pp_group)
+                yield k, t
+
+    def _full_megatron_named_params(self):
+        """Reconstruct the COMPLETE model as (global_name, tensor) on every rank.
+
+        Each colocated rollout replica is TP=1/PP=1 and needs the whole model, so
+        a TP/PP>1 actor rank must gather across both axes: first all-gather within
+        the TP group, then broadcast each stage's (disjoint) params across the PP
+        group. Streams one tensor at a time. Must be called concurrently on all
+        actors (collective)."""
+        yield from self._full_named_params()
 
     def _full_megatron_named_params_moe(self):
         """Reconstruct the COMPLETE MoE model as (global_name, tensor) on every rank.
@@ -947,38 +1068,9 @@ class MegatronNativeEngine(MegatronBaseEngine):
         standalone probe doing the same step, because a probe never syncs
         weights. See the handoff's "the 89 GB" section.
 
-        ⚠️ Collective, and lazily so: see ``_moe_stage_named_params``. Drain it.
+        ⚠️ Collective, and lazily so: drain it on every rank.
         """
-        from megatron.core import parallel_state as mpu
-
-        pp = mpu.get_pipeline_model_parallel_world_size()
-        if pp == 1:
-            yield from self._moe_stage_named_params()
-            return
-
-        # ---- PP broadcast: every rank ends up with all stages' params ----
-        # Still materializes the local stage, because a rank has to publish the
-        # shapes it owns before any rank can join the broadcasts.
-        stage: dict = dict(self._moe_stage_named_params())
-        pp_group = mpu.get_pipeline_model_parallel_group()
-        pp_rank = mpu.get_pipeline_model_parallel_rank()
-        # The dtype travels as a torch.dtype, not as its name: all_gather_object
-        # pickles, and torch dtypes pickle to the same singletons. A name-keyed
-        # map here used to cover only the three float types and died with
-        # KeyError: 'torch.int32' on the first PP=2 weight sync -- a failure mode
-        # that only exists if the map can be incomplete.
-        meta_local = [(k, tuple(v.shape), v.dtype) for k, v in stage.items()]
-        gathered_meta: list = [None] * pp
-        dist.all_gather_object(gathered_meta, meta_local, group=pp_group)
-        for src in range(pp):
-            src_global = dist.get_global_rank(pp_group, src)
-            for (k, shape, dtype) in gathered_meta[src]:
-                if src == pp_rank:
-                    t = stage.pop(k).contiguous()
-                else:
-                    t = torch.empty(shape, dtype=dtype, device="cuda")
-                dist.broadcast(t, src=src_global, group=pp_group)
-                yield k, t
+        yield from self._full_named_params()
 
     def _router_bias_buffers(self):
         """The aux-loss-free load-balancing bias, which is a buffer, not a param.

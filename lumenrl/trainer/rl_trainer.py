@@ -858,10 +858,24 @@ class RLTrainer:
         # senders first turns any receiver-side error into a silent hang that
         # only a stack dump explains. Taking whichever finishes first re-raises
         # the real exception within a bucket's time.
+        send_set = set(send)
+        send_results: list[dict] = []
         pending = list(send) + list(recv)
         while pending:
             done, pending = ray.wait(pending, num_returns=1)
-            ray.get(done)
+            val = ray.get(done[0])
+            if done[0] in send_set and isinstance(val, dict):
+                send_results.append(val)
+        if send_results:
+            def _max_metric(key: str) -> float:
+                return max(float(r.get(key, 0.0) or 0.0) for r in send_results)
+
+            self._last_weight_sync_metrics = {
+                "timing/weight_sync_gather_s": _max_metric("gather_s"),
+                "timing/weight_sync_send_s": _max_metric("send_s"),
+                "mem/weight_sync_peak_alloc_gb": _max_metric("peak_alloc_gb"),
+                "mem/weight_sync_peak_extra_gb": _max_metric("peak_extra_gb"),
+            }
         # 3) wake KV cache so the next rollout can run.
         if sleeping:
             rollout_engine.wake(tags=["kv_cache"])
