@@ -1601,8 +1601,10 @@ class LumenActorWorker(BaseWorker):
         return {
             "gather_s": gather_s,
             "send_s": max(0.0, total_s - gather_s),
+            "total_s": total_s,
             "peak_alloc_gb": peak_alloc / gb,
             "peak_extra_gb": max(0.0, peak_alloc - alloc0) / gb,
+            **{f"sender_{k}": float(v) for k, v in sender.stats.items()},
         }
 
     def cleanup(self) -> None:

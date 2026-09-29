@@ -860,22 +860,56 @@ class RLTrainer:
         # the real exception within a bucket's time.
         send_set = set(send)
         send_results: list[dict] = []
+        recv_results: list[dict] = []
         pending = list(send) + list(recv)
         while pending:
             done, pending = ray.wait(pending, num_returns=1)
             val = ray.get(done[0])
-            if done[0] in send_set and isinstance(val, dict):
-                send_results.append(val)
+            if done[0] in send_set:
+                if isinstance(val, dict):
+                    send_results.append(val)
+            elif isinstance(val, list):
+                recv_results.extend(r for r in val if isinstance(r, dict) and "total_s" in r)
         if send_results:
-            def _max_metric(key: str) -> float:
-                return max(float(r.get(key, 0.0) or 0.0) for r in send_results)
+            def _max_metric(rows: list[dict], key: str) -> float:
+                return max(float(r.get(key, 0.0) or 0.0) for r in rows)
 
-            self._last_weight_sync_metrics = {
-                "timing/weight_sync_gather_s": _max_metric("gather_s"),
-                "timing/weight_sync_send_s": _max_metric("send_s"),
-                "mem/weight_sync_peak_alloc_gb": _max_metric("peak_alloc_gb"),
-                "mem/weight_sync_peak_extra_gb": _max_metric("peak_extra_gb"),
+            metrics = {
+                "timing/weight_sync_gather_s": _max_metric(send_results, "gather_s"),
+                "timing/weight_sync_send_s": _max_metric(send_results, "send_s"),
+                "mem/weight_sync_peak_alloc_gb": _max_metric(send_results, "peak_alloc_gb"),
+                "mem/weight_sync_peak_extra_gb": _max_metric(send_results, "peak_extra_gb"),
             }
+            for key in ("setup_s", "sync_s", "ack_s", "cleanup_s"):
+                metrics[f"timing/weight_sync_sender_{key}"] = _max_metric(
+                    send_results, f"sender_{key}",
+                )
+            from lumenrl.engine.inference.bucketed_weight_transfer import _debug_enabled
+
+            debug = _debug_enabled()
+            recv_keys = ["wait_s", "load_weights_s"]
+            if debug:
+                recv_keys += ["setup_s", "load_s", "route_s", "sync_s", "cleanup_s",
+                              "post_s", "reset_prefix_cache_s", "total_s"]
+            if recv_results:
+                for key in recv_keys:
+                    metrics[f"timing/weight_sync_recv_{key}"] = _max_metric(recv_results, key)
+            self._last_weight_sync_metrics = metrics
+
+            if debug:
+                def _fmt(r: dict) -> str:
+                    return " ".join(
+                        f"{k}={v:.3f}" if isinstance(v, float) else f"{k}={v}"
+                        for k, v in sorted(r.items())
+                        if isinstance(v, (int, float))
+                    )
+
+                logger.info(
+                    "weight_sync breakdown v%d\n  send: %s\n  recv: %s",
+                    version,
+                    "\n        ".join(_fmt(r) for r in send_results),
+                    "\n        ".join(_fmt(r) for r in recv_results),
+                )
         # 3) wake KV cache so the next rollout can run.
         if sleeping:
             rollout_engine.wake(tags=["kv_cache"])
