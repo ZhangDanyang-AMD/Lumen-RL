@@ -1,0 +1,1017 @@
+purpose: benchmark-sft-eval-100-no-overlap
+requests:
+- id: bench-triton-gfx942-gemm_gelu-000
+  recognized_contract: '{"activation": "gelu", "dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "TN", "operator": "gemm_gelu", "shape": {"K": 1024, "M": 16, "N":
+    1024}}'
+  request: 'Generate a standalone TRITON gemm_gelu kernel for AMD gfx942. Frozen contract JSON: {"activation": "gelu", "dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout":
+    "TN", "operator": "gemm_gelu", "shape": {"K": 1024, "M": 16, "N": 1024}}. Independent oracle JSON: {"method": "F.linear then F.gelu", "tier": "pure_torch"}. Implement independently; do not call AITER,
+    CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 8ee7747005d4f6d0aa2780686fd23e2467f5f12e16c0ffe18892abf5f80434f7
+    source_candidate_id: cand-a16w16-gelu-bf16
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-scaled_quant_gemm_gelu_bias-001
+  recognized_contract: '{"activation": "gelu", "bias": true, "dtype": {"accum": "fp32", "input": "fp8_e4m3fnuz", "output": "bf16", "weight": "fp8_e4m3fnuz"}, "layout": "TN", "operator": "scaled_quant_gemm_gelu_bias",
+    "shape": {"K": 768, "M": 32, "N": 3072}}'
+  request: 'Generate a standalone TRITON scaled_quant_gemm_gelu_bias kernel for AMD gfx942. Frozen contract JSON: {"activation": "gelu", "bias": true, "dtype": {"accum": "fp32", "input": "fp8_e4m3fnuz",
+    "output": "bf16", "weight": "fp8_e4m3fnuz"}, "layout": "TN", "operator": "scaled_quant_gemm_gelu_bias", "shape": {"K": 768, "M": 32, "N": 3072}}. Independent oracle JSON: {"method": "fp32 dequant linear
+    plus bias and gelu", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require
+    compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: c2e270859cc3f5f168379831582da85ab8aa10ad9f3b74f4aa3f2b0990616d0d
+    source_candidate_id: cand-fp8-a8w8-gelu-bias-gfx942
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-batched_scaled_quant_gemm-002
+  recognized_contract: '{"dtype": {"accum": "int32", "input": "int8", "output": "bf16", "weight": "int8"}, "layout": "bmn", "operator": "batched_scaled_quant_gemm", "scale": {"activation": "per_batch_row",
+    "weight": "per_batch_column"}, "shape": {"B": 16, "K": 8192, "M": 128, "N": 1280}}'
+  request: 'Generate a standalone TRITON batched_scaled_quant_gemm kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"accum": "int32", "input": "int8", "output": "bf16", "weight": "int8"}, "layout":
+    "bmn", "operator": "batched_scaled_quant_gemm", "scale": {"activation": "per_batch_row", "weight": "per_batch_column"}, "shape": {"B": 16, "K": 8192, "M": 128, "N": 1280}}. Independent oracle JSON:
+    {"method": "per-batch fp32 linear with scales", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic
+    GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 86fc3e5cde1ce0e48ea69d4fa7cd8b7552ff930d69a3e6289a36646feb6cdf66
+    source_candidate_id: cand-batched-int8-a8w8
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-fused_add_rms_norm_pad-003
+  recognized_contract: '{"dtype": {"input": "bf16", "output": "bf16", "residual": "bf16"}, "layout": "contiguous", "operator": "fused_add_rms_norm_pad", "pad_to_multiple": 256, "shape": {"M": 256, "N":
+    2880}}'
+  request: 'Generate a standalone TRITON fused_add_rms_norm_pad kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"input": "bf16", "output": "bf16", "residual": "bf16"}, "layout": "contiguous", "operator":
+    "fused_add_rms_norm_pad", "pad_to_multiple": 256, "shape": {"M": 256, "N": 2880}}. Independent oracle JSON: {"method": "fp32 add and RMS norm then pad", "tier": "pure_torch"}. Implement independently;
+    do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 8c47b8786d8452a1de8d4bde4584fee02b1c64f57d7c729cd3bbf36a1c8a92df
+    source_candidate_id: cand-triton-fused-add-rmsnorm-pad
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-fused_add_layer_norm-004
+  recognized_contract: '{"dtype": {"bias": "bf16", "input": "bf16", "output": "bf16", "residual": "bf16", "weight": "bf16"}, "layout": "contiguous", "operator": "fused_add_layer_norm", "shape": {"M": 32,
+    "N": 4096}}'
+  request: 'Generate a standalone TRITON fused_add_layer_norm kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"bias": "bf16", "input": "bf16", "output": "bf16", "residual": "bf16", "weight": "bf16"},
+    "layout": "contiguous", "operator": "fused_add_layer_norm", "shape": {"M": 32, "N": 4096}}. Independent oracle JSON: {"method": "residual add then F.layer_norm", "tier": "pure_torch"}. Implement independently;
+    do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 832ed19226a34a033f7d946dea87501acd9b322b363f4eee07203e8cf0a31a30
+    source_candidate_id: cand-hip-fused-add-layernorm
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-gated_rmsnorm_fp8_per_token_quant-005
+  recognized_contract: '{"dtype": {"input": "bf16", "output": "fp8_arch_specific", "scale": "fp32_per_token"}, "layout": "token_head_dim", "operator": "gated_rmsnorm_fp8_per_token_quant", "shape": {"head_dim":
+    128, "heads": 32, "tokens": 512}}'
+  request: 'Generate a standalone TRITON gated_rmsnorm_fp8_per_token_quant kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"input": "bf16", "output": "fp8_arch_specific", "scale": "fp32_per_token"},
+    "layout": "token_head_dim", "operator": "gated_rmsnorm_fp8_per_token_quant", "shape": {"head_dim": 128, "heads": 32, "tokens": 512}}. Independent oracle JSON: {"method": "RMS norm plus SiLU gate and
+    clamp quant", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require
+    compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 984dd098de73be61d923bf25db65d0e431a0196a8bd3c90ea306f3c0a44054b9
+    source_candidate_id: cand-hip-gated-rmsnorm-fp8
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-topk-006
+  recognized_contract: '{"dtype": {"indices": "int32", "input": "fp32", "values": "fp32"}, "layout": "row_major", "operator": "topk", "shape": {"batch": 3072, "hidden_size": 4096, "k": 2048}}'
+  request: 'Generate a standalone TRITON topk kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"indices": "int32", "input": "fp32", "values": "fp32"}, "layout": "row_major", "operator": "topk", "shape":
+    {"batch": 3072, "hidden_size": 4096, "k": 2048}}. Independent oracle JSON: {"method": "torch.topk", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch
+    operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 8924b47d826a2739b88263a4c9a71b0cb0197873628794aab822810751eb6083
+    source_candidate_id: cand-hip-topk-large
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-topk_softmax-007
+  recognized_contract: '{"dtype": {"indices": "int32", "input": "fp32", "values": "fp32"}, "layout": "token_expert", "operator": "topk_softmax", "renormalize": true, "shape": {"experts": 128, "k": 8, "tokens":
+    512}}'
+  request: 'Generate a standalone TRITON topk_softmax kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"indices": "int32", "input": "fp32", "values": "fp32"}, "layout": "token_expert", "operator":
+    "topk_softmax", "renormalize": true, "shape": {"experts": 128, "k": 8, "tokens": 512}}. Independent oracle JSON: {"method": "softmax then topk and renormalize", "tier": "pure_torch"}. Implement independently;
+    do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: ec09e390151a2bd60e01f9bafcedd82f0e7aba9c12ffc8cc2964d6f226e3233e
+    source_candidate_id: cand-hip-topk-softmax-moe
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-fused_qk_concat-008
+  recognized_contract: '{"dtype": {"input": "bf16", "output": "bf16"}, "layout": "batch_head_dim", "operator": "fused_qk_concat", "shape": {"B": 8, "d_nope": 512, "d_pe": 128, "kv_heads": 4, "q_heads_per_kv":
+    8}}'
+  request: 'Generate a standalone TRITON fused_qk_concat kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"input": "bf16", "output": "bf16"}, "layout": "batch_head_dim", "operator": "fused_qk_concat",
+    "shape": {"B": 8, "d_nope": 512, "d_pe": 128, "kv_heads": 4, "q_heads_per_kv": 8}}. Independent oracle JSON: {"method": "torch.cat for q and k", "tier": "pure_torch"}. Implement independently; do not
+    call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: a53f1673f661ebe0e3add436e11fec81f1933046378f5624342dfa07f7a590a4
+    source_candidate_id: cand-fused-qk-concat
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-gemm-009
+  recognized_contract: '{"dtype": {"accum": "fp32", "input": "fp16", "output": "fp16", "weight": "fp16"}, "layout": "NN", "operator": "gemm", "shapes": [{"K": 4096, "M": 32, "N": 4096}, {"K": 4096, "M":
+    512, "N": 4096}, {"K": 4096, "M": 1024, "N": 3072}]}'
+  request: 'Generate a standalone TRITON gemm kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"accum": "fp32", "input": "fp16", "output": "fp16", "weight": "fp16"}, "layout": "NN", "operator": "gemm",
+    "shapes": [{"K": 4096, "M": 32, "N": 4096}, {"K": 4096, "M": 512, "N": 4096}, {"K": 4096, "M": 1024, "N": 3072}]}. Independent oracle JSON: {"method": "torch.matmul", "tier": "pure_torch"}. Implement
+    independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace
+    verification.'
+  seed_provenance:
+    contract_hash: 875cba17bc344df191bfe99a92d0e2ba42753c2045ab91e123db6cac3a0434bf
+    source_candidate_id: cand-local-triton-fp16-gemm
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-scaled_quant_gemm-010
+  recognized_contract: '{"dtype": {"accum": "fp32", "input": "fp8_e4m3fnuz", "output": "fp16", "weight": "fp8_e4m3fnuz"}, "layout": "NN", "operator": "scaled_quant_gemm", "scale": {"activation": "per_token",
+    "weight": "per_output_channel"}, "shapes": [{"K": 4096, "M": 1, "N": 4096}, {"K": 4096, "M": 32, "N": 6144}, {"K": 4096, "M": 512, "N": 4096}]}'
+  request: 'Generate a standalone TRITON scaled_quant_gemm kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"accum": "fp32", "input": "fp8_e4m3fnuz", "output": "fp16", "weight": "fp8_e4m3fnuz"},
+    "layout": "NN", "operator": "scaled_quant_gemm", "scale": {"activation": "per_token", "weight": "per_output_channel"}, "shapes": [{"K": 4096, "M": 1, "N": 4096}, {"K": 4096, "M": 32, "N": 6144}, {"K":
+    4096, "M": 512, "N": 4096}]}. Independent oracle JSON: {"method": "fp32 dequantized torch.matmul", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch
+    operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 15b59ecf206066e2a3cd7abd31a22797fe75fb6fd0a7866c0db06e77e3dc7b8b
+    source_candidate_id: cand-local-triton-fp8-gemm-gfx942
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-fused_causal_attention-011
+  recognized_contract: '{"dtype": {"accum": "fp32", "input": "fp16", "output": "fp16"}, "layout": "BHSD", "operator": "fused_causal_attention", "shapes": [{"B": 1, "D": 64, "H": 8, "S": 128}, {"B": 2, "D":
+    64, "H": 16, "S": 256}, {"B": 1, "D": 64, "H": 16, "S": 512}]}'
+  request: 'Generate a standalone TRITON fused_causal_attention kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"accum": "fp32", "input": "fp16", "output": "fp16"}, "layout": "BHSD", "operator":
+    "fused_causal_attention", "shapes": [{"B": 1, "D": 64, "H": 8, "S": 128}, {"B": 2, "D": 64, "H": 16, "S": 256}, {"B": 1, "D": 64, "H": 16, "S": 512}]}. Independent oracle JSON: {"method": "F.scaled_dot_product_attention
+    causal", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile,
+    correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: f2f4113cfe7ca7235620157ed91467ecd287211c3c4965e252118d28fa705e0e
+    source_candidate_id: cand-local-triton-fused-attention
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-grouped_gemm-012
+  recognized_contract: '{"dtype": {"accum": "fp32", "input": "fp16", "output": "fp16", "weight": "fp16"}, "layout": "expert_mk_expert_kn", "operator": "grouped_gemm", "routed_counts": "skewed", "shape":
+    {"K": "fixed_per_case", "M_max": "variable", "N": "fixed_per_case", "experts": "variable"}}'
+  request: 'Generate a standalone TRITON grouped_gemm kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"accum": "fp32", "input": "fp16", "output": "fp16", "weight": "fp16"}, "layout": "expert_mk_expert_kn",
+    "operator": "grouped_gemm", "routed_counts": "skewed", "shape": {"K": "fixed_per_case", "M_max": "variable", "N": "fixed_per_case", "experts": "variable"}}. Independent oracle JSON: {"method": "per-expert
+    torch.matmul", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require
+    compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: b36ab611a1b84f5a41ca5021fb81acd577b7fbb9da14ad011c78cd03fd3a1431
+    source_candidate_id: cand-local-triton-grouped-gemm
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-gemm-013
+  recognized_contract: '{"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape": {"K": 8192, "M": 8192, "N": 8192}, "weight_dtype": "bf16"}'
+  request: 'Generate a standalone TRITON gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape":
+    {"K": 8192, "M": 8192, "N": 8192}, "weight_dtype": "bf16"}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 68e07eda16aece29d4d540c5a458952c99d70d5308dd48a7a71506617c07ed86
+    source_candidate_id: gfx942-auto-13ec84bdfd8fbc8c
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-gemm-014
+  recognized_contract: '{"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape": {"K": 2048, "M": 2048, "N": 2048}, "weight_dtype": "bf16"}'
+  request: 'Generate a standalone TRITON gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape":
+    {"K": 2048, "M": 2048, "N": 2048}, "weight_dtype": "bf16"}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 49b4a8006cde578bc4a2e0a3b80d4d0f4cfb5ba87ea297e38ebe465d0adfbbfc
+    source_candidate_id: gfx942-auto-18ed5b9736b5586d
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-gemm-015
+  recognized_contract: '{"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape": {"K": 5120, "M": 5120, "N": 5120}, "weight_dtype": "bf16"}'
+  request: 'Generate a standalone TRITON gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape":
+    {"K": 5120, "M": 5120, "N": 5120}, "weight_dtype": "bf16"}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: de90ef409963a248155cc192a2c43ec30077b6453205cd684244ad09432c92f9
+    source_candidate_id: gfx942-auto-207af4dca6f2ac52
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-gemm-016
+  recognized_contract: '{"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape": {"K": 2880, "M": 256, "N": 5120}, "weight_dtype": "bf16"}'
+  request: 'Generate a standalone TRITON gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape":
+    {"K": 2880, "M": 256, "N": 5120}, "weight_dtype": "bf16"}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 1658f56726a4575b0564072ec8c84eda93be10cfe11e27a353fc60954423e7a1
+    source_candidate_id: gfx942-auto-294850c939d10d70
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-gemm-017
+  recognized_contract: '{"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape": {"K": 7168, "M": 64, "N": 256}, "weight_dtype": "bf16"}'
+  request: 'Generate a standalone TRITON gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape":
+    {"K": 7168, "M": 64, "N": 256}, "weight_dtype": "bf16"}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: af09d07df81e31f7caf8ef381982961ba353783f3ec57479f0faadf070c859f8
+    source_candidate_id: gfx942-auto-2ed39296fee2f4cb
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-gemm-018
+  recognized_contract: '{"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape": {"K": 2880, "M": 64, "N": 5120}, "weight_dtype": "bf16"}'
+  request: 'Generate a standalone TRITON gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape":
+    {"K": 2880, "M": 64, "N": 5120}, "weight_dtype": "bf16"}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 1c4ccbb58c55c36a33402ddb5e18e803b1cf80603b9b963d6dcfafb01b64c15d
+    source_candidate_id: gfx942-auto-4706fd006a1022c7
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-gemm-019
+  recognized_contract: '{"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape": {"K": 2, "M": 3, "N": 5}, "weight_dtype": "bf16"}'
+  request: 'Generate a standalone TRITON gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape":
+    {"K": 2, "M": 3, "N": 5}, "weight_dtype": "bf16"}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS,
+    hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: cbd476c6d5f23c1fa3dc34d56317c09e6638c7b56ac35d503f8d0e7ba23bc667
+    source_candidate_id: gfx942-auto-479895549cd7bdd5
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-gemm-020
+  recognized_contract: '{"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape": {"K": 2880, "M": 32, "N": 128}, "weight_dtype": "bf16"}'
+  request: 'Generate a standalone TRITON gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape":
+    {"K": 2880, "M": 32, "N": 128}, "weight_dtype": "bf16"}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 3ef198804e02604a3ba5861ef45603c4762ade915b307fd86670565e62fb695d
+    source_candidate_id: gfx942-auto-4e1f7f921ce66ce2
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-gemm-021
+  recognized_contract: '{"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape": {"K": 2880, "M": 256, "N": 128}, "weight_dtype": "bf16"}'
+  request: 'Generate a standalone TRITON gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape":
+    {"K": 2880, "M": 256, "N": 128}, "weight_dtype": "bf16"}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 95da5961547f477b35f8f02a77791254a4e6f9bd73038f5a6d467dcbe480be12
+    source_candidate_id: gfx942-auto-566279744081b2b1
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-gemm-022
+  recognized_contract: '{"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape": {"K": 4096, "M": 32, "N": 2880}, "weight_dtype": "bf16"}'
+  request: 'Generate a standalone TRITON gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape":
+    {"K": 4096, "M": 32, "N": 2880}, "weight_dtype": "bf16"}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 416a1bb6c786290a057b2432785e9a6b3f67130e9b239fc5e18435ff20885966
+    source_candidate_id: gfx942-auto-5aa95c33fa28ce8d
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-gemm-023
+  recognized_contract: '{"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape": {"K": 7168, "M": 32, "N": 256}, "weight_dtype": "bf16"}'
+  request: 'Generate a standalone TRITON gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape":
+    {"K": 7168, "M": 32, "N": 256}, "weight_dtype": "bf16"}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 8164591210fa3d2ba896f9965c737f27e688073d560e220fb518f7b44fd5fba9
+    source_candidate_id: gfx942-auto-6b9dc6961a70a305
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-gemm-024
+  recognized_contract: '{"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape": {"K": 2880, "M": 64, "N": 128}, "weight_dtype": "bf16"}'
+  request: 'Generate a standalone TRITON gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape":
+    {"K": 2880, "M": 64, "N": 128}, "weight_dtype": "bf16"}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 738f8d1f0cb2e81499eb68db7104f208cc19c0511b21dce192bd9248537b2528
+    source_candidate_id: gfx942-auto-6f3d55a5918807ea
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-gemm-025
+  recognized_contract: '{"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape": {"K": 7168, "M": 256, "N": 256}, "weight_dtype": "bf16"}'
+  request: 'Generate a standalone TRITON gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape":
+    {"K": 7168, "M": 256, "N": 256}, "weight_dtype": "bf16"}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: bc4abe500e6a4ccbf8230650925d44819225a8ef9eb892a5b54b0b7256be6d4c
+    source_candidate_id: gfx942-auto-89d7725257e4eb48
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-gemm-026
+  recognized_contract: '{"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape": {"K": 4096, "M": 256, "N": 2880}, "weight_dtype": "bf16"}'
+  request: 'Generate a standalone TRITON gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape":
+    {"K": 4096, "M": 256, "N": 2880}, "weight_dtype": "bf16"}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 0f9aec57c71642af54b9c81e1c764ea17be09da30931fb9eef9ec4adbfced260
+    source_candidate_id: gfx942-auto-8fb276a7fd73a4f4
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-rms_norm-027
+  recognized_contract: '{"epsilon": 1e-05, "input_dtype": "bf16", "layout": "contiguous", "operator": "rms_norm", "output_dtype": "bf16", "shape": {"M": 8192, "N": 65536}}'
+  request: 'Generate a standalone TRITON rms_norm kernel for AMD gfx942. Frozen contract JSON: {"epsilon": 1e-05, "input_dtype": "bf16", "layout": "contiguous", "operator": "rms_norm", "output_dtype": "bf16",
+    "shape": {"M": 8192, "N": 65536}}. Independent oracle JSON: {"method": "local pure-torch torch_rmsnorm", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt,
+    torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: b1da7b2f37f7306c7a7f3d5a158b490dd874de5f487c772b4ed397dc86e3c95f
+    source_candidate_id: gfx942-auto-919ae6669c5a5bf0
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-rms_norm-028
+  recognized_contract: '{"epsilon": 1e-05, "input_dtype": "bf16", "layout": "contiguous", "operator": "rms_norm", "output_dtype": "bf16", "shape": {"M": 1, "N": 31744}}'
+  request: 'Generate a standalone TRITON rms_norm kernel for AMD gfx942. Frozen contract JSON: {"epsilon": 1e-05, "input_dtype": "bf16", "layout": "contiguous", "operator": "rms_norm", "output_dtype": "bf16",
+    "shape": {"M": 1, "N": 31744}}. Independent oracle JSON: {"method": "local pure-torch torch_rmsnorm", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch
+    operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 17703f3017a61d0b4de18494017c68ce81c7d739f2ef065d1d1488e0b58ce76d
+    source_candidate_id: gfx942-auto-a2ebc6aea805f3f3
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-scaled_quant_gemm-029
+  recognized_contract: '{"accum_dtype": "int32", "input_dtype": "int8", "layout": "TN", "operator": "scaled_quant_gemm", "output_dtype": "bf16", "scale": {"activation": "per_row", "weight": "per_column"},
+    "shape": {"K": 8192, "M": 32, "N": 1280}, "weight_dtype": "int8"}'
+  request: 'Generate a standalone TRITON scaled_quant_gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "int32", "input_dtype": "int8", "layout": "TN", "operator": "scaled_quant_gemm", "output_dtype":
+    "bf16", "scale": {"activation": "per_row", "weight": "per_column"}, "shape": {"K": 8192, "M": 32, "N": 1280}, "weight_dtype": "int8"}. Independent oracle JSON: {"method": "dequantize scales then torch.nn.functional.linear",
+    "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness,
+    performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 8c46a7f0fbc73f4fcac5245123f4f7a70953880d44cd35aba44ce54b4c573e70
+    source_candidate_id: gfx942-auto-fd72b53a4f785bab
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-gemm-030
+  recognized_contract: '{"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "TN", "operator": "gemm", "shape": {"K": 1024, "M": 256, "N": 3072}}'
+  request: 'Generate a standalone TRITON gemm kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "TN", "operator": "gemm",
+    "shape": {"K": 1024, "M": 256, "N": 3072}}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt,
+    torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: c42980d047cf3fc19804d1aa91c4ee1fafbcf3f5e2a3ed50393d28a2f58b0a17
+    source_candidate_id: synthetic-gemm-30
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-gemm-031
+  recognized_contract: '{"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "TN", "operator": "gemm", "shape": {"K": 512, "M": 512, "N": 2048}}'
+  request: 'Generate a standalone TRITON gemm kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "TN", "operator": "gemm",
+    "shape": {"K": 512, "M": 512, "N": 2048}}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt,
+    torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: cc29bcc290c7c04b440f05c53308cb2b6c4687616fc054c90b421fae1eb51b52
+    source_candidate_id: synthetic-gemm-31
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-gemm-032
+  recognized_contract: '{"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "TN", "operator": "gemm", "shape": {"K": 2048, "M": 64, "N": 5120}}'
+  request: 'Generate a standalone TRITON gemm kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "TN", "operator": "gemm",
+    "shape": {"K": 2048, "M": 64, "N": 5120}}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt,
+    torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 2bcbec99d5a4df69e3fec216a0671ccc2f2eff02abdba150bfe7b2c4b0eda435
+    source_candidate_id: synthetic-gemm-32
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-gemm-033
+  recognized_contract: '{"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "TN", "operator": "gemm", "shape": {"K": 768, "M": 2048, "N": 4096}}'
+  request: 'Generate a standalone TRITON gemm kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "TN", "operator": "gemm",
+    "shape": {"K": 768, "M": 2048, "N": 4096}}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt,
+    torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: e22aebfd11854cb92d05c41c21f5ac1cc80bf583fdd4875b6fafb728cbb128ed
+    source_candidate_id: synthetic-gemm-33
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-gemm-034
+  recognized_contract: '{"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "TN", "operator": "gemm", "shape": {"K": 3072, "M": 16, "N": 8192}}'
+  request: 'Generate a standalone TRITON gemm kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "TN", "operator": "gemm",
+    "shape": {"K": 3072, "M": 16, "N": 8192}}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt,
+    torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: cdf0756502e479896133e492b7c0393c16275481c0599d7cd17561192c8df621
+    source_candidate_id: synthetic-gemm-34
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-softmax-035
+  recognized_contract: '{"axis": 1, "dtype": {"input": "bf16", "output": "bf16"}, "layout": "row_major", "operator": "softmax", "shape": {"M": 512, "N": 512}}'
+  request: 'Generate a standalone TRITON softmax kernel for AMD gfx942. Frozen contract JSON: {"axis": 1, "dtype": {"input": "bf16", "output": "bf16"}, "layout": "row_major", "operator": "softmax", "shape":
+    {"M": 512, "N": 512}}. Independent oracle JSON: {"method": "torch.softmax", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle
+    at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: a4d5b92df4569a437c1b17972aaee819138fec2fb2332aaa4cda4e07b501368d
+    source_candidate_id: synthetic-softmax-35
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-softmax-036
+  recognized_contract: '{"axis": 1, "dtype": {"input": "bf16", "output": "bf16"}, "layout": "row_major", "operator": "softmax", "shape": {"M": 2048, "N": 256}}'
+  request: 'Generate a standalone TRITON softmax kernel for AMD gfx942. Frozen contract JSON: {"axis": 1, "dtype": {"input": "bf16", "output": "bf16"}, "layout": "row_major", "operator": "softmax", "shape":
+    {"M": 2048, "N": 256}}. Independent oracle JSON: {"method": "torch.softmax", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle
+    at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 0b922e0d7db1d6bf6354d567ff285fd6ff444aa08a82c5f13eb3e3c53680a17b
+    source_candidate_id: synthetic-softmax-36
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-softmax-037
+  recognized_contract: '{"axis": 1, "dtype": {"input": "bf16", "output": "bf16"}, "layout": "row_major", "operator": "softmax", "shape": {"M": 128, "N": 4096}}'
+  request: 'Generate a standalone TRITON softmax kernel for AMD gfx942. Frozen contract JSON: {"axis": 1, "dtype": {"input": "bf16", "output": "bf16"}, "layout": "row_major", "operator": "softmax", "shape":
+    {"M": 128, "N": 4096}}. Independent oracle JSON: {"method": "torch.softmax", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle
+    at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: fcb35b1348bf21d5dfa21de411b3d1102be15bda18976a674890ee9c6769636b
+    source_candidate_id: synthetic-softmax-37
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-rms_norm-038
+  recognized_contract: '{"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "contiguous", "operator": "rms_norm", "shape": {"M": 128, "N": 2048}}'
+  request: 'Generate a standalone TRITON rms_norm kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "contiguous", "operator":
+    "rms_norm", "shape": {"M": 128, "N": 2048}}. Independent oracle JSON: {"method": "torch.nn.functional.rms_norm", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt,
+    torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 41e72b0a77244146b30935b287070ae81e140849a6a665e89b07b3425b4b8b0f
+    source_candidate_id: synthetic-rms_norm-38
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-rms_norm-039
+  recognized_contract: '{"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "contiguous", "operator": "rms_norm", "shape": {"M": 256, "N": 8192}}'
+  request: 'Generate a standalone TRITON rms_norm kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "contiguous", "operator":
+    "rms_norm", "shape": {"M": 256, "N": 8192}}. Independent oracle JSON: {"method": "torch.nn.functional.rms_norm", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt,
+    torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: a0abddce6b223c430c80d448dc32a2ac17806c7d81045c7d9ca3ca61685cbeb6
+    source_candidate_id: synthetic-rms_norm-39
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-rms_norm-040
+  recognized_contract: '{"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "contiguous", "operator": "rms_norm", "shape": {"M": 64, "N": 3072}}'
+  request: 'Generate a standalone TRITON rms_norm kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "contiguous", "operator":
+    "rms_norm", "shape": {"M": 64, "N": 3072}}. Independent oracle JSON: {"method": "torch.nn.functional.rms_norm", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt,
+    torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 7d8b6405628b9a02682e3dbb29b38f5ba8ad2ed3e889301ab2eb1439f2600389
+    source_candidate_id: synthetic-rms_norm-40
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-silu_and_mul-041
+  recognized_contract: '{"dtype": {"input": "bf16", "output": "bf16"}, "layout": "contiguous", "operator": "silu_and_mul", "shape": {"M": 256, "N": 3072}}'
+  request: 'Generate a standalone TRITON silu_and_mul kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"input": "bf16", "output": "bf16"}, "layout": "contiguous", "operator": "silu_and_mul", "shape":
+    {"M": 256, "N": 3072}}. Independent oracle JSON: {"method": "torch_silu_mul", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle
+    at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 7543ef8eb61b5021c7ac6396227229931f88bba94139a1997e5277a61e9f9f1d
+    source_candidate_id: synthetic-silu_and_mul-41
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-silu_and_mul-042
+  recognized_contract: '{"dtype": {"input": "bf16", "output": "bf16"}, "layout": "contiguous", "operator": "silu_and_mul", "shape": {"M": 1024, "N": 1536}}'
+  request: 'Generate a standalone TRITON silu_and_mul kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"input": "bf16", "output": "bf16"}, "layout": "contiguous", "operator": "silu_and_mul", "shape":
+    {"M": 1024, "N": 1536}}. Independent oracle JSON: {"method": "torch_silu_mul", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle
+    at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 34c6156c69609d5ee38de91b26e00630c27a38484b39c007c6f51e1468bbfe66
+    source_candidate_id: synthetic-silu_and_mul-42
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-fused_add_rms_norm-043
+  recognized_contract: '{"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "contiguous", "operator": "fused_add_rms_norm", "shape": {"M": 128, "N": 3072}}'
+  request: 'Generate a standalone TRITON fused_add_rms_norm kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "contiguous",
+    "operator": "fused_add_rms_norm", "shape": {"M": 128, "N": 3072}}. Independent oracle JSON: {"method": "torch_add_rms_norm", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 40059781113688f45422418763272658e3c54620713405e0afde60a672d411c7
+    source_candidate_id: synthetic-fused_add_rms_norm-43
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-fused_add_rms_norm-044
+  recognized_contract: '{"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "contiguous", "operator": "fused_add_rms_norm", "shape": {"M": 256, "N": 2048}}'
+  request: 'Generate a standalone TRITON fused_add_rms_norm kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "contiguous",
+    "operator": "fused_add_rms_norm", "shape": {"M": 256, "N": 2048}}. Independent oracle JSON: {"method": "torch_add_rms_norm", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: a06f98eda23006e7a85438afc60f475ebfb22e52d7ab006b7adc1a52c8f8d174
+    source_candidate_id: synthetic-fused_add_rms_norm-44
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-dynamic_per_token_quant-045
+  recognized_contract: '{"dtype": {"input": "bf16", "output": "fp8_e4m3fnuz", "scale": "fp32_per_token"}, "layout": "contiguous", "operator": "dynamic_per_token_quant", "shape": {"M": 64, "N": 2048}}'
+  request: 'Generate a standalone TRITON dynamic_per_token_quant kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"input": "bf16", "output": "fp8_e4m3fnuz", "scale": "fp32_per_token"}, "layout":
+    "contiguous", "operator": "dynamic_per_token_quant", "shape": {"M": 64, "N": 2048}}. Independent oracle JSON: {"method": "torch_quantize", "tier": "pure_torch"}. Implement independently; do not call
+    AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 7bdd8d0220044069bfa0f54a56096c19f6a2089507d92951016d63bfc88b57d3
+    source_candidate_id: synthetic-dynamic_per_token_quant-45
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-dynamic_per_token_quant-046
+  recognized_contract: '{"dtype": {"input": "bf16", "output": "fp8_e4m3fnuz", "scale": "fp32_per_token"}, "layout": "contiguous", "operator": "dynamic_per_token_quant", "shape": {"M": 512, "N": 4096}}'
+  request: 'Generate a standalone TRITON dynamic_per_token_quant kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"input": "bf16", "output": "fp8_e4m3fnuz", "scale": "fp32_per_token"}, "layout":
+    "contiguous", "operator": "dynamic_per_token_quant", "shape": {"M": 512, "N": 4096}}. Independent oracle JSON: {"method": "torch_quantize", "tier": "pure_torch"}. Implement independently; do not call
+    AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 642a82b0ada0942c6e776d09358807715e2f47a3fe1230092d4523c0f42f5949
+    source_candidate_id: synthetic-dynamic_per_token_quant-46
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-dynamic_per_tensor_quant-047
+  recognized_contract: '{"dtype": {"input": "bf16", "output": "fp8_e4m3fnuz", "scale": "fp32_scalar"}, "layout": "contiguous", "operator": "dynamic_per_tensor_quant", "shape": {"M": 128, "N": 1024}}'
+  request: 'Generate a standalone TRITON dynamic_per_tensor_quant kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"input": "bf16", "output": "fp8_e4m3fnuz", "scale": "fp32_scalar"}, "layout": "contiguous",
+    "operator": "dynamic_per_tensor_quant", "shape": {"M": 128, "N": 1024}}. Independent oracle JSON: {"method": "torch_quantize", "tier": "pure_torch"}. Implement independently; do not call AITER, CK,
+    ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 1eb1c72b5e0e7574628eb6fc3c4c2e554cc14a1440859e61f738597e5cad6b08
+    source_candidate_id: synthetic-dynamic_per_tensor_quant-47
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-static_per_tensor_quant-048
+  recognized_contract: '{"dtype": {"input": "bf16", "output": "fp8_e4m3fnuz", "scale": "fp32_scalar"}, "layout": "contiguous", "operator": "static_per_tensor_quant", "shape": {"M": 256, "N": 3072}}'
+  request: 'Generate a standalone TRITON static_per_tensor_quant kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"input": "bf16", "output": "fp8_e4m3fnuz", "scale": "fp32_scalar"}, "layout": "contiguous",
+    "operator": "static_per_tensor_quant", "shape": {"M": 256, "N": 3072}}. Independent oracle JSON: {"method": "torch_quantize", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 01b45c925be8a7c1ff2b42e2d5497d19cfe0fb13fd183c794cc840d9fe82ff18
+    source_candidate_id: synthetic-static_per_tensor_quant-48
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-triton-gfx942-static_per_tensor_quant-049
+  recognized_contract: '{"dtype": {"input": "bf16", "output": "fp8_e4m3fnuz", "scale": "fp32_scalar"}, "layout": "contiguous", "operator": "static_per_tensor_quant", "shape": {"M": 64, "N": 8192}}'
+  request: 'Generate a standalone TRITON static_per_tensor_quant kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"input": "bf16", "output": "fp8_e4m3fnuz", "scale": "fp32_scalar"}, "layout": "contiguous",
+    "operator": "static_per_tensor_quant", "shape": {"M": 64, "N": 8192}}. Independent oracle JSON: {"method": "torch_quantize", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 2bb0e0eece4d754637f616115c7e9f54e6b1da9271d8e9f7573b8b5fa41202e1
+    source_candidate_id: synthetic-static_per_tensor_quant-49
+    split_group: held_out
+    target_lane: triton_gfx942
+- id: bench-hip-gfx942-gemm_gelu-000
+  recognized_contract: '{"activation": "gelu", "dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "TN", "operator": "gemm_gelu", "shape": {"K": 1024, "M": 16, "N":
+    1024}}'
+  request: 'Generate a standalone HIP gemm_gelu kernel for AMD gfx942. Frozen contract JSON: {"activation": "gelu", "dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout":
+    "TN", "operator": "gemm_gelu", "shape": {"K": 1024, "M": 16, "N": 1024}}. Independent oracle JSON: {"method": "F.linear then F.gelu", "tier": "pure_torch"}. Implement independently; do not call AITER,
+    CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 8ee7747005d4f6d0aa2780686fd23e2467f5f12e16c0ffe18892abf5f80434f7
+    source_candidate_id: cand-a16w16-gelu-bf16
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-scaled_quant_gemm_gelu_bias-001
+  recognized_contract: '{"activation": "gelu", "bias": true, "dtype": {"accum": "fp32", "input": "fp8_e4m3fnuz", "output": "bf16", "weight": "fp8_e4m3fnuz"}, "layout": "TN", "operator": "scaled_quant_gemm_gelu_bias",
+    "shape": {"K": 768, "M": 32, "N": 3072}}'
+  request: 'Generate a standalone HIP scaled_quant_gemm_gelu_bias kernel for AMD gfx942. Frozen contract JSON: {"activation": "gelu", "bias": true, "dtype": {"accum": "fp32", "input": "fp8_e4m3fnuz", "output":
+    "bf16", "weight": "fp8_e4m3fnuz"}, "layout": "TN", "operator": "scaled_quant_gemm_gelu_bias", "shape": {"K": 768, "M": 32, "N": 3072}}. Independent oracle JSON: {"method": "fp32 dequant linear plus
+    bias and gelu", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require
+    compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: c2e270859cc3f5f168379831582da85ab8aa10ad9f3b74f4aa3f2b0990616d0d
+    source_candidate_id: cand-fp8-a8w8-gelu-bias-gfx942
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-batched_scaled_quant_gemm-002
+  recognized_contract: '{"dtype": {"accum": "int32", "input": "int8", "output": "bf16", "weight": "int8"}, "layout": "bmn", "operator": "batched_scaled_quant_gemm", "scale": {"activation": "per_batch_row",
+    "weight": "per_batch_column"}, "shape": {"B": 16, "K": 8192, "M": 128, "N": 1280}}'
+  request: 'Generate a standalone HIP batched_scaled_quant_gemm kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"accum": "int32", "input": "int8", "output": "bf16", "weight": "int8"}, "layout":
+    "bmn", "operator": "batched_scaled_quant_gemm", "scale": {"activation": "per_batch_row", "weight": "per_batch_column"}, "shape": {"B": 16, "K": 8192, "M": 128, "N": 1280}}. Independent oracle JSON:
+    {"method": "per-batch fp32 linear with scales", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic
+    GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 86fc3e5cde1ce0e48ea69d4fa7cd8b7552ff930d69a3e6289a36646feb6cdf66
+    source_candidate_id: cand-batched-int8-a8w8
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-fused_add_rms_norm_pad-003
+  recognized_contract: '{"dtype": {"input": "bf16", "output": "bf16", "residual": "bf16"}, "layout": "contiguous", "operator": "fused_add_rms_norm_pad", "pad_to_multiple": 256, "shape": {"M": 256, "N":
+    2880}}'
+  request: 'Generate a standalone HIP fused_add_rms_norm_pad kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"input": "bf16", "output": "bf16", "residual": "bf16"}, "layout": "contiguous", "operator":
+    "fused_add_rms_norm_pad", "pad_to_multiple": 256, "shape": {"M": 256, "N": 2880}}. Independent oracle JSON: {"method": "fp32 add and RMS norm then pad", "tier": "pure_torch"}. Implement independently;
+    do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 8c47b8786d8452a1de8d4bde4584fee02b1c64f57d7c729cd3bbf36a1c8a92df
+    source_candidate_id: cand-triton-fused-add-rmsnorm-pad
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-fused_add_layer_norm-004
+  recognized_contract: '{"dtype": {"bias": "bf16", "input": "bf16", "output": "bf16", "residual": "bf16", "weight": "bf16"}, "layout": "contiguous", "operator": "fused_add_layer_norm", "shape": {"M": 32,
+    "N": 4096}}'
+  request: 'Generate a standalone HIP fused_add_layer_norm kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"bias": "bf16", "input": "bf16", "output": "bf16", "residual": "bf16", "weight": "bf16"},
+    "layout": "contiguous", "operator": "fused_add_layer_norm", "shape": {"M": 32, "N": 4096}}. Independent oracle JSON: {"method": "residual add then F.layer_norm", "tier": "pure_torch"}. Implement independently;
+    do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 832ed19226a34a033f7d946dea87501acd9b322b363f4eee07203e8cf0a31a30
+    source_candidate_id: cand-hip-fused-add-layernorm
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-gated_rmsnorm_fp8_per_token_quant-005
+  recognized_contract: '{"dtype": {"input": "bf16", "output": "fp8_arch_specific", "scale": "fp32_per_token"}, "layout": "token_head_dim", "operator": "gated_rmsnorm_fp8_per_token_quant", "shape": {"head_dim":
+    128, "heads": 32, "tokens": 512}}'
+  request: 'Generate a standalone HIP gated_rmsnorm_fp8_per_token_quant kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"input": "bf16", "output": "fp8_arch_specific", "scale": "fp32_per_token"},
+    "layout": "token_head_dim", "operator": "gated_rmsnorm_fp8_per_token_quant", "shape": {"head_dim": 128, "heads": 32, "tokens": 512}}. Independent oracle JSON: {"method": "RMS norm plus SiLU gate and
+    clamp quant", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require
+    compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 984dd098de73be61d923bf25db65d0e431a0196a8bd3c90ea306f3c0a44054b9
+    source_candidate_id: cand-hip-gated-rmsnorm-fp8
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-topk-006
+  recognized_contract: '{"dtype": {"indices": "int32", "input": "fp32", "values": "fp32"}, "layout": "row_major", "operator": "topk", "shape": {"batch": 3072, "hidden_size": 4096, "k": 2048}}'
+  request: 'Generate a standalone HIP topk kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"indices": "int32", "input": "fp32", "values": "fp32"}, "layout": "row_major", "operator": "topk", "shape":
+    {"batch": 3072, "hidden_size": 4096, "k": 2048}}. Independent oracle JSON: {"method": "torch.topk", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch
+    operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 8924b47d826a2739b88263a4c9a71b0cb0197873628794aab822810751eb6083
+    source_candidate_id: cand-hip-topk-large
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-topk_softmax-007
+  recognized_contract: '{"dtype": {"indices": "int32", "input": "fp32", "values": "fp32"}, "layout": "token_expert", "operator": "topk_softmax", "renormalize": true, "shape": {"experts": 128, "k": 8, "tokens":
+    512}}'
+  request: 'Generate a standalone HIP topk_softmax kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"indices": "int32", "input": "fp32", "values": "fp32"}, "layout": "token_expert", "operator": "topk_softmax",
+    "renormalize": true, "shape": {"experts": 128, "k": 8, "tokens": 512}}. Independent oracle JSON: {"method": "softmax then topk and renormalize", "tier": "pure_torch"}. Implement independently; do not
+    call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: ec09e390151a2bd60e01f9bafcedd82f0e7aba9c12ffc8cc2964d6f226e3233e
+    source_candidate_id: cand-hip-topk-softmax-moe
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-fused_qk_concat-008
+  recognized_contract: '{"dtype": {"input": "bf16", "output": "bf16"}, "layout": "batch_head_dim", "operator": "fused_qk_concat", "shape": {"B": 8, "d_nope": 512, "d_pe": 128, "kv_heads": 4, "q_heads_per_kv":
+    8}}'
+  request: 'Generate a standalone HIP fused_qk_concat kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"input": "bf16", "output": "bf16"}, "layout": "batch_head_dim", "operator": "fused_qk_concat",
+    "shape": {"B": 8, "d_nope": 512, "d_pe": 128, "kv_heads": 4, "q_heads_per_kv": 8}}. Independent oracle JSON: {"method": "torch.cat for q and k", "tier": "pure_torch"}. Implement independently; do not
+    call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: a53f1673f661ebe0e3add436e11fec81f1933046378f5624342dfa07f7a590a4
+    source_candidate_id: cand-fused-qk-concat
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-gemm-009
+  recognized_contract: '{"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape": {"K": 8192, "M": 8192, "N": 8192}, "weight_dtype": "bf16"}'
+  request: 'Generate a standalone HIP gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape":
+    {"K": 8192, "M": 8192, "N": 8192}, "weight_dtype": "bf16"}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 68e07eda16aece29d4d540c5a458952c99d70d5308dd48a7a71506617c07ed86
+    source_candidate_id: gfx942-auto-13ec84bdfd8fbc8c
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-gemm-010
+  recognized_contract: '{"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape": {"K": 2048, "M": 2048, "N": 2048}, "weight_dtype": "bf16"}'
+  request: 'Generate a standalone HIP gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape":
+    {"K": 2048, "M": 2048, "N": 2048}, "weight_dtype": "bf16"}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 49b4a8006cde578bc4a2e0a3b80d4d0f4cfb5ba87ea297e38ebe465d0adfbbfc
+    source_candidate_id: gfx942-auto-18ed5b9736b5586d
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-gemm-011
+  recognized_contract: '{"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape": {"K": 5120, "M": 5120, "N": 5120}, "weight_dtype": "bf16"}'
+  request: 'Generate a standalone HIP gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape":
+    {"K": 5120, "M": 5120, "N": 5120}, "weight_dtype": "bf16"}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: de90ef409963a248155cc192a2c43ec30077b6453205cd684244ad09432c92f9
+    source_candidate_id: gfx942-auto-207af4dca6f2ac52
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-gemm-012
+  recognized_contract: '{"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape": {"K": 2880, "M": 256, "N": 5120}, "weight_dtype": "bf16"}'
+  request: 'Generate a standalone HIP gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape":
+    {"K": 2880, "M": 256, "N": 5120}, "weight_dtype": "bf16"}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 1658f56726a4575b0564072ec8c84eda93be10cfe11e27a353fc60954423e7a1
+    source_candidate_id: gfx942-auto-294850c939d10d70
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-gemm-013
+  recognized_contract: '{"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape": {"K": 7168, "M": 64, "N": 256}, "weight_dtype": "bf16"}'
+  request: 'Generate a standalone HIP gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape":
+    {"K": 7168, "M": 64, "N": 256}, "weight_dtype": "bf16"}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: af09d07df81e31f7caf8ef381982961ba353783f3ec57479f0faadf070c859f8
+    source_candidate_id: gfx942-auto-2ed39296fee2f4cb
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-gemm-014
+  recognized_contract: '{"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape": {"K": 2880, "M": 64, "N": 5120}, "weight_dtype": "bf16"}'
+  request: 'Generate a standalone HIP gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape":
+    {"K": 2880, "M": 64, "N": 5120}, "weight_dtype": "bf16"}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 1c4ccbb58c55c36a33402ddb5e18e803b1cf80603b9b963d6dcfafb01b64c15d
+    source_candidate_id: gfx942-auto-4706fd006a1022c7
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-gemm-015
+  recognized_contract: '{"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape": {"K": 2, "M": 3, "N": 5}, "weight_dtype": "bf16"}'
+  request: 'Generate a standalone HIP gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape":
+    {"K": 2, "M": 3, "N": 5}, "weight_dtype": "bf16"}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS,
+    hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: cbd476c6d5f23c1fa3dc34d56317c09e6638c7b56ac35d503f8d0e7ba23bc667
+    source_candidate_id: gfx942-auto-479895549cd7bdd5
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-gemm-016
+  recognized_contract: '{"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape": {"K": 2880, "M": 32, "N": 128}, "weight_dtype": "bf16"}'
+  request: 'Generate a standalone HIP gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape":
+    {"K": 2880, "M": 32, "N": 128}, "weight_dtype": "bf16"}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 3ef198804e02604a3ba5861ef45603c4762ade915b307fd86670565e62fb695d
+    source_candidate_id: gfx942-auto-4e1f7f921ce66ce2
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-gemm-017
+  recognized_contract: '{"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape": {"K": 2880, "M": 256, "N": 128}, "weight_dtype": "bf16"}'
+  request: 'Generate a standalone HIP gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape":
+    {"K": 2880, "M": 256, "N": 128}, "weight_dtype": "bf16"}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 95da5961547f477b35f8f02a77791254a4e6f9bd73038f5a6d467dcbe480be12
+    source_candidate_id: gfx942-auto-566279744081b2b1
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-gemm-018
+  recognized_contract: '{"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape": {"K": 4096, "M": 32, "N": 2880}, "weight_dtype": "bf16"}'
+  request: 'Generate a standalone HIP gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape":
+    {"K": 4096, "M": 32, "N": 2880}, "weight_dtype": "bf16"}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 416a1bb6c786290a057b2432785e9a6b3f67130e9b239fc5e18435ff20885966
+    source_candidate_id: gfx942-auto-5aa95c33fa28ce8d
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-gemm-019
+  recognized_contract: '{"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape": {"K": 7168, "M": 32, "N": 256}, "weight_dtype": "bf16"}'
+  request: 'Generate a standalone HIP gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape":
+    {"K": 7168, "M": 32, "N": 256}, "weight_dtype": "bf16"}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 8164591210fa3d2ba896f9965c737f27e688073d560e220fb518f7b44fd5fba9
+    source_candidate_id: gfx942-auto-6b9dc6961a70a305
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-gemm-020
+  recognized_contract: '{"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape": {"K": 2880, "M": 64, "N": 128}, "weight_dtype": "bf16"}'
+  request: 'Generate a standalone HIP gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape":
+    {"K": 2880, "M": 64, "N": 128}, "weight_dtype": "bf16"}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 738f8d1f0cb2e81499eb68db7104f208cc19c0511b21dce192bd9248537b2528
+    source_candidate_id: gfx942-auto-6f3d55a5918807ea
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-gemm-021
+  recognized_contract: '{"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape": {"K": 7168, "M": 256, "N": 256}, "weight_dtype": "bf16"}'
+  request: 'Generate a standalone HIP gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape":
+    {"K": 7168, "M": 256, "N": 256}, "weight_dtype": "bf16"}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: bc4abe500e6a4ccbf8230650925d44819225a8ef9eb892a5b54b0b7256be6d4c
+    source_candidate_id: gfx942-auto-89d7725257e4eb48
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-gemm-022
+  recognized_contract: '{"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape": {"K": 4096, "M": 256, "N": 2880}, "weight_dtype": "bf16"}'
+  request: 'Generate a standalone HIP gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape":
+    {"K": 4096, "M": 256, "N": 2880}, "weight_dtype": "bf16"}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 0f9aec57c71642af54b9c81e1c764ea17be09da30931fb9eef9ec4adbfced260
+    source_candidate_id: gfx942-auto-8fb276a7fd73a4f4
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-rms_norm-023
+  recognized_contract: '{"epsilon": 1e-05, "input_dtype": "bf16", "layout": "contiguous", "operator": "rms_norm", "output_dtype": "bf16", "shape": {"M": 8192, "N": 65536}}'
+  request: 'Generate a standalone HIP rms_norm kernel for AMD gfx942. Frozen contract JSON: {"epsilon": 1e-05, "input_dtype": "bf16", "layout": "contiguous", "operator": "rms_norm", "output_dtype": "bf16",
+    "shape": {"M": 8192, "N": 65536}}. Independent oracle JSON: {"method": "local pure-torch torch_rmsnorm", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt,
+    torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: b1da7b2f37f7306c7a7f3d5a158b490dd874de5f487c772b4ed397dc86e3c95f
+    source_candidate_id: gfx942-auto-919ae6669c5a5bf0
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-gemm-024
+  recognized_contract: '{"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape": {"K": 2880, "M": 128, "N": 128}, "weight_dtype": "bf16"}'
+  request: 'Generate a standalone HIP gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "fp32", "input_dtype": "bf16", "layout": "TN", "operator": "gemm", "output_dtype": "bf16", "shape":
+    {"K": 2880, "M": 128, "N": 128}, "weight_dtype": "bf16"}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: cc32358c94b36bb11e96ca52eb26b760dff5e911a61ce3048a5bea063968fd0b
+    source_candidate_id: gfx942-auto-94d58c75515470ac
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-rms_norm-025
+  recognized_contract: '{"epsilon": 1e-05, "input_dtype": "bf16", "layout": "contiguous", "operator": "rms_norm", "output_dtype": "bf16", "shape": {"M": 1, "N": 31744}}'
+  request: 'Generate a standalone HIP rms_norm kernel for AMD gfx942. Frozen contract JSON: {"epsilon": 1e-05, "input_dtype": "bf16", "layout": "contiguous", "operator": "rms_norm", "output_dtype": "bf16",
+    "shape": {"M": 1, "N": 31744}}. Independent oracle JSON: {"method": "local pure-torch torch_rmsnorm", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch
+    operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 17703f3017a61d0b4de18494017c68ce81c7d739f2ef065d1d1488e0b58ce76d
+    source_candidate_id: gfx942-auto-a2ebc6aea805f3f3
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-scaled_quant_gemm-026
+  recognized_contract: '{"accum_dtype": "int32", "input_dtype": "int8", "layout": "TN", "operator": "scaled_quant_gemm", "output_dtype": "bf16", "scale": {"activation": "per_row", "weight": "per_column"},
+    "shape": {"K": 8192, "M": 32, "N": 1280}, "weight_dtype": "int8"}'
+  request: 'Generate a standalone HIP scaled_quant_gemm kernel for AMD gfx942. Frozen contract JSON: {"accum_dtype": "int32", "input_dtype": "int8", "layout": "TN", "operator": "scaled_quant_gemm", "output_dtype":
+    "bf16", "scale": {"activation": "per_row", "weight": "per_column"}, "shape": {"K": 8192, "M": 32, "N": 1280}, "weight_dtype": "int8"}. Independent oracle JSON: {"method": "dequantize scales then torch.nn.functional.linear",
+    "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness,
+    performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 8c46a7f0fbc73f4fcac5245123f4f7a70953880d44cd35aba44ce54b4c573e70
+    source_candidate_id: gfx942-auto-fd72b53a4f785bab
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-gemm-027
+  recognized_contract: '{"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "TN", "operator": "gemm", "shape": {"K": 1024, "M": 256, "N": 3072}}'
+  request: 'Generate a standalone HIP gemm kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "TN", "operator": "gemm",
+    "shape": {"K": 1024, "M": 256, "N": 3072}}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt,
+    torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: c42980d047cf3fc19804d1aa91c4ee1fafbcf3f5e2a3ed50393d28a2f58b0a17
+    source_candidate_id: synthetic-gemm-27
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-gemm-028
+  recognized_contract: '{"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "TN", "operator": "gemm", "shape": {"K": 512, "M": 512, "N": 2048}}'
+  request: 'Generate a standalone HIP gemm kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "TN", "operator": "gemm",
+    "shape": {"K": 512, "M": 512, "N": 2048}}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt,
+    torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: cc29bcc290c7c04b440f05c53308cb2b6c4687616fc054c90b421fae1eb51b52
+    source_candidate_id: synthetic-gemm-28
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-gemm-029
+  recognized_contract: '{"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "TN", "operator": "gemm", "shape": {"K": 2048, "M": 64, "N": 5120}}'
+  request: 'Generate a standalone HIP gemm kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "TN", "operator": "gemm",
+    "shape": {"K": 2048, "M": 64, "N": 5120}}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt,
+    torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 2bcbec99d5a4df69e3fec216a0671ccc2f2eff02abdba150bfe7b2c4b0eda435
+    source_candidate_id: synthetic-gemm-29
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-gemm-030
+  recognized_contract: '{"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "TN", "operator": "gemm", "shape": {"K": 768, "M": 2048, "N": 4096}}'
+  request: 'Generate a standalone HIP gemm kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "TN", "operator": "gemm",
+    "shape": {"K": 768, "M": 2048, "N": 4096}}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt,
+    torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: e22aebfd11854cb92d05c41c21f5ac1cc80bf583fdd4875b6fafb728cbb128ed
+    source_candidate_id: synthetic-gemm-30
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-gemm-031
+  recognized_contract: '{"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "TN", "operator": "gemm", "shape": {"K": 3072, "M": 16, "N": 8192}}'
+  request: 'Generate a standalone HIP gemm kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "TN", "operator": "gemm",
+    "shape": {"K": 3072, "M": 16, "N": 8192}}. Independent oracle JSON: {"method": "torch.nn.functional.linear", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt,
+    torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: cdf0756502e479896133e492b7c0393c16275481c0599d7cd17561192c8df621
+    source_candidate_id: synthetic-gemm-31
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-softmax-032
+  recognized_contract: '{"axis": 1, "dtype": {"input": "bf16", "output": "bf16"}, "layout": "row_major", "operator": "softmax", "shape": {"M": 512, "N": 512}}'
+  request: 'Generate a standalone HIP softmax kernel for AMD gfx942. Frozen contract JSON: {"axis": 1, "dtype": {"input": "bf16", "output": "bf16"}, "layout": "row_major", "operator": "softmax", "shape":
+    {"M": 512, "N": 512}}. Independent oracle JSON: {"method": "torch.softmax", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle
+    at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: a4d5b92df4569a437c1b17972aaee819138fec2fb2332aaa4cda4e07b501368d
+    source_candidate_id: synthetic-softmax-32
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-softmax-033
+  recognized_contract: '{"axis": 1, "dtype": {"input": "bf16", "output": "bf16"}, "layout": "row_major", "operator": "softmax", "shape": {"M": 2048, "N": 256}}'
+  request: 'Generate a standalone HIP softmax kernel for AMD gfx942. Frozen contract JSON: {"axis": 1, "dtype": {"input": "bf16", "output": "bf16"}, "layout": "row_major", "operator": "softmax", "shape":
+    {"M": 2048, "N": 256}}. Independent oracle JSON: {"method": "torch.softmax", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle
+    at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 0b922e0d7db1d6bf6354d567ff285fd6ff444aa08a82c5f13eb3e3c53680a17b
+    source_candidate_id: synthetic-softmax-33
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-softmax-034
+  recognized_contract: '{"axis": 1, "dtype": {"input": "bf16", "output": "bf16"}, "layout": "row_major", "operator": "softmax", "shape": {"M": 128, "N": 4096}}'
+  request: 'Generate a standalone HIP softmax kernel for AMD gfx942. Frozen contract JSON: {"axis": 1, "dtype": {"input": "bf16", "output": "bf16"}, "layout": "row_major", "operator": "softmax", "shape":
+    {"M": 128, "N": 4096}}. Independent oracle JSON: {"method": "torch.softmax", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle
+    at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: fcb35b1348bf21d5dfa21de411b3d1102be15bda18976a674890ee9c6769636b
+    source_candidate_id: synthetic-softmax-34
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-rms_norm-035
+  recognized_contract: '{"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "contiguous", "operator": "rms_norm", "shape": {"M": 128, "N": 2048}}'
+  request: 'Generate a standalone HIP rms_norm kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "contiguous", "operator":
+    "rms_norm", "shape": {"M": 128, "N": 2048}}. Independent oracle JSON: {"method": "torch.nn.functional.rms_norm", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt,
+    torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 41e72b0a77244146b30935b287070ae81e140849a6a665e89b07b3425b4b8b0f
+    source_candidate_id: synthetic-rms_norm-35
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-rms_norm-036
+  recognized_contract: '{"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "contiguous", "operator": "rms_norm", "shape": {"M": 256, "N": 8192}}'
+  request: 'Generate a standalone HIP rms_norm kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "contiguous", "operator":
+    "rms_norm", "shape": {"M": 256, "N": 8192}}. Independent oracle JSON: {"method": "torch.nn.functional.rms_norm", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt,
+    torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: a0abddce6b223c430c80d448dc32a2ac17806c7d81045c7d9ca3ca61685cbeb6
+    source_candidate_id: synthetic-rms_norm-36
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-rms_norm-037
+  recognized_contract: '{"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "contiguous", "operator": "rms_norm", "shape": {"M": 64, "N": 3072}}'
+  request: 'Generate a standalone HIP rms_norm kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "contiguous", "operator":
+    "rms_norm", "shape": {"M": 64, "N": 3072}}. Independent oracle JSON: {"method": "torch.nn.functional.rms_norm", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt,
+    torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 7d8b6405628b9a02682e3dbb29b38f5ba8ad2ed3e889301ab2eb1439f2600389
+    source_candidate_id: synthetic-rms_norm-37
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-silu_and_mul-038
+  recognized_contract: '{"dtype": {"input": "bf16", "output": "bf16"}, "layout": "contiguous", "operator": "silu_and_mul", "shape": {"M": 256, "N": 3072}}'
+  request: 'Generate a standalone HIP silu_and_mul kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"input": "bf16", "output": "bf16"}, "layout": "contiguous", "operator": "silu_and_mul", "shape":
+    {"M": 256, "N": 3072}}. Independent oracle JSON: {"method": "torch_silu_mul", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle
+    at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 7543ef8eb61b5021c7ac6396227229931f88bba94139a1997e5277a61e9f9f1d
+    source_candidate_id: synthetic-silu_and_mul-38
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-silu_and_mul-039
+  recognized_contract: '{"dtype": {"input": "bf16", "output": "bf16"}, "layout": "contiguous", "operator": "silu_and_mul", "shape": {"M": 1024, "N": 1536}}'
+  request: 'Generate a standalone HIP silu_and_mul kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"input": "bf16", "output": "bf16"}, "layout": "contiguous", "operator": "silu_and_mul", "shape":
+    {"M": 1024, "N": 1536}}. Independent oracle JSON: {"method": "torch_silu_mul", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle
+    at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 34c6156c69609d5ee38de91b26e00630c27a38484b39c007c6f51e1468bbfe66
+    source_candidate_id: synthetic-silu_and_mul-39
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-fused_add_rms_norm-040
+  recognized_contract: '{"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "contiguous", "operator": "fused_add_rms_norm", "shape": {"M": 128, "N": 3072}}'
+  request: 'Generate a standalone HIP fused_add_rms_norm kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "contiguous",
+    "operator": "fused_add_rms_norm", "shape": {"M": 128, "N": 3072}}. Independent oracle JSON: {"method": "torch_add_rms_norm", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 40059781113688f45422418763272658e3c54620713405e0afde60a672d411c7
+    source_candidate_id: synthetic-fused_add_rms_norm-40
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-fused_add_rms_norm-041
+  recognized_contract: '{"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "contiguous", "operator": "fused_add_rms_norm", "shape": {"M": 256, "N": 2048}}'
+  request: 'Generate a standalone HIP fused_add_rms_norm kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"accum": "fp32", "input": "bf16", "output": "bf16", "weight": "bf16"}, "layout": "contiguous",
+    "operator": "fused_add_rms_norm", "shape": {"M": 256, "N": 2048}}. Independent oracle JSON: {"method": "torch_add_rms_norm", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: a06f98eda23006e7a85438afc60f475ebfb22e52d7ab006b7adc1a52c8f8d174
+    source_candidate_id: synthetic-fused_add_rms_norm-41
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-dynamic_per_token_quant-042
+  recognized_contract: '{"dtype": {"input": "bf16", "output": "fp8_e4m3fnuz", "scale": "fp32_per_token"}, "layout": "contiguous", "operator": "dynamic_per_token_quant", "shape": {"M": 64, "N": 2048}}'
+  request: 'Generate a standalone HIP dynamic_per_token_quant kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"input": "bf16", "output": "fp8_e4m3fnuz", "scale": "fp32_per_token"}, "layout": "contiguous",
+    "operator": "dynamic_per_token_quant", "shape": {"M": 64, "N": 2048}}. Independent oracle JSON: {"method": "torch_quantize", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 7bdd8d0220044069bfa0f54a56096c19f6a2089507d92951016d63bfc88b57d3
+    source_candidate_id: synthetic-dynamic_per_token_quant-42
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-dynamic_per_token_quant-043
+  recognized_contract: '{"dtype": {"input": "bf16", "output": "fp8_e4m3fnuz", "scale": "fp32_per_token"}, "layout": "contiguous", "operator": "dynamic_per_token_quant", "shape": {"M": 512, "N": 4096}}'
+  request: 'Generate a standalone HIP dynamic_per_token_quant kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"input": "bf16", "output": "fp8_e4m3fnuz", "scale": "fp32_per_token"}, "layout": "contiguous",
+    "operator": "dynamic_per_token_quant", "shape": {"M": 512, "N": 4096}}. Independent oracle JSON: {"method": "torch_quantize", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 642a82b0ada0942c6e776d09358807715e2f47a3fe1230092d4523c0f42f5949
+    source_candidate_id: synthetic-dynamic_per_token_quant-43
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-dynamic_per_tensor_quant-044
+  recognized_contract: '{"dtype": {"input": "bf16", "output": "fp8_e4m3fnuz", "scale": "fp32_scalar"}, "layout": "contiguous", "operator": "dynamic_per_tensor_quant", "shape": {"M": 128, "N": 1024}}'
+  request: 'Generate a standalone HIP dynamic_per_tensor_quant kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"input": "bf16", "output": "fp8_e4m3fnuz", "scale": "fp32_scalar"}, "layout": "contiguous",
+    "operator": "dynamic_per_tensor_quant", "shape": {"M": 128, "N": 1024}}. Independent oracle JSON: {"method": "torch_quantize", "tier": "pure_torch"}. Implement independently; do not call AITER, CK,
+    ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 1eb1c72b5e0e7574628eb6fc3c4c2e554cc14a1440859e61f738597e5cad6b08
+    source_candidate_id: synthetic-dynamic_per_tensor_quant-44
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-static_per_tensor_quant-045
+  recognized_contract: '{"dtype": {"input": "bf16", "output": "fp8_e4m3fnuz", "scale": "fp32_scalar"}, "layout": "contiguous", "operator": "static_per_tensor_quant", "shape": {"M": 256, "N": 3072}}'
+  request: 'Generate a standalone HIP static_per_tensor_quant kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"input": "bf16", "output": "fp8_e4m3fnuz", "scale": "fp32_scalar"}, "layout": "contiguous",
+    "operator": "static_per_tensor_quant", "shape": {"M": 256, "N": 3072}}. Independent oracle JSON: {"method": "torch_quantize", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 01b45c925be8a7c1ff2b42e2d5497d19cfe0fb13fd183c794cc840d9fe82ff18
+    source_candidate_id: synthetic-static_per_tensor_quant-45
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-static_per_tensor_quant-046
+  recognized_contract: '{"dtype": {"input": "bf16", "output": "fp8_e4m3fnuz", "scale": "fp32_scalar"}, "layout": "contiguous", "operator": "static_per_tensor_quant", "shape": {"M": 64, "N": 8192}}'
+  request: 'Generate a standalone HIP static_per_tensor_quant kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"input": "bf16", "output": "fp8_e4m3fnuz", "scale": "fp32_scalar"}, "layout": "contiguous",
+    "operator": "static_per_tensor_quant", "shape": {"M": 64, "N": 8192}}. Independent oracle JSON: {"method": "torch_quantize", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM,
+    OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: 2bb0e0eece4d754637f616115c7e9f54e6b1da9271d8e9f7573b8b5fa41202e1
+    source_candidate_id: synthetic-static_per_tensor_quant-46
+    split_group: held_out
+    target_lane: hip_gfx942
+- id: bench-hip-gfx942-fused_silu_mul-047
+  recognized_contract: '{"dtype": {"input": "bf16", "output": "bf16"}, "layout": "contiguous", "operator": "fused_silu_mul", "shape": {"M": 512, "N": 2048}}'
+  request: 'Generate a standalone HIP fused_silu_mul kernel for AMD gfx942. Frozen contract JSON: {"dtype": {"input": "bf16", "output": "bf16"}, "layout": "contiguous", "operator": "fused_silu_mul", "shape":
+    {"M": 512, "N": 2048}}. Independent oracle JSON: {"method": "torch_fused_silu_mul", "tier": "pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the
+    oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  seed_provenance:
+    contract_hash: ab09cc393042d62178efc7a0a574f361f8f6d43edea1224bf4da27c403a90001
+    source_candidate_id: synthetic-fused_silu_mul-47
+    split_group: held_out
+    target_lane: hip_gfx942
+version: 1

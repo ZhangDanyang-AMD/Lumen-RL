@@ -1,0 +1,41 @@
+tasks:
+- id: dense-gemm-fp16
+  type: gemm
+  kernel_path: ../examples/tasks/gemm
+  direction: Optimize all decode and prefill matrix shapes without per-case regressions.
+- id: dense-gemm-fp8
+  type: scaled_quant_gemm
+  kernel_path: ../examples/tasks/gemm_fp8
+  direction: Optimize gfx942 FP8 E4M3 FNUZ A8W8 dense GEMM while preserving per-token FP32 activation scales, per-output-channel FP32 weight scales, FP32 accumulation/scaling, and FP16 output; do not run this case on other architectures.
+- id: fused-attention-prefill
+  type: fused_attention
+  kernel_path: ../examples/tasks/fused_attention
+  direction: Preserve the full fused softmax(QK^T * scale + mask)V contract.
+- id: grouped-gemm-moe
+  type: grouped_gemm
+  kernel_path: ../examples/tasks/grouped_gemm
+  direction: Preserve variable per-expert routed counts and one grouped launch.
+- id: mi308-gemm-m1-n2048-k4096-fp16
+  type: gemm
+  kernel_path: ../examples/tasks/mi308-gemm-m1-n2048-k4096-fp16
+  direction: Optimize GEMM on MI308 with M=1 N=2048 K=4096.
+- id: mi308-gemm-m1234-n1024-k2048-fp16
+  type: gemm
+  kernel_path: ../examples/tasks/mi308-gemm-m1234-n1024-k2048-fp16
+  direction: Optimize GEMM on MI308 with M=1234 N=1024 K=2048.
+- id: phase1-triton-gfx942-softmax-square-bf16
+  type: aiter_generated
+  kernel_path: ../examples/tasks/generated/c606442bb1c24b9701ad13c5f2b737de64ec5d04db8a11c8a57e0ced00c62663
+  direction: 'Generate a standalone TRITON softmax kernel for AMD gfx942. Frozen contract JSON: {"axis":1,"dtype":{"input":"bf16","output":"bf16"},"layout":"row_major","operator":"softmax","shape":{"M":1024,"N":1024}}. Independent oracle JSON: {"method":"torch.softmax","tier":"pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  operator: softmax
+  backend: triton
+  architecture: gfx942
+  contract_hash: c606442bb1c24b9701ad13c5f2b737de64ec5d04db8a11c8a57e0ced00c62663
+- id: phase1-triton-gfx942-hip-rmsnorm2d
+  type: aiter_generated
+  kernel_path: ../examples/tasks/generated/50a4ce16c95ca9c464a8a1f739ec21f887eca2d7d261bf507103d45a0045ac14
+  direction: 'Generate a standalone TRITON rms_norm kernel for AMD gfx942. Frozen contract JSON: {"dtype":{"accum":"fp32","input":"bf16","output":"bf16","weight":"bf16"},"layout":"contiguous","operator":"rms_norm","shape":{"M":32,"N":4096}}. Independent oracle JSON: {"method":"torch.nn.functional.rms_norm","tier":"pure_torch"}. Implement independently; do not call AITER, CK, ASM, OPUS, hipBLASLt, torch operators, or the oracle at runtime. Create a deterministic GEAK harness and require compile, correctness, performance, and fresh-workspace verification.'
+  operator: rms_norm
+  backend: triton
+  architecture: gfx942
+  contract_hash: 50a4ce16c95ca9c464a8a1f739ec21f887eca2d7d261bf507103d45a0045ac14
