@@ -17,6 +17,7 @@ from torch import nn
 from lumenrl.engine.inference.vllm_moe_weight_sync import (
     FusedMoEWeightRouter,
     assert_weight_sync_coverage,
+    unstack_expert_weights,
 )
 
 E, I, H = 4, 6, 8
@@ -392,6 +393,102 @@ def test_coverage_modes_are_configurable():
             os.environ.pop("LUMENRL_WEIGHT_SYNC_CHECK", None)
         else:
             os.environ["LUMENRL_WEIGHT_SYNC_CHECK"] = previous
+
+
+def _stacked_payload(ep: int, scale=1.0):
+    """What the Megatron-native trainer sends with stack_experts at EP=ep:
+    per layer, stacks of experts ``e, e + E/ep, ...`` for each local index e."""
+    torch.manual_seed(7)
+    full_gate_up = [torch.randn(E, 2 * I, H) * scale for _ in range(N_LAYERS)]
+    full_down = [torch.randn(E, H, I) * scale for _ in range(N_LAYERS)]
+    step = E // ep
+    weights = []
+    for idx in range(N_LAYERS):
+        p = f"model.layers.{idx}.mlp.experts"
+        for e in range(step):
+            weights.append((f"{p}.{e}::{step}.gate_up_proj", full_gate_up[idx][e::step].clone()))
+            weights.append((f"{p}.{e}::{step}.down_proj", full_down[idx][e::step].clone()))
+    return weights, full_gate_up, full_down
+
+
+def test_stacked_experts_land_in_strided_slots_with_one_copy():
+    model = FakeModel()
+    weights, gate_up, down = _stacked_payload(ep=2)
+    passthrough, loaded = FusedMoEWeightRouter(model).route(weights)
+    assert passthrough == []
+    for idx in range(N_LAYERS):
+        experts = model.model.layers[idx].mlp.experts
+        assert torch.equal(experts.w13_weight.data, gate_up[idx])
+        assert torch.equal(experts.w2_weight.data, down[idx])
+        assert experts.calls == [], "unsharded stacks must bypass the per-expert loader"
+    assert loaded == {
+        f"model.layers.{i}.mlp.experts.{w}" for i in range(N_LAYERS)
+        for w in ("w13_weight", "w2_weight")
+    }
+
+
+def test_stacked_experts_cover_the_model():
+    model = FakeModel()
+    weights, _, _ = _stacked_payload(ep=4)
+    weights += [(f"model.layers.{i}.mlp.gate.weight", torch.randn(E, H)) for i in range(N_LAYERS)]
+    weights.append(("lm_head.weight", torch.randn(16, H)))
+    router = FusedMoEWeightRouter(model)
+    passthrough, loaded = router.route(weights)
+    loaded |= model.load_weights(passthrough)
+    assert_weight_sync_coverage(model, loaded, context="test")
+
+
+def test_stacked_experts_under_ep_use_global_ids():
+    """A rollout EP rank keeps only its experts; the stack's ids are global."""
+    model = FakeModel(ep_size=2, local_experts={1, 3})
+    weights, gate_up, down = _stacked_payload(ep=2)
+    FusedMoEWeightRouter(model).route(weights[:2])  # layer 0, experts 0 and 2
+    FusedMoEWeightRouter(model).route(weights[2:4])  # layer 0, experts 1 and 3
+    experts = model.model.layers[0].mlp.experts
+    assert all(len(shape) == 2 for _, shape in experts.calls)
+    for e in range(E):
+        want13 = gate_up[0][e] if e in {1, 3} else torch.zeros(2 * I, H)
+        want2 = down[0][e] if e in {1, 3} else torch.zeros(H, I)
+        assert torch.equal(experts.w13_weight.data[e], want13), e
+        assert torch.equal(experts.w2_weight.data[e], want2), e
+
+
+def test_stacked_experts_under_tp_take_the_right_slice():
+    tp_size, tp_rank = 2, 1
+    inter = I // tp_size
+    model = FakeModel(tp_size=tp_size, tp_rank=tp_rank)
+    weights, gate_up, down = _stacked_payload(ep=2)
+    FusedMoEWeightRouter(model).route(weights)
+    experts = model.model.layers[1].mlp.experts
+    assert len(experts.calls) == 3 * E, "w1 + w3 + w2, once per expert"
+    w13 = experts.w13_weight.data
+    assert torch.equal(w13[:, :inter], gate_up[1][:, inter : 2 * inter])
+    assert torch.equal(w13[:, inter:], gate_up[1][:, I + inter : I + 2 * inter])
+    assert torch.equal(experts.w2_weight.data, down[1][:, :, inter : 2 * inter])
+
+
+def test_stack_for_an_unknown_layer_is_loud():
+    model = FakeModel()
+    try:
+        FusedMoEWeightRouter(model).route(
+            [("model.layers.9.mlp.experts.0::2.gate_up_proj", torch.randn(2, 2 * I, H))]
+        )
+    except RuntimeError as exc:
+        assert "names no FusedMoE layer" in str(exc)
+    else:
+        raise AssertionError("a stack nobody can load must not pass silently")
+
+
+def test_unstack_gives_per_expert_checkpoint_names():
+    weights, gate_up, down = _stacked_payload(ep=2)
+    flat = dict(unstack_expert_weights(weights))
+    assert len(flat) == N_LAYERS * E * 3
+    p = "model.layers.1.mlp.experts.3."
+    assert torch.equal(flat[p + "gate_proj.weight"], gate_up[1][3][:I])
+    assert torch.equal(flat[p + "up_proj.weight"], gate_up[1][3][I:])
+    assert torch.equal(flat[p + "down_proj.weight"], down[1][3])
+    passthrough = [("lm_head.weight", torch.randn(16, H))]
+    assert unstack_expert_weights(passthrough) == passthrough
 
 
 if __name__ == "__main__":

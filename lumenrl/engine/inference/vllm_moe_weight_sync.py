@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Iterable, Sequence
 
 import torch
@@ -49,6 +50,47 @@ logger.setLevel(os.getenv("LUMENRL_LOGGING_LEVEL", "WARN"))
 _FUSED_GATE_UP = "gate_up_proj"
 _FUSED_DOWN = "down_proj"
 _FUSED_LEAVES = (_FUSED_GATE_UP, _FUSED_DOWN)
+
+# Expert stacks from the Megatron-native trainer: experts start, start+step, ...
+# of one layer as ``[n, out, in]``, named ``<experts>.{start}::{step}.<leaf>``
+# (``bridges.core.stacked_expert_rules``). Same per-expert layout as the fused
+# names above, but a strided subset of the experts.
+_STACKED = re.compile(r"^(.*\.experts)\.(\d+)::(\d+)\.(gate_up_proj|down_proj)$")
+
+
+def _stacked_expert_shards(
+    tensor: torch.Tensor, leaf: str, act_and_mul: bool = True,
+) -> list[tuple[str, torch.Tensor]]:
+    """Split one expert of a stack into vLLM shard ids (w1 = gate, w3 = up, w2 = down)."""
+    if leaf == _FUSED_DOWN:
+        return [("w2", tensor)]
+    if not act_and_mul:
+        return [("w1", tensor)]
+    half = tensor.shape[0] // 2
+    return [("w1", tensor[:half]), ("w3", tensor[half:])]
+
+
+def unstack_expert_weights(
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> list[tuple[str, torch.Tensor]]:
+    """Expand expert stacks into per-expert checkpoint names (views, no copies).
+
+    For receive paths that hand tensors to ``model.load_weights`` without the
+    router, e.g. online FP8, whose layerwise reload tracks experts one by one.
+    """
+    out: list[tuple[str, torch.Tensor]] = []
+    for name, tensor in weights:
+        m = _STACKED.match(name)
+        if m is None:
+            out.append((name, tensor))
+            continue
+        prefix, start, step, leaf = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4)
+        names = {"w1": "gate_proj", "w3": "up_proj", "w2": "down_proj"}
+        for k in range(tensor.shape[0]):
+            p = f"{prefix}.{start + k * step}."
+            for shard_id, shard in _stacked_expert_shards(tensor[k], leaf):
+                out.append((f"{p}{names[shard_id]}.weight", shard))
+    return out
 
 # vLLM submodules that hold the expert buffers *below* the layer everyone else
 # addresses: vLLM >=0.22 splits FusedMoE so the weights live in a nested
@@ -168,6 +210,10 @@ class FusedMoEWeightRouter:
         passthrough: list[tuple[str, torch.Tensor]] = []
         loaded: set[str] = set()
         for name, tensor in weights:
+            stacked = _STACKED.match(name)
+            if stacked is not None:
+                loaded.add(self._load_stacked(name, stacked, tensor))
+                continue
             prefix, leaf = _split_name(name)
             entry = self._experts.get(prefix)
             if entry is None or leaf not in _FUSED_LEAVES:
@@ -205,6 +251,52 @@ class FusedMoEWeightRouter:
             self._dispatch(module, param, param_name, shard_id, shard)
         if self._verify:
             self._verify_written(module, param, param_name, shards)
+        return param_name
+
+    def _load_stacked(self, name: str, match: re.Match, tensor: torch.Tensor) -> str:
+        """Load a strided expert stack: one copy when the layer is unsharded.
+
+        Unsharded and unpadded, the stack is exactly ``param[start::step]``, so
+        it bypasses vLLM's per-expert loader. Otherwise every expert goes
+        through ``weight_loader`` with its global id, which handles TP slicing,
+        the EP expert map and hidden-dim padding.
+        """
+        prefix, start, step, leaf = (
+            match.group(1), int(match.group(2)), int(match.group(3)), match.group(4),
+        )
+        entry = self._experts.get(prefix)
+        if entry is None:
+            raise RuntimeError(
+                f"expert stack {name} names no FusedMoE layer of the rollout model"
+            )
+        if tensor.ndim != 3:
+            raise RuntimeError(
+                f"expert stack {name} must be 3D (experts, out, in), got "
+                f"{tuple(tensor.shape)}"
+            )
+        module, w13_name, w2_name = entry
+        param_name = w13_name if leaf == _FUSED_GATE_UP else w2_name
+        param = self._params[param_name]
+
+        dest = param.data[start::step]
+        if (
+            self._ep_size(module) == 1 and self._tp_size(module) == 1
+            and dest.shape == tensor.shape and dest.dtype == tensor.dtype
+        ):
+            dest.copy_(tensor)
+            if self._verify and not torch.equal(dest, tensor):
+                raise RuntimeError(
+                    f"weight sync verify failed for {param_name} stack {start}::{step}"
+                )
+            return param_name
+
+        act_and_mul = self._is_act_and_mul(module)
+        for k in range(tensor.shape[0]):
+            for shard_id, shard in _stacked_expert_shards(tensor[k], leaf, act_and_mul):
+                module.weight_loader(
+                    param, shard, param_name, shard_id=shard_id,
+                    expert_id=start + k * step, return_success=True,
+                )
         return param_name
 
     def _verify_written(

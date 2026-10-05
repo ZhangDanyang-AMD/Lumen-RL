@@ -42,6 +42,7 @@ from lumenrl.engine.training.bridges.core import (
     rename,
     routed_expert_rules,
     split,
+    stacked_expert_rules,
 )
 
 __all__ = [
@@ -168,6 +169,7 @@ GPT = WeightBridge("gpt", [
     # MoE
     rename(_LAYER + "mlp.router.weight", _HF + "mlp.gate.weight"),
     *routed_expert_rules(),
+    *stacked_expert_rules(),
     Rule(_LAYER + "mlp.experts.weight1", _legacy_fc1),
     Rule(_LAYER + "mlp.experts.weight2", _legacy_fc2),
     gate_up(_LAYER + "mlp.shared_experts.linear_fc1.weight", _HF + "mlp.shared_expert."),

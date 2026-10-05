@@ -1549,7 +1549,16 @@ class LumenActorWorker(BaseWorker):
             alloc0 = float(torch.cuda.memory_allocated())
             torch.cuda.reset_peak_memory_stats()
 
-        params, _ = self._engine.get_per_tensor_param()
+        is_atom = str(get_nested_config(
+            self.config, "policy", "generation_backend", default="",
+        ) or "") == "atom"
+        # Expert stacks load as one copy per stack instead of vLLM's per-expert
+        # loader; only vLLM's receiver understands the stacked names.
+        stack_experts = (
+            not is_atom
+            and os.environ.get("LUMENRL_WEIGHT_SYNC_STACK_EXPERTS", "1") != "0"
+        )
+        params, _ = self._engine.get_per_tensor_param(stack_experts=stack_experts)
         gather_s = 0.0
 
         def _timed_export():
@@ -1581,9 +1590,6 @@ class LumenActorWorker(BaseWorker):
         # expert weight is 768 MiB, past the 512 MiB default. vLLM re-opens per
         # bucket and needs no such floor.
         min_bucket_bytes = 0
-        is_atom = str(get_nested_config(
-            self.config, "policy", "generation_backend", default="",
-        ) or "") == "atom"
         if is_atom:
             min_bucket_bytes = max(
                 (self._sent_nbytes(p, keep_fp32) for _, p in params), default=0,
