@@ -324,6 +324,7 @@ class vLLMColocateWorkerExtension:
                         changed,
                     )
 
+            staging = os.environ.get("LUMENRL_WEIGHT_SYNC_ONLINE_STAGING", "cpu")
             reload_error: BaseException | None = None
             try:
                 prepare_online_quantized_weights_for_loading(model)
@@ -341,6 +342,7 @@ class vLLMColocateWorkerExtension:
                     streamed_scales=False,
                     fingerprint_tracker=fingerprints,
                     finalize_fingerprints=False,
+                    staging=staging,
                 )
                 log_static_changes("after_load")
                 if integrity_enabled:
@@ -399,6 +401,7 @@ class vLLMColocateWorkerExtension:
                 expected_version=int(version),
                 verify_full_load=bool(verify_full_load),
                 streamed_scales=True,
+                staging="none",
             )
         else:
             stats = receive_weight_stream(
@@ -408,6 +411,7 @@ class vLLMColocateWorkerExtension:
                 expected_version=int(version),
                 verify_full_load=bool(verify_full_load),
                 streamed_scales=False,
+                staging="none",
             )
 
         verification = stats.get("verification", {})

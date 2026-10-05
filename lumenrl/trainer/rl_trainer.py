@@ -965,6 +965,12 @@ class RLTrainer:
         if sender is None:
             raise RuntimeError("RDMA weight sync returned no source statistics")
         total_s = time.perf_counter() - started
+        recv_rows = [
+            row
+            for result in results[len(send_refs):]
+            for row in (result if isinstance(result, list) else [result])
+            if isinstance(row, dict)
+        ]
         self._last_weight_sync_metrics = {
             "timing/weight_sync_rdma_s": total_s,
             "weight_sync/bytes": float(sender.get("bytes", 0.0)),
@@ -974,6 +980,16 @@ class RLTrainer:
             "weight_sync/backend_rdma": 1.0,
             "weight_sync/fp8_trainer_quantized": float(fp8_sync),
         }
+        for key in ("gather_s", "pack_s", "bcast_s", "final_sync_s"):
+            self._last_weight_sync_metrics[f"timing/weight_sync_rdma_sender_{key}"] = (
+                float(sender.get(key, 0.0) or 0.0)
+            )
+        for key in ("wait_s", "recv_s", "host_copy_s", "observe_s",
+                    "load_weights_s", "verify_s", "finalize_s"):
+            if recv_rows:
+                self._last_weight_sync_metrics[f"timing/weight_sync_rdma_recv_{key}"] = max(
+                    float(r.get(key, 0.0) or 0.0) for r in recv_rows
+                )
         logger.info(
             "RDMA weight sync committed: version=%d buckets=%d bytes=%.1fGB "
             "broadcast=%.2fs effective=%.2fGb/s total=%.2fs fp8_location=%s",
@@ -984,6 +1000,15 @@ class RLTrainer:
             float(sender.get("gbps", 0)),
             total_s,
             "trainer" if fp8_sync else "inference",
+        )
+        logger.info(
+            "RDMA weight sync breakdown v%d: %s",
+            version,
+            " ".join(
+                f"{k.removeprefix('timing/weight_sync_rdma_')}={v:.3f}"
+                for k, v in self._last_weight_sync_metrics.items()
+                if k.startswith("timing/weight_sync_rdma_")
+            ),
         )
         if sleeping:
             rollout_engine.wake(tags=["kv_cache"])
