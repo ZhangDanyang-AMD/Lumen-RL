@@ -505,7 +505,7 @@ def test_rdma_online_orders_snapshot_prepare_load_finalize_fingerprint(
         events.append("load")
         assert isinstance(fingerprint_tracker, Tracker)
         assert finalize_fingerprints is False
-        assert kwargs["staging"] == "cpu"
+        assert kwargs["staging"] == "gpu"
         return {"weights": 1.0}
 
     fake_platforms = ModuleType("vllm.platforms")

@@ -324,7 +324,8 @@ class vLLMColocateWorkerExtension:
                         changed,
                     )
 
-            staging = os.environ.get("LUMENRL_WEIGHT_SYNC_ONLINE_STAGING", "cpu")
+            # Set to cpu if held modules don't fit (e.g. DSv4's ~12 GB FusedMoE).
+            staging = os.environ.get("LUMENRL_WEIGHT_SYNC_ONLINE_STAGING", "gpu")
             reload_error: BaseException | None = None
             try:
                 prepare_online_quantized_weights_for_loading(model)
