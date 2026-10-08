@@ -899,8 +899,8 @@ class MegatronNativeEngine(MegatronBaseEngine):
         Non-expert params: TP all-gather (attention shards). Expert params:
         ETP-gather each local expert (fc1 gate/up column shards, fc2 row shards),
         then all-gather across the EP group with local->global expert relabel.
-        Expert names carry GLOBAL indices so ``bridges.gpt.megatron_to_hf`` maps
-        them back to HF ``mlp.experts.{e}.*``.
+        Expert names carry GLOBAL indices so ``bridges.gpt.megatron_to_hf`` maps them
+        back to HF ``mlp.experts.{e}.*``.
 
         ⚠️ A generator, and every ``yield`` sits downstream of a collective, so
         the caller MUST drain it on every rank. Abandoning it part-way leaves
