@@ -1059,16 +1059,6 @@ class MegatronNativeEngine(MegatronBaseEngine):
 
     def _full_megatron_named_params_moe(self):
         """Reconstruct the COMPLETE MoE model as (global_name, tensor) on every rank.
-
-        Streams rather than accumulates. That is not a refactor: the eager
-        version held the entire reconstructed model in GPU memory on every rank
-        before the first byte was sent -- 51.0 GiB measured on the 27.39B
-        4-layer slice, and ~529 GiB per rank for the full 43-layer model, which
-        no 288 GB card can hold. It is what put the trainer ~89 GB above a
-        standalone probe doing the same step, because a probe never syncs
-        weights. See the handoff's "the 89 GB" section.
-
-        ⚠️ Collective, and lazily so: drain it on every rank.
         """
         yield from self._full_named_params()
 
