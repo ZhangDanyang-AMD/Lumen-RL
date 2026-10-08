@@ -2,12 +2,12 @@ from collections.abc import Mapping
 
 import torch
 
-import lumenrl.engine.training.dsv4_megatron_bridge as dsv4_bridge
-from lumenrl.engine.training.dsv4_megatron_bridge import (
+import lumenrl.engine.training.bridges.dsv4 as dsv4_bridge
+from lumenrl.engine.training.bridges.dsv4 import (
     DSV4Dims,
     _normalize_hf_keys,
-    dsv4_megatron_to_hf,
-    hf_to_dsv4_megatron,
+    hf_to_megatron,
+    megatron_to_hf,
 )
 
 
@@ -98,7 +98,7 @@ def test_megatron_to_hf_uses_lookup_mapping_without_materializing_it():
             return len(tensors)
 
     converted = dict(
-        dsv4_megatron_to_hf(
+        megatron_to_hf(
             LookupOnlyMapping(),
             DSV4Dims(num_layers=0, num_experts=0, compress_ratios=[]),
         )
@@ -112,7 +112,7 @@ def test_megatron_to_hf_uses_lookup_mapping_without_materializing_it():
 
 
 def test_redhat_key_conversion_is_inverse_of_input_normalization():
-    assert hasattr(dsv4_bridge, "_denormalize_redhat_key")
+    assert hasattr(dsv4_bridge, "denormalize_redhat_key")
     cases = {
         "embed.weight": "model.embed_tokens.weight",
         "head.weight": "lm_head.weight",
@@ -130,7 +130,7 @@ def test_redhat_key_conversion_is_inverse_of_input_normalization():
     }
 
     for redhat_key, official_key in cases.items():
-        assert dsv4_bridge._denormalize_redhat_key(official_key) == redhat_key
+        assert dsv4_bridge.denormalize_redhat_key(official_key) == redhat_key
         normalized = _normalize_hf_keys({redhat_key: object()})
         assert list(normalized) == [official_key]
 
@@ -157,7 +157,7 @@ def test_asymmetric_pipeline_round_trip_preserves_global_layers_and_hash_tables(
     for pp_rank, (offset, local_count) in enumerate(
         zip(offsets, layers_per_rank)
     ):
-        megatron = hf_to_dsv4_megatron(
+        megatron = hf_to_megatron(
             checkpoint,
             dims,
             pp_rank=pp_rank,
@@ -172,7 +172,7 @@ def test_asymmetric_pipeline_round_trip_preserves_global_layers_and_hash_tables(
         assert local_layer_ids == set(range(local_count))
 
         restored = dict(
-            dsv4_megatron_to_hf(
+            megatron_to_hf(
                 megatron,
                 dims,
                 pp_rank=pp_rank,
@@ -208,7 +208,7 @@ def test_asymmetric_pipeline_round_trip_preserves_global_layers_and_hash_tables(
 def test_ep_rank_loads_global_experts_into_local_slots_without_remapping_hash_ids():
     dims, checkpoint = _tiny_dsv4_checkpoint(num_layers=1)
 
-    megatron = hf_to_dsv4_megatron(
+    megatron = hf_to_megatron(
         checkpoint,
         dims,
         ep_rank=1,

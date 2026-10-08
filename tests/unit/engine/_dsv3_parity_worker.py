@@ -28,7 +28,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from safetensors.torch import load_file  # noqa: E402
 from transformers import DeepseekV3ForCausalLM  # noqa: E402
 
-from lumenrl.engine.training import dsv3_megatron_bridge as dsv3  # noqa: E402
+from lumenrl.engine.training.bridges import dsv3  # noqa: E402
 
 CKPT = os.environ["DSV3_CKPT"]
 SEQ = 64
@@ -76,7 +76,7 @@ def _megatron_logits(hf_cfg: dict, state: dict, ids: torch.Tensor) -> torch.Tens
 
     meg = {
         k: v.to(DTYPE) for k, v in
-        dsv3.hf_to_dsv3_megatron(state, dsv3.build_dsv3_dims(hf_cfg), True).items()
+        dsv3.hf_to_megatron(state, dsv3.build_dsv3_dims(hf_cfg), True).items()
     }
     missing, unexpected = model.load_state_dict(meg, strict=False)
     real_missing = [k for k in missing if not any(s in k for s in _NOT_IN_CHECKPOINT)]

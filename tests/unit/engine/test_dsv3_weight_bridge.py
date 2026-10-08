@@ -13,7 +13,7 @@ import os
 import pytest
 import torch
 
-from lumenrl.engine.training import dsv3_megatron_bridge as dsv3
+from lumenrl.engine.training.bridges import dsv3
 
 TINY = {
     "architectures": ["DeepseekV3ForCausalLM"],
@@ -83,9 +83,9 @@ def tiny_model():
 def _export(model):
     import itertools
     named = itertools.chain(
-        model.named_parameters(), dsv3.dsv3_router_bias_buffers(model)
+        model.named_parameters(), dsv3.router_bias_buffers(model)
     )
-    return dict(dsv3.megatron_to_hf_dsv3(named))
+    return dict(dsv3.megatron_to_hf(named))
 
 
 # --- export -------------------------------------------------------------------
@@ -157,7 +157,7 @@ def test_round_trip_restores_every_megatron_parameter(tiny_model):
     """megatron -> HF -> megatron must return every parameter bit-identical."""
     original = {n: p.detach().clone() for n, p in tiny_model.named_parameters()}
     hf = _export(tiny_model)
-    back = dsv3.hf_to_dsv3_megatron(hf, dsv3.build_dsv3_dims(TINY), use_grouped_mlp=True)
+    back = dsv3.hf_to_megatron(hf, dsv3.build_dsv3_dims(TINY), use_grouped_mlp=True)
 
     missing = sorted(set(original) - set(back))
     assert not missing, f"round trip lost {len(missing)} params, e.g. {missing[:5]}"
@@ -177,7 +177,7 @@ def test_round_trip_introduces_no_tensor_the_model_cannot_hold(tiny_model):
     tolerant loader.
     """
     slots = set(dict(tiny_model.named_parameters())) | set(dict(tiny_model.named_buffers()))
-    back = dsv3.hf_to_dsv3_megatron(
+    back = dsv3.hf_to_megatron(
         _export(tiny_model), dsv3.build_dsv3_dims(TINY), use_grouped_mlp=True
     )
     assert not sorted(set(back) - slots)
@@ -185,7 +185,7 @@ def test_round_trip_introduces_no_tensor_the_model_cannot_hold(tiny_model):
 
 def test_round_trip_restores_the_router_bias_buffer(tiny_model):
     """It is a buffer, so the parameter-only round-trip check cannot see it."""
-    back = dsv3.hf_to_dsv3_megatron(
+    back = dsv3.hf_to_megatron(
         _export(tiny_model), dsv3.build_dsv3_dims(TINY), use_grouped_mlp=True
     )
     buffers = dict(tiny_model.named_buffers())
@@ -198,6 +198,6 @@ def test_round_trip_restores_the_router_bias_buffer(tiny_model):
 def test_sequential_expert_layout_round_trips_too(tiny_model):
     """Non-grouped MoE uses local_experts.{E}; both spellings must convert."""
     hf = _export(tiny_model)
-    back = dsv3.hf_to_dsv3_megatron(hf, dsv3.build_dsv3_dims(TINY), use_grouped_mlp=False)
+    back = dsv3.hf_to_megatron(hf, dsv3.build_dsv3_dims(TINY), use_grouped_mlp=False)
     assert "decoder.layers.1.mlp.experts.local_experts.0.linear_fc1.weight" in back
     assert "decoder.layers.1.mlp.experts.linear_fc1.weight0" not in back

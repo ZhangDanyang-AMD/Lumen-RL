@@ -46,11 +46,10 @@ from lumenrl.engine.training.megatron_base_engine import (
     _response_mask_is_token_indexed,
     moe_dispatcher_kwargs
 )
-from lumenrl.engine.training.qwen3_megatron_bridge import (
-    Qwen3Dims,
-    _pp_layer_range,
+from lumenrl.engine.training.bridges.core import load_hf_safetensors, pp_layer_range
+from lumenrl.engine.training.bridges.gpt import (
+    GPTDims,
     hf_to_megatron,
-    load_hf_safetensors,
     megatron_to_hf,
 )
 
@@ -549,7 +548,7 @@ class MegatronEngine(BaseEngine):
         self._ddp: Any = None                          # Megatron DistributedDataParallel wrapper
         self.optimizer: Any = None                     # Megatron distributed optimizer
         self.lr_scheduler: Any = None                  # Megatron OptimizerParamScheduler
-        self._dims: Qwen3Dims | None = None
+        self._dims: GPTDims | None = None
         self._step = 0
         self.mode: str | None = None
 
@@ -639,7 +638,7 @@ class MegatronEngine(BaseEngine):
         moe_ffn = int(hf.get("moe_intermediate_size", 0) or 0)
         shared_ffn = int(hf.get("shared_expert_intermediate_size", 0) or 0)
         shared_gate = bool(hf.get("shared_expert_gate", False))
-        self._dims = Qwen3Dims(
+        self._dims = GPTDims(
             num_layers=hf["num_hidden_layers"], hidden=hf["hidden_size"],
             num_heads=hf["num_attention_heads"], num_kv_groups=hf["num_key_value_heads"],
             head_dim=head_dim, ffn=hf["intermediate_size"], vocab=hf["vocab_size"],
@@ -2822,12 +2821,11 @@ class MegatronEngine(BaseEngine):
 
             # Each PP rank converts its local params to HF keys (with
             # correct global layer indices), then broadcasts to others.
+            layer_offset, _ = pp_layer_range(
+                self._dims, pp_rank, pp_size, self._layers_per_pp_rank,
+            )
             local_hf = dict(megatron_to_hf(
-                list(local_full.items()), self._dims,
-                ep_rank=0, ep_size=1,
-                pp_rank=pp_rank, pp_size=pp_size,
-                layers_per_pp_rank=self._layers_per_pp_rank,
-                use_grouped_mlp=self._use_grouped_mlp,
+                local_full.items(), self._dims, layer_offset=layer_offset,
             ))
 
             # Exchange param metadata across PP group so every rank
@@ -2855,12 +2853,7 @@ class MegatronEngine(BaseEngine):
             return _gen(), None
 
         # PP=1 path: convert directly
-        gen = megatron_to_hf(
-            list(local_full.items()), self._dims,
-            ep_rank=0, ep_size=1,
-            pp_rank=0, pp_size=1,
-            use_grouped_mlp=self._use_grouped_mlp,
-        )
+        gen = megatron_to_hf(local_full.items(), self._dims)
         return gen, None
 
     def _dist_sharded_state_dict(self, is_loading: bool):

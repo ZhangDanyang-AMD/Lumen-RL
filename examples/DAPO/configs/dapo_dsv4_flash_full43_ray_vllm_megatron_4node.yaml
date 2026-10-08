@@ -15,7 +15,7 @@
 #     TP=2 and PP at PP=2 -- but neither helps here. PP cannot divide 43 layers:
 #     transformer_block asserts num_layers % pp == 0, 43 is prime, and the uneven
 #     knobs (num_layers_in_first/last_pipeline_stage) are not plumbed through
-#     dsv4_megatron_bridge. TP would only shard the 7 B of non-expert weights and
+#     bridges/dsv4. TP would only shard the 7 B of non-expert weights and
 #     costs an all-gather per layer. CP is still refused, and now because it is
 #     measured wrong rather than unimplemented. See _dsv4_check_topology.
 #

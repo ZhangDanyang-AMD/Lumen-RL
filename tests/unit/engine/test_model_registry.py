@@ -72,7 +72,7 @@ def test_resolve_head_dim_falls_back_to_hidden_over_heads():
 
 def test_dense_config_resolves_to_dense_spec():
     spec = MODEL_REGISTRY.resolve(QWEN3_DENSE_CFG, {})
-    assert spec.name == "qwen3_dense"
+    assert spec.name == "gpt_dense"
     # Asserted through resolve_has_experts, not a declared flag: the expert check
     # is keyed on the effective count so engine_config can still override it.
     assert spec.resolve_has_experts(QWEN3_DENSE_CFG, {}) is False
@@ -80,20 +80,20 @@ def test_dense_config_resolves_to_dense_spec():
 
 def test_moe_config_resolves_to_moe_spec():
     spec = MODEL_REGISTRY.resolve(QWEN3_MOE_CFG, {})
-    assert spec.name == "qwen3_moe"
+    assert spec.name == "gpt_moe"
     assert spec.resolve_has_experts(QWEN3_MOE_CFG, {}) is True
 
 
 def test_engine_config_num_experts_override_promotes_dense_to_moe():
     """The pre-registry engine let engine_config override the HF expert count."""
     spec = MODEL_REGISTRY.resolve(QWEN3_DENSE_CFG, {"num_experts": 64})
-    assert spec.name == "qwen3_moe"
+    assert spec.name == "gpt_moe"
 
 
 def test_single_expert_is_not_moe():
     """``_is_moe`` was ``num_experts > 1``; one expert stays dense."""
     spec = MODEL_REGISTRY.resolve({**QWEN3_DENSE_CFG, "num_experts": 1}, {})
-    assert spec.name == "qwen3_dense"
+    assert spec.name == "gpt_dense"
 
 
 def test_dense_spec_builds_dims_matching_the_old_inline_construction():
@@ -143,8 +143,8 @@ def test_no_match_raises_rather_than_defaulting():
 def test_registered_families_are_ordered_specific_before_general():
     """DSv4 and MoE must both precede the dense catch-all."""
     names = MODEL_REGISTRY.names
-    assert names[-1] == "qwen3_dense"
-    assert names.index("deepseek_v4") < names.index("qwen3_moe")
+    assert names[-1] == "gpt_dense"
+    assert names.index("deepseek_v4") < names.index("gpt_moe")
 
 
 def test_caps_defaults_are_the_permissive_ones():
@@ -167,7 +167,7 @@ def test_dsv4_declares_the_capabilities_the_engine_used_to_hard_code():
 
 
 def test_generic_families_take_the_generic_paths():
-    for name in ("qwen3_moe", "qwen3_dense"):
+    for name in ("gpt_moe", "gpt_dense"):
         spec = next(s for s in _all_specs() if s.name == name)
         assert spec.caps.supports_hf_bridge is True
         assert spec.caps.supports_dynamic_batch is True
@@ -227,7 +227,7 @@ def test_every_registered_family_is_covered_by_these_tests():
     """
     covered = {s.name for s in _all_specs()}
     assert covered == set(MODEL_REGISTRY.names)
-    for family in ("deepseek_v4", "deepseek_v3", "qwen3_moe", "qwen3_dense"):
+    for family in ("deepseek_v4", "deepseek_v3", "gpt_moe", "gpt_dense"):
         assert family in covered, f"{family} is not covered by the per-family tests"
 
 
@@ -238,18 +238,17 @@ def test_exporters_are_distinct_per_family():
     assert len({id(f) for f in exporters.values()}) == len(specs)
 
 
-def test_dense_exporter_uses_the_plain_gather_and_te_naming(monkeypatch):
+def test_dense_exporter_uses_the_plain_gather(monkeypatch):
     """Pin the wiring without needing real tensors: patch the bridge, check inputs."""
     from lumenrl.engine.training import model_specs as ms
 
     seen = {}
 
-    def fake_megatron_to_hf(named, dims, te=False):
+    def fake_megatron_to_hf(named, dims):
         seen["gather"] = named
-        seen["te"] = te
         return iter(())
 
-    monkeypatch.setattr(ms, "megatron_to_hf", fake_megatron_to_hf)
+    monkeypatch.setattr(ms.gpt, "megatron_to_hf", fake_megatron_to_hf)
 
     sentinel = object()
 
@@ -264,7 +263,6 @@ def test_dense_exporter_uses_the_plain_gather_and_te_naming(monkeypatch):
 
     list(ms._export_dense(FakeEngine()))
     assert seen["gather"] is sentinel
-    assert seen["te"] is True
 
 
 def test_moe_exporter_uses_the_moe_gather(monkeypatch):
@@ -272,11 +270,11 @@ def test_moe_exporter_uses_the_moe_gather(monkeypatch):
 
     seen = {}
 
-    def fake_megatron_to_hf_moe(named, dims):
+    def fake_megatron_to_hf(named, dims):
         seen["gather"] = named
         return iter(())
 
-    monkeypatch.setattr(ms, "megatron_to_hf_moe", fake_megatron_to_hf_moe)
+    monkeypatch.setattr(ms.gpt, "megatron_to_hf", fake_megatron_to_hf)
 
     sentinel = object()
 

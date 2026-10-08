@@ -113,7 +113,7 @@ python3 -m pip install -v . --no-build-isolation'
 > undefined symbol。
 
 > 不要装 `megatron-bridge`。Qwen3 的 HF <-> Megatron 转换由
-> `lumenrl/engine/training/qwen3_megatron_bridge.py` 负责。
+> `lumenrl/engine/training/bridges/` 负责。
 
 ---
 

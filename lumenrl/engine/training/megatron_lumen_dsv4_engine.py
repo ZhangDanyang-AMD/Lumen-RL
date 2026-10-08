@@ -10,9 +10,9 @@ Subclasses :class:`MegatronEngine` to use the Lumen DSV4 layer spec
 the standard Qwen3 GPT layer spec.  Registered as ``backend="megatron_lumen_dsv4"``.
 
 Key differences from the Qwen3 parent:
-  - ``DSV4Dims`` replaces ``Qwen3Dims``
+  - ``DSV4Dims`` replaces ``GPTDims``
   - ``get_dsv4_spec()`` replaces ``get_gpt_layer_local_spec()``
-  - ``hf_to_dsv4_megatron()`` / ``dsv4_megatron_to_hf()`` for weight I/O
+  - ``bridges.dsv4.hf_to_megatron()`` / ``bridges.dsv4.megatron_to_hf()`` for weight I/O
   - MoE router gates, expert bias, and tid2eid hash table are frozen
   - FP32 parameters (HC, attn_sink, compressor APE/norm) are preserved
 """
@@ -35,13 +35,8 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from lumenrl.engine.training.base_engine import EngineRegistry
-from lumenrl.engine.training.dsv4_megatron_bridge import (
-    DSV4_FLASH_COMPRESS_RATIOS,
-    DSV4Dims,
-    _denormalize_redhat_key,
-    dsv4_megatron_to_hf,
-    hf_to_dsv4_megatron,
-)
+from lumenrl.engine.training.bridges import dsv4
+from lumenrl.engine.training.bridges.core import load_hf_safetensors
 from lumenrl.engine.training.megatron_engine import (
     MegatronEngine,
     _clear_stale_router_replay_instances,
@@ -49,7 +44,6 @@ from lumenrl.engine.training.megatron_engine import (
     _shard_with_stride,
 )
 from lumenrl.engine.training.megatron_base_engine import moe_dispatcher_kwargs
-from lumenrl.engine.training.qwen3_megatron_bridge import load_hf_safetensors
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LUMENRL_LOGGING_LEVEL", "INFO"))
@@ -636,7 +630,7 @@ class MegatronLumenDSV4Engine(MegatronEngine):
             else:
                 compress_ratios = [int(x) for x in compress_ratios_raw]
         else:
-            compress_ratios = list(DSV4_FLASH_COMPRESS_RATIOS)
+            compress_ratios = list(dsv4.DSV4_FLASH_COMPRESS_RATIOS)
         self._input_sequence_alignment = _dsv4_sequence_alignment(
             tp, compress_ratios
         )
@@ -654,7 +648,7 @@ class MegatronLumenDSV4Engine(MegatronEngine):
         )
         moe_topk = int(hf.get("num_experts_per_tok", ec.get("moe_router_topk", 6)))
 
-        self._dims = DSV4Dims(
+        self._dims = dsv4.DSV4Dims(
             num_layers=hf["num_hidden_layers"],
             hidden=hf["hidden_size"],
             num_heads=hf["num_attention_heads"],
@@ -854,7 +848,7 @@ class MegatronLumenDSV4Engine(MegatronEngine):
             self._rank(), self.model_name, ep_rank, ep_size, num_experts,
         )
         hf_state = load_hf_safetensors(self.model_name)
-        meg_state = hf_to_dsv4_megatron(
+        meg_state = dsv4.hf_to_megatron(
             hf_state, self._dims,
             ep_rank=ep_rank, ep_size=ep_size,
             pp_rank=pp_rank, pp_size=pp_size,
@@ -863,7 +857,7 @@ class MegatronLumenDSV4Engine(MegatronEngine):
         )
         del hf_state
 
-        # TP shard: hf_to_dsv4_megatron returns full tensors; the GPTModel's
+        # TP shard: dsv4.hf_to_megatron returns full tensors; the GPTModel's
         # parallel linears only hold 1/tp of each weight.
         #
         # Detect which params need TP sharding by comparing bridge output shape
@@ -1104,12 +1098,12 @@ class MegatronLumenDSV4Engine(MegatronEngine):
         }
 
         def convert_for_rollout(mapping):
-            for key, tensor in dsv4_megatron_to_hf(
+            for key, tensor in dsv4.megatron_to_hf(
                 mapping,
                 self._dims,
                 **convert_kwargs,
             ):
-                yield _denormalize_redhat_key(key), tensor
+                yield dsv4.denormalize_redhat_key(key), tensor
 
         # PP=1 still returns a lazy bridge generator: TP/EP collectives occur
         # only when the caller requests the next HF tensor.

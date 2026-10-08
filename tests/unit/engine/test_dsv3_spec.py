@@ -10,7 +10,7 @@ fixture simply does not have.
 
 import pytest
 
-from lumenrl.engine.training import dsv3_megatron_bridge as dsv3
+from lumenrl.engine.training.bridges import dsv3
 from lumenrl.engine.training import model_specs  # noqa: F401  (registers specs)
 from lumenrl.engine.training.model_registry import MODEL_REGISTRY
 
@@ -71,11 +71,11 @@ def test_kimi_k2_resolves_to_the_deepseek_v3_entry():
 def test_dsv3_is_matched_before_the_generic_moe_entry():
     """A DSv3 config declares routed experts, so ordering is what saves it.
 
-    If qwen3_moe claimed it, the model would be built with a plain
+    If gpt_moe claimed it, the model would be built with a plain
     TransformerConfig and fused QKV, which is wrong for MLA.
     """
     names = MODEL_REGISTRY.names
-    assert names.index("deepseek_v3") < names.index("qwen3_moe")
+    assert names.index("deepseek_v3") < names.index("gpt_moe")
 
 
 def test_detection_is_by_architecture_not_by_mla_fields():

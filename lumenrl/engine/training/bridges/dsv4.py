@@ -23,11 +23,8 @@ from typing import Optional
 
 import torch
 
-from lumenrl.engine.training.qwen3_megatron_bridge import (
-    Qwen3Dims,
-    _pp_layer_range,
-    load_hf_safetensors,
-)
+from lumenrl.engine.training.bridges.core import pp_layer_range, strip_module_prefix
+from lumenrl.engine.training.bridges.gpt import GPTDims
 
 # Default compress_ratios for the 43-layer Flash model.
 # Layers 0,1,42: ratio=0 (no compressor/indexer)
@@ -35,23 +32,13 @@ from lumenrl.engine.training.qwen3_megatron_bridge import (
 # Odd layers 3,5,...,41: ratio=128 (HCA -- compressor only, no indexer)
 DSV4_FLASH_COMPRESS_RATIOS: list[int] = [0, 0] + [4, 128] * 20 + [0]  # 43 values
 
-MODEL_TYPE = "deepseek_v4"
-
-
 def is_dsv4(hf: dict) -> bool:
-    """Does this HF config describe a DeepSeek-V4 model?
+    """True when ``config.json`` is a DeepSeek-V4 family (MLA + hyper-connections).
 
     ``MegatronNativeEngine.__init__`` asks this of every model it builds, so a
     Qwen3 run reaches it too: it is how the engine decides whether to take the
-    DSv4 path in this module at all.
+    DSv4 path at all.
     """
-    if str(hf.get("model_type", "")) == MODEL_TYPE:
-        return True
-    return any("DeepseekV4" in a for a in hf.get("architectures", []))
-
-
-def is_dsv4(hf: dict) -> bool:
-    """True when ``config.json`` is a DeepSeek-V4 family (MLA + hyper-connections)."""
     model_type = str(hf.get("model_type") or "").lower()
     if "deepseek_v4" in model_type or "dsv4" in model_type:
         return True
@@ -60,8 +47,8 @@ def is_dsv4(hf: dict) -> bool:
 
 
 @dataclass
-class DSV4Dims(Qwen3Dims):
-    """Qwen3Dims extended with DSV4-specific MLA / HC / compressor fields."""
+class DSV4Dims(GPTDims):
+    """GPTDims extended with DSV4-specific MLA / HC / compressor fields."""
 
     q_lora_rank: int = 1024
     kv_lora_rank: int = 512          # also serves as head_dim for MLA
@@ -144,7 +131,7 @@ def _expert_bias_or_zeros(
     )
 
 
-def _denormalize_redhat_key(key: str) -> str:
+def denormalize_redhat_key(key: str) -> str:
     """Map a normalized DSV4 key back to the RedHat checkpoint/vLLM format."""
     if key == "model.embed_tokens.weight":
         return "embed.weight"
@@ -188,7 +175,7 @@ def _denormalize_redhat_key(key: str) -> str:
     return key
 
 
-def hf_to_dsv4_megatron(
+def hf_to_megatron(
     hf: dict[str, torch.Tensor],
     d: DSV4Dims,
     ep_rank: int = 0,
@@ -239,7 +226,7 @@ def hf_to_dsv4_megatron(
         num_local = d.num_experts // ep_size
         expert_offset = ep_rank * num_local
 
-    layer_offset, num_local_layers = _pp_layer_range(
+    layer_offset, num_local_layers = pp_layer_range(
         d, pp_rank, pp_size, layers_per_pp_rank,
     )
 
@@ -365,7 +352,7 @@ def hf_to_dsv4_megatron(
     return m
 
 
-def dsv4_megatron_to_hf(
+def megatron_to_hf(
     named_params,
     d: DSV4Dims,
     pp_rank: int = 0,
@@ -375,7 +362,7 @@ def dsv4_megatron_to_hf(
 ):
     """Yield ``(hf_name, tensor)`` from Megatron GPTModel named params.
 
-    Inverse of ``hf_to_dsv4_megatron``.  Used for weight sync to vLLM.
+    Inverse of ``hf_to_megatron``.  Used for weight sync to vLLM.
 
     With PP > 1, maps local decoder layer indices back to global HF
     layer indices.
@@ -385,12 +372,7 @@ def dsv4_megatron_to_hf(
     else:
         md: dict[str, torch.Tensor] = {}
         for name, t in named_params:
-            # Strip DDP/Float16Module wrappers
-            for pre in ("module.module.", "module."):
-                if name.startswith(pre):
-                    name = name[len(pre):]
-                    break
-            md[name] = t
+            md[strip_module_prefix(name)] = t
 
     def get(n):
         return md[n]
@@ -418,7 +400,7 @@ def dsv4_megatron_to_hf(
         num_local = d.num_experts  # after EP all-gather, we have all experts
         expert_offset = 0
 
-    layer_offset, num_local_layers = _pp_layer_range(
+    layer_offset, num_local_layers = pp_layer_range(
         d, pp_rank, pp_size, layers_per_pp_rank,
     )
 
