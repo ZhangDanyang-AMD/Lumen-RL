@@ -9,6 +9,7 @@ import re
 import resource
 import shutil
 import sys
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -70,6 +71,8 @@ class LumenActorWorker(BaseWorker):
         super().__init__(rank, world_size, config)
         self._engine: BaseEngine | None = None
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._peak_carry_alloc = 0.0
+        self._peak_carry_reserved = 0.0
 
     def init_model(self, forward_only: bool = False) -> None:
         """Build policy network via EngineRegistry."""
@@ -757,6 +760,8 @@ class LumenActorWorker(BaseWorker):
 
     def reset_memory_stats(self) -> bool:
         """Reset per-step CUDA/HIP peak memory counters for this actor rank."""
+        self._peak_carry_alloc = 0.0
+        self._peak_carry_reserved = 0.0
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
         return True
@@ -794,8 +799,14 @@ class LumenActorWorker(BaseWorker):
                 "cpu_memory_used_bytes": cpu_memory_used_bytes,
             }
         return {
-            "max_reserved_bytes": float(torch.cuda.max_memory_reserved()),
-            "max_allocated_bytes": float(torch.cuda.max_memory_allocated()),
+            "max_reserved_bytes": max(
+                self._peak_carry_reserved,
+                float(torch.cuda.max_memory_reserved()),
+            ),
+            "max_allocated_bytes": max(
+                self._peak_carry_alloc,
+                float(torch.cuda.max_memory_allocated()),
+            ),
             "reserved_bytes": float(torch.cuda.memory_reserved()),
             "allocated_bytes": float(torch.cuda.memory_allocated()),
             "cpu_memory_used_bytes": cpu_memory_used_bytes,
@@ -1485,7 +1496,7 @@ class LumenActorWorker(BaseWorker):
     def update_weights_ipc_send(
         self, bucket_size_mb: int = 512, use_shm: bool = False,
         version: int | None = None,
-    ) -> bool:
+    ) -> dict[str, float]:
         """Stream full (all-gathered) BF16 weights to the colocated vLLM replica.
 
         verl-aligned ZMQ CUDA-IPC weight sync. ``full_tensor()`` is an FSDP
@@ -1499,6 +1510,9 @@ class LumenActorWorker(BaseWorker):
         ``CUDA_VISIBLE_DEVICES``, so each actor talks to the worker sitting on
         its own GPU. Every worker receives the full tensors; vLLM's weight
         loaders take their own slice.
+
+        Returns a dict of sync-only timing and peak-memory metrics. The trainer
+        aggregates the max across ranks.
         """
         if self._engine is None:
             raise RuntimeError("init_model() must be called before update_weights_ipc_send().")
@@ -1523,10 +1537,35 @@ class LumenActorWorker(BaseWorker):
         )
         keep_fp32 = os.environ.get("LUMENRL_SYNC_FP32") == "1"
 
+        gb = 1024.0 ** 3
+        alloc0 = 0.0
+        if torch.cuda.is_available():
+            self._peak_carry_alloc = max(
+                self._peak_carry_alloc, float(torch.cuda.max_memory_allocated()),
+            )
+            self._peak_carry_reserved = max(
+                self._peak_carry_reserved, float(torch.cuda.max_memory_reserved()),
+            )
+            alloc0 = float(torch.cuda.memory_allocated())
+            torch.cuda.reset_peak_memory_stats()
+
         params, _ = self._engine.get_per_tensor_param()
+        gather_s = 0.0
+
+        def _timed_export():
+            nonlocal gather_s
+            it = iter(params)
+            while True:
+                t0 = time.perf_counter()
+                try:
+                    item = next(it)
+                except StopIteration:
+                    break
+                gather_s += time.perf_counter() - t0
+                yield item
 
         def _gen():
-            for name, param in params:
+            for name, param in _timed_export():
                 full = param.full_tensor() if isinstance(param, DTensor) else param
                 full = full.detach()
                 if full.dtype == torch.float32 and not keep_fp32:
@@ -1553,8 +1592,20 @@ class LumenActorWorker(BaseWorker):
             zmq_handle=handle, bucket_size_mb=int(bucket_size_mb), use_shm=bool(use_shm),
             version=version, min_bucket_bytes=min_bucket_bytes,
         )
+        t_send = time.perf_counter()
         asyncio.run(sender.async_send_weights(_gen()))
-        return True
+        total_s = time.perf_counter() - t_send
+        peak_alloc = 0.0
+        if torch.cuda.is_available():
+            peak_alloc = float(torch.cuda.max_memory_allocated())
+        return {
+            "gather_s": gather_s,
+            "send_s": max(0.0, total_s - gather_s),
+            "total_s": total_s,
+            "peak_alloc_gb": peak_alloc / gb,
+            "peak_extra_gb": max(0.0, peak_alloc - alloc0) / gb,
+            **{f"sender_{k}": float(v) for k, v in sender.stats.items()},
+        }
 
     def cleanup(self) -> None:
         self._engine = None

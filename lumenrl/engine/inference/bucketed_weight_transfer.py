@@ -158,6 +158,9 @@ class BucketedWeightSender:
         self.socket = None
         self.buffer = None
         self.shm = None
+        # Wall-clock seconds per phase of the last send, plus counts. ``sync_s``
+        # absorbs the async bucket copies; ``ack_s`` is time the receiver held us.
+        self.stats: dict[str, float] = {}
 
     def _control(self, bucket_meta: dict, is_last: bool) -> dict:
         """Build a per-bucket control message.
@@ -175,18 +178,35 @@ class BucketedWeightSender:
 
     async def async_send_weights(self, weights: Iterable) -> None:
         """Stream ``(name, tensor)`` pairs to the receiver bucket-by-bucket."""
+        st = self.stats = {
+            "setup_s": 0.0, "sync_s": 0.0, "ack_s": 0.0, "cleanup_s": 0.0,
+            "buckets": 0, "direct": 0, "tensors": 0, "bytes": 0,
+        }
+
+        def _flush(meta: dict, is_last: bool) -> None:
+            t0 = time.perf_counter()
+            _sync()
+            t1 = time.perf_counter()
+            self.socket.send_pyobj(self._control(meta, is_last))
+            self.socket.recv()
+            st["sync_s"] += t1 - t0
+            st["ack_s"] += time.perf_counter() - t1
+            st["buckets"] += 1
+
         try:
+            t0 = time.perf_counter()
             self._init_socket()
             self._init_buffer()
+            st["setup_s"] = time.perf_counter() - t0
 
             offset = 0
             bucket_meta: dict[str, TensorMetadata] = {}
             async for name, weight in ensure_async_iterator(weights):
                 weight = weight.contiguous()
+                st["tensors"] += 1
+                st["bytes"] += weight.nbytes
                 if offset + weight.nbytes > self.bucket_size and len(bucket_meta) > 0:
-                    _sync()
-                    self.socket.send_pyobj(self._control(bucket_meta, False))
-                    self.socket.recv()
+                    _flush(bucket_meta, False)
                     bucket_meta = {}
                     offset = 0
 
@@ -196,7 +216,10 @@ class BucketedWeightSender:
                         f"bucket size; increase update_weights_bucket_megabytes "
                         f"({self.bucket_size_mb} MB)."
                     )
+                    t0 = time.perf_counter()
                     self._direct_send_large_weight(name, weight)
+                    st["ack_s"] += time.perf_counter() - t0
+                    st["direct"] += 1
                     continue
 
                 bucket_meta[name] = {
@@ -211,11 +234,11 @@ class BucketedWeightSender:
                 )
                 offset += weight.nbytes
 
-            _sync()
-            self.socket.send_pyobj(self._control(bucket_meta, True))
-            self.socket.recv()
+            _flush(bucket_meta, True)
         finally:
+            t0 = time.perf_counter()
             self._cleanup()
+            st["cleanup_s"] = time.perf_counter() - t0
 
     def _init_socket(self) -> None:
         if self.zmq_handle.startswith("ipc://"):
@@ -303,14 +326,26 @@ class BucketedWeightReceiver:
         self.socket = None
         self.buffer = None
         self.shm = None
+        # Wall-clock seconds per phase of the last receive, plus counts.
+        # ``setup_s`` includes waiting for the sender to start; ``wait_s`` is
+        # time blocked on the sender between buckets.
+        self.stats: dict[str, float] = {}
 
     def receive_weights(self, on_bucket_received: Callable) -> None:
+        st = self.stats = {
+            "setup_s": 0.0, "wait_s": 0.0, "load_s": 0.0, "sync_s": 0.0,
+            "cleanup_s": 0.0, "buckets": 0, "tensors": 0,
+        }
         try:
+            t0 = time.perf_counter()
             self._init_socket()
             self._init_buffer()
+            st["setup_s"] = time.perf_counter() - t0
 
             while True:
+                t0 = time.perf_counter()
                 metadata = self.socket.recv_pyobj()
+                st["wait_s"] += time.perf_counter() - t0
                 check_bucket_version(metadata, self.expected_version)
                 weights, tensor = [], None
                 for name, meta in metadata["bucket_meta"].items():
@@ -326,14 +361,22 @@ class BucketedWeightReceiver:
                     if self.use_shm:
                         tensor = tensor.to(self.device)
                     weights.append((name, tensor))
+                t0 = time.perf_counter()
                 on_bucket_received(weights)
+                t1 = time.perf_counter()
                 _sync()
+                st["load_s"] += t1 - t0
+                st["sync_s"] += time.perf_counter() - t1
+                st["buckets"] += 1
+                st["tensors"] += len(weights)
                 self.socket.send(b"")
                 del weights, tensor
                 if metadata["is_last"]:
                     break
         finally:
+            t0 = time.perf_counter()
             self._cleanup()
+            st["cleanup_s"] = time.perf_counter() - t0
 
     def _init_socket(self) -> None:
         self.socket = self.zmq_context.socket(zmq.REP)
