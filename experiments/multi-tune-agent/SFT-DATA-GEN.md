@@ -9,7 +9,7 @@ End-to-end guide for generating training data for Qwen3-Coder kernel optimizatio
 - 8x AMD MI308X GPUs with ROCm 7.0
 - Docker container with vLLM 0.15.0+rocm700
 - GEAK repo at `/home/danyzhan/GEAK`
-- AITER repo at `/home/danyzhan/aiter`
+- AITER repo at `/home/danyzhan/Lumen/third_party/aiter`
 - A serving model (e.g., Qwen/Qwen3-Coder-30B-A3B-Instruct) on vLLM
 
 ```bash

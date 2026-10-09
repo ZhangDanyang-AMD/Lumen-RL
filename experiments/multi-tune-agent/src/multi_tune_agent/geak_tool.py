@@ -407,6 +407,17 @@ class GEAKToolEnvironment:
                         else {}
                     ),
                 }
+                case_seed = observation["provenance"].get("case_seed")
+                case_seed = case_seed if isinstance(case_seed, Mapping) else {}
+                target_lane = case_seed.get("target_lane")
+                language = metadata.get("language") or metadata.get("backend")
+                if not language and isinstance(target_lane, str):
+                    language = target_lane.split("_", 1)[0]
+                if language:
+                    observation["language"] = str(language).lower()
+                    observation["backend"] = str(language).lower()
+                if target_lane:
+                    observation["target_lane"] = target_lane
                 observation["trust"] = metadata.get("trust", {})
                 observation["optimization_contract_instruction"] = (
                     "Preserve the supplied generated-kernel contract, shapes, dtypes, "

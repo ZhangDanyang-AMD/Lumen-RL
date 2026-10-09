@@ -330,8 +330,18 @@ class ToolAgentLoop(AgentLoopBase):
                     pending_calls = turn.tool_calls
                     if pending_calls:
                         state = AgentState.PROCESSING_TOOLS
-                    else:
+                    elif metrics.assistant_turns >= self.max_assistant_turns:
                         state = AgentState.TERMINATED
+                    else:
+                        has_speedup = any(r > 0 for r in tool_rewards)
+                        if has_speedup:
+                            state = AgentState.TERMINATED
+                        else:
+                            history.append({
+                                "role": "user",
+                                "content": "No speedup achieved yet. Keep trying different optimization strategies. Use read_file to review the kernel, then write_file with a new approach, and evaluate.",
+                            })
+                            state = AgentState.GENERATING
                     continue
                 if state is AgentState.PROCESSING_TOOLS:
                     for call in pending_calls:

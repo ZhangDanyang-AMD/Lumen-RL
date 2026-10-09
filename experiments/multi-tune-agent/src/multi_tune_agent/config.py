@@ -19,6 +19,7 @@ class MultiTuneConfig:
     model: str = "Qwen/Qwen3-Coder-Next"
     gpu_ids: str = "1"
     request_timeout: float = 600.0
+    request_max_tokens: int = 4096
     command_timeout: int = 300
     baseline_repeats: int = 3
     max_rounds: int = 3
@@ -63,6 +64,12 @@ class MultiTuneConfig:
             raise ValueError("tool round limits must be positive")
         if self.baseline_repeats < 1:
             raise ValueError("baseline_repeats must be positive")
+        if (
+            isinstance(self.request_max_tokens, bool)
+            or not isinstance(self.request_max_tokens, int)
+            or self.request_max_tokens < 128
+        ):
+            raise ValueError("request_max_tokens must be an integer of at least 128")
         if self.candidate_floor <= 0 or self.target_speedup <= 0:
             raise ValueError("speedup thresholds must be positive")
         if self.min_improvement < 0:

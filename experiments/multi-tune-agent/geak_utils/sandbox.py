@@ -178,7 +178,6 @@ class KernelSandbox:
     def evaluate(self) -> EvaluationResult:
         if not self.baseline_ms:
             raise SandboxError("establish_baseline() must run before evaluate()")
-
         compile_result = self.run_mode("compile") if "compile" in self.commands else None
         compiled = compile_result is None or compile_result.ok
         if not compiled:
