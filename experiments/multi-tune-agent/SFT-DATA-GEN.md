@@ -326,3 +326,68 @@ geak-agent-coder data-build --config configs/data/qwen3_30b_a3b_phase1.yaml
 # 5. Train
 torchrun --nproc-per-node=8 -m geak_agent_coder.sft.train --config configs/sft/qwen3_coder_12k_production.yaml
 ```
+
+
+## Phase 5: Unified Messages Dataset (SFT-f)
+
+### Dataset Location
+- HuggingFace: `Zhangdanyang/agent-kernel-sft-gfx942-triton-HIP`
+- Local: `/home/danyzhan/geak_sft_dataset/merged_sft_v2/train.jsonl`
+
+### Format
+All data unified to `messages` chat format (compatible with Qwen3-Coder SFT training):
+
+```json
+{
+  "messages": [
+    {"role": "system", "content": "You are an expert GPU kernel engineer..."},
+    {"role": "user", "content": "<task description + kernel code>"},
+    {"role": "assistant", "content": "<diff patch or complete kernel>"}
+  ],
+  "task_type": "direction_conditioned|cold_start|error_recovery|profile_guided|regression_balance|complete_implementation",
+  "operator": "gemm|rms_norm|mha|...",
+  "data_source": "patch_v1|complete_impl_v1",
+  "schema_version": "messages_v1"
+}
+```
+
+### Composition
+
+| File | Samples | Content |
+|------|---------|---------|
+| train.jsonl | 3164 | 2000 patch + 1164 complete implementation |
+| dev.jsonl | 200 | Patch optimization (converted) |
+| samples.jsonl | 2700 | Full sample pool (converted) |
+
+### Task Types
+
+| Type | Count (train) | Input | Output | Teaches |
+|------|---------------|-------|--------|---------|
+| direction_conditioned | 907 | kernel + optimization direction | diff patch | Directed optimization |
+| complete_implementation | 1164 | operator spec only (no code) | complete kernel | From-scratch writing |
+| cold_start | 307 | kernel, no direction | diff patch | Self-directed optimization |
+| error_recovery | 293 | broken kernel + error | fix patch | Debugging |
+| profile_guided | 293 | kernel + profiling data | optimization patch | Performance tuning |
+| regression_balance | 200 | kernel + constraints | balanced patch | Safe optimization |
+
+### Data Sources
+- **patch_v1** (2000): From `phase1-production-wave-2000-v1` agent runs
+- **complete_impl_v2** (1164): Derived from `phase1-production-wave-2000-v1` by applying patches (fuzzy match) to parent_source to get final optimized kernels. Covers 23 operator types.
+
+### No Overlap with Benchmark
+- Training data: `phase1-production-wave-*` task pools (23 operators)
+- Benchmark: `held-out-benchmark-aiter` (8 operators, 100 tasks)
+- Verified: 0 content overlap
+
+### Build Commands
+
+```bash
+# Generate complete implementation data from existing patches
+python3 gen_complete_impl_data.py
+
+# Unify all data to messages format
+python3 unify_format.py
+
+# Upload to HuggingFace
+huggingface-cli upload Zhangdanyang/agent-kernel-sft-gfx942-triton-HIP train.jsonl --repo-type dataset
+```

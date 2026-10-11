@@ -94,6 +94,7 @@ class SFTCollector:
         self._candidate_count = 0
         self._accepted_candidate_count = 0
         self._frozen_input_hashes: dict[int, str] = {}
+        self._frozen_parent_sources: dict[int, dict[str, dict[str, Any]]] = {}
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.blob_root.mkdir(parents=True, exist_ok=True)
 
@@ -104,10 +105,15 @@ class SFTCollector:
         self.config_snapshot = _redact(config_value)
         self.config_hash = self.store_blob(_json_bytes(self.config_snapshot))
         environment = self._environment(config)
-        if (environment.get("lumen_git") or {}).get("dirty"):
-            self.mark_ineligible("lumen_worktree_dirty")
-        if (environment.get("geak_git") or {}).get("dirty"):
-            self.mark_ineligible("geak_worktree_dirty")
+        software = environment.get("software")
+        software = software if isinstance(software, Mapping) else {}
+        for field in ("rocm_version", "compiler_version"):
+            if not str(software.get(field) or "").strip():
+                self.mark_ineligible("missing_environment_%s" % field)
+        for field in ("gpu_inventory", "gpu_architecture"):
+            receipt = environment.get(field)
+            if not isinstance(receipt, Mapping) or receipt.get("ok") is not True:
+                self.mark_ineligible("missing_environment_%s" % field)
         self.environment_hash = self.store_blob(_json_bytes(environment))
         self._write_json(self.environment_path, environment)
         self.append(
@@ -201,6 +207,25 @@ class SFTCollector:
         self, round_index: int, frozen_input: Mapping[str, Any]
     ) -> Path:
         created_at = time.time()
+        if self.task_type == "profile_guided":
+            profile = frozen_input.get("profile")
+            if not isinstance(profile, Mapping):
+                self.mark_ineligible("missing_frozen_profile")
+            elif profile.get("source_hash") != frozen_input.get("parent_source_hash"):
+                self.mark_ineligible("frozen_profile_source_mismatch")
+        elif self.task_type == "error_recovery" and not isinstance(
+            frozen_input.get("error_feedback"), Mapping
+        ):
+            self.mark_ineligible("missing_frozen_error_feedback")
+        elif self.task_type == "regression_balance" and (
+            not isinstance(frozen_input.get("per_case_benchmark"), Mapping)
+            or not isinstance(frozen_input.get("regression_constraints"), Mapping)
+        ):
+            self.mark_ineligible("missing_frozen_regression_context")
+        elif self.task_type == "direction_conditioned" and not (
+            self.run_dir / ("round_%d" % round_index) / "plan.json"
+        ).is_file():
+            self.mark_ineligible("missing_frozen_direction_plan")
         payload = {
             "schema_version": "geak_sft_frozen_input_v1",
             "run_id": self.run_id,
@@ -212,6 +237,23 @@ class SFTCollector:
         path = self.run_dir / ("round_%d" % round_index) / "frozen_input.json"
         digest = self.store_blob(_json_bytes(payload))
         self._frozen_input_hashes[int(round_index)] = digest
+        parent_source = frozen_input.get("parent_source")
+        if isinstance(parent_source, Mapping) and parent_source:
+            snapshot: dict[str, dict[str, Any]] = {}
+            for relative, text in parent_source.items():
+                if not isinstance(relative, str) or not isinstance(text, str):
+                    self.mark_ineligible("invalid_frozen_parent_source")
+                    snapshot = {}
+                    break
+                data = text.encode("utf-8")
+                snapshot[relative] = {
+                    "sha256": self.store_blob(data),
+                    "size": len(data),
+                }
+            if snapshot:
+                self._frozen_parent_sources[int(round_index)] = snapshot
+        else:
+            self.mark_ineligible("missing_frozen_parent_source")
         self._write_json(path, payload)
         self.append(
             {
@@ -236,11 +278,34 @@ class SFTCollector:
         round_index: int,
         role: str = "engineer",
     ) -> dict[str, Any]:
-        parent = self._source_snapshot(environment, parent_session_id)
+        parent = self._frozen_parent_sources.get(int(round_index))
+        frozen_parent_available = parent is not None
+        if parent is None:
+            self.mark_ineligible("candidate_without_frozen_parent_source")
+            parent = self._source_snapshot(environment, parent_session_id)
         child = self._source_snapshot(environment, candidate_session_id)
         patch = self._unified_patch(parent, child)
         patch_bytes = patch.encode("utf-8")
         patch_hash = self.store_blob(patch_bytes)
+        patch_applies = False
+        if patch:
+            from .sft_dataset import DatasetError, apply_unified_patch
+
+            try:
+                parent_bytes = {
+                    path: self._blob_bytes(metadata)
+                    for path, metadata in parent.items()
+                }
+                child_bytes = {
+                    path: self._blob_bytes(metadata)
+                    for path, metadata in child.items()
+                }
+                applied, _ = apply_unified_patch(parent_bytes, patch_bytes)
+                patch_applies = applied == child_bytes
+            except DatasetError:
+                patch_applies = False
+        if patch and not patch_applies:
+            self.mark_ineligible("candidate_patch_replay_failed")
         evaluation = dict(verify_result.get("evaluation") or {})
         independently_verified = (
             verify_result.get("verify_source") == "multitune_independent"
@@ -266,7 +331,7 @@ class SFTCollector:
             "candidate_sources": child,
             "patch_hash": patch_hash,
             "patch_bytes": len(patch_bytes),
-            "patch_applies": bool(patch),
+            "patch_applies": patch_applies,
             "verify_result": _redact(dict(verify_result)),
             "independent_verify": independently_verified,
             "compile_pass": bool(evaluation.get("compiled")),
@@ -283,6 +348,8 @@ class SFTCollector:
             and record["independent_verify"]
             and record["compile_pass"]
             and record["correctness_pass"]
+            and frozen_parent_available
+            and record["frozen_input_hash"]
             and candidate.get("accepted")
         )
         accepted = (
@@ -409,6 +476,19 @@ class SFTCollector:
         lumen_root = Path(__file__).resolve().parents[4]
         geak_root = Path(config.geak_root).resolve()
         container = os.environ.get("GEAK_CONTAINER_NAME", "geak-phase1-vllm")
+        rocm_version = _run(
+            [
+                "docker",
+                "exec",
+                container,
+                "bash",
+                "-lc",
+                "cat /opt/rocm/.info/version 2>/dev/null || hipcc --version",
+            ]
+        )
+        compiler_version = _run(
+            ["docker", "exec", container, "bash", "-lc", "hipcc --version"]
+        )
         return {
             "schema_version": "geak_sft_environment_v1",
             "captured_at": time.time(),
@@ -430,6 +510,14 @@ class SFTCollector:
                         container,
                     ]
                 ),
+            },
+            "software": {
+                "rocm_version": str(rocm_version.get("stdout") or "").strip(),
+                "compiler_version": str(
+                    compiler_version.get("stdout") or ""
+                ).strip(),
+                "rocm_version_receipt": rocm_version,
+                "compiler_version_receipt": compiler_version,
             },
             "gpu_inventory": _run(
                 [
@@ -465,14 +553,41 @@ class SFTCollector:
             },
         }
 
-    @staticmethod
-    def _git_state(root: Path) -> dict[str, Any]:
+    def _git_state(self, root: Path) -> dict[str, Any]:
         head = _run(["git", "rev-parse", "HEAD"], cwd=root)
         branch = _run(["git", "branch", "--show-current"], cwd=root)
         remote = _run(["git", "remote", "get-url", "origin"], cwd=root)
         status = _run(["git", "status", "--porcelain"], cwd=root)
         diff = _run(["git", "diff", "--binary"], cwd=root)
         diff_bytes = str(diff.get("stdout") or "").encode("utf-8")
+        changed = _run(
+            ["git", "ls-files", "-m", "-o", "-d", "--exclude-standard"],
+            cwd=root,
+        )
+        working_files: dict[str, dict[str, Any]] = {}
+        for relative in sorted(set(str(changed.get("stdout") or "").splitlines())):
+            if not relative:
+                continue
+            path = (root / relative).resolve()
+            try:
+                path.relative_to(root)
+            except ValueError:
+                continue
+            if path.is_symlink():
+                data = os.readlink(path).encode("utf-8", errors="surrogateescape")
+                kind = "symlink"
+            elif path.is_file():
+                data = path.read_bytes()
+                kind = "file"
+            else:
+                working_files[relative] = {"kind": "deleted"}
+                continue
+            working_files[relative] = {
+                "kind": kind,
+                "sha256": self.store_blob(data),
+                "size": len(data),
+            }
+        working_state_sha256 = _sha256(_json_bytes(working_files))
         return {
             "root": str(root),
             "head": str(head.get("stdout") or "").strip(),
@@ -481,4 +596,6 @@ class SFTCollector:
             "dirty": bool(str(status.get("stdout") or "").strip()),
             "status": str(status.get("stdout") or "").splitlines(),
             "working_diff_sha256": _sha256(diff_bytes),
+            "working_state_sha256": working_state_sha256,
+            "working_files": working_files,
         }

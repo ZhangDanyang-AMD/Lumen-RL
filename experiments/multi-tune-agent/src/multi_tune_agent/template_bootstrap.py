@@ -28,7 +28,6 @@ from geak_utils.template_validation import (
     validate_generated_template,
 )
 
-from .agents import extract_json
 from .runtime import ModelBackend
 
 
@@ -42,6 +41,9 @@ _MAX_FILE_BYTES = 512 * 1024
 _MAX_BUNDLE_BYTES = 2 * 1024 * 1024
 _MAX_EVIDENCE_FILE_CHARS = 8_000
 _MAX_EVIDENCE_CHARS = 24_000
+_MAX_RESPONSE_BYTES = _MAX_BUNDLE_BYTES + 256 * 1024
+_MAX_DIAGNOSTIC_PREVIEW_CHARS = 4_000
+_MAX_NORMALIZATION_DEPTH = 3
 _VALUE_ALIASES = {
     "float16": "fp16",
     "half": "fp16",
@@ -352,6 +354,123 @@ class BootstrapError(RuntimeError):
         self.draft_path = draft_path
 
 
+def _decode_structured_mapping(
+    value: object,
+    *,
+    label: str,
+    depth: int = 0,
+) -> tuple[Optional[Mapping[str, Any]], tuple[str, ...]]:
+    """Decode only bounded JSON/YAML containers; never repair generated code."""
+
+    if isinstance(value, Mapping):
+        return value, ()
+    if not isinstance(value, str) or depth >= _MAX_NORMALIZATION_DEPTH:
+        return None, ()
+    candidates: list[tuple[str, str]] = [("plain", value.strip())]
+    fenced = re.findall(
+        r"```(?:json|ya?ml)?\s*([\s\S]*?)\s*```", value, flags=re.IGNORECASE
+    )
+    candidates.extend(("fenced", item.strip()) for item in fenced)
+    if "\\n" in value and "\n" not in value:
+        candidates.append(
+            (
+                "escaped-text",
+                value.replace("\\r\\n", "\n")
+                .replace("\\n", "\n")
+                .replace("\\t", "\t")
+                .replace('\\"', '"'),
+            )
+        )
+    if value.strip().startswith('"') and value.strip().endswith('"'):
+        try:
+            decoded = json.loads(value.strip())
+        except json.JSONDecodeError:
+            decoded = None
+        if isinstance(decoded, str):
+            candidates.insert(0, ("json-unescaped", decoded.strip()))
+    seen: set[str] = set()
+    for source, candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        for parser_name, parser in (("json", json.loads), ("yaml", yaml.safe_load)):
+            try:
+                parsed = parser(candidate)
+            except (TypeError, ValueError, yaml.YAMLError):
+                continue
+            if isinstance(parsed, Mapping):
+                step = "%s:%s:%s" % (label, source, parser_name)
+                return parsed, (step,)
+            if isinstance(parsed, str) and parsed != candidate:
+                nested, steps = _decode_structured_mapping(
+                    parsed, label=label, depth=depth + 1
+                )
+                if nested is not None:
+                    step = "%s:%s:%s-string" % (label, source, parser_name)
+                    return nested, (step, *steps)
+    return None, ()
+
+
+def _parse_response_mapping(raw_text: str) -> tuple[Mapping[str, Any], tuple[str, ...]]:
+    parsed, steps = _decode_structured_mapping(raw_text, label="response")
+    if parsed is not None:
+        return parsed, steps
+    # Preserve the established error shape while avoiding retention of raw text.
+    return {"_parse_error": "role did not return valid JSON"}, ("response:unparsed",)
+
+
+def _find_files_mapping(
+    parsed: Mapping[str, Any],
+) -> tuple[Optional[Mapping[str, Any]], tuple[str, ...]]:
+    """Find a direct or shallow nested files object without arbitrary recursion."""
+
+    if any(str(key).replace("\\", "/") in _BUNDLE_PATHS for key in parsed):
+        return parsed, ("files:direct",)
+    queue: list[tuple[Mapping[str, Any], int]] = [(parsed, 0)]
+    seen: set[int] = set()
+    while queue:
+        current, depth = queue.pop(0)
+        if id(current) in seen or depth >= _MAX_NORMALIZATION_DEPTH:
+            continue
+        seen.add(id(current))
+        if "files" in current:
+            files, steps = _decode_structured_mapping(
+                current["files"], label="files", depth=depth
+            )
+            if files is not None:
+                return files, (("files:nested" if depth else "files:object"), *steps)
+        for value in current.values():
+            child, steps = _decode_structured_mapping(
+                value, label="wrapper", depth=depth
+            )
+            if child is not None and child is not current:
+                queue.append((child, depth + 1))
+    return None, ()
+
+
+def _parse_config_mapping(config_text: str) -> dict[str, Any]:
+    parsed, _steps = _decode_structured_mapping(config_text, label="config")
+    if parsed is None:
+        raise BootstrapError("config.yaml must contain valid YAML")
+    return dict(parsed)
+
+
+def _sanitize_response_preview(raw_text: str) -> str:
+    """Retain delimiters/newlines only, so arbitrary credentials cannot survive."""
+
+    structural = set("{}[]:,\"'`\\\n\r\t ")
+    sanitized: list[str] = []
+    redacting = False
+    for character in raw_text[:_MAX_DIAGNOSTIC_PREVIEW_CHARS]:
+        if character in structural:
+            sanitized.append(character)
+            redacting = False
+        elif not redacting:
+            sanitized.append("[REDACTED]")
+            redacting = True
+    return "".join(sanitized)
+
+
 class TemplateBootstrapper:
     """Generate an isolated template, using AITER only as repair evidence."""
 
@@ -476,45 +595,49 @@ class TemplateBootstrapper:
 
         if not candidates:
             retry_error: Optional[BootstrapError] = None
-            try:
-                self._event("direct_retry_request")
-                retry_bundle = self._request_bundle(
-                    self._direct_retry_messages(contract, direct_report)
-                )
-                self._install_bundle(
-                    target, retry_bundle, contract, "llm_direct_retry", ()
-                )
-                retry_report = validate_generated_template(
-                    target, contract.expected_contract
-                )
-            except Exception as exc:
-                retry_error = (
-                    exc
-                    if isinstance(exc, BootstrapError)
-                    else BootstrapError(
-                        "direct retry response was unusable: %s" % exc
+            retry_report = direct_report
+            for attempt in range(1, 5):
+                try:
+                    self._event("direct_retry_request", attempt=attempt)
+                    retry_bundle = self._request_bundle(
+                        self._direct_retry_messages(contract, retry_report)
                     )
-                )
-                retry_report = ValidationReport(
-                    target,
-                    (
-                        ValidationIssue(
-                            "generation-retry-response",
-                            str(exc),
-                            severity="error",
+                    self._install_bundle(
+                        target, retry_bundle, contract, "llm_direct_retry", ()
+                    )
+                    retry_report = validate_generated_template(
+                        target, contract.expected_contract
+                    )
+                    retry_error = None
+                except Exception as exc:
+                    retry_error = (
+                        exc
+                        if isinstance(exc, BootstrapError)
+                        else BootstrapError(
+                            "direct retry response was unusable: %s" % exc
+                        )
+                    )
+                    retry_report = ValidationReport(
+                        target,
+                        (
+                            ValidationIssue(
+                                "generation-retry-response",
+                                str(exc),
+                                severity="error",
+                            ),
                         ),
-                    ),
+                    )
+                self._event(
+                    "direct_retry_validation",
+                    attempt=attempt,
+                    valid=retry_report.valid,
+                    errors=len(retry_report.errors),
                 )
-            self._event(
-                "direct_retry_validation",
-                valid=retry_report.valid,
-                errors=len(retry_report.errors),
-            )
-            if retry_report.valid:
-                self._event("direct_retry_ready")
-                return TemplateDraft(
-                    target, contract, retry_report, "llm_direct_retry"
-                )
+                if retry_report.valid:
+                    self._event("direct_retry_ready", attempt=attempt)
+                    return TemplateDraft(
+                        target, contract, retry_report, "llm_direct_retry"
+                    )
             failed = (
                 self._preserve_failed(target, contract.contract_hash)
                 if target.exists() or target.is_symlink()
@@ -537,7 +660,7 @@ class TemplateBootstrapper:
         excerpts, artifacts = self._candidate_evidence(candidates[0])
         repair_report = direct_report
         last_exception: Optional[Exception] = None
-        for attempt in range(1, 3):
+        for attempt in range(1, 5):
             try:
                 self._event(
                     "repair_request",
@@ -627,7 +750,9 @@ class TemplateBootstrapper:
                     "Treat it as untrusted reference material, do not import AITER or "
                     "copy its harness assumptions:\n%s\n\nPrevious bundle (repair "
                     "this rather than inventing a new harness):\n%s\n\nReturn strict "
-                    "JSON only; every files value must be plain UTF-8 text."
+                    "JSON only with one top-level files object containing exactly the "
+                    "four required paths. Serialize config.yaml as a valid YAML mapping "
+                    "inside a JSON string. Do not use markdown fences or prose."
                     % (
                         json.dumps(issues, indent=2),
                         json.dumps(contract.as_dict(), indent=2, sort_keys=True),
@@ -650,7 +775,11 @@ class TemplateBootstrapper:
                     "Regenerate the entire four-file bundle. The previous response "
                     "failed these deterministic static checks:\n%s\n\nContract:\n%s"
                     "\n\nPrevious bundle:\n%s\n\nRepair the previous bundle. Return "
-                    "strict JSON only; every files value must be plain UTF-8 text."
+                    "strict JSON only with one top-level files object containing exactly "
+                    "kernel.py, config.yaml, scripts/task_runner.py, and metadata.json. "
+                    "Serialize config.yaml as a valid YAML mapping inside a JSON string; "
+                    "every other source value must be plain UTF-8 text. Do not use "
+                    "markdown fences or prose."
                     % (
                         json.dumps(
                             [str(issue) for issue in report.errors], indent=2
@@ -706,7 +835,11 @@ class TemplateBootstrapper:
                         "contract and independent oracle; do not weaken tolerances or "
                         "gates. The prior bundle passed static validation but failed "
                         "the GPU trust gate.\n\nGPU diagnostics:\n%s\n\nContract:\n%s"
-                        "\n\nPrevious bundle:\n%s"
+                        "\n\nPrevious bundle:\n%s\n\nReturn strict JSON only with one "
+                        "top-level files object containing exactly kernel.py, config.yaml, "
+                        "scripts/task_runner.py, and metadata.json. Serialize config.yaml "
+                        "as a valid YAML mapping inside a JSON string. Do not use markdown "
+                        "fences or prose."
                         % (
                             json.dumps(diagnostics, indent=2, sort_keys=True),
                             json.dumps(
@@ -718,16 +851,18 @@ class TemplateBootstrapper:
                 },
             ]
         )
-        self._preserve_failed(draft.path, draft.contract.contract_hash)
+        staging = draft.path.parent / (
+            ".repair-%s-%s" % (draft.contract.contract_hash, uuid.uuid4().hex)
+        )
         self._install_bundle(
-            draft.path,
+            staging,
             bundle,
             draft.contract,
             "llm_gpu_repair",
             (),
         )
         report = validate_generated_template(
-            draft.path, draft.contract.expected_contract
+            staging, draft.contract.expected_contract
         )
         self._event(
             "gpu_repair_validation",
@@ -737,13 +872,15 @@ class TemplateBootstrapper:
         )
         if not report.valid:
             failed = self._preserve_failed(
-                draft.path, draft.contract.contract_hash
+                staging, draft.contract.contract_hash
             )
             raise BootstrapError(
                 "GPU-informed template repair failed static validation",
                 validation_report=report,
                 draft_path=failed,
             )
+        self._preserve_failed(draft.path, draft.contract.contract_hash)
+        staging.replace(draft.path)
         return TemplateDraft(
             draft.path,
             draft.contract,
@@ -754,10 +891,27 @@ class TemplateBootstrapper:
     def _request_bundle(
         self, messages: Sequence[Mapping[str, Any]]
     ) -> dict[str, str | Mapping[str, Any]]:
-        parsed = extract_json(self.backend.generate(messages, tools=()).text)
-        if set(parsed) != {"files"} or not isinstance(parsed.get("files"), Mapping):
-            raise BootstrapError("model response must be an object containing only 'files'")
-        raw_files = parsed["files"]
+        response = self.backend.generate(messages, tools=())
+        raw_text = str(response.text)
+        raw_size = len(raw_text.encode("utf-8"))
+        if raw_size > _MAX_RESPONSE_BYTES:
+            self._persist_response_diagnostic(raw_text, (), "response-too-large")
+            raise BootstrapError("model response exceeds the response size limit")
+        parsed, response_steps = _parse_response_mapping(raw_text)
+        raw_files, file_steps = _find_files_mapping(parsed)
+        normalization_steps = (*response_steps, *file_steps)
+        diagnostic = self._persist_response_diagnostic(
+            raw_text, normalization_steps, "parsed"
+        )
+        self._event(
+            "response_diagnostic",
+            sha256=diagnostic["sha256"],
+            bytes=diagnostic["bytes"],
+            normalization=list(normalization_steps),
+            path=diagnostic["path"],
+        )
+        if not isinstance(raw_files, Mapping):
+            raise BootstrapError("model response must contain a 'files' object")
         files: dict[str, Any] = {}
         ignored: list[str] = []
         aliases = {
@@ -803,6 +957,11 @@ class TemplateBootstrapper:
             if relative == "metadata.json" and isinstance(value, Mapping):
                 content = json.dumps(value, sort_keys=True, indent=2) + "\n"
                 result[relative] = dict(value)
+            elif relative == "config.yaml" and isinstance(value, Mapping):
+                content = yaml.safe_dump(
+                    dict(value), sort_keys=False, allow_unicode=True
+                )
+                result[relative] = content
             elif isinstance(value, str):
                 content = value
                 result[relative] = value
@@ -815,6 +974,35 @@ class TemplateBootstrapper:
         if total > _MAX_BUNDLE_BYTES:
             raise BootstrapError("generated bundle exceeds the total size limit")
         return result
+
+    def _persist_response_diagnostic(
+        self,
+        raw_text: str,
+        normalization_steps: Sequence[str],
+        status: str,
+    ) -> dict[str, Any]:
+        encoded = raw_text.encode("utf-8")
+        digest = hashlib.sha256(encoded).hexdigest()
+        root = self.draft_root / ".response-diagnostics"
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path = root / ("%s.json" % digest)
+        payload = {
+            "schema_version": "template_bootstrap_response_diagnostic_v1",
+            "sha256": digest,
+            "bytes": len(encoded),
+            "status": status,
+            "normalization": list(normalization_steps),
+            "sanitized_raw_preview": _sanitize_response_preview(raw_text),
+            "preview_truncated": len(raw_text) > _MAX_DIAGNOSTIC_PREVIEW_CHARS,
+        }
+        temporary = root / (".%s-%s.tmp" % (digest, uuid.uuid4().hex))
+        temporary.write_text(
+            json.dumps(payload, sort_keys=True, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        temporary.chmod(0o600)
+        os.replace(temporary, path)
+        return {**payload, "path": str(path)}
 
     def _install_bundle(
         self,
@@ -850,10 +1038,18 @@ class TemplateBootstrapper:
                 "contract_hash": contract.contract_hash,
             }
             rendered = dict(bundle)
-            try:
-                config = yaml.safe_load(str(bundle["config.yaml"]))
-            except yaml.YAMLError as exc:
-                raise BootstrapError("config.yaml must contain valid YAML") from exc
+            if contract.language == "hip":
+                rendered["kernel.py"] = (
+                    str(bundle["kernel.py"])
+                    .replace(
+                        "#include <hip/hip_bfloat16.h>",
+                        "#include <hip/hip_bf16.h>",
+                    )
+                    .replace("__hip_bfloat162float", "__bfloat162float")
+                    .replace("__hip_float2bfloat16", "__float2bfloat16")
+                )
+            config_text = str(bundle["config.yaml"]).strip()
+            config = _parse_config_mapping(config_text)
             if not isinstance(config, dict):
                 raise BootstrapError("config.yaml must contain a YAML mapping")
             config["source_file_path"] = ["kernel.py"]
@@ -862,6 +1058,16 @@ class TemplateBootstrapper:
                     config["target_kernel_functions"]
                 ]
             targets = config.get("target_kernel_functions")
+            if isinstance(targets, list) and targets and all(
+                isinstance(item, Mapping) for item in targets
+            ):
+                target_names = [
+                    str(item.get("name") or item.get("function") or "").strip()
+                    for item in targets
+                ]
+                if all(target_names):
+                    config["target_kernel_functions"] = target_names
+                    targets = target_names
             if not (
                 isinstance(targets, list)
                 and targets
@@ -891,8 +1097,10 @@ class TemplateBootstrapper:
             rendered["config.yaml"] = yaml.safe_dump(
                 config, sort_keys=False, allow_unicode=True
             )
-            rendered["scripts/task_runner.py"] = _ensure_template_root_importable(
-                str(bundle["scripts/task_runner.py"])
+            rendered["scripts/task_runner.py"] = _harden_runner_exceptions(
+                _ensure_template_root_importable(
+                    str(bundle["scripts/task_runner.py"])
+                )
             )
             rendered["metadata.json"] = (
                 json.dumps(metadata, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
@@ -1004,6 +1212,46 @@ def _ensure_template_root_importable(runner: str) -> str:
     )
     lines.insert(insertion, setup)
     return "".join(lines)
+
+
+def _harden_runner_exceptions(runner: str) -> str:
+    """Convert broad swallowed failures into nonzero failures."""
+    try:
+        tree = ast.parse(runner, filename="scripts/task_runner.py")
+    except SyntaxError:
+        return runner
+    changed = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ExceptHandler):
+            continue
+        broad = node.type is None or (
+            isinstance(node.type, ast.Name)
+            and node.type.id in {"Exception", "BaseException"}
+        )
+        swallowed = bool(node.body) and all(
+            isinstance(statement, (ast.Pass, ast.Continue, ast.Break, ast.Return))
+            or (
+                isinstance(statement, ast.Expr)
+                and isinstance(statement.value, ast.Call)
+                and (
+                    isinstance(statement.value.func, ast.Name)
+                    and statement.value.func.id == "print"
+                )
+            )
+            for statement in node.body
+        )
+        if broad and swallowed:
+            messages = [
+                statement
+                for statement in node.body
+                if isinstance(statement, ast.Expr)
+            ]
+            node.body = [*messages, ast.Raise()]
+            changed = True
+    if not changed:
+        return runner
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree) + "\n"
 
 
 def _canonical_runner_command(mode: str) -> str:
@@ -1138,7 +1386,15 @@ def run_template_gpu_gate(
         summary = _command_summary(result)
         summaries.append(summary)
         if not bool(getattr(result, "ok", False)):
-            errors.append("%s command failed" % mode)
+            detail = "%s command failed (returncode=%s)" % (
+                mode,
+                summary["returncode"],
+            )
+            if summary["stdout"]:
+                detail += "\nstdout:\n%s" % summary["stdout"]
+            if summary["stderr"]:
+                detail += "\nstderr:\n%s" % summary["stderr"]
+            errors.append(detail)
             break
         states[mode] = True
         if mode == "performance":
@@ -1334,7 +1590,8 @@ Return one JSON object only, matching this exact schema:
 {"files":{"kernel.py":"...","config.yaml":"...","scripts/task_runner.py":"...",
 "metadata.json":{}}}
 The files object must have exactly those four paths and no others. metadata.json may
-be either an object or a JSON string. Do not use markdown fences.
+be either an object or a JSON string. config.yaml must be a valid YAML mapping serialized
+as a JSON string, not a nested object. Do not use markdown fences or prose.
 
 Requirements:
 - kernel.py defines every target_kernel_functions entry from config.yaml.
@@ -1342,6 +1599,18 @@ Requirements:
   and launch a real HIP C++ kernel or extension; a torch matmul/linear/reference
   wrapper, Triton kernel, no-op compile mode, or reference-only implementation is
   invalid. For a Triton contract, implement and launch a real Triton kernel.
+- The execution image has PyTorch ROCm and hipcc but no Python `hip`, `hiprtc`, or
+  CuPy modules. HIP kernel.py must build through `torch.utils.cpp_extension`
+  (`load_inline` or `load`) and include `<hip/hip_runtime.h>`; include
+  `<hip/hip_bf16.h>` whenever bfloat16 conversion intrinsics are used. Never depend on an
+  importable `hip`/`hiprtc` Python package.
+- A `load_inline` HIP extension must define
+  `PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)` and bind every Python entrypoint;
+  call `load_inline(..., cuda_sources=source, functions=None, with_cuda=True)`.
+  Omitting the PYBIND module causes `PyInit_<name>` load failures.
+- ROCm bfloat16 scalar conversions are `__bfloat162float` and
+  `__float2bfloat16`; never invent `__hip_bfloat162float` or
+  `__hip_float2bfloat16`.
 - config commands invoke scripts/task_runner.py in exactly compile, correctness,
   and performance modes through `docker exec -e
   HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-1} -w "$PWD"
@@ -1359,6 +1628,9 @@ Requirements:
 - Gate the requested GPU architecture before kernel import, tensor allocation,
   compilation, correctness, or benchmarking. Normalize ROCm gcnArchName by
   splitting at `:` before comparing it with gfx942/gfx950.
+- Never use `torch.cuda.get_device_capability()` to identify gfx942: ROCm reports
+  capability tuples such as (9, 4), which are not architecture names. Read
+  `torch.cuda.get_device_properties(0).gcnArchName` and require exact `gfx942`.
 - Never import kernel or AITER at module scope, even below a module-level
   architecture check. Define main(); its first operational call must enforce the
   exact requested architecture, and mode handlers may import kernel locally only

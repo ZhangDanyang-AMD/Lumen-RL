@@ -44,7 +44,16 @@ def test_sft_collector_records_plan_sources_patch_and_manifest(tmp_path, monkeyp
     monkeypatch.setattr(
         SFTCollector,
         "_environment",
-        lambda self, config: {"gpu_architecture": "gfx942"},
+        lambda self, config: {
+            "gpu_architecture": {"ok": True, "stdout": "gfx942\n"},
+            "gpu_inventory": {"ok": True, "stdout": "Card SKU: M3000108\n"},
+            "software": {
+                "rocm_version": "7.0",
+                "compiler_version": "clang-20",
+            },
+            "lumen_git": {"dirty": False},
+            "geak_git": {"dirty": False},
+        },
     )
     config = make_config(tmp_path)
     run_dir = config.trajectory_root / "runs" / "demo"
@@ -56,6 +65,14 @@ def test_sft_collector_records_plan_sources_patch_and_manifest(tmp_path, monkeyp
         {"directions": [{"id": "tile"}]},
         [{"direction_id": "tile"}],
         user_request="optimize",
+    )
+    collector.record_frozen_input(
+        1,
+        {
+            "parent_source": {"kernel.py": "value = 1\n"},
+            "source_lineage_id": "lineage-a",
+            "split_group": "train",
+        },
     )
 
     parent = tmp_path / "parent"

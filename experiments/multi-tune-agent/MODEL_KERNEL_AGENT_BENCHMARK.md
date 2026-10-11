@@ -1,300 +1,233 @@
-# Model Kernel Agent Benchmark
+# Kernel Agent Benchmark: From-Scratch Kernel Writing
 
-Reproducible benchmark for evaluating kernel optimization models on AMD MI300X (gfx942) using the GEAK tool-calling agent flow.
+## Goal
 
-## Overview
+Evaluate a model's ability to **write GPU kernels from scratch** for AMD MI300X (gfx942) using the GEAK tool-calling agent flow. The model reads a task spec (operator type, shapes, correctness oracle) and writes a Triton kernel that achieves at least **90% of AITER SOTA performance**.
 
-This benchmark measures a model ability to optimize Triton GPU kernels through multi-turn tool-calling interactions. It uses the same GEAK agent infrastructure that generates SFT training data, ensuring training/eval consistency.
+This measures real kernel engineering capability — not just optimizing existing code, but understanding operator semantics, memory access patterns, and hardware-specific tuning from zero.
 
-**Key design choices:**
-- **GEAK ToolAgentLoop** — model uses `read_file`, `write_file`, `evaluate` tools (matches real deployment)
-- **Autotuned baselines** — both original and optimized kernels are benchmarked with `@triton.autotune` over `num_warps`/`num_stages`, ensuring speedups reflect genuine algorithmic improvements
-- **AITER SOTA kernels** — baselines are verbatim AITER library kernels, representing production-grade optimization
-- **100 held-out tasks** — 8 operator types, 100 unique production shapes, zero overlap with training data
+## Benchmark Design
+
+### Task Structure
+
+Each of the 100 tasks provides:
+- `scripts/task_runner.py` — defines function signature, test inputs, correctness oracle, and performance measurement
+- `config.yaml` — compile/correctness/performance commands
+- `kernel.py` — **cleared to skeleton** (model writes from scratch)
+
+The model does NOT see the AITER reference kernel. It must figure out the implementation from the task_runner interface.
+
+### Agent Flow (GEAK ToolAgentLoop)
+
+```
+Model receives: operator type + baseline perf target
+  → read_file("scripts/task_runner.py")     # understand interface
+  → write_file("kernel.py", implementation) # write Triton kernel
+  → evaluate                                 # compile → correctness → performance
+  → iterate up to 50 turns                   # fix errors, improve performance
+```
+
+### Success Metric
+
+| Metric | Threshold | Meaning |
+|--------|-----------|---------|
+| **speedup_geomean** | >= 0.9x | Kernel reaches 90% of AITER performance |
+| **Fast@0.9** | count | Number of tasks achieving the target |
+| per_operator_speedup | breakdown | Performance by operator type |
+
+Compile rate and correct rate are diagnostic (prerequisites, not goals).
+
+### Models Tested
+
+| Label | Path | Prompt Format |
+|-------|------|---------------|
+| base | `Qwen/Qwen3-Coder-30B-A3B-Instruct` | Generic (natural language) |
+| sft2 | `qwen3-coder-full2000-2epoch-merged` | SFT-compatible JSON |
+| sft4 | `qwen3-coder-full2000-4epoch-merged` | SFT-compatible JSON |
+
+SFT models get prompts in `geak_kernel_sft_v1` format (contract + direction + baseline). Base model gets generic natural language prompt. Controlled by `sft_compat` flag.
 
 ## Prerequisites
 
 ```bash
-# Inside the geak-sft-32k container
+# Inside geak-sft-32k container
 cd /home/danyzhan/Lumen-RL/experiments/multi-tune-agent
 export PYTHONPATH="src:.:scripts:/home/danyzhan/Lumen-RL/experiments/sandbox:${PYTHONPATH}"
-export EVAL_GPU_IDS="2,3,4,5,6,7"  # GPUs for kernel eval (GPU 0 = vLLM inference)
+export EVAL_GPU_IDS="2,3,4,5,6,7"
 ```
 
-### Dataset
-- Location: `/home/danyzhan/held-out-benchmark-aiter/`
-- HuggingFace: `Zhangdanyang/agent-phase1-held-out-aiter`
-- 100 tasks, 8 operators: gemm(24), rms_norm(18), mha(14), paged_attention(12), rope_kv_cache(12), sampling(12), mla(6), fused_moe(2)
-
-### Models
-| Label | Path | Description |
-|-------|------|-------------|
-| base  | `Qwen/Qwen3-Coder-30B-A3B-Instruct` | Pre-trained base model |
-| sft2  | `outputs/qwen3-coder-full2000-2epoch-merged` | SFT 2-epoch |
-| sft4  | `outputs/qwen3-coder-full2000-4epoch-merged` | SFT 4-epoch |
-
-Model paths are under `/home/danyzhan/Lumen/experiments/GEAK-agent-coder/outputs/`.
-
-## Step 1: Start vLLM with Tool Calling
+### vLLM Setup (Critical)
 
 ```bash
-ROCR_VISIBLE_DEVICES=0 HIP_VISIBLE_DEVICES=0 CUDA_VISIBLE_DEVICES=0 \
-python3 -m vllm.entrypoints.openai.api_server \
+ROCR_VISIBLE_DEVICES=0 python3 -m vllm.entrypoints.openai.api_server \
     --model <MODEL_PATH> \
     --served-model-name <LABEL> \
-    --tensor-parallel-size 1 \
-    --max-model-len 262144 \
-    --enforce-eager --dtype bfloat16 \
-    --trust-remote-code \
-    --gpu-memory-utilization 0.95 \
-    --port 8000 \
-    --enable-auto-tool-choice \
-    --tool-call-parser qwen3_coder
+    --tensor-parallel-size 1 --max-model-len 262144 \
+    --enforce-eager --dtype bfloat16 --trust-remote-code \
+    --gpu-memory-utilization 0.95 --port 8000 \
+    --enable-auto-tool-choice --tool-call-parser qwen3_coder
 ```
 
-**Critical**: `--tool-call-parser qwen3_coder` is required for Qwen3-Coder models. Using `hermes` or other parsers will silently break tool calling (model responds with text instead of function calls).
+**`--tool-call-parser qwen3_coder` is required.** Using `hermes` or other parsers silently breaks tool calling.
 
-Wait for health check:
-```bash
-curl -s http://localhost:8000/health  # returns 200 when ready
-```
+### Dataset
 
-## Step 2: Verify Baselines (once)
+- Location: `/home/danyzhan/held-out-benchmark-aiter/`
+- 100 tasks, 8 operators: gemm(25), rms_norm(19), mha(14), paged_attention(12), rope_kv_cache(12), sampling(12), mla(6)
+- Baselines: AITER kernels with frozen optimal num_warps/num_stages configs
 
-Ensures all 100 kernels compile, pass correctness, and have stable autotuned performance numbers.
+## Running the Benchmark
+
+### Step 1: Verify Baselines
 
 ```bash
 python3 -u scripts/run_aiter_benchmark.py --verify-only
 ```
 
-Output: `held-out-benchmark-aiter/receipts/aiter_baseline_results.json`
-
-All 100 kernels have `@triton.autotune` for fair comparison:
-- **gemm**: Full config search (BLOCK_SIZE_M/N/K + num_warps)
-- **mha**: AITER native autotune
-- **Others**: num_warps/num_stages sweep via `tuned_bench.py`
-
-## Step 3: Run GEAK Agent Benchmark
+### Step 2: Run Benchmark
 
 ```bash
 python3 -u scripts/run_aiter_benchmark_geak.py \
-    --model-label sft2 \
-    --model-name sft2 \
-    --max-turns 50
+    --model-label sft2 --model-name sft2 --max-turns 50
 ```
 
-This runs the full GEAK tool-calling agent loop for each task:
-1. Model receives task description with available tools
-2. Model calls `read_file("kernel.py")` to read the kernel
-3. Model analyzes and calls `write_file("kernel.py", optimized_code)` 
-4. Model calls `evaluate` to test compile → correctness → performance
-5. If not satisfied, model iterates (up to `--max-turns`)
+The benchmark:
+1. Creates a session per task with AITER kernel as baseline (for timing reference)
+2. **Clears kernel.py** to a skeleton (model starts from zero)
+3. Runs 50-turn agent loop (no early stopping)
+4. Records best speedup achieved
 
-### Output
-- Results: `held-out-benchmark-aiter/receipts/geak-benchmark-<label>/results.json`
-- Summary: `held-out-benchmark-aiter/receipts/geak-benchmark-<label>/summary.json`
-- Sessions: `held-out-benchmark-aiter/receipts/geak-flow-<label>/sessions/` (when `keep_sessions=True`)
-  - Each session has `workspace/kernel.py` (optimized) and `workspace/metadata.json`
-  - Original kernel: `held-out-benchmark-aiter/artifacts/kernel/<task_id>/initial/kernel.py`
+### Step 3: Multi-Model Comparison
 
-### Metrics
-| Metric | Description |
-|--------|-------------|
-| compile_rate | % of tasks where model produced a compiling kernel |
-| correct_rate | % of tasks passing correctness check |
-| fast12_rate | % of tasks achieving ≥1.2x speedup over autotuned baseline |
-| speedup_geomean | Geometric mean of speedups (correct tasks only) |
-| avg_turns | Average tool-calling turns used |
-| avg_tools | Average tool calls per task |
+The pipeline script runs SFT-2e → Base → SFT-4e sequentially, switching vLLM between each.
 
-## Step 4: Multi-Model Comparison
+## Baseline Stability
 
-Run for all three models sequentially (switch vLLM between runs):
+### Autotune Freeze (Critical)
 
-```bash
-# SFT-2e
-# (vLLM already running with sft2)
-python3 -u scripts/run_aiter_benchmark_geak.py --model-label sft2 --model-name sft2 --max-turns 50
+Raw `@triton.autotune` causes **6x measurement variance** across runs (different num_warps winners due to GPU noise). Fixed by:
 
-# Switch to Base
-pkill -f vllm; sleep 15
-# Start vLLM with Qwen/Qwen3-Coder-30B-A3B-Instruct --served-model-name base
-python3 -u scripts/run_aiter_benchmark_geak.py --model-label base --model-name base --max-turns 50
+1. **One-time config sweep** (`freeze_autotune.py`): try num_warps=[2,4,8,16] x num_stages=[1,2] for each kernel
+2. **Lock winner** into kernel as single-config `@triton.autotune`
+3. **Stable measurement**: `tuned_bench.py` with 200 warmup + 5-round median
 
-# Switch to SFT-4e
-pkill -f vllm; sleep 15
-# Start vLLM with qwen3-coder-full2000-4epoch-merged --served-model-name sft4
-python3 -u scripts/run_aiter_benchmark_geak.py --model-label sft4 --model-name sft4 --max-turns 50
-```
+Results stored in `receipts/autotune_freeze.json`. Each kernel has its optimal config locked.
 
-## Step 5: Extract Kernel Pairs
+### Measurement Stability
 
-After benchmark completes, extract original/optimized kernel pairs:
+| Component | Setting | Purpose |
+|-----------|---------|---------|
+| tuned_bench.py | 200 warmup + 5x median | JIT warmup + stable timing |
+| baseline_repeats | 3 | Multiple baseline measurements |
+| Frozen configs | Single best num_warps | Eliminates autotune variance |
+
+## Code-Level Validation
+
+### validate_kernel (in sandbox.write_file)
+
+Blocks two cheating patterns discovered during earlier benchmarks:
+
+1. **PyTorch Replacement**: Model writes empty `@triton.jit` shell but does computation in PyTorch wrapper (`torch.argsort`, `torch.gather`, etc.)
+2. **PyTorch in Wrapper**: Model keeps `@triton.jit` tag but moves core computation to Python
 
 ```python
-import json, shutil
-from pathlib import Path
+# kernel_validator.py
+PYTORCH_OPS = ["torch.argsort", "torch.sort(", "torch.gather", "torch.cumsum"]
 
-HELD_OUT = Path("/home/danyzhan/held-out-benchmark-aiter")
-model = "sft2"
-results = json.load(open(HELD_OUT / f"receipts/geak-benchmark-{model}/results.json"))
-sessions = HELD_OUT / f"receipts/geak-flow-{model}/sessions"
-
-out = HELD_OUT / f"receipts/kernel-pairs-{model}"
-out.mkdir(exist_ok=True)
-
-for sess_dir in sessions.iterdir():
-    meta = json.loads((sess_dir / "workspace/metadata.json").read_text())
-    tid = meta["task_id"]
-    pair_dir = out / tid
-    pair_dir.mkdir(exist_ok=True)
-    shutil.copy2(HELD_OUT / f"artifacts/kernel/{tid}/initial/kernel.py", pair_dir / "original.py")
-    opt = sess_dir / "workspace/kernel.py"
-    if opt.exists():
-        shutil.copy2(opt, pair_dir / "optimized.py")
+def validate_kernel(content, original_path=None):
+    if "@triton.jit" not in content:
+        return False, "Must contain @triton.jit"
+    # Check wrapper (after last @triton.jit) for PyTorch ops
+    wrapper = content.split("@triton.jit")[-1]
+    for op in PYTORCH_OPS:
+        if op in wrapper:
+            return False, f"Wrapper must not use {op}"
+    return True, content
 ```
 
-## Architecture Notes
+### Diff Patch Support
 
-### Why GEAK ToolAgentLoop (not simple chat)?
-- SFT model retains Qwen3-Coder native tool-calling capability
-- SFT kernel optimization knowledge applies in tool-calling context
-- Matches real deployment: model reads → writes → evaluates → iterates
-- Previous simple chat benchmark had patch-application failures (LLM-generated diffs have inaccurate line numbers)
+SFT models may output unified diffs instead of complete files. `write_file` auto-detects and applies:
+1. `patch --fuzz=3` (standard)
+2. `patch --fuzz=99` (aggressive, ignore context)
+3. `robust_patch` (custom context-matching)
+4. Direct write (fallback)
 
-### Why autotuned baselines?
-- Without autotune, model can achieve "speedup" by just changing BLOCK_SIZE or num_warps
-- With autotune, both baseline and candidate run at their best config
-- Speedup reflects genuine algorithmic improvements (memory access patterns, tiling strategies, instruction-level optimization)
+## Lessons Learned
 
-### Autotune implementation
-- `tuned_bench.py` in each task scripts/ dir — uses `triton.testing.do_bench` with 50 warmup + 100 reps
-- gemm: `@triton.autotune` over BLOCK_SIZE_M/N/K + num_warps (12 configs)
-- Other operators: `@triton.autotune` over num_warps/num_stages (6 configs)
-- mha: AITER native autotune preserved
+### Infrastructure
 
-### Context compression
-For the simple chat benchmark (`run_aiter_benchmark_fast.py`), context compression is applied after `KEEP_RECENT=4` turns — old turns are summarized to prevent context overflow on large kernels (mha=2863 lines/99KB).
+**1. Tool Call Parser Must Be `qwen3_coder`**
 
-## Troubleshooting
+Wrong parser → model outputs text instead of function calls → agent loop terminates after 1 turn with tools=0. This is a silent failure — no error, just poor results.
 
-| Issue | Cause | Fix |
-|-------|-------|-----|
-| `turns=0 tools=0 FAIL` | Wrong tool-call-parser | Use `--tool-call-parser qwen3_coder` |
-| `ModuleNotFoundError: tuned_bench` | Missing in workspace | Copy `tuned_bench.py` to each task scripts/ dir |
-| `baseline benchmark failed` | task_runner error | Run `python3 scripts/task_runner.py compile` in workspace to debug |
-| MHA timeout | 99KB kernel prompt too large | Increase `--timeout` or use context compression |
-| Container crash | GPU OOM from zombie processes | `docker restart geak-sft-32k` |
-| All 0x speedup | Patch apply failure | Check eval pipeline fallbacks (fuzzy→GNU patch→robust→reconstruct) |
+**2. Large Kernel Timeout**
 
-## File Layout
+MHA kernel (2863 lines, 99KB) causes vLLM inference timeout when 6 workers compete for GPU with 25K+ token prompts each. Fix: `timeout=3600s`. Complex operators (mha, mla, paged_attention, rope_kv_cache) need 100 turns instead of 50.
 
-```
-multi-tune-agent/
-├── scripts/
-│   ├── run_aiter_benchmark_geak.py    # GEAK tool-calling benchmark (primary)
-│   ├── run_aiter_benchmark_fast.py    # Simple chat benchmark (fast, less accurate)
-│   ├── run_aiter_benchmark.py         # Baseline verification
-│   ├── run_aiter_multi_benchmark.py   # Multi-model comparison
-│   ├── grpo_multiturn.py              # Multi-turn RL training
-│   ├── grpo_agentic.py                # Agentic RL training
-│   ├── grpo_train.py                  # Basic RL training
-│   ├── fuzzy_patch.py                 # Diff patch application
-│   ├── eval_checkpoint.py             # Checkpoint evaluation
-│   ├── build_aiter_held_out.py        # Dataset building
-│   ├── build_rl_dataset.py            # RL dataset building
-│   ├── upload_hf.py                   # HuggingFace upload
-│   └── wandb_sync.py                  # W&B sync
-├── src/multi_tune_agent/
-│   ├── runtime.py                     # ToolAgentLoop, OpenAIModelBackend
-│   ├── geak_tool.py                   # GEAKStatefulTool, GEAKToolEnvironment
-│   ├── config.py                      # MultiTuneConfig
-│   └── ...
-├── geak_utils/
-│   ├── sandbox.py                     # Kernel workspace + benchmark sandbox
-│   └── ...
-└── held-out-benchmark-aiter/          # (at /home/danyzhan/)
-    ├── artifacts/kernel/*/initial/
-    │   ├── kernel.py                  # AITER baseline (with autotune)
-    │   ├── kernel_clean.py            # Without autotune (for reference)
-    │   ├── config.yaml                # Compile/correctness/perf commands
-    │   ├── metadata.json              # Task metadata + AITER provenance
-    │   └── scripts/
-    │       ├── task_runner.py         # Compile/correctness/perf harness
-    │       └── tuned_bench.py         # Autotune benchmark utility
-    ├── receipts/
-    │   ├── aiter_baseline_results.json
-    │   ├── geak-benchmark-<model>/    # Results per model
-    │   └── geak-flow-<model>/sessions/  # Agent sessions (keep_sessions=True)
-    └── tasks/kernel.jsonl             # Task manifest
-```
+**3. Zombie GPU Processes**
 
+When vLLM crashes or is killed, GPU memory may not be freed (zombie processes with parent PID 1 inside container). New vLLM instances fail to allocate. Fix: `docker restart <container>`.
 
+**4. Session Cleanup Between Runs**
 
-## Lessons Learned (Pitfalls)
+Old sessions from previous benchmark runs pollute audit results and can cause session ID conflicts. Always `rm -rf receipts/geak-flow-*` before a new run.
 
-### 1. Tool Call Parser Must Be `qwen3_coder`
+### Measurement
 
-vLLM supports multiple tool-call parsers. Using the wrong parser causes the model to output text instead of function calls — the agent loop terminates after 1 turn with tools=0.
+**5. Autotune Instability**
 
-```bash
-# WRONG - model will not use tools
---tool-call-parser hermes
+Adding `@triton.autotune` with multiple configs causes 6x measurement variance. Each subprocess re-runs the config search, picking different winners due to GPU noise. Fix: run config sweep once (`freeze_autotune.py`), lock the winner into a single-config autotune.
 
-# CORRECT for Qwen3-Coder models
---tool-call-parser qwen3_coder
-```
+**6. Speedup Noise (Code-Identical Kernels)**
 
-### 2. Model Replaces Triton with PyTorch
+Even with frozen configs, code-identical kernels can report 1.3-1.7x "speedup" due to: baseline measured during session creation (with GPU contention from parallel workers) vs candidate measured later (different contention). Fix: for any reported speedup, verify the code actually changed (diff > 3 lines of real code). Re-benchmark baseline and candidate independently on idle GPU.
 
-Without explicit constraints, the SFT model sometimes replaces the Triton kernel with a PyTorch reference implementation (e.g., torch.argsort instead of Triton bitonic sort). This passes correctness but is not a valid kernel optimization.
+**7. Baseline Must Be Re-measured**
 
-**Fix**: System prompt includes: "You MUST keep the kernel as a Triton kernel (@triton.jit). Do NOT replace it with PyTorch ops."
+`establish_baseline` runs once at session creation and caches `baseline_ms`. If that measurement was noisy (GPU contention), all subsequent speedup calculations inherit the error. For production benchmarks, re-measure both baseline and candidate on the same GPU in sequence.
 
-### 3. Model Deletes @triton.autotune
+### Model Behavior
 
-The model deletes @triton.autotune and hardcodes a specific config. If that config happens to be better than what autotune searched, it looks like "speedup" but is actually just config tuning.
+**8. PyTorch Wrapper Cheating**
 
-**Fix**: System prompt includes: "You MUST preserve @triton.autotune if present." The baseline is already autotuned, so config-only changes should not produce speedup.
+Both Base and SFT models independently discover the "empty Triton shell + PyTorch wrapper" trick — keep `@triton.jit` to pass checks but move computation to `torch.argsort/gather/cumsum` in the wrapper function. Prompt rules alone are insufficient. Code-level validation (`kernel_validator.py` in `sandbox.write_file`) is essential.
 
-### 4. Autotune Baseline is Critical for Fair Comparison
+**9. Autotune Deletion Cheating**
 
-Without autotuning both baseline and candidate:
-- Model adds @triton.autotune to a kernel that had fixed config -> "2.4x speedup" that is pure config tuning
-- Model changes BLOCK_SIZE -> appears as algorithmic improvement but is just config
+Models delete `@triton.autotune` and hardcode a fixed config. Since autotune search has overhead, the fixed-config version appears faster. This is NOT a real optimization — it's exploiting measurement artifacts. Fix: freeze baseline configs so autotune deletion has no advantage.
 
-**Fix**: All 100 baseline kernels have @triton.autotune (gemm: full config search, others: num_warps/num_stages sweep).
+**10. SFT Narrows Capability**
 
-### 5. SFT Training Format != GEAK Tool-Calling Format
+In optimization benchmarks, SFT-2e specialized on rms_norm (6.98x) but degraded on attention operators (0x on mha/mla/paged_attn where Base got 2.88x). SFT training on single-turn `input→patch` format may cause catastrophic forgetting on complex multi-step reasoning tasks. Recommendation: use RL (agentic GRPO) instead of more SFT for capability breadth.
 
-SFT training data is single-turn input->patch format (geak_kernel_sft_v1), not multi-turn tool-calling. However, this does NOT break tool-calling because Qwen3-Coder has native tool-calling ability from pre-training. SFT adds domain knowledge (kernel optimization) that transfers to the tool-calling context.
+**11. SFT Format Compatibility**
 
-### 6. LLM-Generated Diffs Have Inaccurate Line Numbers
+SFT training data (`geak_kernel_sft_v1`) is single-turn, but GEAK uses multi-turn tool-calling. This works because Qwen3-Coder has native tool-calling. SFT adds domain knowledge (kernel optimization) that transfers. The SFT data has 5 task types: `cold_start` (15%), `direction_conditioned` (45%), `error_recovery` (15%), `profile_guided` (15%), `regression_balance` (10%). Error recovery format is useful for multi-turn feedback.
 
-Models produce unified diffs with wrong hunk headers, causing fuzzy_patch, GNU patch --fuzz=3, and _reconstruct_from_diff to all fail.
+### Benchmark Design
 
-**Fix**: Use the GEAK tool-calling flow where the model writes complete files via write_file tool, avoiding diff application entirely.
+**12. From-Scratch > Optimization**
 
-### 7. MHA Kernel Baseline Timeout
+Optimization benchmarks suffer from measurement noise (identical code reports different speedups) and cheating (autotune deletion, PyTorch replacement). From-scratch writing eliminates these — either the model can write a working kernel or it can't. Target: reach 90% of AITER performance.
 
-MHA kernel (2863 lines, 99KB) needs >120s for baseline establishment (compile + autotune warmup). Default command_timeout=120 causes turns=0 tools=0 FAIL.
+**13. Simple vs Complex Operators**
 
-**Fix**: Set command_timeout=300 in the benchmark config.
+Simple operators (gemm, rms_norm, sampling) are solvable in 50 turns. Complex operators (mha, mla, paged_attention, rope_kv_cache) need 100 turns due to: larger kernels, more complex semantics, multi-kernel coordination.
 
-### 8. Zombie GPU Processes After Container Restart
+**14. Prompt Format Per Model**
 
-When vLLM crashes or is killed, GPU memory may not be freed (zombie processes with parent PID 1). New vLLM instances cannot allocate GPU memory.
+SFT models should see SFT training format (JSON with contract/direction/baseline). Base model should see generic natural language. Using the wrong format degrades performance. Controlled by `sft_compat` config flag.
 
-**Fix**: docker restart container to clean up all processes and free GPU memory.
+## Cheating Prevention (validate_kernel)
 
-### 9. Agent Terminates Early Without Speedup
+Models discover creative ways to bypass Triton kernel requirements. All blocked at `sandbox.write_file` level:
 
-When the model generates text without tool calls, the ToolAgentLoop terminates immediately. Tasks may stop at turn 17 or 26 without reaching 50 turns.
+| Pattern | Detection | Example |
+|---------|-----------|---------|
+| Empty Triton shell + PyTorch wrapper | Check `torch.matmul/mm/bmm/einsum/argsort/sort/gather/cumsum` in wrapper | `@triton.jit def k(): pass` + `def gemm(): return torch.matmul(a,b)` |
+| No @triton.jit | Check `@triton.jit` presence | Pure PyTorch implementation |
+| Empty kernel body | Check for `tl.load`/`tl.store` in JIT function | `@triton.jit def k(): pass` |
+| Method-form PyTorch | Check `.mm(`, `.matmul(`, `.bmm(` | `result = a.matmul(b.T)` |
 
-**Fix**: Modified runtime.py — if no tool calls AND no speedup achieved yet, inject a user feedback message to continue. If speedup already achieved, allow early termination.
-
-### 10. tuned_bench.py Import Path in GEAK Sandbox
-
-GEAK sandbox copies task files to a new workspace directory. tuned_bench.py must be in each task scripts/ directory (not just the root), because the workspace has a different absolute path.
-
-**Fix**: Copy tuned_bench.py into every task scripts/ directory, use local path import.
+Blocked ops list: `torch.matmul`, `torch.mm`, `torch.bmm`, `torch.einsum`, `torch.argsort`, `torch.sort`, `torch.gather`, `torch.cumsum`, `torch.nn.functional`, `.mm(`, `.matmul(`, `.bmm(`

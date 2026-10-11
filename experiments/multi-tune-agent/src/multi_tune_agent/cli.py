@@ -456,7 +456,8 @@ def _bootstrap_kernel_task(
         )
         draft = bootstrapper.generate(contract)
         gate = None
-        for gate_attempt in range(3):
+        max_gate_attempts = 5
+        for gate_attempt in range(max_gate_attempts):
             output_fn(
                 "[lumen-code] Running compile, correctness, and performance gate"
             )
@@ -467,11 +468,12 @@ def _bootstrap_kernel_task(
                 gpu_ids=config.gpu_ids,
                 command_timeout=config.command_timeout,
             )
-            if gate.trusted or gate_attempt == 2:
+            if gate.trusted or gate_attempt == max_gate_attempts - 1:
                 break
             output_fn(
                 "[lumen-code] GPU gate failed; regenerating the complete template "
-                "from exact diagnostics (%d/2)" % (gate_attempt + 1)
+                "from exact diagnostics (%d/%d)"
+                % (gate_attempt + 1, max_gate_attempts - 1)
             )
             try:
                 draft = bootstrapper.repair_after_gpu_failure(
@@ -482,8 +484,6 @@ def _bootstrap_kernel_task(
                     "[lumen-code] GPU-informed repair response was unusable: %s"
                     % exc
                 )
-                if gate_attempt == 1:
-                    break
         assert gate is not None
         if not gate.trusted:
             output_fn("[lumen-code] Template gate failed; nothing was cataloged.")
@@ -760,6 +760,7 @@ def _model_backend(config: MultiTuneConfig) -> OpenAIModelBackend:
         config.base_url,
         config.model,
         timeout=config.request_timeout,
+        max_tokens=config.request_max_tokens,
     )
 
 

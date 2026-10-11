@@ -10,11 +10,14 @@ requires-python = ">=3.10"
 dependencies = [
     "PyYAML>=6.0",
     "requests>=2.31",
+    "scipy>=1.15",
+    "multi-swe-bench==1.1.2",
     "geak @ git+https://github.com/AMD-AGI/GEAK.git",
 ]
 
 [project.optional-dependencies]
 test = ["pytest>=8.0"]
+benchmark-freeze = ["pyarrow>=25.0.1"]
 
 [project.scripts]
 multi-tune = "multi_tune_agent.cli:main"

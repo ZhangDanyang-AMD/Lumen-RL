@@ -29,6 +29,26 @@ separate. Mechanical translations share one `implementation_family_id`, and
 all language variants from the same source/implementation family must remain
 in one split group.
 
+Build the gfx942 v3 source-lineage split before starting collection:
+
+```bash
+PYTHONPATH=src:. python3 scripts/build_phase1_splits.py \
+  --catalog cases/phase1-case-candidates.yaml \
+  --output-dir /home/danyzhan/phase1_control/splits/v3 \
+  --registered-seeds cases/phase1-aiter-seeds.yaml \
+  --preserve-train \
+    /home/danyzhan/phase1_control/production-wave-300/production-cases.yaml
+```
+
+The command is deterministic and append-safe: the wave-300 source lineages are
+forced to `train`, while each new lineage is assigned independently by a
+versioned SHA-256 threshold. Triton/HIP requests from one source lineage stay
+together. `generation-requests.yaml` contains only train/dev entries;
+held-out groups are reserved in `held_out_groups.jsonl` and must never be
+passed to collection. Re-running against an extended catalog preserves every
+existing assignment. When carrying an earlier v3 manifest forward, also pass
+`--prior-split-dir /home/danyzhan/phase1_control/splits/v3`.
+
 Candidate status values are:
 
 ```text

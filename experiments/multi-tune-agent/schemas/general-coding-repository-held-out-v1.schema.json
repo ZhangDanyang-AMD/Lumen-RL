@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "general-coding-repository-held-out-v1.schema.json",
+  "title": "General Coding Repository Held-out Private Candidate",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "task_id",
+    "repository",
+    "base_commit",
+    "source_lineage_id",
+    "primary_language",
+    "mutation_id",
+    "license",
+    "problem_contract",
+    "parent_source_refs",
+    "protected",
+    "evaluation"
+  ],
+  "properties": {
+    "task_id": {"type": "string", "pattern": "^gc-ho-[0-9a-f]{24}$"},
+    "repository": {"type": "string", "pattern": "^https://github\\.com/[^/]+/[^/]+(?:\\.git)?$"},
+    "base_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "source_lineage_id": {"type": "string", "minLength": 1},
+    "primary_language": {
+      "enum": ["python", "cpp", "go", "javascript_typescript", "rust"]
+    },
+    "mutation_id": {"type": "string", "minLength": 1},
+    "license": {
+      "type": "object",
+      "required": ["spdx", "evidence_path"],
+      "properties": {
+        "spdx": {"type": "string"},
+        "evidence_path": {"type": "string"}
+      }
+    },
+    "problem_contract": {
+      "type": "object",
+      "required": ["description", "allowed_paths", "public_test_command"]
+    },
+    "parent_source_refs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["path", "sha256"],
+        "properties": {
+          "path": {"type": "string"},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    },
+    "protected": {
+      "type": "object",
+      "required": ["hidden_tests_path", "oracle_path", "validation_receipt_path"],
+      "properties": {
+        "hidden_tests_path": {"type": "string"},
+        "oracle_path": {"type": "string"},
+        "validation_receipt_path": {"type": "string"}
+      }
+    },
+    "evaluation": {
+      "type": "object",
+      "required": ["command", "timeout_seconds", "network", "cpu_only"],
+      "properties": {
+        "command": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600},
+        "network": {"const": "disabled"},
+        "cpu_only": {"const": true}
+      }
+    }
+  }
+}

@@ -2070,8 +2070,6 @@ class RLTrainer:
         rank can run identical dynamic-sampling filtering. Returns
         ``(rewards [N] on device, responses, acc [N] floats)``.
         """
-        from lumenrl.rewards.math_reward import compute_math_reward
-
         N = int(sequences.shape[0])
         responses: list[str] = []
         response_lengths: list[int] = []
@@ -2084,14 +2082,41 @@ class RLTrainer:
                 response_lengths.append(int(response_ids.numel()))
                 text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
                 responses.append(text)
-            rewards_t, details = compute_math_reward(responses, gts_expanded)
-            rewards = rewards_t.to(self._device)
-            accs = torch.tensor(
-                [1.0 if d["acc"] else 0.0 for d in details],
-                dtype=torch.float32, device=self._device,
-            )
-            acc_frac = float(accs.mean().item()) if N else 0.0
-            logger.info("Rollout reward: N=%d accuracy=%.4f mean=%.4f", N, acc_frac, float(rewards.mean().item()))
+
+            custom_fn = self._resolve_reward_fn()
+            if custom_fn is not None:
+                rewards_t = custom_fn(responses, gts_expanded)
+                if not isinstance(rewards_t, torch.Tensor):
+                    rewards_t = torch.tensor(rewards_t, dtype=torch.float32)
+                rewards = rewards_t.to(self._device)
+                accs = (rewards > -0.5).float().to(self._device)
+                logger.info(
+                    "Custom rollout reward: N=%d mean=%.4f positive=%d",
+                    N, float(rewards.mean()), int((rewards > 0).sum()),
+                )
+            else:
+                from lumenrl.rewards.math_reward import compute_math_reward
+                rewards_t, details = compute_math_reward(responses, gts_expanded)
+                rewards = rewards_t.to(self._device)
+                accs = torch.tensor(
+                    [1.0 if d["acc"] else 0.0 for d in details],
+                    dtype=torch.float32, device=self._device,
+                )
+                acc_frac = float(accs.mean().item()) if N else 0.0
+                logger.info("Rollout reward: N=%d accuracy=%.4f mean=%.4f", N, acc_frac, float(rewards.mean().item()))
+                invalid = sum(
+                    detail.get("pred") == "[INVALID]" for detail in details
+                )
+                for idx in range(min(2, len(responses), len(details))):
+                    logger.info(
+                        "Rollout sample[%d]: tokens=%d pred=%r gt=%r tail=%r",
+                        idx,
+                        response_lengths[idx],
+                        details[idx].get("pred", "N/A"),
+                        gts_expanded[idx] if idx < len(gts_expanded) else "?",
+                        responses[idx][-400:],
+                    )
+
             max_response_length = int(
                 getattr(self.config.policy, "max_response_length", 0) or 0
             )
@@ -2099,32 +2124,17 @@ class RLTrainer:
                 length >= max_response_length
                 for length in response_lengths
             ) if max_response_length > 0 else 0
-            invalid = sum(
-                detail.get("pred") == "[INVALID]" for detail in details
-            )
             mean_length = (
                 sum(response_lengths) / len(response_lengths)
                 if response_lengths else 0.0
             )
             logger.info(
-                "Rollout response diagnostics: tokens_mean=%.1f tokens_max=%d "
-                "cap_hits=%d/%d invalid_format=%d/%d",
+                "Rollout response diagnostics: tokens_mean=%.1f tokens_max=%d cap_hits=%d/%d",
                 mean_length,
                 max(response_lengths, default=0),
                 cap_hits,
                 N,
-                invalid,
-                N,
             )
-            for idx in range(min(2, len(responses), len(details))):
-                logger.info(
-                    "Rollout sample[%d]: tokens=%d pred=%r gt=%r tail=%r",
-                    idx,
-                    response_lengths[idx],
-                    details[idx].get("pred", "N/A"),
-                    gts_expanded[idx] if idx < len(gts_expanded) else "?",
-                    responses[idx][-400:],
-                )
         else:
             rewards = torch.zeros(N, dtype=torch.float32, device=self._device)
             accs = torch.zeros(N, dtype=torch.float32, device=self._device)
@@ -2577,6 +2587,22 @@ class RLTrainer:
 
         return torch.cat(all_log_probs, dim=0)
 
+    def _resolve_reward_fn(self):
+        """Resolve the reward function from config.reward.function."""
+        fn_name = getattr(self.config.reward, "function", "math_reward")
+        if fn_name == "math_reward" or not fn_name:
+            return None
+        import importlib
+        module_path, _, func_name = fn_name.rpartition(".")
+        if not module_path:
+            return None
+        try:
+            mod = importlib.import_module(module_path)
+            return getattr(mod, func_name)
+        except (ImportError, AttributeError) as e:
+            logger.warning("Could not import reward function %s: %s", fn_name, e)
+            return None
+
     def _compute_rewards(
         self,
         sequences: torch.Tensor,
@@ -2585,7 +2611,10 @@ class RLTrainer:
         ground_truths: list[str],
         num_generations: int,
     ) -> tuple[torch.Tensor, list[str]]:
-        """Decode responses and compute math rewards.
+        """Decode responses and compute rewards.
+
+        Dispatches to the reward function specified in config.reward.function.
+        Falls back to math_reward if not configured or import fails.
 
         Returns rewards on ``self._device`` to avoid a CPU round-trip.
         """
@@ -2605,6 +2634,25 @@ class RLTrainer:
         expanded_gts = []
         for gt in ground_truths:
             expanded_gts.extend([gt] * num_generations)
+
+        custom_fn = self._resolve_reward_fn()
+        if custom_fn is not None:
+            rewards = custom_fn(responses, expanded_gts)
+            if not isinstance(rewards, torch.Tensor):
+                rewards = torch.tensor(rewards, dtype=torch.float32)
+            rewards = rewards.to(self._device)
+            n_pos = int((rewards > 0).sum())
+            n_neg = int((rewards < 0).sum())
+            logger.info(
+                "Custom reward: mean=%.4f +=%d -=%d / %d total",
+                float(rewards.mean()), n_pos, n_neg, len(responses),
+            )
+            for idx in range(min(2, len(responses))):
+                logger.info(
+                    "Sample[%d] reward=%.2f tail=...%s",
+                    idx, rewards[idx].item(), repr(responses[idx][-200:]),
+                )
+            return rewards, responses
 
         from lumenrl.rewards.math_reward import compute_math_reward
 

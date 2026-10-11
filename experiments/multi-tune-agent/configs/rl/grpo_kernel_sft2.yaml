@@ -1,0 +1,84 @@
+# GRPO Kernel Optimization — from SFT-2epoch checkpoint
+# Single-node 8x MI308X, FSDP2 training + vLLM rollout (colocated)
+# Reward: GEAK sandbox compile → correctness → speedup
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
+  ray_address: "auto"
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: true
+    actor:
+      num_workers: 8
+      dispatch_mode: dp_compute_proto
+    rollout:
+      num_workers: 4
+
+policy:
+  model_name: /home/danyzhan/Lumen/experiments/GEAK-agent-coder/outputs/qwen3-coder-full2000-2epoch-merged
+  training_backend: fsdp2
+  generation_backend: vllm
+  max_total_sequence_length: 16384
+  max_response_length: 8192
+  train_global_batch_size: 32
+  gen_batch_size: 8
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 4096
+  learning_rate: 5.0e-7
+  lr_warmup_steps: 10
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  training:
+    optimizer_dtype: bf16
+    fsdp_cfg:
+      param_offload: false
+      optimizer_offload: true
+      reshard_after_forward: false
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 1
+      kv_cache_dtype: fp8
+      enforce_eager: true
+      trust_remote_code: true
+
+algorithm:
+  name: grpo
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  loss_agg_mode: token-mean
+  clip_ratio: 0.2
+  clip_ratio_high: 0.28
+  grpo:
+    num_generations: 8
+    kl_coeff: 0.0
+    clip_ratio: 0.2
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+
+reward:
+  type: function
+  function: lumenrl.rewards.kernel_reward.compute_kernel_reward
+  dataset: /home/danyzhan/geak_sft_dataset/phase1-production-wave-2000-v1/processed/rl_prompts.jsonl
+  shuffle: true
+  shuffle_seed: 42
+
+checkpointing:
+  checkpoint_dir: /home/danyzhan/Lumen-RL/experiments/multi-tune-agent/outputs/rl-grpo-sft2
+  save_steps: 50
+  save_total_limit: 3
+  resume: false
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 300
+seed: 42

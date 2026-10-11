@@ -483,6 +483,42 @@ def test_restricted_architecture_gate_precedes_import_and_allocation(tmp_path):
         validate_generated_template(template)
     )
 
+    predicate_gate = VALID_RUNNER.replace(
+        "def require_gfx942():\n"
+        "    if runtime_arch() != SUPPORTED_ARCH:\n"
+        '        raise RuntimeError("unsupported architecture")',
+        "def is_gfx942():\n"
+        "    return runtime_arch() == SUPPORTED_ARCH",
+    ).replace(
+        "    require_gfx942()\n",
+        "    if not is_gfx942():\n"
+        '        raise RuntimeError("unsupported architecture")\n',
+    )
+    template = write_template(tmp_path / "predicate-gate", runner=predicate_gate)
+    assert "runner-architecture-gate" not in codes(
+        validate_generated_template(template)
+    )
+
+    assigned_arch_gate = VALID_RUNNER.replace(
+        "    require_gfx942()\n",
+        '    arch = runtime_arch()\n'
+        '    if arch != "gfx942":\n'
+        '        raise RuntimeError("unsupported architecture")\n',
+    )
+    template = write_template(tmp_path / "assigned-arch-gate", runner=assigned_arch_gate)
+    assert "runner-architecture-gate" not in codes(
+        validate_generated_template(template)
+    )
+
+    capability_gate = VALID_RUNNER.replace(
+        'torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0]',
+        "torch.cuda.get_device_capability(0)",
+    )
+    template = write_template(tmp_path / "capability-gate", runner=capability_gate)
+    assert "runner-invalid-architecture-source" in codes(
+        validate_generated_template(template)
+    )
+
 
 def test_validator_never_executes_template(tmp_path):
     marker = tmp_path / "executed"

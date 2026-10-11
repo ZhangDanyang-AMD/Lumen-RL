@@ -18,3 +18,4 @@ build/
 !/examples/tasks/fused_attention/**
 !/examples/tasks/grouped_gemm/
 !/examples/tasks/grouped_gemm/**
+GEAK/

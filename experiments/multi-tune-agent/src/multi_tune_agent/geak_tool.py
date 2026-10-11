@@ -480,7 +480,7 @@ class GEAKStatefulTool:
     def create(
         self, create_kwargs: Mapping[str, Any]
     ) -> tuple[str, Mapping[str, Any]]:
-        return self.environment.create(
+        session_id, observation = self.environment.create(
             str(create_kwargs["case_id"]),
             role=str(create_kwargs.get("role") or "engineer"),
             parent_session_id=(
@@ -490,6 +490,16 @@ class GEAKStatefulTool:
             ),
             establish_baseline=bool(create_kwargs.get("establish_baseline", False)),
         )
+        # Clear kernel.py for from-scratch writing
+        if create_kwargs.get("clear_kernel"):
+            state = self.environment.get(session_id)
+            kernel_path = state.workspace / "kernel.py"
+            kernel_path.write_text(
+                "# Write your Triton kernel implementation here.\n"
+                "# Read scripts/task_runner.py for the required function signature.\n"
+                "import torch\nimport triton\nimport triton.language as tl\n"
+            )
+        return session_id, observation
 
     def execute(
         self, instance_id: str, parameters: Mapping[str, Any]

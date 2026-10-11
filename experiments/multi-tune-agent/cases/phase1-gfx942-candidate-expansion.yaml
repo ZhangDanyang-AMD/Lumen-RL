@@ -1,0 +1,5815 @@
+schema_version: geak_phase1_gfx942_candidate_expansion_v1
+source_revisions:
+  aiter:
+    repository: https://github.com/ROCm/aiter.git
+    branch: main
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    license: MIT
+    local_root: /home/danyzhan/aiter
+policy:
+  generated_candidates_are_gpu_validated: false
+  cross_product_allowed: false
+  merge_preserves_existing_candidates: true
+  target_architecture: gfx942
+  priority_policy:
+    P0: direct gfx942 tuned rows and unfused baseline primitives
+    P1: fused or activation-bearing variants
+candidates:
+- id: gfx942-auto-03840debfb0f6aa1
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-BF04195C618C
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/normalization/test_rmsnorm.py:test_rmsnorm
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/normalization/test_rmsnorm.py
+    test_id: test_rmsnorm
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: a4e9977897e44ab54295eb7e79c9d52fced26596db9ee9b4c4d161a954367098
+    line: 100
+    record_ordinal: 16
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 364800
+    - 128
+    no_cross_product: true
+  shape_cluster: 2d-large-irregular
+  contract:
+    operator: rms_norm
+    shape:
+      M: 364800
+      N: 128
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: contiguous
+    epsilon: 1.0e-05
+  oracle:
+    tier: pure_torch
+    method: local pure-torch torch_rmsnorm
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-0654b60269ef05f9
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-0289A9B7C215
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:aiter/configs/a8w8_tuned_gemm.csv:gfx942-tuned-row
+  source:
+    revision: aiter
+    test_path: aiter/configs/a8w8_tuned_gemm.csv
+    test_id: gfx942-tuned-row
+    source_language: hip
+    source_backend: aiter_asm_tuned
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c0b9a313244b38a2b60ca55650ad270ff49307dc05050bbf49e641c717fad3f0
+    line: 5
+    record_ordinal: 3
+    extraction: csv_row
+  lineage:
+    kind: gfx942_tuned_csv_row
+    kernel_id: 28
+    kernel_name: a8w8_rowwise_256x32x128x256_32x32_1x1_16x16x1_16x16x1_1x32x1x8_8x8x1_1x1_intrawave_v3
+    split_k: 0
+    no_cross_product: true
+  shape_cluster: 3d-large-power2
+  contract:
+    operator: scaled_quant_gemm
+    shape:
+      M: 32
+      N: 8192
+      K: 1024
+    input_dtype: int8
+    weight_dtype: int8
+    accum_dtype: int32
+    output_dtype: bf16
+    layout: TN
+    scale:
+      activation: per_row
+      weight: per_column
+  oracle:
+    tier: pure_torch
+    method: dequantize scales then torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: csv_gfx_column
+      path: aiter/configs/a8w8_tuned_gemm.csv
+      line: 5
+      value: gfx942
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-06e67b8aa596b1a2
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-0289A9B7C215
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:aiter/configs/a8w8_tuned_gemm.csv:gfx942-tuned-row
+  source:
+    revision: aiter
+    test_path: aiter/configs/a8w8_tuned_gemm.csv
+    test_id: gfx942-tuned-row
+    source_language: hip
+    source_backend: aiter_asm_tuned
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c0b9a313244b38a2b60ca55650ad270ff49307dc05050bbf49e641c717fad3f0
+    line: 9
+    record_ordinal: 7
+    extraction: csv_row
+  lineage:
+    kind: gfx942_tuned_csv_row
+    kernel_id: 45
+    kernel_name: a8w8_rowwise_256x128x64x128_32x32_2x1_8x32x1_8x32x1_1x32x1x8_8x8x1_1x1_intrawave_v3
+    split_k: 0
+    no_cross_product: true
+  shape_cluster: 3d-large-power2
+  contract:
+    operator: scaled_quant_gemm
+    shape:
+      M: 128
+      N: 8192
+      K: 1024
+    input_dtype: int8
+    weight_dtype: int8
+    accum_dtype: int32
+    output_dtype: bf16
+    layout: TN
+    scale:
+      activation: per_row
+      weight: per_column
+  oracle:
+    tier: pure_torch
+    method: dequantize scales then torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: csv_gfx_column
+      path: aiter/configs/a8w8_tuned_gemm.csv
+      line: 9
+      value: gfx942
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-07e3838b9365c685
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-BF04195C618C
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/normalization/test_rmsnorm.py:test_rmsnorm
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/normalization/test_rmsnorm.py
+    test_id: test_rmsnorm
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: a4e9977897e44ab54295eb7e79c9d52fced26596db9ee9b4c4d161a954367098
+    line: 100
+    record_ordinal: 9
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 2048
+    - 4096
+    no_cross_product: true
+  shape_cluster: 2d-medium-power2
+  contract:
+    operator: rms_norm
+    shape:
+      M: 2048
+      N: 4096
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: contiguous
+    epsilon: 1.0e-05
+  oracle:
+    tier: pure_torch
+    method: local pure-torch torch_rmsnorm
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-0a90225f7d5a9a8b
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-75BD103AEBFB
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/test_softmax.py:test_softmax
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/test_softmax.py
+    test_id: test_softmax
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 56b49b9a7c15c22789dd8e8432f51b8b343408f14f84d92173223616f2fe7925
+    line: 22
+    record_ordinal: 9
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 1
+    - 89999
+    no_cross_product: true
+  shape_cluster: 2d-medium-irregular
+  contract:
+    operator: softmax
+    shape:
+      M: 1
+      N: 89999
+    input_dtype: fp32
+    output_dtype: fp32
+    layout: row_major
+    axis: 1
+  oracle:
+    tier: pure_torch
+    method: torch.softmax
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-0dfa1ae06e4928c9
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-72F77723027E
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/quant/test_quant.py:test_dynamic_per_token_quant
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/quant/test_quant.py
+    test_id: test_dynamic_per_token_quant
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    line: 128
+    record_ordinal: 2
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 1
+    - 32
+    no_cross_product: true
+  shape_cluster: 2d-small-power2
+  contract:
+    operator: dynamic_per_token_quant
+    shape:
+      M: 1
+      N: 32
+    input_dtype: bf16
+    output_dtype: fp8_e4m3fnuz
+    layout: contiguous
+    scale: fp32_per_row
+  oracle:
+    tier: pure_torch
+    method: pure-torch row absmax scaling then dtype cast
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-10d745e221079de8
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-BF04195C618C
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/normalization/test_rmsnorm.py:test_rmsnorm
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/normalization/test_rmsnorm.py
+    test_id: test_rmsnorm
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: a4e9977897e44ab54295eb7e79c9d52fced26596db9ee9b4c4d161a954367098
+    line: 100
+    record_ordinal: 8
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 8192
+    - 8192
+    no_cross_product: true
+  shape_cluster: 2d-large-power2
+  contract:
+    operator: rms_norm
+    shape:
+      M: 8192
+      N: 8192
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: contiguous
+    epsilon: 1.0e-05
+  oracle:
+    tier: pure_torch
+    method: local pure-torch torch_rmsnorm
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-13ec84bdfd8fbc8c
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-7EF6E9FF14F6
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 59
+    record_ordinal: 6
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 8192
+    - 8192
+    - 8192
+    no_cross_product: true
+  shape_cluster: 3d-large-power2
+  contract:
+    operator: gemm
+    shape:
+      M: 8192
+      N: 8192
+      K: 8192
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+  oracle:
+    tier: pure_torch
+    method: torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-18ed5b9736b5586d
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-7EF6E9FF14F6
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 59
+    record_ordinal: 3
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 2048
+    - 2048
+    - 2048
+    no_cross_product: true
+  shape_cluster: 3d-large-power2
+  contract:
+    operator: gemm
+    shape:
+      M: 2048
+      N: 2048
+      K: 2048
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+  oracle:
+    tier: pure_torch
+    method: torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-1bc67e0bbfb7dd39
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-BF04195C618C
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/normalization/test_rmsnorm.py:test_rmsnorm
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/normalization/test_rmsnorm.py
+    test_id: test_rmsnorm
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: a4e9977897e44ab54295eb7e79c9d52fced26596db9ee9b4c4d161a954367098
+    line: 100
+    record_ordinal: 3
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 4096
+    - 8192
+    no_cross_product: true
+  shape_cluster: 2d-large-power2
+  contract:
+    operator: rms_norm
+    shape:
+      M: 4096
+      N: 8192
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: contiguous
+    epsilon: 1.0e-05
+  oracle:
+    tier: pure_torch
+    method: local pure-torch torch_rmsnorm
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-1c3e485662259503
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-0289A9B7C215
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:aiter/configs/a8w8_tuned_gemm.csv:gfx942-tuned-row
+  source:
+    revision: aiter
+    test_path: aiter/configs/a8w8_tuned_gemm.csv
+    test_id: gfx942-tuned-row
+    source_language: hip
+    source_backend: aiter_asm_tuned
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c0b9a313244b38a2b60ca55650ad270ff49307dc05050bbf49e641c717fad3f0
+    line: 3
+    record_ordinal: 1
+    extraction: csv_row
+  lineage:
+    kind: gfx942_tuned_csv_row
+    kernel_id: 78
+    kernel_name: a8w8_rowwise_64x16x16x128_16x16_1x1_8x8x1_8x8x1_1x16x1x4_4x4x1_1x1_interwave_v2
+    split_k: 0
+    no_cross_product: true
+  shape_cluster: 3d-medium-power2
+  contract:
+    operator: scaled_quant_gemm
+    shape:
+      M: 1
+      N: 8192
+      K: 1024
+    input_dtype: int8
+    weight_dtype: int8
+    accum_dtype: int32
+    output_dtype: bf16
+    layout: TN
+    scale:
+      activation: per_row
+      weight: per_column
+  oracle:
+    tier: pure_torch
+    method: dequantize scales then torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: csv_gfx_column
+      path: aiter/configs/a8w8_tuned_gemm.csv
+      line: 3
+      value: gfx942
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-1f96a10682113a57
+  priority: P1
+  contract_family_id: CF-GFX942-AUTO-3C5B809A8D14
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/fusions/test_fused_mul_add.py:test_mul_add
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/fusions/test_fused_mul_add.py
+    test_id: test_mul_add
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 99b883efc0e14bb91a9acedc6f6a34e3abf673d4844ce5572cce54f4a1bfb9ab
+    line: 41
+    record_ordinal: 5
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - shape
+    record:
+    - 16
+    - 50
+    - 4186
+    no_cross_product: true
+  shape_cluster: 3d-medium-irregular
+  contract:
+    operator: fused_mul_add
+    shape:
+      dims:
+      - 16
+      - 50
+      - 4186
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: contiguous
+    operand_kinds: &id002
+    - python_float_scalar
+    - python_int_scalar
+    - tensor_scalar
+    - tensor
+  oracle:
+    tier: pure_torch
+    method: pure-torch a * x.float() + b then input dtype cast
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-207af4dca6f2ac52
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-7EF6E9FF14F6
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 59
+    record_ordinal: 5
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 5120
+    - 5120
+    - 5120
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: gemm
+    shape:
+      M: 5120
+      N: 5120
+      K: 5120
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+  oracle:
+    tier: pure_torch
+    method: torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-2435134006e59e64
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-72F77723027E
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/quant/test_quant.py:test_dynamic_per_token_quant
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/quant/test_quant.py
+    test_id: test_dynamic_per_token_quant
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    line: 133
+    record_ordinal: 7
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 400
+    - 400
+    no_cross_product: true
+  shape_cluster: 2d-medium-irregular
+  contract:
+    operator: dynamic_per_token_quant
+    shape:
+      M: 400
+      N: 400
+    input_dtype: bf16
+    output_dtype: fp8_e4m3fnuz
+    layout: contiguous
+    scale: fp32_per_row
+  oracle:
+    tier: pure_torch
+    method: pure-torch row absmax scaling then dtype cast
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-26e41e0f594f4b3b
+  priority: P1
+  contract_family_id: CF-GFX942-AUTO-4836A0F17835
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16_activation
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16_activation
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 99
+    record_ordinal: 0
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 16
+    - 1024
+    - 1024
+    no_cross_product: true
+  shape_cluster: 3d-medium-power2
+  contract:
+    operator: gemm_activation
+    shape:
+      M: 16
+      N: 1024
+      K: 1024
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+    activation_options: &id001
+    - gelu
+    - gelu_tanh
+    - silu
+  oracle:
+    tier: pure_torch
+    method: F.linear followed by the selected torch activation
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-294850c939d10d70
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-7EF6E9FF14F6
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 59
+    record_ordinal: 14
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 256
+    - 5120
+    - 2880
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: gemm
+    shape:
+      M: 256
+      N: 5120
+      K: 2880
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+  oracle:
+    tier: pure_torch
+    method: torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-2bcd3c549718c060
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-0289A9B7C215
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:aiter/configs/a8w8_tuned_gemm.csv:gfx942-tuned-row
+  source:
+    revision: aiter
+    test_path: aiter/configs/a8w8_tuned_gemm.csv
+    test_id: gfx942-tuned-row
+    source_language: hip
+    source_backend: aiter_asm_tuned
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c0b9a313244b38a2b60ca55650ad270ff49307dc05050bbf49e641c717fad3f0
+    line: 20
+    record_ordinal: 18
+    extraction: csv_row
+  lineage:
+    kind: gfx942_tuned_csv_row
+    kernel_id: 13
+    kernel_name: a8w8_rowwise_256x128x128x128_32x32_2x2_8x32x1_8x32x1_1x32x1x8_8x8x1_1x1_intrawave_v3
+    split_k: 0
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: scaled_quant_gemm
+    shape:
+      M: 2048
+      N: 1280
+      K: 8192
+    input_dtype: int8
+    weight_dtype: int8
+    accum_dtype: int32
+    output_dtype: bf16
+    layout: TN
+    scale:
+      activation: per_row
+      weight: per_column
+  oracle:
+    tier: pure_torch
+    method: dequantize scales then torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: csv_gfx_column
+      path: aiter/configs/a8w8_tuned_gemm.csv
+      line: 20
+      value: gfx942
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-2e91823f33b7aa09
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-7EF6E9FF14F6
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 59
+    record_ordinal: 2
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 1024
+    - 1024
+    - 1024
+    no_cross_product: true
+  shape_cluster: 3d-large-power2
+  contract:
+    operator: gemm
+    shape:
+      M: 1024
+      N: 1024
+      K: 1024
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+  oracle:
+    tier: pure_torch
+    method: torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-2ed39296fee2f4cb
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-7EF6E9FF14F6
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 59
+    record_ordinal: 8
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 64
+    - 256
+    - 7168
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: gemm
+    shape:
+      M: 64
+      N: 256
+      K: 7168
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+  oracle:
+    tier: pure_torch
+    method: torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-2f97edd8dbc068b4
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-75BD103AEBFB
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/test_softmax.py:test_softmax
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/test_softmax.py
+    test_id: test_softmax
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 56b49b9a7c15c22789dd8e8432f51b8b343408f14f84d92173223616f2fe7925
+    line: 18
+    record_ordinal: 5
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 4096
+    - 8192
+    no_cross_product: true
+  shape_cluster: 2d-large-power2
+  contract:
+    operator: softmax
+    shape:
+      M: 4096
+      N: 8192
+    input_dtype: fp32
+    output_dtype: fp32
+    layout: row_major
+    axis: 1
+  oracle:
+    tier: pure_torch
+    method: torch.softmax
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-3407cdf076f80a8c
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-0289A9B7C215
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:aiter/configs/a8w8_tuned_gemm.csv:gfx942-tuned-row
+  source:
+    revision: aiter
+    test_path: aiter/configs/a8w8_tuned_gemm.csv
+    test_id: gfx942-tuned-row
+    source_language: hip
+    source_backend: aiter_asm_tuned
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c0b9a313244b38a2b60ca55650ad270ff49307dc05050bbf49e641c717fad3f0
+    line: 2
+    record_ordinal: 0
+    extraction: csv_row
+  lineage:
+    kind: gfx942_tuned_csv_row
+    kernel_id: 34
+    kernel_name: a8w8_rowwise_256x16x64x512_16x16_1x1_32x8x1_32x8x1_1x16x1x16_4x4x1_1x1_intrawave_v3
+    split_k: 0
+    no_cross_product: true
+  shape_cluster: 3d-medium-irregular
+  contract:
+    operator: scaled_quant_gemm
+    shape:
+      M: 1
+      N: 1280
+      K: 8192
+    input_dtype: int8
+    weight_dtype: int8
+    accum_dtype: int32
+    output_dtype: bf16
+    layout: TN
+    scale:
+      activation: per_row
+      weight: per_column
+  oracle:
+    tier: pure_torch
+    method: dequantize scales then torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: csv_gfx_column
+      path: aiter/configs/a8w8_tuned_gemm.csv
+      line: 2
+      value: gfx942
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-3773c3b6f26bd7d8
+  priority: P1
+  contract_family_id: CF-GFX942-AUTO-4836A0F17835
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16_activation
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16_activation
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 99
+    record_ordinal: 3
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 1024
+    - 1024
+    - 1024
+    no_cross_product: true
+  shape_cluster: 3d-large-power2
+  contract:
+    operator: gemm_activation
+    shape:
+      M: 1024
+      N: 1024
+      K: 1024
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+    activation_options: *id001
+  oracle:
+    tier: pure_torch
+    method: F.linear followed by the selected torch activation
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-384cea9d5c28243a
+  priority: P1
+  contract_family_id: CF-GFX942-AUTO-3C5B809A8D14
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/fusions/test_fused_mul_add.py:test_mul_add
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/fusions/test_fused_mul_add.py
+    test_id: test_mul_add
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 99b883efc0e14bb91a9acedc6f6a34e3abf673d4844ce5572cce54f4a1bfb9ab
+    line: 41
+    record_ordinal: 0
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - shape
+    record:
+    - 1
+    no_cross_product: true
+  shape_cluster: 1d-small-power2
+  contract:
+    operator: fused_mul_add
+    shape:
+      dims:
+      - 1
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: contiguous
+    operand_kinds: *id002
+  oracle:
+    tier: pure_torch
+    method: pure-torch a * x.float() + b then input dtype cast
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-3fdf4ddaf5b0ad0b
+  priority: P1
+  contract_family_id: CF-GFX942-AUTO-4836A0F17835
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16_activation
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16_activation
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 99
+    record_ordinal: 5
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 8192
+    - 8192
+    - 8192
+    no_cross_product: true
+  shape_cluster: 3d-large-power2
+  contract:
+    operator: gemm_activation
+    shape:
+      M: 8192
+      N: 8192
+      K: 8192
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+    activation_options: *id001
+  oracle:
+    tier: pure_torch
+    method: F.linear followed by the selected torch activation
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-46c97e3f410c680a
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-BF04195C618C
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/normalization/test_rmsnorm.py:test_rmsnorm
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/normalization/test_rmsnorm.py
+    test_id: test_rmsnorm
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: a4e9977897e44ab54295eb7e79c9d52fced26596db9ee9b4c4d161a954367098
+    line: 100
+    record_ordinal: 15
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 71
+    - 3571
+    no_cross_product: true
+  shape_cluster: 2d-medium-irregular
+  contract:
+    operator: rms_norm
+    shape:
+      M: 71
+      N: 3571
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: contiguous
+    epsilon: 1.0e-05
+  oracle:
+    tier: pure_torch
+    method: local pure-torch torch_rmsnorm
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-4706fd006a1022c7
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-7EF6E9FF14F6
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 59
+    record_ordinal: 12
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 64
+    - 5120
+    - 2880
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: gemm
+    shape:
+      M: 64
+      N: 5120
+      K: 2880
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+  oracle:
+    tier: pure_torch
+    method: torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-479895549cd7bdd5
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-7EF6E9FF14F6
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 59
+    record_ordinal: 1
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 3
+    - 5
+    - 2
+    no_cross_product: true
+  shape_cluster: 3d-small-irregular
+  contract:
+    operator: gemm
+    shape:
+      M: 3
+      N: 5
+      K: 2
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+  oracle:
+    tier: pure_torch
+    method: torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-4a2edab849f64f42
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-A244EFDD6D16
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/quant/test_quant.py:test_dynamic_per_tensor_quant
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/quant/test_quant.py
+    test_id: test_dynamic_per_tensor_quant
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    line: 75
+    record_ordinal: 5
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 93
+    - 75
+    no_cross_product: true
+  shape_cluster: 2d-medium-irregular
+  contract:
+    operator: dynamic_per_tensor_quant
+    shape:
+      M: 93
+      N: 75
+    input_dtype: bf16
+    output_dtype: fp8_e4m3fnuz
+    layout: contiguous
+    scale: fp32_scalar
+  oracle:
+    tier: pure_torch
+    method: pure-torch global absmax scaling then dtype cast
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-4b5e0ed5f964bb7c
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-0289A9B7C215
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:aiter/configs/a8w8_tuned_gemm.csv:gfx942-tuned-row
+  source:
+    revision: aiter
+    test_path: aiter/configs/a8w8_tuned_gemm.csv
+    test_id: gfx942-tuned-row
+    source_language: hip
+    source_backend: aiter_asm_tuned
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c0b9a313244b38a2b60ca55650ad270ff49307dc05050bbf49e641c717fad3f0
+    line: 8
+    record_ordinal: 6
+    extraction: csv_row
+  lineage:
+    kind: gfx942_tuned_csv_row
+    kernel_id: 30
+    kernel_name: a8w8_rowwise_256x32x64x512_16x16_1x2_32x8x1_32x8x1_1x32x1x8_8x8x1_1x2_intrawave_v3
+    split_k: 0
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: scaled_quant_gemm
+    shape:
+      M: 128
+      N: 1280
+      K: 8192
+    input_dtype: int8
+    weight_dtype: int8
+    accum_dtype: int32
+    output_dtype: bf16
+    layout: TN
+    scale:
+      activation: per_row
+      weight: per_column
+  oracle:
+    tier: pure_torch
+    method: dequantize scales then torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: csv_gfx_column
+      path: aiter/configs/a8w8_tuned_gemm.csv
+      line: 8
+      value: gfx942
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-4e1f7f921ce66ce2
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-7EF6E9FF14F6
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 59
+    record_ordinal: 19
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 32
+    - 128
+    - 2880
+    no_cross_product: true
+  shape_cluster: 3d-medium-irregular
+  contract:
+    operator: gemm
+    shape:
+      M: 32
+      N: 128
+      K: 2880
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+  oracle:
+    tier: pure_torch
+    method: torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-4fe37d3052f1c30f
+  priority: P1
+  contract_family_id: CF-GFX942-AUTO-4836A0F17835
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16_activation
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16_activation
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 99
+    record_ordinal: 2
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 256
+    - 512
+    - 8192
+    no_cross_product: true
+  shape_cluster: 3d-large-power2
+  contract:
+    operator: gemm_activation
+    shape:
+      M: 256
+      N: 512
+      K: 8192
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+    activation_options: *id001
+  oracle:
+    tier: pure_torch
+    method: F.linear followed by the selected torch activation
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-50cd40481a3e7d88
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-72F77723027E
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/quant/test_quant.py:test_dynamic_per_token_quant
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/quant/test_quant.py
+    test_id: test_dynamic_per_token_quant
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    line: 129
+    record_ordinal: 3
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 32
+    - 32
+    no_cross_product: true
+  shape_cluster: 2d-small-power2
+  contract:
+    operator: dynamic_per_token_quant
+    shape:
+      M: 32
+      N: 32
+    input_dtype: bf16
+    output_dtype: fp8_e4m3fnuz
+    layout: contiguous
+    scale: fp32_per_row
+  oracle:
+    tier: pure_torch
+    method: pure-torch row absmax scaling then dtype cast
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-51ce9f72f21c9458
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-75BD103AEBFB
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/test_softmax.py:test_softmax
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/test_softmax.py
+    test_id: test_softmax
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 56b49b9a7c15c22789dd8e8432f51b8b343408f14f84d92173223616f2fe7925
+    line: 14
+    record_ordinal: 1
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 1
+    - 1
+    no_cross_product: true
+  shape_cluster: 2d-small-power2
+  contract:
+    operator: softmax
+    shape:
+      M: 1
+      N: 1
+    input_dtype: fp32
+    output_dtype: fp32
+    layout: row_major
+    axis: 1
+  oracle:
+    tier: pure_torch
+    method: torch.softmax
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-52aaff012bcb5ed5
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-0289A9B7C215
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:aiter/configs/a8w8_tuned_gemm.csv:gfx942-tuned-row
+  source:
+    revision: aiter
+    test_path: aiter/configs/a8w8_tuned_gemm.csv
+    test_id: gfx942-tuned-row
+    source_language: hip
+    source_backend: aiter_asm_tuned
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c0b9a313244b38a2b60ca55650ad270ff49307dc05050bbf49e641c717fad3f0
+    line: 21
+    record_ordinal: 19
+    extraction: csv_row
+  lineage:
+    kind: gfx942_tuned_csv_row
+    kernel_id: 41
+    kernel_name: a8w8_rowwise_256x128x128x128_32x32_2x2_8x32x1_8x32x1_1x32x1x8_8x8x1_1x1_intrawave_v5
+    split_k: 0
+    no_cross_product: true
+  shape_cluster: 3d-large-power2
+  contract:
+    operator: scaled_quant_gemm
+    shape:
+      M: 2048
+      N: 8192
+      K: 1024
+    input_dtype: int8
+    weight_dtype: int8
+    accum_dtype: int32
+    output_dtype: bf16
+    layout: TN
+    scale:
+      activation: per_row
+      weight: per_column
+  oracle:
+    tier: pure_torch
+    method: dequantize scales then torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: csv_gfx_column
+      path: aiter/configs/a8w8_tuned_gemm.csv
+      line: 21
+      value: gfx942
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-55946d1ba16be179
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-BF04195C618C
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/normalization/test_rmsnorm.py:test_rmsnorm
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/normalization/test_rmsnorm.py
+    test_id: test_rmsnorm
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: a4e9977897e44ab54295eb7e79c9d52fced26596db9ee9b4c4d161a954367098
+    line: 100
+    record_ordinal: 14
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 173
+    - 409
+    no_cross_product: true
+  shape_cluster: 2d-medium-irregular
+  contract:
+    operator: rms_norm
+    shape:
+      M: 173
+      N: 409
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: contiguous
+    epsilon: 1.0e-05
+  oracle:
+    tier: pure_torch
+    method: local pure-torch torch_rmsnorm
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-566279744081b2b1
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-7EF6E9FF14F6
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 59
+    record_ordinal: 22
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 256
+    - 128
+    - 2880
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: gemm
+    shape:
+      M: 256
+      N: 128
+      K: 2880
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+  oracle:
+    tier: pure_torch
+    method: torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-597cdf05d3346887
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-0289A9B7C215
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:aiter/configs/a8w8_tuned_gemm.csv:gfx942-tuned-row
+  source:
+    revision: aiter
+    test_path: aiter/configs/a8w8_tuned_gemm.csv
+    test_id: gfx942-tuned-row
+    source_language: hip
+    source_backend: aiter_asm_tuned
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c0b9a313244b38a2b60ca55650ad270ff49307dc05050bbf49e641c717fad3f0
+    line: 18
+    record_ordinal: 16
+    extraction: csv_row
+  lineage:
+    kind: gfx942_tuned_csv_row
+    kernel_id: 13
+    kernel_name: a8w8_rowwise_256x128x128x128_32x32_2x2_8x32x1_8x32x1_1x32x1x8_8x8x1_1x1_intrawave_v3
+    split_k: 0
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: scaled_quant_gemm
+    shape:
+      M: 1024
+      N: 1280
+      K: 8192
+    input_dtype: int8
+    weight_dtype: int8
+    accum_dtype: int32
+    output_dtype: bf16
+    layout: TN
+    scale:
+      activation: per_row
+      weight: per_column
+  oracle:
+    tier: pure_torch
+    method: dequantize scales then torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: csv_gfx_column
+      path: aiter/configs/a8w8_tuned_gemm.csv
+      line: 18
+      value: gfx942
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-5aa95c33fa28ce8d
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-7EF6E9FF14F6
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 59
+    record_ordinal: 15
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 32
+    - 2880
+    - 4096
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: gemm
+    shape:
+      M: 32
+      N: 2880
+      K: 4096
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+  oracle:
+    tier: pure_torch
+    method: torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-5bd33a07a15a669a
+  priority: P1
+  contract_family_id: CF-GFX942-AUTO-4836A0F17835
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16_activation
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16_activation
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 99
+    record_ordinal: 4
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 5120
+    - 5120
+    - 5120
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: gemm_activation
+    shape:
+      M: 5120
+      N: 5120
+      K: 5120
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+    activation_options: *id001
+  oracle:
+    tier: pure_torch
+    method: F.linear followed by the selected torch activation
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-5e6297e3d0fd629a
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-A244EFDD6D16
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/quant/test_quant.py:test_dynamic_per_tensor_quant
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/quant/test_quant.py
+    test_id: test_dynamic_per_tensor_quant
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    line: 75
+    record_ordinal: 4
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 32
+    - 8192
+    no_cross_product: true
+  shape_cluster: 2d-medium-power2
+  contract:
+    operator: dynamic_per_tensor_quant
+    shape:
+      M: 32
+      N: 8192
+    input_dtype: bf16
+    output_dtype: fp8_e4m3fnuz
+    layout: contiguous
+    scale: fp32_scalar
+  oracle:
+    tier: pure_torch
+    method: pure-torch global absmax scaling then dtype cast
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-5e6c9f11455a0260
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-CCB1A51C709E
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/quant/test_quant.py:test_static_per_tensor_quant
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/quant/test_quant.py
+    test_id: test_static_per_tensor_quant
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    line: 33
+    record_ordinal: 7
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 193
+    - 75
+    no_cross_product: true
+  shape_cluster: 2d-medium-irregular
+  contract:
+    operator: static_per_tensor_quant
+    shape:
+      M: 193
+      N: 75
+    input_dtype: bf16
+    output_dtype: fp8_e4m3fnuz
+    layout: contiguous
+    scale: fp32_scalar
+  oracle:
+    tier: pure_torch
+    method: pure-torch x divided by scalar scale then dtype cast
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-5e956b0847de86f3
+  priority: P1
+  contract_family_id: CF-GFX942-AUTO-3C5B809A8D14
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/fusions/test_fused_mul_add.py:test_mul_add
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/fusions/test_fused_mul_add.py
+    test_id: test_mul_add
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 99b883efc0e14bb91a9acedc6f6a34e3abf673d4844ce5572cce54f4a1bfb9ab
+    line: 41
+    record_ordinal: 3
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - shape
+    record:
+    - 10000
+    no_cross_product: true
+  shape_cluster: 1d-medium-irregular
+  contract:
+    operator: fused_mul_add
+    shape:
+      dims:
+      - 10000
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: contiguous
+    operand_kinds: *id002
+  oracle:
+    tier: pure_torch
+    method: pure-torch a * x.float() + b then input dtype cast
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-6264eb486197f616
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-0289A9B7C215
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:aiter/configs/a8w8_tuned_gemm.csv:gfx942-tuned-row
+  source:
+    revision: aiter
+    test_path: aiter/configs/a8w8_tuned_gemm.csv
+    test_id: gfx942-tuned-row
+    source_language: hip
+    source_backend: aiter_asm_tuned
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c0b9a313244b38a2b60ca55650ad270ff49307dc05050bbf49e641c717fad3f0
+    line: 17
+    record_ordinal: 15
+    extraction: csv_row
+  lineage:
+    kind: gfx942_tuned_csv_row
+    kernel_id: 13
+    kernel_name: a8w8_rowwise_256x128x128x128_32x32_2x2_8x32x1_8x32x1_1x32x1x8_8x8x1_1x1_intrawave_v3
+    split_k: 0
+    no_cross_product: true
+  shape_cluster: 3d-large-power2
+  contract:
+    operator: scaled_quant_gemm
+    shape:
+      M: 512
+      N: 8192
+      K: 1024
+    input_dtype: int8
+    weight_dtype: int8
+    accum_dtype: int32
+    output_dtype: bf16
+    layout: TN
+    scale:
+      activation: per_row
+      weight: per_column
+  oracle:
+    tier: pure_torch
+    method: dequantize scales then torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: csv_gfx_column
+      path: aiter/configs/a8w8_tuned_gemm.csv
+      line: 17
+      value: gfx942
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-64366d4733e6d28c
+  priority: P1
+  contract_family_id: CF-GFX942-AUTO-0B23B5DDCF09
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/fusions/test_fused_silu_mul.py:test_fused_silu_mul
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/fusions/test_fused_silu_mul.py
+    test_id: test_fused_silu_mul
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 636efeb6a45d537fed124f132390cde2d76134f545fe4c8a85acf92dc3084c07
+    line: 36
+    record_ordinal: 2
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - shape
+    record:
+    - 31
+    - 500
+    no_cross_product: true
+  shape_cluster: 2d-medium-irregular
+  contract:
+    operator: fused_silu_mul
+    shape:
+      dims:
+      - 31
+      - 500
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: split_last_dimension
+  oracle:
+    tier: pure_torch
+    method: local pure-torch silu_exp2 reference multiplied by gate
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-67ad8670538c0dd4
+  priority: P1
+  contract_family_id: CF-GFX942-AUTO-0B23B5DDCF09
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/fusions/test_fused_silu_mul.py:test_fused_silu_mul
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/fusions/test_fused_silu_mul.py
+    test_id: test_fused_silu_mul
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 636efeb6a45d537fed124f132390cde2d76134f545fe4c8a85acf92dc3084c07
+    line: 34
+    record_ordinal: 0
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - shape
+    record:
+    - 4
+    - 64
+    no_cross_product: true
+  shape_cluster: 2d-small-power2
+  contract:
+    operator: fused_silu_mul
+    shape:
+      dims:
+      - 4
+      - 64
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: split_last_dimension
+  oracle:
+    tier: pure_torch
+    method: local pure-torch silu_exp2 reference multiplied by gate
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-68dd036cfc06e14c
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-CCB1A51C709E
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/quant/test_quant.py:test_static_per_tensor_quant
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/quant/test_quant.py
+    test_id: test_static_per_tensor_quant
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    line: 26
+    record_ordinal: 0
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 1
+    - 32
+    no_cross_product: true
+  shape_cluster: 2d-small-power2
+  contract:
+    operator: static_per_tensor_quant
+    shape:
+      M: 1
+      N: 32
+    input_dtype: bf16
+    output_dtype: fp8_e4m3fnuz
+    layout: contiguous
+    scale: fp32_scalar
+  oracle:
+    tier: pure_torch
+    method: pure-torch x divided by scalar scale then dtype cast
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-6b9dc6961a70a305
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-7EF6E9FF14F6
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 59
+    record_ordinal: 7
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 32
+    - 256
+    - 7168
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: gemm
+    shape:
+      M: 32
+      N: 256
+      K: 7168
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+  oracle:
+    tier: pure_torch
+    method: torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-6cb79ef9960cfbb2
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-A244EFDD6D16
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/quant/test_quant.py:test_dynamic_per_tensor_quant
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/quant/test_quant.py
+    test_id: test_dynamic_per_tensor_quant
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    line: 75
+    record_ordinal: 3
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 10
+    - 128
+    no_cross_product: true
+  shape_cluster: 2d-small-irregular
+  contract:
+    operator: dynamic_per_tensor_quant
+    shape:
+      M: 10
+      N: 128
+    input_dtype: bf16
+    output_dtype: fp8_e4m3fnuz
+    layout: contiguous
+    scale: fp32_scalar
+  oracle:
+    tier: pure_torch
+    method: pure-torch global absmax scaling then dtype cast
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-6e0df0b3cd131888
+  priority: P1
+  contract_family_id: CF-GFX942-AUTO-0B23B5DDCF09
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/fusions/test_fused_silu_mul.py:test_fused_silu_mul
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/fusions/test_fused_silu_mul.py
+    test_id: test_fused_silu_mul
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 636efeb6a45d537fed124f132390cde2d76134f545fe4c8a85acf92dc3084c07
+    line: 38
+    record_ordinal: 4
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - shape
+    record:
+    - 1
+    - 3
+    - 7
+    - 32
+    no_cross_product: true
+  shape_cluster: 4d-small-irregular
+  contract:
+    operator: fused_silu_mul
+    shape:
+      dims:
+      - 1
+      - 3
+      - 7
+      - 32
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: split_last_dimension
+  oracle:
+    tier: pure_torch
+    method: local pure-torch silu_exp2 reference multiplied by gate
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-6f3d55a5918807ea
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-7EF6E9FF14F6
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 59
+    record_ordinal: 20
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 64
+    - 128
+    - 2880
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: gemm
+    shape:
+      M: 64
+      N: 128
+      K: 2880
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+  oracle:
+    tier: pure_torch
+    method: torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-7552919fafff665a
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-0289A9B7C215
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:aiter/configs/a8w8_tuned_gemm.csv:gfx942-tuned-row
+  source:
+    revision: aiter
+    test_path: aiter/configs/a8w8_tuned_gemm.csv
+    test_id: gfx942-tuned-row
+    source_language: hip
+    source_backend: aiter_asm_tuned
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c0b9a313244b38a2b60ca55650ad270ff49307dc05050bbf49e641c717fad3f0
+    line: 24
+    record_ordinal: 22
+    extraction: csv_row
+  lineage:
+    kind: gfx942_tuned_csv_row
+    kernel_id: 13
+    kernel_name: a8w8_rowwise_256x128x128x128_32x32_2x2_8x32x1_8x32x1_1x32x1x8_8x8x1_1x1_intrawave_v3
+    split_k: 0
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: scaled_quant_gemm
+    shape:
+      M: 8192
+      N: 1280
+      K: 8192
+    input_dtype: int8
+    weight_dtype: int8
+    accum_dtype: int32
+    output_dtype: bf16
+    layout: TN
+    scale:
+      activation: per_row
+      weight: per_column
+  oracle:
+    tier: pure_torch
+    method: dequantize scales then torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: csv_gfx_column
+      path: aiter/configs/a8w8_tuned_gemm.csv
+      line: 24
+      value: gfx942
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-7ea4cca4c79097f2
+  priority: P1
+  contract_family_id: CF-GFX942-AUTO-0B23B5DDCF09
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/fusions/test_fused_silu_mul.py:test_fused_silu_mul
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/fusions/test_fused_silu_mul.py
+    test_id: test_fused_silu_mul
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 636efeb6a45d537fed124f132390cde2d76134f545fe4c8a85acf92dc3084c07
+    line: 35
+    record_ordinal: 1
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - shape
+    record:
+    - 128
+    - 256
+    no_cross_product: true
+  shape_cluster: 2d-medium-power2
+  contract:
+    operator: fused_silu_mul
+    shape:
+      dims:
+      - 128
+      - 256
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: split_last_dimension
+  oracle:
+    tier: pure_torch
+    method: local pure-torch silu_exp2 reference multiplied by gate
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-7ed096b1544b08e9
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-BF04195C618C
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/normalization/test_rmsnorm.py:test_rmsnorm
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/normalization/test_rmsnorm.py
+    test_id: test_rmsnorm
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: a4e9977897e44ab54295eb7e79c9d52fced26596db9ee9b4c4d161a954367098
+    line: 100
+    record_ordinal: 11
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 256
+    - 1024
+    no_cross_product: true
+  shape_cluster: 2d-medium-power2
+  contract:
+    operator: rms_norm
+    shape:
+      M: 256
+      N: 1024
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: contiguous
+    epsilon: 1.0e-05
+  oracle:
+    tier: pure_torch
+    method: local pure-torch torch_rmsnorm
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-81d59b094ca12f38
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-0289A9B7C215
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:aiter/configs/a8w8_tuned_gemm.csv:gfx942-tuned-row
+  source:
+    revision: aiter
+    test_path: aiter/configs/a8w8_tuned_gemm.csv
+    test_id: gfx942-tuned-row
+    source_language: hip
+    source_backend: aiter_asm_tuned
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c0b9a313244b38a2b60ca55650ad270ff49307dc05050bbf49e641c717fad3f0
+    line: 12
+    record_ordinal: 10
+    extraction: csv_row
+  lineage:
+    kind: gfx942_tuned_csv_row
+    kernel_id: 23
+    kernel_name: a8w8_rowwise_256x64x64x512_32x32_1x1_32x8x1_32x8x1_1x32x1x8_8x8x1_1x1_intrawave_v3
+    split_k: 0
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: scaled_quant_gemm
+    shape:
+      M: 256
+      N: 1280
+      K: 8192
+    input_dtype: int8
+    weight_dtype: int8
+    accum_dtype: int32
+    output_dtype: bf16
+    layout: TN
+    scale:
+      activation: per_row
+      weight: per_column
+  oracle:
+    tier: pure_torch
+    method: dequantize scales then torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: csv_gfx_column
+      path: aiter/configs/a8w8_tuned_gemm.csv
+      line: 12
+      value: gfx942
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-82b6220bad60e248
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-72F77723027E
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/quant/test_quant.py:test_dynamic_per_token_quant
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/quant/test_quant.py
+    test_id: test_dynamic_per_token_quant
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    line: 132
+    record_ordinal: 6
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 48
+    - 96
+    no_cross_product: true
+  shape_cluster: 2d-medium-irregular
+  contract:
+    operator: dynamic_per_token_quant
+    shape:
+      M: 48
+      N: 96
+    input_dtype: bf16
+    output_dtype: fp8_e4m3fnuz
+    layout: contiguous
+    scale: fp32_per_row
+  oracle:
+    tier: pure_torch
+    method: pure-torch row absmax scaling then dtype cast
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-86499e841d593352
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-A244EFDD6D16
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/quant/test_quant.py:test_dynamic_per_tensor_quant
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/quant/test_quant.py
+    test_id: test_dynamic_per_tensor_quant
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    line: 75
+    record_ordinal: 2
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 2
+    - 16
+    no_cross_product: true
+  shape_cluster: 2d-small-power2
+  contract:
+    operator: dynamic_per_tensor_quant
+    shape:
+      M: 2
+      N: 16
+    input_dtype: bf16
+    output_dtype: fp8_e4m3fnuz
+    layout: contiguous
+    scale: fp32_scalar
+  oracle:
+    tier: pure_torch
+    method: pure-torch global absmax scaling then dtype cast
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-870e7ccdfe1797cc
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-0289A9B7C215
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:aiter/configs/a8w8_tuned_gemm.csv:gfx942-tuned-row
+  source:
+    revision: aiter
+    test_path: aiter/configs/a8w8_tuned_gemm.csv
+    test_id: gfx942-tuned-row
+    source_language: hip
+    source_backend: aiter_asm_tuned
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c0b9a313244b38a2b60ca55650ad270ff49307dc05050bbf49e641c717fad3f0
+    line: 7
+    record_ordinal: 5
+    extraction: csv_row
+  lineage:
+    kind: gfx942_tuned_csv_row
+    kernel_id: 21
+    kernel_name: a8w8_rowwise_256x64x128x256_32x32_1x2_16x16x1_16x16x1_1x32x1x8_8x8x1_1x1_intrawave_v3
+    split_k: 0
+    no_cross_product: true
+  shape_cluster: 3d-large-power2
+  contract:
+    operator: scaled_quant_gemm
+    shape:
+      M: 64
+      N: 8192
+      K: 1024
+    input_dtype: int8
+    weight_dtype: int8
+    accum_dtype: int32
+    output_dtype: bf16
+    layout: TN
+    scale:
+      activation: per_row
+      weight: per_column
+  oracle:
+    tier: pure_torch
+    method: dequantize scales then torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: csv_gfx_column
+      path: aiter/configs/a8w8_tuned_gemm.csv
+      line: 7
+      value: gfx942
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-8874465143c5fcc6
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-CCB1A51C709E
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/quant/test_quant.py:test_static_per_tensor_quant
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/quant/test_quant.py
+    test_id: test_static_per_tensor_quant
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    line: 32
+    record_ordinal: 6
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 2048
+    - 1024
+    no_cross_product: true
+  shape_cluster: 2d-medium-power2
+  contract:
+    operator: static_per_tensor_quant
+    shape:
+      M: 2048
+      N: 1024
+    input_dtype: bf16
+    output_dtype: fp8_e4m3fnuz
+    layout: contiguous
+    scale: fp32_scalar
+  oracle:
+    tier: pure_torch
+    method: pure-torch x divided by scalar scale then dtype cast
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-89d7725257e4eb48
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-7EF6E9FF14F6
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 59
+    record_ordinal: 10
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 256
+    - 256
+    - 7168
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: gemm
+    shape:
+      M: 256
+      N: 256
+      K: 7168
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+  oracle:
+    tier: pure_torch
+    method: torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-8a304d46b5dbf8c6
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-BF04195C618C
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/normalization/test_rmsnorm.py:test_rmsnorm
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/normalization/test_rmsnorm.py
+    test_id: test_rmsnorm
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: a4e9977897e44ab54295eb7e79c9d52fced26596db9ee9b4c4d161a954367098
+    line: 100
+    record_ordinal: 7
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 4096
+    - 5120
+    no_cross_product: true
+  shape_cluster: 2d-large-irregular
+  contract:
+    operator: rms_norm
+    shape:
+      M: 4096
+      N: 5120
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: contiguous
+    epsilon: 1.0e-05
+  oracle:
+    tier: pure_torch
+    method: local pure-torch torch_rmsnorm
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-8b6b0f102a060163
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-CCB1A51C709E
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/quant/test_quant.py:test_static_per_tensor_quant
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/quant/test_quant.py
+    test_id: test_static_per_tensor_quant
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    line: 27
+    record_ordinal: 1
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 32
+    - 32
+    no_cross_product: true
+  shape_cluster: 2d-small-power2
+  contract:
+    operator: static_per_tensor_quant
+    shape:
+      M: 32
+      N: 32
+    input_dtype: bf16
+    output_dtype: fp8_e4m3fnuz
+    layout: contiguous
+    scale: fp32_scalar
+  oracle:
+    tier: pure_torch
+    method: pure-torch x divided by scalar scale then dtype cast
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-8bbab9a4c40d33dc
+  priority: P1
+  contract_family_id: CF-GFX942-AUTO-3C5B809A8D14
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/fusions/test_fused_mul_add.py:test_mul_add
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/fusions/test_fused_mul_add.py
+    test_id: test_mul_add
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 99b883efc0e14bb91a9acedc6f6a34e3abf673d4844ce5572cce54f4a1bfb9ab
+    line: 41
+    record_ordinal: 4
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - shape
+    record:
+    - 32
+    - 7168
+    no_cross_product: true
+  shape_cluster: 2d-medium-irregular
+  contract:
+    operator: fused_mul_add
+    shape:
+      dims:
+      - 32
+      - 7168
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: contiguous
+    operand_kinds: *id002
+  oracle:
+    tier: pure_torch
+    method: pure-torch a * x.float() + b then input dtype cast
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-8fb276a7fd73a4f4
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-7EF6E9FF14F6
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 59
+    record_ordinal: 18
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 256
+    - 2880
+    - 4096
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: gemm
+    shape:
+      M: 256
+      N: 2880
+      K: 4096
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+  oracle:
+    tier: pure_torch
+    method: torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-919ae6669c5a5bf0
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-BF04195C618C
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/normalization/test_rmsnorm.py:test_rmsnorm
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/normalization/test_rmsnorm.py
+    test_id: test_rmsnorm
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: a4e9977897e44ab54295eb7e79c9d52fced26596db9ee9b4c4d161a954367098
+    line: 100
+    record_ordinal: 5
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 8192
+    - 65536
+    no_cross_product: true
+  shape_cluster: 2d-large-power2
+  contract:
+    operator: rms_norm
+    shape:
+      M: 8192
+      N: 65536
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: contiguous
+    epsilon: 1.0e-05
+  oracle:
+    tier: pure_torch
+    method: local pure-torch torch_rmsnorm
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-9322a7ed9c392692
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-0289A9B7C215
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:aiter/configs/a8w8_tuned_gemm.csv:gfx942-tuned-row
+  source:
+    revision: aiter
+    test_path: aiter/configs/a8w8_tuned_gemm.csv
+    test_id: gfx942-tuned-row
+    source_language: hip
+    source_backend: aiter_asm_tuned
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c0b9a313244b38a2b60ca55650ad270ff49307dc05050bbf49e641c717fad3f0
+    line: 11
+    record_ordinal: 9
+    extraction: csv_row
+  lineage:
+    kind: gfx942_tuned_csv_row
+    kernel_id: 47
+    kernel_name: a8w8_rowwise_256x64x64x128_32x32_1x1_8x32x1_8x32x1_1x32x1x8_8x8x1_1x1_intrawave_v3
+    split_k: 0
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: scaled_quant_gemm
+    shape:
+      M: 192
+      N: 8192
+      K: 1024
+    input_dtype: int8
+    weight_dtype: int8
+    accum_dtype: int32
+    output_dtype: bf16
+    layout: TN
+    scale:
+      activation: per_row
+      weight: per_column
+  oracle:
+    tier: pure_torch
+    method: dequantize scales then torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: csv_gfx_column
+      path: aiter/configs/a8w8_tuned_gemm.csv
+      line: 11
+      value: gfx942
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-94d58c75515470ac
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-7EF6E9FF14F6
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 59
+    record_ordinal: 21
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 128
+    - 128
+    - 2880
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: gemm
+    shape:
+      M: 128
+      N: 128
+      K: 2880
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+  oracle:
+    tier: pure_torch
+    method: torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-9eff99ff409d6104
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-BF04195C618C
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/normalization/test_rmsnorm.py:test_rmsnorm
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/normalization/test_rmsnorm.py
+    test_id: test_rmsnorm
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: a4e9977897e44ab54295eb7e79c9d52fced26596db9ee9b4c4d161a954367098
+    line: 100
+    record_ordinal: 12
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 128
+    - 768
+    no_cross_product: true
+  shape_cluster: 2d-medium-irregular
+  contract:
+    operator: rms_norm
+    shape:
+      M: 128
+      N: 768
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: contiguous
+    epsilon: 1.0e-05
+  oracle:
+    tier: pure_torch
+    method: local pure-torch torch_rmsnorm
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-9f34f0d796119898
+  priority: P1
+  contract_family_id: CF-GFX942-AUTO-3C5B809A8D14
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/fusions/test_fused_mul_add.py:test_mul_add
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/fusions/test_fused_mul_add.py
+    test_id: test_mul_add
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 99b883efc0e14bb91a9acedc6f6a34e3abf673d4844ce5572cce54f4a1bfb9ab
+    line: 41
+    record_ordinal: 1
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - shape
+    record:
+    - 8
+    no_cross_product: true
+  shape_cluster: 1d-small-power2
+  contract:
+    operator: fused_mul_add
+    shape:
+      dims:
+      - 8
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: contiguous
+    operand_kinds: *id002
+  oracle:
+    tier: pure_torch
+    method: pure-torch a * x.float() + b then input dtype cast
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-9f9d78adfa572203
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-7EF6E9FF14F6
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 59
+    record_ordinal: 4
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 4096
+    - 4096
+    - 4096
+    no_cross_product: true
+  shape_cluster: 3d-large-power2
+  contract:
+    operator: gemm
+    shape:
+      M: 4096
+      N: 4096
+      K: 4096
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+  oracle:
+    tier: pure_torch
+    method: torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-9fd37129b12f9bb6
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-7EF6E9FF14F6
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 59
+    record_ordinal: 13
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 128
+    - 5120
+    - 2880
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: gemm
+    shape:
+      M: 128
+      N: 5120
+      K: 2880
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+  oracle:
+    tier: pure_torch
+    method: torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-a02093d46f93be46
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-75BD103AEBFB
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/test_softmax.py:test_softmax
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/test_softmax.py
+    test_id: test_softmax
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 56b49b9a7c15c22789dd8e8432f51b8b343408f14f84d92173223616f2fe7925
+    line: 17
+    record_ordinal: 4
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 8192
+    - 8192
+    no_cross_product: true
+  shape_cluster: 2d-large-power2
+  contract:
+    operator: softmax
+    shape:
+      M: 8192
+      N: 8192
+    input_dtype: fp32
+    output_dtype: fp32
+    layout: row_major
+    axis: 1
+  oracle:
+    tier: pure_torch
+    method: torch.softmax
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-a054dd1e1e3c63c3
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-CCB1A51C709E
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/quant/test_quant.py:test_static_per_tensor_quant
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/quant/test_quant.py
+    test_id: test_static_per_tensor_quant
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    line: 31
+    record_ordinal: 5
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 1024
+    - 128
+    no_cross_product: true
+  shape_cluster: 2d-medium-power2
+  contract:
+    operator: static_per_tensor_quant
+    shape:
+      M: 1024
+      N: 128
+    input_dtype: bf16
+    output_dtype: fp8_e4m3fnuz
+    layout: contiguous
+    scale: fp32_scalar
+  oracle:
+    tier: pure_torch
+    method: pure-torch x divided by scalar scale then dtype cast
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-a13af183a3c97841
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-75BD103AEBFB
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/test_softmax.py:test_softmax
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/test_softmax.py
+    test_id: test_softmax
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 56b49b9a7c15c22789dd8e8432f51b8b343408f14f84d92173223616f2fe7925
+    line: 15
+    record_ordinal: 2
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 128
+    - 1
+    no_cross_product: true
+  shape_cluster: 2d-small-power2
+  contract:
+    operator: softmax
+    shape:
+      M: 128
+      N: 1
+    input_dtype: fp32
+    output_dtype: fp32
+    layout: row_major
+    axis: 1
+  oracle:
+    tier: pure_torch
+    method: torch.softmax
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-a2ebc6aea805f3f3
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-BF04195C618C
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/normalization/test_rmsnorm.py:test_rmsnorm
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/normalization/test_rmsnorm.py
+    test_id: test_rmsnorm
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: a4e9977897e44ab54295eb7e79c9d52fced26596db9ee9b4c4d161a954367098
+    line: 100
+    record_ordinal: 4
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 1
+    - 31744
+    no_cross_product: true
+  shape_cluster: 2d-medium-irregular
+  contract:
+    operator: rms_norm
+    shape:
+      M: 1
+      N: 31744
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: contiguous
+    epsilon: 1.0e-05
+  oracle:
+    tier: pure_torch
+    method: local pure-torch torch_rmsnorm
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-a521ad3903496b75
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-0289A9B7C215
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:aiter/configs/a8w8_tuned_gemm.csv:gfx942-tuned-row
+  source:
+    revision: aiter
+    test_path: aiter/configs/a8w8_tuned_gemm.csv
+    test_id: gfx942-tuned-row
+    source_language: hip
+    source_backend: aiter_asm_tuned
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c0b9a313244b38a2b60ca55650ad270ff49307dc05050bbf49e641c717fad3f0
+    line: 23
+    record_ordinal: 21
+    extraction: csv_row
+  lineage:
+    kind: gfx942_tuned_csv_row
+    kernel_id: 13
+    kernel_name: a8w8_rowwise_256x128x128x128_32x32_2x2_8x32x1_8x32x1_1x32x1x8_8x8x1_1x1_intrawave_v3
+    split_k: 0
+    no_cross_product: true
+  shape_cluster: 3d-large-power2
+  contract:
+    operator: scaled_quant_gemm
+    shape:
+      M: 4096
+      N: 8192
+      K: 1024
+    input_dtype: int8
+    weight_dtype: int8
+    accum_dtype: int32
+    output_dtype: bf16
+    layout: TN
+    scale:
+      activation: per_row
+      weight: per_column
+  oracle:
+    tier: pure_torch
+    method: dequantize scales then torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: csv_gfx_column
+      path: aiter/configs/a8w8_tuned_gemm.csv
+      line: 23
+      value: gfx942
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-a6acbda84ac4fddd
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-CCB1A51C709E
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/quant/test_quant.py:test_static_per_tensor_quant
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/quant/test_quant.py
+    test_id: test_static_per_tensor_quant
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    line: 28
+    record_ordinal: 2
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 2
+    - 16
+    no_cross_product: true
+  shape_cluster: 2d-small-power2
+  contract:
+    operator: static_per_tensor_quant
+    shape:
+      M: 2
+      N: 16
+    input_dtype: bf16
+    output_dtype: fp8_e4m3fnuz
+    layout: contiguous
+    scale: fp32_scalar
+  oracle:
+    tier: pure_torch
+    method: pure-torch x divided by scalar scale then dtype cast
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-a79032a4098ca97f
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-72F77723027E
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/quant/test_quant.py:test_dynamic_per_token_quant
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/quant/test_quant.py
+    test_id: test_dynamic_per_token_quant
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    line: 131
+    record_ordinal: 5
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 1024
+    - 128
+    no_cross_product: true
+  shape_cluster: 2d-medium-power2
+  contract:
+    operator: dynamic_per_token_quant
+    shape:
+      M: 1024
+      N: 128
+    input_dtype: bf16
+    output_dtype: fp8_e4m3fnuz
+    layout: contiguous
+    scale: fp32_per_row
+  oracle:
+    tier: pure_torch
+    method: pure-torch row absmax scaling then dtype cast
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-a869a17c82321844
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-A244EFDD6D16
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/quant/test_quant.py:test_dynamic_per_tensor_quant
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/quant/test_quant.py
+    test_id: test_dynamic_per_tensor_quant
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    line: 75
+    record_ordinal: 1
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 32
+    - 32
+    no_cross_product: true
+  shape_cluster: 2d-small-power2
+  contract:
+    operator: dynamic_per_tensor_quant
+    shape:
+      M: 32
+      N: 32
+    input_dtype: bf16
+    output_dtype: fp8_e4m3fnuz
+    layout: contiguous
+    scale: fp32_scalar
+  oracle:
+    tier: pure_torch
+    method: pure-torch global absmax scaling then dtype cast
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-aaa585ae9c3d4e48
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-7EF6E9FF14F6
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 59
+    record_ordinal: 17
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 128
+    - 2880
+    - 4096
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: gemm
+    shape:
+      M: 128
+      N: 2880
+      K: 4096
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+  oracle:
+    tier: pure_torch
+    method: torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-abb4f6b1f58a516b
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-0289A9B7C215
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:aiter/configs/a8w8_tuned_gemm.csv:gfx942-tuned-row
+  source:
+    revision: aiter
+    test_path: aiter/configs/a8w8_tuned_gemm.csv
+    test_id: gfx942-tuned-row
+    source_language: hip
+    source_backend: aiter_asm_tuned
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c0b9a313244b38a2b60ca55650ad270ff49307dc05050bbf49e641c717fad3f0
+    line: 15
+    record_ordinal: 13
+    extraction: csv_row
+  lineage:
+    kind: gfx942_tuned_csv_row
+    kernel_id: 47
+    kernel_name: a8w8_rowwise_256x64x64x128_32x32_1x1_8x32x1_8x32x1_1x32x1x8_8x8x1_1x1_intrawave_v3
+    split_k: 0
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: scaled_quant_gemm
+    shape:
+      M: 320
+      N: 8192
+      K: 1024
+    input_dtype: int8
+    weight_dtype: int8
+    accum_dtype: int32
+    output_dtype: bf16
+    layout: TN
+    scale:
+      activation: per_row
+      weight: per_column
+  oracle:
+    tier: pure_torch
+    method: dequantize scales then torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: csv_gfx_column
+      path: aiter/configs/a8w8_tuned_gemm.csv
+      line: 15
+      value: gfx942
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-ac2edad2ef19886b
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-0289A9B7C215
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:aiter/configs/a8w8_tuned_gemm.csv:gfx942-tuned-row
+  source:
+    revision: aiter
+    test_path: aiter/configs/a8w8_tuned_gemm.csv
+    test_id: gfx942-tuned-row
+    source_language: hip
+    source_backend: aiter_asm_tuned
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c0b9a313244b38a2b60ca55650ad270ff49307dc05050bbf49e641c717fad3f0
+    line: 25
+    record_ordinal: 23
+    extraction: csv_row
+  lineage:
+    kind: gfx942_tuned_csv_row
+    kernel_id: 13
+    kernel_name: a8w8_rowwise_256x128x128x128_32x32_2x2_8x32x1_8x32x1_1x32x1x8_8x8x1_1x1_intrawave_v3
+    split_k: 0
+    no_cross_product: true
+  shape_cluster: 3d-large-power2
+  contract:
+    operator: scaled_quant_gemm
+    shape:
+      M: 8192
+      N: 8192
+      K: 1024
+    input_dtype: int8
+    weight_dtype: int8
+    accum_dtype: int32
+    output_dtype: bf16
+    layout: TN
+    scale:
+      activation: per_row
+      weight: per_column
+  oracle:
+    tier: pure_torch
+    method: dequantize scales then torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: csv_gfx_column
+      path: aiter/configs/a8w8_tuned_gemm.csv
+      line: 25
+      value: gfx942
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-ad5db5e1d6e49bd6
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-7EF6E9FF14F6
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 59
+    record_ordinal: 0
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 1
+    - 1
+    - 1
+    no_cross_product: true
+  shape_cluster: 3d-small-power2
+  contract:
+    operator: gemm
+    shape:
+      M: 1
+      N: 1
+      K: 1
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+  oracle:
+    tier: pure_torch
+    method: torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-ade98329565aafa2
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-7EF6E9FF14F6
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 59
+    record_ordinal: 16
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 64
+    - 2880
+    - 4096
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: gemm
+    shape:
+      M: 64
+      N: 2880
+      K: 4096
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+  oracle:
+    tier: pure_torch
+    method: torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-ae865441144d1050
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-75BD103AEBFB
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/test_softmax.py:test_softmax
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/test_softmax.py
+    test_id: test_softmax
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 56b49b9a7c15c22789dd8e8432f51b8b343408f14f84d92173223616f2fe7925
+    line: 19
+    record_ordinal: 6
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 359
+    - 1
+    no_cross_product: true
+  shape_cluster: 2d-small-irregular
+  contract:
+    operator: softmax
+    shape:
+      M: 359
+      N: 1
+    input_dtype: fp32
+    output_dtype: fp32
+    layout: row_major
+    axis: 1
+  oracle:
+    tier: pure_torch
+    method: torch.softmax
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-afe3b20f015eaf2d
+  priority: P1
+  contract_family_id: CF-GFX942-AUTO-0B23B5DDCF09
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/fusions/test_fused_silu_mul.py:test_fused_silu_mul
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/fusions/test_fused_silu_mul.py
+    test_id: test_fused_silu_mul
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 636efeb6a45d537fed124f132390cde2d76134f545fe4c8a85acf92dc3084c07
+    line: 37
+    record_ordinal: 3
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - shape
+    record:
+    - 2
+    - 16
+    - 128
+    no_cross_product: true
+  shape_cluster: 3d-small-power2
+  contract:
+    operator: fused_silu_mul
+    shape:
+      dims:
+      - 2
+      - 16
+      - 128
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: split_last_dimension
+  oracle:
+    tier: pure_torch
+    method: local pure-torch silu_exp2 reference multiplied by gate
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-b06da2ccdf5692e1
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-0289A9B7C215
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:aiter/configs/a8w8_tuned_gemm.csv:gfx942-tuned-row
+  source:
+    revision: aiter
+    test_path: aiter/configs/a8w8_tuned_gemm.csv
+    test_id: gfx942-tuned-row
+    source_language: hip
+    source_backend: aiter_asm_tuned
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c0b9a313244b38a2b60ca55650ad270ff49307dc05050bbf49e641c717fad3f0
+    line: 26
+    record_ordinal: 24
+    extraction: csv_row
+  lineage:
+    kind: gfx942_tuned_csv_row
+    kernel_id: 13
+    kernel_name: a8w8_rowwise_256x128x128x128_32x32_2x2_8x32x1_8x32x1_1x32x1x8_8x8x1_1x1_intrawave_v3
+    split_k: 0
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: scaled_quant_gemm
+    shape:
+      M: 16384
+      N: 1280
+      K: 8192
+    input_dtype: int8
+    weight_dtype: int8
+    accum_dtype: int32
+    output_dtype: bf16
+    layout: TN
+    scale:
+      activation: per_row
+      weight: per_column
+  oracle:
+    tier: pure_torch
+    method: dequantize scales then torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: csv_gfx_column
+      path: aiter/configs/a8w8_tuned_gemm.csv
+      line: 26
+      value: gfx942
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-b0ca940999790c27
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-0289A9B7C215
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:aiter/configs/a8w8_tuned_gemm.csv:gfx942-tuned-row
+  source:
+    revision: aiter
+    test_path: aiter/configs/a8w8_tuned_gemm.csv
+    test_id: gfx942-tuned-row
+    source_language: hip
+    source_backend: aiter_asm_tuned
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c0b9a313244b38a2b60ca55650ad270ff49307dc05050bbf49e641c717fad3f0
+    line: 14
+    record_ordinal: 12
+    extraction: csv_row
+  lineage:
+    kind: gfx942_tuned_csv_row
+    kernel_id: 21
+    kernel_name: a8w8_rowwise_256x64x128x256_32x32_1x2_16x16x1_16x16x1_1x32x1x8_8x8x1_1x1_intrawave_v3
+    split_k: 0
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: scaled_quant_gemm
+    shape:
+      M: 320
+      N: 1280
+      K: 8192
+    input_dtype: int8
+    weight_dtype: int8
+    accum_dtype: int32
+    output_dtype: bf16
+    layout: TN
+    scale:
+      activation: per_row
+      weight: per_column
+  oracle:
+    tier: pure_torch
+    method: dequantize scales then torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: csv_gfx_column
+      path: aiter/configs/a8w8_tuned_gemm.csv
+      line: 14
+      value: gfx942
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-b16a1896cd6eb7a3
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-75BD103AEBFB
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/test_softmax.py:test_softmax
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/test_softmax.py
+    test_id: test_softmax
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 56b49b9a7c15c22789dd8e8432f51b8b343408f14f84d92173223616f2fe7925
+    line: 13
+    record_ordinal: 0
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 1823
+    - 781
+    no_cross_product: true
+  shape_cluster: 2d-medium-irregular
+  contract:
+    operator: softmax
+    shape:
+      M: 1823
+      N: 781
+    input_dtype: fp32
+    output_dtype: fp32
+    layout: row_major
+    axis: 1
+  oracle:
+    tier: pure_torch
+    method: torch.softmax
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-b99da6089cfbafda
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-A244EFDD6D16
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/quant/test_quant.py:test_dynamic_per_tensor_quant
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/quant/test_quant.py
+    test_id: test_dynamic_per_tensor_quant
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    line: 75
+    record_ordinal: 0
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 1
+    - 32
+    no_cross_product: true
+  shape_cluster: 2d-small-power2
+  contract:
+    operator: dynamic_per_tensor_quant
+    shape:
+      M: 1
+      N: 32
+    input_dtype: bf16
+    output_dtype: fp8_e4m3fnuz
+    layout: contiguous
+    scale: fp32_scalar
+  oracle:
+    tier: pure_torch
+    method: pure-torch global absmax scaling then dtype cast
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-bf35768a6da0fc3a
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-72F77723027E
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/quant/test_quant.py:test_dynamic_per_token_quant
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/quant/test_quant.py
+    test_id: test_dynamic_per_token_quant
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    line: 130
+    record_ordinal: 4
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 192
+    - 96
+    no_cross_product: true
+  shape_cluster: 2d-medium-irregular
+  contract:
+    operator: dynamic_per_token_quant
+    shape:
+      M: 192
+      N: 96
+    input_dtype: bf16
+    output_dtype: fp8_e4m3fnuz
+    layout: contiguous
+    scale: fp32_per_row
+  oracle:
+    tier: pure_torch
+    method: pure-torch row absmax scaling then dtype cast
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-c353ef5295fc90c3
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-BF04195C618C
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/normalization/test_rmsnorm.py:test_rmsnorm
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/normalization/test_rmsnorm.py
+    test_id: test_rmsnorm
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: a4e9977897e44ab54295eb7e79c9d52fced26596db9ee9b4c4d161a954367098
+    line: 100
+    record_ordinal: 6
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 873
+    - 1245
+    no_cross_product: true
+  shape_cluster: 2d-medium-irregular
+  contract:
+    operator: rms_norm
+    shape:
+      M: 873
+      N: 1245
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: contiguous
+    epsilon: 1.0e-05
+  oracle:
+    tier: pure_torch
+    method: local pure-torch torch_rmsnorm
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-c46ee1150c3a298d
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-BF04195C618C
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/normalization/test_rmsnorm.py:test_rmsnorm
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/normalization/test_rmsnorm.py
+    test_id: test_rmsnorm
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: a4e9977897e44ab54295eb7e79c9d52fced26596db9ee9b4c4d161a954367098
+    line: 100
+    record_ordinal: 13
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 64
+    - 512
+    no_cross_product: true
+  shape_cluster: 2d-medium-power2
+  contract:
+    operator: rms_norm
+    shape:
+      M: 64
+      N: 512
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: contiguous
+    epsilon: 1.0e-05
+  oracle:
+    tier: pure_torch
+    method: local pure-torch torch_rmsnorm
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-ca4bd98c29a00fe5
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-75BD103AEBFB
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/test_softmax.py:test_softmax
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/test_softmax.py
+    test_id: test_softmax
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 56b49b9a7c15c22789dd8e8432f51b8b343408f14f84d92173223616f2fe7925
+    line: 16
+    record_ordinal: 3
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 1
+    - 128
+    no_cross_product: true
+  shape_cluster: 2d-small-power2
+  contract:
+    operator: softmax
+    shape:
+      M: 1
+      N: 128
+    input_dtype: fp32
+    output_dtype: fp32
+    layout: row_major
+    axis: 1
+  oracle:
+    tier: pure_torch
+    method: torch.softmax
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-cb1638fd361a02c4
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-BF04195C618C
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/normalization/test_rmsnorm.py:test_rmsnorm
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/normalization/test_rmsnorm.py
+    test_id: test_rmsnorm
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: a4e9977897e44ab54295eb7e79c9d52fced26596db9ee9b4c4d161a954367098
+    line: 100
+    record_ordinal: 17
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 16380
+    - 1536
+    no_cross_product: true
+  shape_cluster: 2d-large-irregular
+  contract:
+    operator: rms_norm
+    shape:
+      M: 16380
+      N: 1536
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: contiguous
+    epsilon: 1.0e-05
+  oracle:
+    tier: pure_torch
+    method: local pure-torch torch_rmsnorm
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-cc48c86fc2eed449
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-BF04195C618C
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/normalization/test_rmsnorm.py:test_rmsnorm
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/normalization/test_rmsnorm.py
+    test_id: test_rmsnorm
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: a4e9977897e44ab54295eb7e79c9d52fced26596db9ee9b4c4d161a954367098
+    line: 100
+    record_ordinal: 0
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 1
+    - 4
+    no_cross_product: true
+  shape_cluster: 2d-small-power2
+  contract:
+    operator: rms_norm
+    shape:
+      M: 1
+      N: 4
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: contiguous
+    epsilon: 1.0e-05
+  oracle:
+    tier: pure_torch
+    method: local pure-torch torch_rmsnorm
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-d0631bc2fb5f366a
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-0289A9B7C215
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:aiter/configs/a8w8_tuned_gemm.csv:gfx942-tuned-row
+  source:
+    revision: aiter
+    test_path: aiter/configs/a8w8_tuned_gemm.csv
+    test_id: gfx942-tuned-row
+    source_language: hip
+    source_backend: aiter_asm_tuned
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c0b9a313244b38a2b60ca55650ad270ff49307dc05050bbf49e641c717fad3f0
+    line: 27
+    record_ordinal: 25
+    extraction: csv_row
+  lineage:
+    kind: gfx942_tuned_csv_row
+    kernel_id: 13
+    kernel_name: a8w8_rowwise_256x128x128x128_32x32_2x2_8x32x1_8x32x1_1x32x1x8_8x8x1_1x1_intrawave_v3
+    split_k: 0
+    no_cross_product: true
+  shape_cluster: 3d-large-power2
+  contract:
+    operator: scaled_quant_gemm
+    shape:
+      M: 16384
+      N: 8192
+      K: 1024
+    input_dtype: int8
+    weight_dtype: int8
+    accum_dtype: int32
+    output_dtype: bf16
+    layout: TN
+    scale:
+      activation: per_row
+      weight: per_column
+  oracle:
+    tier: pure_torch
+    method: dequantize scales then torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: csv_gfx_column
+      path: aiter/configs/a8w8_tuned_gemm.csv
+      line: 27
+      value: gfx942
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-d23ee15dfb6d8f30
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-7EF6E9FF14F6
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 59
+    record_ordinal: 11
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 32
+    - 5120
+    - 2880
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: gemm
+    shape:
+      M: 32
+      N: 5120
+      K: 2880
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+  oracle:
+    tier: pure_torch
+    method: torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-d6ec8de71714dab2
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-75BD103AEBFB
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/test_softmax.py:test_softmax
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/test_softmax.py
+    test_id: test_softmax
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 56b49b9a7c15c22789dd8e8432f51b8b343408f14f84d92173223616f2fe7925
+    line: 20
+    record_ordinal: 7
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 1
+    - 359
+    no_cross_product: true
+  shape_cluster: 2d-small-irregular
+  contract:
+    operator: softmax
+    shape:
+      M: 1
+      N: 359
+    input_dtype: fp32
+    output_dtype: fp32
+    layout: row_major
+    axis: 1
+  oracle:
+    tier: pure_torch
+    method: torch.softmax
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-d7dce5cf3981c57e
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-7EF6E9FF14F6
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 59
+    record_ordinal: 9
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 128
+    - 256
+    - 7168
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: gemm
+    shape:
+      M: 128
+      N: 256
+      K: 7168
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+  oracle:
+    tier: pure_torch
+    method: torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-da1f794eebc645d5
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-0289A9B7C215
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:aiter/configs/a8w8_tuned_gemm.csv:gfx942-tuned-row
+  source:
+    revision: aiter
+    test_path: aiter/configs/a8w8_tuned_gemm.csv
+    test_id: gfx942-tuned-row
+    source_language: hip
+    source_backend: aiter_asm_tuned
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c0b9a313244b38a2b60ca55650ad270ff49307dc05050bbf49e641c717fad3f0
+    line: 10
+    record_ordinal: 8
+    extraction: csv_row
+  lineage:
+    kind: gfx942_tuned_csv_row
+    kernel_id: 23
+    kernel_name: a8w8_rowwise_256x64x64x512_32x32_1x1_32x8x1_32x8x1_1x32x1x8_8x8x1_1x1_intrawave_v3
+    split_k: 0
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: scaled_quant_gemm
+    shape:
+      M: 192
+      N: 1280
+      K: 8192
+    input_dtype: int8
+    weight_dtype: int8
+    accum_dtype: int32
+    output_dtype: bf16
+    layout: TN
+    scale:
+      activation: per_row
+      weight: per_column
+  oracle:
+    tier: pure_torch
+    method: dequantize scales then torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: csv_gfx_column
+      path: aiter/configs/a8w8_tuned_gemm.csv
+      line: 10
+      value: gfx942
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-dc0c1f07be2cfe57
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-CCB1A51C709E
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/quant/test_quant.py:test_static_per_tensor_quant
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/quant/test_quant.py
+    test_id: test_static_per_tensor_quant
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    line: 29
+    record_ordinal: 3
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 10
+    - 128
+    no_cross_product: true
+  shape_cluster: 2d-small-irregular
+  contract:
+    operator: static_per_tensor_quant
+    shape:
+      M: 10
+      N: 128
+    input_dtype: bf16
+    output_dtype: fp8_e4m3fnuz
+    layout: contiguous
+    scale: fp32_scalar
+  oracle:
+    tier: pure_torch
+    method: pure-torch x divided by scalar scale then dtype cast
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-e05fa217dae9a407
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-CCB1A51C709E
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/quant/test_quant.py:test_static_per_tensor_quant
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/quant/test_quant.py
+    test_id: test_static_per_tensor_quant
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    line: 30
+    record_ordinal: 4
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 32
+    - 8192
+    no_cross_product: true
+  shape_cluster: 2d-medium-power2
+  contract:
+    operator: static_per_tensor_quant
+    shape:
+      M: 32
+      N: 8192
+    input_dtype: bf16
+    output_dtype: fp8_e4m3fnuz
+    layout: contiguous
+    scale: fp32_scalar
+  oracle:
+    tier: pure_torch
+    method: pure-torch x divided by scalar scale then dtype cast
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-e10bc90c129dbe5a
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-7EF6E9FF14F6
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 59
+    record_ordinal: 23
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 256
+    - 106496
+    - 16384
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: gemm
+    shape:
+      M: 256
+      N: 106496
+      K: 16384
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+  oracle:
+    tier: pure_torch
+    method: torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-e32e1091c8b995b2
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-75BD103AEBFB
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/test_softmax.py:test_softmax
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/test_softmax.py
+    test_id: test_softmax
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 56b49b9a7c15c22789dd8e8432f51b8b343408f14f84d92173223616f2fe7925
+    line: 21
+    record_ordinal: 8
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 1
+    - 131072
+    no_cross_product: true
+  shape_cluster: 2d-medium-power2
+  contract:
+    operator: softmax
+    shape:
+      M: 1
+      N: 131072
+    input_dtype: fp32
+    output_dtype: fp32
+    layout: row_major
+    axis: 1
+  oracle:
+    tier: pure_torch
+    method: torch.softmax
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-e3879d8dbbcc2752
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-72F77723027E
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/quant/test_quant.py:test_dynamic_per_token_quant
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/quant/test_quant.py
+    test_id: test_dynamic_per_token_quant
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    line: 134
+    record_ordinal: 8
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 32
+    - 4096
+    no_cross_product: true
+  shape_cluster: 2d-medium-power2
+  contract:
+    operator: dynamic_per_token_quant
+    shape:
+      M: 32
+      N: 4096
+    input_dtype: bf16
+    output_dtype: fp8_e4m3fnuz
+    layout: contiguous
+    scale: fp32_per_row
+  oracle:
+    tier: pure_torch
+    method: pure-torch row absmax scaling then dtype cast
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-e44e675f80453a1f
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-BF04195C618C
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/normalization/test_rmsnorm.py:test_rmsnorm
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/normalization/test_rmsnorm.py
+    test_id: test_rmsnorm
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: a4e9977897e44ab54295eb7e79c9d52fced26596db9ee9b4c4d161a954367098
+    line: 100
+    record_ordinal: 1
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 2
+    - 10
+    no_cross_product: true
+  shape_cluster: 2d-small-irregular
+  contract:
+    operator: rms_norm
+    shape:
+      M: 2
+      N: 10
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: contiguous
+    epsilon: 1.0e-05
+  oracle:
+    tier: pure_torch
+    method: local pure-torch torch_rmsnorm
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-e63389a50b2b7fee
+  priority: P1
+  contract_family_id: CF-GFX942-AUTO-3C5B809A8D14
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/fusions/test_fused_mul_add.py:test_mul_add
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/fusions/test_fused_mul_add.py
+    test_id: test_mul_add
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 99b883efc0e14bb91a9acedc6f6a34e3abf673d4844ce5572cce54f4a1bfb9ab
+    line: 41
+    record_ordinal: 2
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - shape
+    record:
+    - 500
+    no_cross_product: true
+  shape_cluster: 1d-small-irregular
+  contract:
+    operator: fused_mul_add
+    shape:
+      dims:
+      - 500
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: contiguous
+    operand_kinds: *id002
+  oracle:
+    tier: pure_torch
+    method: pure-torch a * x.float() + b then input dtype cast
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-ea9c10d0b48bfa6b
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-72F77723027E
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/quant/test_quant.py:test_dynamic_per_token_quant
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/quant/test_quant.py
+    test_id: test_dynamic_per_token_quant
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    line: 127
+    record_ordinal: 1
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 2
+    - 16
+    no_cross_product: true
+  shape_cluster: 2d-small-power2
+  contract:
+    operator: dynamic_per_token_quant
+    shape:
+      M: 2
+      N: 16
+    input_dtype: bf16
+    output_dtype: fp8_e4m3fnuz
+    layout: contiguous
+    scale: fp32_per_row
+  oracle:
+    tier: pure_torch
+    method: pure-torch row absmax scaling then dtype cast
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-ed3616aa005aac5f
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-7EF6E9FF14F6
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 59
+    record_ordinal: 24
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 4096
+    - 106496
+    - 16384
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: gemm
+    shape:
+      M: 4096
+      N: 106496
+      K: 16384
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+  oracle:
+    tier: pure_torch
+    method: torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-ed3b35f632a95884
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-0289A9B7C215
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:aiter/configs/a8w8_tuned_gemm.csv:gfx942-tuned-row
+  source:
+    revision: aiter
+    test_path: aiter/configs/a8w8_tuned_gemm.csv
+    test_id: gfx942-tuned-row
+    source_language: hip
+    source_backend: aiter_asm_tuned
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c0b9a313244b38a2b60ca55650ad270ff49307dc05050bbf49e641c717fad3f0
+    line: 22
+    record_ordinal: 20
+    extraction: csv_row
+  lineage:
+    kind: gfx942_tuned_csv_row
+    kernel_id: 13
+    kernel_name: a8w8_rowwise_256x128x128x128_32x32_2x2_8x32x1_8x32x1_1x32x1x8_8x8x1_1x1_intrawave_v3
+    split_k: 0
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: scaled_quant_gemm
+    shape:
+      M: 4096
+      N: 1280
+      K: 8192
+    input_dtype: int8
+    weight_dtype: int8
+    accum_dtype: int32
+    output_dtype: bf16
+    layout: TN
+    scale:
+      activation: per_row
+      weight: per_column
+  oracle:
+    tier: pure_torch
+    method: dequantize scales then torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: csv_gfx_column
+      path: aiter/configs/a8w8_tuned_gemm.csv
+      line: 22
+      value: gfx942
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-ed9e17a9a8c9196a
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-0289A9B7C215
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:aiter/configs/a8w8_tuned_gemm.csv:gfx942-tuned-row
+  source:
+    revision: aiter
+    test_path: aiter/configs/a8w8_tuned_gemm.csv
+    test_id: gfx942-tuned-row
+    source_language: hip
+    source_backend: aiter_asm_tuned
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c0b9a313244b38a2b60ca55650ad270ff49307dc05050bbf49e641c717fad3f0
+    line: 6
+    record_ordinal: 4
+    extraction: csv_row
+  lineage:
+    kind: gfx942_tuned_csv_row
+    kernel_id: 34
+    kernel_name: a8w8_rowwise_256x16x64x512_16x16_1x1_32x8x1_32x8x1_1x16x1x16_4x4x1_1x1_intrawave_v3
+    split_k: 0
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: scaled_quant_gemm
+    shape:
+      M: 64
+      N: 1280
+      K: 8192
+    input_dtype: int8
+    weight_dtype: int8
+    accum_dtype: int32
+    output_dtype: bf16
+    layout: TN
+    scale:
+      activation: per_row
+      weight: per_column
+  oracle:
+    tier: pure_torch
+    method: dequantize scales then torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: csv_gfx_column
+      path: aiter/configs/a8w8_tuned_gemm.csv
+      line: 6
+      value: gfx942
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-ee18fdf1b674df35
+  priority: P1
+  contract_family_id: CF-GFX942-AUTO-4836A0F17835
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py:test_gemm_a16_w16_activation
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+    test_id: test_gemm_a16_w16_activation
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: 07bb9e3f7ef794ea8e4a962b8083c7469fb132b3fe7bf9a627d59ad73a896172
+    line: 99
+    record_ordinal: 1
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    - K
+    record:
+    - 128
+    - 8192
+    - 512
+    no_cross_product: true
+  shape_cluster: 3d-large-power2
+  contract:
+    operator: gemm_activation
+    shape:
+      M: 128
+      N: 8192
+      K: 512
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: TN
+    weight_dtype: bf16
+    accum_dtype: fp32
+    activation_options: *id001
+  oracle:
+    tier: pure_torch
+    method: F.linear followed by the selected torch activation
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: gfx942_tuned_config
+      path: aiter/ops/triton/configs/gfx942/triton/gemm/gemm_a16w16/DEFAULT.json
+      sha256: 1d5c93a5ffddb3dfb4e5755146c93a6bb566129669ca4b745e2631ecec0e27f2
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-f068c01966cb0301
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-0289A9B7C215
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:aiter/configs/a8w8_tuned_gemm.csv:gfx942-tuned-row
+  source:
+    revision: aiter
+    test_path: aiter/configs/a8w8_tuned_gemm.csv
+    test_id: gfx942-tuned-row
+    source_language: hip
+    source_backend: aiter_asm_tuned
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c0b9a313244b38a2b60ca55650ad270ff49307dc05050bbf49e641c717fad3f0
+    line: 13
+    record_ordinal: 11
+    extraction: csv_row
+  lineage:
+    kind: gfx942_tuned_csv_row
+    kernel_id: 13
+    kernel_name: a8w8_rowwise_256x128x128x128_32x32_2x2_8x32x1_8x32x1_1x32x1x8_8x8x1_1x1_intrawave_v3
+    split_k: 0
+    no_cross_product: true
+  shape_cluster: 3d-large-power2
+  contract:
+    operator: scaled_quant_gemm
+    shape:
+      M: 256
+      N: 8192
+      K: 1024
+    input_dtype: int8
+    weight_dtype: int8
+    accum_dtype: int32
+    output_dtype: bf16
+    layout: TN
+    scale:
+      activation: per_row
+      weight: per_column
+  oracle:
+    tier: pure_torch
+    method: dequantize scales then torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: csv_gfx_column
+      path: aiter/configs/a8w8_tuned_gemm.csv
+      line: 13
+      value: gfx942
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-f1a840305da20615
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-72F77723027E
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/quant/test_quant.py:test_dynamic_per_token_quant
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/quant/test_quant.py
+    test_id: test_dynamic_per_token_quant
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c6ccfce04cb36de44d6cd959905ad484802b879b01268f207be1630c519ca823
+    line: 126
+    record_ordinal: 0
+    extraction: parametrize
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 256
+    - 13
+    no_cross_product: true
+  shape_cluster: 2d-small-irregular
+  contract:
+    operator: dynamic_per_token_quant
+    shape:
+      M: 256
+      N: 13
+    input_dtype: bf16
+    output_dtype: fp8_e4m3fnuz
+    layout: contiguous
+    scale: fp32_per_row
+  oracle:
+    tier: pure_torch
+    method: pure-torch row absmax scaling then dtype cast
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-f38188329b05628c
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-0289A9B7C215
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:aiter/configs/a8w8_tuned_gemm.csv:gfx942-tuned-row
+  source:
+    revision: aiter
+    test_path: aiter/configs/a8w8_tuned_gemm.csv
+    test_id: gfx942-tuned-row
+    source_language: hip
+    source_backend: aiter_asm_tuned
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c0b9a313244b38a2b60ca55650ad270ff49307dc05050bbf49e641c717fad3f0
+    line: 19
+    record_ordinal: 17
+    extraction: csv_row
+  lineage:
+    kind: gfx942_tuned_csv_row
+    kernel_id: 13
+    kernel_name: a8w8_rowwise_256x128x128x128_32x32_2x2_8x32x1_8x32x1_1x32x1x8_8x8x1_1x1_intrawave_v3
+    split_k: 0
+    no_cross_product: true
+  shape_cluster: 3d-large-power2
+  contract:
+    operator: scaled_quant_gemm
+    shape:
+      M: 1024
+      N: 8192
+      K: 1024
+    input_dtype: int8
+    weight_dtype: int8
+    accum_dtype: int32
+    output_dtype: bf16
+    layout: TN
+    scale:
+      activation: per_row
+      weight: per_column
+  oracle:
+    tier: pure_torch
+    method: dequantize scales then torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: csv_gfx_column
+      path: aiter/configs/a8w8_tuned_gemm.csv
+      line: 19
+      value: gfx942
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-f57e374b66691b8b
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-0289A9B7C215
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:aiter/configs/a8w8_tuned_gemm.csv:gfx942-tuned-row
+  source:
+    revision: aiter
+    test_path: aiter/configs/a8w8_tuned_gemm.csv
+    test_id: gfx942-tuned-row
+    source_language: hip
+    source_backend: aiter_asm_tuned
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c0b9a313244b38a2b60ca55650ad270ff49307dc05050bbf49e641c717fad3f0
+    line: 16
+    record_ordinal: 14
+    extraction: csv_row
+  lineage:
+    kind: gfx942_tuned_csv_row
+    kernel_id: 21
+    kernel_name: a8w8_rowwise_256x64x128x256_32x32_1x2_16x16x1_16x16x1_1x32x1x8_8x8x1_1x1_intrawave_v3
+    split_k: 0
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: scaled_quant_gemm
+    shape:
+      M: 512
+      N: 1280
+      K: 8192
+    input_dtype: int8
+    weight_dtype: int8
+    accum_dtype: int32
+    output_dtype: bf16
+    layout: TN
+    scale:
+      activation: per_row
+      weight: per_column
+  oracle:
+    tier: pure_torch
+    method: dequantize scales then torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: csv_gfx_column
+      path: aiter/configs/a8w8_tuned_gemm.csv
+      line: 16
+      value: gfx942
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-f605ada579e5a6c6
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-BF04195C618C
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/normalization/test_rmsnorm.py:test_rmsnorm
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/normalization/test_rmsnorm.py
+    test_id: test_rmsnorm
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: a4e9977897e44ab54295eb7e79c9d52fced26596db9ee9b4c4d161a954367098
+    line: 100
+    record_ordinal: 2
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 256
+    - 4096
+    no_cross_product: true
+  shape_cluster: 2d-medium-power2
+  contract:
+    operator: rms_norm
+    shape:
+      M: 256
+      N: 4096
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: contiguous
+    epsilon: 1.0e-05
+  oracle:
+    tier: pure_torch
+    method: local pure-torch torch_rmsnorm
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-f66db3c5ccf36c9f
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-BF04195C618C
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:op_tests/triton_tests/normalization/test_rmsnorm.py:test_rmsnorm
+  source:
+    revision: aiter
+    test_path: op_tests/triton_tests/normalization/test_rmsnorm.py
+    test_id: test_rmsnorm
+    source_language: triton
+    source_backend: triton
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: a4e9977897e44ab54295eb7e79c9d52fced26596db9ee9b4c4d161a954367098
+    line: 100
+    record_ordinal: 10
+    extraction: function
+  lineage:
+    kind: pytest_parameter_record
+    value_names:
+    - M
+    - N
+    record:
+    - 768
+    - 2048
+    no_cross_product: true
+  shape_cluster: 2d-medium-irregular
+  contract:
+    operator: rms_norm
+    shape:
+      M: 768
+      N: 2048
+    input_dtype: bf16
+    output_dtype: bf16
+    layout: contiguous
+    epsilon: 1.0e-05
+  oracle:
+    tier: pure_torch
+    method: local pure-torch torch_rmsnorm
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: target_constraint_only
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942
+- id: gfx942-auto-fd72b53a4f785bab
+  priority: P0
+  contract_family_id: CF-GFX942-AUTO-0289A9B7C215
+  status: extracted_candidate
+  gpu_validated: false
+  source_lineage_id: aiter:aiter/configs/a8w8_tuned_gemm.csv:gfx942-tuned-row
+  source:
+    revision: aiter
+    test_path: aiter/configs/a8w8_tuned_gemm.csv
+    test_id: gfx942-tuned-row
+    source_language: hip
+    source_backend: aiter_asm_tuned
+    git_sha: 926eb3d059efd3c866c8f53ecb8b1fb8fb7135e8
+    sha256: c0b9a313244b38a2b60ca55650ad270ff49307dc05050bbf49e641c717fad3f0
+    line: 4
+    record_ordinal: 2
+    extraction: csv_row
+  lineage:
+    kind: gfx942_tuned_csv_row
+    kernel_id: 34
+    kernel_name: a8w8_rowwise_256x16x64x512_16x16_1x1_32x8x1_32x8x1_1x16x1x16_4x4x1_1x1_intrawave_v3
+    split_k: 0
+    no_cross_product: true
+  shape_cluster: 3d-large-irregular
+  contract:
+    operator: scaled_quant_gemm
+    shape:
+      M: 32
+      N: 1280
+      K: 8192
+    input_dtype: int8
+    weight_dtype: int8
+    accum_dtype: int32
+    output_dtype: bf16
+    layout: TN
+    scale:
+      activation: per_row
+      weight: per_column
+  oracle:
+    tier: pure_torch
+    method: dequantize scales then torch.nn.functional.linear
+  architecture_guard:
+    target: gfx942
+    evidence:
+      kind: csv_gfx_column
+      path: aiter/configs/a8w8_tuned_gemm.csv
+      line: 4
+      value: gfx942
+  target_lanes:
+  - hip_gfx942
+  - triton_gfx942

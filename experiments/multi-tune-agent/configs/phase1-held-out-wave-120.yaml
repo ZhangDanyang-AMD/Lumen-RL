@@ -1,0 +1,28 @@
+name: "phase1-held-out-120"
+dataset_version: phase1-held-out-wave-120-v1
+eval_only: true
+sft_enabled: false
+target_task_count: 120
+task_type_quotas:
+  cold_start: 18
+  profile_guided: 18
+  direction_conditioned: 54
+  error_recovery: 18
+  regression_balance: 12
+lane_quotas:
+  hip_gfx942: 60
+  triton_gfx942: 60
+source_suite_quotas:
+  geak_native: 40
+  aiter_derived: 40
+  adversarial_boundary: 40
+split:
+  name: held_out
+  source_version: v4
+  append_safe_successor: v5
+protection:
+  harness_oracle: hash_refs_only
+  publish_protected_content: false
+  publish_candidate_sources: false
+  publish_target_patch: false
+  publish_trajectory: false

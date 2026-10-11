@@ -335,11 +335,46 @@ class ToolAgentLoop(AgentLoopBase):
                     else:
                         has_speedup = any(r > 0 for r in tool_rewards)
                         if has_speedup:
-                            state = AgentState.TERMINATED
+                            # Re-benchmark to verify speedup
+                            verify_result = None
+                            try:
+                                verify_result, _, _ = await asyncio.to_thread(
+                                    self.tool.execute, session_id,
+                                    {"action": "evaluate", "mode": "full"},
+                                )
+                            except Exception:
+                                pass
+                            verified_sp = float(
+                                (verify_result or {}).get("evaluation", {}).get("speedup_geomean", 0)
+                            ) if verify_result else 0
+                            if verified_sp >= 0.9:
+                                state = AgentState.TERMINATED
+                            else:
+                                history.append({
+                                    "role": "user",
+                                    "content": f"Re-benchmark: speedup={verified_sp:.2f}x (target >=0.9x). "
+                                        "Continue improving. Try different algorithm or config.",
+                                })
+                                state = AgentState.GENERATING
                         else:
+                            last_eval = next(
+                                (e.get("result", {}).get("evaluation", {})
+                                 for e in reversed(events)
+                                 if e.get("type") == "tool" and "evaluation" in e.get("result", {})),
+                                {},
+                            )
+                            error_feedback = json.dumps({
+                                "error_feedback": {
+                                    "verify_result": {"evaluation": last_eval},
+                                },
+                                "task_type": "error_recovery",
+                                "instruction": "Continue improving the kernel. "
+                                    "Read the current kernel.py, analyze the feedback, "
+                                    "then write_file with improvements and evaluate.",
+                            })
                             history.append({
                                 "role": "user",
-                                "content": "No speedup achieved yet. Keep trying different optimization strategies. Use read_file to review the kernel, then write_file with a new approach, and evaluate.",
+                                "content": error_feedback,
                             })
                             state = AgentState.GENERATING
                     continue
@@ -363,6 +398,47 @@ class ToolAgentLoop(AgentLoopBase):
                         metrics.tool_seconds += elapsed
                         metrics.tool_calls += 1
                         tool_rewards.append(float(reward))
+                        # Check if evaluate achieved target speedup
+                        eval_data = result.get("evaluation", {}) if isinstance(result, dict) else {}
+                        sp = float(eval_data.get("speedup_geomean", 0))
+                        if sp >= 0.9 and eval_data.get("correct"):
+                            # Re-benchmark: restore best snapshot first
+                            try:
+                                # Restore kernel_best.py before re-benchmark
+                                await asyncio.to_thread(
+                                    self.tool.execute, session_id,
+                                    {"action": "read_file", "path": "snapshots/kernel_best.py"},
+                                )
+                                best_src_r, _, _ = await asyncio.to_thread(
+                                    self.tool.execute, session_id,
+                                    {"action": "read_file", "path": "snapshots/kernel_best.py"},
+                                )
+                                if best_src_r.get("ok") and best_src_r.get("content"):
+                                    await asyncio.to_thread(
+                                        self.tool.execute, session_id,
+                                        {"action": "write_file", "path": "kernel.py",
+                                         "content": best_src_r["content"]},
+                                    )
+                                vr, _, _ = await asyncio.to_thread(
+                                    self.tool.execute, session_id,
+                                    {"action": "evaluate", "mode": "full"},
+                                )
+                                vsp = float((vr or {}).get("evaluation", {}).get("speedup_geomean", 0))
+                            except Exception:
+                                vsp = 0
+                            if vsp >= 0.9:
+                                state = AgentState.TERMINATED
+                                break
+                            else:
+                                # Re-benchmark didn't confirm; tell model and continue
+                                history.append({
+                                    "role": "user",
+                                    "content": f"Re-benchmark with best snapshot: speedup={vsp:.2f}x "
+                                        f"(target >=0.9x). Previous eval showed {sp:.2f}x but "
+                                        "re-benchmark didn't confirm. Continue optimizing.",
+                                })
+                                state = AgentState.GENERATING
+                                break
                         content = json.dumps(result, sort_keys=True, default=str)
                         history.append(
                             {
@@ -383,11 +459,12 @@ class ToolAgentLoop(AgentLoopBase):
                                 "metrics": dict(tool_metrics),
                             }
                         )
-                    state = (
-                        AgentState.TERMINATED
-                        if metrics.assistant_turns >= self.max_assistant_turns
-                        else AgentState.GENERATING
-                    )
+                    if state != AgentState.TERMINATED:
+                        state = (
+                            AgentState.TERMINATED
+                            if metrics.assistant_turns >= self.max_assistant_turns
+                            else AgentState.GENERATING
+                        )
                     continue
                 raise RuntimeError("invalid agent state: %s" % state)
         finally:

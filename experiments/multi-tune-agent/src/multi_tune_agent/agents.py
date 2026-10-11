@@ -175,9 +175,10 @@ class CodeRoleAgent:
         task_type: str = "direction_conditioned",
         frozen_input: Mapping[str, Any] | None = None,
     ) -> AgentLoopOutput:
+        case_observation = self.environment.case_observation(case_id)
         visible = {
             "task_type": task_type,
-            "case": self.environment.case_observation(case_id),
+            "case": case_observation,
             **dict(frozen_input or {}),
         }
         if task_type == "direction_conditioned":
@@ -195,15 +196,44 @@ class CodeRoleAgent:
         }.get(task_type)
         if instruction is None:
             raise ValueError("unsupported SFT task type: %s" % task_type)
+        operator = str(case_observation.get("operator") or "").lower()
+        backend = str(case_observation.get("backend") or "").lower()
+        guardrails: list[str] = []
+        if backend == "triton":
+            guardrails.append(
+                "For this ROCm Triton environment, do not invent unsupported "
+                "intrinsics such as tl.shuffle, tl.shuffle_xor, tl.static_alloc, "
+                "tl.shared_array, tl.nearbyint, or unavailable float8 symbols; "
+                "use APIs already proven by the parent source or compile-check "
+                "the exact API before relying on it."
+            )
+        if "quant" in operator:
+            guardrails.append(
+                "Preserve the oracle's exact FP32 scale, rounding, clamp, and cast "
+                "order, including ties-to-even behavior for integer quantization."
+            )
+        if any(name in operator for name in ("rms_norm", "silu", "fused")):
+            guardrails.append(
+                "Preserve residual-buffer mutation, fusion order, output layout, "
+                "dtype, and full reduction semantics exactly."
+            )
+        guardrail_text = " ".join(guardrails)
         messages = [
             {"role": "system", "content": self.prompts.system("engineer", case_type)},
             {
                 "role": "user",
                 "content": (
                     instruction
-                    + " Use the GEAK tool; finish only after correctness and "
-                    "performance evidence. Preserve every field in the generated "
-                    "kernel contract when one is supplied.\n\nFROZEN_INPUT=\n"
+                    + " Use the GEAK tool and iterate on the implementation until "
+                    "the final source has fresh compile, correctness, and performance "
+                    "evidence. If a check fails, repair the source and rerun it; never "
+                    "finish with a diagnosis or a promise to make another edit. "
+                    "Preserve every field in the generated kernel contract when one "
+                    "is supplied. Preserve complete reduction and normalization "
+                    "domains: do not split them across independent program instances "
+                    "unless the implementation includes a correct cross-program "
+                    "reduction or synchronization mechanism.\n\nFROZEN_INPUT=\n"
+                    + (guardrail_text + "\n\n" if guardrail_text else "")
                     + json.dumps(visible, indent=2, sort_keys=True)
                 ),
             },

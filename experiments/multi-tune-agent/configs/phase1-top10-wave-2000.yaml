@@ -1,0 +1,41 @@
+name: "2000"
+dataset_version: phase1-production-wave-2000-v1
+mode_quotas:
+  cold_start: 307
+  profile_guided: 293
+  direction_conditioned: 907
+  error_recovery: 293
+  regression_balance: 200
+lane_quotas:
+  triton_gfx942: 1000
+  hip_gfx942: 1000
+cell_quotas:
+  cold_start:
+    triton_gfx942: 154
+    hip_gfx942: 153
+  profile_guided:
+    triton_gfx942: 146
+    hip_gfx942: 147
+  direction_conditioned:
+    triton_gfx942: 453
+    hip_gfx942: 454
+  error_recovery:
+    triton_gfx942: 147
+    hip_gfx942: 146
+  regression_balance:
+    triton_gfx942: 100
+    hip_gfx942: 100
+allowed_case_splits:
+  - train
+checkpoint_sample_count: 330
+family_minimum_quotas:
+  mha: 112
+  mla: 112
+  paged_attention: 112
+  fused_moe: 111
+  gemm: 167
+  rms_norm: 111
+  rope_kv_cache: 111
+  blockscale_gemm: 111
+  all_reduce: 111
+  sampling: 111

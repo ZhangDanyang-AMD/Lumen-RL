@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -226,6 +226,172 @@ def test_direct_success_and_metadata_override(
     }
 
 
+def test_bundle_ignores_non_file_top_level_metadata(
+    tmp_path: Path, contract: KernelContract
+) -> None:
+    response = bundle()
+    response["explanation"] = "Files are authoritative; this text is not installed."
+
+    draft = TemplateBootstrapper(
+        FakeBackend([response]), tmp_path / "drafts"
+    ).generate(contract)
+
+    assert draft.valid
+    assert not (draft.path / "explanation").exists()
+
+
+@pytest.mark.parametrize(
+    "wrap",
+    [
+        lambda response: response["files"],
+        lambda response: {"result": response, "analysis": "done"},
+    ],
+)
+def test_bundle_accepts_safe_common_json_wrappers(
+    tmp_path: Path, contract: KernelContract, wrap
+) -> None:
+    response = wrap(bundle())
+
+    draft = TemplateBootstrapper(
+        FakeBackend([response]), tmp_path / "drafts"
+    ).generate(contract)
+
+    assert draft.valid
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda response: {"result": json.dumps(response)},
+        lambda response: {
+            "files": {
+                **response["files"],
+                "config.yaml": yaml.safe_load(response["files"]["config.yaml"]),
+            }
+        },
+        lambda response: {
+            "files": {
+                **response["files"],
+                "config.yaml": "Configuration follows:\n```yaml\n"
+                + response["files"]["config.yaml"]
+                + "```\n",
+            }
+        },
+        lambda response: {
+            "files": {
+                **response["files"],
+                "config.yaml": response["files"]["config.yaml"].replace("\n", "\\n"),
+            }
+        },
+    ],
+)
+def test_bundle_normalizes_bounded_structural_response_variants(
+    tmp_path: Path, contract: KernelContract, mutate
+) -> None:
+    draft = TemplateBootstrapper(
+        FakeBackend([mutate(bundle())]), tmp_path / "drafts"
+    ).generate(contract)
+
+    assert draft.valid
+    config = yaml.safe_load((draft.path / "config.yaml").read_text(encoding="utf-8"))
+    assert config["target_kernel_functions"] == ["candidate"]
+
+
+def test_response_diagnostic_is_hashed_bounded_and_redacted(
+    tmp_path: Path, contract: KernelContract
+) -> None:
+    response = bundle()
+    response["authorization"] = "Bearer sk_this_must_not_be_persisted"
+    events = []
+
+    TemplateBootstrapper(
+        FakeBackend([response]),
+        tmp_path / "drafts",
+        event_sink=events.append,
+    ).generate(contract)
+
+    event = next(item for item in events if item["phase"] == "response_diagnostic")
+    diagnostic = json.loads(Path(event["path"]).read_text(encoding="utf-8"))
+    assert len(event["sha256"]) == 64
+    assert diagnostic["sha256"] == event["sha256"]
+    assert diagnostic["bytes"] > 0
+    assert "[REDACTED]" in diagnostic["sanitized_raw_preview"]
+    assert "sk_this_must_not_be_persisted" not in diagnostic["sanitized_raw_preview"]
+    assert Path(event["path"]).stat().st_mode & 0o777 == 0o600
+
+
+def test_install_normalizes_fenced_config_and_named_targets(
+    tmp_path: Path, contract: KernelContract
+) -> None:
+    response = bundle()
+    response["files"]["config.yaml"] = """```yaml
+target_kernel_functions:
+  - name: candidate
+commands:
+  compile: python3 scripts/task_runner.py compile
+```
+"""
+
+    draft = TemplateBootstrapper(
+        FakeBackend([response]), tmp_path / "drafts"
+    ).generate(contract)
+
+    config = yaml.safe_load((draft.path / "config.yaml").read_text())
+    assert config["target_kernel_functions"] == ["candidate"]
+    assert config["compile_command"] == [
+        'docker exec -e HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-1} '
+        '-w "$PWD" ${GEAK_CONTAINER_NAME:-geak-phase1-vllm} '
+        "python3 scripts/task_runner.py compile"
+    ]
+
+
+def test_install_hardens_broad_swallowed_runner_failure(
+    tmp_path: Path, contract: KernelContract
+) -> None:
+    response = bundle(
+        runner=RUNNER
+        + """
+def swallowed_failure():
+    try:
+        raise RuntimeError("compile failed")
+    except Exception as exc:
+        print(exc)
+        return False
+"""
+    )
+
+    draft = TemplateBootstrapper(
+        FakeBackend([response]), tmp_path / "drafts"
+    ).generate(contract)
+
+    runner = (draft.path / "scripts/task_runner.py").read_text()
+    assert "except Exception as exc:\n        print(exc)\n        raise" in runner
+    assert draft.valid
+
+
+def test_install_normalizes_rocm_bfloat16_intrinsics(
+    tmp_path: Path, contract: KernelContract
+) -> None:
+    response = bundle()
+    response["files"]["kernel.py"] = (
+        KERNEL
+        + '\n# #include <hip/hip_bfloat16.h>\n'
+        + "\n# __hip_bfloat162float(value)\n"
+        + "# __hip_float2bfloat16(value)\n"
+    )
+
+    draft = TemplateBootstrapper(
+        FakeBackend([response]), tmp_path / "drafts"
+    ).generate(replace(contract, language="hip"))
+
+    kernel = (draft.path / "kernel.py").read_text()
+    assert "__hip_bfloat162float" not in kernel
+    assert "__hip_float2bfloat16" not in kernel
+    assert "__bfloat162float" in kernel
+    assert "__float2bfloat16" in kernel
+    assert "#include <hip/hip_bf16.h>" in kernel
+
+
 def test_invalid_direct_is_repaired_with_aiter(
     tmp_path: Path, contract: KernelContract
 ) -> None:
@@ -295,6 +461,8 @@ def test_invalid_direct_retries_without_aiter(
     assert draft.generation_method == "llm_direct_retry"
     assert len(backend.messages) == 2
     assert "previous response failed" in backend.messages[1][1]["content"]
+    assert "one top-level files object" in backend.messages[1][1]["content"]
+    assert "valid YAML mapping" in backend.messages[1][1]["content"]
 
 
 def test_bundle_normalizes_scalar_config_and_runner_import_path(
@@ -388,7 +556,7 @@ def test_low_confidence_evidence_does_not_trigger_repair(
             backend, tmp_path / "drafts", aiter_root=aiter
         ).generate(contract)
 
-    assert len(backend.messages) == 2
+    assert len(backend.messages) == 5
     assert "Read-only AITER evidence" not in backend.messages[1][1]["content"]
     assert caught.value.validation_report is not None
     assert caught.value.draft_path is not None

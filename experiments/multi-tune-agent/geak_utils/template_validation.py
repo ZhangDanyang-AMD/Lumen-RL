@@ -1023,6 +1023,15 @@ def _validate_sensitive_writes(tree: ast.Module, issues: _Issues) -> None:
 
 
 def _validate_architecture_gate(tree: ast.Module, issues: _Issues) -> None:
+    for call in (item for item in ast.walk(tree) if isinstance(item, ast.Call)):
+        if _call_name(call.func).lower().endswith("get_device_capability"):
+            issues.add(
+                "runner-invalid-architecture-source",
+                "ROCm architecture must use gcnArchName, not compute capability",
+                "scripts/task_runner.py",
+                call.lineno,
+            )
+
     for node in tree.body:
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             names = (
@@ -1075,8 +1084,7 @@ def _validate_architecture_gate(tree: ast.Module, issues: _Issues) -> None:
         entry_body = main.body
     gate_index: Optional[int] = None
     for index, statement in enumerate(entry_body):
-        calls = [item for item in ast.walk(statement) if isinstance(item, ast.Call)]
-        if any(_is_gate_call(call) for call in calls):
+        if _is_gate_statement(statement):
             gate_index = index
             break
     if gate_index is None:
@@ -1123,12 +1131,35 @@ def _function_gates_before_work(
     gate_index: Optional[int] = None
     for index, statement in enumerate(function.body):
         calls = [item for item in ast.walk(statement) if isinstance(item, ast.Call)]
-        if any(_is_gate_call(call) for call in calls):
+        if _is_gate_statement(statement):
             gate_index = index
             break
         if any(_is_heavy_call(_call_name(call.func).lower()) for call in calls):
             return False
     return gate_index is not None
+
+
+def _is_gate_statement(statement: ast.stmt) -> bool:
+    calls = [item for item in ast.walk(statement) if isinstance(item, ast.Call)]
+    if any(_is_gate_call(call) for call in calls):
+        return True
+    if not isinstance(statement, ast.If):
+        return False
+    predicate_calls = [
+        item for item in ast.walk(statement.test) if isinstance(item, ast.Call)
+    ]
+    predicate_names = [_call_name(call.func).lower() for call in predicate_calls]
+    architecture_predicate = any(
+        any(prefix in name for prefix in ("get", "is", "has", "support", "runtime"))
+        and any(token in name for token in ("arch", "gfx", "device", "gpu"))
+        for name in predicate_names
+    )
+    rendered_test = ast.unparse(statement.test).lower()
+    explicit_arch_rejection = "arch" in rendered_test and "gfx" in rendered_test
+    rejects = any(isinstance(item, ast.Raise) for item in ast.walk(statement)) or any(
+        _call_name(call.func).lower().endswith("exit") for call in calls
+    )
+    return (architecture_predicate or explicit_arch_rejection) and rejects
 
 
 def _is_gate_call(call: ast.Call) -> bool:

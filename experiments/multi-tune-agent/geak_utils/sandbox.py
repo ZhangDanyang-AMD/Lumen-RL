@@ -8,6 +8,7 @@ import re
 import subprocess
 import time
 from pathlib import Path
+from geak_utils.kernel_validator import validate_kernel
 from typing import Any, Mapping, Sequence
 
 import yaml
@@ -240,10 +241,22 @@ class KernelSandbox:
         ratios = [
             self.baseline_ms[name] / performance.per_case_ms[name] for name in shared
         ]
+        sp = geomean(ratios)
+        # Save best kernel snapshot
+        if self.workspace and sp > getattr(self, "_best_speedup", 0):
+            self._best_speedup = sp
+            self._eval_count = getattr(self, "_eval_count", 0) + 1
+            snap_dir = self.workspace / "snapshots"
+            snap_dir.mkdir(exist_ok=True)
+            kernel = self.workspace / "kernel.py"
+            if kernel.exists():
+                import shutil
+                shutil.copy2(kernel, snap_dir / f"kernel_sp{sp:.2f}_t{self._eval_count}.py")
+                shutil.copy2(kernel, snap_dir / "kernel_best.py")
         return EvaluationResult(
             compiled=True,
             correct=True,
-            speedup_geomean=geomean(ratios),
+            speedup_geomean=sp,
             speedup_arithmetic=sum(ratios) / len(ratios),
             baseline_ms=dict(self.baseline_ms),
             candidate_ms=performance.per_case_ms,
@@ -414,6 +427,55 @@ class KernelSandbox:
                 "read the current source and submit complete code"
             )
         path.parent.mkdir(parents=True, exist_ok=True)
+        # Auto-apply diff patches for .py files
+        if relative.endswith(".py") and "---" in content[:300] and "+++" in content[:600] and path.exists():
+            import subprocess as _sp
+            import tempfile as _tf
+            _orig = path.read_text()
+            _patch = content
+            _m = re.search(r'```(?:diff|patch|)\s*\n(.*?)```', content, re.DOTALL)
+            if _m:
+                _patch = _m.group(1)
+            try:
+                _tf1 = _tf.NamedTemporaryFile(mode="w", suffix=".py", delete=False)
+                _tf1.write(_orig); _tf1.close()
+                _tf2 = _tf.NamedTemporaryFile(mode="w", suffix=".patch", delete=False)
+                _tf2.write(_patch); _tf2.close()
+                # Try fuzz=3 first, then fuzz=99 (ignore all context)
+                _applied = False
+                for _fuzz in [3, 99]:
+                    Path(_tf1.name).write_text(_orig)
+                    _r = _sp.run(["patch", f"--fuzz={_fuzz}", "-s", _tf1.name, _tf2.name],
+                                 capture_output=True, text=True, timeout=10)
+                    if _r.returncode == 0:
+                        _patched = Path(_tf1.name).read_text()
+                        try:
+                            compile(_patched, "<patch>", "exec")
+                            content = _patched
+                            _applied = True
+                            break
+                        except SyntaxError:
+                            continue
+                if not _applied:
+                    try:
+                        from sandbox.robust_patch import apply_robust_patch
+                        _rp = apply_robust_patch(_orig, _patch)
+                        if _rp:
+                            compile(_rp, "<robust>", "exec")
+                            content = _rp
+                    except Exception:
+                        pass
+                Path(_tf1.name).unlink(missing_ok=True)
+                Path(_tf2.name).unlink(missing_ok=True)
+            except Exception:
+                pass
+        # Validate kernel before writing
+        if relative.endswith("kernel.py"):
+            from geak_utils.kernel_validator import validate_kernel
+            _ok, _result = validate_kernel(content, str(path) if path.exists() else None)
+            if not _ok:
+                raise SandboxError("Kernel validation: " + _result)
+            content = _result
         path.write_text(content, encoding="utf-8")
 
     @staticmethod

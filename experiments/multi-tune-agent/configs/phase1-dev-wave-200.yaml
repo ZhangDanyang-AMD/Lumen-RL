@@ -1,0 +1,29 @@
+name: "200-dev"
+dataset_version: phase1-dev-wave-200-v1
+mode_quotas:
+  cold_start: 30
+  profile_guided: 30
+  direction_conditioned: 90
+  error_recovery: 30
+  regression_balance: 20
+lane_quotas:
+  triton_gfx942: 100
+  hip_gfx942: 100
+cell_quotas:
+  cold_start:
+    triton_gfx942: 15
+    hip_gfx942: 15
+  profile_guided:
+    triton_gfx942: 15
+    hip_gfx942: 15
+  direction_conditioned:
+    triton_gfx942: 45
+    hip_gfx942: 45
+  error_recovery:
+    triton_gfx942: 15
+    hip_gfx942: 15
+  regression_balance:
+    triton_gfx942: 10
+    hip_gfx942: 10
+allowed_case_splits:
+  - dev

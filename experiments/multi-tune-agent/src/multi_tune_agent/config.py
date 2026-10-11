@@ -40,6 +40,7 @@ class MultiTuneConfig:
     sft_enabled: bool = False
     sft_dataset_root: Path = Path("~/geak_sft_dataset")
     sft_task_type: str = "direction_conditioned"
+    sft_compat: bool = False  # When True, format prompts in SFT training format and accept diff patches
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "geak_root", self.geak_root.expanduser().resolve())

@@ -1,0 +1,93 @@
+# Single-Turn GRPO for Kernel Optimization on 8x MI308X (single node)
+#
+# SFT checkpoint → GRPO with GEAK sandbox reward
+# Algorithm: GRPO with group-relative advantage
+# Reward: compile (-1) → correctness (-0.5) → speedup (log-scaled)
+# GPU split: 4 for inference/training (colocated), 4 for kernel eval
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
+  ray_address: "auto"
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: true
+    actor:
+      num_workers: 4
+      dispatch_mode: dp_compute_proto
+    rollout:
+      num_workers: 4
+
+policy:
+  model_name: /home/danyzhan/Lumen/experiments/GEAK-agent-coder/outputs/qwen3-coder-full2000-4epoch-merged
+  training_backend: fsdp2
+  generation_backend: vllm
+  max_total_sequence_length: 16384
+  max_response_length: 8192
+  train_global_batch_size: 32
+  gen_batch_size: 8
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 4096
+  learning_rate: 5.0e-7
+  lr_warmup_steps: 10
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  training:
+    optimizer_dtype: bf16
+    fsdp_cfg:
+      param_offload: false
+      optimizer_offload: true
+      reshard_after_forward: false
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 1
+      kv_cache_dtype: fp8
+      enforce_eager: true
+      trust_remote_code: true
+      enable_auto_tool_choice: false
+
+algorithm:
+  name: grpo
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  loss_agg_mode: token-mean
+  grpo:
+    num_generations: 8
+    kl_coeff: 0.0
+    clip_ratio: 0.2
+    clip_ratio_high: 0.28
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+
+reward:
+  type: function
+  function: experiments.multi_tune_agent.rewards.kernel_reward.kernel_reward_batch
+
+agentic_rl:
+  environment: geak
+  geak_root: /home/danyzhan/GEAK
+  cases_path: /home/danyzhan/geak_sft_dataset/phase1-production-wave-2000-v1/processed/train.jsonl
+  max_turns: 1
+  gpu_ids: "4,5,6,7"
+  command_timeout: 120
+  baseline_repeats: 3
+
+checkpointing:
+  checkpoint_dir: /home/danyzhan/Lumen/experiments/GEAK-agent-coder/outputs/rl-grpo-kernel
+  save_steps: 50
+  save_total_limit: 3
+  resume: false
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 500
+seed: 42
