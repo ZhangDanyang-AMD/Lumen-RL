@@ -165,7 +165,19 @@ def run_single_task(
         best_speedup = 0.0
         compiled = False
         correct = False
-        if ever_correct and in_loop_speedup > 0:
+        # Always check for kernel_best.py, even if events don't record correctness
+        # (exceptions may cause early exit before events are fully populated)
+        has_snapshot = False
+        flow_dir_check = AITER_HELD_OUT / "receipts" / f"geak-flow-{env.config.model}" / "sessions"
+        if flow_dir_check.exists():
+            for sess_check in flow_dir_check.iterdir():
+                meta_check = sess_check / "workspace" / "metadata.json"
+                if meta_check.exists() and task_id in meta_check.read_text():
+                    kb_check = sess_check / "workspace" / "snapshots" / "kernel_best.py"
+                    if kb_check.exists():
+                        has_snapshot = True
+                    break
+        if has_snapshot or (ever_correct and in_loop_speedup > 0):
             import subprocess, shutil
             flow_dir = AITER_HELD_OUT / "receipts" / f"geak-flow-{env.config.model}" / "sessions"
             td = AITER_HELD_OUT / "artifacts" / "kernel" / task_id / "initial"

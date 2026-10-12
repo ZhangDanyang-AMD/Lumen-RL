@@ -308,9 +308,18 @@ class ToolAgentLoop(AgentLoopBase):
                     continue
                 if state is AgentState.GENERATING:
                     model_started = time.monotonic()
-                    turn = await asyncio.to_thread(
-                        self.backend.generate, history, self.tool.schemas()
-                    )
+                    try:
+                        turn = await asyncio.to_thread(
+                            self.backend.generate, history, self.tool.schemas()
+                        )
+                    except Exception as gen_err:
+                        elapsed = time.monotonic() - model_started
+                        metrics.model_seconds += elapsed
+                        metrics.assistant_turns += 1
+                        history.append({"role": "user", "content": f"Generation error: {gen_err}. Continue trying."})
+                        if metrics.assistant_turns >= self.max_assistant_turns:
+                            state = AgentState.TERMINATED
+                        continue
                     elapsed = time.monotonic() - model_started
                     metrics.model_seconds += elapsed
                     metrics.assistant_turns += 1
@@ -389,11 +398,15 @@ class ToolAgentLoop(AgentLoopBase):
                             }
                             reward, tool_metrics = 0.0, {"unknown_tool": call.name}
                         else:
-                            result, reward, tool_metrics = await asyncio.to_thread(
-                                self.tool.execute,
-                                session_id,
-                                call.arguments,
-                            )
+                            try:
+                                result, reward, tool_metrics = await asyncio.to_thread(
+                                    self.tool.execute,
+                                    session_id,
+                                    call.arguments,
+                                )
+                            except Exception as tool_err:
+                                result = {"ok": False, "error": f"Tool execution error: {tool_err}"}
+                                reward, tool_metrics = 0.0, {"tool_error": str(tool_err)}
                         elapsed = time.monotonic() - tool_started
                         metrics.tool_seconds += elapsed
                         metrics.tool_calls += 1
