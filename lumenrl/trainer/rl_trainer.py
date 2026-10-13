@@ -4345,7 +4345,8 @@ class RLTrainer:
                     self._sync_weights_ipc()   # wake weights -> ZMQ IPC -> wake KV
                 else:
                     self._sync_rollout_weights()
-            metrics["timing/weight_sync_s"] = time.time() - t_sync
+            sync_time = time.time() - t_sync
+            metrics["timing/weight_sync_s"] = sync_time
             metrics.update(self._last_weight_sync_metrics)
             metrics.update(self._collect_actor_memory_metrics())
 
