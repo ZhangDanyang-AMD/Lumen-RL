@@ -1314,6 +1314,7 @@ def run_template_gpu_gate(
     run_root: Path | str,
     gpu_ids: str = "1",
     command_timeout: int = 300,
+    aiter_root: Path | str | None = None,
 ) -> TemplateGateResult:
     """Validate a draft through GEAK's locked GPU command path without a baseline."""
 
@@ -1354,6 +1355,7 @@ def run_template_gpu_gate(
             run_root=root,
             gpu_ids=gpu_ids,
             command_timeout=command_timeout,
+            aiter_root=aiter_root,
         )
         workspace = sandbox.prepare(task, episode)
     except Exception as exc:

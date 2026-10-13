@@ -59,6 +59,7 @@ class KernelSandbox:
         command_timeout: int = 300,
         *,
         repository_root: Path | str | None = None,
+        aiter_root: Path | str | None = None,
     ) -> None:
         if upstream_root is not None and repository_root is not None:
             if Path(upstream_root).expanduser().resolve() != Path(
@@ -81,6 +82,11 @@ class KernelSandbox:
         self.command_timeout = int(command_timeout)
         if self.command_timeout < 1:
             raise ValueError("command_timeout must be >= 1")
+        self.aiter_root: Path | None = (
+            Path(aiter_root).expanduser().resolve()
+            if aiter_root is not None
+            else None
+        )
 
         self.workspace: Path | None = None
         self.commands: dict[str, str] = {}
@@ -115,6 +121,7 @@ class KernelSandbox:
                 % (result.stderr or result.stdout)[-4000:]
             )
 
+        self._link_aiter_headers(workspace)
         self.workspace = workspace.resolve()
         self.commands = self._discover_commands(self.workspace)
         self.allowed_write_paths = self._discover_write_paths(self.workspace)
@@ -122,6 +129,70 @@ class KernelSandbox:
             raise SandboxError("no editable kernel source found in %s" % self.workspace)
         self.baseline_ms = {}
         return self.workspace
+
+    _AITER_MODULE_INCLUDES = [
+        "csrc/opus_gemm/include",
+        "csrc/opus_moe/include",
+        "csrc/kernels/mla",
+        "csrc/kernels/mha_native",
+        "csrc/kernels/rope",
+        "csrc/kernels/rmsnorm",
+        "csrc/kernels/mxfp4_moe",
+        "csrc/cpp_itfs/pa",
+        "csrc/cpp_itfs/sampling",
+        "csrc/ck_gemm_a8w8/include",
+        "csrc/ck_batched_gemm_a8w8/include",
+        "csrc/ck_batched_gemm_bf16/include",
+        "csrc/ck_gemm_a4w4_blockscale/include",
+        "csrc/ck_gemm_a8w8_blockscale/include",
+        "csrc/ck_gemm_a8w8_blockscale_bpreshuffle/include",
+        "csrc/ck_gemm_a8w8_bpreshuffle/include",
+        "csrc/cktile_gemm_a8w8_bpreshuffle/include",
+        "csrc/ck_deepgemm/include",
+        "csrc/ck_tile_gemm_moe_2stages/include",
+    ]
+
+    def _link_aiter_headers(self, workspace: Path) -> None:
+        """Symlink aiter header directories into workspace/include/ for hipcc."""
+        if self.aiter_root is None or not self.aiter_root.is_dir():
+            return
+        include_dir = workspace / "include"
+        include_dir.mkdir(exist_ok=True)
+
+        csrc_include = self.aiter_root / "csrc" / "include"
+        if csrc_include.is_dir():
+            for item in csrc_include.iterdir():
+                target = include_dir / item.name
+                if not target.exists():
+                    target.symlink_to(item)
+
+        for rel in self._AITER_MODULE_INCLUDES:
+            src = self.aiter_root / rel
+            if not src.is_dir():
+                continue
+            for item in src.rglob("*"):
+                if not item.is_file():
+                    continue
+                rel_to_src = item.relative_to(src)
+                target = include_dir / rel_to_src
+                if not target.exists():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.symlink_to(item)
+
+    def _detect_language(self) -> str | None:
+        """Read language from workspace config.yaml."""
+        if self.workspace is None:
+            return None
+        for name in ("config.yaml", "config.yml"):
+            cfg = self.workspace / name
+            if cfg.is_file():
+                try:
+                    data = yaml.safe_load(cfg.read_text(encoding="utf-8"))
+                    if isinstance(data, dict):
+                        return data.get("language")
+                except Exception:
+                    pass
+        return None
 
     def establish_baseline(self, repeats: int = 3) -> dict[str, Any]:
         self._require_prepared()
@@ -248,11 +319,15 @@ class KernelSandbox:
             self._eval_count = getattr(self, "_eval_count", 0) + 1
             snap_dir = self.workspace / "snapshots"
             snap_dir.mkdir(exist_ok=True)
-            kernel = self.workspace / "kernel.py"
+            lang = self._detect_language()
+            kernel_name = "kernel.cu" if lang == "opus" else "kernel.py"
+            best_name = "kernel_best.cu" if lang == "opus" else "kernel_best.py"
+            kernel = self.workspace / kernel_name
             if kernel.exists():
                 import shutil
-                shutil.copy2(kernel, snap_dir / f"kernel_sp{sp:.2f}_t{self._eval_count}.py")
-                shutil.copy2(kernel, snap_dir / "kernel_best.py")
+                ext = ".cu" if lang == "opus" else ".py"
+                shutil.copy2(kernel, snap_dir / f"kernel_sp{sp:.2f}_t{self._eval_count}{ext}")
+                shutil.copy2(kernel, snap_dir / best_name)
         return EvaluationResult(
             compiled=True,
             correct=True,
@@ -470,9 +545,10 @@ class KernelSandbox:
             except Exception:
                 pass
         # Validate kernel before writing
-        if relative.endswith("kernel.py"):
+        if relative.endswith("kernel.py") or relative.endswith("kernel.cu"):
+            language = self._detect_language()
             from geak_utils.kernel_validator import validate_kernel
-            _ok, _result = validate_kernel(content, str(path) if path.exists() else None)
+            _ok, _result = validate_kernel(content, str(path) if path.exists() else None, language=language)
             if not _ok:
                 raise SandboxError("Kernel validation: " + _result)
             content = _result

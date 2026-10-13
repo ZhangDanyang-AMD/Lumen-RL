@@ -40,6 +40,7 @@ class GEAKGymEnv:
         max_turns: int = 20,
         baseline_repeats: int = 3,
         reward_config: RewardShapingConfig | None = None,
+        aiter_root: str | Path | None = None,
     ) -> None:
         self.tasks = list(tasks)
         self.upstream_root = Path(upstream_root)
@@ -49,6 +50,7 @@ class GEAKGymEnv:
         self.max_turns = int(max_turns)
         self.baseline_repeats = int(baseline_repeats)
         self.reward_config = reward_config or RewardShapingConfig()
+        self.aiter_root: Path | None = Path(aiter_root) if aiter_root else None
 
         self._task_index = 0
         self._sandbox: KernelSandbox | None = None
@@ -78,6 +80,7 @@ class GEAKGymEnv:
             run_root=self.run_root,
             gpu_ids=self.gpu_ids,
             command_timeout=self.command_timeout,
+            aiter_root=self.aiter_root,
         )
         self._sandbox.prepare(task, self._episode_dir)
         self._baseline = self._sandbox.establish_baseline(self.baseline_repeats)

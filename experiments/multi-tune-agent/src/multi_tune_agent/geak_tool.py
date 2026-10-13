@@ -102,6 +102,7 @@ class GEAKToolEnvironment:
             run_root=self.config.trajectory_root,
             gpu_ids=self.config.gpu_ids,
             command_timeout=self.config.command_timeout,
+            aiter_root=self.config.aiter_root,
         )
         started = time.monotonic()
         workspace = sandbox.prepare(fork_case, episode_dir)
@@ -489,16 +490,32 @@ class GEAKStatefulTool:
                 else None
             ),
             establish_baseline=bool(create_kwargs.get("establish_baseline", False)),
+            baseline_override=create_kwargs.get("baseline_override"),
         )
-        # Clear kernel.py for from-scratch writing
+        # Clear kernel for from-scratch writing (language-aware)
         if create_kwargs.get("clear_kernel"):
             state = self.environment.get(session_id)
-            kernel_path = state.workspace / "kernel.py"
-            kernel_path.write_text(
-                "# Write your Triton kernel implementation here.\n"
-                "# Read scripts/task_runner.py for the required function signature.\n"
-                "import torch\nimport triton\nimport triton.language as tl\n"
-            )
+            language = state.sandbox._detect_language()
+            if language == "opus":
+                kernel_path = state.workspace / "kernel.cu"
+                kernel_path.write_text(
+                    "// Write your HIP/OPUS kernel implementation here.\n"
+                    "// Read scripts/task_runner.py for the required function signature.\n"
+                    '#include "hip/hip_runtime.h"\n'
+                )
+            elif language == "flydsl":
+                kernel_path = state.workspace / "kernel.py"
+                kernel_path.write_text(
+                    "# Write your FlyDSL kernel implementation here.\n"
+                    "# Read scripts/task_runner.py for the required function signature.\n"
+                )
+            else:
+                kernel_path = state.workspace / "kernel.py"
+                kernel_path.write_text(
+                    "# Write your Triton kernel implementation here.\n"
+                    "# Read scripts/task_runner.py for the required function signature.\n"
+                    "import torch\nimport triton\nimport triton.language as tl\n"
+                )
         return session_id, observation
 
     def execute(
