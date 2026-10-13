@@ -19,6 +19,7 @@ import logging
 import os
 import platform
 import signal
+import time
 from types import MethodType
 
 import torch
@@ -530,6 +531,7 @@ class vLLMColocateWorkerExtension:
                 "online_quant": True,
                 **_stats,
                 "fingerprints": fingerprint_summary,
+                "timing": dict(getattr(receiver, "stats", {})),
             }
             logger.warning(
                 "IPC online reload checks complete: manifest=not aggregated, "
@@ -554,13 +556,20 @@ class vLLMColocateWorkerExtension:
         # everything else goes through vLLM's own load_weights.
         router = FusedMoEWeightRouter(model)
         loaded: set[str] = set()
+        timing = {"route_s": 0.0, "load_weights_s": 0.0}
 
         def _load(weights):
+            t0 = time.perf_counter()
             passthrough, moe_loaded = router.route(weights)
+            t1 = time.perf_counter()
             loaded.update(moe_loaded)
             loaded.update(model.load_weights(passthrough) or ())
+            timing["route_s"] += t1 - t0
+            timing["load_weights_s"] += time.perf_counter() - t1
 
+        t_total = time.perf_counter()
         receiver.receive_weights(on_bucket_received=_load)
+        t_post = time.perf_counter()
         assert_weight_sync_coverage(model, loaded, context="colocate-ipc")
 
         # Some post-load transforms are non-idempotent; run once after all buckets.
@@ -570,6 +579,13 @@ class vLLMColocateWorkerExtension:
             process_weights_after_loading(model, model_config, self.device)
         except Exception as exc:  # pragma: no cover - best effort parity with verl
             logger.warning("process_weights_after_loading skipped: %s", exc)
+        now = time.perf_counter()
+        return {
+            **getattr(receiver, "stats", {}),
+            **timing,
+            "post_s": now - t_post,
+            "total_s": now - t_total,
+        }
 
     def reload_weights_from_safetensors(self, weight_dir: str) -> None:
         """Load weights from safetensors on shared storage (separation mode)."""

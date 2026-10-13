@@ -28,6 +28,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -287,13 +288,23 @@ class VLLMRayServer:
 
     async def update_weights_from_ipc(
         self, use_shm: bool = False, version: int | None = None
-    ) -> bool:
-        """Start the in-worker IPC receiver; blocks until the sender completes."""
-        await self.engine.collective_rpc(
+    ) -> list:
+        """Start the in-worker IPC receiver; blocks until the sender completes.
+
+        Returns each vLLM worker's receive summary (timing dicts on the BF16 path).
+        """
+        results = await self.engine.collective_rpc(
             "update_weights_from_ipc", kwargs={"use_shm": use_shm, "version": version}
         )
+        t0 = time.perf_counter()
         await self.engine.reset_prefix_cache()
-        return True
+        reset_s = time.perf_counter() - t0
+        out = []
+        for r in results or []:
+            if isinstance(r, dict) and "total_s" in r:
+                r = {**r, "reset_prefix_cache_s": reset_s}
+            out.append(r)
+        return out
 
     async def reload_weights_from_path(self, weight_dir: str) -> bool:
         """Reload weights from a safetensors directory (for separation mode / TP>1)."""
