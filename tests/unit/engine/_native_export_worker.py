@@ -1,4 +1,4 @@
-"""torchrun worker: streaming Megatron-native export vs the pre-G1 materializing copy.
+"""torchrun worker: streaming Megatron-native export vs the original materializing copy.
 
 Not collected by pytest. Env:
 
@@ -58,7 +58,7 @@ MOE_FFN = 64
 
 
 # ---------------------------------------------------------------------------
-# Verbatim pre-G1 export (the reference). Do not "improve" this copy.
+# Verbatim old export (the reference). Do not "improve" this copy.
 # ---------------------------------------------------------------------------
 
 def _old_tp_gather_named_params(engine) -> dict:

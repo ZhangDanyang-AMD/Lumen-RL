@@ -1,4 +1,4 @@
-"""Multi-GPU parity: streaming Megatron-native export vs the pre-G1 gather."""
+"""Multi-GPU parity: streaming Megatron-native export vs the original gather."""
 
 from __future__ import annotations
 
