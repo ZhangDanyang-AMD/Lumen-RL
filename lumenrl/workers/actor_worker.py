@@ -1581,16 +1581,20 @@ class LumenActorWorker(BaseWorker):
         # expert weight is 768 MiB, past the 512 MiB default. vLLM re-opens per
         # bucket and needs no such floor.
         min_bucket_bytes = 0
-        if str(get_nested_config(
+        is_atom = str(get_nested_config(
             self.config, "policy", "generation_backend", default="",
-        ) or "") == "atom":
+        ) or "") == "atom"
+        if is_atom:
             min_bucket_bytes = max(
                 (self._sent_nbytes(p, keep_fp32) for _, p in params), default=0,
             )
 
+        # ATOM's receive loop needs the whole bucket for its largest tensor
+        # and one mapping per cycle, so it keeps the verl protocol.
+        legacy = {"gc_collect": True, "double_buffer": False} if is_atom else {}
         sender = BucketedWeightSender(
             zmq_handle=handle, bucket_size_mb=int(bucket_size_mb), use_shm=bool(use_shm),
-            version=version, min_bucket_bytes=min_bucket_bytes,
+            version=version, min_bucket_bytes=min_bucket_bytes, **legacy,
         )
         t_send = time.perf_counter()
         asyncio.run(sender.async_send_weights(_gen()))

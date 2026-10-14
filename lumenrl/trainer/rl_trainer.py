@@ -880,17 +880,21 @@ class RLTrainer:
                 "mem/weight_sync_peak_alloc_gb": _max_metric(send_results, "peak_alloc_gb"),
                 "mem/weight_sync_peak_extra_gb": _max_metric(send_results, "peak_extra_gb"),
             }
-            for key in ("setup_s", "sync_s", "ack_s", "cleanup_s"):
-                metrics[f"timing/weight_sync_sender_{key}"] = _max_metric(
-                    send_results, f"sender_{key}",
-                )
             from lumenrl.engine.inference.bucketed_weight_transfer import _debug_enabled
 
             debug = _debug_enabled()
+            cleanup_keys = ["cleanup_gc_s", "cleanup_ipc_collect_s", "cleanup_empty_cache_s"]
+            sender_keys = ["setup_s", "sync_s", "ack_s", "cleanup_s"]
+            if debug:
+                sender_keys += cleanup_keys
+            for key in sender_keys:
+                metrics[f"timing/weight_sync_sender_{key}"] = _max_metric(
+                    send_results, f"sender_{key}",
+                )
             recv_keys = ["wait_s", "load_weights_s"]
             if debug:
                 recv_keys += ["setup_s", "load_s", "route_s", "sync_s", "cleanup_s",
-                              "post_s", "reset_prefix_cache_s", "total_s"]
+                              "post_s", "reset_prefix_cache_s", "total_s", *cleanup_keys]
             if recv_results:
                 for key in recv_keys:
                     metrics[f"timing/weight_sync_recv_{key}"] = _max_metric(recv_results, key)
@@ -4342,8 +4346,7 @@ class RLTrainer:
                 else:
                     self._sync_rollout_weights()
             sync_time = time.time() - t_sync
-            if sync_time > 1.0:
-                metrics["timing/weight_sync_s"] = sync_time
+            metrics["timing/weight_sync_s"] = sync_time
             metrics.update(self._last_weight_sync_metrics)
             metrics.update(self._collect_actor_memory_metrics())
 

@@ -3,11 +3,23 @@
 Vendored from verl
 (``verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py``) and made
 self-contained so LumenRL does not depend on the verl source tree at runtime.
-Behaviour is intentionally identical: a training worker (sender) packs weight
+Default behaviour is identical: a training worker (sender) packs weight
 tensors into a fixed-size GPU buffer shared via a CUDA IPC handle and streams
 them bucket-by-bucket over a ZMQ REQ/REP socket to the colocated vLLM worker
 (receiver), which views tensors directly out of the shared buffer and loads
 them into the model.
+
+Two sender options differ from verl by default; pass ``gc_collect=True,
+double_buffer=False`` for the verl behaviour, which ATOM's hand-rolled
+receiver needs:
+
+* ``gc_collect=False`` skips the full ``gc.collect()`` in the sender's cleanup,
+  which costs ~0.4 s per sync in a Megatron trainer.
+* ``double_buffer=True`` splits the bucket into two slots. The receiver acks a
+  slot bucket on receipt (``ack_early`` in the control message) and loads it
+  while the sender fills the other slot; its next ack therefore means the
+  previous slot is free. The last bucket and direct sends are still acked
+  after loading, because nothing follows them to carry that guarantee.
 
 torch.cuda works for both NVIDIA and AMD/ROCm builds, so no device abstraction
 layer is required here.
@@ -48,6 +60,18 @@ def _device_id() -> int:
 
 def _sync() -> None:
     torch.cuda.synchronize()
+
+
+def _timed_cleanup(stats: dict, *, gc_collect: bool, ipc_collect: bool, empty_cache: bool) -> None:
+    for key, enabled, fn in (
+        ("cleanup_gc_s", gc_collect, gc.collect),
+        ("cleanup_ipc_collect_s", ipc_collect, torch.cuda.ipc_collect),
+        ("cleanup_empty_cache_s", empty_cache, torch.cuda.empty_cache),
+    ):
+        if enabled:
+            t0 = time.perf_counter()
+            fn()
+            stats[key] = time.perf_counter() - t0
 
 
 def _debug_log(role: str, message: str, **kwargs) -> None:
@@ -142,6 +166,8 @@ class BucketedWeightSender:
         use_shm: bool = False,
         version: int | None = None,
         min_bucket_bytes: int = 0,
+        gc_collect: bool = False,
+        double_buffer: bool = True,
     ):
         # ``min_bucket_bytes`` raises the bucket above the configured size so a
         # receiver that needs one stable buffer per update cycle can be given a
@@ -153,16 +179,23 @@ class BucketedWeightSender:
         self.bucket_size = max(int(bucket_size_mb) << 20, int(min_bucket_bytes))
         self.use_shm = use_shm
         self.version = version
+        self.gc_collect = gc_collect
+        self.double_buffer = double_buffer
+        self.num_slots = 2 if double_buffer else 1
+        # The slots split the configured bucket rather than doubling it: on a
+        # colocated GPU every extra byte comes out of vLLM's headroom.
+        self.bucket_size //= self.num_slots
 
         self.zmq_context = zmq.Context.instance()
         self.socket = None
         self.buffer = None
         self.shm = None
+        self._slot = 0
         # Wall-clock seconds per phase of the last send, plus counts. ``sync_s``
         # absorbs the async bucket copies; ``ack_s`` is time the receiver held us.
         self.stats: dict[str, float] = {}
 
-    def _control(self, bucket_meta: dict, is_last: bool) -> dict:
+    def _control(self, bucket_meta: dict, is_last: bool, ack_early: bool = False) -> dict:
         """Build a per-bucket control message.
 
         ``version`` rides on every bucket rather than on the ``_init_buffer``
@@ -174,6 +207,8 @@ class BucketedWeightSender:
         message = {"bucket_meta": bucket_meta, "is_last": is_last}
         if self.version is not None:
             message["version"] = int(self.version)
+        if ack_early:
+            message["ack_early"] = True
         return message
 
     async def async_send_weights(self, weights: Iterable) -> None:
@@ -182,16 +217,21 @@ class BucketedWeightSender:
             "setup_s": 0.0, "sync_s": 0.0, "ack_s": 0.0, "cleanup_s": 0.0,
             "buckets": 0, "direct": 0, "tensors": 0, "bytes": 0,
         }
+        self._slot = 0
 
         def _flush(meta: dict, is_last: bool) -> None:
             t0 = time.perf_counter()
             _sync()
             t1 = time.perf_counter()
-            self.socket.send_pyobj(self._control(meta, is_last))
+            ack_early = self.double_buffer and not is_last
+            self.socket.send_pyobj(self._control(meta, is_last, ack_early))
             self.socket.recv()
             st["sync_s"] += t1 - t0
             st["ack_s"] += time.perf_counter() - t1
             st["buckets"] += 1
+            # An early ack for this bucket arrives only after the receiver has
+            # finished the previous one, so the other slot is free now.
+            self._slot = (self._slot + 1) % self.num_slots
 
         try:
             t0 = time.perf_counter()
@@ -222,14 +262,15 @@ class BucketedWeightSender:
                     st["direct"] += 1
                     continue
 
+                start = self._slot * self.bucket_size + offset
                 bucket_meta[name] = {
                     "name": name,
                     "shape": weight.shape,
                     "dtype": weight.dtype,
-                    "offset": offset,
+                    "offset": start,
                     "handle": None,
                 }
-                self.buffer[offset : offset + weight.nbytes].copy_(
+                self.buffer[start : start + weight.nbytes].copy_(
                     weight.view(-1).view(torch.uint8), non_blocking=True
                 )
                 offset += weight.nbytes
@@ -252,10 +293,11 @@ class BucketedWeightSender:
         self.socket.bind(self.zmq_handle)
 
     def _init_buffer(self) -> None:
+        size = self.bucket_size * self.num_slots
         buffer, shm = None, None
         if not self.use_shm:
             buffer = torch.empty(
-                self.bucket_size, dtype=torch.uint8, device=f"{_device_name()}:{_device_id()}"
+                size, dtype=torch.uint8, device=f"{_device_name()}:{_device_id()}"
             )
             handle = reduce_tensor(buffer)
             self.socket.send_pyobj(handle)
@@ -263,9 +305,9 @@ class BucketedWeightSender:
             import uuid
 
             shm_name = f"lumen_weights_{uuid.uuid4().hex}"
-            shm = create_shared_memory(self.bucket_size, shm_name)
+            shm = create_shared_memory(size, shm_name)
             buffer = torch.frombuffer(shm.buf, dtype=torch.uint8)
-            self.socket.send_pyobj({"name": shm_name, "size": self.bucket_size})
+            self.socket.send_pyobj({"name": shm_name, "size": size})
 
         self.socket.recv()
         self.buffer = buffer
@@ -288,9 +330,9 @@ class BucketedWeightSender:
             self.shm.unlink()
             del self.shm
             self.shm = None
-        gc.collect()
-        torch.cuda.ipc_collect()
-        torch.cuda.empty_cache()
+        _timed_cleanup(
+            self.stats, gc_collect=self.gc_collect, ipc_collect=True, empty_cache=True,
+        )
 
     def _direct_send_large_weight(self, name: str, weight: torch.Tensor) -> None:
         handle = reduce_tensor(weight)
@@ -361,6 +403,11 @@ class BucketedWeightReceiver:
                     if self.use_shm:
                         tensor = tensor.to(self.device)
                     weights.append((name, tensor))
+                # Early ack lets the sender fill the other slot while we load;
+                # we must finish this slot before reading the next message.
+                ack_early = bool(metadata.get("ack_early"))
+                if ack_early:
+                    self.socket.send(b"")
                 t0 = time.perf_counter()
                 on_bucket_received(weights)
                 t1 = time.perf_counter()
@@ -369,7 +416,8 @@ class BucketedWeightReceiver:
                 st["sync_s"] += time.perf_counter() - t1
                 st["buckets"] += 1
                 st["tensors"] += len(weights)
-                self.socket.send(b"")
+                if not ack_early:
+                    self.socket.send(b"")
                 del weights, tensor
                 if metadata["is_last"]:
                     break
@@ -410,6 +458,4 @@ class BucketedWeightReceiver:
             self.shm.close()
             del self.shm
             self.shm = None
-        gc.collect()
-        torch.cuda.ipc_collect()
-        torch.cuda.empty_cache()
+        _timed_cleanup(self.stats, gc_collect=True, ipc_collect=True, empty_cache=True)
