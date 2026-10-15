@@ -793,7 +793,9 @@ class MegatronNativeEngine(MegatronBaseEngine):
 
         ``stack_experts`` (EP>1 only) emits each expert gather as one
         ``[ep, out, in]`` tensor holding experts ``e, e + num_local, ...``,
-        named with ``stacked_expert_index``.
+        named with ``stacked_expert_index``. The stack is the EP all-gather's
+        output buffer, so it costs nothing extra; at EP=1 there is no gather,
+        and stacking would mean copying every expert each sync.
         """
         from megatron.core import parallel_state as mpu
         from megatron.core.dist_checkpointing.mapping import (
@@ -1142,7 +1144,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
     def get_per_tensor_param(self, **kwargs):
         """Yield the whole model as (rollout_name, tensor), one tensor at a time.
 
-        ⚠️ Lazy, and every tensor comes out of a collective, so the caller must
+        This is Lazy, and every tensor comes out of a collective, so the caller must
         drain the generator on every rank. Consuming it partially deadlocks.
 
         ``stack_experts=True`` asks for expert stacks (see ``_stage_plan``) from
