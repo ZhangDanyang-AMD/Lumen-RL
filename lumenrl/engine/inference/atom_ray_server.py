@@ -896,7 +896,21 @@ class ATOMRayServer:
                 for name, tensor in sd.items():
                     yield name, tensor
 
-        load_weights_via_shm(self.engine.core_mgr, weight_iter(), bucket_size_mb=2048)
+        # A bucket must hold the largest tensor whole, and an FSDP2 export
+        # carries FP32 master weights: Qwen3-8B's embedding alone is 2.3 GiB.
+        # Sized from the safetensors headers, which give every tensor's bytes.
+        largest = 0
+        for fname in files:
+            with open(os.path.join(weight_dir, fname), "rb") as f:
+                header = json.loads(f.read(int.from_bytes(f.read(8), "little")))
+            for key, entry in header.items():
+                if key != "__metadata__":
+                    begin, end = entry["data_offsets"]
+                    largest = max(largest, end - begin)
+        bucket_size_mb = max(2048, -(-largest // (1 << 20)))
+        load_weights_via_shm(
+            self.engine.core_mgr, weight_iter(), bucket_size_mb=bucket_size_mb
+        )
         logger.info(
             "ATOMRayServer[%d]: reloaded weights from %s", self.replica_rank, weight_dir
         )
