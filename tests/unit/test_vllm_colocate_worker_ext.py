@@ -344,6 +344,7 @@ def test_online_reload_runs_prepare_load_finalize_and_returns_summary(
     )
     fake_moe_sync.FusedMoEWeightRouter = object
     fake_moe_sync.assert_weight_sync_coverage = lambda *args, **kwargs: None
+    fake_moe_sync.unstack_expert_weights = list
     monkeypatch.setitem(sys.modules, "vllm", ModuleType("vllm"))
     monkeypatch.setitem(sys.modules, "vllm.platforms", fake_platforms)
     monkeypatch.setitem(
@@ -423,6 +424,7 @@ def test_ipc_online_load_error_still_finalizes_and_preserves_original(
     fake_moe_sync = ModuleType("lumenrl.engine.inference.vllm_moe_weight_sync")
     fake_moe_sync.FusedMoEWeightRouter = object
     fake_moe_sync.assert_weight_sync_coverage = lambda *args, **kwargs: None
+    fake_moe_sync.unstack_expert_weights = list
     monkeypatch.setitem(sys.modules, "vllm", ModuleType("vllm"))
     monkeypatch.setitem(sys.modules, "vllm.platforms", fake_platforms)
     monkeypatch.setitem(

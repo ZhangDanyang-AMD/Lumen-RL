@@ -25,7 +25,7 @@ def _effective_num_experts(hf: Mapping[str, Any], ec: Mapping[str, Any]) -> int:
     return int(ec.get("num_experts") or hf_num_experts(hf) or 0)
 
 
-def _export_dsv4(engine):
+def _export_dsv4(engine, **_):
     """Gathers like Qwen3-MoE but renames to the DSv4 *checkpoint* names, which
     the rollout feeds straight to vLLM's ``load_weights``."""
     named = itertools.chain(
@@ -35,7 +35,7 @@ def _export_dsv4(engine):
     return dsv4.megatron_to_dsv4_native(named)
 
 
-def _export_dsv3(engine):
+def _export_dsv3(engine, **_):
     """MLA export. The router bias is a buffer, so it is chained in explicitly:
     noaux_tc top-k reads it, and a rollout without it picks other experts.
 
@@ -50,11 +50,13 @@ def _export_dsv3(engine):
     return dsv3.megatron_to_hf(named)
 
 
-def _export_moe(engine):
-    return gpt.megatron_to_hf(engine._full_megatron_named_params_moe(), engine._dims)
+def _export_moe(engine, stack_experts: bool = False, **_):
+    return gpt.megatron_to_hf(
+        engine._full_megatron_named_params_moe(stack_experts), engine._dims,
+    )
 
 
-def _export_dense(engine):
+def _export_dense(engine, **_):
     return gpt.megatron_to_hf(engine._full_megatron_named_params(), engine._dims)
 
 

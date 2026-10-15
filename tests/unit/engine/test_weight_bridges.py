@@ -12,7 +12,7 @@ import pytest
 import torch
 
 from lumenrl.engine.training.bridges import dsv3, gpt
-from lumenrl.engine.training.bridges.core import pp_layer_range
+from lumenrl.engine.training.bridges.core import pp_layer_range, stacked_expert_index
 
 H, NH, KV, HD, FFN, V, E, MF, SF = 8, 4, 2, 2, 6, 10, 4, 3, 5
 
@@ -83,6 +83,37 @@ def _native_moe_named(hf: dict, sequential: bool) -> list:
             named.append((pre + fc1, gpt.hf_expert_fc1(hf, MOE, L, e)))
             named.append((pre + fc2, gpt.hf_expert_fc2(hf, MOE, L, e)))
     return named
+
+
+def _native_moe_stacked_named(hf: dict, sequential: bool, ep: int = 2) -> list:
+    """The engine's ``stack_experts`` output: one ``[ep, out, in]`` stack per local expert."""
+    named = list(gpt.non_expert_hf_to_megatron(hf, MOE).items())
+    num_local = E // ep
+    for L in range(MOE.num_layers):
+        for local_e in range(num_local):
+            idx = stacked_expert_index(local_e, num_local)
+            pre = f"module.decoder.layers.{L}.mlp.experts."
+            fc1 = f"local_experts.{idx}.linear_fc1.weight" if sequential else f"linear_fc1.weight{idx}"
+            fc2 = f"local_experts.{idx}.linear_fc2.weight" if sequential else f"linear_fc2.weight{idx}"
+            experts = [j * num_local + local_e for j in range(ep)]
+            named.append((pre + fc1, torch.stack([gpt.hf_expert_fc1(hf, MOE, L, e) for e in experts])))
+            named.append((pre + fc2, torch.stack([gpt.hf_expert_fc2(hf, MOE, L, e) for e in experts])))
+    return named
+
+
+@pytest.mark.parametrize("sequential", [False, True])
+def test_gpt_moe_stacked_experts_round_trip(sequential):
+    """Stacks keep their stride in the HF name, and the receiver's expansion
+    recovers every per-expert checkpoint tensor bit for bit."""
+    from lumenrl.engine.inference.vllm_moe_weight_sync import unstack_expert_weights
+
+    hf = _hf(2, moe=True)
+    exported = list(gpt.megatron_to_hf(_native_moe_stacked_named(hf, sequential), MOE))
+    stacked = [n for n, _ in exported if "::" in n]
+    assert "model.layers.1.mlp.experts.1::2.gate_up_proj" in stacked
+    assert "model.layers.0.mlp.experts.0::2.down_proj" in stacked
+    assert len(stacked) == MOE.num_layers * E  # (E / ep) stacks x 2 leaves x ep=2
+    _assert_same(hf, unstack_expert_weights(exported))
 
 
 @pytest.mark.parametrize("te", [True, False])
@@ -158,6 +189,8 @@ def test_unmatched_names_are_reported(caplog):
         *gpt.hf_to_megatron(_hf(4, moe=False), DENSE, te=True),
         *gpt.hf_to_megatron(_hf(4, moe=False), DENSE, te=False),
         *(n for n, _ in _native_moe_named(_hf(2, moe=True), sequential=False)),
+        *(n for n, _ in _native_moe_stacked_named(_hf(2, moe=True), sequential=False)),
+        *(n for n, _ in _native_moe_stacked_named(_hf(2, moe=True), sequential=True)),
     ]),
     (dsv3.DSV3, lambda: [
         "decoder.layers.1.mlp.router.expert_bias",
