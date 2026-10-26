@@ -1020,8 +1020,11 @@ class MegatronNativeEngine(MegatronBaseEngine):
         while receiving earlier stages and topped up before each of this
         stage's own broadcasts, so gathers are queued on the GPU ahead of the
         consumer (e.g. while it waits on a bucket ack). Refills depend only on
-        this stage's tensor sizes, so every rank in the stage issues the same
-        collectives in the same order.
+        this stage's tensor sizes and the budget, so every rank in the stage
+        issues the same collectives in the same order -- provided the budget is
+        the same on every rank. It is read from each rank's environment, so the
+        ranks agree on the smallest value set anywhere (with a warning if they
+        differ) before the first refill.
         """
         from megatron.core import parallel_state as mpu
 
@@ -1037,7 +1040,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
         gathered_meta: list = [None] * pp
         dist.all_gather_object(gathered_meta, meta_local, group=pp_group)
 
-        budget = int(os.environ.get("LUMENRL_SYNC_PREFETCH_MB", "1024") or 0) << 20
+        budget = self._agreed_prefetch_mb() << 20
         own = self._stage_named_params(recipes)
         queue: deque[tuple[str, torch.Tensor]] = deque()
         queued_bytes = 0
@@ -1078,6 +1081,25 @@ class MegatronNativeEngine(MegatronBaseEngine):
                     t = torch.empty(shape, dtype=dtype, device="cuda")
                 dist.broadcast(t, src=src_global, group=pp_group)
                 yield k, t
+
+    @staticmethod
+    def _agreed_prefetch_mb() -> int:
+        """``LUMENRL_SYNC_PREFETCH_MB``, made identical on every rank.
+
+        The budget sets how many TP/EP gathers a rank issues between PP
+        broadcasts; ranks of one stage with different budgets issue collectives
+        in different orders and hang. Collective over the default group.
+        """
+        local = int(os.environ.get("LUMENRL_SYNC_PREFETCH_MB", "1024") or 0)
+        bounds = torch.tensor([local, -local], dtype=torch.int64, device="cuda")
+        dist.all_reduce(bounds, op=dist.ReduceOp.MAX)
+        hi, lo = int(bounds[0]), -int(bounds[1])
+        if hi != lo and dist.get_rank() == 0:
+            logger.warning(
+                "LUMENRL_SYNC_PREFETCH_MB differs across ranks (%d..%d MB); "
+                "using %d MB everywhere", lo, hi, lo,
+            )
+        return lo
 
     def _full_megatron_named_params(self):
         """Reconstruct the COMPLETE model as (global_name, tensor) on every rank.

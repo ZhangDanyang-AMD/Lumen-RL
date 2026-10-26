@@ -467,6 +467,28 @@ def test_stacked_experts_under_tp_take_the_right_slice():
     assert torch.equal(experts.w2_weight.data, down[1][:, :, inter : 2 * inter])
 
 
+def test_stacked_experts_under_tp_and_ep():
+    """vLLM TP and EP together: only owned experts land, each with this TP rank's slice."""
+    tp_size, tp_rank, owned = 2, 1, {1, 3}
+    inter = I // tp_size
+    model = FakeModel(tp_size=tp_size, tp_rank=tp_rank, ep_size=2, local_experts=owned)
+    weights, gate_up, down = _stacked_payload(ep=2)
+    passthrough, _ = FusedMoEWeightRouter(model).route(weights)
+    assert passthrough == []
+    rows = slice(tp_rank * inter, (tp_rank + 1) * inter)
+    for idx in range(N_LAYERS):
+        experts = model.model.layers[idx].mlp.experts
+        assert all(len(shape) == 2 for _, shape in experts.calls)
+        for e in range(E):
+            w13, w2 = experts.w13_weight.data[e], experts.w2_weight.data[e]
+            if e not in owned:
+                assert not w13.any() and not w2.any(), (idx, e)
+                continue
+            assert torch.equal(w13[:inter], gate_up[idx][e][:I][rows]), (idx, e)
+            assert torch.equal(w13[inter:], gate_up[idx][e][I:][rows]), (idx, e)
+            assert torch.equal(w2, down[idx][e][:, rows]), (idx, e)
+
+
 def test_stack_for_an_unknown_layer_is_loud():
     model = FakeModel()
     try:

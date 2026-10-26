@@ -1561,26 +1561,22 @@ class LumenActorWorker(BaseWorker):
         params, _ = self._engine.get_per_tensor_param(stack_experts=stack_experts)
         gather_s = 0.0
 
-        def _timed_export():
+        def _gen():
             nonlocal gather_s
             it = iter(params)
             while True:
                 t0 = time.perf_counter()
                 try:
-                    item = next(it)
+                    name, param = next(it)
                 except StopIteration:
                     break
-                gather_s += time.perf_counter() - t0
-                yield item
-
-        def _gen():
-            for name, param in _timed_export():
                 full = param.full_tensor() if isinstance(param, DTensor) else param
                 full = full.detach()
                 if full.dtype == torch.float32 and not keep_fp32:
                     full = full.to(torch.bfloat16)
                 if not full.is_cuda:
                     full = full.to("cuda", non_blocking=True)
+                gather_s += time.perf_counter() - t0
                 yield name, full
 
         # ATOM's ModelRunner opens the staging buffer once per update cycle and

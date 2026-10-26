@@ -278,6 +278,8 @@ class FusedMoEWeightRouter:
         param_name = w13_name if leaf == _FUSED_GATE_UP else w2_name
         param = self._params[param_name]
 
+        # Basic slicing, so a strided view of param: copy_ writes through it in
+        # place. Advanced indexing (param.data[idx]) would copy and drop the write.
         dest = param.data[start::step]
         if (
             self._ep_size(module) == 1 and self._tp_size(module) == 1

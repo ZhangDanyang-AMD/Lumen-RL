@@ -3,7 +3,7 @@
 Not collected by pytest. Env:
 
 * ``NATIVE_TP`` / ``NATIVE_PP`` / ``NATIVE_EP`` / ``NATIVE_MOE`` (0/1)
-* ``LUMENRL_SYNC_PREFETCH_MB`` (0 or 1024)
+* ``LUMENRL_SYNC_PREFETCH_MB`` (0, 1024, or ``mixed``: 1024 on even ranks, 0 on odd)
 
 Prints ``NATIVE_EXPORT_OK`` on success.
 """
@@ -333,6 +333,8 @@ def _assert_stacked(engine, per_expert, rank: int) -> None:
 
 def main() -> None:
     rank = int(os.environ["RANK"])
+    if os.environ.get("LUMENRL_SYNC_PREFETCH_MB") == "mixed":
+        os.environ["LUMENRL_SYNC_PREFETCH_MB"] = "1024" if rank % 2 == 0 else "0"
     torch.cuda.set_device(rank % torch.cuda.device_count())
     dist.init_process_group(backend="nccl")
     mpu.initialize_model_parallel(
