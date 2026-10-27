@@ -262,6 +262,37 @@ class MegatronNativeEngine(MegatronBaseEngine):
         )
         return megatron_fp8_kwargs(cfg, num_layers=num_layers, pp_size=pp)
 
+    @staticmethod
+    def _check_fp8_usable(fp8_kwargs: dict, tfcfg) -> None:
+        """Refuse an FP8 request this run cannot actually honour.
+
+        Two ways it cannot, both of which otherwise surface late and wrong: a
+        ``build_config`` family builds its own config and never receives
+        fp8_kwargs, so the run would train in BF16 while reporting FP8; and TE
+        only resolves the recipe at the first forward, so an unsupported one
+        kills the run minutes in.
+        """
+        if not getattr(tfcfg, "fp8", None):
+            raise RuntimeError(
+                f"FP8 was requested (fp8={fp8_kwargs.get('fp8')}, "
+                f"fp8_recipe={fp8_kwargs.get('fp8_recipe')}) but the "
+                f"{type(tfcfg).__name__} built for this model family does not carry "
+                f"it; that path would train in BF16. FP8 is only wired for the "
+                f"generic TransformerConfig path."
+            )
+        try:
+            from megatron.core.fp8_utils import get_fp8_recipe
+            from transformer_engine.pytorch.quantization import check_recipe_support
+        except ImportError:
+            return  # best-effort: TE still raises at the first forward
+        try:
+            check_recipe_support(get_fp8_recipe(tfcfg))
+        except (RuntimeError, ValueError) as e:
+            raise RuntimeError(
+                f"fp8_recipe={fp8_kwargs.get('fp8_recipe')!r} is not usable on this "
+                f"build: {e}"
+            ) from e
+
     @property
     def _caps(self):
         """Capabilities of the resolved family, or the defaults pre-``initialize``."""
@@ -557,22 +588,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
         self._tfcfg = tfcfg
 
         if fp8_kwargs:
-            # TE resolves the recipe at the first forward, so an unsupported one
-            # (blockwise has no ROCm GEMM as of TE 2.15) kills the run minutes in.
-            # Ask up front, via Megatron's own string -> recipe mapping.
-            try:
-                from megatron.core.fp8_utils import get_fp8_recipe
-                from transformer_engine.pytorch.quantization import check_recipe_support
-            except ImportError:
-                pass  # best-effort: TE still raises at the first forward
-            else:
-                try:
-                    check_recipe_support(get_fp8_recipe(tfcfg))
-                except RuntimeError as e:
-                    raise RuntimeError(
-                        f"fp8_recipe={fp8_kwargs.get('fp8_recipe')!r} is not usable on "
-                        f"this build: {e}"
-                    ) from e
+            self._check_fp8_usable(fp8_kwargs, tfcfg)
             if self._rank() == 0:
                 # print, not logger: Ray forwards worker stdout, not log records.
                 print(
@@ -1303,6 +1319,34 @@ class MegatronNativeEngine(MegatronBaseEngine):
             mbs.append({"rows": [rows[j] for j in bin_rows], "ids_list": ids_list})
         return mbs
 
+    def _token_align(self) -> int:
+        """LCM of every token-count divisibility this run requires.
+
+        RL sequence lengths are whatever the rollout produced, so each of these
+        has to be padded for rather than assumed:
+          * sequence parallelism (required for MoE+TP) scatters the packed
+            sequence across TP ranks, so it must be a multiple of TP;
+          * DSv4's compressor asserts ``seqlen % ratio == 0`` every forward, and
+            under CP additionally ``seqlen % (ratio*2) == 0``;
+          * TE refuses an unaligned activation under FP8
+            (``assert_dim_for_fp8_exec``). Pretraining never trips this because
+            its ``[seq, mbs]`` is fixed.
+        """
+        align = self._tp if (self._sp and self._tp > 1) else 1
+        if self._spec is not None and self._spec.sequence_alignment is not None:
+            align = math.lcm(align, self._dsv4_align * (2 if self._cp > 1 else 1))
+        if getattr(self._tfcfg, "fp8", None):
+            # Megatron's own size, so mxfp8's 32 is covered rather than just 16.
+            from megatron.core.fp8_utils import get_fp8_align_size
+
+            align = math.lcm(align, get_fp8_align_size(self._tfcfg.fp8_recipe))
+        return align
+
+    def _packed_token_align(self) -> int:
+        """Override of the base hook: the base packed forward (dense, pp=cp=1)
+        needs exactly the alignment the pipelined path computes."""
+        return self._token_align()
+
     def _pp_forward_model(self, model, mb):
         """Pack full sequences into this rank's ``thd`` token stream.
 
@@ -1336,23 +1380,9 @@ class MegatronNativeEngine(MegatronBaseEngine):
         rows = mb.get("rows") or []
         cp_rank = mpu.get_context_parallel_rank()
 
-        # Token-count alignment, computed BEFORE the CP split because under the
-        # contiguous layout the per-rank chunk itself has to be aligned.
-        #   * sequence parallelism (required for MoE+TP) scatters the packed
-        #     sequence across TP ranks, so it must be a multiple of TP;
-        #   * DSv4's compressor asserts ``seqlen % ratio == 0`` on every forward,
-        #     and under CP additionally ``seqlen % (ratio*2) == 0``, while RL
-        #     sequence lengths are whatever the rollout produced.
-        align = self._tp if (self._sp and self._tp > 1) else 1
-        if self._spec.sequence_alignment is not None:
-            align = math.lcm(align, self._dsv4_align * (2 if self._cp > 1 else 1))
-        if getattr(self._tfcfg, "fp8", None):
-            # TE refuses an unaligned token count outright (assert_dim_for_fp8_exec).
-            # Pretraining never trips this because its [seq, mbs] is fixed; an RL
-            # token count is whatever the rollout produced.
-            from megatron.core.fp8_utils import get_fp8_align_size
-
-            align = math.lcm(align, get_fp8_align_size(self._tfcfg.fp8_recipe))
+        # Computed BEFORE the CP split: under the contiguous layout the per-rank
+        # chunk itself has to be aligned. Shared with the base packed forward.
+        align = self._token_align()
 
         cp_contiguous = self._caps.packed_stream_is_single_sequence and self._cp > 1
         if cp_contiguous and len(ids_list) > 1:
