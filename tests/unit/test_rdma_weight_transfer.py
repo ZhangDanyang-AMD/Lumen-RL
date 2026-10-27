@@ -92,6 +92,77 @@ def test_receive_stream_calls_model_loader_once_across_all_buckets(monkeypatch):
     assert stats["weights"] == 2
 
 
+def _receive_one_bucket(monkeypatch, staging):
+    metadata, payload = _bucket("w.weight", torch.tensor([1.0, 2.0, 3.0]))
+    headers = iter(
+        [
+            torch.tensor([rdma._CMD_BUCKET, len(metadata), payload.numel(), 5]),
+            torch.tensor([rdma._CMD_END, 0, 0, 5]),
+        ]
+    )
+    broadcasts = iter([torch.tensor(list(metadata), dtype=torch.uint8), payload])
+    received_payloads = []
+
+    def broadcast(output, src, group):
+        output.copy_(next(broadcasts))
+        received_payloads.append(output)
+
+    monkeypatch.setattr(rdma, "_broadcast_header", lambda *args, **kwargs: next(headers))
+    monkeypatch.setattr(rdma.dist, "broadcast", broadcast)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+
+    class Model:
+        received = []
+
+        def named_parameters(self):
+            return iter(())
+
+        def named_buffers(self):
+            return iter(())
+
+        def load_weights(self, weights):
+            self.received.extend(weights)
+            return {"w"}
+
+    model = Model()
+    rdma.receive_weight_stream(
+        object(),
+        model,
+        device=torch.device("cpu"),
+        expected_version=5,
+        verify_full_load=False,
+        staging=staging,
+    )
+    (name, tensor), = model.received
+    return name, tensor, received_payloads[-1]
+
+
+def test_receive_stream_without_staging_yields_views_into_the_payload(monkeypatch):
+    name, tensor, payload = _receive_one_bucket(monkeypatch, "none")
+
+    assert name == "w.weight"
+    assert tensor.untyped_storage().data_ptr() == payload.untyped_storage().data_ptr()
+    torch.testing.assert_close(tensor, torch.tensor([1.0, 2.0, 3.0]))
+
+
+def test_receive_stream_gpu_staging_yields_copies(monkeypatch):
+    _, tensor, payload = _receive_one_bucket(monkeypatch, "gpu")
+
+    assert tensor.untyped_storage().data_ptr() != payload.untyped_storage().data_ptr()
+    torch.testing.assert_close(tensor, torch.tensor([1.0, 2.0, 3.0]))
+
+
+def test_receive_stream_rejects_unknown_staging_mode():
+    with pytest.raises(ValueError, match="invalid RDMA staging mode"):
+        rdma.receive_weight_stream(
+            object(),
+            object(),
+            device=torch.device("cpu"),
+            expected_version=1,
+            staging="pinned",
+        )
+
+
 def test_receive_stream_reports_last_source_tensor_on_loader_failure(monkeypatch):
     bucket = _bucket("layers.0.attn.wq_b.weight_scale_inv", torch.ones(2, 3))
     headers = iter(

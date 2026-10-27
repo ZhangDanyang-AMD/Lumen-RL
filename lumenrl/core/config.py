@@ -779,6 +779,9 @@ class RDMAWeightSyncConfig:
     interface: str = "ens11np0"
     gid_index: int = 3
     gdr_mode: str = "auto"  # off | auto | required
+    # Where online-FP8 reload copies each received tensor while vLLM holds it
+    # until its module is complete. cpu if the held modules don't fit on the GPU.
+    online_staging: str = "gpu"  # gpu | cpu
 
 
 @dataclass

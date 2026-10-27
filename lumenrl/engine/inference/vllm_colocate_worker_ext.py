@@ -237,12 +237,16 @@ class vLLMColocateWorkerExtension:
         version: int,
         verify_full_load: bool = True,
         prequantized_fp8: bool = False,
+        online_staging: str = "gpu",
     ) -> dict[str, object]:
         """Receive HF-named GPU buckets over RCCL and load them in place.
 
         For online FP8 quantized models (``fp8_per_block``), wraps the reload
         with vLLM's layerwise quantization lifecycle so per-block FP8 scales
-        are rebuilt from the fresh BF16 weights after each update.
+        are rebuilt from the fresh BF16 weights after each update. That reload
+        holds tensors until a module is complete, so each one is copied first,
+        to ``online_staging`` (``gpu`` or ``cpu``). The other paths load views
+        into the received bucket.
         """
         from vllm.platforms import current_platform
 
@@ -341,6 +345,7 @@ class vLLMColocateWorkerExtension:
                     streamed_scales=False,
                     fingerprint_tracker=fingerprints,
                     finalize_fingerprints=False,
+                    staging=online_staging,
                 )
                 log_static_changes("after_load")
                 if integrity_enabled:
@@ -399,6 +404,7 @@ class vLLMColocateWorkerExtension:
                 expected_version=int(version),
                 verify_full_load=bool(verify_full_load),
                 streamed_scales=True,
+                staging="none",
             )
         else:
             stats = receive_weight_stream(
@@ -408,6 +414,7 @@ class vLLMColocateWorkerExtension:
                 expected_version=int(version),
                 verify_full_load=bool(verify_full_load),
                 streamed_scales=False,
+                staging="none",
             )
 
         verification = stats.get("verification", {})

@@ -505,6 +505,7 @@ def test_rdma_online_orders_snapshot_prepare_load_finalize_fingerprint(
         events.append("load")
         assert isinstance(fingerprint_tracker, Tracker)
         assert finalize_fingerprints is False
+        assert kwargs["staging"] == "gpu"
         return {"weights": 1.0}
 
     fake_platforms = ModuleType("vllm.platforms")
@@ -622,6 +623,84 @@ def test_rdma_online_load_error_still_finalizes_and_preserves_original(
     assert "secondary RDMA online FP8 finalize failure" in caplog.text
 
 
+def test_bf16_rdma_loads_views_without_staging(monkeypatch):
+    calls = []
+
+    def receive_weight_stream(*args, **kwargs):
+        calls.append(kwargs)
+        return {"weights": 1.0}
+
+    fake_platforms = ModuleType("vllm.platforms")
+    fake_platforms.current_platform = SimpleNamespace(device_type="cpu")
+    monkeypatch.setitem(sys.modules, "vllm", ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.platforms", fake_platforms)
+    monkeypatch.setattr(rdma, "receive_weight_stream", receive_weight_stream)
+    monkeypatch.setattr(fp8_utils, "is_online_quant_model", lambda config: False)
+
+    worker = object.__new__(vLLMColocateWorkerExtension)
+    worker.local_rank = 0
+    worker.device = torch.device("cpu")
+    worker._rdma_weight_groups = {"group": object()}
+    worker.model_runner = SimpleNamespace(
+        model=torch.nn.Linear(1, 1),
+        vllm_config=SimpleNamespace(model_config=object()),
+    )
+
+    worker.receive_weights_rdma("group", version=4)
+
+    assert [c["staging"] for c in calls] == ["none"]
+    assert calls[0]["streamed_scales"] is False
+
+
+def test_online_rdma_stages_to_the_requested_device(monkeypatch):
+    calls = []
+
+    class Tracker:
+        def __init__(self, model):
+            pass
+
+        def checkpoint_static_changed_names(self):
+            return []
+
+        def restore_checkpoint_static_tensors(self):
+            pass
+
+        def finalize(self):
+            return {}
+
+    def receive_weight_stream(*args, **kwargs):
+        calls.append(kwargs)
+        return {"weights": 1.0}
+
+    fake_platforms = ModuleType("vllm.platforms")
+    fake_platforms.current_platform = SimpleNamespace(device_type="cpu")
+    monkeypatch.setitem(sys.modules, "vllm", ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.platforms", fake_platforms)
+    monkeypatch.setattr(rdma, "receive_weight_stream", receive_weight_stream)
+    monkeypatch.setattr(fp8_utils, "ReloadFingerprintTracker", Tracker)
+    monkeypatch.setattr(fp8_utils, "is_online_quant_model", lambda config: True)
+    monkeypatch.setattr(
+        fp8_utils, "prepare_online_quantized_weights_for_loading", lambda model: None
+    )
+    monkeypatch.setattr(
+        fp8_utils, "finalize_online_quantized_weights_loading", lambda model, config: None
+    )
+
+    worker = object.__new__(vLLMColocateWorkerExtension)
+    worker.local_rank = 0
+    worker.device = torch.device("cpu")
+    worker._rdma_weight_groups = {"group": object()}
+    worker.model_runner = SimpleNamespace(
+        model=torch.nn.Linear(1, 1),
+        vllm_config=SimpleNamespace(model_config=object()),
+    )
+
+    worker.receive_weights_rdma("group", version=4)
+    worker.receive_weights_rdma("group", version=5, online_staging="cpu")
+
+    assert [c["staging"] for c in calls] == ["gpu", "cpu"]
+
+
 def test_prequantized_rdma_requires_online_fp8_model(monkeypatch):
     fake_platforms = ModuleType("vllm.platforms")
     fake_platforms.current_platform = SimpleNamespace(device_type="cpu")
@@ -661,6 +740,7 @@ def test_prequantized_rdma_restores_sharding_metadata_before_load(monkeypatch):
         model = args[1]
         assert model.metadata_restored is True
         assert streamed_scales is True
+        assert kwargs["staging"] == "none"
         events.append("load")
         return {"weights": 2.0, "verification": {}}
 

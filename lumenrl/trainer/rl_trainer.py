@@ -939,6 +939,7 @@ class RLTrainer:
             version=version,
             verify_full_load=bool(cfg.verify_full_load),
             prequantized_fp8=fp8_sync,
+            online_staging=str(cfg.rdma.online_staging),
         )
         send_refs = self._actor_wg.execute_all_async(
             "send_weights_rdma",
@@ -965,6 +966,12 @@ class RLTrainer:
         if sender is None:
             raise RuntimeError("RDMA weight sync returned no source statistics")
         total_s = time.perf_counter() - started
+        recv_rows = [
+            row
+            for result in results[len(send_refs):]
+            for row in (result if isinstance(result, list) else [result])
+            if isinstance(row, dict)
+        ]
         self._last_weight_sync_metrics = {
             "timing/weight_sync_rdma_s": total_s,
             "weight_sync/bytes": float(sender.get("bytes", 0.0)),
@@ -974,6 +981,16 @@ class RLTrainer:
             "weight_sync/backend_rdma": 1.0,
             "weight_sync/fp8_trainer_quantized": float(fp8_sync),
         }
+        for key in ("gather_s", "pack_s", "bcast_s", "final_sync_s"):
+            self._last_weight_sync_metrics[f"timing/weight_sync_rdma_sender_{key}"] = (
+                float(sender.get(key, 0.0) or 0.0)
+            )
+        for key in ("wait_s", "recv_s", "host_copy_s", "observe_s",
+                    "load_weights_s", "verify_s", "finalize_s"):
+            if recv_rows:
+                self._last_weight_sync_metrics[f"timing/weight_sync_rdma_recv_{key}"] = max(
+                    float(r.get(key, 0.0) or 0.0) for r in recv_rows
+                )
         logger.info(
             "RDMA weight sync committed: version=%d buckets=%d bytes=%.1fGB "
             "broadcast=%.2fs effective=%.2fGb/s total=%.2fs fp8_location=%s",
@@ -984,6 +1001,15 @@ class RLTrainer:
             float(sender.get("gbps", 0)),
             total_s,
             "trainer" if fp8_sync else "inference",
+        )
+        logger.info(
+            "RDMA weight sync breakdown v%d: %s",
+            version,
+            " ".join(
+                f"{k.removeprefix('timing/weight_sync_rdma_')}={v:.3f}"
+                for k, v in self._last_weight_sync_metrics.items()
+                if k.startswith("timing/weight_sync_rdma_")
+            ),
         )
         if sleeping:
             rollout_engine.wake(tags=["kv_cache"])
@@ -1078,6 +1104,11 @@ class RLTrainer:
                 raise ValueError(
                     f"weight_sync.rdma.gdr_mode must be off, auto, or required; "
                     f"got {rdma_cfg.gdr_mode!r}"
+                )
+            if str(rdma_cfg.online_staging) not in ("gpu", "cpu"):
+                raise ValueError(
+                    f"weight_sync.rdma.online_staging must be gpu or cpu; "
+                    f"got {rdma_cfg.online_staging!r}"
                 )
         if RayCluster is None or RayWorkerGroup is None:
             raise RuntimeError("Ray controller modules are unavailable in this environment.")
