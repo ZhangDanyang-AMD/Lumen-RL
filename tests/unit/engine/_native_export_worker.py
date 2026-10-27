@@ -3,7 +3,7 @@
 Not collected by pytest. Env:
 
 * ``NATIVE_TP`` / ``NATIVE_PP`` / ``NATIVE_EP`` / ``NATIVE_MOE`` (0/1)
-* ``LUMENRL_SYNC_PREFETCH_MB`` (0 or 1024)
+* ``LUMENRL_SYNC_PREFETCH_MB`` (0, 1024, or ``mixed``: 1024 on even ranks, 0 on odd)
 
 Prints ``NATIVE_EXPORT_OK`` on success.
 """
@@ -11,6 +11,7 @@ Prints ``NATIVE_EXPORT_OK`` on success.
 from __future__ import annotations
 
 import os
+import re
 import sys
 
 import torch
@@ -296,8 +297,44 @@ def _assert_owners(engine, rank: int) -> None:
     )
 
 
+_STACK_TOKEN = re.compile(r"(\d+)::(\d+)")
+
+
+def _expand_stacks(pairs):
+    """``stack_experts`` output -> the per-expert names and tensors it stands for."""
+    out = []
+    for name, t in pairs:
+        m = _STACK_TOKEN.search(name)
+        if m is None:
+            out.append((name, t))
+            continue
+        start, step = int(m.group(1)), int(m.group(2))
+        for k in range(t.shape[0]):
+            out.append((f"{name[:m.start()]}{start + k * step}{name[m.end():]}", t[k]))
+    return out
+
+
+def _assert_stacked(engine, per_expert, rank: int) -> None:
+    recipes = engine._stage_plan(stack_experts=True)
+    meta = engine._stage_metadata(recipes)
+    got = [(n, tuple(t.shape), t.dtype) for n, t in engine._stage_named_params(recipes)]
+    assert got == [(n, tuple(s), d) for n, s, d in meta], (
+        f"[rank{rank}] stacked _stage_metadata does not match _stage_named_params"
+    )
+    stacked = _to_cpu(engine._full_megatron_named_params_moe(stack_experts=True))
+    assert any("::" in n for n, _ in stacked), f"[rank{rank}] no expert stacks emitted"
+    expanded = _expand_stacks(stacked)
+    assert [n for n, _ in expanded] == [n for n, _ in per_expert], (
+        f"[rank{rank}] stacked name/order mismatch"
+    )
+    for (n1, t1), (_, t2) in zip(expanded, per_expert, strict=True):
+        assert torch.equal(t1, t2), f"[rank{rank}] stacked {n1} differs"
+
+
 def main() -> None:
     rank = int(os.environ["RANK"])
+    if os.environ.get("LUMENRL_SYNC_PREFETCH_MB") == "mixed":
+        os.environ["LUMENRL_SYNC_PREFETCH_MB"] = "1024" if rank % 2 == 0 else "0"
     torch.cuda.set_device(rank % torch.cuda.device_count())
     dist.init_process_group(backend="nccl")
     mpu.initialize_model_parallel(
@@ -332,6 +369,10 @@ def main() -> None:
     for (n1, t1), (n2, t2) in zip(new, old, strict=True):
         assert n1 == n2
         assert torch.equal(t1, t2), f"[rank{rank}] {n1} tensors differ"
+
+    if MOE and EP > 1:
+        dist.barrier()
+        _assert_stacked(engine, new, rank)
 
     dist.barrier()
     if rank == 0:

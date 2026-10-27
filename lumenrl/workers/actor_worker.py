@@ -1549,29 +1549,34 @@ class LumenActorWorker(BaseWorker):
             alloc0 = float(torch.cuda.memory_allocated())
             torch.cuda.reset_peak_memory_stats()
 
-        params, _ = self._engine.get_per_tensor_param()
+        is_atom = str(get_nested_config(
+            self.config, "policy", "generation_backend", default="",
+        ) or "") == "atom"
+        # Expert stacks load as one copy per stack instead of vLLM's per-expert
+        # loader; only vLLM's receiver understands the stacked names.
+        stack_experts = (
+            not is_atom
+            and os.environ.get("LUMENRL_WEIGHT_SYNC_STACK_EXPERTS", "1") != "0"
+        )
+        params, _ = self._engine.get_per_tensor_param(stack_experts=stack_experts)
         gather_s = 0.0
 
-        def _timed_export():
+        def _gen():
             nonlocal gather_s
             it = iter(params)
             while True:
                 t0 = time.perf_counter()
                 try:
-                    item = next(it)
+                    name, param = next(it)
                 except StopIteration:
                     break
-                gather_s += time.perf_counter() - t0
-                yield item
-
-        def _gen():
-            for name, param in _timed_export():
                 full = param.full_tensor() if isinstance(param, DTensor) else param
                 full = full.detach()
                 if full.dtype == torch.float32 and not keep_fp32:
                     full = full.to(torch.bfloat16)
                 if not full.is_cuda:
                     full = full.to("cuda", non_blocking=True)
+                gather_s += time.perf_counter() - t0
                 yield name, full
 
         # ATOM's ModelRunner opens the staging buffer once per update cycle and
@@ -1581,9 +1586,6 @@ class LumenActorWorker(BaseWorker):
         # expert weight is 768 MiB, past the 512 MiB default. vLLM re-opens per
         # bucket and needs no such floor.
         min_bucket_bytes = 0
-        is_atom = str(get_nested_config(
-            self.config, "policy", "generation_backend", default="",
-        ) or "") == "atom"
         if is_atom:
             min_bucket_bytes = max(
                 (self._sent_nbytes(p, keep_fp32) for _, p in params), default=0,

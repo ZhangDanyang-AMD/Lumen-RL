@@ -33,7 +33,16 @@ MODULE_PREFIXES = ("module.module.", "module.")
 _EXP_GROUPED = re.compile(r"^(.*\.mlp\.experts\.linear_fc([12]))\.weight(\d+)$")
 _EXP_SEQ = re.compile(r"^(.*\.mlp\.experts\.local_experts\.)(\d+)(\.linear_fc([12])\.weight)$")
 
-_PLACEHOLDERS = {"L": r"(?P<L>\d+)", "E": r"(?P<E>\d+)"}
+_PLACEHOLDERS = {"L": r"(?P<L>\d+)", "E": r"(?P<E>\d+)", "S": r"(?P<S>\d+)"}
+
+
+def stacked_expert_index(start: int, step: int) -> str:
+    """Expert-index token for a stack of experts ``start, start + step, ...``.
+
+    Goes where a single expert index would (``relabel_expert_index``), so a
+    stacked tensor keeps its layout's name and gets its own bridge rule.
+    """
+    return f"{start}::{step}"
 
 
 def strip_module_prefix(name: str) -> str:
@@ -64,7 +73,7 @@ def expert_local_index(name: str) -> tuple[int, str] | None:
     return None
 
 
-def relabel_expert_index(name: str, new_e: int) -> str:
+def relabel_expert_index(name: str, new_e: int | str) -> str:
     """Rewrite a routed-expert param name to use expert index ``new_e``."""
     m = _EXP_GROUPED.match(name)
     if m:
@@ -113,16 +122,18 @@ class Site:
         expert_offset: Global index of this rank's first expert, for layouts
             that fuse several experts into one tensor.
         dims: The family's dims dataclass.
+        expert_step: Stride between experts of a stacked tensor, else None.
     """
 
     layer: Optional[int]
     expert: Optional[int]
     expert_offset: int
     dims: Any
+    expert_step: Optional[int] = None
 
     def name(self, template: str) -> str:
-        """Fill ``{L}`` / ``{E}`` in an HF name template."""
-        return template.format(L=self.layer, E=self.expert)
+        """Fill ``{L}`` / ``{E}`` / ``{S}`` in an HF name template."""
+        return template.format(L=self.layer, E=self.expert, S=self.expert_step)
 
 
 Convert = Callable[[torch.Tensor, Site], Iterable[HfTensor]]
@@ -180,6 +191,23 @@ def routed_expert_rules(hf_prefix: str = "model.layers.{L}.mlp.experts.{E}.") ->
                 "decoder.layers.{L}.mlp.experts.local_experts.{E}.linear_fc{fc}.weight"):
         rules.append(gate_up(meg.replace("{fc}", "1"), hf_prefix))
         rules.append(rename(meg.replace("{fc}", "2"), hf_prefix + "down_proj.weight"))
+    return rules
+
+
+def stacked_expert_rules(hf_prefix: str = "model.layers.{L}.mlp.experts.") -> list[Rule]:
+    """Expert stacks ``[n, out, in]`` from the Megatron-native gather, both layouts.
+
+    Experts ``E, E+S, ...`` of one layer, kept whole: ``linear_fc1`` stays fused
+    ``[gate; up]`` per expert, which is the rollout's ``w13`` layout, and the HF
+    name carries the stride (``{E}::{S}.gate_up_proj``) for the receiver's
+    router. Only the vLLM IPC path asks for stacks.
+    """
+    stack = "{E}::{S}"
+    rules = []
+    for meg in ("decoder.layers.{L}.mlp.experts.linear_fc{fc}.weight" + stack,
+                "decoder.layers.{L}.mlp.experts.local_experts." + stack + ".linear_fc{fc}.weight"):
+        rules.append(rename(meg.replace("{fc}", "1"), hf_prefix + stack + ".gate_up_proj"))
+        rules.append(rename(meg.replace("{fc}", "2"), hf_prefix + stack + ".down_proj"))
     return rules
 
 
@@ -246,6 +274,7 @@ class WeightBridge:
                 expert=idx["E"] + expert_offset if "E" in idx else None,
                 expert_offset=expert_offset,
                 dims=dims,
+                expert_step=idx.get("S"),
             )
             yield from rule.convert(t, site)
         if unmatched:

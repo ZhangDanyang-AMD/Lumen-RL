@@ -23,7 +23,7 @@ def _visible_gpus() -> int:
         return 0
 
 
-def _run(*, nproc: int, port: str, prefetch: int, **topo: int) -> None:
+def _run(*, nproc: int, port: str, prefetch: int | str, **topo: int) -> None:
     env = dict(os.environ)
     env["LUMENRL_ROOT"] = str(REPO_ROOT)
     env["LUMENRL_SYNC_PREFETCH_MB"] = str(prefetch)
@@ -57,8 +57,8 @@ def test_dense_tp2(prefetch: int) -> None:
 
 @pytest.mark.multigpu
 @pytest.mark.skipif(_visible_gpus() < 4, reason="needs 4 GPUs for dense TP2 PP2")
-@pytest.mark.parametrize("prefetch", [0, 1024])
-def test_dense_tp2_pp2(prefetch: int) -> None:
+@pytest.mark.parametrize("prefetch", [0, 1024, "mixed"])
+def test_dense_tp2_pp2(prefetch: int | str) -> None:
     _run(nproc=4, port="29702", prefetch=prefetch, tp=2, pp=2, ep=1, moe=0)
 
 
@@ -78,6 +78,6 @@ def test_moe_ep2_tp2(prefetch: int) -> None:
 
 @pytest.mark.multigpu
 @pytest.mark.skipif(_visible_gpus() < 8, reason="needs 8 GPUs for MoE EP4 PP2")
-@pytest.mark.parametrize("prefetch", [0, 1024])
-def test_moe_ep4_pp2(prefetch: int) -> None:
+@pytest.mark.parametrize("prefetch", [0, 1024, "mixed"])
+def test_moe_ep4_pp2(prefetch: int | str) -> None:
     _run(nproc=8, port="29705", prefetch=prefetch, tp=1, pp=2, ep=4, moe=1)

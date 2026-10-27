@@ -34,6 +34,7 @@ from lumenrl.engine.training.bridges.core import (
     expert_local_index,
     load_hf_safetensors,
     relabel_expert_index,
+    stacked_expert_index,
 )
 from lumenrl.engine.training.bridges.gpt import (
     hf_expert_fc1,
@@ -224,6 +225,8 @@ class StageRecipe:
     outputs: tuple[StageOutput, ...]
     split_dim: int | None = None
     which_fc: str | None = None
+    # One ``[ep, out, in]`` output instead of ``ep`` per-expert ones.
+    stacked: bool = False
 
 
 class MegatronNativeEngine(MegatronBaseEngine):
@@ -781,12 +784,18 @@ class MegatronNativeEngine(MegatronBaseEngine):
         return local_sd
 
     # ---- weight sync: Megatron(TE) -> full (TP+PP gathered) named tensors ----
-    def _stage_plan(self) -> list[StageRecipe]:
+    def _stage_plan(self, stack_experts: bool = False) -> list[StageRecipe]:
         """Describe this PP stage's gathered tensors without communicating.
 
         Shapes come from local shards, ``sharded_state_dict()`` global shapes,
         and the TP/ETP/EP factors. Dense models take only the non-expert
         recipes (no name matches the expert pattern).
+
+        ``stack_experts`` (EP>1 only) emits each expert gather as one
+        ``[ep, out, in]`` tensor holding experts ``e, e + num_local, ...``,
+        named with ``stacked_expert_index``. The stack is the EP all-gather's
+        output buffer, so it costs nothing extra; at EP=1 there is no gather,
+        and stacking would mean copying every expert each sync.
         """
         from megatron.core import parallel_state as mpu
         from megatron.core.dist_checkpointing.mapping import (
@@ -867,6 +876,21 @@ class MegatronNativeEngine(MegatronBaseEngine):
             if etp > 1:
                 shape[split_dim] *= etp
             out_shape = tuple(shape)
+            if stack_experts and ep > 1:
+                stack_name = relabel_expert_index(
+                    name, stacked_expert_index(local_e, num_local),
+                )
+                recipes.append(StageRecipe(
+                    local_name=name, kind="expert", which_fc=which_fc, stacked=True,
+                    outputs=(StageOutput(
+                        name=_to_global_key(stack_name, offset),
+                        shape=(ep, *out_shape), dtype=dtype,
+                        pp_stage=pp_rank, ep_owner=None,
+                        local_e=local_e, tp_split_dim=split_dim,
+                        tp_size=tp, etp_size=etp, gate_up=(which_fc == "1"),
+                    ),),
+                ))
+                continue
             outputs = []
             for j in range(max(ep, 1)):
                 global_e = j * num_local + local_e
@@ -971,6 +995,12 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 _check(recipe.outputs[0].name, p, recipe.outputs[0])
                 yield recipe.outputs[0].name, p
                 continue
+            if recipe.stacked:
+                stack = torch.empty((ep, *p.shape), dtype=p.dtype, device=p.device)
+                dist.all_gather_into_tensor(stack, p.contiguous(), group=ep_group)
+                _check(recipe.outputs[0].name, stack, recipe.outputs[0])
+                yield recipe.outputs[0].name, stack
+                continue
             g = [torch.empty_like(p) for _ in range(ep)]
             dist.all_gather(g, p, group=ep_group)
             for j, expected in enumerate(recipe.outputs):
@@ -978,7 +1008,9 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 yield expected.name, g[j]
                 g[j] = None
 
-    def _full_named_params(self) -> Iterator[tuple[str, torch.Tensor]]:
+    def _full_named_params(
+        self, stack_experts: bool = False,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
         """Stream the full model as (global_name, tensor) on every rank.
 
         At PP=1 this is the stage gather. At PP>1 each rank publishes metadata
@@ -988,24 +1020,27 @@ class MegatronNativeEngine(MegatronBaseEngine):
         while receiving earlier stages and topped up before each of this
         stage's own broadcasts, so gathers are queued on the GPU ahead of the
         consumer (e.g. while it waits on a bucket ack). Refills depend only on
-        this stage's tensor sizes, so every rank in the stage issues the same
-        collectives in the same order.
+        this stage's tensor sizes and the budget, so every rank in the stage
+        issues the same collectives in the same order -- provided the budget is
+        the same on every rank. It is read from each rank's environment, so the
+        ranks agree on the smallest value set anywhere (with a warning if they
+        differ) before the first refill.
         """
         from megatron.core import parallel_state as mpu
 
         pp = mpu.get_pipeline_model_parallel_world_size()
+        recipes = self._stage_plan(stack_experts)
         if pp == 1:
-            yield from self._stage_named_params()
+            yield from self._stage_named_params(recipes)
             return
 
         pp_group = mpu.get_pipeline_model_parallel_group()
         pp_rank = mpu.get_pipeline_model_parallel_rank()
-        recipes = self._stage_plan()
         meta_local = self._stage_metadata(recipes)
         gathered_meta: list = [None] * pp
         dist.all_gather_object(gathered_meta, meta_local, group=pp_group)
 
-        budget = int(os.environ.get("LUMENRL_SYNC_PREFETCH_MB", "1024") or 0) << 20
+        budget = self._agreed_prefetch_mb() << 20
         own = self._stage_named_params(recipes)
         queue: deque[tuple[str, torch.Tensor]] = deque()
         queued_bytes = 0
@@ -1047,6 +1082,25 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 dist.broadcast(t, src=src_global, group=pp_group)
                 yield k, t
 
+    @staticmethod
+    def _agreed_prefetch_mb() -> int:
+        """``LUMENRL_SYNC_PREFETCH_MB``, made identical on every rank.
+
+        The budget sets how many TP/EP gathers a rank issues between PP
+        broadcasts; ranks of one stage with different budgets issue collectives
+        in different orders and hang. Collective over the default group.
+        """
+        local = int(os.environ.get("LUMENRL_SYNC_PREFETCH_MB", "1024") or 0)
+        bounds = torch.tensor([local, -local], dtype=torch.int64, device="cuda")
+        dist.all_reduce(bounds, op=dist.ReduceOp.MAX)
+        hi, lo = int(bounds[0]), -int(bounds[1])
+        if hi != lo and dist.get_rank() == 0:
+            logger.warning(
+                "LUMENRL_SYNC_PREFETCH_MB differs across ranks (%d..%d MB); "
+                "using %d MB everywhere", lo, hi, lo,
+            )
+        return lo
+
     def _full_megatron_named_params(self):
         """Reconstruct the COMPLETE model as (global_name, tensor) on every rank.
 
@@ -1057,10 +1111,10 @@ class MegatronNativeEngine(MegatronBaseEngine):
         actors (collective)."""
         yield from self._full_named_params()
 
-    def _full_megatron_named_params_moe(self):
+    def _full_megatron_named_params_moe(self, stack_experts: bool = False):
         """Reconstruct the COMPLETE MoE model as (global_name, tensor) on every rank.
         """
-        yield from self._full_named_params()
+        yield from self._full_named_params(stack_experts)
 
     def _router_bias_buffers(self):
         """The aux-loss-free load-balancing bias, which is a buffer, not a param.
@@ -1112,14 +1166,20 @@ class MegatronNativeEngine(MegatronBaseEngine):
     def get_per_tensor_param(self, **kwargs):
         """Yield the whole model as (rollout_name, tensor), one tensor at a time.
 
-        ⚠️ Lazy, and every tensor comes out of a collective, so the caller must
+        This is Lazy, and every tensor comes out of a collective, so the caller must
         drain the generator on every rank. Consuming it partially deadlocks.
+
+        ``stack_experts=True`` asks for expert stacks (see ``_stage_plan``) from
+        families that support them; the others ignore it. Only a receiver that
+        understands stacked names (vLLM's ``FusedMoEWeightRouter``) may ask.
         """
         assert self.module is not None
         _mem_diag_note("weight_sync gather begin")
         # Which gather to use and how to rename on the way out are one decision,
         # owned by the family. See ``model_specs`` for the three implementations.
-        gen = self._spec.export_weights(self)
+        gen = self._spec.export_weights(
+            self, stack_experts=bool(kwargs.get("stack_experts", False)),
+        )
         return _mem_diag_stream("weight_sync gather", gen), None
 
     def is_mp_src_rank_with_outputs(self) -> bool:

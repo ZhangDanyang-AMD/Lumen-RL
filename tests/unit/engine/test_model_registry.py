@@ -284,11 +284,15 @@ def test_moe_exporter_uses_the_moe_gather(monkeypatch):
         def _full_megatron_named_params(self):
             raise AssertionError("MoE must not use the plain gather")
 
-        def _full_megatron_named_params_moe(self):
+        def _full_megatron_named_params_moe(self, stack_experts=False):
+            seen["stack_experts"] = stack_experts
             return sentinel
 
     list(ms._export_moe(FakeEngine()))
     assert seen["gather"] is sentinel
+    assert seen["stack_experts"] is False
+    list(ms._export_moe(FakeEngine(), stack_experts=True))
+    assert seen["stack_experts"] is True
 
 
 def test_the_pipeline_forward_check_is_a_spec_hook_not_a_dsv4_call():

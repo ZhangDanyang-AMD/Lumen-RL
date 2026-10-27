@@ -452,6 +452,7 @@ class vLLMColocateWorkerExtension:
         from lumenrl.engine.inference.vllm_moe_weight_sync import (
             FusedMoEWeightRouter,
             assert_weight_sync_coverage,
+            unstack_expert_weights,
         )
 
         if getattr(self, "device", None) is None:
@@ -503,7 +504,7 @@ class vLLMColocateWorkerExtension:
                 # lm_head -> policy collapse after the first update). Clone so the
                 # deferred reload owns valid storage. (The standard BF16 path copies
                 # into params during the call, so it does not need this.)
-                cloned = [(n, t.clone()) for (n, t) in weights]
+                cloned = [(n, t.clone()) for (n, t) in unstack_expert_weights(weights)]
                 fingerprints.observe_source(cloned)
                 _stats["buckets"] += 1
                 _stats["weights"] += len(cloned)
@@ -563,7 +564,8 @@ class vLLMColocateWorkerExtension:
             passthrough, moe_loaded = router.route(weights)
             t1 = time.perf_counter()
             loaded.update(moe_loaded)
-            loaded.update(model.load_weights(passthrough) or ())
+            if passthrough:
+                loaded.update(model.load_weights(passthrough) or ())
             timing["route_s"] += t1 - t0
             timing["load_weights_s"] += time.perf_counter() - t1
 
