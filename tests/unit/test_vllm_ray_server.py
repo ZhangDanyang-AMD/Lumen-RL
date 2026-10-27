@@ -145,12 +145,44 @@ def test_manager_validates_once_per_rdma_group_before_receive_refs(monkeypatch):
         version=2,
         verify_full_load=False,
         prequantized_fp8=False,
+        online_staging="cpu",
     )
 
     assert first == ["receive-ref"]
     assert second == ["receive-ref"]
     assert len(server.get_rdma_capabilities.calls) == 1
-    assert len(server.receive_weights_rdma.calls) == 2
+    assert server.receive_weights_rdma.calls == [
+        ("group-1", 1, True, True, "gpu"),
+        ("group-1", 2, False, False, "cpu"),
+    ]
+
+
+def test_server_forwards_online_staging_to_workers():
+    calls = []
+
+    class Engine:
+        async def collective_rpc(self, method, args=(), kwargs=None):
+            calls.append((method, kwargs))
+            return [{"weights": 1.0}]
+
+        async def reset_prefix_cache(self):
+            return None
+
+    server = object.__new__(VLLMRayServer)
+    server.engine = Engine()
+
+    asyncio.run(server.receive_weights_rdma("group-1", 3, online_staging="cpu"))
+
+    assert calls == [(
+        "receive_weights_rdma",
+        {
+            "group_name": "group-1",
+            "version": 3,
+            "verify_full_load": True,
+            "prequantized_fp8": False,
+            "online_staging": "cpu",
+        },
+    )]
 
 
 @pytest.mark.parametrize(

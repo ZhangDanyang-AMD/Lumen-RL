@@ -359,6 +359,7 @@ class VLLMRayServer:
         version: int,
         verify_full_load: bool = True,
         prequantized_fp8: bool = False,
+        online_staging: str = "gpu",
     ) -> Any:
         stats = await self.engine.collective_rpc(
             "receive_weights_rdma",
@@ -367,6 +368,7 @@ class VLLMRayServer:
                 "version": int(version),
                 "verify_full_load": bool(verify_full_load),
                 "prequantized_fp8": bool(prequantized_fp8),
+                "online_staging": str(online_staging),
             },
         )
         await self.engine.reset_prefix_cache()
@@ -822,6 +824,7 @@ class VLLMReplicaManager:
         version: int,
         verify_full_load: bool,
         prequantized_fp8: bool = False,
+        online_staging: str = "gpu",
     ) -> list:
         if not self.rdma_group_name:
             raise RuntimeError("RDMA weight group has not been initialized")
@@ -832,6 +835,7 @@ class VLLMReplicaManager:
                 int(version),
                 bool(verify_full_load),
                 bool(prequantized_fp8),
+                str(online_staging),
             )
             for server in self.servers
         ]

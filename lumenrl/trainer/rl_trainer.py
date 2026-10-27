@@ -939,6 +939,7 @@ class RLTrainer:
             version=version,
             verify_full_load=bool(cfg.verify_full_load),
             prequantized_fp8=fp8_sync,
+            online_staging=str(cfg.rdma.online_staging),
         )
         send_refs = self._actor_wg.execute_all_async(
             "send_weights_rdma",
@@ -1103,6 +1104,11 @@ class RLTrainer:
                 raise ValueError(
                     f"weight_sync.rdma.gdr_mode must be off, auto, or required; "
                     f"got {rdma_cfg.gdr_mode!r}"
+                )
+            if str(rdma_cfg.online_staging) not in ("gpu", "cpu"):
+                raise ValueError(
+                    f"weight_sync.rdma.online_staging must be gpu or cpu; "
+                    f"got {rdma_cfg.online_staging!r}"
                 )
         if RayCluster is None or RayWorkerGroup is None:
             raise RuntimeError("Ray controller modules are unavailable in this environment.")
