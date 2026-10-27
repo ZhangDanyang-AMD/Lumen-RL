@@ -11,6 +11,15 @@ from types import SimpleNamespace
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _ignore_te_blockwise_pin(monkeypatch):
+    """These tests are about the recipe/config preflight, not the TE version gate.
+
+    The image ships TE 2.15, which the gate refuses, so without this the gate fires
+    first and masks what each test is actually checking.
+    """
+    monkeypatch.setenv("LUMENRL_SKIP_TE_BLOCKWISE_CHECK", "1")
+
 from lumenrl.engine.training.megatron_native_engine import MegatronNativeEngine
 from megatron.core.transformer.transformer_config import TransformerConfig
 
