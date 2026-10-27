@@ -782,6 +782,9 @@ def _prequantized_ipc_worker(monkeypatch, events, *, online_quant=True):
     fake_moe_sync.assert_weight_sync_coverage = lambda *a, **k: events.append(
         "coverage"
     )
+    # main sends MoE experts as stacks and unstacks them on the way in; identity
+    # here because these tests are about the FP8 path, not the expert layout.
+    fake_moe_sync.unstack_expert_weights = list
     monkeypatch.setitem(sys.modules, "vllm", ModuleType("vllm"))
     monkeypatch.setitem(sys.modules, "vllm.platforms", fake_platforms)
     monkeypatch.setitem(

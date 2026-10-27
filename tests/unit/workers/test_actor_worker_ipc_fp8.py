@@ -22,6 +22,8 @@ class _Sender:
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
+        # main folds the real sender's counters into the returned timing dict.
+        self.stats: dict[str, float] = {}
         _Sender.captured = []
 
     async def async_send_weights(self, stream):
@@ -54,12 +56,19 @@ def worker(monkeypatch):
     w = object.__new__(LumenActorWorker)
     w.rank = 0
     w.config = SimpleNamespace()
-    w._engine = SimpleNamespace(get_per_tensor_param=lambda: (iter(params), None))
+    # main's double-buffered IPC sender accumulates into this; the real worker sets
+    # it in __init__, which this fake bypasses.
+    w._peak_carry_alloc = 0.0
+    w._peak_carry_reserved = 0.0
+    w._engine = SimpleNamespace(
+        get_per_tensor_param=lambda *a, **kw: (iter(params), None)
+    )
     return w
 
 
 def test_ipc_send_quantizes_when_asked(worker) -> None:
-    assert worker.update_weights_ipc_send(fp8_quantize=True) is True
+    stats = worker.update_weights_ipc_send(fp8_quantize=True)
+    assert isinstance(stats, dict) and "total_s" in stats
     sent = dict(_Sender.captured)
 
     weight = sent["model.layers.0.self_attn.q_proj.weight"]
@@ -74,7 +83,8 @@ def test_ipc_send_quantizes_when_asked(worker) -> None:
 
 
 def test_ipc_send_stays_bf16_by_default(worker) -> None:
-    assert worker.update_weights_ipc_send() is True
+    stats = worker.update_weights_ipc_send()
+    assert isinstance(stats, dict) and "total_s" in stats
     sent = dict(_Sender.captured)
 
     assert sent["model.layers.0.self_attn.q_proj.weight"].dtype == torch.bfloat16
