@@ -858,8 +858,17 @@ class RLTrainer:
         if sleeping:
             rollout_engine.wake(tags=["weights"])
         # 2) start receivers + senders concurrently, then join both.
+        # Keyword, and only when it is on: `prequantized_fp8` exists on the vLLM
+        # server, not on ATOMRayServer.update_weights_from_ipc(use_shm, version).
+        # Passing it positionally broke every ATOM rollout (release examples 4, 5
+        # and 9) with "TypeError: too many positional arguments" from inside Ray's
+        # arg validation -- far from the cause. Off is the default, so this keeps
+        # ATOM on its existing two-arg call; on, it is a vLLM-only feature and
+        # weight_sync.validate_fp8_quantization_location already requires a vLLM
+        # fp8_per_block model.
+        recv_kw = {"prequantized_fp8": True} if fp8_sync else {}
         recv = [
-            s.update_weights_from_ipc.remote(use_shm, version, fp8_sync)
+            s.update_weights_from_ipc.remote(use_shm, version, **recv_kw)
             for s in mgr.servers
         ]
         send = self._actor_wg.execute_all_async(
