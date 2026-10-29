@@ -305,6 +305,34 @@ class LumenActorWorker(BaseWorker):
                 "moe_permute_fusion": meg_cfg.get("moe_permute_fusion", False),
                 "r3_enabled": r3_enabled,
                 "moe_enable_routing_replay": r3_enabled,
+                # FP8 training. Carried as the resolved FP8Config fields rather
+                # than raw strings so the engine never parses a recipe name, and
+                # so one place decides what an "AMD FP8 recipe" means -- see
+                # quantization/fp8_config.megatron_fp8_kwargs. Absent/bf16 leaves
+                # every fp8 field unset and the BF16 path byte-identical.
+                "fp8_precision": str(
+                    get_nested_config(self.config, "quantization", "training", "fp8",
+                                      default=None) or ""
+                ),
+                "fp8_recipe": str(
+                    get_nested_config(self.config, "quantization", "training",
+                                      "fp8_recipe", default="blockwise")
+                ),
+                "fp8_num_first_layers_in_bf16": int(
+                    get_nested_config(self.config, "quantization", "rollout",
+                                      "num_first_layers_in_bf16", default=0) or 0
+                ),
+                "fp8_num_last_layers_in_bf16": int(
+                    get_nested_config(self.config, "quantization", "rollout",
+                                      "num_last_layers_in_bf16", default=0) or 0
+                ),
+                "r3_enabled": bool(
+                    get_nested_config(self.config, "moe", "r3", "enabled", default=False)
+                    or meg_cfg.get("r3_enabled", False)
+                ),
+                "moe_enable_routing_replay": bool(
+                    get_nested_config(self.config, "moe", "r3", "enabled", default=False)
+                ),
                 "param_offload": meg_cfg.get("param_offload", False),
                 "optimizer_cpu_offload": meg_cfg.get("optimizer_cpu_offload", meg_cfg.get("optimizer_offload", False)),
                 "optimizer_offload_fraction": meg_cfg.get("optimizer_offload_fraction", 1.0),
