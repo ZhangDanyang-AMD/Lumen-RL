@@ -632,9 +632,51 @@ class MegatronBaseEngine(BaseEngine):
             "grad_norm": grad_norm,
         }
 
+    def _nan_scan(self, losses) -> None:
+        """Report non-finite grads BEFORE the reduce-and-clip inside optimizer.step().
+
+        ``optimizer.step()`` returns an already-global grad_norm, so a NaN there
+        says only "somewhere on some rank". This runs per rank on the local
+        gradients right after the backward, which distinguishes: a bad forward
+        (non-finite microbatch loss), one bad layer, one bad rank, or everything.
+        Opt-in via LUMENRL_NAN_SCAN=1 -- it walks every parameter.
+        """
+        if os.environ.get("LUMENRL_NAN_SCAN", "0") != "1":
+            return
+        rank = self._rank()
+        bad_loss = []
+        for i, l in enumerate(losses or []):
+            for k, v in (l.items() if isinstance(l, dict) else [("loss", l)]):
+                if torch.is_tensor(v) and not torch.isfinite(v).all():
+                    bad_loss.append(f"mb{i}:{k}")
+        offenders, n_params, n_with_grad = [], 0, 0
+        for name, prm in self.module.named_parameters():
+            n_params += 1
+            g = getattr(prm, "main_grad", None)
+            src = "main_grad"
+            if g is None:
+                g, src = prm.grad, "grad"
+            if g is None:
+                continue
+            n_with_grad += 1
+            if not torch.isfinite(g).all():
+                offenders.append(
+                    f"{name}[{src}] nan={int(torch.isnan(g).sum())} "
+                    f"inf={int(torch.isinf(g).sum())}/{g.numel()}"
+                )
+        print(
+            f"[NAN_SCAN rank={rank}] params={n_params} with_grad={n_with_grad} "
+            f"bad_microbatch_loss={bad_loss or 'none'} "
+            f"non_finite_grads={len(offenders)}"
+            + ("".join(f"\n  [NAN_SCAN rank=" + str(rank) + "] " + o for o in offenders[:8])
+               if offenders else ""),
+            flush=True,
+        )
+
     def _optimizer_step(self) -> float:
         """Reduce grads across DP (+reduce-scatter for the distributed optimizer),
         then step the Megatron distributed optimizer."""
+        self._nan_scan(None)
         from megatron.core.distributed import finalize_model_grads
         finalize_model_grads([self._ddp])
         update_successful, grad_norm, _num_zeros = self.optimizer.step()
