@@ -581,6 +581,13 @@ class RolloutQuantConfig:
     use_deep_gemm: bool = True
     num_first_layers_in_bf16: int = 0
     num_last_layers_in_bf16: int = 0
+    # Round rollout weight block scales to powers of two, matching TE's
+    # force_pow_2_scales. Makes the trainer's and the rollout's quantisation of the
+    # same weights bit-identical rather than merely close -- with continuous scales
+    # the two differ by ~1e-7 from arithmetic order alone. Costs up to 1 bit of e4m3
+    # range utilisation. Only meaningful when the training side also uses pow-2
+    # scales (NVTE_FP8_BLOCK_SCALING_FP32_SCALES=0, TE's default).
+    use_weight_pow2_scale: bool = False
 
 
 @dataclass
@@ -823,10 +830,11 @@ class WeightSyncConfig:
         if location is None and not self.fp8_quantize:
             return
         self.resolve_fp8_quantize()
-        if self.backend != "rdma":
+        if self.backend not in {"rdma", "auto"}:
             raise ValueError(
                 "weight_sync.fp8_quantization_location requires "
-                "weight_sync.backend='rdma'"
+                "weight_sync.backend='rdma' (separated) or 'auto' (colocated "
+                f"CUDA IPC), got {self.backend!r}"
             )
         if rollout_quantization != "fp8_per_block":
             raise ValueError(

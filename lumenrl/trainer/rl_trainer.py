@@ -822,8 +822,21 @@ class RLTrainer:
                 "expected auto, shared_folder, or rdma"
             )
 
+        fp8_sync = self.config.weight_sync.resolve_fp8_quantize()
         separated = getattr(self, "_rollout_wg", None) is not None
         if separated or not self._ipc_endpoints_match_actors(mgr):
+            if fp8_sync:
+                # The safetensors fallback exports BF16 through disk and has no
+                # quantization hook, so honouring fp8_quantize here would silently
+                # mean "not quantized". Say so instead of degrading in silence.
+                raise RuntimeError(
+                    "weight_sync.fp8_quantize=true is not supported by the "
+                    "safetensors weight-sync fallback (separated="
+                    f"{separated}, replicas={mgr.num_replicas}, "
+                    f"actors={self._actor_wg.num_workers}). Use "
+                    "weight_sync.backend='rdma' for a separated topology, or a "
+                    "colocated topology with one replica per actor for CUDA IPC."
+                )
             if LUMENRL_DEBUG:
                 logger.info("[DBG] _sync_weights_ipc: separated=%s replicas=%d workers=%d, using safetensors",
                             separated, mgr.num_replicas, self._actor_wg.num_workers)
@@ -845,12 +858,22 @@ class RLTrainer:
         if sleeping:
             rollout_engine.wake(tags=["weights"])
         # 2) start receivers + senders concurrently, then join both.
+        # Keyword, and only when it is on: `prequantized_fp8` exists on the vLLM
+        # server, not on ATOMRayServer.update_weights_from_ipc(use_shm, version).
+        # Passing it positionally broke every ATOM rollout (release examples 4, 5
+        # and 9) with "TypeError: too many positional arguments" from inside Ray's
+        # arg validation -- far from the cause. Off is the default, so this keeps
+        # ATOM on its existing two-arg call; on, it is a vLLM-only feature and
+        # weight_sync.validate_fp8_quantization_location already requires a vLLM
+        # fp8_per_block model.
+        recv_kw = {"prequantized_fp8": True} if fp8_sync else {}
         recv = [
-            s.update_weights_from_ipc.remote(use_shm, version) for s in mgr.servers
+            s.update_weights_from_ipc.remote(use_shm, version, **recv_kw)
+            for s in mgr.servers
         ]
         send = self._actor_wg.execute_all_async(
             "update_weights_ipc_send", bucket_size_mb=bmb, use_shm=use_shm,
-            version=version,
+            version=version, fp8_quantize=fp8_sync,
         )
         # Join as they finish rather than senders-then-receivers. The two sides
         # are a ZMQ REQ/REP pair, so a receiver that raises leaves its socket

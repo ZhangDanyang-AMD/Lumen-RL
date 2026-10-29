@@ -228,15 +228,62 @@ class MegatronBaseEngine(BaseEngine):
         tokens = torch.cat([t.view(-1) for t in ids_list], dim=0).view(1, T)
         # per-segment position ids (0..L_i-1); ignored by thd rotary but kept correct.
         pos = torch.cat([torch.arange(L, device=tokens.device) for L in lens], dim=0).view(1, T)
-        cu = torch.tensor(offsets, dtype=torch.int32, device=tokens.device)
-        max_seqlen = max(lens) if lens else 0
+        # Same token-count alignment the pipelined path applies (TP/SP scatter,
+        # DSv4's compressor, and TE's assert_dim_for_fp8_exec under FP8). The pp
+        # path padded for this and this one did not, so an FP8 run that happened
+        # to take the dense path tripped TE instead.
+        align = max(1, int(self._packed_token_align()))
+        if align > 1 and T % align:
+            pad = align - (T % align)
+            # One extra cu_seqlens bin so attention stays isolated from the real
+            # sequences, and the caller's `offsets` is left untouched so no layout
+            # entry points into the pad and its logits are never read for loss.
+            tokens = torch.cat([tokens.view(-1), tokens.new_zeros(pad)], dim=0).view(1, T + pad)
+            pos = torch.cat([pos.view(-1), torch.arange(pad, device=pos.device)], dim=0).view(1, T + pad)
+            padded_offsets = offsets + [offsets[-1] + pad]
+        else:
+            pad = 0
+            padded_offsets = offsets
+        cu = torch.tensor(padded_offsets, dtype=torch.int32, device=tokens.device)
+        # Every bin, pad included. The pad bin can be longer than every real
+        # sequence (a microbatch of short sequences with a large alignment pad),
+        # and rotary/attention slice their tables to max_seqlen -- so taking the
+        # max over real sequences only hands that bin a short slice.
+        max_seqlen = self._packed_max_seqlen(padded_offsets, 1)   # cp == 1 on this path
         pp = PackedSeqParams(
             cu_seqlens_q=cu, cu_seqlens_kv=cu,
             max_seqlen_q=max_seqlen, max_seqlen_kv=max_seqlen, qkv_format="thd",
         )
         out = m(input_ids=tokens, position_ids=pos, attention_mask=None, packed_seq_params=pp)
         logits = out.logits if hasattr(out, "logits") else out
-        return logits.view(T, -1).float(), offsets
+        # Drop the pad bin's rows: callers index by `offsets`, which covers real tokens only.
+        return logits.view(T + pad, -1)[:T].float(), offsets
+
+    def _packed_token_align(self) -> int:
+        """Token-count divisibility this packed forward must satisfy; 1 = no padding.
+
+        Overridden by MegatronNativeEngine, which knows the run's TP/SP, DSv4 and
+        FP8 constraints. A base hook rather than a getattr probe so the contract is
+        visible here and a subclass cannot silently fail to provide it.
+        """
+        return 1
+
+    @staticmethod
+    def _packed_max_seqlen(local_offsets, cp: int) -> int:
+        """``max_seqlen`` for PackedSeqParams: every cu_seqlens bin, pad included.
+
+        Megatron sizes the RoPE table from this (``get_rotary_seq_len``), then
+        ``_apply_rotary_pos_emb_thd`` slices ``freqs[:len]`` per bin. A trailing
+        pad bin longer than ``max_seqlen`` therefore gets a short slice, and the
+        packed freqs come out shorter than the activation. It only bites when the
+        pad exceeds every real sequence, so a microbatch of short sequences is
+        what exposes it.
+        """
+        bins = [
+            (local_offsets[i + 1] - local_offsets[i]) * cp
+            for i in range(len(local_offsets) - 1)
+        ]
+        return max(bins) if bins else 0
 
     def _build_bins(self, lengths: list[int], budget: int) -> list[list[int]]:
         """Greedy bin-packing of row indices into groups whose summed token length

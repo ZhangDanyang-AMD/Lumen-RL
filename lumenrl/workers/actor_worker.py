@@ -305,6 +305,34 @@ class LumenActorWorker(BaseWorker):
                 "moe_permute_fusion": meg_cfg.get("moe_permute_fusion", False),
                 "r3_enabled": r3_enabled,
                 "moe_enable_routing_replay": r3_enabled,
+                # FP8 training. Carried as the resolved FP8Config fields rather
+                # than raw strings so the engine never parses a recipe name, and
+                # so one place decides what an "AMD FP8 recipe" means -- see
+                # quantization/fp8_config.megatron_fp8_kwargs. Absent/bf16 leaves
+                # every fp8 field unset and the BF16 path byte-identical.
+                "fp8_precision": str(
+                    get_nested_config(self.config, "quantization", "training", "fp8",
+                                      default=None) or ""
+                ),
+                "fp8_recipe": str(
+                    get_nested_config(self.config, "quantization", "training",
+                                      "fp8_recipe", default="blockwise")
+                ),
+                "fp8_num_first_layers_in_bf16": int(
+                    get_nested_config(self.config, "quantization", "rollout",
+                                      "num_first_layers_in_bf16", default=0) or 0
+                ),
+                "fp8_num_last_layers_in_bf16": int(
+                    get_nested_config(self.config, "quantization", "rollout",
+                                      "num_last_layers_in_bf16", default=0) or 0
+                ),
+                "r3_enabled": bool(
+                    get_nested_config(self.config, "moe", "r3", "enabled", default=False)
+                    or meg_cfg.get("r3_enabled", False)
+                ),
+                "moe_enable_routing_replay": bool(
+                    get_nested_config(self.config, "moe", "r3", "enabled", default=False)
+                ),
                 "param_offload": meg_cfg.get("param_offload", False),
                 "optimizer_cpu_offload": meg_cfg.get("optimizer_cpu_offload", meg_cfg.get("optimizer_offload", False)),
                 "optimizer_offload_fraction": meg_cfg.get("optimizer_offload_fraction", 1.0),
@@ -1125,7 +1153,15 @@ class LumenActorWorker(BaseWorker):
             from lumenrl.engine.inference.fp8_weight_quantizer import (
                 quantize_weights_fp8_per_block,
             )
-            params = quantize_weights_fp8_per_block(params)
+            params = quantize_weights_fp8_per_block(
+                params,
+                pow2_scales=bool(
+                    get_nested_config(
+                        self.config, "quantization", "rollout",
+                        "use_weight_pow2_scale", default=False,
+                    )
+                ),
+            )
             if integrity_enabled:
                 params = require_finite_stream(params, stage="fp8_quantize")
 
@@ -1495,9 +1531,17 @@ class LumenActorWorker(BaseWorker):
 
     def update_weights_ipc_send(
         self, bucket_size_mb: int = 512, use_shm: bool = False,
-        version: int | None = None,
+        version: int | None = None, fp8_quantize: bool = False,
     ) -> dict[str, float]:
-        """Stream full (all-gathered) BF16 weights to the colocated vLLM replica.
+        """Stream full (all-gathered) weights to the colocated vLLM replica.
+
+        With ``fp8_quantize=True`` the weights are cast to FP8 e4m3 with
+        per-128x128-block scales before they go on the wire, the same as
+        ``send_weights_rdma`` does for the separated topology: roughly 42% fewer
+        bytes, and the rollout loads them directly instead of re-quantizing BF16.
+        Requires a vLLM ``fp8_per_block`` model on the receiving end, which
+        ``WeightSyncConfig.validate_fp8_quantization_location`` enforces.
+
 
         verl-aligned ZMQ CUDA-IPC weight sync. ``full_tensor()`` is an FSDP
         all-gather COLLECTIVE, so every actor must call this concurrently (the
@@ -1594,12 +1638,30 @@ class LumenActorWorker(BaseWorker):
         # ATOM's receive loop needs the whole bucket for its largest tensor
         # and one mapping per cycle, so it keeps the verl protocol.
         legacy = {"gc_collect": True, "double_buffer": False} if is_atom else {}
+
+        stream = _gen()
+        if fp8_quantize:
+            # After _gen(), not inside it: the quantizer needs the full (all-gathered),
+            # device-resident tensor that _gen() produces.
+            from lumenrl.engine.inference.fp8_weight_quantizer import (
+                quantize_weights_fp8_per_block,
+            )
+            stream = quantize_weights_fp8_per_block(
+                stream,
+                pow2_scales=bool(
+                    get_nested_config(
+                        self.config, "quantization", "rollout",
+                        "use_weight_pow2_scale", default=False,
+                    )
+                ),
+            )
+
         sender = BucketedWeightSender(
             zmq_handle=handle, bucket_size_mb=int(bucket_size_mb), use_shm=bool(use_shm),
             version=version, min_bucket_bytes=min_bucket_bytes, **legacy,
         )
         t_send = time.perf_counter()
-        asyncio.run(sender.async_send_weights(_gen()))
+        asyncio.run(sender.async_send_weights(stream))
         total_s = time.perf_counter() - t_send
         peak_alloc = 0.0
         if torch.cuda.is_available():

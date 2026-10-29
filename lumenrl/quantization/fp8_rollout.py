@@ -10,7 +10,11 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from lumenrl.quantization.fp8_config import FP8Config
-from lumenrl.quantization.weight_quantizer import WeightQuantizer, fp8_e4m3_max
+from lumenrl.quantization.weight_quantizer import (
+    WeightQuantizer,
+    _round_scale_pow2,
+    fp8_e4m3_max,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,8 +69,7 @@ class _FP8W8A8Linear(nn.Module):
         x_scales = amax / fp8_max
         x_scales = torch.clamp(x_scales, min=torch.finfo(amax.dtype).tiny)
         if self._fp8_config.use_activation_pow2_scale:
-            log2 = torch.log2(x_scales.clamp(min=torch.finfo(x_scales.dtype).tiny))
-            x_scales = torch.pow(2.0, torch.round(log2))
+            x_scales = _round_scale_pow2(x_scales)
 
         x_blocks_f = (blocks / x_scales.unsqueeze(-1)).to(torch.float32)
         x_dq = (x_blocks_f * x_scales.unsqueeze(-1)).reshape(leading, last)

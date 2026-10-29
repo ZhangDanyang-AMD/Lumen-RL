@@ -242,6 +242,57 @@ class MegatronNativeEngine(MegatronBaseEngine):
     _spec = None
     _dsv4_align = 1
 
+    @staticmethod
+    def _fp8_kwargs(ec, num_layers: int, pp: int) -> dict:
+        """TransformerConfig FP8 fields for this run, or ``{}`` for BF16.
+
+        ``{}`` is load-bearing: a BF16 run must produce exactly the config it did
+        before FP8 existed, so nothing is set unless FP8 is actually requested.
+        """
+        from lumenrl.quantization.fp8_config import FP8Config, megatron_fp8_kwargs
+
+        precision = str(ec.get("fp8_precision") or "").strip()
+        if not precision:
+            return {}
+        cfg = FP8Config(
+            precision=precision,
+            recipe=str(ec.get("fp8_recipe") or "blockwise"),
+            num_first_layers_in_bf16=int(ec.get("fp8_num_first_layers_in_bf16") or 0),
+            num_last_layers_in_bf16=int(ec.get("fp8_num_last_layers_in_bf16") or 0),
+        )
+        return megatron_fp8_kwargs(cfg, num_layers=num_layers, pp_size=pp)
+
+    @staticmethod
+    def _check_fp8_usable(fp8_kwargs: dict, tfcfg) -> None:
+        """Refuse an FP8 request this run cannot actually honour.
+
+        Two ways it cannot, both of which otherwise surface late and wrong: a
+        ``build_config`` family builds its own config and never receives
+        fp8_kwargs, so the run would train in BF16 while reporting FP8; and TE
+        only resolves the recipe at the first forward, so an unsupported one
+        kills the run minutes in.
+        """
+        if not getattr(tfcfg, "fp8", None):
+            raise RuntimeError(
+                f"FP8 was requested (fp8={fp8_kwargs.get('fp8')}, "
+                f"fp8_recipe={fp8_kwargs.get('fp8_recipe')}) but the "
+                f"{type(tfcfg).__name__} built for this model family does not carry "
+                f"it; that path would train in BF16. FP8 is only wired for the "
+                f"generic TransformerConfig path."
+            )
+        try:
+            from megatron.core.fp8_utils import get_fp8_recipe
+            from transformer_engine.pytorch.quantization import check_recipe_support
+        except ImportError:
+            return  # best-effort: TE still raises at the first forward
+        try:
+            check_recipe_support(get_fp8_recipe(tfcfg))
+        except (RuntimeError, ValueError) as e:
+            raise RuntimeError(
+                f"fp8_recipe={fp8_kwargs.get('fp8_recipe')!r} is not usable on this "
+                f"build: {e}"
+            ) from e
+
     @property
     def _caps(self):
         """Capabilities of the resolved family, or the defaults pre-``initialize``."""
@@ -359,6 +410,11 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 "(packed thd padded to multiple of TP).", tp,
             )
 
+        # ---- FP8 training (B1) ----
+        # Was hard-coded bf16. The mapping lives in quantization/fp8_config so the
+        # engine never interprets a recipe name; {} here means BF16 exactly as before.
+        fp8_kwargs = self._fp8_kwargs(ec, num_layers=int(hf["num_hidden_layers"]), pp=pp)
+
         moe_kwargs: dict = {}
         # Dims come from the spec. DSv4 declares None: its block-quantized FP8 is
         # unreadable by the HF bridge, the only consumer of dims.
@@ -433,6 +489,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 normalization="RMSNorm", layernorm_epsilon=hf.get("rms_norm_eps", 1e-6),
                 qk_layernorm=True, hidden_dropout=0.0, attention_dropout=0.0,
                 bf16=True, params_dtype=torch.bfloat16, pipeline_dtype=torch.bfloat16,
+                **fp8_kwargs,
                 tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp,
                 context_parallel_size=cp, sequence_parallel=sp,
                 use_cpu_initialization=True,
@@ -529,6 +586,18 @@ class MegatronNativeEngine(MegatronBaseEngine):
             del meg_state
             self.module = model.cuda()
         self._tfcfg = tfcfg
+
+        if fp8_kwargs:
+            self._check_fp8_usable(fp8_kwargs, tfcfg)
+            if str(fp8_kwargs.get("fp8_recipe", "")).lower() == "blockwise":
+                self._check_te_supports_blockwise()
+            if self._rank() == 0:
+                # print, not logger: Ray forwards worker stdout, not log records.
+                print(
+                    "[MegatronNativeEngine] FP8 training enabled: "
+                    + " ".join(f"{k}={v}" for k, v in fp8_kwargs.items()),
+                    flush=True,
+                )
 
         if self._is_moe and self._caps.supports_hf_bridge and self._rank() == 0:
             # Surface MoE + Expert-Parallel topology to the run log (stdout is
@@ -1252,6 +1321,72 @@ class MegatronNativeEngine(MegatronBaseEngine):
             mbs.append({"rows": [rows[j] for j in bin_rows], "ids_list": ids_list})
         return mbs
 
+    # Blockwise FP8 on ROCm needs a TransformerEngine that carries the CDNA4
+    # running-scale fix. Before it, the gfx950 blockwise GEMM divided by a denormal
+    # block scale and produced non-finite wgrads part-way into training -- silent
+    # until the gradient norm blew up. Fixed by ROCm/TransformerEngine #737 (a
+    # scale_inv floor) and properly by #744 (scale-then-accumulate, which removes
+    # the division entirely); #744 landed in 2.20.
+    #
+    # This is a version gate rather than a functional probe on purpose: a synthetic
+    # GEMM with a large per-block magnitude spread does NOT reproduce the fault
+    # (measured against the pre-#737 build -- 0 non-finite across K and spread), so
+    # there is no cheap startup check that would actually discriminate.
+    _TE_BLOCKWISE_MIN = (2, 20)
+
+    @classmethod
+    def _check_te_supports_blockwise(cls) -> None:
+        if os.environ.get("LUMENRL_SKIP_TE_BLOCKWISE_CHECK") == "1":
+            return
+        try:
+            import transformer_engine as te_root
+            raw = str(te_root.__version__)
+        except Exception:
+            return  # cannot tell; let TE speak for itself
+        base = raw.split("+", 1)[0]
+        try:
+            parts = tuple(int(x) for x in base.split(".")[:2])
+        except ValueError:
+            return
+        if parts < cls._TE_BLOCKWISE_MIN:
+            want = ".".join(str(x) for x in cls._TE_BLOCKWISE_MIN)
+            raise RuntimeError(
+                f"quantization.training.fp8_recipe='blockwise' needs TransformerEngine "
+                f">= {want} on ROCm, found {raw}. Earlier builds hit the CDNA4 "
+                f"running-scale bug and produce non-finite weight gradients mid-run "
+                f"(ROCm/TransformerEngine #737, #744). Point PYTHONPATH at a newer TE "
+                f"prefix, or set LUMENRL_SKIP_TE_BLOCKWISE_CHECK=1 if you know your "
+                f"build carries the fix."
+            )
+
+    def _token_align(self) -> int:
+        """LCM of every token-count divisibility this run requires.
+
+        RL sequence lengths are whatever the rollout produced, so each of these
+        has to be padded for rather than assumed:
+          * sequence parallelism (required for MoE+TP) scatters the packed
+            sequence across TP ranks, so it must be a multiple of TP;
+          * DSv4's compressor asserts ``seqlen % ratio == 0`` every forward, and
+            under CP additionally ``seqlen % (ratio*2) == 0``;
+          * TE refuses an unaligned activation under FP8
+            (``assert_dim_for_fp8_exec``). Pretraining never trips this because
+            its ``[seq, mbs]`` is fixed.
+        """
+        align = self._tp if (self._sp and self._tp > 1) else 1
+        if self._spec is not None and self._spec.sequence_alignment is not None:
+            align = math.lcm(align, self._dsv4_align * (2 if self._cp > 1 else 1))
+        if getattr(self._tfcfg, "fp8", None):
+            # Megatron's own size, so mxfp8's 32 is covered rather than just 16.
+            from megatron.core.fp8_utils import get_fp8_align_size
+
+            align = math.lcm(align, get_fp8_align_size(self._tfcfg.fp8_recipe))
+        return align
+
+    def _packed_token_align(self) -> int:
+        """Override of the base hook: the base packed forward (dense, pp=cp=1)
+        needs exactly the alignment the pipelined path computes."""
+        return self._token_align()
+
     def _pp_forward_model(self, model, mb):
         """Pack full sequences into this rank's ``thd`` token stream.
 
@@ -1285,16 +1420,9 @@ class MegatronNativeEngine(MegatronBaseEngine):
         rows = mb.get("rows") or []
         cp_rank = mpu.get_context_parallel_rank()
 
-        # Token-count alignment, computed BEFORE the CP split because under the
-        # contiguous layout the per-rank chunk itself has to be aligned.
-        #   * sequence parallelism (required for MoE+TP) scatters the packed
-        #     sequence across TP ranks, so it must be a multiple of TP;
-        #   * DSv4's compressor asserts ``seqlen % ratio == 0`` on every forward,
-        #     and under CP additionally ``seqlen % (ratio*2) == 0``, while RL
-        #     sequence lengths are whatever the rollout produced.
-        align = self._tp if (self._sp and self._tp > 1) else 1
-        if self._spec.sequence_alignment is not None:
-            align = math.lcm(align, self._dsv4_align * (2 if self._cp > 1 else 1))
+        # Computed BEFORE the CP split: under the contiguous layout the per-rank
+        # chunk itself has to be aligned. Shared with the base packed forward.
+        align = self._token_align()
 
         cp_contiguous = self._caps.packed_stream_is_single_sequence and self._cp > 1
         if cp_contiguous and len(ids_list) > 1:
