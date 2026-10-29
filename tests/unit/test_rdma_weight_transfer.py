@@ -92,6 +92,54 @@ def test_receive_stream_calls_model_loader_once_across_all_buckets(monkeypatch):
     assert stats["weights"] == 2
 
 
+def test_receive_stream_can_load_straight_from_the_device_buffer(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("requires a GPU to tell device views from host copies")
+    bucket = _bucket("first.weight", torch.tensor([1.0, 2.0]))
+    headers = iter(
+        [
+            torch.tensor([rdma._CMD_BUCKET, len(bucket[0]), bucket[1].numel(), 7]),
+            torch.tensor([rdma._CMD_END, 0, 0, 7]),
+        ]
+    )
+    broadcasts = iter([torch.tensor(list(bucket[0]), dtype=torch.uint8), bucket[1]])
+    monkeypatch.setattr(rdma, "_broadcast_header", lambda *args, **kwargs: next(headers))
+    monkeypatch.setattr(
+        rdma.dist,
+        "broadcast",
+        lambda output, src, group: output.copy_(next(broadcasts)),
+    )
+
+    class Model:
+        def __init__(self):
+            self.received = []
+
+        def named_parameters(self):
+            return iter(())
+
+        def named_buffers(self):
+            return iter(())
+
+        def load_weights(self, weights):
+            self.received.extend((name, tensor.clone()) for name, tensor in weights)
+            return {"first"}
+
+    model = Model()
+    stats = rdma.receive_weight_stream(
+        object(),
+        model,
+        device=torch.device("cuda", 0),
+        expected_version=7,
+        verify_full_load=False,
+        stage_on_cpu=False,
+    )
+
+    [(name, tensor)] = model.received
+    assert (name, tensor.device.type) == ("first.weight", "cuda")
+    torch.testing.assert_close(tensor.cpu(), torch.tensor([1.0, 2.0]))
+    assert stats["stage_s"] == 0.0
+
+
 def test_receive_stream_reports_last_source_tensor_on_loader_failure(monkeypatch):
     bucket = _bucket("layers.0.attn.wq_b.weight_scale_inv", torch.ones(2, 3))
     headers = iter(

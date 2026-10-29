@@ -174,11 +174,18 @@ def receive_weight_stream(
     fingerprint_tracker=None,
     finalize_fingerprints: bool = True,
     moe_router=None,
+    stage_on_cpu: bool = True,
 ) -> dict[str, Any]:
     """Receive RCCL buckets and load them directly into a resident vLLM model.
 
     ``moe_router`` (a ``FusedMoEWeightRouter``) loads the fused expert tensors
     an FSDP2 trainer sends, which ``model.load_weights`` would drop.
+
+    ``stage_on_cpu`` hands the loader host copies instead of views of the
+    receive buffer. A loader that holds tensors past their bucket, such as
+    online FP8's layerwise reload, would otherwise keep every bucket's buffer
+    on the device. A loader that copies each tensor in as it arrives can take
+    the views and skip a device-to-host-to-device round trip per tensor.
     """
     from lumenrl.engine.inference.vllm_fp8_utils import ReloadFingerprintTracker
 
@@ -242,14 +249,11 @@ def receive_weight_stream(
                 dtype = getattr(torch, entry["dtype"])
                 start = int(entry["offset"])
                 end = start + int(entry["nbytes"])
-                t_stage = time.perf_counter()
-                value = (
-                    payload[start:end]
-                    .view(dtype)
-                    .view(entry["shape"])
-                    .cpu()
-                )
-                timing["stage_s"] += time.perf_counter() - t_stage
+                value = payload[start:end].view(dtype).view(entry["shape"])
+                if stage_on_cpu:
+                    t_stage = time.perf_counter()
+                    value = value.cpu()
+                    timing["stage_s"] += time.perf_counter() - t_stage
                 if os.environ.get("LUMENRL_WEIGHT_SYNC_INTEGRITY", "0") == "1":
                     from lumenrl.engine.inference.weight_integrity import (
                         sampled_tensor_integrity,

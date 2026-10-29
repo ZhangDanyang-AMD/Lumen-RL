@@ -413,6 +413,7 @@ class vLLMColocateWorkerExtension:
                 verify_full_load=bool(verify_full_load),
                 streamed_scales=False,
                 moe_router=FusedMoEWeightRouter(model),
+                stage_on_cpu=False,
             )
 
         verification = stats.get("verification", {})
