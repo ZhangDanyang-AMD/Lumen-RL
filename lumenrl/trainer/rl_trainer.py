@@ -142,6 +142,8 @@ class RLTrainer:
         # generation rounds, not just steps).
         self._prompt_cursor: int = 0
         self._prompt_perm: Any = None
+        # Background generation of the next step (controller.ray.one_step_off_policy).
+        self._rollout_pipeline: Any = None
         # verl-aligned Ray rollout (ray_http transport); populated in setup.
         self._ray_use_vllm: bool = False
         self._ray_use_atom: bool = False
@@ -4138,6 +4140,20 @@ class RLTrainer:
                 logger.info("Resume: syncing restored actor weights to Ray rollout before first rollout.")
                 self._sync_weights_ipc()
 
+        # Policy version loaded in the rollout engine, counted in optimizer steps.
+        rollout_version = start_step
+        if self._resolve_one_step_off_policy(use_ray_rollout) and start_step < total_steps:
+            from lumenrl.trainer.one_step_off_policy import OneStepOffPolicyRollout
+
+            self._rollout_pipeline = OneStepOffPolicyRollout(
+                lambda s: self._collect_rollout_batch(s, num_generations), total_steps,
+            )
+            self._rollout_pipeline.submit(start_step, rollout_version)
+            logger.info(
+                "One-step off-policy: each step's batch generates on the rollout pool "
+                "while the previous step trains."
+            )
+
         for step in range(start_step, total_steps):
             step_start = time.time()
             self.global_step = step
@@ -4149,7 +4165,13 @@ class RLTrainer:
             # ---- rollout ----
             gen_t0 = time.time()
             rollout_lp = None
-            if use_ray_rollout:
+            if self._rollout_pipeline is not None:
+                rollout, gen_time, staleness, trainer_wait = self._rollout_pipeline.take(
+                    step, rollout_version,
+                )
+                (sequences, seq_mask, prompt_lengths, rewards, responses,
+                 ground_truths_expanded, rollout_lp, rollout_ragged) = rollout
+            elif use_ray_rollout:
                 # verl-aligned online rollout across colocated replicas, with
                 # DAPO filter_groups dynamic sampling handled in the collector.
                 (sequences, seq_mask, prompt_lengths, rewards, responses,
@@ -4163,7 +4185,8 @@ class RLTrainer:
                 rewards, responses = None, None
                 ground_truths_expanded = ground_truths * num_generations
                 rollout_ragged = {}
-            gen_time = time.time() - gen_t0
+            if self._rollout_pipeline is None:
+                gen_time = time.time() - gen_t0
 
             _rc_cfg_ray = self.config.quantization.rollout_correction
             _bypass_ray = getattr(_rc_cfg_ray, "bypass_mode", False)
@@ -4339,10 +4362,16 @@ class RLTrainer:
                         )
 
             # ---- weight sync to rollout engine ----
+            if self._rollout_pipeline is not None:
+                # The engine must be idle while it loads the new weights.
+                trainer_wait += self._rollout_pipeline.drain()
+                metrics["async/staleness"] = float(staleness)
+                metrics["async/trainer_wait_s"] = trainer_wait
             t_sync = time.time()
             if getattr(self.config.weight_sync, "enabled", True):
                 if use_ray_rollout:
                     self._sync_weights_ipc()   # wake weights -> ZMQ IPC -> wake KV
+                    rollout_version = step + 1
                 else:
                     self._sync_rollout_weights()
             sync_time = time.time() - t_sync
@@ -4389,9 +4418,30 @@ class RLTrainer:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+        if self._rollout_pipeline is not None:
+            self._rollout_pipeline.close()
+            self._rollout_pipeline = None
         for cb in self.callbacks:
             cb.on_train_end(self)
         logger.info("RLTrainer.train (ray-controller) finished after %d steps.", total_steps)
+
+    def _resolve_one_step_off_policy(self, use_ray_rollout: bool) -> bool:
+        """Whether to overlap generation with training; reject layouts that cannot."""
+        if not bool(getattr(self.config.controller.ray, "one_step_off_policy", False)):
+            return False
+        if not use_ray_rollout or getattr(self, "_rollout_wg", None) is None:
+            raise ValueError(
+                "controller.ray.one_step_off_policy generates the next batch while the "
+                "current one trains, so the rollout needs GPUs of its own: set "
+                "controller.ray.rollout.num_workers > 0 with a Ray vLLM or ATOM rollout."
+            )
+        if getattr(self._ray_vllm_engine, "enable_sleep", False):
+            raise ValueError(
+                "controller.ray.one_step_off_policy keeps the rollout generating while "
+                "the trainer runs, so it cannot sleep between steps: turn off "
+                "enable_sleep_mode for the rollout engine."
+            )
+        return True
 
     def _sync_rollout_weights(self) -> None:
         """Sync actor weights to ATOM rollout engine if configured."""
@@ -4579,6 +4629,9 @@ class RLTrainer:
             except Exception:
                 pass
             self._profiler = None
+        if self._rollout_pipeline is not None:
+            self._rollout_pipeline.close()
+            self._rollout_pipeline = None
         if (
             self._ray_rollout_mgr is not None
             and getattr(self._ray_rollout_mgr, "rdma_group_name", None)

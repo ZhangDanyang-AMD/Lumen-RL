@@ -133,6 +133,10 @@ class RayControllerConfig:
     rollout: RayWorkerRoleConfig = field(default_factory=RayWorkerRoleConfig)
     # Optional role->pool name mapping for complex topology routing.
     topology_map: dict[str, str] = field(default_factory=dict)
+    # Generate step s+1 on the rollout pool while step s trains, as in verl's
+    # one_step_off_policy. Needs rollout.num_workers > 0; every batch after the
+    # first then trains one update after the weights that generated it.
+    one_step_off_policy: bool = False
 
 
 @dataclass
