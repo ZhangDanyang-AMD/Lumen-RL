@@ -60,6 +60,20 @@ def _normalize_streamed_optimizer_chunk_size_mib(value: Any) -> int:
     )
 
 
+def _whole_tensors(params):
+    """Each parameter whole, gathered on every rank in the same order.
+
+    FSDP2 yields DTensor shards, and ``full_tensor()`` is a collective: a rank
+    that skips one leaves its peers in that all-gather. So every rank consumes
+    this, and only the writer keeps what it yields. Megatron's tensors are
+    already whole and pass through.
+    """
+    from torch.distributed.tensor import DTensor
+
+    for name, param in params:
+        yield name, param.full_tensor() if isinstance(param, DTensor) else param
+
+
 class LumenActorWorker(BaseWorker):
     """Trainable policy worker using the Engine abstraction layer.
 
@@ -1101,9 +1115,10 @@ class LumenActorWorker(BaseWorker):
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         params, _ = self._engine.get_per_tensor_param()
+        params = _whole_tensors(params)
         if self.rank != 0:
-            # Consume the conversion iterator on every rank. Megatron TP/EP
-            # collectives in get_per_tensor_param have already run collectively.
+            # Consume the conversion iterator on every rank: Megatron's TP/EP
+            # collectives and FSDP2's all-gathers run as it advances.
             for _ in params:
                 pass
             return {"writer": False}
@@ -1180,6 +1195,7 @@ class LumenActorWorker(BaseWorker):
                 old.unlink()
 
         params, _ = self._engine.get_per_tensor_param()
+        params = _whole_tensors(params)
         shard: dict[str, torch.Tensor] = {}
         shard_keys: list[list[str]] = []
         temp_paths: list[Path] = []
