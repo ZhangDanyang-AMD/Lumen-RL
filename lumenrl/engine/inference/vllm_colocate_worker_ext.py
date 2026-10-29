@@ -401,6 +401,10 @@ class vLLMColocateWorkerExtension:
                 streamed_scales=True,
             )
         else:
+            from lumenrl.engine.inference.vllm_moe_weight_sync import (
+                FusedMoEWeightRouter,
+            )
+
             stats = receive_weight_stream(
                 groups[group_name],
                 model,
@@ -408,6 +412,7 @@ class vLLMColocateWorkerExtension:
                 expected_version=int(version),
                 verify_full_load=bool(verify_full_load),
                 streamed_scales=False,
+                moe_router=FusedMoEWeightRouter(model),
             )
 
         verification = stats.get("verification", {})

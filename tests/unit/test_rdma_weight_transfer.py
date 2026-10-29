@@ -149,6 +149,81 @@ def test_receive_stream_reports_last_source_tensor_on_loader_failure(monkeypatch
         )
 
 
+def _serve_buckets(monkeypatch, weights, version=7):
+    """Feed one single-tensor bucket per weight to receive_weight_stream, on CPU."""
+    buckets = [_bucket(name, tensor) for name, tensor in weights]
+    headers = iter(
+        [
+            torch.tensor([rdma._CMD_BUCKET, len(metadata), payload.numel(), version])
+            for metadata, payload in buckets
+        ]
+        + [torch.tensor([rdma._CMD_END, 0, 0, version])]
+    )
+    broadcasts = iter(
+        [
+            part
+            for metadata, payload in buckets
+            for part in (torch.tensor(list(metadata), dtype=torch.uint8), payload)
+        ]
+    )
+    original_empty = torch.empty
+
+    def cpu_empty(*args, **kwargs):
+        kwargs["device"] = "cpu"
+        return original_empty(*args, **kwargs)
+
+    monkeypatch.setattr(rdma, "_broadcast_header", lambda *args, **kwargs: next(headers))
+    monkeypatch.setattr(
+        rdma.dist,
+        "broadcast",
+        lambda output, src, group: output.copy_(next(broadcasts)),
+    )
+    monkeypatch.setattr(rdma.torch, "empty", cpu_empty)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+
+
+def test_receive_stream_loads_fsdp2_fused_experts_through_the_router(monkeypatch):
+    from lumenrl.engine.inference.vllm_moe_weight_sync import FusedMoEWeightRouter
+    from lumenrl.tests.test_moe_weight_sync import FakeModel, _fused_payload
+
+    torch.manual_seed(0)
+    model = FakeModel()
+    weights = _fused_payload(model)
+    _serve_buckets(monkeypatch, weights)
+
+    stats = rdma.receive_weight_stream(
+        object(),
+        model,
+        device=torch.device("cpu"),
+        expected_version=7,
+        verify_full_load=True,
+        moe_router=FusedMoEWeightRouter(model),
+    )
+
+    sent = dict(weights)
+    for idx, layer in enumerate(model.model.layers):
+        prefix = f"model.layers.{idx}.mlp.experts"
+        torch.testing.assert_close(layer.mlp.experts.w13_weight.data, sent[f"{prefix}.gate_up_proj"])
+        torch.testing.assert_close(layer.mlp.experts.w2_weight.data, sent[f"{prefix}.down_proj"])
+    assert stats["weights"] == len(weights)
+
+
+def test_receive_stream_without_a_router_rejects_dropped_fused_experts(monkeypatch):
+    from lumenrl.tests.test_moe_weight_sync import FakeModel, _fused_payload
+
+    model = FakeModel()
+    _serve_buckets(monkeypatch, _fused_payload(model))
+
+    with pytest.raises(RuntimeError, match=r"Incomplete vLLM RDMA weight reload.*experts\.w13_weight"):
+        rdma.receive_weight_stream(
+            object(),
+            model,
+            device=torch.device("cpu"),
+            expected_version=7,
+            verify_full_load=True,
+        )
+
+
 def test_reload_verification_ignores_generated_scales_and_static_router_table():
     expected = {
         "model.layers.0.attn.wq_b.weight",

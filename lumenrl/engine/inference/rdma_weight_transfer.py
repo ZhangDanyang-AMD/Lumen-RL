@@ -173,8 +173,13 @@ def receive_weight_stream(
     streamed_scales: bool = False,
     fingerprint_tracker=None,
     finalize_fingerprints: bool = True,
+    moe_router=None,
 ) -> dict[str, Any]:
-    """Receive RCCL buckets and load them directly into a resident vLLM model."""
+    """Receive RCCL buckets and load them directly into a resident vLLM model.
+
+    ``moe_router`` (a ``FusedMoEWeightRouter``) loads the fused expert tensors
+    an FSDP2 trainer sends, which ``model.load_weights`` would drop.
+    """
     from lumenrl.engine.inference.vllm_fp8_utils import ReloadFingerprintTracker
 
     if not finalize_fingerprints and fingerprint_tracker is None:
@@ -251,7 +256,12 @@ def receive_weight_stream(
                             f"tensor={entry['name']}: {integrity}"
                         )
                 fingerprints.observe_source([(entry["name"], value)])
-                yield entry["name"], value
+                if moe_router is None:
+                    yield entry["name"], value
+                    continue
+                passthrough, moe_loaded = moe_router.route([(entry["name"], value)])
+                loaded_names.update(moe_loaded)
+                yield from passthrough
 
     try:
         loaded = model.load_weights(received_weights())
