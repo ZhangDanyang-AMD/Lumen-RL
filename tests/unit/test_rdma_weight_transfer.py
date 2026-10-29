@@ -206,6 +206,8 @@ def test_receive_stream_loads_fsdp2_fused_experts_through_the_router(monkeypatch
         torch.testing.assert_close(layer.mlp.experts.w13_weight.data, sent[f"{prefix}.gate_up_proj"])
         torch.testing.assert_close(layer.mlp.experts.w2_weight.data, sent[f"{prefix}.down_proj"])
     assert stats["weights"] == len(weights)
+    for key in ("wait_s", "stage_s", "route_s", "load_weights_s"):
+        assert stats[key] >= 0.0
 
 
 def test_receive_stream_without_a_router_rejects_dropped_fused_experts(monkeypatch):

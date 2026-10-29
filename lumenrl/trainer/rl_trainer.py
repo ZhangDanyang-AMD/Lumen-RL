@@ -976,9 +976,22 @@ class RLTrainer:
             "weight_sync/backend_rdma": 1.0,
             "weight_sync/fp8_trainer_quantized": float(fp8_sync),
         }
+        # One stats dict per vLLM worker; the slowest worker sets the pace.
+        recv_rows = [
+            row
+            for result in results[len(send_refs):]
+            for row in (result if isinstance(result, list) else [result])
+            if isinstance(row, dict)
+        ]
+        recv_timing = {}
+        for key in ("wait_s", "stage_s", "route_s", "load_weights_s"):
+            values = [float(row[key]) for row in recv_rows if key in row]
+            if values:
+                recv_timing[key] = max(values)
+                self._last_weight_sync_metrics[f"timing/weight_sync_recv_{key}"] = max(values)
         logger.info(
             "RDMA weight sync committed: version=%d buckets=%d bytes=%.1fGB "
-            "broadcast=%.2fs effective=%.2fGb/s total=%.2fs fp8_location=%s",
+            "broadcast=%.2fs effective=%.2fGb/s total=%.2fs fp8_location=%s recv_max=%s",
             version,
             int(sender.get("buckets", 0)),
             float(sender.get("bytes", 0)) / 1e9,
@@ -986,6 +999,7 @@ class RLTrainer:
             float(sender.get("gbps", 0)),
             total_s,
             "trainer" if fp8_sync else "inference",
+            " ".join(f"{k}={v:.2f}" for k, v in recv_timing.items()) or "n/a",
         )
         if sleeping:
             rollout_engine.wake(tags=["kv_cache"])
