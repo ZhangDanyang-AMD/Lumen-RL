@@ -474,6 +474,11 @@ class RLTrainer:
             engine_kwargs["kv_cache_dtype"] = str(vcfg.kv_cache_dtype)
         if vcfg.quantization:
             engine_kwargs["quantization"] = str(vcfg.quantization)
+            from lumenrl.moe.router_precision import vllm_quantization_config
+
+            quant_cfg = vllm_quantization_config(engine_kwargs["quantization"])
+            if quant_cfg is not None:
+                engine_kwargs["quantization_config"] = quant_cfg
         if self._r3_rollout_replay:
             # makes the engine attach the selected expert ids to every completion
             engine_kwargs["enable_return_routed_experts"] = True
