@@ -1,7 +1,11 @@
 import pytest
 import torch
 
-from lumenrl.moe.router_precision import _is_router, enable_fp32_moe_router
+from lumenrl.moe.router_precision import (
+    _is_router,
+    enable_fp32_moe_router,
+    vllm_quantization_config,
+)
 
 
 @pytest.mark.parametrize("container_name", ["ffn", "mlp"])
@@ -36,6 +40,45 @@ def test_dsv4_gate_names_are_detected_and_return_fp32(
 )
 def test_similarly_named_non_router_modules_are_rejected(name):
     assert not _is_router(name, torch.nn.Linear(3, 2, bias=False))
+
+
+def test_fp32_router_refuses_quantized_gate(monkeypatch):
+    monkeypatch.setenv("LUMENRL_FP32_MOE_ROUTER", "1")
+    model = torch.nn.Module()
+    model.add_module("model", torch.nn.Module())
+    model.model.add_module("mlp", torch.nn.Module())
+    gate = torch.nn.Linear(3, 2, bias=False)
+    gate.weight = torch.nn.Parameter(gate.weight.to(torch.float8_e4m3fn), requires_grad=False)
+    model.model.mlp.add_module("gate", gate)
+
+    with pytest.raises(RuntimeError, match="mlp.gate is quantized"):
+        enable_fp32_moe_router(model)
+    monkeypatch.setenv("LUMENRL_FP32_MOE_ROUTER", "0")
+    assert enable_fp32_moe_router(model) == 0
+
+
+@pytest.mark.parametrize(("quantization", "fp32", "ignored"), [
+    ("fp8_per_block", "1", True), ("fp8_per_block", "0", False), ("fp8", "1", False),
+    ("", "1", False)])
+def test_online_quantization_keeps_routers_unquantized_for_fp32_router(
+        monkeypatch, quantization, fp32, ignored):
+    from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+        should_ignore_layer,
+    )
+
+    monkeypatch.setenv("LUMENRL_FP32_MOE_ROUTER", fp32)
+    quant_cfg = vllm_quantization_config(quantization)
+
+    assert (quant_cfg is not None) == ignored
+    if ignored:
+        ignore = quant_cfg["ignore"]
+        assert should_ignore_layer("model.layers.3.mlp.gate", ignore=ignore)
+        assert should_ignore_layer("model.layers.3.ffn.gate", ignore=ignore)
+        for name in ("model.layers.3.mlp.gate_up_proj", "model.layers.3.mlp.experts",
+                     "model.layers.3.self_attn.qkv_proj"):
+            assert not should_ignore_layer(name, ignore=ignore,
+                                           fused_mapping={"gate_up_proj": ["gate_proj", "up_proj"],
+                                                          "qkv_proj": ["q_proj", "k_proj", "v_proj"]})
 
 
 @pytest.mark.parametrize("name", ["model.ffn.gate", "model.mlp.gate"])
