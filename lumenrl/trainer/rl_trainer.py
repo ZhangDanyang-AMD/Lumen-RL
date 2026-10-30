@@ -474,6 +474,8 @@ class RLTrainer:
             engine_kwargs["kv_cache_dtype"] = str(vcfg.kv_cache_dtype)
         if vcfg.quantization:
             engine_kwargs["quantization"] = str(vcfg.quantization)
+            # Online vLLM quant (fp8_per_block, ...) quantizes every Linear; pass
+            # quantization_config.ignore so MoE gates stay BF16 for enable_fp32_moe_router.
             from lumenrl.moe.router_precision import vllm_quantization_config
 
             quant_cfg = vllm_quantization_config(engine_kwargs["quantization"])
