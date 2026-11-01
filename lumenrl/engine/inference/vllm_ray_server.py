@@ -245,6 +245,8 @@ class VLLMRayServer:
             "prompt_token_ids": list(final.prompt_token_ids),
             "token_ids": tok,
             "logprobs": lps,
+            # "stop" (EOS or a stop token), "length" (max_tokens) or "abort".
+            "finish_reason": comp.finish_reason,
             # MILES R3 contract: vLLM returns the top-k expert ids for every
             # model-input token as [sequence_length - 1, num_layers, top_k].
             # Keep this as a numpy array across Ray; the controller packs it

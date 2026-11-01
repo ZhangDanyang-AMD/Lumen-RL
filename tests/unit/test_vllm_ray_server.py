@@ -252,3 +252,33 @@ def test_destroyed_rdma_group_requires_a_new_handshake(monkeypatch):
     manager.start_receive_weights_rdma(version=2, verify_full_load=True)
 
     assert len(server.get_rdma_capabilities.calls) == 2
+
+
+def install_fake_vllm(monkeypatch):
+    fake_vllm = ModuleType("vllm")
+    fake_vllm.SamplingParams = lambda **kwargs: SimpleNamespace(**kwargs)
+    fake_inputs = ModuleType("vllm.inputs")
+    fake_inputs.TokensPrompt = lambda prompt_token_ids: {"prompt_token_ids": prompt_token_ids}
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+    monkeypatch.setitem(sys.modules, "vllm.inputs", fake_inputs)
+
+
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+def test_generate_reports_why_the_completion_ended(monkeypatch, finish_reason):
+    install_fake_vllm(monkeypatch)
+
+    class Engine:
+        async def generate(self, prompt, sampling_params, request_id):
+            completion = SimpleNamespace(
+                text="ab", token_ids=[7, 8], logprobs=None,
+                finish_reason=finish_reason,
+            )
+            yield SimpleNamespace(prompt_token_ids=[1, 2], outputs=[completion])
+
+    server = object.__new__(VLLMRayServer)
+    server.engine = Engine()
+
+    out = asyncio.run(server.generate([1, 2], {"max_tokens": 2}))
+
+    assert out["token_ids"] == [7, 8]
+    assert out["finish_reason"] == finish_reason
