@@ -1,0 +1,141 @@
+# Agentic RL smoke: Qwen3-8B solves DAPO-Math with a code interpreter (ReTool-like).
+#
+# Every completion is a multi-turn rollout: the model may call code_interpreter,
+# which runs on a SandboxFusion /run_code service, and the output is appended to
+# the response as environment tokens that carry no loss. 4 FSDP2 actors + 4 vLLM
+# replicas, so the same config also runs with controller.ray.fully_async.
+#
+# Needs the post-trained Qwen3-8B (its chat template renders tools) and a
+# SandboxFusion service at policy.generation.multi_turn.code_interpreter.url.
+# On one node the RCCL weight sync also needs weight_sync.backend=rdma with
+# weight_sync.rdma.{require_rdma=false,interface,hca} for the node.
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    actor:
+      num_workers: 4
+      dispatch_mode: dp_compute_proto
+    rollout:
+      num_workers: 4
+
+policy:
+  model_name: "${oc.env:DATA_ROOT}/models/Qwen3-8B"
+  training_backend: fsdp2
+  generation_backend: vllm
+  max_total_sequence_length: 5120      # prompt with the tool schema + response
+  max_response_length: 4096            # model turns and tool output together
+  train_global_batch_size: 64          # 8 prompts x 8 rollouts
+  gen_batch_size: 16
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 16384
+  learning_rate: 1.0e-6
+  lr_warmup_steps: 10
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  training:
+    optimizer_dtype: bf16
+    fsdp_cfg:
+      param_offload: false
+      optimizer_offload: false
+  generation:
+    vllm_cfg:
+      transport: ray_http
+      ray_http_start_server: false
+      gpu_memory_utilization: 0.85
+      max_model_len: 5120
+      dtype: bfloat16
+      enforce_eager: true
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 8192
+      max_num_seqs: 128
+      quantization: ""
+      calculate_log_probs: true
+      enable_sleep_mode: false
+      sleep_level: 2
+      update_weights_bucket_megabytes: 512
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+    multi_turn:
+      enabled: true
+      format: hermes
+      max_assistant_turns: 8
+      max_parallel_calls: 1
+      max_tool_response_length: 256
+      tool_response_truncate_side: middle
+      system_prompt: >-
+        You can call the code_interpreter tool to run Python code. Use it to
+        calculate and to check your reasoning before you give the final answer.
+      chat_template_kwargs:
+        enable_thinking: false
+      code_interpreter:
+        url: http://localhost:8080/run_code
+        run_timeout_s: 30
+        memory_limit_mb: 1024
+        max_concurrency: 64
+
+algorithm:
+  name: dapo
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  loss_agg_mode: token-mean
+  dapo:
+    num_generations: 8
+    kl_coeff: 0.0
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 10.0
+    dynamic_sampling: true
+    token_level_pg: true
+    overlong_reward_shaping: false
+    max_resp_len: 4096
+    filter_groups:
+      enable: true
+      metric: acc
+      max_num_gen_batches: 10
+    overlong_buffer:
+      enable: false
+
+reward:
+  type: function
+  function: lumenrl.rewards.math_reward.dapo_math_reward
+  dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet"
+  shuffle: true
+  shuffle_seed: 10086
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+    rollout_is_batch_normalize: false
+
+val_dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/aime-2024.filtered.parquet"
+val_steps: 2
+val_batch_size: 0
+eval:
+  enabled: false
+  num_samples: 16
+
+checkpointing:
+  checkpoint_dir: "${oc.env:DATA_ROOT}/ckpts/lumenrl-dapo/retool-smoke-8b"
+  save_steps: 1000
+  save_total_limit: 1
+  resume: false
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 3
+seed: 10086

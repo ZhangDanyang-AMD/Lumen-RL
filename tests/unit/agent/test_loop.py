@@ -91,6 +91,7 @@ def test_tool_round_trip_masks_the_tool_output():
     assert tool.calls == [{"code": "42"}]
     assert trajectory.stop_reason == "answer"
     assert trajectory.assistant_turns == 2
+    assert trajectory.tool_rounds == 1
     assert trajectory.tool_calls == 1
     assert segments(trajectory.response_mask) == [
         (1, len(first_turn)), (0, environment_len), (1, len(second_turn)),
@@ -121,6 +122,20 @@ def test_each_turn_gets_the_rest_of_the_response_budget():
     budgets = [params["max_tokens"] for _, params in engine.requests]
     first_turn_and_tool = len(engine.requests[1][0]) - len(trajectory.prompt_ids)
     assert budgets == [500, 500 - first_turn_and_tool]
+
+
+def test_the_sequence_limit_caps_the_response_budget():
+    tok = ChatMLTokenizer()
+    engine = ScriptedEngine(tok, [("done", "stop")])
+    loop = ToolAgentLoop(ChatTemplateTokenizer(tok), [EchoTool()])
+
+    trajectory = asyncio.run(loop.run(
+        engine.generate, PROMPT, {"max_tokens": 10_000}, max_response_tokens=4096,
+        max_sequence_tokens=400,
+    ))
+
+    [(_, params)] = engine.requests
+    assert params["max_tokens"] == 400 - len(trajectory.prompt_ids)
 
 
 def test_a_truncated_turn_ends_the_rollout_without_running_its_tools():

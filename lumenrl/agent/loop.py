@@ -74,8 +74,15 @@ class ToolAgentLoop:
         messages: list[dict[str, Any]],
         sampling_params: dict[str, Any],
         max_response_tokens: int,
+        max_sequence_tokens: int | None = None,
     ) -> Trajectory:
+        """Roll out ``messages``; the response stays within ``max_response_tokens``
+        and, with ``max_sequence_tokens``, prompt plus response within that."""
         trajectory = Trajectory(prompt_ids=self._chat.encode_prompt(messages, self.tool_schemas))
+        if max_sequence_tokens is not None:
+            max_response_tokens = min(
+                max_response_tokens, max_sequence_tokens - len(trajectory.prompt_ids),
+            )
         while True:
             budget = max_response_tokens - len(trajectory.response_ids)
             if budget <= 0:

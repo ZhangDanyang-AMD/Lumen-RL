@@ -23,6 +23,8 @@ class Trajectory:
     response_mask: list[int] = field(default_factory=list)
     response_logprobs: list[float] = field(default_factory=list)
     assistant_turns: int = 0
+    # Rounds of tool output appended; verl counts them as user turns.
+    tool_rounds: int = 0
     tool_calls: int = 0
     tool_errors: int = 0
     malformed_tool_calls: int = 0
@@ -46,16 +48,33 @@ class Trajectory:
         self.response_ids.extend(token_ids)
         self.response_mask.extend([0] * len(token_ids))
         self.response_logprobs.extend([0.0] * len(token_ids))
+        self.tool_rounds += 1
 
     @property
     def model_tokens(self) -> int:
         return sum(self.response_mask)
 
+    def stats(self) -> dict[str, Any]:
+        return {
+            "assistant_turns": self.assistant_turns,
+            "tool_rounds": self.tool_rounds,
+            "tool_calls": self.tool_calls,
+            "tool_errors": self.tool_errors,
+            "malformed_tool_calls": self.malformed_tool_calls,
+            "stop_reason": self.stop_reason,
+            "model_tokens": self.model_tokens,
+            "environment_tokens": len(self.response_ids) - self.model_tokens,
+            "generate_s": self.generate_s,
+            "tool_s": self.tool_s,
+        }
+
     def to_rollout_result(self) -> dict[str, Any]:
-        """The trajectory in the shape ``VLLMRayServer.generate`` returns."""
+        """The trajectory in the shape ``VLLMRayServer.generate`` returns, plus
+        its ``response_mask`` and ``agent_stats``."""
         return {
             "prompt_token_ids": list(self.prompt_ids),
             "token_ids": list(self.response_ids),
             "logprobs": list(self.response_logprobs),
             "response_mask": list(self.response_mask),
+            "agent_stats": self.stats(),
         }

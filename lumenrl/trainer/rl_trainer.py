@@ -11,6 +11,7 @@ Supports three modes:
 from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass
+import concurrent.futures
 import gc
 import json
 import logging
@@ -141,15 +142,20 @@ class _RayRolloutGroups:
         )
         return ready
 
-    def finish(self, handle: Any) -> tuple | None:
+    def _collect(self, handle: Any) -> tuple[list[dict[str, Any]], str]:
+        """The group's generate results and its ground truth."""
         import ray
-
-        from lumenrl.algorithms.dapo_sampling import filter_groups_keep_mask
 
         replica, gt = self._groups.pop(handle)
         self._load[replica] -= 1
+        return ray.get(handle), gt
+
+    def finish(self, handle: Any) -> tuple | None:
+        from lumenrl.algorithms.dapo_sampling import filter_groups_keep_mask
+
+        results, gt = self._collect(handle)
         sequences, seq_mask, prompt_lengths, rollout_lp, ragged = (
-            self._trainer._assemble_ray_rollout(ray.get(handle))
+            self._trainer._assemble_ray_rollout(results)
         )
         gts = [gt] * self._num_generations
         rewards, responses, accs = self._trainer._compute_rewards_full(
@@ -166,6 +172,32 @@ class _RayRolloutGroups:
 
     def resume(self) -> None:
         self._mgr.resume_all()
+
+
+class _AgentRolloutGroups(_RayRolloutGroups):
+    """Prompt groups rolled out by the tool-calling agent loop.
+
+    A paused engine queues the turns submitted meanwhile and runs them on the
+    new weights after ``resume``, so a rollout may span weight versions.
+    """
+
+    def submit(self, index: int) -> Any:
+        [messages], gts = self._trainer._get_prompts_range(index, 1, messages=True)
+        handle = self._trainer._get_agent_rollout().submit(
+            messages, self._num_generations, self._sampling_params,
+        )
+        self._groups[handle] = gts[0]
+        return handle
+
+    def wait(self, handles: list[Any], timeout: float) -> list[Any]:
+        done, _ = concurrent.futures.wait(
+            handles, timeout=timeout, return_when=concurrent.futures.FIRST_COMPLETED,
+        )
+        return [handle for handle in handles if handle in done]
+
+    def _collect(self, handle: Any) -> tuple[list[dict[str, Any]], str]:
+        gt = self._groups.pop(handle)
+        return [trajectory.to_rollout_result() for trajectory in handle.result()], gt
 
 
 class RLTrainer:
@@ -227,6 +259,8 @@ class RLTrainer:
         self._prompt_perm: Any = None
         # Background generation of the next step (controller.ray.one_step_off_policy).
         self._rollout_pipeline: Any = None
+        # Tool-calling rollouts (policy.generation.multi_turn); built on first use.
+        self._agent_rollout: Any = None
         # verl-aligned Ray rollout (ray_http transport); populated in setup.
         self._ray_use_vllm: bool = False
         self._ray_use_atom: bool = False
@@ -747,6 +781,40 @@ class RLTrainer:
         results = self._ray_vllm_engine.generate_tokens(expanded, sp)
         return self._assemble_ray_rollout(results)
 
+    @property
+    def _multi_turn(self) -> bool:
+        """Whether rollouts are tool-calling agent rollouts."""
+        generation = getattr(getattr(self.config, "policy", None), "generation", None)
+        return bool(getattr(getattr(generation, "multi_turn", None), "enabled", False))
+
+    def _get_agent_rollout(self) -> Any:
+        """The tool-calling agent rollout on the Ray vLLM replicas, built on first use."""
+        if self._agent_rollout is None:
+            from lumenrl.trainer.agent_rollout import build_agent_rollout
+
+            self._agent_rollout = build_agent_rollout(
+                self.config, self._tokenizer, self._ray_rollout_mgr.servers,
+            )
+        return self._agent_rollout
+
+    def _rollout_with_agent_loop(
+        self,
+        prompts: list[list[dict[str, Any]]],
+        num_generations: int,
+        sampling_params: dict[str, Any] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[int], torch.Tensor | None, dict[str, list[Any]]]:
+        """``_rollout_with_ray_vllm`` for chat-message prompts, one agent
+        rollout per completion; the ragged dict carries the agent masks."""
+        want_lp = bool(self.config.policy.generation.vllm_cfg.calculate_log_probs)
+        sp = dict(sampling_params) if sampling_params is not None else self._ray_sampling_params(want_lp)
+        if getattr(self._ray_vllm_engine, "_sleeping", False):
+            logger.info("Ray rollout engine sleeping before generation; refreshing weights before wake.")
+            self._sync_weights_ipc()
+        groups = self._get_agent_rollout().run(prompts, num_generations, sp)
+        return self._assemble_ray_rollout(
+            [trajectory.to_rollout_result() for group in groups for trajectory in group],
+        )
+
     def _ray_rollout_prompt_ids(self, prompts: list[str]) -> list[list[int]]:
         """Token ids the Ray rollout sends for each prompt.
 
@@ -870,6 +938,12 @@ class RLTrainer:
             # ``sequence_length - 1`` there; re-reading the raw results here
             # would silently discard that normalization.
             ragged["rollout_routing"] = response_routes
+        if results and "response_mask" in results[0]:
+            # Agent rollouts: which response tokens the model sampled, and the
+            # per-rollout stats. Ragged, so they follow their rows through
+            # filter_groups and group merging.
+            ragged["agent_response_mask"] = [list(res["response_mask"]) for res in results]
+            ragged["agent_stats"] = [dict(res["agent_stats"]) for res in results]
         return sequences, seq_mask, prompt_lengths, rollout_lp, ragged
 
     def _ray_sampling_params(self, want_logprobs: bool) -> dict[str, Any]:
@@ -1720,15 +1794,21 @@ class RLTrainer:
         start = step * num_prompts
         return self._get_prompts_range(start, num_prompts)
 
-    def _get_prompts_range(self, start: int, count: int) -> tuple[list[str], list[str]]:
+    def _get_prompts_range(
+        self, start: int, count: int, *, messages: bool = False,
+    ) -> tuple[list[Any], list[str]]:
         """Get ``count`` (prompt, ground_truth) pairs starting at global index ``start``.
 
         Wraps around the dataset. Used by both the fixed-batch path and the DAPO
         dynamic-sampling regeneration loop (which advances a running cursor).
+        With ``messages`` each prompt is its chat messages instead of the
+        rendered chat template, for the agent loop to render with its tools.
         """
         if self._dataset is None:
             prompts = [f"What is {start + i} + {start + i + 1}?" for i in range(count)]
             gts = [str(2 * (start + i) + 1) for i in range(count)]
+            if messages:
+                prompts = [[{"role": "user", "content": p}] for p in prompts]
             return prompts, gts
 
         dataset_len = len(self._dataset)
@@ -1741,7 +1821,10 @@ class RLTrainer:
         prompts = []
         gts = []
         for s in samples:
-            p, gt = self._extract_prompt_gt(s)
+            if messages:
+                p, gt = self._extract_prompt_messages_gt(s)
+            else:
+                p, gt = self._extract_prompt_gt(s)
             prompts.append(p)
             gts.append(gt)
         return prompts, gts
@@ -1758,6 +1841,34 @@ class RLTrainer:
         template and ground-truth field (``reward_model.ground_truth``) are
         parsed identically.
         """
+        prompt_messages, prompt_text, gt = self._extract_prompt_parts(
+            s, ensure_answer_format=ensure_answer_format,
+        )
+        if self._tokenizer is not None and prompt_messages is not None:
+            prompt_text = _format_chat_prompt(self._tokenizer, prompt_messages)
+        return prompt_text, gt
+
+    def _extract_prompt_messages_gt(
+        self,
+        s: dict,
+        *,
+        ensure_answer_format: bool = False,
+    ) -> tuple[list[dict[str, Any]], str]:
+        """Like ``_extract_prompt_gt``, with the prompt as chat messages."""
+        prompt_messages, prompt_text, gt = self._extract_prompt_parts(
+            s, ensure_answer_format=ensure_answer_format,
+        )
+        if prompt_messages is None:
+            prompt_messages = [{"role": "user", "content": prompt_text}]
+        return prompt_messages, gt
+
+    def _extract_prompt_parts(
+        self,
+        s: dict,
+        *,
+        ensure_answer_format: bool = False,
+    ) -> tuple[list[dict[str, Any]] | None, str, str]:
+        """(chat messages or None, plain prompt text, ground truth) of a dataset row."""
         import json as _json
 
         prompt_raw = s.get("prompt") or s.get("question") or s.get("input") or ""
@@ -1808,10 +1919,7 @@ class RLTrainer:
                         )
                     break
 
-        if self._tokenizer is not None and prompt_messages is not None:
-            prompt_text = _format_chat_prompt(self._tokenizer, prompt_messages)
-
-        return prompt_text, str(gt)
+        return prompt_messages, prompt_text, str(gt)
 
     def _tokenize_prompts(self, prompts: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
         """Tokenize prompts to input_ids and attention_mask."""
@@ -2476,9 +2584,13 @@ class RLTrainer:
         if not use_filter:
             gen_prompts = train_prompts
 
-        def _one_round(prompts: list[str]):
+        multi_turn = self._multi_turn
+
+        def _one_round(prompts: list[Any]):
             rag: dict[str, list[Any]] = {}
-            if (
+            if multi_turn:
+                seqs, mask, plen, lp, rag = self._rollout_with_agent_loop(prompts, g)
+            elif (
                 (getattr(self, "_ray_use_vllm", False) or getattr(self, "_ray_use_atom", False))
                 and self._ray_vllm_engine is not None
             ):
@@ -2496,7 +2608,9 @@ class RLTrainer:
 
         # Simple (no dynamic sampling) path: one round, return everything.
         if not use_filter:
-            prompts, gts = self._get_prompts_range(self._prompt_cursor, gen_prompts)
+            prompts, gts = self._get_prompts_range(
+                self._prompt_cursor, gen_prompts, messages=multi_turn,
+            )
             self._prompt_cursor += gen_prompts
             if LUMENRL_DEBUG:
                 logger.info("[DBG] _collect_rollout: no-filter path, %d prompts × %d gen", gen_prompts, g)
@@ -2532,7 +2646,9 @@ class RLTrainer:
 
         while kept_prompts < train_prompts and rounds < max_rounds:
             rounds += 1
-            prompts, gts = self._get_prompts_range(self._prompt_cursor, gen_prompts)
+            prompts, gts = self._get_prompts_range(
+                self._prompt_cursor, gen_prompts, messages=multi_turn,
+            )
             self._prompt_cursor += gen_prompts
             seqs, mask, plen, lp, rag = _one_round(prompts)
             gts_exp = [gt for gt in gts for _ in range(g)]
@@ -4191,8 +4307,13 @@ class RLTrainer:
         timing_raw: dict[str, float],
         prompt_lengths: list[int],
         response_lengths: list[int],
+        agent_stats: list[dict[str, Any]] | None = None,
     ) -> None:
-        """Populate the metric names used by the AMD-BF16-VERL dashboard."""
+        """Populate the metric names used by the AMD-BF16-VERL dashboard.
+
+        Agent rollouts report their real turn counts and per-rollout times
+        (``agent_stats``, one per row); otherwise one turn and no tools.
+        """
         from lumenrl.trainer.metric_utils import (
             compute_data_metrics,
             compute_throughput_metrics,
@@ -4276,6 +4397,12 @@ class RLTrainer:
         metrics["timing_s/agent_loop/slowest/response_length"] = float(
             max(response_lengths, default=0)
         )
+        if agent_stats:
+            from lumenrl.trainer.agent_rollout import verl_agent_loop_metrics
+
+            metrics.update(
+                verl_agent_loop_metrics(agent_stats, prompt_lengths, response_lengths),
+            )
 
         for name in ("save_checkpoint", "start_profile", "stop_profile"):
             metrics.setdefault(f"timing_s/{name}", 0.0)
@@ -4408,7 +4535,19 @@ class RLTrainer:
                 )
             reward_time = time.time() - reward_t0
             response_mask = self._build_response_mask(sequences, seq_mask, prompt_lengths)
+            # Counts tool output too, as verl's response length does: the
+            # response budget and the overlong buffer apply to all of it.
             response_lengths = [int(response_mask[i].sum().item()) for i in range(response_mask.shape[0])]
+            agent_token_masks = rollout_ragged.pop("agent_response_mask", None)
+            agent_stats = rollout_ragged.pop("agent_stats", None)
+            if agent_token_masks is not None:
+                from lumenrl.trainer.agent_rollout import mask_environment_tokens
+
+                # Tool output and template glue are in the sequence for the
+                # model to condition on, but carry no loss.
+                response_mask = mask_environment_tokens(
+                    response_mask, seq_mask, prompt_lengths, agent_token_masks,
+                )
 
             tensors = {
                 "input_ids": sequences,
@@ -4560,6 +4699,10 @@ class RLTrainer:
                         metrics.update(val_metrics)
                     async_metrics["async/trainer_wait_s"] += pipeline.before_sync()
                 metrics.update(async_metrics)
+            if agent_stats:
+                from lumenrl.trainer.agent_rollout import agent_metrics
+
+                metrics.update(agent_metrics(agent_stats))
             t_sync = time.time()
             if sync_now and getattr(self.config.weight_sync, "enabled", True):
                 if use_ray_rollout:
@@ -4593,7 +4736,7 @@ class RLTrainer:
                 "step": time.time() - step_start,
             }
             self._add_verl_metrics(
-                metrics, batch, timing_raw, prompt_lengths, response_lengths,
+                metrics, batch, timing_raw, prompt_lengths, response_lengths, agent_stats,
             )
 
             self.last_metrics = metrics
@@ -4658,8 +4801,24 @@ class RLTrainer:
         gen_prompts = int(pol.gen_batch_size) if pol.gen_batch_size > 0 else train_prompts
         return start_step * gen_prompts
 
+    def _check_multi_turn(self, use_ray_rollout: bool) -> None:
+        """Reject rollout setups the agent loop cannot drive."""
+        if not self._multi_turn:
+            return
+        if not use_ray_rollout or not getattr(self, "_ray_use_vllm", False):
+            raise ValueError(
+                "policy.generation.multi_turn needs the Ray controller with the vLLM "
+                "rollout: the agent loop generates turn by turn on VLLMRayServer."
+            )
+        if self._r3_rollout_replay or getattr(self.config.moe.r3, "enabled", False):
+            raise ValueError(
+                "policy.generation.multi_turn does not replay MoE routing (moe.r3) "
+                "across the turns of a rollout yet; turn off moe.r3."
+            )
+
     def _resolve_rollout_pipeline(self, use_ray_rollout: bool) -> str:
         """``sync``, ``one_step`` or ``fully_async``; reject layouts that cannot overlap."""
+        self._check_multi_turn(use_ray_rollout)
         ray_cfg = self.config.controller.ray
         one_step = bool(getattr(ray_cfg, "one_step_off_policy", False))
         fully_async = bool(getattr(getattr(ray_cfg, "fully_async", None), "enabled", False))
@@ -4728,8 +4887,9 @@ class RLTrainer:
             int(fg.max_num_gen_batches) * gen_prompts
             if use_filter and fg.max_num_gen_batches > 0 else 0
         )
+        groups = _AgentRolloutGroups if self._multi_turn else _RayRolloutGroups
         pipeline = StreamingRollout(
-            _RayRolloutGroups(self, num_generations, use_filter),
+            groups(self, num_generations, use_filter),
             self._merge_rollout_groups,
             groups_per_step=groups_per_step,
             sync_every=int(fa_cfg.trigger_parameter_sync_step),
@@ -4806,6 +4966,7 @@ class RLTrainer:
         all_acc: list[float] = []
         all_response_lengths: list[int] = []
         all_responses: list[str] = []
+        all_agent_stats: list[dict[str, Any]] = []
 
         if self._rank == 0:
             logger.info(
@@ -4824,7 +4985,10 @@ class RLTrainer:
             samples = [self._val_dataset[idx] for idx in range(start, end)]
             prompts, ground_truths = [], []
             for s in samples:
-                p, gt = self._extract_prompt_gt(s, ensure_answer_format=True)
+                if self._multi_turn:
+                    p, gt = self._extract_prompt_messages_gt(s, ensure_answer_format=True)
+                else:
+                    p, gt = self._extract_prompt_gt(s, ensure_answer_format=True)
                 prompts.append(p)
                 ground_truths.append(gt)
             real_batch = len(prompts)
@@ -4844,7 +5008,13 @@ class RLTrainer:
             # Eval generation (colocated). Ray-controller path generates via the
             # colocated vLLM replicas (self._actor_model is None on the driver, so
             # the torchrun _rollout_phase fallback would crash).
-            if getattr(self, "_ray_vllm_engine", None) is not None:
+            if self._multi_turn:
+                sequences, seq_mask, prompt_lengths, _, val_ragged = self._rollout_with_agent_loop(
+                    prompts, num_generations=eval_n, sampling_params=eval_sp,
+                )
+                keep_stats = len(samples) * eval_n
+                all_agent_stats.extend(val_ragged["agent_stats"][:keep_stats])
+            elif getattr(self, "_ray_vllm_engine", None) is not None:
                 sequences, seq_mask, prompt_lengths, _, _ = self._rollout_with_ray_vllm(
                     prompts, num_generations=eval_n, sampling_params=eval_sp,
                 )
@@ -4927,6 +5097,16 @@ class RLTrainer:
             "val/response_length_mean": float(lengths_t.mean()),
             "val/num_samples": float(len(all_scores)),
         }
+        if all_agent_stats:
+            from lumenrl.trainer.agent_rollout import agent_metrics, num_turns
+
+            turns = [float(num_turns(s)) for s in all_agent_stats]
+            metrics["val-aux/num_turns/max"] = max(turns)
+            metrics["val-aux/num_turns/mean"] = sum(turns) / len(turns)
+            metrics["val-aux/num_turns/min"] = min(turns)
+            metrics.update(
+                {f"val-aux/{key}": value for key, value in agent_metrics(all_agent_stats).items()},
+            )
         self._last_val_generations = [
             {
                 "response": response,
@@ -4963,6 +5143,9 @@ class RLTrainer:
         if self._rollout_pipeline is not None:
             self._rollout_pipeline.close()
             self._rollout_pipeline = None
+        if self._agent_rollout is not None:
+            self._agent_rollout.close()
+            self._agent_rollout = None
         if (
             self._ray_rollout_mgr is not None
             and getattr(self._ray_rollout_mgr, "rdma_group_name", None)

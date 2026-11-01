@@ -378,9 +378,47 @@ class TrainingConfig:
 
 
 @dataclass
+class SandboxFusionToolConfig:
+    """ReTool's ``code_interpreter`` tool on a SandboxFusion ``/run_code`` service."""
+
+    enabled: bool = True
+    url: str = "http://localhost:8080/run_code"
+    language: str = "python"
+    run_timeout_s: float = 30.0
+    memory_limit_mb: int = 1024
+    # Requests in flight to the sandbox at once, across all rollouts.
+    max_concurrency: int = 64
+
+
+@dataclass
+class MultiTurnConfig:
+    """Multi-turn rollouts with tool calls, as verl's ``rollout.multi_turn``.
+
+    Needs the Ray controller with the vLLM rollout. Tool output enters the
+    response as environment tokens, which carry no loss.
+    """
+
+    enabled: bool = False
+    # Tool-call syntax the model writes; only "hermes" (Qwen) is supported.
+    format: str = "hermes"
+    max_assistant_turns: int = 8
+    # Tool calls run per turn; later calls in the same turn are dropped.
+    max_parallel_calls: int = 1
+    # Characters of tool output kept; 0 keeps everything.
+    max_tool_response_length: int = 256
+    tool_response_truncate_side: str = "middle"
+    # Prepended to every prompt as a system message when non-empty.
+    system_prompt: str = ""
+    # Passed to apply_chat_template, e.g. {enable_thinking: false} for Qwen3.
+    chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
+    code_interpreter: SandboxFusionToolConfig = field(default_factory=SandboxFusionToolConfig)
+
+
+@dataclass
 class GenerationConfig:
     atom_cfg: AtomConfig = field(default_factory=AtomConfig)
     vllm_cfg: VLLMConfig = field(default_factory=VLLMConfig)
+    multi_turn: MultiTurnConfig = field(default_factory=MultiTurnConfig)
 
 
 @dataclass
