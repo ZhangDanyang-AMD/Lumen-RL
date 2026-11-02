@@ -17,6 +17,7 @@ import logging
 import os
 import shutil
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Type
 
@@ -62,6 +63,24 @@ def _response_token_ids(
     return sequence[min(response_start, real_end):real_end]
 
 
+def _merge_left_padded(parts: list[torch.Tensor], value: float) -> torch.Tensor:
+    """Stack left-padded row blocks, widening each to the widest on the left.
+
+    Real tokens sit at the right end of every row (what pack_sequences expects),
+    so the padding a narrower block needs goes in front.
+    """
+    width = max(t.shape[1] for t in parts)
+    widened = []
+    for t in parts:
+        if t.shape[1] < width:
+            pad = torch.full(
+                (t.shape[0], width - t.shape[1]), value, dtype=t.dtype, device=t.device,
+            )
+            t = torch.cat([pad, t], dim=1)
+        widened.append(t)
+    return torch.cat(widened, dim=0)
+
+
 def _format_chat_prompt(tokenizer: Any, messages: list[dict[str, Any]]) -> str:
     """Format chat messages without silently dropping model turn markers."""
     if getattr(tokenizer, "chat_template", None):
@@ -83,6 +102,70 @@ def _format_chat_prompt(tokenizer: Any, messages: list[dict[str, Any]]) -> str:
     return tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True,
     )
+
+
+class _RayRolloutGroups:
+    """Prompt groups on the Ray vLLM replicas, the backend of ``StreamingRollout``.
+
+    All methods run on the rollout thread. A group's completions all go to one
+    replica, the one with the fewest groups in flight.
+    """
+
+    def __init__(self, trainer: RLTrainer, num_generations: int, use_filter: bool) -> None:
+        self._trainer = trainer
+        self._num_generations = num_generations
+        self._use_filter = use_filter
+        self._mgr = trainer._ray_rollout_mgr
+        self._servers = self._mgr.servers
+        want_lp = bool(trainer.config.policy.generation.vllm_cfg.calculate_log_probs)
+        self._sampling_params = trainer._ray_sampling_params(want_lp)
+        self._load = [0] * len(self._servers)
+        self._groups: dict[Any, tuple[int, str]] = {}
+
+    def submit(self, index: int) -> Any:
+        prompts, gts = self._trainer._get_prompts_range(index, 1)
+        [prompt_ids] = self._trainer._ray_rollout_prompt_ids(prompts)
+        replica = min(range(len(self._servers)), key=self._load.__getitem__)
+        handle = self._servers[replica].generate_batch.remote(
+            [prompt_ids] * self._num_generations, self._sampling_params,
+        )
+        self._load[replica] += 1
+        self._groups[handle] = (replica, gts[0])
+        return handle
+
+    def wait(self, handles: list[Any], timeout: float) -> list[Any]:
+        import ray
+
+        ready, _ = ray.wait(
+            handles, num_returns=len(handles), timeout=timeout, fetch_local=False,
+        )
+        return ready
+
+    def finish(self, handle: Any) -> tuple | None:
+        import ray
+
+        from lumenrl.algorithms.dapo_sampling import filter_groups_keep_mask
+
+        replica, gt = self._groups.pop(handle)
+        self._load[replica] -= 1
+        sequences, seq_mask, prompt_lengths, rollout_lp, ragged = (
+            self._trainer._assemble_ray_rollout(ray.get(handle))
+        )
+        gts = [gt] * self._num_generations
+        rewards, responses, accs = self._trainer._compute_rewards_full(
+            sequences, seq_mask, prompt_lengths, gts, verbose=False,
+        )
+        if self._use_filter:
+            _, kept = filter_groups_keep_mask(accs, [0] * self._num_generations)
+            if not kept:
+                return None
+        return sequences, seq_mask, prompt_lengths, rewards, responses, gts, rollout_lp, ragged
+
+    def pause(self) -> None:
+        self._mgr.pause_all(mode="keep", clear_cache=True)
+
+    def resume(self) -> None:
+        self._mgr.resume_all()
 
 
 class RLTrainer:
@@ -142,6 +225,8 @@ class RLTrainer:
         # generation rounds, not just steps).
         self._prompt_cursor: int = 0
         self._prompt_perm: Any = None
+        # Background generation of the next step (controller.ray.one_step_off_policy).
+        self._rollout_pipeline: Any = None
         # verl-aligned Ray rollout (ray_http transport); populated in setup.
         self._ray_use_vllm: bool = False
         self._ray_use_atom: bool = False
@@ -626,9 +711,62 @@ class RLTrainer:
         ``[batch, seq_len-1, num_layers, top_k]`` and align with the left-padded
         token/log-prob positions.
         """
+        want_lp = bool(self.config.policy.generation.vllm_cfg.calculate_log_probs)
+        expanded = [
+            ids
+            for ids in self._ray_rollout_prompt_ids(prompts)
+            for _ in range(num_generations)
+        ]
+        sp = dict(sampling_params) if sampling_params is not None else self._ray_sampling_params(want_lp)
+        if getattr(self._ray_vllm_engine, "_sleeping", False):
+            logger.info("Ray rollout engine sleeping before generation; refreshing weights before wake.")
+            self._sync_weights_ipc()
+        results = self._ray_vllm_engine.generate_tokens(expanded, sp)
+        return self._assemble_ray_rollout(results)
+
+    def _ray_rollout_prompt_ids(self, prompts: list[str]) -> list[list[int]]:
+        """Token ids the Ray rollout sends for each prompt.
+
+        Send pre-tokenized prompt_token_ids (verl's token-in path), NOT the
+        prompt string. A controlled A/B (identical prompts/params/seed/base
+        weights) showed vLLM's INTERNAL string tokenization diverges from the
+        token-in path even when the offline HF ids are identical: the string
+        path generated ~15% longer responses with 2.4x more cap-hits. Feeding
+        HF-tokenized ids (add_special_tokens=False, matching verl's
+        apply_chat_template(tokenize=True)) makes response length match verl.
+        """
+        max_prompt_len = min(
+            int(self.config.policy.max_total_sequence_length) // 2,
+            1024,
+        )
+        return [
+            list(
+                self._tokenizer(
+                    p,
+                    add_special_tokens=False,
+                    truncation=True,
+                    max_length=max_prompt_len,
+                )["input_ids"]
+            )
+            for p in prompts
+        ]
+
+    def _assemble_ray_rollout(
+        self, results: list[dict[str, Any]],
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        list[int],
+        torch.Tensor | None,
+        dict[str, list[Any]],
+    ]:
+        """Left-pad the replicas' token-out results into one block of rows.
+
+        Returns ``(sequences, seq_mask, prompt_lengths, rollout_log_probs,
+        ragged)`` in the order of ``results``.
+        """
         vcfg = self.config.policy.generation.vllm_cfg
-        tok = self._tokenizer
-        pad_id = tok.pad_token_id or 0
+        pad_id = self._tokenizer.pad_token_id or 0
         want_lp = bool(vcfg.calculate_log_probs)
         # Megatron MILES R3 uses ``enabled`` while the FSDP replay path uses
         # ``rollout_replay``. Both consume the same per-completion expert ids,
@@ -637,33 +775,6 @@ class RLTrainer:
             getattr(self.config.moe.r3, "enabled", False)
             or self._r3_rollout_replay
         )
-
-        # Send pre-tokenized prompt_token_ids (verl's token-in path), NOT the
-        # prompt string. A controlled A/B (identical prompts/params/seed/base
-        # weights) showed vLLM's INTERNAL string tokenization diverges from the
-        # token-in path even when the offline HF ids are identical: the string
-        # path generated ~15% longer responses with 2.4x more cap-hits. Feeding
-        # HF-tokenized ids (add_special_tokens=False, matching verl's
-        # apply_chat_template(tokenize=True)) makes response length match verl.
-        expanded: list[list[int]] = []
-        max_prompt_len = min(
-            int(self.config.policy.max_total_sequence_length) // 2,
-            1024,
-        )
-        for p in prompts:
-            ids = self._tokenizer(
-                p,
-                add_special_tokens=False,
-                truncation=True,
-                max_length=max_prompt_len,
-            )["input_ids"]
-            expanded.extend([list(ids)] * num_generations)
-
-        sp = dict(sampling_params) if sampling_params is not None else self._ray_sampling_params(want_lp)
-        if getattr(self._ray_vllm_engine, "_sleeping", False):
-            logger.info("Ray rollout engine sleeping before generation; refreshing weights before wake.")
-            self._sync_weights_ipc()
-        results = self._ray_vllm_engine.generate_tokens(expanded, sp)
 
         # Assemble left-padded prompt + response into a single tensor block.
         seqs_tok: list[list[int]] = []
@@ -2208,12 +2319,15 @@ class RLTrainer:
         attention_mask: torch.Tensor,
         prompt_lengths: list[int],
         gts_expanded: list[str],
+        verbose: bool = True,
     ) -> tuple[torch.Tensor, list[str], list[float]]:
         """Compute rewards + accuracy on the FULL (unsharded) rollout set.
 
         Rank 0 decodes and scores; ``rewards`` and ``acc`` are broadcast so every
         rank can run identical dynamic-sampling filtering. Returns
-        ``(rewards [N] on device, responses, acc [N] floats)``.
+        ``(rewards [N] on device, responses, acc [N] floats)``. ``verbose=False``
+        drops the per-call reward and sample log lines, for callers that score
+        one prompt group at a time.
         """
         from lumenrl.rewards.math_reward import compute_math_reward
 
@@ -2235,40 +2349,9 @@ class RLTrainer:
                 [1.0 if d["acc"] else 0.0 for d in details],
                 dtype=torch.float32, device=self._device,
             )
-            acc_frac = float(accs.mean().item()) if N else 0.0
-            logger.info("Rollout reward: N=%d accuracy=%.4f mean=%.4f", N, acc_frac, float(rewards.mean().item()))
-            max_response_length = int(
-                getattr(self.config.policy, "max_response_length", 0) or 0
-            )
-            cap_hits = sum(
-                length >= max_response_length
-                for length in response_lengths
-            ) if max_response_length > 0 else 0
-            invalid = sum(
-                detail.get("pred") == "[INVALID]" for detail in details
-            )
-            mean_length = (
-                sum(response_lengths) / len(response_lengths)
-                if response_lengths else 0.0
-            )
-            logger.info(
-                "Rollout response diagnostics: tokens_mean=%.1f tokens_max=%d "
-                "cap_hits=%d/%d invalid_format=%d/%d",
-                mean_length,
-                max(response_lengths, default=0),
-                cap_hits,
-                N,
-                invalid,
-                N,
-            )
-            for idx in range(min(2, len(responses), len(details))):
-                logger.info(
-                    "Rollout sample[%d]: tokens=%d pred=%r gt=%r tail=%r",
-                    idx,
-                    response_lengths[idx],
-                    details[idx].get("pred", "N/A"),
-                    gts_expanded[idx] if idx < len(gts_expanded) else "?",
-                    responses[idx][-400:],
+            if verbose:
+                self._log_rollout_diagnostics(
+                    rewards, accs, responses, response_lengths, details, gts_expanded,
                 )
         else:
             rewards = torch.zeros(N, dtype=torch.float32, device=self._device)
@@ -2278,6 +2361,52 @@ class RLTrainer:
             torch.distributed.broadcast(rewards, src=0)
             torch.distributed.broadcast(accs, src=0)
         return rewards, responses, accs.tolist()
+
+    def _log_rollout_diagnostics(
+        self,
+        rewards: torch.Tensor,
+        accs: torch.Tensor,
+        responses: list[str],
+        response_lengths: list[int],
+        details: list[dict[str, Any]],
+        gts_expanded: list[str],
+    ) -> None:
+        N = len(responses)
+        acc_frac = float(accs.mean().item()) if N else 0.0
+        logger.info("Rollout reward: N=%d accuracy=%.4f mean=%.4f", N, acc_frac, float(rewards.mean().item()))
+        max_response_length = int(
+            getattr(self.config.policy, "max_response_length", 0) or 0
+        )
+        cap_hits = sum(
+            length >= max_response_length
+            for length in response_lengths
+        ) if max_response_length > 0 else 0
+        invalid = sum(
+            detail.get("pred") == "[INVALID]" for detail in details
+        )
+        mean_length = (
+            sum(response_lengths) / len(response_lengths)
+            if response_lengths else 0.0
+        )
+        logger.info(
+            "Rollout response diagnostics: tokens_mean=%.1f tokens_max=%d "
+            "cap_hits=%d/%d invalid_format=%d/%d",
+            mean_length,
+            max(response_lengths, default=0),
+            cap_hits,
+            N,
+            invalid,
+            N,
+        )
+        for idx in range(min(2, len(responses), len(details))):
+            logger.info(
+                "Rollout sample[%d]: tokens=%d pred=%r gt=%r tail=%r",
+                idx,
+                response_lengths[idx],
+                details[idx].get("pred", "N/A"),
+                gts_expanded[idx] if idx < len(gts_expanded) else "?",
+                responses[idx][-400:],
+            )
 
     def _collect_rollout_batch(
         self, step: int, num_generations: int,
@@ -2392,22 +2521,11 @@ class RLTrainer:
         if not acc_rows:
             raise RuntimeError("filter_groups collected no valid groups; check data difficulty / max_num_gen_batches.")
 
-        # LEFT-pad every round to a common sequence length and concatenate.
-        # Sequences are left-padded (real tokens at the right end), so widening
-        # must prepend pad columns to preserve right-alignment for pack_sequences.
-        S_max = max(t.shape[1] for t in acc_rows)
         pad_id = self._tokenizer.pad_token_id or 0
-
-        def _lpad(t: torch.Tensor, width: int, value: float) -> torch.Tensor:
-            if t.shape[1] >= width:
-                return t[:, t.shape[1] - width:]
-            pad = torch.full((t.shape[0], width - t.shape[1]), value, dtype=t.dtype, device=t.device)
-            return torch.cat([pad, t], dim=1)
-
-        sequences = torch.cat([_lpad(t, S_max, pad_id) for t in acc_rows], dim=0)
-        seq_mask = torch.cat([_lpad(t, S_max, 0) for t in acc_mask], dim=0)
+        sequences = _merge_left_padded(acc_rows, pad_id)
+        seq_mask = _merge_left_padded(acc_mask, 0)
         rewards = torch.cat(acc_rewards, dim=0)
-        rollout_lp = torch.cat([_lpad(t, S_max - 1, 0.0) for t in acc_lp], dim=0) if acc_lp else None
+        rollout_lp = _merge_left_padded(acc_lp, 0.0) if acc_lp else None
 
         # Truncate to exactly train_prompts groups (whole groups of g rows each).
         keep_rows = train_prompts * g
@@ -3228,11 +3346,7 @@ class RLTrainer:
         if start_step > 0:
             logger.info("[rank %d] Skipping steps 0..%d (resuming from checkpoint).", self._rank, start_step - 1)
 
-        # Advance the dynamic-sampling prompt cursor to roughly where a resumed
-        # run left off (per-round granularity; exact alignment isn't required).
-        _train_prompts = max(1, self.config.policy.train_global_batch_size // max(1, num_generations))
-        _gp = int(self.config.policy.gen_batch_size) if self.config.policy.gen_batch_size > 0 else _train_prompts
-        self._prompt_cursor = start_step * _gp
+        self._prompt_cursor = self._resume_prompt_cursor(start_step, num_generations)
 
         # On resume, push the restored actor weights to the rollout engine BEFORE
         # the first rollout. Otherwise the engine would start from the base model
@@ -4142,6 +4256,7 @@ class RLTrainer:
         num_generations = _algo_num_generations(self.config)
         total_steps = int(self.config.num_training_steps)
         start_step = self._resume_step
+        self._prompt_cursor = self._resume_prompt_cursor(start_step, num_generations)
         use_ray_rollout = bool(
             (getattr(self, "_ray_use_vllm", False) or getattr(self, "_ray_use_atom", False))
             and self._ray_vllm_engine is not None
@@ -4151,6 +4266,25 @@ class RLTrainer:
             if use_ray_rollout:
                 logger.info("Resume: syncing restored actor weights to Ray rollout before first rollout.")
                 self._sync_weights_ipc()
+
+        # Policy version loaded in the rollout engine, counted in optimizer steps.
+        rollout_version = start_step
+        pipeline_mode = self._resolve_rollout_pipeline(use_ray_rollout)
+        if pipeline_mode == "one_step" and start_step < total_steps:
+            from lumenrl.trainer.one_step_off_policy import OneStepOffPolicyRollout
+
+            self._rollout_pipeline = OneStepOffPolicyRollout(
+                lambda s: self._collect_rollout_batch(s, num_generations), total_steps,
+            )
+            self._rollout_pipeline.submit(start_step, rollout_version)
+            logger.info(
+                "One-step off-policy: each step's batch generates on the rollout pool "
+                "while the previous step trains."
+            )
+        elif pipeline_mode == "fully_async" and start_step < total_steps:
+            self._rollout_pipeline = self._start_streaming_rollout(
+                num_generations, rollout_version,
+            )
 
         for step in range(start_step, total_steps):
             step_start = time.time()
@@ -4163,7 +4297,13 @@ class RLTrainer:
             # ---- rollout ----
             gen_t0 = time.time()
             rollout_lp = None
-            if use_ray_rollout:
+            if self._rollout_pipeline is not None:
+                rollout, gen_time, async_metrics = self._rollout_pipeline.take(
+                    step, rollout_version,
+                )
+                (sequences, seq_mask, prompt_lengths, rewards, responses,
+                 ground_truths_expanded, rollout_lp, rollout_ragged) = rollout
+            elif use_ray_rollout:
                 # verl-aligned online rollout across colocated replicas, with
                 # DAPO filter_groups dynamic sampling handled in the collector.
                 (sequences, seq_mask, prompt_lengths, rewards, responses,
@@ -4177,7 +4317,8 @@ class RLTrainer:
                 rewards, responses = None, None
                 ground_truths_expanded = ground_truths * num_generations
                 rollout_ragged = {}
-            gen_time = time.time() - gen_t0
+            if self._rollout_pipeline is None:
+                gen_time = time.time() - gen_t0
 
             _rc_cfg_ray = self.config.quantization.rollout_correction
             _bypass_ray = getattr(_rc_cfg_ray, "bypass_mode", False)
@@ -4353,15 +4494,25 @@ class RLTrainer:
                         )
 
             # ---- weight sync to rollout engine ----
+            pipeline = self._rollout_pipeline
+            sync_now = pipeline is None or pipeline.sync_due()
+            if pipeline is not None:
+                if sync_now:
+                    async_metrics["async/trainer_wait_s"] += pipeline.before_sync()
+                metrics.update(async_metrics)
             t_sync = time.time()
-            if getattr(self.config.weight_sync, "enabled", True):
+            if sync_now and getattr(self.config.weight_sync, "enabled", True):
                 if use_ray_rollout:
                     self._sync_weights_ipc()   # wake weights -> ZMQ IPC -> wake KV
+                    rollout_version = step + 1
                 else:
                     self._sync_rollout_weights()
+            if pipeline is not None and sync_now:
+                pipeline.after_sync(rollout_version)
             sync_time = time.time() - t_sync
             metrics["timing/weight_sync_s"] = sync_time
-            metrics.update(self._last_weight_sync_metrics)
+            if sync_now:
+                metrics.update(self._last_weight_sync_metrics)
             metrics.update(self._collect_actor_memory_metrics())
 
             # Validation uses the rollout engine too, so run it after the fresh
@@ -4369,7 +4520,8 @@ class RLTrainer:
             val_t0 = time.time()
             val_steps = getattr(self.config, 'val_steps', 0)
             if val_steps > 0 and (step + 1) % val_steps == 0:
-                val_metrics = self.run_validation()
+                with pipeline.submissions_paused() if pipeline is not None else nullcontext():
+                    val_metrics = self.run_validation()
                 metrics.update(val_metrics)
             val_time = time.time() - val_t0
 
@@ -4403,9 +4555,127 @@ class RLTrainer:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+        if self._rollout_pipeline is not None:
+            self._rollout_pipeline.close()
+            self._rollout_pipeline = None
         for cb in self.callbacks:
             cb.on_train_end(self)
         logger.info("RLTrainer.train (ray-controller) finished after %d steps.", total_steps)
+
+    def _resume_prompt_cursor(self, start_step: int, num_generations: int) -> int:
+        """Roughly where a run resumed at ``start_step`` left the prompt cursor.
+
+        One generation round of ``gen_batch_size`` prompts per step; exact
+        alignment isn't required, only not replaying the prompts already seen.
+        """
+        pol = self.config.policy
+        train_prompts = max(1, pol.train_global_batch_size // max(1, num_generations))
+        gen_prompts = int(pol.gen_batch_size) if pol.gen_batch_size > 0 else train_prompts
+        return start_step * gen_prompts
+
+    def _resolve_rollout_pipeline(self, use_ray_rollout: bool) -> str:
+        """``sync``, ``one_step`` or ``fully_async``; reject layouts that cannot overlap."""
+        ray_cfg = self.config.controller.ray
+        one_step = bool(getattr(ray_cfg, "one_step_off_policy", False))
+        fully_async = bool(getattr(getattr(ray_cfg, "fully_async", None), "enabled", False))
+        if not one_step and not fully_async:
+            return "sync"
+        if one_step and fully_async:
+            raise ValueError(
+                "controller.ray.one_step_off_policy and controller.ray.fully_async.enabled "
+                "are alternatives; set one of them."
+            )
+        name = "controller.ray.fully_async" if fully_async else "controller.ray.one_step_off_policy"
+        if not use_ray_rollout or getattr(self, "_rollout_wg", None) is None:
+            raise ValueError(
+                f"{name} generates while the trainer trains, so the rollout needs "
+                "GPUs of its own: set controller.ray.rollout.num_workers > 0 with a "
+                "Ray vLLM or ATOM rollout."
+            )
+        if getattr(self._ray_vllm_engine, "enable_sleep", False):
+            raise ValueError(
+                f"{name} keeps the rollout generating while the trainer runs, so it "
+                "cannot sleep between steps: turn off enable_sleep_mode for the "
+                "rollout engine."
+            )
+        if not fully_async:
+            return "one_step"
+        if not getattr(self, "_ray_use_vllm", False):
+            raise ValueError(
+                "controller.ray.fully_async needs the vLLM rollout: it pauses the engine "
+                "around weight syncs, which the ATOM rollout does not expose."
+            )
+        if self._r3_rollout_replay or getattr(self.config.moe.r3, "enabled", False):
+            raise ValueError(
+                "controller.ray.fully_async does not carry R3 rollout routing across "
+                "a weight sync yet; turn off moe.r3."
+            )
+        return "fully_async"
+
+    def _start_streaming_rollout(self, num_generations: int, rollout_version: int) -> Any:
+        from lumenrl.trainer.fully_async_rollout import StreamingRollout
+
+        fa_cfg = self.config.controller.ray.fully_async
+        pol = self.config.policy
+        groups_per_step = max(1, pol.train_global_batch_size // num_generations)
+        mgr = self._ray_rollout_mgr
+        max_inflight = int(fa_cfg.max_inflight_groups) or mgr.num_replicas * max(
+            1, int(pol.generation.vllm_cfg.max_num_seqs) // num_generations,
+        )
+        fg = (
+            getattr(self.config.algorithm.dapo, "filter_groups", None)
+            if self.config.algorithm.name.lower() == "dapo" else None
+        )
+        use_filter = bool(fg is not None and fg.enable)
+        # The synchronous loop gives up after max_num_gen_batches rounds of
+        # gen_batch_size prompts without one valid group; stop at the same count.
+        gen_prompts = int(pol.gen_batch_size) if pol.gen_batch_size > 0 else groups_per_step
+        max_drops = (
+            int(fg.max_num_gen_batches) * gen_prompts
+            if use_filter and fg.max_num_gen_batches > 0 else 0
+        )
+        pipeline = StreamingRollout(
+            _RayRolloutGroups(self, num_generations, use_filter),
+            self._merge_rollout_groups,
+            groups_per_step=groups_per_step,
+            sync_every=int(fa_cfg.trigger_parameter_sync_step),
+            staleness_threshold=float(fa_cfg.staleness_threshold),
+            max_inflight=max_inflight,
+            partial_rollout=bool(fa_cfg.partial_rollout),
+            max_consecutive_drops=max_drops,
+            start_version=rollout_version,
+            start_index=self._prompt_cursor,
+        )
+        pipeline.start()
+        logger.info(
+            "Fully async rollout: %d prompt groups per step, weight sync every %d "
+            "steps, staleness_threshold=%.2f, partial_rollout=%s, up to %d groups "
+            "in flight, filter_groups=%s.",
+            groups_per_step, int(fa_cfg.trigger_parameter_sync_step),
+            float(fa_cfg.staleness_threshold), bool(fa_cfg.partial_rollout),
+            max_inflight, use_filter,
+        )
+        return pipeline
+
+    def _merge_rollout_groups(self, groups: list[tuple]) -> tuple:
+        """Stack prompt groups into the tuple ``_collect_rollout_batch`` returns."""
+        pad_id = self._tokenizer.pad_token_id or 0
+        log_probs = [g[6] for g in groups]
+        ragged: dict[str, list[Any]] = {}
+        for g in groups:
+            for key, rows in g[7].items():
+                ragged.setdefault(key, []).extend(rows)
+        return (
+            _merge_left_padded([g[0] for g in groups], pad_id),
+            _merge_left_padded([g[1] for g in groups], 0),
+            [length for g in groups for length in g[2]],
+            torch.cat([g[3] for g in groups], dim=0),
+            [response for g in groups for response in g[4]],
+            [gt for g in groups for gt in g[5]],
+            _merge_left_padded(log_probs, 0.0)
+            if all(lp is not None for lp in log_probs) else None,
+            ragged,
+        )
 
     def _sync_rollout_weights(self) -> None:
         """Sync actor weights to ATOM rollout engine if configured."""
@@ -4593,6 +4863,9 @@ class RLTrainer:
             except Exception:
                 pass
             self._profiler = None
+        if self._rollout_pipeline is not None:
+            self._rollout_pipeline.close()
+            self._rollout_pipeline = None
         if (
             self._ray_rollout_mgr is not None
             and getattr(self._ray_rollout_mgr, "rdma_group_name", None)

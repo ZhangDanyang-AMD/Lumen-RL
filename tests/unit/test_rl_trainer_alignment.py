@@ -175,6 +175,96 @@ def test_compute_rewards_full_logs_response_diagnostics(caplog) -> None:
     assert "invalid_format=0/1" in caplog.text
 
 
+def test_compute_rewards_full_can_score_quietly(caplog) -> None:
+    caplog.set_level(logging.INFO, logger="lumenrl.trainer.rl_trainer")
+
+    class Tokenizer:
+        @staticmethod
+        def decode(token_ids, *, skip_special_tokens):
+            return "Answer: " + r"\boxed{437}"
+
+    trainer = object.__new__(RLTrainer)
+    trainer._rank = 0
+    trainer._tokenizer = Tokenizer()
+    trainer._device = torch.device("cpu")
+    trainer._is_distributed = False
+    trainer.config = SimpleNamespace(policy=SimpleNamespace(max_response_length=2))
+
+    rewards, _, accs = trainer._compute_rewards_full(
+        sequences=torch.tensor([[11, 21, 22]]),
+        attention_mask=torch.tensor([[1, 1, 1]]),
+        prompt_lengths=[1],
+        gts_expanded=["437"],
+        verbose=False,
+    )
+
+    assert accs == [1.0]
+    assert rewards.shape == (1,)
+    assert caplog.text == ""
+
+
+def test_ray_controller_resume_skips_the_prompts_already_generated() -> None:
+    trainer = object.__new__(RLTrainer)
+    trainer.config = SimpleNamespace(
+        policy=SimpleNamespace(train_global_batch_size=2048, gen_batch_size=384),
+        algorithm=SimpleNamespace(name="dapo", dapo=SimpleNamespace(num_generations=16)),
+        num_training_steps=60,
+        controller=SimpleNamespace(ray=SimpleNamespace(one_step_off_policy=False)),
+    )
+    trainer._algorithm = object()
+    trainer._actor_wg = object()
+    trainer._atom_engine = None
+    trainer._ray_vllm_engine = SimpleNamespace(enable_sleep=False)
+    trainer._resume_step = 60
+    trainer._prompt_cursor = 0
+    trainer._rollout_pipeline = None
+    trainer.callbacks = []
+
+    trainer._train_with_ray_controller()  # resumes at the last step: no step runs
+
+    assert trainer._prompt_cursor == 60 * 384
+
+
+def test_merge_left_padded_widens_narrow_blocks_in_front() -> None:
+    merged = rl_trainer._merge_left_padded(
+        [torch.tensor([[1, 2, 3]]), torch.tensor([[4]])], value=0,
+    )
+
+    assert merged.tolist() == [[1, 2, 3], [0, 0, 4]]
+
+
+def test_assemble_ray_rollout_left_pads_and_aligns_log_probs() -> None:
+    class Tokenizer:
+        pad_token_id = 9
+
+    trainer = object.__new__(RLTrainer)
+    trainer._tokenizer = Tokenizer()
+    trainer._device = torch.device("cpu")
+    trainer.config = SimpleNamespace(
+        policy=SimpleNamespace(
+            generation=SimpleNamespace(vllm_cfg=SimpleNamespace(calculate_log_probs=True)),
+        ),
+        moe=SimpleNamespace(r3=SimpleNamespace(enabled=False, rollout_replay=False)),
+    )
+
+    sequences, mask, prompt_lengths, log_probs, ragged = trainer._assemble_ray_rollout(
+        [
+            {"prompt_token_ids": [1, 2], "token_ids": [3], "logprobs": [-0.1]},
+            {"prompt_token_ids": [5], "token_ids": [6, 7, 8], "logprobs": [-0.2, -0.3, -0.4]},
+        ]
+    )
+
+    assert sequences.tolist() == [[9, 1, 2, 3], [5, 6, 7, 8]]
+    assert mask.tolist() == [[0, 1, 1, 1], [1, 1, 1, 1]]
+    assert prompt_lengths == [2, 1]
+    # Column t holds the log-prob of token t + 1.
+    torch.testing.assert_close(
+        log_probs,
+        torch.tensor([[0.0, 0.0, -0.1], [-0.2, -0.3, -0.4]]),
+    )
+    assert ragged == {}
+
+
 def test_extract_prompt_gt_uses_dsv4_encoder_and_label(monkeypatch) -> None:
     calls = []
 

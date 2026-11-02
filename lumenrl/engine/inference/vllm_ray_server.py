@@ -448,6 +448,21 @@ class VLLMRayServer:
         await self.engine.reset_prefix_cache()
         return True
 
+    async def pause_generation(self, mode: str = "keep", clear_cache: bool = True) -> bool:
+        """Stop scheduling until :meth:`resume_generation`, e.g. around a weight load.
+
+        ``keep`` freezes in-flight requests instead of aborting them. With
+        ``clear_cache`` vLLM also preempts them and drops their KV, so on resume
+        they re-prefill prompt plus generated tokens on whatever weights are
+        loaded by then.
+        """
+        await self.engine.pause_generation(mode=mode, clear_cache=clear_cache)
+        return True
+
+    async def resume_generation(self) -> bool:
+        await self.engine.resume_generation()
+        return True
+
     async def wait_for_requests_to_drain(self, timeout_s: float = 60.0) -> bool:
         """Best-effort wait until no unfinished requests remain."""
         deadline = asyncio.get_event_loop().time() + timeout_s
@@ -655,6 +670,14 @@ class VLLMReplicaManager:
     def drain_all(self) -> None:
         import ray
         ray.get([s.wait_for_requests_to_drain.remote() for s in self.servers])
+
+    def pause_all(self, mode: str = "keep", clear_cache: bool = True) -> None:
+        import ray
+        ray.get([s.pause_generation.remote(mode, clear_cache) for s in self.servers])
+
+    def resume_all(self) -> None:
+        import ray
+        ray.get([s.resume_generation.remote() for s in self.servers])
 
     def reload_weights_from_path(self, weight_dir: str) -> None:
         """Reload weights one replica at a time.
