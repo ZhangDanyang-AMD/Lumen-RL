@@ -6,6 +6,7 @@ An AMD native **Post-Training Framework for LLMs**, powered by [Lumen](https://g
 
 ## 📢 News
 
+- **[2026/11]** LumenRL now supports **diffusion RL: Qwen-Image full-parameter FlowGRPO** on 8× MI350X — verl-omni's official recipe (VeOmni training, vLLM-Omni rollout) reaches validation reward 0.978 at step 300 (official reference best 0.975), and Lumen patches on the actor cut actor time by 8% ([example](examples/QwenImage_FlowGRPO/README.md))
 - **[2026/09]** The ATOM-side fixes LumenRL's rollout depends on — FP8 expert weight synchronization and CUDA graph release across sleep/wake — are **merged into upstream [ROCm/ATOM](https://github.com/ROCm/ATOM) `main`** ([#2028](https://github.com/ROCm/ATOM/pull/2028)), so ATOM is now pinned to a main commit instead of a PR head
 - **[2026/07]** LumenRL now supports **MoE RL training (Qwen3-30B-A3B)** — fused routing + aux loss, R3 router alignment for stable MoE RL training
 - **[2026/07]** LumenRL now supports **Megatron-Core training backend** — TP/EP/DP parallelism with distributed optimizer and sequence parallelism
@@ -43,6 +44,7 @@ An AMD native **Post-Training Framework for LLMs**, powered by [Lumen](https://g
 - **Speculative Decoding Draft Distillation (SDDD)**: Train Eagle3/DSpark draft models via teacher hidden-state distillation with [Mooncake](https://github.com/kvcache-ai/Mooncake)/MORI RDMA transfer
 - **Training-Inference Separation**: Decoupled training and inference onto independent GPU groups for improved resource utilization and scalability
 - **Flexible Backends**: FSDP2 or Megatron-Core training, ATOM/SGLang/vLLM inference with TP/EP/DP parallelism
+- **Diffusion RL**: Qwen-Image full-parameter FlowGRPO on [verl-omni](https://github.com/verl-project/verl-omni) (VeOmni training, vLLM-Omni rollout) with Lumen actor patches, matching the official reference on 8× MI350X
 
 ## Architecture
 
@@ -56,7 +58,7 @@ An AMD native **Post-Training Framework for LLMs**, powered by [Lumen](https://g
 |---|---|
 | **Training Backends** | FSDP2, Megatron-Core — with Lumen quantized training and AITER kernels |
 | **Inference Engine** | ATOM / SGLang / vLLM — quantized rollout, MoE expert parallel, speculative decoding, piecewise torch.compile |
-| **RL Algorithms** | GRPO, DAPO, PPO |
+| **RL Algorithms** | GRPO, DAPO, PPO; FlowGRPO for diffusion models (Qwen-Image, via verl-omni) |
 | **SDDD** | Eagle3/DSpark draft distillation, Mooncake/MORI RDMA hidden-state transfer |
 | **Quantization** | FP8 (blockwise W8A8), MXFP8, MXFP4, FP8 KV-cache, FP8 training (hybrid E4M3/E5M2), rollout correction (TIS/MIS) |
 | **MoE** | R3 router alignment, fused routing + aux loss |
