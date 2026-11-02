@@ -589,11 +589,27 @@ class RLTrainer:
         self._ray_vllm_engine = VLLMHttpEngine(
             mgr, sleep_level=int(vcfg.sleep_level), enable_sleep=bool(vcfg.enable_sleep_mode),
         )
+        weight_backend = str(getattr(self.config.weight_sync, "backend", "auto"))
+        if weight_backend == "rdma":
+            # Built once at startup and held for the run: the RCCL group is
+            # persistent, so per-step sync is a broadcast rather than a
+            # rendezvous. Mirrors _setup_ray_vllm_rollout.
+            rdma_cfg = self.config.weight_sync.rdma
+            group_name = f"lumen-atom-rdma-weights-{os.getpid()}"
+            mgr.init_rdma_weight_group(
+                self._actor_wg,
+                interface=str(rdma_cfg.interface),
+                hca=str(rdma_cfg.hca),
+                require_rdma=bool(rdma_cfg.require_rdma),
+                timeout_s=int(self.config.weight_sync.timeout_s),
+                group_name=group_name,
+            )
         logger.info(
-            "Ray ATOM rollout ready: %d colocated replicas (TP=%d, online_quant=%s, ZMQ IPC weight sync).",
+            "Ray ATOM rollout ready: %d colocated replicas (TP=%d, online_quant=%s, weight_sync=%s).",
             mgr.num_replicas,
             int(engine_kwargs["tensor_parallel_size"]),
             engine_kwargs.get("online_quant_config"),
+            weight_backend,
         )
 
     @property
