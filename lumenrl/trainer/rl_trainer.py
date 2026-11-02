@@ -3812,6 +3812,7 @@ class RLTrainer:
             # Comprehensive data metrics (verl/trainer/ppo/metric_utils.py L89-268)
             try:
                 from lumenrl.trainer.metric_utils import compute_data_metrics
+                batch.meta["max_response_length"] = int(self.config.policy.max_response_length)
                 _data_m = compute_data_metrics(batch, use_critic=self._critic_worker is not None)
                 metrics.update(_data_m)
             except Exception:
@@ -4188,6 +4189,7 @@ class RLTrainer:
             - int(self.config.policy.max_response_length),
         )
         batch.meta["max_prompt_length"] = max_prompt_length
+        batch.meta["max_response_length"] = int(self.config.policy.max_response_length)
         metrics.update(compute_data_metrics(batch, use_critic=self._critic_worker is not None))
         metrics.update(compute_timing_metrics(batch, timing_raw))
 
