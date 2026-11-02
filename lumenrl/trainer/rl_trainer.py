@@ -126,8 +126,8 @@ class _RayRolloutGroups:
         prompts, gts = self._trainer._get_prompts_range(index, 1)
         [prompt_ids] = self._trainer._ray_rollout_prompt_ids(prompts)
         replica = min(range(len(self._servers)), key=self._load.__getitem__)
-        handle = self._servers[replica].generate_batch.remote(
-            [prompt_ids] * self._num_generations, self._sampling_params,
+        handle = self._servers[replica].generate_group.remote(
+            prompt_ids, self._num_generations, self._sampling_params,
         )
         self._load[replica] += 1
         self._groups[handle] = (replica, gts[0])
@@ -4661,10 +4661,16 @@ class RLTrainer:
             )
         if not fully_async:
             return "one_step"
-        if not getattr(self, "_ray_use_vllm", False):
+        if getattr(self, "_ray_use_atom", False):
+            if bool(getattr(ray_cfg.fully_async, "partial_rollout", False)):
+                raise ValueError(
+                    "controller.ray.fully_async.partial_rollout needs the vLLM rollout: "
+                    "ATOM cannot pause requests in flight across a weight sync. Set "
+                    "partial_rollout=false to let each sync wait for them instead."
+                )
+        elif not getattr(self, "_ray_use_vllm", False):
             raise ValueError(
-                "controller.ray.fully_async needs the vLLM rollout: it pauses the engine "
-                "around weight syncs, which the ATOM rollout does not expose."
+                "controller.ray.fully_async needs the Ray vLLM or ATOM rollout."
             )
         if self._r3_rollout_replay or getattr(self.config.moe.r3, "enabled", False):
             raise ValueError(

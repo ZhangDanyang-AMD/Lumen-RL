@@ -291,18 +291,21 @@ def test_merge_rollout_groups_stacks_groups_of_different_widths() -> None:
     assert ragged == {"rollout_routing": [1, 1, 2, 2]}
 
 
-def _layout_trainer(*, one_step=False, vllm=True, r3=False) -> RLTrainer:
+def _layout_trainer(
+    *, one_step=False, vllm=True, atom=False, partial=False, r3=False,
+) -> RLTrainer:
     trainer = object.__new__(RLTrainer)
     trainer.config = SimpleNamespace(
         controller=SimpleNamespace(ray=SimpleNamespace(
             one_step_off_policy=one_step,
-            fully_async=SimpleNamespace(enabled=True),
+            fully_async=SimpleNamespace(enabled=True, partial_rollout=partial),
         )),
         moe=SimpleNamespace(r3=SimpleNamespace(enabled=r3, rollout_replay=False)),
     )
     trainer._rollout_wg = object()
     trainer._ray_vllm_engine = SimpleNamespace(enable_sleep=False)
     trainer._ray_use_vllm = vllm
+    trainer._ray_use_atom = atom
     return trainer
 
 
@@ -310,11 +313,18 @@ def test_layout_check_accepts_fully_async_on_a_separate_vllm_pool() -> None:
     assert _layout_trainer()._resolve_rollout_pipeline(True) == "fully_async"
 
 
+def test_layout_check_accepts_atom_when_syncs_wait_for_the_groups_in_flight() -> None:
+    trainer = _layout_trainer(vllm=False, atom=True, partial=False)
+
+    assert trainer._resolve_rollout_pipeline(True) == "fully_async"
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
         ({"one_step": True}, "are alternatives"),
-        ({"vllm": False}, "needs the vLLM rollout"),
+        ({"vllm": False}, "needs the Ray vLLM or ATOM rollout"),
+        ({"vllm": False, "atom": True, "partial": True}, "partial_rollout needs the vLLM"),
         ({"r3": True}, "R3 rollout routing"),
     ],
 )
@@ -330,8 +340,8 @@ def test_ray_backend_sends_a_group_to_the_least_loaded_replica_and_filters_it(
 
     class Server:
         def __init__(self, name):
-            self.generate_batch = SimpleNamespace(
-                remote=lambda prompts, sp: (name, len(prompts)),
+            self.generate_group = SimpleNamespace(
+                remote=lambda prompt, n, sp: (name, n),
             )
 
     accs = {"r0": [1.0, 1.0], "r1": [1.0, 0.0]}
