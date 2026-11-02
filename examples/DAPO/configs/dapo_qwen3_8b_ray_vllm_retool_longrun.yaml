@@ -2,10 +2,11 @@
 #
 # The smoke config (dapo_qwen3_8b_ray_vllm_retool_smoke.yaml) at about half the
 # scale of verl's ReTool 7B DAPO recipe: 32 prompts x 16 rollouts per step,
-# 8192-token responses (model turns and tool output together), up to 8
-# assistant turns. AIME24 validation every 10 steps samples each problem 32
-# times (the file repeats every problem 32 times) with verl's val_kwargs
-# (temperature 1.0, top_p 0.6).
+# 16384-token responses as in verl's recipe (model turns and tool output
+# together), up to 8 assistant turns. The first runs used 8192, which cut off
+# 6% of the rollouts once responses grew past 3k tokens on average. AIME24
+# validation every 10 steps samples each problem 32 times (the file repeats
+# every problem 32 times) with verl's val_kwargs (temperature 1.0, top_p 0.6).
 #
 # 4 FSDP2 actors + 4 vLLM replicas; add controller.ray.fully_async.* to run it
 # fully async. Needs the post-trained Qwen3-8B and a SandboxFusion service at
@@ -31,12 +32,12 @@ policy:
   model_name: "${oc.env:DATA_ROOT}/models/Qwen3-8B"
   training_backend: fsdp2
   generation_backend: vllm
-  max_total_sequence_length: 9216      # prompt with the tool schema + response
-  max_response_length: 8192            # model turns and tool output together
+  max_total_sequence_length: 17408     # prompt with the tool schema + response
+  max_response_length: 16384           # model turns and tool output together
   train_global_batch_size: 512         # 32 prompts x 16 rollouts
   gen_batch_size: 64
   train_micro_batch_size: 1
-  max_token_len_per_gpu: 18432
+  max_token_len_per_gpu: 34816
   learning_rate: 1.0e-6
   lr_warmup_steps: 10
   weight_decay: 0.1
@@ -52,7 +53,7 @@ policy:
       transport: ray_http
       ray_http_start_server: false
       gpu_memory_utilization: 0.85
-      max_model_len: 9216
+      max_model_len: 17408
       dtype: bfloat16
       # run_dapo.sh sets TORCHDYNAMO_DISABLE=1, and vLLM's CUDA graphs need
       # torch.compile ("aot_compile is not supported" at engine start).
@@ -100,7 +101,7 @@ algorithm:
     dynamic_sampling: true
     token_level_pg: true
     overlong_reward_shaping: false
-    max_resp_len: 8192
+    max_resp_len: 16384
     filter_groups:
       enable: true
       metric: acc

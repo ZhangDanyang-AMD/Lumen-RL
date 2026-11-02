@@ -28,12 +28,12 @@ policy:
   model_name: "${oc.env:DATA_ROOT}/models/Qwen3-30B-A3B"
   training_backend: fsdp2
   generation_backend: vllm
-  max_total_sequence_length: 9216      # prompt with the tool schema + response
-  max_response_length: 8192            # model turns and tool output together
+  max_total_sequence_length: 17408     # prompt with the tool schema + response
+  max_response_length: 16384           # model turns and tool output together
   train_global_batch_size: 512         # 32 prompts x 16 rollouts
   gen_batch_size: 64
   train_micro_batch_size: 1
-  max_token_len_per_gpu: 18432
+  max_token_len_per_gpu: 22528
   learning_rate: 1.0e-6
   lr_warmup_steps: 10
   weight_decay: 0.1
@@ -50,7 +50,7 @@ policy:
       transport: ray_http
       ray_http_start_server: false
       gpu_memory_utilization: 0.85
-      max_model_len: 9216
+      max_model_len: 17408
       dtype: bfloat16
       # run_dapo.sh sets TORCHDYNAMO_DISABLE=1, and vLLM's CUDA graphs need
       # torch.compile ("aot_compile is not supported" at engine start).
@@ -102,7 +102,7 @@ algorithm:
     dynamic_sampling: true
     token_level_pg: true
     overlong_reward_shaping: false
-    max_resp_len: 8192
+    max_resp_len: 16384
     filter_groups:
       enable: true
       metric: acc
