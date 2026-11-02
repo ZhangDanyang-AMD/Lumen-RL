@@ -173,8 +173,20 @@ def receive_weight_stream(
     streamed_scales: bool = False,
     fingerprint_tracker=None,
     finalize_fingerprints: bool = True,
+    moe_router=None,
+    stage_on_cpu: bool = True,
 ) -> dict[str, Any]:
-    """Receive RCCL buckets and load them directly into a resident vLLM model."""
+    """Receive RCCL buckets and load them directly into a resident vLLM model.
+
+    ``moe_router`` (a ``FusedMoEWeightRouter``) loads the fused expert tensors
+    an FSDP2 trainer sends, which ``model.load_weights`` would drop.
+
+    ``stage_on_cpu`` hands the loader host copies instead of views of the
+    receive buffer. A loader that holds tensors past their bucket, such as
+    online FP8's layerwise reload, would otherwise keep every bucket's buffer
+    on the device. A loader that copies each tensor in as it arrives can take
+    the views and skip a device-to-host-to-device round trip per tensor.
+    """
     from lumenrl.engine.inference.vllm_fp8_utils import ReloadFingerprintTracker
 
     if not finalize_fingerprints and fingerprint_tracker is None:
@@ -197,10 +209,13 @@ def receive_weight_stream(
     total_buckets = 0
     started = time.perf_counter()
     last_source: dict[str, Any] | None = None
+    # wait_s covers the sender producing each bucket and the transfer itself.
+    timing = {"wait_s": 0.0, "stage_s": 0.0, "route_s": 0.0, "load_weights_s": 0.0}
 
     def received_weights():
         nonlocal total_bytes, total_weights, total_buckets, last_source
         while True:
+            t_wait = time.perf_counter()
             header = _broadcast_header(group, device=device)
             command, metadata_bytes, payload_bytes, version = [
                 int(x) for x in header.cpu().tolist()
@@ -225,6 +240,7 @@ def receive_weight_stream(
             metadata = json.loads(
                 bytes(metadata_tensor.cpu().tolist()).decode("utf-8")
             )
+            timing["wait_s"] += time.perf_counter() - t_wait
             total_bytes += payload_bytes
             total_weights += len(metadata)
             total_buckets += 1
@@ -233,12 +249,11 @@ def receive_weight_stream(
                 dtype = getattr(torch, entry["dtype"])
                 start = int(entry["offset"])
                 end = start + int(entry["nbytes"])
-                value = (
-                    payload[start:end]
-                    .view(dtype)
-                    .view(entry["shape"])
-                    .cpu()
-                )
+                value = payload[start:end].view(dtype).view(entry["shape"])
+                if stage_on_cpu:
+                    t_stage = time.perf_counter()
+                    value = value.cpu()
+                    timing["stage_s"] += time.perf_counter() - t_stage
                 if os.environ.get("LUMENRL_WEIGHT_SYNC_INTEGRITY", "0") == "1":
                     from lumenrl.engine.inference.weight_integrity import (
                         sampled_tensor_integrity,
@@ -251,7 +266,16 @@ def receive_weight_stream(
                             f"tensor={entry['name']}: {integrity}"
                         )
                 fingerprints.observe_source([(entry["name"], value)])
-                yield entry["name"], value
+                to_load = [(entry["name"], value)]
+                if moe_router is not None:
+                    t_route = time.perf_counter()
+                    to_load, moe_loaded = moe_router.route(to_load)
+                    loaded_names.update(moe_loaded)
+                    timing["route_s"] += time.perf_counter() - t_route
+                for item in to_load:
+                    t_load = time.perf_counter()
+                    yield item
+                    timing["load_weights_s"] += time.perf_counter() - t_load
 
     try:
         loaded = model.load_weights(received_weights())
@@ -304,6 +328,7 @@ def receive_weight_stream(
         "seconds": elapsed,
         "gbps": (total_bytes * 8 / 1e9 / elapsed) if elapsed > 0 else 0.0,
         "loaded_internal": float(len(loaded_names)),
+        **timing,
     }
     if finalize_fingerprints:
         stats["verification"] = fingerprints.finalize()

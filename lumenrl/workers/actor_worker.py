@@ -1127,6 +1127,13 @@ class LumenActorWorker(BaseWorker):
         if group is None:
             raise RuntimeError("RDMA weight group is not initialized")
 
+        if os.environ.get("LUMENRL_SYNC_FP32") != "1":
+            # The same FP32 -> BF16 cast as update_weights_ipc_send.
+            params = (
+                (name, t.to(torch.bfloat16) if t.dtype == torch.float32 else t)
+                for name, t in params
+            )
+
         integrity_enabled = bool(integrity_check) or os.environ.get(
             "LUMENRL_WEIGHT_SYNC_INTEGRITY", "0"
         ) == "1"
