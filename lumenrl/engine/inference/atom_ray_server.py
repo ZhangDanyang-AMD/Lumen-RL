@@ -57,6 +57,9 @@ class ATOMRayServer:
         # ATOM's preemption counter is cumulative; keep the last reading so
         # each batch can report its own.
         self._preemptions_seen = 0
+        # Set by the first generate_group(); from then on every request goes
+        # through it (see AtomGroupPump).
+        self._pump: Any = None
 
     async def launch(self) -> bool:
         from atom.rollout.async_engine import AsyncLLMEngine
@@ -228,8 +231,11 @@ class ATOMRayServer:
             )
 
         prompt_ids = list(prompt)
-        sp = self._build_sampling_params(sampling_params, prompt_length=len(prompt_ids))
         rid = request_id or uuid4().hex
+        if self._pump is not None:
+            [result] = await self._generate_on_pump(prompt_ids, 1, sampling_params, rid)
+            return result
+        sp = self._build_sampling_params(sampling_params, prompt_length=len(prompt_ids))
 
         def _generate_blocking():
             return self.engine.generate([prompt_ids], sp, request_ids=[rid])[0]
@@ -263,6 +269,13 @@ class ATOMRayServer:
             else:
                 grouped_prompts.append(prompt_ids)
                 grouped_counts.append(1)
+
+        if self._pump is not None:
+            groups = await asyncio.gather(*(
+                self._generate_on_pump(p, n, sampling_params)
+                for p, n in zip(grouped_prompts, grouped_counts)
+            ))
+            return [result for group in groups for result in group]
 
         request_ids = [uuid4().hex for _ in grouped_prompts]
         params = []
@@ -298,6 +311,50 @@ class ATOMRayServer:
                     ),
                 }
             )
+        return results
+
+    async def generate_group(
+        self,
+        prompt: list[int],
+        num_generations: int,
+        sampling_params: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """``num_generations`` completions of one prompt, safe to run concurrently.
+
+        ``engine.generate`` holds the engine until it is idle, so it serves one
+        batch at a time; streaming groups goes through an AtomGroupPump instead,
+        which every later request on this server shares.
+        """
+        if self.engine is None:
+            raise RuntimeError(
+                "ATOMRayServer.launch() must be called before generate_group()."
+            )
+        if self._pump is None:
+            from lumenrl.engine.inference.atom_group_pump import AtomGroupPump
+
+            self._pump = AtomGroupPump(self.engine)
+        return await self._generate_on_pump(list(prompt), num_generations, sampling_params)
+
+    async def _generate_on_pump(
+        self,
+        prompt_ids: list[int],
+        num_generations: int,
+        sampling_params: dict[str, Any],
+        request_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        sp = self._build_sampling_params(sampling_params, prompt_length=len(prompt_ids))
+        if num_generations > 1 and hasattr(sp, "n"):
+            sp.n = num_generations
+        outs = await self._pump.submit(prompt_ids, sp, request_id or uuid4().hex)
+        results = []
+        for out in outs:
+            logprobs = out.get("logprobs")
+            results.append({
+                "text": out.get("text", ""),
+                "prompt_token_ids": list(prompt_ids),
+                "token_ids": list(out.get("token_ids", [])),
+                "logprobs": [float(x) for x in logprobs] if logprobs is not None else None,
+            })
         return results
 
     def _log_kv_pressure(self) -> None:

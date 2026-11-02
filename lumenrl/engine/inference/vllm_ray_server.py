@@ -273,6 +273,15 @@ class VLLMRayServer:
         ]
         return await asyncio.gather(*tasks)
 
+    async def generate_group(
+        self,
+        prompt: list[int],
+        num_generations: int,
+        sampling_params: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """``num_generations`` completions of one prompt (AsyncLLM interleaves calls)."""
+        return await self.generate_batch([list(prompt)] * num_generations, sampling_params)
+
     async def collective_rpc(
         self, method: str, args: tuple = (), kwargs: Optional[dict] = None
     ) -> Any:
