@@ -188,6 +188,8 @@ On example 6 (Qwen3-30B-A3B-Base, DAPO, 8× MI355X), fully async on 4 + 4 GPUs r
 
 On two nodes (8 actors and 8 vLLM replicas, RCCL over RoCE) with `staleness_threshold: 2`, `max_num_seqs: 768` and `fully_async.overlap_validation: true`, which validates beside training instead of holding it, the same run reached step 30 in 47 min against 108 min on 4 + 4 GPUs, with AIME24 0.225 vs 0.228 at step 30.
 
+The ATOM rollout runs fully async too, with partial rollout on an ATOM whose engine has `pause_generation`; on the same two-node layout it matched vLLM step for step (41 min to step 30, training reward 0.470 vs 0.467 over steps 21–30).
+
 ## Quantization
 
 LumenRL implements a comprehensive quantization stack for low-precision post-training, including FP8, MXFP8, and MXFP4. The [FP8-RL](https://arxiv.org/abs/2601.18150) stack powers RL training, while MXFP8/MXFP4 online quantization via AITER enables efficient SDDD inference:

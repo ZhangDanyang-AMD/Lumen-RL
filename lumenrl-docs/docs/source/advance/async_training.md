@@ -20,6 +20,15 @@ correct for it.
 - The Ray controller (`controller.ray.enabled: true`) with the vLLM rollout
   (`generation_backend: vllm`, `vllm_cfg.transport: ray_http`). Both modes
   have been run with the FSDP2 training backend.
+- Or the ATOM rollout (`generation_backend: atom`, `atom_cfg.transport:
+  ray_http`). Its RCCL weight sync needs
+  [ROCm/ATOM#2298](https://github.com/ROCm/ATOM/pull/2298) in the ATOM build,
+  and `fully_async.partial_rollout` needs an ATOM whose engine has the
+  `pause_generation` utility (mode `keep`); with an older one set
+  `partial_rollout: false`, and each sync waits for the groups in flight.
+  `run_dapo.sh` turns sleep mode on for `MODE=atom*` (a colocated rollout
+  frees its memory for training); pass
+  `policy.generation.vllm_cfg.enable_sleep_mode=false`.
 - A rollout pool of its own: `controller.ray.rollout.num_workers > 0`, with the
   actors on the remaining GPUs (`controller.ray.actor.num_workers`), for example
   4 + 4 on one 8-GPU node.
@@ -30,9 +39,9 @@ correct for it.
   HCA either way. A sync of Qwen3-30B-A3B (61 GB in BF16) takes about 2 s.
 
 Setups that cannot overlap are rejected when training starts: both switches
-on, no separate rollout pool, a sleeping rollout, and for fully async also the
-ATOM rollout (it cannot pause generation) and `moe.r3` (routing replay is not
-carried across a weight sync).
+on, no separate rollout pool, a sleeping rollout, and for fully async also
+partial rollout on an ATOM that cannot pause generation, and `moe.r3`
+(routing replay is not carried across a weight sync).
 
 ## One-step off-policy
 
@@ -271,6 +280,40 @@ took 700–780 s on the shared pool and ran through up to nine weight syncs; the
 last step's, in the foreground, took 590 s. Staleness averaged 2.2 against
 1.1.
 
+### ATOM rollout
+
+The two-node layout above with the ATOM BF16 rollout
+(`dapo_qwen3moe_a3b_ray_atom_bf16_longrun.yaml`: the same hyperparameters with
+`generation_backend: atom`), `s = 2`, `max_num_seqs: 768`, on an ATOM with
+#2298 and `pause_generation`:
+
+| Steps 2–10, no validation | vLLM, partial | ATOM, no partial | ATOM, partial |
+| --- | --- | --- | --- |
+| Step | 64.1 s | 192 s (steps 2–4) | 63.6 s |
+| Trainer wait | 2.8 s | 120 s | 0.1 s |
+| `reward/accuracy` | 0.242 | 0.194 (steps 2–4) | 0.238 |
+| `rollout_corr/k3_kl` | 0.00148 | 0.00153 | 0.00156 |
+| Weight sync | 3.2 s | 3.6 s | 3.6 s |
+
+Without partial rollout each sync waits for the longest response in flight,
+which on 20k-token responses is most of the step. With it, 21–43 requests per
+replica were preempted at each sync and recomputed on the new weights.
+
+30 steps with `overlap_validation` and `val_steps: 10`:
+
+| | vLLM | ATOM |
+| --- | --- | --- |
+| Time to step 10 / 20 / 30 | 12 / 25 / 47 min | 12 / 25 / 41 min |
+| `reward/accuracy`, steps 1–10 / 11–20 / 21–30 | 0.237 / 0.375 / 0.467 | 0.236 / 0.372 / 0.470 |
+| AIME24 at step 10 / 20 / 30 | 0.175 / 0.182 / 0.225 | 0.170 / 0.191 / 0.212 |
+| `rollout_corr/k3_kl`, steps 21–30 | 0.00085 | 0.00093 |
+
+ATOM's `k3_kl` sits a little above vLLM's with or without partial rollout, so
+it is the engine's rather than the preemption's. All 240 weight streams
+committed on every replica. On one node (example 9's smoke config, 4 + 4 GPUs,
+six steps, no partial rollout) fully async took 211 s at `s = 1` against 392 s
+synchronous.
+
 ## Limitations
 
 - `trigger_parameter_sync_step > 1` has been run end to end only in six-step
@@ -285,8 +328,8 @@ last step's, in the foreground, took 590 s. Staleness averaged 2.2 against
   resumed prompt cursor is an estimate (see above).
 - No decoupled PPO: the trainer recomputes the old log-probs with its current
   weights and TIS corrects against the rollout's.
-- Rejected with fully async: the ATOM rollout and MoE routing replay
-  (`moe.r3`). Untested: the Megatron training backend. The two-node layout
+- Rejected with fully async: partial rollout on an ATOM without
+  `pause_generation`, and MoE routing replay (`moe.r3`). Untested: the Megatron training backend. The two-node layout
   has run 30 steps at most.
 
 ## The `async_training` section
