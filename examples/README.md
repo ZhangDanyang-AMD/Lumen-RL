@@ -53,6 +53,25 @@ Example 9 is example 6 with the rollout switched from vLLM to ATOM, and has been
 run on **8x MI355X** only; it is the one example that drives MoE expert weights
 through the ATOM weight-sync path.
 
+Example 6 also runs asynchronously: 4 FSDP2 actors train while 4 vLLM replicas keep
+generating, with weights pushed over RCCL. On 8x MI355X it reached step 60 2.7x
+sooner than the colocated synchronous run at comparable accuracy; see
+[Asynchronous Training](../lumenrl-docs/docs/source/advance/async_training.md).
+Set `interface` and `hca` to the node's NIC and HCA:
+
+```bash
+EXTRA_OVERRIDE="controller.ray.actor.num_workers=4 controller.ray.rollout.num_workers=4 \
+controller.ray.fully_async.enabled=true controller.ray.fully_async.staleness_threshold=1.0 \
+controller.ray.fully_async.partial_rollout=true \
+policy.generation.vllm_cfg.gpu_memory_utilization=0.85 policy.generation.vllm_cfg.max_num_seqs=512 \
+weight_sync.backend=rdma weight_sync.rdma.require_rdma=false \
+weight_sync.rdma.interface=<nic> weight_sync.rdma.hca=<hca>" \
+DATA_ROOT=/path/to/data bash release/run_example.sh 6 --longrun
+```
+
+The same settings as a config file are
+`examples/DAPO/configs/dapo_qwen3moe_a3b_ray_vllm_verlref_fully_async_longrun.yaml`.
+
 Example 8 runs on **2x 8x MI308X** with disaggregated training and inference: Megatron
 trainer on node 1, vLLM rollout on node 2, connected via RCCL/RoCE GPU Direct RDMA
 weight sync (9-rank process group). See the
