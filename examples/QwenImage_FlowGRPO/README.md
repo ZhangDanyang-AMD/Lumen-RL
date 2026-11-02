@@ -1,4 +1,6 @@
-# Qwen-Image FlowGRPO full-parameter RL on 8x MI350X: baseline and Lumen-accelerated
+# Qwen-Image FlowGRPO full-parameter RL on 8x MI350X: baseline and Lumen
+
+> 中文版：[README_cn.md](README_cn.md)
 
 Reproduces verl-omni's official recipe
 [`run_qwen_image_ocr_veomni.sh`](https://github.com/verl-project/verl-omni/blob/9ab544d81f93cbf49754aabacfa67f6fcf01b505/examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_veomni.sh)
@@ -6,37 +8,69 @@ on one node with 8x AMD Instinct MI350X: full-parameter FlowGRPO on Qwen-Image (
 vLLM-Omni rollout, Qwen3-VL-8B as the OCR reward, 300 steps.
 
 - **Baseline**: the official recipe with only paths, GPU count and ROCm attention backends changed (§4).
-- **Lumen**: the baseline plus two [Lumen](https://github.com/ZhangDanyang-AMD/Lumen) patches on the actor (the VeOmni
-  training engine) (§5); nothing else changes.
+- **Lumen**: the baseline plus two [Lumen](https://github.com/ZhangDanyang-AMD/Lumen) patches on the actor (§5);
+  nothing else changes.
 
-## 1. Results
+## 1. Comparison with the official results
 
-8x MI350X, same seed, 300 steps each. Validation reward (OCR test split, 1018 prompts):
+Official reference: verl-omni's public W&B run
+[`andyzhou/VeRL-Omni-demo/8p8y9olb`](https://wandb.ai/andyzhou/VeRL-Omni-demo/runs/8p8y9olb) (same algorithm and
+hyper-parameters, 4x H200, FSDP engine, ends at step 277) and
+[`docs/algo/performance.md`](https://github.com/verl-project/verl-omni/blob/9ab544d81f93cbf49754aabacfa67f6fcf01b505/docs/algo/performance.md).
+Ours: 8x MI350X, VeOmni engine, same seed for both versions.
+
+### Correctness
+
+Validation reward (OCR test split, 1018 prompts):
 
 | step | official | baseline | Lumen |
 |---:|---:|---:|---:|
-| 0 | 0.406 | 0.402 | 0.403 |
-| 30 | | 0.644 | 0.618 |
-| 60 | | 0.815 | 0.822 |
-| 120 | 0.937 | 0.928 | 0.937 |
-| 180 | | 0.934 | 0.964 |
-| 240 | | 0.939 | 0.968 |
+| 0 | | 0.402 | 0.403 |
+| 30 | 0.689 | 0.644 | 0.618 |
+| 60 | 0.851 | 0.815 | 0.822 |
+| 90 | 0.932 | 0.901 | 0.919 |
+| 120 | 0.964 | 0.928 | 0.937 |
+| 180 | 0.975 | 0.934 | 0.964 |
+| 240 | 0.950 | 0.939 | 0.968 |
+| 270 | 0.924 | 0.960 | 0.975 |
 | 300 | | 0.949 | **0.978** |
 
-Performance (median of steps 2–300, validation and checkpoint steps excluded):
+Train reward (mean over the window):
 
-| | baseline | Lumen |
+| steps | official | baseline | Lumen |
+|---|---:|---:|---:|
+| 1–60 | 0.407 | 0.359 | 0.354 |
+| 61–120 | 0.850 | 0.806 | 0.814 |
+| 121–180 | 0.958 | 0.919 | 0.922 |
+| 181–240 | 0.950 | 0.883 | 0.952 |
+| 241–277 | 0.924 | 0.926 | 0.954 |
+
+- All three reach the same plateau (validation 0.95–0.98). The official run rises faster over the first 120 steps
+  and then declines; both of ours keep rising to step 300, and the Lumen version ends highest.
+- Training health is in the same range as the official run (30-step means): clip fraction 0.11–0.31 (official
+  0.09–0.24), grad norm 0.005–0.018 (official 0.006–0.019), no non-finite gradients in any of the three.
+- Separate runs of one configuration vary noticeably, so compare on the same machine with the same seed.
+
+### Performance
+
+| run | GPUs | engine | time per step | throughput (images/GPU/s) |
+|---|---|---|---:|---:|
+| official, W&B run | 4x H200 | FSDP | 247.7 s | 0.517 |
+| official, docs | 64x H100 | VeOmni | 100 s | 0.079 |
+| baseline | 8x MI350X | VeOmni | 129.1 s | 0.496 |
+| **Lumen** | 8x MI350X | VeOmni | **122.4 s** | **0.523** |
+
+Medians over all training steps, validation and checkpoint steps excluded. Every step trains on 32 prompts × 16
+images, so images/GPU/s is the comparable number across GPU counts.
+
+| Lumen vs baseline | baseline | Lumen |
 |---|---:|---:|
 | actor (`old_log_prob` + `update_actor`) | 31.5 s | 29.1 s (−8%) |
 | whole step | 129.1 s | 122.4 s (−5%) |
-| throughput (images/GPU/s) | 0.496 | 0.523 |
 | 300 steps end to end (startup, validation and checkpoints included) | about 12.5 h | about 12.0 h |
 
-- The official reference is verl-omni's [`docs/algo/performance.md`](https://github.com/verl-project/verl-omni/blob/9ab544d81f93cbf49754aabacfa67f6fcf01b505/docs/algo/performance.md):
-  the validation curve of the VeOmni engine on 64x H100, and 0.510 images/GPU/s on 4x H200.
-- Lumen speeds up only the actor, about 24% of a step. Of the 6.7 s saved per step, 2.4 s come from the actor; the
-  rest come from the weight sync and generation, which the patches do not touch, and differ between the two runs.
-- Separate runs of one configuration vary noticeably, so compare on the same machine with the same seed.
+Lumen speeds up only the actor, about 24% of a step. Of the 6.7 s saved per step, 2.4 s come from the actor; the rest
+come from the weight sync and generation, which the patches do not touch, and differ between the two runs.
 
 ## 2. Requirements
 
@@ -50,7 +84,7 @@ Performance (median of steps 2–300, validation and checkpoint steps excluded):
 ```bash
 export WORK=/path/to/work                       # code, models, data and run outputs
 git clone https://github.com/ZhangDanyang-AMD/Lumen-RL.git $WORK/src/Lumen-RL
-EX=$WORK/src/Lumen-RL/examples/QwenImage_FlowGRPO_MI350_VeOmni
+EX=$WORK/src/Lumen-RL/examples/QwenImage_FlowGRPO
 
 docker pull vllm/vllm-openai-rocm:v0.27.0
 WORK=$WORK bash $EX/launch_container.sh         # container qwen-image-rl
@@ -113,7 +147,7 @@ checkpointing or reshard takes memory the rollout needs; the aiter fused backwar
 | file | runs on | purpose |
 |---|---|---|
 | `launch_container.sh` | host | start the container with `$WORK` mounted at the same path |
-| `setup_env.sh` | container | pinned sources, the RL dependencies (image torch / vLLM / triton untouched), models, data |
+| `setup_env.sh` | container | pinned sources (incl. Lumen), the RL dependencies (image torch / vLLM / triton untouched), models, data |
 | `run_flowgrpo.sh` | container | the official recipe plus the §4 overrides; `LUMEN=1` adds the §5 patches |
 | `lumen_rl_patch.py` | Ray workers | installs the Lumen patches in the actor processes only and prints call counts |
-| `compare.py` | anywhere | validation reward, train reward, per-phase time and throughput, against the official reference |
+| `compare.py` | anywhere | validation reward, train reward, per-phase time and throughput of several runs, against the official run |

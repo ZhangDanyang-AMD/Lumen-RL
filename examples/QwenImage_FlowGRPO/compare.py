@@ -12,8 +12,9 @@ from pathlib import Path
 VAL = "val-core/flow_grpo/ocr/reward/mean@1"
 REWARD = "critic/rewards/mean"
 PHASES = ["gen", "reward", "old_log_prob", "update_actor", "update_weights", "step"]
-# verl-omni docs/algo/performance.md: VeOmni validation curve on 64x H100; throughput of the 4x H200 full-model run.
-OFFICIAL = {"val": {0: 0.406, 120: 0.937}, "throughput": 0.510}
+# verl-omni's public reference run https://wandb.ai/andyzhou/VeRL-Omni-demo/runs/8p8y9olb (4x H200, FSDP engine).
+OFFICIAL = {"val": {30: 0.689, 60: 0.851, 90: 0.932, 120: 0.964, 150: 0.973, 180: 0.975, 210: 0.954, 240: 0.950,
+                    270: 0.924}, "throughput": 0.517}
 
 
 def load(run):
