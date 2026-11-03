@@ -40,10 +40,30 @@ logger = logging.getLogger(__name__)
 
 _MARKER = "_lumen_fp32_router"
 
+# vLLM quantization ``ignore`` entry matching the routers ``_is_router`` patches.
+ROUTER_PATTERN = r"re:.*\.(mlp|ffn)\.gate$"
+
 
 def fp32_router_enabled() -> bool:
     """Env override; on by default (MoEConfig.moe_router_dtype defaults to fp32)."""
     return os.environ.get("LUMENRL_FP32_MOE_ROUTER", "1") == "1"
+
+
+def vllm_quantization_config(quantization: str | None) -> dict | None:
+    """vLLM ``quantization_config`` for a rollout engine that gets the fp32 router.
+
+    vLLM's online quantizations (``fp8_per_block``, ...) quantize every linear
+    layer, the routers included, and the fp32 router needs the gate's real weights.
+    Keeping the gates BF16 also keeps the rollout's routing on the trainer's
+    weights; they are a few MB per model.
+    """
+    if not quantization or not fp32_router_enabled():
+        return None
+    from vllm.config.quantization import ONLINE_QUANT_SHORTHAND_NAMES
+
+    if quantization not in ONLINE_QUANT_SHORTHAND_NAMES:
+        return None
+    return {"ignore": [ROUTER_PATTERN]}
 
 
 def _is_router(name: str, mod: torch.nn.Module) -> bool:
@@ -135,6 +155,13 @@ def enable_fp32_moe_router(model: torch.nn.Module) -> int:
         if _is_hf_topk_router(mod):
             _patch_hf_topk_router(mod, layer_index_of(name), fp32)
         elif fp32:
+            if mod.weight.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+                # Quantized weights keep their scales outside .weight, so an fp32
+                # matmul over them routes every token to the wrong experts.
+                raise RuntimeError(
+                    f"fp32 MoE router: {name} is quantized ({mod.weight.dtype}); keep "
+                    f"routers unquantized (vLLM quantization_config ignore "
+                    f"[{ROUTER_PATTERN!r}]) or set LUMENRL_FP32_MOE_ROUTER=0")
             _patch_linear_router(mod, returns_tuple=not isinstance(mod, torch.nn.Linear))
         else:
             continue
