@@ -233,6 +233,16 @@ def test_staleness_grows_through_a_sync_period() -> None:
     rollout.close()
 
 
+def test_the_rollout_reports_the_version_its_weights_hold() -> None:
+    rollout = _rollout(FakeBackend(), start_version=3)
+    assert rollout.version == 3
+
+    rollout.before_sync()
+    rollout.after_sync(4)
+    assert rollout.version == 4
+    rollout.close()
+
+
 def test_new_groups_wait_while_submissions_are_paused() -> None:
     backend = FakeBackend(auto=False)
     rollout = _rollout(

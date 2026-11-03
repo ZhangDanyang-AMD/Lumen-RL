@@ -143,6 +143,13 @@ class FullyAsyncRolloutConfig:
     partial_rollout: bool = False
     # Prompt groups generating at once; 0 = max_num_seqs // n per replica.
     max_inflight_groups: int = 0
+    # Validate on a background thread while training goes on, sharing the
+    # rollout pool with the training groups. With partial_rollout a weight sync
+    # freezes validation requests along with the groups and they finish on the
+    # newer weights (val/finished_version says how much newer); without it the
+    # next sync waits for validation to finish. The final step validates in
+    # the foreground.
+    overlap_validation: bool = False
 
 
 @dataclass

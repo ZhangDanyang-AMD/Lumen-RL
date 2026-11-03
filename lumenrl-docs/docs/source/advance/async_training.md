@@ -71,6 +71,7 @@ controller:
 | `staleness_threshold` | `0.0` | Per sync period the rollout budgets `(1 + s) × groups per step × K` useful prompt groups, counting those still queued from before the sync (*s*) |
 | `partial_rollout` | `false` | On a sync, freeze the requests in flight and continue them on the new weights, instead of waiting for them to finish |
 | `max_inflight_groups` | `0` | Prompt groups generating at once; 0 means `max_num_seqs // n` per replica |
+| `overlap_validation` | `false` | Validate on a background thread while training goes on, instead of holding the trainer for it (see below) |
 
 ### How it works
 
@@ -101,7 +102,24 @@ partial rollout, which waits for every group in flight; in a six-step example 6
 smoke at *K* = 2, `s = 1`, the first period kept 42 groups against a budget of
 32.
 
-Validation runs on the rollout pool while new submissions are held back.
+Validation runs on the rollout pool. By default the trainer waits for it and
+new submissions are held back meanwhile. Its length is that of the longest
+response, so more replicas do not shorten it: on example 6 it takes about 500 s
+on 4 or 8 replicas.
+
+With `overlap_validation`, a validation step starts validation on a background
+thread instead, and training and new submissions go on beside it. Validation
+requests share the replicas with the training groups. With partial rollout a
+weight sync freezes them along with the groups, so the long responses finish on
+newer weights; `val/finished_version` minus `val/started_version` counts the
+syncs a validation ran through. Without partial rollout the next sync waits for
+validation to finish, since the engine loads weights only when idle. Metrics
+are logged at the first step after validation finishes, with `val/global_step`
+naming the step validated. One validation runs at a time: a due step waits for
+the one running before it starts its own. The last step validates in the
+foreground; when it does, the step before waits for the one running, so the
+two are not logged on the same step.
+
 On resume from a checkpoint the prompt cursor skips the prompts the run has
 used, estimated as one `gen_batch_size` round per step. Groups that were queued
 or in flight at the checkpoint are not saved; the resumed run generates new
@@ -132,6 +150,9 @@ ones.
 | `async/trainer_wait_s` | Seconds the trainer waited for groups, plus the wait for groups in flight at a sync without partial rollout |
 | `async/queued_groups`, `async/inflight_groups` | Groups ready and generating when the step's groups were taken |
 | `async/keep_rate` | Fraction of finished groups `filter_groups` kept |
+| `val/global_step` | With `overlap_validation`: the step whose weights started the validation logged at this step |
+| `val/started_version`, `val/finished_version` | Rollout weight versions when that validation started and finished |
+| `val/elapsed_s` | How long it ran; `timing_s/testing` counts only the seconds the trainer waited for it |
 
 ### Tuning
 

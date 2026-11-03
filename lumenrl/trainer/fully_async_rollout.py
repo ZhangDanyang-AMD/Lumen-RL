@@ -123,6 +123,12 @@ class StreamingRollout:
         with self._cv:
             return self._next_index
 
+    @property
+    def version(self) -> int:
+        """Policy version the rollout weights hold."""
+        with self._cv:
+            return self._version
+
     def _keep_rate(self) -> float:
         return (self._kept + 1) / (self._finished + 1)
 
@@ -264,3 +270,68 @@ class StreamingRollout:
             self._stop = True
             self._cv.notify_all()
         self._thread.join(timeout=10.0)
+
+
+class BackgroundValidation:
+    """Runs one validation at a time on a thread while the trainer keeps training.
+
+    ``run(step)`` returns the validation metrics; ``version()`` is the policy
+    version the rollout holds, read when validation starts and when it ends.
+    """
+
+    def __init__(self, run: Callable[[int], dict[str, float]], version: Callable[[], int]) -> None:
+        self._run = run
+        self._version = version
+        self._thread: threading.Thread | None = None
+        self._step = 0
+        self._versions = (0, 0)
+        self._elapsed_s = 0.0
+        self._result: dict[str, float] = {}
+        self._error: BaseException | None = None
+
+    @property
+    def pending(self) -> bool:
+        return self._thread is not None
+
+    def start(self, step: int) -> None:
+        if self._thread is not None:
+            raise RuntimeError("collect() the running validation before starting another")
+        self._step = step
+        self._result, self._error = {}, None
+        self._thread = threading.Thread(target=self._target, name="lumenrl-validation", daemon=True)
+        self._thread.start()
+
+    def _target(self) -> None:
+        started_version = self._version()
+        started = time.perf_counter()
+        try:
+            self._result = dict(self._run(self._step))
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the trainer thread by collect()
+            self._error = exc
+        self._elapsed_s = time.perf_counter() - started
+        self._versions = (started_version, self._version())
+
+    def collect(self, *, wait: bool) -> tuple[dict[str, float], float]:
+        """Metrics of the finished validation and the seconds this blocked.
+
+        Returns ``({}, 0.0)`` when none is running, or when one is and ``wait``
+        is false.
+        """
+        if self._thread is None or (not wait and self._thread.is_alive()):
+            return {}, 0.0
+        started = time.perf_counter()
+        self._thread.join()
+        blocked_s = time.perf_counter() - started
+        self._thread = None
+        if self._error is not None:
+            raise RuntimeError(f"validation at step {self._step + 1} failed") from self._error
+        if not self._result:
+            return {}, blocked_s
+        started_version, finished_version = self._versions
+        return {
+            **self._result,
+            "val/global_step": float(self._step + 1),
+            "val/started_version": float(started_version),
+            "val/finished_version": float(finished_version),
+            "val/elapsed_s": self._elapsed_s,
+        }, blocked_s
