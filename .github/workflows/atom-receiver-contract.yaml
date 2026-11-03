@@ -1,0 +1,59 @@
+name: ATOM Receiver Contract
+
+# ATOM's RDMA weight receiver (ROCm/ATOM, atom/rollout/rdma_weight_receiver.py)
+# decodes the stream lumenrl/engine/inference/rdma_weight_transfer.py sends.
+# ATOM's tests hold the receiver to a snapshot of this sender,
+# tests/fixtures/lumenrl_rdma_sender.txt; this job holds the snapshot to the
+# sender -- on any change to it, and daily, since ATOM can move without LumenRL
+# changing. The sender is only read as text by ATOM's tests; nothing of
+# LumenRL runs.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'lumenrl/engine/inference/rdma_weight_transfer.py'
+      - '.github/workflows/atom-receiver-contract.yaml'
+  workflow_dispatch:
+  schedule:
+    - cron: '30 22 * * *'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  receiver-contract:
+    name: Check the sender against ATOM's snapshot of it
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout LumenRL
+        uses: actions/checkout@v4
+      - name: Checkout ATOM
+        uses: actions/checkout@v4
+        with:
+          repository: ROCm/ATOM
+          path: ATOM
+          persist-credentials: false
+      - name: Take the receiver from its PR until it is on ATOM main
+        # Drop this step once ROCm/ATOM#2946 is merged.
+        run: |
+          if [ ! -f ATOM/tests/fixtures/lumenrl_rdma_sender.txt ]; then
+            git -C ATOM fetch --depth 1 origin pull/2946/head
+            git -C ATOM checkout --detach FETCH_HEAD
+          fi
+          git -C ATOM log -1 --format='ATOM under test: %H %s'
+      - name: Set up Python environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          pip3 install torch --index-url https://download.pytorch.org/whl/cpu
+          SETUPTOOLS_SCM_PRETEND_VERSION_FOR_ATOM=0.0.0+cpu.ci pip3 install -e ./ATOM
+          pip3 install pytest
+      - name: Run ATOM's sender contract tests against this sender
+        working-directory: ATOM
+        env:
+          LUMENRL_ROOT: ${{ github.workspace }}
+        run: python -m pytest tests/test_rdma_weight_receiver.py -k "sender or snapshot" -rA
