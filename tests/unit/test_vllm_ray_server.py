@@ -82,8 +82,8 @@ class RemoteMethod:
         self.result = result
         self.calls = []
 
-    def remote(self, *args):
-        self.calls.append(args)
+    def remote(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
         return self.result
 
 
@@ -152,8 +152,20 @@ def test_manager_validates_once_per_rdma_group_before_receive_refs(monkeypatch):
     assert second == ["receive-ref"]
     assert len(server.get_rdma_capabilities.calls) == 1
     assert server.receive_weights_rdma.calls == [
-        ("group-1", 1, True, True, "gpu"),
-        ("group-1", 2, False, False, "cpu"),
+        ((), {
+            "group_name": "group-1",
+            "version": 1,
+            "verify_full_load": True,
+            "prequantized_fp8": True,
+            "online_staging": "gpu",
+        }),
+        ((), {
+            "group_name": "group-1",
+            "version": 2,
+            "verify_full_load": False,
+            "prequantized_fp8": False,
+            "online_staging": "cpu",
+        }),
     ]
 
 

@@ -829,16 +829,14 @@ class VLLMReplicaManager:
         if not self.rdma_group_name:
             raise RuntimeError("RDMA weight group has not been initialized")
         self._validate_rdma_capabilities()
-        return [
-            server.receive_weights_rdma.remote(
-                self.rdma_group_name,
-                int(version),
-                bool(verify_full_load),
-                bool(prequantized_fp8),
-                str(online_staging),
-            )
-            for server in self.servers
-        ]
+        kwargs = {
+            "group_name": self.rdma_group_name,
+            "version": int(version),
+            "verify_full_load": bool(verify_full_load),
+            "prequantized_fp8": bool(prequantized_fp8),
+            "online_staging": str(online_staging),
+        }
+        return [server.receive_weights_rdma.remote(**kwargs) for server in self.servers]
 
     def destroy_rdma_weight_group(self, actor_wg=None) -> None:
         import ray
