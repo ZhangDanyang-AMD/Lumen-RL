@@ -4311,6 +4311,20 @@ class RLTrainer:
             self._rollout_pipeline = self._start_streaming_rollout(
                 num_generations, rollout_version,
             )
+        background_val = None
+        val_blocks_sync = False
+        if (
+            pipeline_mode == "fully_async" and self._rollout_pipeline is not None
+            and self.config.controller.ray.fully_async.overlap_validation
+        ):
+            from lumenrl.trainer.fully_async_rollout import BackgroundValidation
+
+            streaming = self._rollout_pipeline
+            background_val = BackgroundValidation(
+                lambda s: self.run_validation(step=s), lambda: streaming.version,
+            )
+            # Without partial rollout the engine loads weights only when idle.
+            val_blocks_sync = not self.config.controller.ray.fully_async.partial_rollout
 
         for step in range(start_step, total_steps):
             step_start = time.time()
@@ -4522,8 +4536,12 @@ class RLTrainer:
             # ---- weight sync to rollout engine ----
             pipeline = self._rollout_pipeline
             sync_now = pipeline is None or pipeline.sync_due()
+            val_blocked_s = 0.0
             if pipeline is not None:
                 if sync_now:
+                    if val_blocks_sync:
+                        val_metrics, val_blocked_s = background_val.collect(wait=True)
+                        metrics.update(val_metrics)
                     async_metrics["async/trainer_wait_s"] += pipeline.before_sync()
                 metrics.update(async_metrics)
             t_sync = time.time()
@@ -4544,12 +4562,8 @@ class RLTrainer:
             # Validation uses the rollout engine too, so run it after the fresh
             # actor weights have been synced and sleep/wake has restored KV cache.
             val_t0 = time.time()
-            val_steps = getattr(self.config, 'val_steps', 0)
-            if val_steps > 0 and (step + 1) % val_steps == 0:
-                with pipeline.submissions_paused() if pipeline is not None else nullcontext():
-                    val_metrics = self.run_validation()
-                metrics.update(val_metrics)
-            val_time = time.time() - val_t0
+            metrics.update(self._validate_at_step(step, total_steps, pipeline, background_val))
+            val_time = time.time() - val_t0 + val_blocked_s
 
             timing_raw = {
                 "gen": gen_time,
@@ -4587,6 +4601,35 @@ class RLTrainer:
         for cb in self.callbacks:
             cb.on_train_end(self)
         logger.info("RLTrainer.train (ray-controller) finished after %d steps.", total_steps)
+
+    def _validate_at_step(
+        self, step: int, total_steps: int, pipeline: Any, background_val: Any,
+    ) -> dict[str, float]:
+        """Validation metrics to log at ``step``, validating if it is due.
+
+        With a ``BackgroundValidation`` a due step starts one and a later step
+        logs it. The last step validates in the foreground, since nothing is
+        left to overlap with; when it does, the step before waits for the one
+        running and starts none, so that two validations never land on one step.
+        """
+        val_steps = getattr(self.config, "val_steps", 0)
+        due = val_steps > 0 and (step + 1) % val_steps == 0
+        last = step == total_steps - 1
+        clear_for_last = (
+            background_val is not None and step == total_steps - 2
+            and val_steps > 0 and total_steps % val_steps == 0
+        )
+        done: dict[str, float] = {}
+        if background_val is not None:
+            # One validation at a time, and none left running past the end.
+            done, _ = background_val.collect(wait=due or last or clear_for_last)
+        if not due or clear_for_last:
+            return done
+        if background_val is not None and not last:
+            background_val.start(step)
+            return done
+        with pipeline.submissions_paused() if pipeline is not None else nullcontext():
+            return self.run_validation()
 
     def _resume_prompt_cursor(self, start_step: int, num_generations: int) -> int:
         """Roughly where a run resumed at ``start_step`` left the prompt cursor.
@@ -4708,17 +4751,20 @@ class RLTrainer:
         if self._use_atom and self._atom_engine is not None:
             self._sync_weights_to_atom()
 
-    def run_validation(self) -> dict[str, float]:
+    def run_validation(self, step: int | None = None) -> dict[str, float]:
         """Evaluate on the validation set with configured sampling.
 
         Reports ``val-core/acc/mean@N`` (fraction correct) plus mean
         reward and response length. Generation is colocated (rank 0 generates via
         the inference engine, broadcast to all ranks) so every rank computes
         identical metrics. ``eval.num_samples <= 0`` evaluates the full val set,
-        matching verl's val dataloader behavior.
+        matching verl's val dataloader behavior. ``step`` labels the log lines
+        and defaults to the current step; a background validation passes the
+        step it validates, since training moves on while it runs.
         """
         if self._val_dataset is None or len(self._val_dataset) == 0:
             return {}
+        label_step = (self.global_step if step is None else step) + 1
 
         from lumenrl.rewards.math_reward import compute_math_reward
 
@@ -4740,7 +4786,7 @@ class RLTrainer:
             logger.info(
                 "[eval] step=%d: evaluating %d prompts x %d samples "
                 "(temperature=%.3g, top_p=%.3g, batch_size=%d)",
-                self.global_step + 1, num_samples, eval_n,
+                label_step, num_samples, eval_n,
                 eval_sp["temperature"], eval_sp["top_p"], val_bs,
             )
 
@@ -4870,7 +4916,7 @@ class RLTrainer:
         if self._rank == 0:
             logger.info(
                 "[eval] step=%d acc=%.4f score_mean=%.4f resp_len=%.1f n=%d",
-                self.global_step + 1, metrics[f"val-core/acc/mean@{eval_n}"],
+                label_step, metrics[f"val-core/acc/mean@{eval_n}"],
                 metrics["val/score_mean"],
                 metrics["val/response_length_mean"], len(all_scores),
             )
