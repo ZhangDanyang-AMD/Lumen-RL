@@ -4,6 +4,7 @@
 
 ## News
 
+- **[2026/11]** LumenRL now supports **one-step off-policy and fully async training** on the Ray controller path — the rollout keeps generating on GPUs of its own while the trainer trains; 2.7× faster on Qwen3-30B-A3B DAPO (example 6) at comparable accuracy. See [Asynchronous Training](advance/async_training.md)
 - **[2026/05]** LumenRL now supports **Speculative Decoding Draft Distillation (SDDD)** — Eagle3 draft distillation for Kimi K2.5 and Qwen3-8B on MI350 with [Mooncake](https://github.com/kvcache-ai/Mooncake)/MORI RDMA transfer
 - **[2026/04]** LumenRL now supports **fully async training** — inspired by [VERL](https://github.com/verl-project/verl), decouples rollout and training for up to 2.7x throughput improvement
 - **[2026/03]** LumenRL now supports **MoE [R3](https://arxiv.org/abs/2510.11370) router alignment** — Rollout Routing Replay for stable MoE RL training

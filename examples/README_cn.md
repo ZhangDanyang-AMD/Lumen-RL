@@ -44,6 +44,24 @@
 例子 9 是把例子 6 的 rollout 从 vLLM 换成 ATOM，只在 **8x MI355X** 上跑过；
 它是唯一一个让 MoE 专家权重走 ATOM 权重同步这条路的例子。
 
+例子 6 也可以异步跑：4 张卡做 FSDP2 训练，另外 4 张卡上的 vLLM 副本一直在生成，
+权重通过 RCCL 推送。在 8x MI355X 上，它跑到第 60 步比同卡同步快 2.7 倍，准确率相当，详见
+[异步训练](../lumenrl-docs/docs/source/advance/async_training.md)。
+`interface` 和 `hca` 填节点的网卡和 HCA：
+
+```bash
+EXTRA_OVERRIDE="controller.ray.actor.num_workers=4 controller.ray.rollout.num_workers=4 \
+controller.ray.fully_async.enabled=true controller.ray.fully_async.staleness_threshold=1.0 \
+controller.ray.fully_async.partial_rollout=true \
+policy.generation.vllm_cfg.gpu_memory_utilization=0.85 policy.generation.vllm_cfg.max_num_seqs=512 \
+weight_sync.backend=rdma weight_sync.rdma.require_rdma=false \
+weight_sync.rdma.interface=<nic> weight_sync.rdma.hca=<hca>" \
+DATA_ROOT=/path/to/data bash release/run_example.sh 6 --longrun
+```
+
+对应的配置文件是
+`examples/DAPO/configs/dapo_qwen3moe_a3b_ray_vllm_verlref_fully_async_longrun.yaml`。
+
 例子 8 在 **2x 8x MI308X** 上运行训推分离部署：节点 1 Megatron 训练，节点 2 vLLM rollout，
 通过 RCCL/RoCE GPU Direct RDMA 权重同步（9-rank 进程组）。完整部署流程见
 [训推分离双节点 RDMA 部署指南](docs/07-disaggregated-rdma_cn.md)。
