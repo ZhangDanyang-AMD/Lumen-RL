@@ -292,7 +292,7 @@ def test_merge_rollout_groups_stacks_groups_of_different_widths() -> None:
 
 
 def _layout_trainer(
-    *, one_step=False, vllm=True, atom=False, partial=False, r3=False,
+    *, one_step=False, vllm=True, atom=False, partial=False, r3=False, pause_modes=(),
 ) -> RLTrainer:
     trainer = object.__new__(RLTrainer)
     trainer.config = SimpleNamespace(
@@ -306,6 +306,7 @@ def _layout_trainer(
     trainer._ray_vllm_engine = SimpleNamespace(enable_sleep=False)
     trainer._ray_use_vllm = vllm
     trainer._ray_use_atom = atom
+    trainer._ray_rollout_mgr = SimpleNamespace(generation_pause_modes=lambda: set(pause_modes))
     return trainer
 
 
@@ -319,12 +320,18 @@ def test_layout_check_accepts_atom_when_syncs_wait_for_the_groups_in_flight() ->
     assert trainer._resolve_rollout_pipeline(True) == "fully_async"
 
 
+def test_layout_check_accepts_partial_rollout_on_an_atom_that_can_pause() -> None:
+    trainer = _layout_trainer(vllm=False, atom=True, partial=True, pause_modes=("keep",))
+
+    assert trainer._resolve_rollout_pipeline(True) == "fully_async"
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
         ({"one_step": True}, "are alternatives"),
         ({"vllm": False}, "needs the Ray vLLM or ATOM rollout"),
-        ({"vllm": False, "atom": True, "partial": True}, "partial_rollout needs the vLLM"),
+        ({"vllm": False, "atom": True, "partial": True}, "an ATOM that can pause"),
         ({"r3": True}, "R3 rollout routing"),
     ],
 )

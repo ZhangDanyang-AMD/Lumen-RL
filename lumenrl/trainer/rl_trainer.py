@@ -4686,11 +4686,14 @@ class RLTrainer:
         if not fully_async:
             return "one_step"
         if getattr(self, "_ray_use_atom", False):
-            if bool(getattr(ray_cfg.fully_async, "partial_rollout", False)):
+            if bool(getattr(ray_cfg.fully_async, "partial_rollout", False)) and (
+                "keep" not in self._ray_rollout_mgr.generation_pause_modes()
+            ):
                 raise ValueError(
-                    "controller.ray.fully_async.partial_rollout needs the vLLM rollout: "
-                    "ATOM cannot pause requests in flight across a weight sync. Set "
-                    "partial_rollout=false to let each sync wait for them instead."
+                    "controller.ray.fully_async.partial_rollout on the ATOM rollout needs "
+                    "an ATOM that can pause requests in flight across a weight sync "
+                    "(engine utility pause_generation, mode 'keep'); this one cannot. "
+                    "Set partial_rollout=false to let each sync wait for them instead."
                 )
         elif not getattr(self, "_ray_use_vllm", False):
             raise ValueError(

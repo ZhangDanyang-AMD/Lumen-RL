@@ -732,6 +732,37 @@ class ATOMRayServer:
             self.engine.wake_up(tags=tags or ["weights", "kv_cache"])
         return True
 
+    async def generation_pause_modes(self) -> list[str]:
+        """Modes ``pause_generation`` takes here; empty on an ATOM that cannot pause."""
+        try:
+            from atom.model_engine.engine_utility import GENERATION_PAUSE_MODES
+        except ImportError:
+            return []
+        return list(GENERATION_PAUSE_MODES)
+
+    async def pause_generation(self, mode: str = "keep", clear_cache: bool = True) -> bool:
+        """Freeze generation for a weight update, as ``VLLMRayServer`` does.
+
+        "keep" preempts the running requests; after ``resume_generation`` they
+        recompute their context on the new weights and go on.
+        """
+        await self._engine_utility("pause_generation", mode=mode, clear_cache=clear_cache)
+        return True
+
+    async def resume_generation(self) -> bool:
+        await self._engine_utility("resume_generation")
+        return True
+
+    async def _engine_utility(self, cmd: str, **kwargs: Any) -> list:
+        """Run an engine-core utility command on every DP engine; raises on any error."""
+        if self.engine is None:
+            raise RuntimeError("ATOMRayServer.launch() must be called first.")
+        # Off the event loop: the call blocks on a reply queue, as collective_rpc's.
+        return await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: self.engine.core_mgr.broadcast_utility_command_sync(cmd, **kwargs),
+        )
+
     async def collective_rpc(
         self,
         method: str,
@@ -1205,6 +1236,23 @@ class ATOMReplicaManager:
         import ray
 
         ray.get([s.wait_for_requests_to_drain.remote() for s in self.servers])
+
+    def generation_pause_modes(self) -> set[str]:
+        """Pause modes every replica takes."""
+        import ray
+
+        modes = ray.get([s.generation_pause_modes.remote() for s in self.servers])
+        return set.intersection(*(set(m) for m in modes)) if modes else set()
+
+    def pause_all(self, mode: str = "keep", clear_cache: bool = True) -> None:
+        import ray
+
+        ray.get([s.pause_generation.remote(mode, clear_cache) for s in self.servers])
+
+    def resume_all(self) -> None:
+        import ray
+
+        ray.get([s.resume_generation.remote() for s in self.servers])
 
     def collective_rpc(
         self,
