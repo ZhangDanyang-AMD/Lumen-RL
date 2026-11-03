@@ -386,7 +386,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
         # R3: replay vLLM rollout expert ids through Megatron-Core RouterReplay
         # on every log-prob and update forward. Only meaningful for MoE.
         self._r3_enabled = self._is_moe and bool(
-            ec.get("r3_enabled", False) or ec.get("moe_enable_routing_replay", False)
+            ec.get("moe_enable_routing_replay", False)
         )
         self._r3_batch_routes = None
         self._r3_append = False

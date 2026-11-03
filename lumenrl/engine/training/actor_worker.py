@@ -249,12 +249,10 @@ class LumenActorWorker(BaseWorker):
                 "moe_mori_max_tokens_per_rank": meg_cfg.get("moe_mori_max_tokens_per_rank"),
                 "moe_mori_kernel_type": meg_cfg.get("moe_mori_kernel_type"),
                 "moe_permute_fusion": meg_cfg.get("moe_permute_fusion", False),
-                "r3_enabled": bool(
-                    get_nested_config(self.config, "moe", "r3", "enabled", default=False)
-                    or meg_cfg.get("r3_enabled", False)
-                ),
+                # Single R3 key (see lumenrl/workers/actor_worker.py).
                 "moe_enable_routing_replay": bool(
                     get_nested_config(self.config, "moe", "r3", "enabled", default=False)
+                    or meg_cfg.get("r3_enabled", False)
                 ),
                 "param_offload": meg_cfg.get("param_offload", False),
                 "optimizer_cpu_offload": meg_cfg.get("optimizer_cpu_offload", meg_cfg.get("optimizer_offload", False)),

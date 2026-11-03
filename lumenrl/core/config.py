@@ -588,6 +588,10 @@ class TrainingQuantConfig:
     fp8: Optional[str] = None
     fp8_recipe: str = "blockwise"
     fp8_weight_cache: bool = False
+    # BF16 keep-outs at each end of the stack. None = follow rollout; an
+    # asymmetric keep-out skews the importance ratio on those layers.
+    num_first_layers_in_bf16: Optional[int] = None
+    num_last_layers_in_bf16: Optional[int] = None
     lumen_norm: bool = False
     fused_mlp: bool = False
     fused_rope: bool = False

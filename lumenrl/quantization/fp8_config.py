@@ -53,8 +53,16 @@ class FP8Config:
             precision=precision,
             recipe=recipe,
             use_deep_gemm=rollout.use_deep_gemm,
-            num_first_layers_in_bf16=rollout.num_first_layers_in_bf16,
-            num_last_layers_in_bf16=rollout.num_last_layers_in_bf16,
+            num_first_layers_in_bf16=(
+                training.num_first_layers_in_bf16
+                if training.num_first_layers_in_bf16 is not None
+                else rollout.num_first_layers_in_bf16
+            ),
+            num_last_layers_in_bf16=(
+                training.num_last_layers_in_bf16
+                if training.num_last_layers_in_bf16 is not None
+                else rollout.num_last_layers_in_bf16
+            ),
             use_weight_pow2_scale=False,
             use_activation_pow2_scale=False,
         )
