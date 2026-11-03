@@ -166,6 +166,12 @@ ones.
   flight; example 6 uses 512 (32 groups of 16 per replica).
 - `trigger_parameter_sync_step > 1` syncs less often at the price of staler
   data; with syncs of about 2 s there is little to save at *K* = 1.
+- Groups in flight are capped twice, by the budget and by
+  `max_inflight_groups`; raise `max_num_seqs` with `s`, or the cap stays at
+  `max_num_seqs // n` per replica (see the two-node results).
+- `overlap_validation` pays off when validation is long and `val_steps`
+  training steps take longer than one validation; otherwise the next due step
+  waits for the rest of it.
 
 ## Results
 
@@ -233,6 +239,38 @@ accuracy rising to 0.52 and AIME24 to 0.27–0.29. On this hardware the
 synchronous 4 + 4 and 8-GPU colocated layouts run at about the same speed, so the
 speed-up comes from the overlap, not the layout.
 
+### Two nodes
+
+The long-run configuration with 8 actors on one node and 8 vLLM replicas on
+another, weights over RCCL on RoCE (3.2 s per sync), partial rollout. Steps
+2–10 of one seed each, step time without validation:
+
+| `s` | `max_num_seqs` | Step | Trainer wait | Groups in flight |
+| --- | --- | --- | --- | --- |
+| 1 | 512 | 106 s | 36 s | 220 (budget 256) |
+| 2 | 512 | 78 s | 11 s | 256 (`max_num_seqs // n` × 8) |
+| 2 | 768 | 64 s | 3 s | 379 (budget 384) |
+
+At `s = 2` with 768 the trainer barely waits and the step is training time.
+Training accuracy and `rollout_corr/k3_kl` were the same in all three
+(0.24–0.25 and 0.0014–0.0015).
+
+The last row with `overlap_validation` and `val_steps: 10`, 30 steps, against
+the single-node long run (4 + 4, `s = 1`, validation in the foreground):
+
+| | 4 + 4, `s = 1` | 8 + 8, `s = 2`, 768, `overlap_validation` |
+| --- | --- | --- |
+| Time to step 10 / 20 / 30 | 39 / 72 / 108 min | 12 / 25 / 47 min |
+| `reward/accuracy`, steps 1–10 / 11–20 / 21–30 | 0.240 / 0.405 / 0.474 | 0.237 / 0.375 / 0.467 |
+| AIME24 at step 10 / 20 / 30 | 0.173 / 0.200 / 0.228 | 0.175 / 0.182 / 0.225 |
+| `rollout_corr/k3_kl`, steps 21–30 | 0.00070 | 0.00085 |
+
+Validation ran beside steps 11–29 nearly all the time, and they took 75 s, of
+which the trainer waited 0.1 s: the rollout kept up with both. A validation
+took 700–780 s on the shared pool and ran through up to nine weight syncs; the
+last step's, in the foreground, took 590 s. Staleness averaged 2.2 against
+1.1.
+
 ## Limitations
 
 - `trigger_parameter_sync_step > 1` has been run end to end only in six-step
@@ -248,7 +286,8 @@ speed-up comes from the overlap, not the layout.
 - No decoupled PPO: the trainer recomputes the old log-probs with its current
   weights and TIS corrects against the rollout's.
 - Rejected with fully async: the ATOM rollout and MoE routing replay
-  (`moe.r3`). Untested: the Megatron training backend and multi-node layouts.
+  (`moe.r3`). Untested: the Megatron training backend. The two-node layout
+  has run 30 steps at most.
 
 ## The `async_training` section
 

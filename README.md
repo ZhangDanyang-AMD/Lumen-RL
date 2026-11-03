@@ -186,6 +186,8 @@ weight_sync:
 
 On example 6 (Qwen3-30B-A3B-Base, DAPO, 8× MI355X), fully async on 4 + 4 GPUs reached step 60 in 204 min against 555 min for synchronous training on 8 GPUs, with the same hyperparameters and comparable accuracy (training reward 0.421 vs 0.426, AIME24 0.211 vs 0.225). The configuration is [`dapo_qwen3moe_a3b_ray_vllm_verlref_fully_async_longrun.yaml`](examples/DAPO/configs/dapo_qwen3moe_a3b_ray_vllm_verlref_fully_async_longrun.yaml); requirements, tuning, the full settings of that comparison and the limitations are in [docs/advance/async_training.md](lumenrl-docs/docs/source/advance/async_training.md).
 
+On two nodes (8 actors and 8 vLLM replicas, RCCL over RoCE) with `staleness_threshold: 2`, `max_num_seqs: 768` and `fully_async.overlap_validation: true`, which validates beside training instead of holding it, the same run reached step 30 in 47 min against 108 min on 4 + 4 GPUs, with AIME24 0.225 vs 0.228 at step 30.
+
 ## Quantization
 
 LumenRL implements a comprehensive quantization stack for low-precision post-training, including FP8, MXFP8, and MXFP4. The [FP8-RL](https://arxiv.org/abs/2601.18150) stack powers RL training, while MXFP8/MXFP4 online quantization via AITER enables efficient SDDD inference:
