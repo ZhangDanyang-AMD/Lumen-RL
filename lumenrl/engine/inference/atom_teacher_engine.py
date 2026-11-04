@@ -1285,6 +1285,9 @@ class AtomTeacherEngine:
             "sequence_width": int(resp["T"]),
             "hidden_dim": int(resp["D"]),
             "num_aux_layers": len(self._aux_layer_indices),
+            "aux_layer_ids": list(self._aux_layer_indices),
+            "kv_cache_dtype": self._atom_config.get("kv_cache_dtype"),
+            "index_cache_dtype": self._atom_config.get("index_cache_dtype"),
         }
 
     def generate_tokens(

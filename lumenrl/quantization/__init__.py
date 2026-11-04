@@ -6,6 +6,7 @@ from lumenrl.quantization.fp8_config import FP8Config
 from lumenrl.quantization.fp8_kv_cache import FP8KVCacheQuantizer
 from lumenrl.quantization.fp8_rollout import FP8RolloutQuantizer
 from lumenrl.quantization.fp8_training import FP8TrainingManager
+from lumenrl.quantization.mxfp4_training import setup_mxfp4_training
 from lumenrl.quantization.rollout_correction import (
     apply_rollout_correction,
     token_level_mis,
@@ -18,6 +19,7 @@ __all__ = [
     "FP8KVCacheQuantizer",
     "FP8RolloutQuantizer",
     "FP8TrainingManager",
+    "setup_mxfp4_training",
     "WeightQuantizer",
     "apply_rollout_correction",
     "token_level_mis",

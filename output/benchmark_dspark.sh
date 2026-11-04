@@ -16,6 +16,8 @@
 #   NUM_SPEC       --num-speculative-tokens         (default 7)
 #   MAX_NUM_SEQS   --max-num-seqs                   (default 8)
 #   QUESTION_SETS  space-separated name:path pairs  (default mtbench:$BENCH_DIR/mt_bench_question.jsonl)
+#   NCCL_SOCKET_IFNAME/NCCL_IB_HCA/NCCL_IB_GID_INDEX/NCCL_DMABUF_ENABLE
+#                  RCCL settings, applied only on Ionic hosts (defaults spur0, ionic_0..6, 1, 1)
 #
 # max_num_seqs defaults to 8 because that is what the 2026-08-14 runs used and
 # because K3's KDA recurrent state is allocated per slot: at 64 the state pool
@@ -65,6 +67,10 @@ echo "  window : $MAX_MODEL_LEN (batched tokens $MAX_NUM_BATCHED_TOKENS)"
 python3 -m json.tool "$DRAFT_DIR/config.json" | grep -E 'rope|mscale' || true
 
 docker rm -f "$CONTAINER" >/dev/null 2>&1
+if curl -sf "http://127.0.0.1:${SERVER_PORT}/health" >/dev/null; then
+  echo "port ${SERVER_PORT} is already served by another healthy process" >&2
+  exit 2
+fi
 
 EXTRA_ARGS=()
 # ONLINE_QUANT_CONFIG is the recipes/Kimi-K3.md ptpc_fp8 spec. recipes/DSpark.md
@@ -97,12 +103,36 @@ if [[ "${DISABLE_SPEC:-0}" == "1" ]]; then
   SPEC_ARGS=()
 fi
 
+# On Ionic hosts, match the validated training containers' RCCL setup. The ATOM
+# image's userspace provider predates the host kernel driver; without the host
+# provider and explicit ionic_0..6 selection, TP=8 communicator setup can fail
+# with `HIP failure: invalid argument` before /health becomes ready.
+HOST_IBVERBS_PROVIDER=/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so
+HOST_IONIC_LIB=/usr/lib/x86_64-linux-gnu/libionic.so.1
+RDMA_ARGS=()
+if [[ -f "$HOST_IBVERBS_PROVIDER" && -f "$HOST_IONIC_LIB" ]]; then
+  RDMA_ARGS+=(
+    -v /dev/infiniband:/dev/infiniband
+    -v "$HOST_IBVERBS_PROVIDER:$HOST_IBVERBS_PROVIDER:ro"
+    -v "$HOST_IONIC_LIB:$HOST_IONIC_LIB:ro"
+    -e "NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-spur0}"
+    -e "NCCL_IB_HCA=${NCCL_IB_HCA:-ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6}"
+    -e "NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX:-1}"
+    -e "NCCL_DMABUF_ENABLE=${NCCL_DMABUF_ENABLE:-1}"
+  )
+  for rdma_device in /dev/infiniband/*; do
+    [[ -c "$rdma_device" ]] && RDMA_ARGS+=(--device "$rdma_device:$rdma_device")
+  done
+fi
+
 # No --rm: the container has to survive its own exit so `docker logs` can still
 # explain a failed startup.
 docker run -d --name "$CONTAINER" \
-  --device=/dev/kfd --device=/dev/dri --group-add video \
+  --device=/dev/kfd --device=/dev/dri --group-add video --group-add render \
   --security-opt seccomp=unconfined --cap-add=SYS_PTRACE \
-  --ipc=host --shm-size 128g --network host \
+  --ipc=host --shm-size 128g --network host --ulimit memlock=-1:-1 \
+  "${RDMA_ARGS[@]}" \
+  -e NCCL_TIMEOUT=7200 \
   -v "$TARGET_MODEL":/target:ro \
   -v "$DRAFT_DIR":/draft:ro \
   "${EXTRA_ARGS[@]}" \
@@ -134,11 +164,14 @@ trap cleanup EXIT
 
 echo "--- waiting for /health (timeout ${STARTUP_TIMEOUT}s) ---"
 deadline=$((SECONDS + STARTUP_TIMEOUT))
-until curl -sf "http://127.0.0.1:${SERVER_PORT}/health" >/dev/null; do
+while true; do
   if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
     echo "server container exited early; last 60 log lines:"
     docker logs "$CONTAINER" 2>&1 | tail -60
     exit 1
+  fi
+  if curl -sf "http://127.0.0.1:${SERVER_PORT}/health" >/dev/null; then
+    break
   fi
   if (( SECONDS > deadline )); then
     echo "startup timed out"

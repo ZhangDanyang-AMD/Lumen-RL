@@ -1,0 +1,505 @@
+# syntax=docker/dockerfile:1
+#
+# AITER and Lumen layers of the Kimi-K3 DSpark MXFP4 training image.
+#
+# build_mxfp4_atom.sh in this directory builds this file with the Lumen
+# checkout as the context; ./Dockerfile then adds the Lumen-RL layer.
+#
+# This is a source rebuild, not a layer copy from the historical MXFP4 image.
+# ATOM supplies the final Python 3.12 / Torch 2.13 / ROCm 7.14 runtime. Lumen's
+# forked AITER, HIP extensions, and Megatron integration are rebuilt against
+# that runtime. ATOM's curated Python dependencies, MORI, LMCache, and serving
+# stack are retained rather than resolved again from Lumen's broad test ranges.
+
+ARG ATOM_IMAGE="rocm/atom-dev@sha256:2f8bd4206ad15d014ae48115eae1ee9f1db83781848a8542de7177cfbd4ac914"
+# The supported build helper always supplies the completed aiter-build image.
+# A plain final-stage build must fail instead of silently using ATOM's stock
+# AITER and producing an image that only appears to contain Lumen's fork.
+ARG AITER_BASE_IMAGE="lumen/aiter-base:must-be-specified"
+FROM ${ATOM_IMAGE} AS aiter-prepare
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG ATOM_IMAGE
+ARG GPU_ARCH="gfx950"
+
+LABEL org.opencontainers.image.description="ATOM runtime with Lumen's MXFP4 training stack rebuilt from source"
+LABEL com.amd.atom.base.image="${ATOM_IMAGE}"
+
+ENV GPU_ARCH_LIST=${GPU_ARCH}
+ENV GPU_ARCHS=${GPU_ARCH}
+ENV PYTORCH_ROCM_ARCH=${GPU_ARCH}
+ENV AITER_USE_SYSTEM_TRITON=1
+
+# The pinned ATOM image already built AITER, RCCL, Mooncake, and atomesh, so it
+# contains the AITER and Lumen build prerequisites. Do not run apt --fix-broken
+# here: ATOM intentionally installed a custom RCCL .deb, and a later apt repair
+# can replace it with Ubuntu's stock RCCL.
+RUN set -eux; \
+    command -v cmake; \
+    command -v g++; \
+    command -v git; \
+    command -v hipcc; \
+    command -v make; \
+    command -v ninja; \
+    command -v python3-config; \
+    python -c 'import pybind11, setuptools, setuptools_scm'
+
+# Prevent any later dependency install from replacing the ROCm-specific Torch
+# and Triton wheels supplied by the pinned ATOM image.
+ENV PIP_CONSTRAINT=/etc/lumen/atom-runtime-constraints.txt
+RUN mkdir -p "$(dirname "${PIP_CONSTRAINT}")" && \
+    python - <<'PY'
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
+
+required_packages = (
+    "atom",
+    "torch",
+    "triton",
+    "transformers",
+    "tokenizers",
+    "datasets",
+    "huggingface-hub",
+    "numpy",
+    "pandas",
+    "fsspec",
+    "psutil",
+    "sentencepiece",
+    "safetensors",
+    "einops",
+    "packaging",
+)
+optional_packages = ("torchvision", "torchaudio", "prometheus-client")
+
+pins = []
+for package in required_packages:
+    pins.append(f"{package}=={version(package)}")
+for package in optional_packages:
+    try:
+        pins.append(f"{package}=={version(package)}")
+    except PackageNotFoundError:
+        pass
+Path("/etc/lumen/atom-runtime-constraints.txt").write_text(
+    "\n".join(pins) + "\n",
+    encoding="utf-8",
+)
+print("\n".join(pins))
+PY
+
+# Fail before the expensive AITER build if the pinned ATOM runtime does not
+# already provide the exact training dependencies this image relies on.
+RUN python - <<'PY'
+import datasets
+import huggingface_hub
+import numpy
+import pandas
+import sentencepiece
+import tokenizers
+import torch
+import transformers
+
+assert torch.version.hip is not None, torch.__version__
+print(
+    "ATOM dependency baseline:",
+    f"torch={torch.__version__}",
+    f"transformers={transformers.__version__}",
+    f"tokenizers={tokenizers.__version__}",
+    f"datasets={datasets.__version__}",
+    f"huggingface_hub={huggingface_hub.__version__}",
+    f"numpy={numpy.__version__}",
+    f"pandas={pandas.__version__}",
+    f"sentencepiece={sentencepiece.__version__}",
+)
+PY
+
+WORKDIR /workspace
+
+# Rebuild Lumen's AITER fork against the ATOM Torch/ROCm/Triton stack. Remove
+# ATOM's editable checkout first so there is exactly one importable AITER tree.
+RUN set -eux; \
+    python -m pip uninstall -y amd-aiter || true; \
+    rm -rf \
+        /app/aiter-test \
+        /opt/aiter \
+        /opt/venv/lib/python3.12/site-packages/flydsl \
+        /opt/venv/lib/python3.12/site-packages/flydsl-*.dist-info \
+        /opt/venv/lib/python3.12/site-packages/flydsl.libs
+COPY third_party/aiter /opt/aiter
+COPY third_party/aiter_vendor/aiter/ /opt/aiter/aiter/
+RUN set -eux; \
+    python -m pip install --no-cache-dir --no-deps \
+        "flydsl==0.3.4.1"; \
+    python - <<'PY'
+import inspect
+from importlib.metadata import version
+from flydsl.expr import rocdl
+
+assert version("flydsl") == "0.3.4.1"
+assert "lgkmcnt" in inspect.signature(rocdl.s_waitcnt).parameters
+PY
+
+# Apply narrowly asserted AITER build-system compatibility patches.
+RUN python - <<'PY'
+from pathlib import Path
+
+setup_path = Path("/opt/aiter/setup.py")
+setup_source = setup_path.read_text(encoding="utf-8")
+setup_anchor = "setup(\n    name=PACKAGE_NAME,"
+assert setup_source.count(setup_anchor) == 1
+setup_source = setup_source.replace(
+    setup_anchor,
+    "if PREBUILD_KERNELS != 0:\n"
+    "    sys.exit(0)\n\n"
+    "setup(\n"
+    "    name=PACKAGE_NAME,",
+)
+requires_anchor = "    setup_requires=setup_requires,"
+assert setup_source.count(requires_anchor) == 1
+setup_source = setup_source.replace(
+    requires_anchor,
+    "    setup_requires=[],  # Dependencies are supplied by the pinned ATOM base.",
+)
+setup_path.write_text(setup_source, encoding="utf-8")
+
+core_path = Path("/opt/aiter/aiter/jit/core.py")
+core_source = core_path.read_text(encoding="utf-8")
+core_anchor = "from aiter.jit.utils.chip_info import gfx_from_cu_num"
+assert core_source.count(core_anchor) == 1
+core_path.write_text(
+    core_source.replace(core_anchor, "from chip_info import gfx_from_cu_num"),
+    encoding="utf-8",
+)
+
+common_path = Path("/opt/aiter/aiter/aot/flydsl/common.py")
+common_source = common_path.read_text(encoding="utf-8")
+loop_anchor = "    for kind in OpKind:\n        for job in _collect_aot_jobs_for(kind):"
+assert common_source.count(loop_anchor) == 1
+common_source = common_source.replace(
+    loop_anchor,
+    "    target_arches = set(filter(None, os.environ.get('GPU_ARCHS', '').split(';')))\n"
+    "    for kind in OpKind:\n"
+    "        for job in _collect_aot_jobs_for(kind):\n"
+    "            job_arch = 'gfx950'\n"
+    "            if kind in (OpKind.MOE, OpKind.GEMM):\n"
+    "                job_arch = cu_num_to_arch(int(job.get('cu_num', 0)))\n"
+    "            elif kind is OpKind.GROUPED_MOE:\n"
+    "                job_arch = job.get('gfx') or 'gfx1250'\n"
+    "            elif kind is OpKind.CHUNK_GDN_H:\n"
+    "                job_arch = job.get('arch') or 'gfx950'\n"
+    "            if target_arches and job_arch not in target_arches:\n"
+    "                continue",
+)
+common_path.write_text(common_source, encoding="utf-8")
+
+# Torch Library already supplies the "aiter" namespace; qualifying it again
+# leaves malformed cleanup keys such as "aiter::aiter::op".
+torch_guard_path = Path("/opt/aiter/aiter/jit/utils/torch_guard.py")
+torch_guard_source = torch_guard_path.read_text(encoding="utf-8")
+qualified_schema = 'op_schema = f"aiter::{loadName}" + schema'
+unqualified_schema = 'op_schema = f"{loadName}" + schema'
+if qualified_schema in torch_guard_source:
+    assert torch_guard_source.count(qualified_schema) == 1
+    torch_guard_source = torch_guard_source.replace(
+        qualified_schema,
+        unqualified_schema,
+    )
+else:
+    assert unqualified_schema in torch_guard_source
+torch_guard_path.write_text(torch_guard_source, encoding="utf-8")
+
+constraints = Path("/etc/lumen/atom-runtime-constraints.txt")
+constraint_lines = constraints.read_text(encoding="utf-8").splitlines()
+constraint_lines = [
+    line for line in constraint_lines if not line.startswith("flydsl==")
+]
+constraint_lines.append("flydsl==0.3.4.1")
+constraints.write_text("\n".join(constraint_lines) + "\n", encoding="utf-8")
+PY
+
+RUN python - <<'PY'
+from importlib.metadata import distributions, metadata, version
+from pathlib import Path
+
+assert version("flydsl") == "0.3.4.1"
+assert metadata("flydsl")["Name"] == "flydsl"
+assert len(list(distributions(name="flydsl"))) == 1
+assert Path("/opt/aiter/setup.py").read_text().count(
+    "if PREBUILD_KERNELS != 0:\n    sys.exit(0)\n\nsetup("
+) == 1
+assert "from chip_info import gfx_from_cu_num" in Path(
+    "/opt/aiter/aiter/jit/core.py"
+).read_text()
+assert "job_arch not in target_arches" in Path(
+    "/opt/aiter/aiter/aot/flydsl/common.py"
+).read_text()
+assert 'op_schema = f"{loadName}" + schema' in Path(
+    "/opt/aiter/aiter/jit/utils/torch_guard.py"
+).read_text()
+PY
+
+RUN set -eux; \
+    cd /opt/aiter; \
+    PREBUILD_KERNELS=0 python setup.py --name | tee /tmp/aiter-package-name.txt; \
+    grep -Fxq "amd-aiter" /tmp/aiter-package-name.txt
+
+FROM aiter-prepare AS aiter-build
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG GPU_ARCH="gfx950"
+ARG MAX_JOBS=64
+
+# PREBUILD_KERNELS runs before setuptools dispatches its command and exits after
+# producing the kernels. AITER normalizes one duplicate tuned table per failed
+# pass, hence the bounded retries must remain in this Docker layer.
+RUN set -eux; \
+    cd /opt/aiter; \
+    prebuild_ok=0; \
+    for attempt in {1..8}; do \
+        if AITER_USE_SYSTEM_TRITON=1 \
+           GPU_ARCHS="${GPU_ARCH}" \
+           MAX_JOBS="${MAX_JOBS}" \
+           PREBUILD_KERNELS=1 \
+               python setup.py build_ext --inplace 2>&1 | \
+               tee /tmp/aiter-prebuild.log; then \
+            prebuild_ok=1; \
+            break; \
+        fi; \
+        grep -Fq \
+            'Auto-resolved by keeping best performing' \
+            /tmp/aiter-prebuild.log || exit 1; \
+        echo "AITER prebuild attempt ${attempt} requested a re-run"; \
+    done; \
+    test "${prebuild_ok}" = 1
+
+# Register the already-built source tree without resolving dependencies.
+RUN set -eux; \
+    cd /opt/aiter; \
+    PREBUILD_KERNELS=0 \
+        python -m pip install -e . --no-build-isolation --no-deps
+
+ARG ATOM_IMAGE
+ARG AITER_REVISION="unknown"
+ARG AITER_SOURCE_FINGERPRINT="unknown"
+ARG AITER_BUILD_RECIPE_FINGERPRINT="unknown"
+
+# Keep provenance and a completion marker on the reusable intermediate image.
+# These instructions are intentionally after the expensive build so metadata
+# changes do not invalidate kernel compilation.
+LABEL com.amd.lumen.aiter.build.complete="true"
+LABEL com.amd.lumen.aiter.revision="${AITER_REVISION}"
+LABEL com.amd.lumen.aiter.source.fingerprint="${AITER_SOURCE_FINGERPRINT}"
+LABEL com.amd.lumen.aiter.gpu.arch="${GPU_ARCH}"
+LABEL com.amd.lumen.aiter.atom.base="${ATOM_IMAGE}"
+LABEL com.amd.lumen.aiter.build.recipe.fingerprint="${AITER_BUILD_RECIPE_FINGERPRINT}"
+
+RUN set -eux; \
+    test -s /opt/aiter/aiter/jit/module_aiter_core.so; \
+    test -s /opt/aiter/aiter/jit/module_quant.so; \
+    python - <<'PY'
+import json
+from importlib.metadata import distribution
+
+dist = distribution("amd-aiter")
+direct_url = json.loads(dist.read_text("direct_url.json"))
+assert direct_url["url"] == "file:///opt/aiter", direct_url
+PY
+RUN printf '%s\n' \
+        "atom_base=${ATOM_IMAGE}" \
+        "aiter_revision=${AITER_REVISION}" \
+        "aiter_source_fingerprint=${AITER_SOURCE_FINGERPRINT}" \
+        "aiter_build_recipe_fingerprint=${AITER_BUILD_RECIPE_FINGERPRINT}" \
+        "gpu_arch=${GPU_ARCH}" \
+        > /etc/lumen/aiter-build-manifest.txt
+
+FROM ${AITER_BASE_IMAGE} AS runtime
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG AITER_BASE_IMAGE
+ARG ATOM_IMAGE="rocm/atom-dev@sha256:2f8bd4206ad15d014ae48115eae1ee9f1db83781848a8542de7177cfbd4ac914"
+ARG GPU_ARCH="gfx950"
+ARG MAX_JOBS=64
+ARG MEGATRON_REPO="https://github.com/ROCm/Megatron-LM.git"
+ARG MEGATRON_COMMIT="8dd45f5a51378ec1ee7937dee3c20d8626df4763"
+
+ENV GPU_ARCH_LIST=${GPU_ARCH}
+ENV GPU_ARCHS=${GPU_ARCH}
+ENV PYTORCH_ROCM_ARCH=${GPU_ARCH}
+
+# Lumen's two-file SwiGLU overlay was based on the previous AITER pin. The
+# unified AITER added sigmoid helpers used by fused_sigmoid_mul after that
+# overlay was created, so restore those small API additions without discarding
+# Lumen's swiglu_fwd/swiglu_bwd additions.
+RUN python - <<'PY'
+from pathlib import Path
+
+path = Path("/opt/aiter/aiter/ops/triton/_triton_kernels/activation.py")
+source = path.read_text(encoding="utf-8")
+if "def _sigmoid(x):" not in source:
+    silu_anchor = (
+        "@triton.jit\n"
+        "def _silu(x):\n"
+        "    return _silu_exp2(x)\n"
+    )
+    assert source.count(silu_anchor) == 1
+    source = source.replace(
+        silu_anchor,
+        silu_anchor
+        + "\n\n@triton.jit\n"
+        + "def _sigmoid_exp2(x):\n"
+        + "    return 1.0 / (1.0 + tl.exp2(-(x * 1.44269504089)))\n"
+        + "\n\n@triton.jit\n"
+        + "def _sigmoid(x):\n"
+        + "    return _sigmoid_exp2(x)\n",
+    )
+    mapping_anchor = '        "gelu_tanh": _gelu_tanh,\n'
+    assert source.count(mapping_anchor) == 1
+    source = source.replace(
+        mapping_anchor,
+        mapping_anchor
+        + '        "sigmoid": _sigmoid,\n'
+        + '        "sigmoid_exp2": _sigmoid_exp2,\n',
+    )
+    dispatch_anchor = (
+        '    elif activation == "gelu_tanh":\n'
+        "        return _gelu_tanh(x)\n"
+    )
+    assert source.count(dispatch_anchor) == 1
+    source = source.replace(
+        dispatch_anchor,
+        dispatch_anchor
+        + '    elif activation == "sigmoid":\n'
+        + "        return _sigmoid(x)\n"
+        + '    elif activation == "sigmoid_exp2":\n'
+        + "        return _sigmoid_exp2(x)\n",
+    )
+    path.write_text(source, encoding="utf-8")
+
+assert "def _sigmoid(x):" in source
+assert '"sigmoid": _sigmoid' in source
+PY
+
+# Match the historical MXFP4 training image's Megatron checkout. Its Python
+# package and dataset helper are rebuilt in the new runtime.
+RUN set -eux; \
+    rm -rf /workspace/megatron_lm; \
+    git clone --recursive "${MEGATRON_REPO}" /workspace/megatron_lm; \
+    cd /workspace/megatron_lm; \
+    git checkout "${MEGATRON_COMMIT}"; \
+    git submodule update --init --recursive; \
+    python -m pip uninstall -y megatron-core || true; \
+    python -m pip install -e . --no-build-isolation --no-deps; \
+    make -C megatron/core/datasets
+
+# Normal Lumen application changes invalidate only the final package layers,
+# not the persisted AITER build or pinned Megatron checkout above.
+COPY . /workspace/Lumen
+
+# Build Lumen's HIP extensions without invoking a dependency resolver. The
+# generic Lumen requirements files contain test and optional LoRA/download
+# dependencies with broad lower bounds; ATOM already provides the runtime
+# packages required by this training target.
+RUN set -eux; \
+    cd /workspace/Lumen; \
+    MAX_JOBS="${MAX_JOBS}" \
+        python -m pip install -e . --no-build-isolation --no-deps
+
+# MORI's extension RPATH is package-local; register Torch's shared-library
+# directory as the historical Lumen image does so libtorch dependencies resolve.
+RUN python -c "import pathlib, torch; print(pathlib.Path(torch.__file__).parent / 'lib')" \
+        > /etc/ld.so.conf.d/torch.conf && \
+    ldconfig
+
+ENV PYTHONPATH="/workspace/Lumen:/opt/aiter:/workspace/megatron_lm:/app/ATOM"
+ENV LUMEN_ROOT=/workspace/Lumen
+# Keep AITER's build-time dispatch pinned to the image's only supported arch.
+# GPU-dependent imports still use live detection and are tested after the image
+# is built, by selfcheck/run_gpu_correctness_checks.sh and when a run starts,
+# rather than in this device-less build step.
+
+RUN python - <<'PY'
+import importlib.util
+import json
+from importlib.metadata import distribution, version
+from pathlib import Path
+
+import atom
+import torch
+import transformers
+from atom.config import Config as AtomConfig
+
+for pin in Path("/etc/lumen/atom-runtime-constraints.txt").read_text().splitlines():
+    package, expected = pin.split("==", 1)
+    actual = version(package)
+    assert actual == expected, f"{package}: expected {expected}, got {actual}"
+
+assert torch.version.hip is not None, torch.__version__
+assert "+rocm" in torch.__version__, torch.__version__
+assert Path(importlib.util.find_spec("aiter").origin).is_relative_to("/opt/aiter")
+assert Path("/opt/aiter/aiter/jit/module_aiter_core.so").is_file()
+assert Path("/opt/aiter/aiter/jit/module_quant.so").is_file()
+assert version("amd-aiter")
+assert importlib.util.find_spec("mori") is not None
+assert Path(atom.__file__).is_relative_to("/app/ATOM"), atom.__file__
+lumen_spec = importlib.util.find_spec("lumen")
+assert lumen_spec is not None and lumen_spec.origin is not None
+assert Path(lumen_spec.origin).is_relative_to("/workspace/Lumen"), lumen_spec.origin
+megatron_dist = distribution("megatron-core")
+megatron_direct_url = json.loads(megatron_dist.read_text("direct_url.json"))
+assert megatron_direct_url["url"] == "file:///workspace/megatron_lm", (
+    megatron_direct_url
+)
+assert list(
+    Path("/workspace/megatron_lm/megatron/core/datasets").glob(
+        "helpers_cpp*.so"
+    )
+)
+assert AtomConfig is not None
+print(
+    "combined source rebuild:",
+    f"atom={version('atom')}",
+    f"torch={torch.__version__}",
+    f"hip={torch.version.hip}",
+    f"triton={version('triton')}",
+    f"transformers={transformers.__version__}",
+)
+PY
+
+# Provenance only. Every RUN after an ARG sees it as an environment variable,
+# so declaring these earlier would let a per-build value such as BUILD_DATE
+# invalidate the Megatron and Lumen layers above.
+ARG LUMEN_REVISION="unknown"
+ARG AITER_REVISION="unknown"
+ARG LUMEN_SOURCE_STATE="unknown"
+ARG BUILD_DATE="unknown"
+ARG AITER_BASE_IMAGE_ID="unknown"
+ARG BUILD_RECIPE_FINGERPRINT="unknown"
+
+LABEL org.opencontainers.image.revision="${LUMEN_REVISION}"
+LABEL org.opencontainers.image.created="${BUILD_DATE}"
+LABEL com.amd.lumen.source.state="${LUMEN_SOURCE_STATE}"
+LABEL com.amd.lumen.aiter.revision="${AITER_REVISION}"
+LABEL com.amd.lumen.megatron.revision="${MEGATRON_COMMIT}"
+LABEL com.amd.lumen.aiter.base.image="${AITER_BASE_IMAGE}"
+LABEL com.amd.lumen.aiter.base.image.id="${AITER_BASE_IMAGE_ID}"
+LABEL com.amd.lumen.gpu.arch="${GPU_ARCH}"
+LABEL com.amd.lumen.build.recipe.fingerprint="${BUILD_RECIPE_FINGERPRINT}"
+
+RUN printf '%s\n' \
+        "atom_base=${ATOM_IMAGE}" \
+        "aiter_base=${AITER_BASE_IMAGE}" \
+        "aiter_base_image_id=${AITER_BASE_IMAGE_ID}" \
+        "lumen_revision=${LUMEN_REVISION}" \
+        "lumen_source_state=${LUMEN_SOURCE_STATE}" \
+        "aiter_revision=${AITER_REVISION}" \
+        "megatron_revision=${MEGATRON_COMMIT}" \
+        "build_recipe_fingerprint=${BUILD_RECIPE_FINGERPRINT}" \
+        "build_date=${BUILD_DATE}" \
+        "gpu_arch=${GPU_ARCH_LIST}" \
+        > /etc/lumen/build-manifest.txt
+
+WORKDIR /workspace/Lumen
+ENTRYPOINT []
+CMD ["bash"]

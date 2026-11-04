@@ -1,0 +1,302 @@
+# Kimi K3 DSpark SDDD — MI350 (4x ATOM TP=8 teachers + 1x 8-GPU draft)
+#
+# Four resident Ray actors each own one ATOM TP=8 node. Whole batches are sent
+# round-robin; every actor prefills the response stored in the dataset and
+# extracts hidden states. There is no teacher decode sweep.
+# The 8-rank draft node consumes disjoint per-sequence keys through Mooncake TCP
+# while teachers continue producing into a bounded queue.
+#
+# 正式训练数据从零训练 MXFP4：3 epoch，32768 窗口，cosine 5e-5 -> 2e-6。
+#
+# 模型、数据路径、token cache 和固定 eval slice 由启动脚本通过环境变量传入。
+#
+# Usage:
+#   bash scripts/launch_multinode.sh
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
+
+policy:
+  model_name: /path/to/local_nvme/models/Kimi-K3
+  training_backend: fsdp2
+  generation_backend: hf
+  # 32768：正式训练数据在这个口径下存活 2,468,457 / 2,468,462 = 99.9998%。
+  # 降到 16384 会丢 0.7%、8192 会丢 6.6%，丢掉的正是 32768 窗口重新生成的长样本。
+  max_total_sequence_length: 32768
+  # Keep this optimizer block as a unit: it is the TorchSpec reference recipe.
+  train_global_batch_size: 128
+  train_micro_batch_size: 1
+  # 峰值。从零训会真的走到它（warmup 4% 之后就是这里）。
+  learning_rate: 5.0e-5
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  # /!\ Not 0. gen-3 ran a single epoch with min_lr 0, so cosine took the lr to
+  # 7.6e-10 and eval AL flattened at 1.613-1.617 from step 3300 on -- a schedule
+  # artefact, not data exhaustion, and it is why a second epoch cannot simply be
+  # appended.
+  #
+  # 2.0e-6 = 峰值的 1/25：三个 epoch 跨完整 cosine，既真正退火完了，又留了一个
+  # 非零的入场券，以后想再补一轮不用重开 schedule。
+  min_lr: 2.0e-6
+  warmup_ratio: 0.04
+  # cosine 跨完整三个 epoch。从零训不存在"入口 lr"的问题（warmup 从 0 升到峰值），
+  # 所以不需要 WSD —— WSD 是为了解耦"切进来时的 lr"和"收尾退火"，那是续训才有的
+  # 需求。
+  lr_decay_style: cosine
+
+algorithm:
+  name: spec_distill
+  spec_distill:
+    draft_type: dspark
+    loss_type: dspark
+    sequential_mode: streaming_disaggregated
+    teacher_replicas: 4
+    teacher_actor_prefix: kimi-k3-sddd-teacher
+    # Two queued batches per replica keeps all four teachers busy while the
+    # draft consumes the oldest completed batch.
+    stream_prefetch_batches: 8
+    # The launcher overrides this onto CACHE_DIR under SHARED_ROOT.
+    teacher_weights_path: /data/cache/kimi_k3_teacher_static_weights.pt
+    # DSpark position decay: w_k = exp(-k / gamma)
+    loss_decay_gamma: 4.0
+    num_target_layers: 5
+    spec_length: 7
+    # /!\ These five layers are the draft's feature contract; the teacher must
+    # capture exactly the same five. ATOM's hook captures hidden_states +
+    # residual (the post-layer residual stream), which is semantically equal to
+    # capture_mode: postnorm, and ATOM's own DSpark checkpoint came out of this
+    # path. Changing the layers means changing num_target_layers and the draft's
+    # input width along with it.
+    aux_hidden_state_layer_ids: [2, 23, 47, 71, 89]
+    capture_mode: postnorm
+    # anchor_num is the main driver of peak memory (57.8 GiB measured at 512).
+    anchor_num: 512
+    # /!\ Must be false on ATOM, the inverse of the vLLM variant, because the two
+    # storage conventions differ:
+    #   vLLM: splits the 5 aux layers into "first 4 -> hidden_states, 5th ->
+    #     last_hidden_states", pre-norm, so the trainer has to rejoin them and
+    #     apply RMSNorm itself.
+    #   ATOM: hidden_states already holds all 5 layers (35840), and
+    #     last_hidden_states is the model's final output with the final norm
+    #     already applied (kimi_k3.py's forward ends in
+    #     return self.norm(hidden_states)).
+    # Setting it true makes the trainer concatenate once more -> fc receives
+    # 6*7168=43008 instead of 5*7168, a straight shape error, and the norm gets
+    # applied a second time.
+    separate_last_hidden: false
+    shift_input_embeds: false
+    # DSpark loss weights
+    ce_loss_alpha: 0.1
+    l1_loss_alpha: 0.9
+    confidence_loss_alpha: 1.0
+  teacher:
+    model_name: /path/to/local_nvme/models/Kimi-K3
+    inference_backend: atom
+    tensor_parallel_size: 8
+    gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+    quantization: ""
+    # Off-policy: use the Kimi-K3 responses already stored in
+    # slippedJim/ATOM_regen_seeklight_kimi_mtp. Teachers only prefill and publish
+    # hidden states; A1 decode is intentionally skipped.
+    generate_mode: prefill
+    transport: mooncake
+    # ATOM prefill settings aligned with Jim's cache-on-policy branch. Chunking
+    # and prefix caching must remain disabled because extraction is keyed by
+    # request and a later write would overwrite an earlier partial span.
+    atom:
+      max_model_len: 32768
+      # max_num_seqs=32 曾在相同 step/batch 上重复触发 teacher 集合通信挂死；
+      # 降到 24 后训练通过该位置，实测吞吐差异在噪声范围内。FlyDSL catalog
+      # warning 在成功和失败 run 中都出现过，不是可用的故障判据。若 resume 后在
+      # 同一步重复 extract_hidden 超时，应调整 batch 打包，而不是原样反复重启。
+      # /!\ 不要改 max_num_batched_tokens 去躲 —— 它必须 >= max_model_len，
+      # 而 enable_chunked_prefill 是 false，调小会让长序列没法一次 prefill。
+      max_num_seqs: 24
+      # Exactly one full sequence per scheduler step; lowering this silently
+      # truncates captured hidden states.
+      max_num_batched_tokens: 32768
+      enable_prefix_caching: false
+      enable_chunked_prefill: false
+      # 0.90 会在 33–39 万 token 的重批次上让 Teacher OOM：prefill 后还要额外
+      # 申请约 3.5 GiB 存 hidden state，0.80 为它留出余量。
+      gpu_memory_utilization: 0.80
+      # Match the target's serving precision so the draft sees the same context
+      # features during training and deployment.
+      kv_cache_dtype: fp8
+      index_cache_dtype: fp8
+      enforce_eager: true
+  draft:
+    # The formal run trains from random initialization. resume_from must be
+    # null, not merely ignored: the loader only skips it because from_scratch is
+    # true, and a stale path here is the kind of thing that silently becomes live
+    # again when someone flips one flag.
+    from_scratch: true
+    resume_from: null
+    # ---- Aligned with Inferact/Kimi-K3-DSpark/config.json ----
+    num_layers: 5
+    num_heads: 64
+    num_kv_heads: 64
+    head_dim: 128
+    ffn_dim: 14336
+    rms_norm_eps: 1.0e-5
+    rope_theta: 50000.0
+    rope_scaling_type: yarn
+    rope_scaling_factor: 32.0
+    rope_original_max_pos: 32768
+    rope_beta_fast: 32.0
+    rope_beta_slow: 1.0
+    rope_mscale: 1.0
+    rope_mscale_all_dim: 1.0
+    use_aux_hidden_state: true
+    use_input_layernorm_in_first_layer: true
+    use_last_layernorm: true
+    use_mtp_layernorm: false
+    attention_bias: false
+    mlp_bias: false
+    dtype: bfloat16
+    # ---- MLA dimensions (Inferact/Kimi-K3-DSpark) ----
+    q_lora_rank: 1536
+    kv_lora_rank: 512
+    qk_nope_head_dim: 128
+    qk_rope_head_dim: 64
+    v_head_dim: 128
+    # ---- DSpark-specific ----
+    markov_rank: 256
+    markov_head_type: vanilla
+    enable_confidence_head: true
+    confidence_head_with_markov: true
+    mask_token_id: 163837
+    block_size: 7
+
+mooncake:
+  # /!\ TCP, not RDMA. Ionic allows one RDMA client per HCA per process: the
+  # second registration on a device fails with EINVAL. With seven
+  # HCAs a teacher's producer pool therefore tops out at 7 x 2 GiB = 14 GiB,
+  # while one batch of 128 sequences publishes about 24 GiB at this dataset's
+  # mean length, so the producer can never place a whole batch and the request
+  # never completes -- observed as extract_hidden timing out at 600 s with zero
+  # steps done on 2026-08-24. TCP has no memory-region limit and measured
+  # 2.0 GiB/s put plus 4.44 GiB/s cross-node get with eight fetchers, roughly
+  # 5 s per batch against a ~44 s draft step.
+  protocol: tcp
+  # Empty under TCP. Only NCCL (draft gradients, intra-node) uses the HCAs, and
+  # the hosts expose ionic_0..6 -- there is no ionic_7.
+  device_name: ""
+  enable_gpu_direct: false
+  enable_hard_pin: true
+  # One teacher segment holds every batch in flight. The 256 GB value is for the
+  # 32768-window formal run and is touched lazily; launchers may override it.
+  global_segment_size: 256GB
+  # Per-sequence staging buffer for the five aux layers plus final hidden state.
+  local_buffer_size: 8GB
+  # The default was 90 seconds. Widening it to 300 is pure fault tolerance and
+  # does not affect the normal path.
+  get_retry_max_wait_seconds: 300.0
+
+quantization:
+  training:
+    fp8: null
+    lumen_norm: true
+    lumen_linear: false
+    hf_attn_patch: true
+    mxfp4: true
+    mxfp4_disable_weight_cache: false
+    mxfp4_quant_weight_selection:
+      mode: explicit
+      include_quant_weight:
+        - layers.*.mlp.gate_proj.weight
+        - layers.*.mlp.up_proj.weight
+        - layers.*.mlp.down_proj.weight
+        - layers.*.self_attn.q_b_proj.weight
+        - layers.*.self_attn.kv_b_proj.weight
+        - layers.*.self_attn.o_proj.weight
+      exclude_quant_weight:
+        # fc 在 ATOM 导出后对应 context_proj；以下 Linear 均保持 BF16。
+        - fc.weight
+        - layers.*.self_attn.q_a_proj.weight
+        - layers.*.self_attn.kv_a_proj_with_mqa.weight
+        - markov_head.*
+        - confidence_head.*
+  rollout_correction:
+    enabled: false
+
+dataset:
+  chat_template: kimi-k3
+  # The regenerated final assistant turn is K3 output; earlier assistant turns
+  # are conversation history and are not part of this distillation target.
+  last_turn_loss_only: "true"
+  min_loss_tokens: 14
+  # Rendering the 2.47M-row training set is CPU-heavy; the nodes have 236 cores.
+  # Pre-warm the cache with selfcheck/preprocess_dataset.py using these exact
+  # arguments, otherwise the trainer pays for it after the teachers have already
+  # claimed the GPUs. num_workers is the one argument not in the cache key.
+  num_preprocess_workers: 120
+  cache_dir: /dev/shm/lumenrl_cache
+  # The complete stored response must fit; do not train on a truncated answer.
+  drop_overlong: true
+  # Zero selects full input_ids + dataset assistant loss mask instead of
+  # generating prompt_ids for an on-policy decode.
+  max_prompt_tokens: 0
+  # /!\ Must be true. K3 is a preserved-thinking model and reasoning_effort only
+  # supports max: apply_chat_template's thinking argument controls which channel
+  # the decode starts on (<|open|>think<|sep|> versus <|open|>response<|sep|>),
+  # so thinking=false pins the model on a starting point it was never trained
+  # for, and reasoning_content in multi-turn history gets stripped as well.
+  #
+  # It was previously set false on the argument that "the think block will eat
+  # the 1000-token budget and leave no response at all". Measurement does not
+  # support that: K3's output has a median of only 398 tokens, and **truncation
+  # is harmless for speculative distillation** (see teacher.generate_max_tokens).
+  # Even with 26% of rows hitting the cap at 1024, what got capped is still
+  # entirely tokens the teacher really produced, so it remains valid supervision.
+  #
+  # /!\ Depends on the kimi_k3_parser fix (PARSER_VERSION=6): before it,
+  # _prepare_messages unconditionally stripped reasoning from non-final assistant
+  # turns, so thinking=true rendered a string of empty think blocks. Old caches
+  # must be invalidated through PARSER_VERSION and must not be reused.
+  thinking: true
+
+reward:
+  type: function
+  function: math_reward
+  # 正式训练数据：HF 数据集 ZhuoBohang-AMD/Kimi-K3-Draft-mxfp4-training-data
+  # （2,468,462 行），来源与组成见其数据卡。切换数据后必须重新预处理并重算总步数。
+  dataset: ${oc.env:DATASET_PATH}
+
+eval:
+  enabled: true
+  interval_on_completed_steps: true
+  # Formal 3-epoch run evaluates every 1500 steps.
+  interval: 1500
+  # Must stay a multiple of world_size * micro_batch_size.
+  num_samples: 128
+  micro_batch_size: 2
+  # eval/* uses the shuffled training-data tail. eval_fixed/* is materialized
+  # once by selfcheck/build_eval_slice.py from the same file, preprocessing
+  # parameters, and seed.
+  extra_slices:
+    - path: ${oc.env:EVAL_FIXED_PATH}
+      prefix: eval_fixed
+
+checkpointing:
+  # The multinode launcher overrides this onto shared persistent storage.
+  checkpoint_dir: /dev/shm/checkpoints/kimi_k3_dspark_mxfp4_atom
+  # 每 500 steps 保存；训练结束时 Trainer 会额外保存最终 step。
+  save_steps: 500
+  save_total_limit: 10
+  # 保持 false。故障恢复时启动加 EXTRA_OVERRIDES="checkpointing.resume=true"：
+  # 从 checkpoint_dir 中步数最大的 checkpoint 恢复 model、optimizer、FP32 master
+  # 和 scheduler，num_training_steps 保持不变。
+  resume: false
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+# 仅适用于正式训练数据：2,468,457 条预处理存活样本，每 epoch 19,283 steps。
+# 换数据后用 selfcheck/preprocess_dataset.py 按同一 YAML 参数重算，并通过
+# EXTRA_OVERRIDES="num_training_steps=N" 传入；错误的步数会越过 _trainable_len，
+# 污染固定 eval 尾部。
+num_training_steps: 57849
+seed: 42

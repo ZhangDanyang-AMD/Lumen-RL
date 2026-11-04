@@ -12,7 +12,10 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from lumenrl.utils.checkpoint import CheckpointManager
+from lumenrl.utils.checkpoint import (
+    CheckpointManager,
+    capture_distributed_rng_state,
+)
 
 if TYPE_CHECKING:
     from lumenrl.trainer.rl_trainer import RLTrainer
@@ -47,6 +50,16 @@ class LoggingCallback(Callback):
             return
         if trainer._rank != 0:
             return
+        if "simulated_acc_len" not in metrics:
+            running = 1.0
+            acceptance_length = 0.0
+            position = 0
+            while f"step_{position}_acc" in metrics:
+                running *= float(metrics[f"step_{position}_acc"])
+                acceptance_length += running
+                position += 1
+            if position:
+                metrics["simulated_acc_len"] = acceptance_length
         parts = [f"{k}={v:.6g}" for k, v in sorted(metrics.items())]
         # Display 1-based step (aligns with verl's 1-indexed global_steps).
         logger.info("step=%d %s", step + 1, " ".join(parts))
@@ -151,6 +164,10 @@ class CheckpointCallback(Callback):
             if hasattr(opt, "scheduler"):
                 state["scheduler_last_epoch"] = opt.scheduler.last_epoch
 
+        state["rng_state"] = capture_distributed_rng_state(
+            getattr(trainer, "_is_distributed", False)
+        )
+
         if rank == 0:
             n_model = len(state.get("model_state_dict", {}))
             n_fp32 = len(state.get("fp32_params", []))
@@ -160,10 +177,8 @@ class CheckpointCallback(Callback):
                 "yes" if "optimizer_state_dict" in state else "no",
                 state.get("scheduler_last_epoch", "N/A"),
             )
-            self._prune_old_checkpoints(
-                ckpt_dir, keep=self.save_total_limit - 1,
-            )
             self._manager.save(state, path, global_step)
+            self._prune_old_checkpoints(ckpt_dir)
 
         if trainer._is_distributed:
             torch.distributed.barrier()
@@ -337,16 +352,20 @@ class EvalCallback(Callback):
     collective operations.  Only rank 0 logs the results.
     """
 
-    def __init__(self, interval: int) -> None:
+    def __init__(
+        self, interval: int, *, interval_on_completed_steps: bool = False
+    ) -> None:
         self.interval = max(1, int(interval))
+        self.interval_on_completed_steps = interval_on_completed_steps
 
     def on_step_end(self, trainer: "RLTrainer", step: int, metrics: dict[str, float]) -> None:
-        if step % self.interval != 0:
+        eval_step = step + 1 if self.interval_on_completed_steps else step
+        if eval_step % self.interval != 0:
             return
         val_metrics = trainer.run_validation()
         if trainer._rank == 0:
             parts = [f"{k}={v:.6g}" for k, v in sorted(val_metrics.items())]
-            logger.info("eval step=%d %s", step, " ".join(parts))
+            logger.info("eval step=%d %s", eval_step, " ".join(parts))
         metrics.update(val_metrics)
 
 

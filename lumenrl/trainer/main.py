@@ -113,7 +113,12 @@ def main() -> None:
         ))
 
     if config.eval.enabled:
-        cbs.append(EvalCallback(interval=config.eval.interval))
+        cbs.append(
+            EvalCallback(
+                interval=config.eval.interval,
+                interval_on_completed_steps=config.eval.interval_on_completed_steps,
+            )
+        )
 
     if config.logger.wandb_enabled:
         cbs.append(WandbCallback(

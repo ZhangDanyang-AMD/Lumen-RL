@@ -619,11 +619,32 @@ class TrainingQuantConfig:
     fp8: Optional[str] = None
     fp8_recipe: str = "blockwise"
     fp8_weight_cache: bool = False
+    mxfp4: bool = False
+    mxfp4_disable_weight_cache: bool = False
+    mxfp4_quant_weight_selection: dict[str, Any] = field(
+        default_factory=lambda: {
+            "mode": "all_linear",
+            "include_quant_weight": [],
+            "exclude_quant_weight": [],
+        }
+    )
     lumen_norm: bool = False
     fused_mlp: bool = False
     fused_rope: bool = False
     lumen_linear: bool = False
     hf_attn_patch: bool = False
+
+    def __post_init__(self) -> None:
+        if self.mxfp4 and self.fp8:
+            raise ValueError(
+                "quantization.training.fp8 and quantization.training.mxfp4 "
+                "cannot be enabled together"
+            )
+        if self.mxfp4 and self.lumen_linear:
+            raise ValueError(
+                "quantization.training.lumen_linear must be false when "
+                "quantization.training.mxfp4 is true"
+            )
 
 
 @dataclass
@@ -758,6 +779,9 @@ class EvalConfig:
 
     enabled: bool = False
     interval: int = 1000
+    # False preserves legacy zero-based scheduling (eval at internal step 0).
+    # True treats interval as completed optimizer steps (100, 200, ...).
+    interval_on_completed_steps: bool = False
     num_samples: int = 256
     micro_batch_size: int = 8
     # Fixed eval slices, each an entry of {path, prefix}, built offline by
@@ -981,6 +1005,7 @@ class LumenRLConfig:
         if overrides:
             cli_cfg = OmegaConf.from_dotlist(overrides)
             merged = OmegaConf.merge(merged, cli_cfg)
+        OmegaConf.resolve(merged)
         return OmegaConf.to_object(merged)  # type: ignore[return-value]
 
     @classmethod

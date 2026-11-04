@@ -3,13 +3,92 @@
 from __future__ import annotations
 
 import logging
+import os
+import random
 import re
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
+
+
+def capture_rng_state() -> dict[str, Any]:
+    """Capture the process-local RNG streams used by training."""
+    state: dict[str, Any] = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state()
+    return state
+
+
+def restore_rng_state(state: dict[str, Any]) -> None:
+    """Restore process-local RNG streams captured by :func:`capture_rng_state`."""
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch_cpu"])
+    cuda_state = state.get("torch_cuda")
+    if cuda_state is not None:
+        if not torch.cuda.is_available():
+            raise RuntimeError("checkpoint contains CUDA RNG state but CUDA is unavailable")
+        torch.cuda.set_rng_state(cuda_state)
+
+
+def capture_distributed_rng_state(distributed: bool) -> dict[str, Any]:
+    """Collect one RNG state per draft rank for a rank-0 checkpoint."""
+    local_state = capture_rng_state()
+    if (
+        distributed
+        and torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+    ):
+        world_size = torch.distributed.get_world_size()
+        states: list[dict[str, Any] | None] = [None] * world_size
+        torch.distributed.all_gather_object(states, local_state)
+    else:
+        world_size = 1
+        states = [local_state]
+    return {
+        "version": 1,
+        "world_size": world_size,
+        "states": states,
+    }
+
+
+def restore_distributed_rng_state(
+    bundle: dict[str, Any],
+    *,
+    rank: int,
+    world_size: int,
+) -> None:
+    """Restore this rank's RNG streams from a distributed checkpoint."""
+    saved_world_size = int(bundle.get("world_size", 0))
+    states = bundle.get("states")
+    if (
+        saved_world_size != world_size
+        or not isinstance(states, list)
+        or len(states) != world_size
+        or any(state is None for state in states)
+    ):
+        raise RuntimeError(
+            "checkpoint RNG topology mismatch: "
+            f"saved_world_size={saved_world_size}, current_world_size={world_size}, "
+            f"saved_states={len(states) if isinstance(states, list) else 'invalid'}"
+        )
+    if rank < 0 or rank >= len(states):
+        raise RuntimeError(
+            f"checkpoint has no RNG state for rank {rank} "
+            f"(saved states={len(states)})"
+        )
+
+    state = states[rank]
+    assert state is not None
+    restore_rng_state(state)
 
 
 class CheckpointManager:
@@ -21,7 +100,12 @@ class CheckpointManager:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {"step": int(step), "state_dict": state_dict}
-        torch.save(payload, path)
+        tmp_path = path.with_suffix(f"{path.suffix}.incomplete")
+        try:
+            torch.save(payload, tmp_path)
+            os.replace(tmp_path, path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
         logger.info("Saved checkpoint to %s (step=%d)", path, step)
 
     @staticmethod

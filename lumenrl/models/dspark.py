@@ -686,6 +686,62 @@ class DSparkModel(nn.Module):
         )
         return block_mask, keep_rows
 
+    def prepare_loss_metadata(
+        self,
+        input_ids: Tensor,
+        loss_mask: Tensor,
+        decay_gamma: float,
+    ) -> dict[str, Tensor]:
+        """Sample anchors and build loss masks without running the backbone."""
+        B, T = input_ids.shape
+        device = input_ids.device
+        num_anchors = self.anchor_num
+        anchors, block_keep_mask = self._sample_anchors(
+            T, loss_mask, num_anchors,
+        )
+        label_offsets = torch.arange(
+            1, self.block_size + 1, device=device,
+        ).view(1, 1, -1)
+        label_indices = anchors.unsqueeze(-1) + label_offsets
+        valid_label_mask = label_indices < T
+        safe_label_indices = label_indices.clamp(max=T - 1)
+        safe_label_indices = torch.where(
+            block_keep_mask.unsqueeze(-1),
+            safe_label_indices,
+            torch.zeros_like(safe_label_indices),
+        )
+        target_ids = torch.gather(
+            input_ids.unsqueeze(1).expand(-1, num_anchors, -1),
+            2,
+            safe_label_indices,
+        )
+        target_loss_mask = torch.gather(
+            loss_mask.unsqueeze(1).expand(-1, num_anchors, -1),
+            2,
+            safe_label_indices,
+        )
+        eval_bool = (
+            block_keep_mask.unsqueeze(-1)
+            & valid_label_mask
+            & (target_loss_mask > 0.5)
+        )
+        eval_mask = eval_bool.to(torch.int32).cumprod(dim=-1).bool().float()
+        k_idx = torch.arange(self.block_size, device=device).view(1, 1, -1)
+        if decay_gamma > 0:
+            decay_w = torch.exp(-k_idx.float() / decay_gamma)
+        else:
+            decay_w = torch.ones_like(k_idx, dtype=torch.float32)
+        decay_weight_mask = eval_mask * decay_w
+        return {
+            "anchors": anchors,
+            "block_keep_mask": block_keep_mask,
+            "safe_label_indices": safe_label_indices,
+            "target_ids": target_ids,
+            "eval_mask": eval_mask,
+            "decay_weight_mask": decay_weight_mask,
+            "local_den": decay_weight_mask.sum(),
+        }
+
     def forward(
         self,
         input_ids: Tensor,
@@ -699,6 +755,8 @@ class DSparkModel(nn.Module):
         l1_alpha: float = 0.9,
         conf_alpha: float = 1.0,
         decay_gamma: float = 4.0,
+        loss_metadata: Optional[dict[str, Tensor]] = None,
+        global_denominator: Optional[Tensor] = None,
     ) -> dict[str, Tensor]:
         """DSpark forward aligned with TorchSpec's DSparkModel.
 
@@ -730,8 +788,19 @@ class DSparkModel(nn.Module):
 
         num_anchors = self.anchor_num
 
-        # 1. Sample anchors with block_keep_mask (aligned with TorchSpec)
-        anchors, block_keep_mask = self._sample_anchors(T, loss_mask, num_anchors)
+        # 1. Sample anchors with block_keep_mask (aligned with TorchSpec), or
+        # consume metadata prebuilt by the trainer for a vector denominator sum.
+        if loss_metadata is None:
+            loss_metadata = self.prepare_loss_metadata(
+                input_ids, loss_mask, decay_gamma,
+            )
+        anchors = loss_metadata["anchors"]
+        block_keep_mask = loss_metadata["block_keep_mask"]
+        safe_label_indices = loss_metadata["safe_label_indices"]
+        target_ids = loss_metadata["target_ids"]
+        eval_mask = loss_metadata["eval_mask"]
+        decay_weight_mask = loss_metadata["decay_weight_mask"]
+        local_den = loss_metadata["local_den"]
 
         # 2. Extract context features from full sequence (TorchSpec extract_context_feature)
         context_feature = self.hidden_norm(self.fc(aux_hidden_states))
@@ -786,38 +855,6 @@ class DSparkModel(nn.Module):
             )
         draft_hidden = self.norm(draft_hidden)
         hidden_4d = draft_hidden.reshape(B, num_anchors, self.block_size, H)
-
-        # 7. Labels (TorchSpec convention: slot k predicts input_ids[anchor+k+1])
-        label_offsets = torch.arange(1, self.block_size + 1, device=device).view(1, 1, -1)
-        label_indices = anchors.unsqueeze(-1) + label_offsets
-        valid_label_mask = label_indices < T
-        safe_label_indices = label_indices.clamp(max=T - 1)
-        safe_label_indices = torch.where(
-            block_keep_mask.unsqueeze(-1), safe_label_indices,
-            torch.zeros_like(safe_label_indices),
-        )
-
-        target_ids = torch.gather(
-            input_ids.unsqueeze(1).expand(-1, num_anchors, -1),
-            2, safe_label_indices,
-        )
-
-        # Eval mask: cumprod for contiguous prefix (TorchSpec convention)
-        target_loss_mask = torch.gather(
-            loss_mask.unsqueeze(1).expand(-1, num_anchors, -1),
-            2, safe_label_indices,
-        )
-        eval_bool = block_keep_mask.unsqueeze(-1) & valid_label_mask & (target_loss_mask > 0.5)
-        eval_bool = eval_bool.to(torch.int32).cumprod(dim=-1).bool()
-        eval_mask = eval_bool.float()
-
-        # Decay weights
-        k_idx = torch.arange(self.block_size, device=device).view(1, 1, -1)
-        if decay_gamma > 0:
-            decay_w = torch.exp(-k_idx.float() / decay_gamma)
-        else:
-            decay_w = torch.ones_like(k_idx, dtype=torch.float32)
-        decay_weight_mask = eval_mask * decay_w
 
         # 8. Draft logits via LM head
         base_logits = F.linear(draft_hidden, teacher_lm_head_weight)
@@ -890,11 +927,16 @@ class DSparkModel(nn.Module):
 
         # 13. Pooled global loss (TorchSpec _build_loss: all_reduce denominator,
         # multiply by world_size to cancel FSDP mean reduction)
-        local_den = decay_weight_mask.sum()
         world_size = dist.get_world_size() if dist.is_initialized() else 1
-        global_den = local_den.detach().clone()
-        if world_size > 1:
-            dist.all_reduce(global_den, op=dist.ReduceOp.SUM)
+        if global_denominator is None:
+            global_den = local_den.detach().clone()
+            if world_size > 1:
+                with torch.profiler.record_function(
+                    "dspark.loss_den_allreduce",
+                ):
+                    dist.all_reduce(global_den, op=dist.ReduceOp.SUM)
+        else:
+            global_den = global_denominator
         global_den = global_den + 1e-6
         total_loss = (
             ce_alpha * ce_num / global_den

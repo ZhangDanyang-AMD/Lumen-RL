@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from omegaconf import OmegaConf
 
-from lumenrl.core.config import LumenRLConfig
+from lumenrl.core.config import LumenRLConfig, TrainingQuantConfig
 from lumenrl.core.types import AlgorithmName, GenerationBackend, TrainingBackend
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -21,6 +22,7 @@ def test_default_config() -> None:
     assert cfg.policy.train_global_batch_size == 64
     assert cfg.policy.train_micro_batch_size == 8
     assert cfg.checkpointing.save_steps == 50
+    assert cfg.eval.interval_on_completed_steps is False
     assert cfg.logger.wandb_enabled is False
     assert cfg.assembly.training_backend == "fsdp2"
     assert cfg.assembly.inference_backend == "atom"
@@ -47,6 +49,23 @@ def test_cli_overrides() -> None:
     assert cfg.logger.log_interval == 10
 
 
+def test_from_yaml_resolves_environment_paths(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("EVAL_FIXED_PATH", "/shared/eval_fixed.pt")
+    config_path = tmp_path / "env.yaml"
+    config_path.write_text(
+        "eval:\n"
+        "  extra_slices:\n"
+        "    - path: ${oc.env:EVAL_FIXED_PATH}\n"
+        "      prefix: eval_fixed\n"
+    )
+
+    cfg = LumenRLConfig.from_yaml(config_path)
+
+    assert cfg.eval.extra_slices[0]["path"] == "/shared/eval_fixed.pt"
+
+
 def test_fp8_config_values() -> None:
     cfg = LumenRLConfig.from_yaml(GRPO_YAML)
     assert cfg.quantization.rollout.precision == "bf16"
@@ -65,6 +84,41 @@ def test_fp8_config_values() -> None:
     assert merged.quantization.training.fp8 == "e4m3"
     assert merged.quantization.training.fp8_recipe == "tensorwise"
     assert merged.quantization.training.fp8_weight_cache is True
+
+
+def test_mxfp4_config_values() -> None:
+    cfg = LumenRLConfig.from_yaml(GRPO_YAML)
+    training = cfg.quantization.training
+    assert training.mxfp4 is False
+    assert training.mxfp4_disable_weight_cache is False
+    assert training.mxfp4_quant_weight_selection["mode"] == "all_linear"
+
+    merged = LumenRLConfig.from_yaml(
+        GRPO_YAML,
+        overrides=[
+            "quantization.training.mxfp4=true",
+            "quantization.training.mxfp4_disable_weight_cache=true",
+            "quantization.training.mxfp4_quant_weight_selection.mode=explicit",
+            (
+                "quantization.training.mxfp4_quant_weight_selection."
+                "include_quant_weight=[layers.*.mlp.gate_proj.weight]"
+            ),
+        ],
+    )
+    selection = merged.quantization.training.mxfp4_quant_weight_selection
+    assert merged.quantization.training.mxfp4 is True
+    assert merged.quantization.training.mxfp4_disable_weight_cache is True
+    assert selection["mode"] == "explicit"
+    assert selection["include_quant_weight"] == [
+        "layers.*.mlp.gate_proj.weight"
+    ]
+
+
+def test_mxfp4_rejects_lumen_linear() -> None:
+    with pytest.raises(ValueError, match="lumen_linear must be false"):
+        TrainingQuantConfig(mxfp4=True, lumen_linear=True)
+    with pytest.raises(ValueError, match="cannot be enabled together"):
+        TrainingQuantConfig(mxfp4=True, fp8="e4m3")
 
 
 def test_moe_config_values() -> None:
