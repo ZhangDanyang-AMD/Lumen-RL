@@ -992,7 +992,7 @@ class RLTrainer:
             self._last_weight_sync_metrics[f"timing/weight_sync_rdma_sender_{key}"] = (
                 float(sender.get(key, 0.0) or 0.0)
             )
-        for key in ("wait_s", "recv_s", "host_copy_s", "observe_s",
+        for key in ("wait_s", "recv_s", "host_copy_s", "observe_s", "route_s",
                     "load_weights_s", "verify_s", "finalize_s"):
             if recv_rows:
                 self._last_weight_sync_metrics[f"timing/weight_sync_rdma_recv_{key}"] = max(
