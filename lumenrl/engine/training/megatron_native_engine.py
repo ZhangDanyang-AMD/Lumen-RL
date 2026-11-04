@@ -44,6 +44,7 @@ from lumenrl.engine.training.bridges.gpt import (
 )
 from lumenrl.engine.training.megatron_base_engine import (
     MegatronBaseEngine,
+    _accum_sc,
     moe_dispatcher_kwargs,
 )
 from lumenrl.engine.training.model_registry import (
@@ -1696,6 +1697,14 @@ class MegatronNativeEngine(MegatronBaseEngine):
         global_batch_size = (
             meta.get("global_batch_size") or batch.batch_size * dp
         )
+        sc = self._sc_config(_cfg)
+        if sc is not None and self._cp > 1:
+            raise NotImplementedError(
+                "score_centering with context_parallel_size > 1 is not supported yet: "
+                "the sampler-head log-probs would need the same cross-rank "
+                "reconstruction as the token log-probs"
+            )
+        sc_chunk = int(sc.get("chunk_rows", 4096)) if sc else 4096
         t = batch.tensors
         seqs = t["input_ids"]
         am = t.get("attention_mask")
@@ -1732,13 +1741,26 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 agg = {"loss": 0.0, "n": 0, "ppo_kl_sum": 0.0, "ppo_kl_tok": 0.0,
                        "rc_kl_sum": 0.0, "rc_kl_tok": 0.0}
                 for k, (r, start, _L) in enumerate(mb["rows"]):
-                    token_lp, _ = self._cp_row_logprob_entropy(
-                        logits,
-                        mb["ids_list"][k],
-                        layouts[k],
-                        training=True,
-                        want_entropy=False,
-                    )
+                    head_lp = None
+                    if sc is not None:
+                        # CP == 1 (checked above): this row's logits are one
+                        # contiguous slice; position j predicts token j + 1.
+                        lay = layouts[k]
+                        local = logits[lay["local_start"]:lay["local_end"]][:-1]
+                        ids_k = mb["ids_list"][k]
+                        head_ids = self._sc_row_head_ids(t, r, start, local.shape[0], local.device)
+                        token_lp, head_lp = self._token_head_logprob_train(
+                            local, ids_k[1:], head_ids, chunk_rows=sc_chunk,
+                        )
+                        head_lp = head_lp.unsqueeze(0)
+                    else:
+                        token_lp, _ = self._cp_row_logprob_entropy(
+                            logits,
+                            mb["ids_list"][k],
+                            layouts[k],
+                            training=True,
+                            want_entropy=False,
+                        )
                     token_lp = token_lp.view(1, -1)
                     loss, stats = self._row_policy_loss(
                         t,
@@ -1751,10 +1773,12 @@ class MegatronNativeEngine(MegatronBaseEngine):
                         dp,
                         loss_agg_mode,
                         global_batch_size,
+                        head_lp=head_lp,
                     )
                     if loss is None:
                         continue
                     bin_loss = loss if bin_loss is None else bin_loss + loss
+                    _accum_sc(agg, stats)
                     agg["loss"] += stats["loss"]; agg["n"] += 1
                     agg["ppo_kl_sum"] += stats["ppo_kl_sum"]; agg["ppo_kl_tok"] += stats["ppo_kl_tok"]
                     agg["rc_kl_sum"] += stats["rc_kl_sum"]; agg["rc_kl_tok"] += stats["rc_kl_tok"]
@@ -1807,7 +1831,9 @@ class MegatronNativeEngine(MegatronBaseEngine):
         # Aggregate metrics on the last stage (where losses were computed).
         loss_accum = ppo_kl_sum = ppo_kl_tok = rc_kl_sum = rc_kl_tok = 0.0
         n_rows = 0
+        sc_acc: dict[str, float] = {}
         for agg in losses:
+            _accum_sc(sc_acc, agg)
             loss_accum += agg["loss"]; n_rows += agg["n"]
             ppo_kl_sum += agg["ppo_kl_sum"]; ppo_kl_tok += agg["ppo_kl_tok"]
             rc_kl_sum += agg["rc_kl_sum"]; rc_kl_tok += agg["rc_kl_tok"]
@@ -1822,6 +1848,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
         if rc_kl_tok > 0:
             metrics["rollout_corr_kl_sum"] = rc_kl_sum
             metrics["rollout_corr_kl_tok"] = rc_kl_tok
+        metrics.update(sc_acc)
 
         from lumenrl.engine.training.megatron_base_engine import _GAP_ROWS, _gap_dump_dir
         _dump = _gap_dump_dir()

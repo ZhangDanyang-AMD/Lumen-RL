@@ -313,6 +313,125 @@ def packed_token_entropy(
     return torch.cat(parts, dim=0)[not_last]
 
 
+class _SelectedLogProbs(torch.autograd.Function):
+    """``log_softmax(logits / T).gather(-1, ids)`` with one LSE per row.
+
+    Row-chunked so the fp32 workspace is ``chunk_rows x V`` at a time. Only the
+    input logits (no copy) and the per-row LSE are saved; the softmax is
+    recomputed per chunk in backward. Duplicate ids in a row accumulate.
+    """
+
+    @staticmethod
+    def forward(ctx, logits, ids, temperature, chunk_rows):
+        rows = logits.shape[0]
+        cdt = torch.promote_types(logits.dtype, torch.float32)
+        out = torch.empty(ids.shape, dtype=cdt, device=logits.device)
+        lse = torch.empty(rows, dtype=cdt, device=logits.device)
+        for start in range(0, rows, chunk_rows):
+            end = min(start + chunk_rows, rows)
+            z = logits[start:end].to(cdt)
+            if temperature != 1.0:
+                z = z / temperature
+            lse[start:end] = torch.logsumexp(z, dim=-1)
+            out[start:end] = z.gather(-1, ids[start:end]) - lse[start:end, None]
+        ctx.save_for_backward(logits, ids, lse)
+        ctx.temperature = temperature
+        ctx.chunk_rows = chunk_rows
+        return out
+
+    @staticmethod
+    def backward(ctx, g_out):
+        logits, ids, lse = ctx.saved_tensors
+        t, chunk_rows = ctx.temperature, ctx.chunk_rows
+        grad = torch.empty_like(logits)
+        rows = logits.shape[0]
+        for start in range(0, rows, chunk_rows):
+            end = min(start + chunk_rows, rows)
+            z = logits[start:end].to(lse.dtype)
+            if t != 1.0:
+                z = z / t
+            g = g_out[start:end].to(lse.dtype)
+            # d/dz_j sum_m g_m (z_{id_m} - lse) = sum_m g_m 1[j=id_m] - softmax_j sum_m g_m
+            # One chunk-sized buffer: reuse z when it is already a private copy.
+            owns_z = t != 1.0 or logits.dtype != lse.dtype
+            gz = z.sub_(lse[start:end, None]) if owns_z else z - lse[start:end, None]
+            gz.exp_().mul_(-g.sum(-1, keepdim=True))
+            gz.scatter_add_(-1, ids[start:end], g)
+            if t != 1.0:
+                gz.div_(t)
+            grad[start:end] = gz.to(grad.dtype)
+        return grad, None, None, None
+
+
+def selected_log_probs(
+    logits: torch.Tensor,
+    ids: torch.Tensor,
+    *,
+    temperature: float = 1.0,
+    chunk_rows: int = 4096,
+) -> torch.Tensor:
+    """Log-probs ``[R, m]`` at ``ids [R, m]`` under ``softmax(logits [R, V] / T)``.
+
+    Computed and returned in ``promote(logits.dtype, float32)`` (float32 for
+    bf16/fp32 logits); the gradient has the logits dtype.
+    """
+    return _SelectedLogProbs.apply(logits, ids.long(), float(temperature), int(chunk_rows))
+
+
+def pack_shifted(x: torch.Tensor, seq_lens: torch.Tensor) -> torch.Tensor:
+    """Inverse of :func:`unpack_log_probs`: left-padded ``[B, S-1, ...]`` to flat
+    ``(sum(seq_lens) - B, ...)`` in the packed shifted order."""
+    S_m1 = x.shape[1]
+    parts = [x[i, S_m1 - (int(sl) - 1):] for i, sl in enumerate(seq_lens.tolist()) if sl > 1]
+    if not parts:
+        return x.new_zeros(0, *x.shape[2:])
+    return torch.cat(parts, dim=0)
+
+
+def packed_selected_log_probs(
+    logits: torch.Tensor,
+    packed_ids: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    head_ids: torch.Tensor,
+    *,
+    temperature: float = 1.0,
+    chunk_rows: int = 4096,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sampled-token and head log-probs from packed logits, for score centering.
+
+    Scores ``[y, H]`` against one log-sum-exp per row, so ``p_y`` and ``p_H``
+    are consistent. Use this *instead of* :func:`packed_token_log_probs` when
+    the head is needed: the fused cross-entropy there overwrites the logits
+    buffer in backward (``inplace_backward=True``), which this op re-reads.
+
+    Args:
+        logits: ``(total_padded, V)``; rows past ``cu_seqlens[-1]`` are TP pad.
+        packed_ids: ``(total_padded,)`` packed token ids.
+        cu_seqlens: ``(B+1,)`` cumulative sequence lengths.
+        head_ids: ``(total_real - B, k)`` head ids in packed shifted order
+            (see :func:`pack_shifted`).
+
+    Returns:
+        ``(token_lp (total_real - B,), head_lp (total_real - B, k))`` (float32
+        for bf16/fp32 logits), aligned with :func:`packed_token_log_probs`.
+    """
+    total_real = int(cu_seqlens[-1].item())
+    device = logits.device
+    not_last = torch.ones(total_real, dtype=torch.bool, device=device)
+    not_last[cu_seqlens[1:].long() - 1] = False
+
+    # Score every real row (a view, no vocab-sized copy) and drop each
+    # sequence's last row afterwards; dropped rows get zero gradient.
+    k = head_ids.shape[-1]
+    ids = torch.zeros(total_real, k + 1, dtype=torch.long, device=device)
+    ids[:-1, 0] = packed_ids[1:total_real]
+    ids[not_last, 1:] = head_ids.to(device=device, dtype=torch.long)
+    out = selected_log_probs(
+        logits[:total_real], ids, temperature=temperature, chunk_rows=chunk_rows
+    )[not_last]
+    return out[:, 0], out[:, 1:]
+
+
 def unpack_log_probs(
     flat_lp: torch.Tensor,
     cu_seqlens: torch.Tensor,
@@ -333,7 +452,8 @@ def unpack_log_probs(
     """
     B = seq_lens.shape[0]
     S_m1 = padded_seq_len - 1
-    result = flat_lp.new_zeros(B, S_m1)
+    # Trailing dims (e.g. the score-centering head ``[.., k]``) ride along.
+    result = flat_lp.new_zeros(B, S_m1, *flat_lp.shape[1:])
 
     # Shifted cu_seqlens: cumulative (sl - 1) for indexing into flat_lp
     shifted_lens = seq_lens - 1

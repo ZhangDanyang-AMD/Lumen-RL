@@ -133,6 +133,13 @@ class _FusedTokenLogProb(torch.autograd.Function):
         return grad, None
 
 
+def _accum_sc(acc: dict[str, float], stats: dict[str, float]) -> None:
+    """Sum the score-centering token sums (``sc/*_sum``, ``sc_tok``) of one row."""
+    for key, val in stats.items():
+        if key == "sc_tok" or key.startswith("sc/"):
+            acc[key] = acc.get(key, 0.0) + float(val)
+
+
 class MegatronBaseEngine(BaseEngine):
     """Shared implementation for concrete Megatron-Core engines."""
 
@@ -281,6 +288,41 @@ class MegatronBaseEngine(BaseEngine):
         lp = torch.log_softmax(logits, dim=-1)
         return lp.gather(-1, targets.view(-1, 1)).squeeze(-1)
 
+    def _token_head_logprob_train(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        head_ids: torch.Tensor,
+        *,
+        chunk_rows: int = 4096,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Score centering: log-probs of the sampled token ``[L]`` and of the
+        sampler's head ids ``[L, k]`` under one log-sum-exp per row (so ``p_y``
+        and ``p_H`` are consistent). ``logits`` are already temperature-scaled."""
+        from lumenrl.engine.training.packing import selected_log_probs
+
+        ids = torch.cat([targets.view(-1, 1).long(), head_ids.long()], dim=1)
+        out = selected_log_probs(logits, ids, chunk_rows=chunk_rows)
+        return out[:, 0], out[:, 1:]
+
+    @staticmethod
+    def _sc_row_head_ids(t, r: int, start: int, n: int, device) -> torch.Tensor:
+        """Head ids ``[n, k]`` for row ``r``'s logit positions ``start..start+n-1``
+        (the controller's ``[B, S-1, k]`` layout, same columns as the log-probs)."""
+        ids = t.get("rollout_topk_ids")
+        if ids is None:
+            raise RuntimeError(
+                "score_centering is enabled but the batch has no rollout_topk_ids; "
+                "the rollout did not capture the sampler head"
+            )
+        return ids[r, start:start + n].to(device=device, dtype=torch.long)
+
+    @staticmethod
+    def _sc_config(cfg_fn) -> dict | None:
+        """``algorithm.score_centering`` as a dict when enabled, else ``None``."""
+        sc = cfg_fn("score_centering", None)
+        return sc if isinstance(sc, dict) and sc.get("enabled") else None
+
     def _logprob_entropy_nograd(
         self, logits: torch.Tensor, targets: torch.Tensor, want_entropy: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -311,10 +353,15 @@ class MegatronBaseEngine(BaseEngine):
         dp,
         loss_agg_mode,
         global_batch_size,
+        head_lp=None,
     ):
         """DAPO/PG loss + PPO-KL metrics for one sequence, given its (grad-carrying)
         per-token log-prob ``token_lp`` [1, Lm]. Returns ``(loss_tensor|None, stats|None)``.
-        Shared by the packed and per-row training paths."""
+        Shared by the packed and per-row training paths.
+
+        With ``algorithm.score_centering.enabled`` the loss is REINFORCE + score
+        centering instead; ``head_lp`` [1, Lm, k] are the trainer log-probs at
+        the sampler's head ids (from :meth:`_token_head_logprob_train`)."""
         Lm = token_lp.shape[-1]
         dev = token_lp.device
 
@@ -346,10 +393,25 @@ class MegatronBaseEngine(BaseEngine):
         ref_lp0 = _col("ref_log_probs", shift=False)
         rlp0 = _col("rollout_log_probs", shift=False)
 
+        sc = self._sc_config(cfg_fn)
+        q_head0 = None
+        if sc is not None:
+            q_all = t.get("rollout_topk_logprobs")
+            if q_all is None or head_lp is None or rlp0 is None:
+                raise RuntimeError(
+                    "score_centering needs rollout_log_probs, rollout_topk_logprobs and the "
+                    "trainer head log-probs; got "
+                    f"rollout_log_probs={rlp0 is not None}, "
+                    f"rollout_topk_logprobs={q_all is not None}, head_lp={head_lp is not None}"
+                )
+            q_head0 = q_all[r].to(dev)[start:].reshape(1, -1, q_all.shape[-1])
+
         cand = [token_lp, old_lp, adv]
         for v in (resp_mask, ris, ref_lp0, rlp0):
             if v is not None:
                 cand.append(v)
+        if sc is not None:
+            cand += [head_lp[..., 0], q_head0[..., 0]]
         Le = min(v.shape[-1] for v in cand)
         token_lp = token_lp[..., :Le]
         old_lp = old_lp[..., :Le]
@@ -359,7 +421,32 @@ class MegatronBaseEngine(BaseEngine):
         ref_lp = ref_lp0[..., :Le] if ref_lp0 is not None else None
         rlp = rlp0[..., :Le] if rlp0 is not None else None
 
-        if algo_name == AlgorithmName.DAPO.value:
+        from lumenrl.algorithms.score_centering import (
+            score_centering_loss_from_config,
+            score_centering_replaces_loss,
+        )
+
+        sc_stats: dict[str, float] = {}
+
+        def _sc_term():
+            return score_centering_loss_from_config(
+                sc,
+                token_lp=token_lp,
+                head_lp=head_lp[:, :Le],
+                q_y=rlp,
+                q_head=q_head0[:, :Le],
+                advantages=adv,
+                mask=mask,
+                algo_name=algo_name,
+                loss_agg_mode=loss_agg_mode,
+                dp_size=dp,
+                batch_num_tokens=bnt,
+                global_batch_size=global_batch_size,
+            )
+
+        if score_centering_replaces_loss(sc):
+            loss, sc_stats = _sc_term()
+        elif algo_name == AlgorithmName.DAPO.value:
             loss = asymmetric_clip_loss(
                 token_lp, old_lp, adv,
                 float(cfg_fn("clip_ratio_low", 0.2)), float(cfg_fn("clip_ratio_high", 0.28)),
@@ -388,12 +475,16 @@ class MegatronBaseEngine(BaseEngine):
                 float(cfg_fn("clip_ratio", 0.2)),
                 mask=mask,
             )
+        if sc is not None and not score_centering_replaces_loss(sc):
+            # base_objective: ppo_clip_additive -- clip loss above + correction.
+            sc_loss, sc_stats = _sc_term()
+            loss = loss + sc_loss
         kl_c = float(cfg_fn("kl_coeff", 0.0))
         if kl_c > 0.0 and ref_lp is not None:
             loss = loss + kl_c * kl_penalty(token_lp, ref_lp, mask=mask)
 
         stats = {"loss": float(loss.detach()), "ppo_kl_sum": 0.0, "ppo_kl_tok": 0.0,
-                 "rc_kl_sum": 0.0, "rc_kl_tok": 0.0}
+                 "rc_kl_sum": 0.0, "rc_kl_tok": 0.0, **sc_stats}
         if mask is not None:
             with torch.no_grad():
                 tok = float(mask.sum())
@@ -488,6 +579,9 @@ class MegatronBaseEngine(BaseEngine):
         rc_kl_sum = 0.0
         rc_kl_tok = 0.0
         n_rows = 0
+        sc = self._sc_config(_cfg)
+        sc_chunk = int(sc.get("chunk_rows", 4096)) if sc else 4096
+        sc_acc: dict[str, float] = {}
 
         def _accum(stats):
             nonlocal loss_accum, ppo_kl_sum, ppo_kl_tok, rc_kl_sum, rc_kl_tok, n_rows
@@ -497,6 +591,17 @@ class MegatronBaseEngine(BaseEngine):
             ppo_kl_tok += stats["ppo_kl_tok"]
             rc_kl_sum += stats["rc_kl_sum"]
             rc_kl_tok += stats["rc_kl_tok"]
+            _accum_sc(sc_acc, stats)
+
+        def _row_lp(seg_logits, ids_row, r, start):
+            """(token_lp [1, L-1], head_lp [1, L-1, k] | None) for one row."""
+            if sc is None:
+                return self._token_logprob_train(seg_logits, ids_row).view(1, -1), None
+            head_ids = self._sc_row_head_ids(t, r, start, seg_logits.shape[0], seg_logits.device)
+            tok, head = self._token_head_logprob_train(
+                seg_logits, ids_row, head_ids, chunk_rows=sc_chunk,
+            )
+            return tok.view(1, -1), head.unsqueeze(0)
 
         # Collect valid (non-empty) rows.
         rows = []
@@ -517,10 +622,10 @@ class MegatronBaseEngine(BaseEngine):
                 for k, j in enumerate(bin_rows):
                     r, start, _L = rows[j]
                     seg = logits_packed[offsets[k]:offsets[k + 1]]           # [L,V]
-                    token_lp = self._token_logprob_train(seg[:-1], ids_list[k][1:]).view(1, -1)
+                    token_lp, head_lp = _row_lp(seg[:-1], ids_list[k][1:], r, start)
                     loss, stats = self._row_policy_loss(
                         t, r, start, token_lp, algo_name, _cfg, bnt, dp,
-                        loss_agg_mode, global_batch_size,
+                        loss_agg_mode, global_batch_size, head_lp=head_lp,
                     )
                     if loss is None:
                         continue
@@ -533,10 +638,10 @@ class MegatronBaseEngine(BaseEngine):
             for (r, start, L) in rows:
                 ids = seqs[r, start:start + L].to("cuda")
                 logits = self._forward_logits(ids, model=self._ddp) / temperature  # [L,V] (grad)
-                token_lp = self._token_logprob_train(logits[:-1], ids[1:]).view(1, -1)  # [1,L-1]
+                token_lp, head_lp = _row_lp(logits[:-1], ids[1:], r, start)  # [1,L-1]
                 loss, stats = self._row_policy_loss(
                     t, r, start, token_lp, algo_name, _cfg, bnt, dp,
-                    loss_agg_mode, global_batch_size,
+                    loss_agg_mode, global_batch_size, head_lp=head_lp,
                 )
                 if loss is None:
                     continue
@@ -560,6 +665,7 @@ class MegatronBaseEngine(BaseEngine):
         if rc_kl_tok > 0:
             metrics["rollout_corr_kl_sum"] = rc_kl_sum
             metrics["rollout_corr_kl_tok"] = rc_kl_tok
+        metrics.update(sc_acc)
         return metrics
 
     def _engine_update_sft(self, batch: DataProto) -> dict[str, float]:

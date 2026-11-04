@@ -348,6 +348,9 @@ class FSDP2Engine(BaseEngine):
             loss = torch.tensor(0.0, device=device)
             metrics = {}
 
+        # The score-centering head ([mb, S-1, k]) is only needed by the loss;
+        # keeping it in the per-step outputs would hold it for every micro.
+        model_output.pop("head_log_probs", None)
         meta = {
             "model_output": model_output,
             "loss": loss.detach().item(),
@@ -362,6 +365,11 @@ class FSDP2Engine(BaseEngine):
         micro_batch: dict[str, Any],
     ) -> dict[str, torch.Tensor]:
         """Compute log_probs (and optionally entropy / sum-pi-squared) from logits."""
+        if micro_batch.get("rollout_topk_ids") is not None:
+            raise NotImplementedError(
+                "score_centering is wired for the packed forward only "
+                "(use_packed_forward, the Ray actor default)"
+            )
         shift_logits = logits[:, :-1].contiguous()
         shift_labels = input_ids[:, 1:].contiguous()
 
@@ -391,6 +399,8 @@ class FSDP2Engine(BaseEngine):
         code expects. Applies verl's ``logits.div_(temperature)`` convention.
         """
         from lumenrl.engine.training.packing import (
+            pack_shifted,
+            packed_selected_log_probs,
             packed_token_entropy,
             packed_token_log_probs,
             unpack_log_probs,
@@ -400,12 +410,28 @@ class FSDP2Engine(BaseEngine):
         S = int(micro_batch.get("_padded_seq_len", micro_batch["input_ids"].shape[1]))
         temperature = float(micro_batch.get("temperature", 1.0) or 1.0)
 
-        flat_lp = packed_token_log_probs(
-            logits, packed.input_ids.squeeze(0), packed.cu_seqlens,
-            temperature=temperature,
-        )
+        head_ids = micro_batch.get("rollout_topk_ids")
+        result: dict[str, torch.Tensor] = {}
+        if head_ids is not None:
+            # Score centering: score [y, H] against one log-sum-exp per row.
+            # Not the fused CE path -- its in-place backward overwrites the
+            # logits buffer this op re-reads.
+            flat_head_ids = pack_shifted(head_ids.to(logits.device), packed.seq_lens)
+            flat_lp, flat_head = packed_selected_log_probs(
+                logits, packed.input_ids.squeeze(0), packed.cu_seqlens, flat_head_ids,
+                temperature=temperature,
+                chunk_rows=int(micro_batch.get("sc_chunk_rows", 4096) or 4096),
+            )
+            result["head_log_probs"] = unpack_log_probs(
+                flat_head, packed.cu_seqlens, packed.seq_lens, S,
+            )
+        else:
+            flat_lp = packed_token_log_probs(
+                logits, packed.input_ids.squeeze(0), packed.cu_seqlens,
+                temperature=temperature,
+            )
         log_probs = unpack_log_probs(flat_lp, packed.cu_seqlens, packed.seq_lens, S)
-        result: dict[str, torch.Tensor] = {"log_probs": log_probs}
+        result["log_probs"] = log_probs
 
         meta = micro_batch.get("meta", {}) if isinstance(micro_batch, dict) else {}
         if meta.get("calculate_entropy", False):

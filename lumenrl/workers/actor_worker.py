@@ -723,6 +723,11 @@ class LumenActorWorker(BaseWorker):
         # inflating entropy ~7x.
         data["use_packed_forward"] = True
         data["temperature"] = float(batch.meta.get("temperature", 1.0) or 1.0)
+        from lumenrl.algorithms.score_centering import score_centering_enabled
+
+        _sc = score_centering_enabled(batch.meta.get("algo_config", {}))
+        if _sc is not None:
+            data["sc_chunk_rows"] = int(_sc.get("chunk_rows", 4096))
         # Pack micros to the same token budget verl uses for
         # ppo_max_token_len_per_gpu. Falls back to one row per micro only if the
         # budget is unset.
@@ -893,7 +898,39 @@ class LumenActorWorker(BaseWorker):
             if ris.dim() > 1 and ris.shape[-1] != L:
                 ris = ris[..., :L]
 
-        if algo_name == AlgorithmName.DAPO.value:
+        from lumenrl.algorithms.score_centering import (
+            score_centering_enabled,
+            score_centering_loss_from_config,
+            score_centering_replaces_loss,
+        )
+
+        sc = score_centering_enabled(algo_cfg_full)
+        sc_stats: dict[str, float] = {}
+
+        def _sc_term():
+            # IS rule inside the correction; controller IS weights only ever
+            # enter through the clip loss (ppo_clip_additive).
+            head_lp = model_output.get("head_log_probs")
+            q_head = data.get("rollout_topk_logprobs")
+            q_y = data.get("rollout_log_probs")
+            return score_centering_loss_from_config(
+                sc,
+                token_lp=token_log_probs,
+                head_lp=head_lp[..., :L, :] if head_lp is not None else None,
+                q_y=q_y.to(dev)[..., :L] if q_y is not None else None,
+                q_head=q_head.to(dev)[..., :L, :] if q_head is not None else None,
+                advantages=adv,
+                mask=mask,
+                algo_name=algo_name,
+                loss_agg_mode=loss_agg_mode,
+                dp_size=dp,
+                batch_num_tokens=bnt,
+                global_batch_size=global_batch_size,
+            )
+
+        if score_centering_replaces_loss(sc):
+            loss, sc_stats = _sc_term()
+        elif algo_name == AlgorithmName.DAPO.value:
             loss = asymmetric_clip_loss(
                 token_log_probs, old_logp, adv,
                 float(_cfg("clip_ratio_low", 0.2)), float(_cfg("clip_ratio_high", 0.28)),
@@ -923,6 +960,11 @@ class LumenActorWorker(BaseWorker):
                 mask=mask,
             )
 
+        if sc is not None and not score_centering_replaces_loss(sc):
+            # base_objective: ppo_clip_additive -- clip loss above + correction.
+            sc_loss, sc_stats = _sc_term()
+            loss = loss + sc_loss
+
         kl_c = float(_cfg("kl_coeff", 0.0))
         ref_logp = data.get("ref_log_probs")
         if kl_c > 0.0 and ref_logp is not None:
@@ -936,7 +978,7 @@ class LumenActorWorker(BaseWorker):
         # outlier sequences and make core/kl look much noisier than verl.
         #   ppo_kl          = Σ(old_logp - new_logp) / Σtok  -> verl actor/ppo_kl
         #   rollout_corr/kl = Σ(rollout_logp - new_logp) / Σtok -> verl rollout_corr/kl
-        out_metrics = {"loss": float(loss.detach())}
+        out_metrics = {"loss": float(loss.detach()), **sc_stats}
         if mask is not None:
             with torch.no_grad():
                 tok = float(mask.sum())

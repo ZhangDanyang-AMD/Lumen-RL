@@ -546,6 +546,64 @@ class DistillationConfig:
 
 
 @dataclass
+class ScoreCenteringConfig:
+    """Score centering (arXiv 2609.20807): REINFORCE + a correction that removes
+    the sampler/trainer drift term, from the sampler's top-k head.
+
+    See ``docs/score_centering_design.md``. Cross-config guards live in
+    ``lumenrl.algorithms.score_centering.validate_score_centering``.
+    """
+    enabled: bool = False
+    # reinforce: REINFORCE + score centering (paper, verl, slime, Vime, Miles).
+    # ppo_clip_additive: keep the algorithm's clip loss (with controller token-IS
+    # weights) and add the score-centering correction on top (NeMo RL #4818).
+    base_objective: str = "reinforce"
+    top_k: int = 32                 # sampler head size (paper's conservative default: 128)
+    is_mode: str = "tis"            # none | tis | icepop  (IS rule inside the correction)
+    tis_clip: float = 2.0           # tis:    f(r) = min(r, c)
+    icepop_low: float = 0.5         # icepop: f(r) = r * 1[lo <= r <= hi]
+    icepop_high: float = 5.0
+    eps: float = 1e-6               # floor on both tail masses
+    # rho := 1 when both tails are below this: on near-deterministic tokens the
+    # tail ratio is fp32 rounding noise (measured on Qwen3-8B rollouts: every
+    # rho < 0.5 came from tails < 1e-5), and the tail term is bounded by the
+    # tail mass anyway. 0 disables.
+    rho_pin_tail: float = 1e-5
+    chunk_rows: int = 4096          # trainer top-k op row chunk (fp32 rows x V workspace)
+    # Filtered sampling (vLLM top_k < top_k above, any top_p): the sampler's
+    # support always fits in the captured head, so the trainer renormalizes over
+    # it and the correction is exact (rho = 1, no tail model).
+    support_replay: bool = False
+    validate_rows: bool = True      # check captured rollout rows on the controller
+
+    def __post_init__(self) -> None:
+        if self.base_objective not in ("reinforce", "ppo_clip_additive"):
+            raise ValueError(
+                "score_centering.base_objective must be reinforce|ppo_clip_additive, got "
+                f"{self.base_objective!r}"
+            )
+        if self.top_k < 1:
+            raise ValueError(f"score_centering.top_k must be >= 1, got {self.top_k}")
+        if self.is_mode not in ("none", "tis", "icepop"):
+            raise ValueError(
+                f"score_centering.is_mode must be none|tis|icepop, got {self.is_mode!r}"
+            )
+        if self.tis_clip <= 0:
+            raise ValueError(f"score_centering.tis_clip must be > 0, got {self.tis_clip}")
+        if not 0 <= self.icepop_low < self.icepop_high:
+            raise ValueError(
+                "score_centering needs 0 <= icepop_low < icepop_high, got "
+                f"[{self.icepop_low}, {self.icepop_high}]"
+            )
+        if self.eps <= 0:
+            raise ValueError(f"score_centering.eps must be > 0, got {self.eps}")
+        if self.rho_pin_tail < 0:
+            raise ValueError(f"score_centering.rho_pin_tail must be >= 0, got {self.rho_pin_tail}")
+        if self.chunk_rows < 1:
+            raise ValueError(f"score_centering.chunk_rows must be >= 1, got {self.chunk_rows}")
+
+
+@dataclass
 class AlgorithmConfig:
     name: str = AlgorithmName.GRPO.value
     adv_estimator: str = ""  # empty = auto-infer from algorithm.name
@@ -573,6 +631,9 @@ class AlgorithmConfig:
     clip_ratio_c: float = 3.0
     # Rollout correction (also available via quantization.rollout_correction)
     rollout_correction: Optional[RolloutCorrectionConfig] = None
+    # Score centering; lives under ``algorithm`` so workers get it through
+    # ``meta["algo_config"]`` with no extra plumbing.
+    score_centering: ScoreCenteringConfig = field(default_factory=ScoreCenteringConfig)
 
 
 @dataclass
@@ -977,14 +1038,17 @@ class LumenRLConfig:
         # single source of truth in ``r3_scope`` (imported directly, not via
         # ``lumenrl.moe``, to avoid cycling through ``R3Manager``). Runs on
         # ``OmegaConf.to_object`` too, so ``from_yaml`` needs no extra check.
-        if not self.moe.r3.enabled:
-            return
-        from lumenrl.moe.r3_scope import assert_supported_r3
+        if self.moe.r3.enabled:
+            from lumenrl.moe.r3_scope import assert_supported_r3
 
-        assert_supported_r3(
-            replay_mode=self.moe.r3.replay_mode,
-            generation_backend=self.policy.generation_backend,
-        )
+            assert_supported_r3(
+                replay_mode=self.moe.r3.replay_mode,
+                generation_backend=self.policy.generation_backend,
+            )
+        if self.algorithm.score_centering.enabled:
+            from lumenrl.algorithms.score_centering import validate_score_centering
+
+            validate_score_centering(self)
 
     @classmethod
     def from_yaml(cls, path: str | Path, overrides: list[str] | None = None) -> "LumenRLConfig":

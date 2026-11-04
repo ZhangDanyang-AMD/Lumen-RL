@@ -484,6 +484,9 @@ class RLTrainer:
         if self._r3_rollout_replay:
             # makes the engine attach the selected expert ids to every completion
             engine_kwargs["enable_return_routed_experts"] = True
+        from lumenrl.algorithms.score_centering import vllm_engine_kwargs
+
+        engine_kwargs.update(vllm_engine_kwargs(self.config.algorithm.score_centering))
 
         colocation_wg = getattr(self, "_rollout_wg", None) or self._actor_wg
         if colocation_wg is not self._actor_wg:
@@ -671,19 +674,43 @@ class RLTrainer:
             logger.info("Ray rollout engine sleeping before generation; refreshing weights before wake.")
             self._sync_weights_ipc()
         results = self._ray_vllm_engine.generate_tokens(expanded, sp)
+        # Score centering: the sampler head rides as a per-row ragged payload
+        # (so DAPO filtering / slicing reindex it with the rows) and is
+        # densified to [B, S-1, k] when the training batch is built.
+        want_topk = int(sp.get("topk_logprobs", 0) or 0) > 0
+        validate_topk = want_topk and bool(self.config.algorithm.score_centering.validate_rows)
 
         # Assemble left-padded prompt + response into a single tensor block.
         seqs_tok: list[list[int]] = []
         plens: list[int] = []
         resp_lps: list[list[float]] = []
         response_routes: list[torch.Tensor] = []
-        for res in results:
+        response_topk: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for row, res in enumerate(results):
             p_ids = res["prompt_token_ids"]
             g_ids = res["token_ids"]
             seqs_tok.append(list(p_ids) + list(g_ids))
             plens.append(len(p_ids))
             if want_lp:
                 resp_lps.append(res.get("logprobs") or [0.0] * len(g_ids))
+            if want_topk:
+                from lumenrl.algorithms.score_centering import validate_topk_rows
+
+                raw_ids, raw_lps = res.get("topk_ids"), res.get("topk_logprobs")
+                if raw_ids is None or raw_lps is None:
+                    raise RuntimeError(
+                        "score_centering is enabled but vLLM returned no top-k head "
+                        "(topk_ids/topk_logprobs)."
+                    )
+                h_ids, h_lps = torch.as_tensor(raw_ids), torch.as_tensor(raw_lps)
+                if h_ids.shape[0] != len(g_ids):
+                    raise ValueError(
+                        f"score_centering: head has {h_ids.shape[0]} rows for "
+                        f"{len(g_ids)} generated tokens (sample {row})"
+                    )
+                if validate_topk:
+                    validate_topk_rows(h_ids, h_lps, tag=f"sample {row}")
+                response_topk.append((h_ids.to(torch.int32), h_lps.to(torch.float32)))
             if want_r3:
                 raw_routes = res.get("routed_experts")
                 if raw_routes is None:
@@ -743,6 +770,8 @@ class RLTrainer:
             # ``sequence_length - 1`` there; re-reading the raw results here
             # would silently discard that normalization.
             ragged["rollout_routing"] = response_routes
+        if want_topk:
+            ragged["rollout_topk"] = response_topk
         return sequences, seq_mask, prompt_lengths, rollout_lp, ragged
 
     def _ray_sampling_params(self, want_logprobs: bool) -> dict[str, Any]:
@@ -762,7 +791,57 @@ class RLTrainer:
             sp["temperature"] = 1.0
         if want_logprobs:
             sp["logprobs"] = 0
+            sc = self.config.algorithm.score_centering
+            if sc.enabled:
+                # Sampler top-k head per generated token (score centering).
+                sp["topk_logprobs"] = int(sc.top_k)
         return sp
+
+    def _attach_score_centering_head(
+        self,
+        tensors: dict[str, torch.Tensor],
+        rollout_ragged: dict[str, list[Any]],
+        seq_mask: torch.Tensor,
+        prompt_lengths: list[int],
+        response_mask: torch.Tensor,
+    ) -> None:
+        """Move the per-row sampler head out of ``rollout_ragged`` into dense
+        ``rollout_topk_ids`` / ``rollout_topk_logprobs`` ``[B, S-1, k]`` tensors,
+        aligned with ``rollout_log_probs`` (``-inf`` marks an invalid slot)."""
+        sc = self.config.algorithm.score_centering
+        heads = rollout_ragged.pop("rollout_topk", None) if rollout_ragged else None
+        if not sc.enabled:
+            return
+        if heads is None:
+            raise RuntimeError("score_centering is enabled but the rollout carried no top-k head")
+        from lumenrl.algorithms.score_centering import densify_rollout_topk
+
+        ids, lps = densify_rollout_topk(
+            heads, seq_mask.detach().cpu(), list(prompt_lengths), int(sc.top_k)
+        )
+        covered = torch.isfinite(lps).any(-1)
+        missing = response_mask.detach().cpu().bool() & ~covered
+        if missing.any():
+            row = int(missing.any(-1).nonzero()[0])
+            raise ValueError(
+                f"score_centering: {int(missing.sum())} response positions have no sampler "
+                f"head (first in row {row}); head and response_mask are misaligned"
+            )
+        # Host-resident: the controller only reorders, slices and ships these
+        # rows (per-tensor device in DataProto), and [B, S-1, k] would cost
+        # ~2.8 GB of controller-GPU memory on the long-run configs.
+        tensors["rollout_topk_ids"] = ids
+        tensors["rollout_topk_logprobs"] = lps
+
+    @staticmethod
+    def _finalize_score_centering_metrics(metrics: dict[str, float]) -> None:
+        """Workers report ``sc/<name>_sum`` plus ``sc_tok``; the worker merge
+        averages every key alike, so the ratio is the global token mean."""
+        tok = metrics.pop("sc_tok", None)
+        for key in [k for k in metrics if k.startswith("sc/") and k.endswith("_sum")]:
+            val = metrics.pop(key)
+            if tok:
+                metrics[key[: -len("_sum")]] = val / max(tok, 1e-6)
 
     def _ray_eval_sampling_params(self) -> dict[str, Any]:
         """Validation sampling params, independently configurable from rollout."""
@@ -4216,6 +4295,9 @@ class RLTrainer:
             }
             if rollout_lp is not None:
                 tensors["rollout_log_probs"] = rollout_lp
+            self._attach_score_centering_head(
+                tensors, rollout_ragged, seq_mask, prompt_lengths, response_mask
+            )
             batch = DataProto(
                 tensors=tensors,
                 meta={
@@ -4306,6 +4388,7 @@ class RLTrainer:
             _pt = metrics.pop("ppo_kl_tok", None)
             if _ps is not None and _pt:
                 metrics["ppo_kl"] = _ps / max(_pt, 1e-6)
+            self._finalize_score_centering_metrics(metrics)
             self._finalize_mismatch_metrics(metrics)
 
             if _rc_metrics_ray:

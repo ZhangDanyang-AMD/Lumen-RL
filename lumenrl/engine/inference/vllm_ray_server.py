@@ -74,6 +74,47 @@ def _copy_vllm_runtime_env(env_vars: dict[str, str]) -> None:
             env_vars[key] = os.environ[key]
 
 
+def extract_flat_logprobs(flat: Any, token_ids: list[int], k: int):
+    """Split vLLM ``FlatLogprobs`` into the sampled-token log-probs and the top-k head.
+
+    With ``SamplingParams(logprobs=k, flat_logprobs=True)`` vLLM stores, per
+    generated position, exactly ``k + 1`` entries: the sampled token first,
+    then top-1..top-k (a sampled token inside the top-k appears twice).
+
+    Returns:
+        ``(sampled_logprobs: list[float], topk_ids: int32[T, k] | None,
+        topk_logprobs: float32[T, k] | None)``; the arrays are ``None`` when k == 0.
+    """
+    import numpy as np
+
+    n = len(token_ids)
+    width = k + 1
+    st = np.asarray(flat.start_indices, dtype=np.int64)
+    en = np.asarray(flat.end_indices, dtype=np.int64)
+    if st.shape[0] != n:
+        raise ValueError(f"vLLM returned logprobs for {st.shape[0]} positions, expected {n}")
+    if n == 0:
+        empty = (np.zeros((0, k), np.int32), np.zeros((0, k), np.float32)) if k else (None, None)
+        return [], *empty
+    if (en - st != width).any() or st[0] != 0 or (st[1:] != en[:-1]).any():
+        raise ValueError(
+            f"vLLM flat logprobs: expected {width} entries per position "
+            f"(sampled + top-{k}), got {sorted(set((en - st).tolist()))}"
+        )
+    ids = np.asarray(flat.token_ids, dtype=np.int64)[: n * width].reshape(n, width)
+    lps = np.asarray(flat.logprobs, dtype=np.float64)[: n * width].reshape(n, width)
+    if (ids[:, 0] != np.asarray(token_ids, dtype=np.int64)).any():
+        bad = int(np.flatnonzero(ids[:, 0] != np.asarray(token_ids))[0])
+        raise ValueError(
+            f"vLLM flat logprobs: entry 0 at position {bad} is token {int(ids[bad, 0])}, "
+            f"but the sampled token is {int(token_ids[bad])}"
+        )
+    sampled = lps[:, 0].tolist()
+    if k == 0:
+        return sampled, None, None
+    return sampled, ids[:, 1:].astype(np.int32), lps[:, 1:].astype(np.float32)
+
+
 class VLLMRayServer:
     """Ray actor hosting one vLLM AsyncLLM engine on a single pinned GPU."""
 
@@ -219,14 +260,22 @@ class VLLMRayServer:
         from vllm import SamplingParams
         from vllm.inputs import TokensPrompt
 
-        want_lp = sampling_params.get("logprobs", None) is not None
+        # ``topk_logprobs`` > 0 also captures the sampler's top-k head per
+        # generated token (score centering). Flat logprobs avoid one Python
+        # dict per position; detokenizing k + 1 candidates per position is
+        # pure overhead (the trainer decodes token ids itself), so it is off
+        # while capturing the head.
+        topk = int(sampling_params.get("topk_logprobs", 0) or 0)
+        want_lp = sampling_params.get("logprobs", None) is not None or topk > 0
         sp = SamplingParams(
             n=1,
             max_tokens=int(sampling_params.get("max_tokens", 512)),
             temperature=float(sampling_params.get("temperature", 1.0)),
             top_p=float(sampling_params.get("top_p", 1.0)),
             top_k=int(sampling_params.get("top_k", -1)),
-            logprobs=(0 if want_lp else None),
+            logprobs=(topk if want_lp else None),
+            flat_logprobs=want_lp,
+            detokenize=topk == 0,
             seed=sampling_params.get("seed", None),
             stop_token_ids=sampling_params.get("stop_token_ids", None),
         )
@@ -237,9 +286,9 @@ class VLLMRayServer:
             final = out
         comp = final.outputs[0]
         tok = list(comp.token_ids)
-        lps = None
+        lps = topk_ids = topk_lps = None
         if want_lp and comp.logprobs is not None:
-            lps = [float(comp.logprobs[i].get(t).logprob) for i, t in enumerate(tok)]
+            lps, topk_ids, topk_lps = extract_flat_logprobs(comp.logprobs, tok, topk)
         out = {
             "text": comp.text,
             "prompt_token_ids": list(final.prompt_token_ids),
@@ -259,6 +308,11 @@ class VLLMRayServer:
         routed = getattr(comp, "routed_experts", None)
         if routed is not None:
             out["routed_experts"] = routed
+        if topk_ids is not None:
+            # Sampler head, aligned with ``logprobs``: row t is the distribution
+            # that produced token t. numpy across Ray.
+            out["topk_ids"] = topk_ids
+            out["topk_logprobs"] = topk_lps
         return out
 
     async def generate_batch(
