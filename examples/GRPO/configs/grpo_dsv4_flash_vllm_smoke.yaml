@@ -36,6 +36,7 @@ weight_sync:
     interface: ens14np0
     gid_index: 3
     gdr_mode: auto
+    online_staging: cpu  # held FusedMoE modules (~12 GB) don't fit on the GPU
 
 controller:
   ray:
