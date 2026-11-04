@@ -60,6 +60,18 @@ def _normalize_streamed_optimizer_chunk_size_mib(value: Any) -> int:
     )
 
 
+def _layers_in_bf16(config: dict[str, Any], key: str) -> int:
+    """Resolve an FP8 BF16 keep-out: training wins, rollout is the fallback.
+
+    Rollout stays the fallback because that is where every config sets them.
+    """
+    for section in ("training", "rollout"):
+        value = get_nested_config(config, "quantization", section, key, default=None)
+        if value is not None:
+            return int(value)
+    return 0
+
+
 class LumenActorWorker(BaseWorker):
     """Trainable policy worker using the Engine abstraction layer.
 
@@ -303,8 +315,28 @@ class LumenActorWorker(BaseWorker):
                 "moe_mori_max_tokens_per_rank": meg_cfg.get("moe_mori_max_tokens_per_rank"),
                 "moe_mori_kernel_type": meg_cfg.get("moe_mori_kernel_type"),
                 "moe_permute_fusion": meg_cfg.get("moe_permute_fusion", False),
-                "r3_enabled": r3_enabled,
+                # One key: the Megatron TransformerConfig field name, which is
+                # what all three engines read. ``r3_enabled`` was an alias.
                 "moe_enable_routing_replay": r3_enabled,
+                # FP8 training. Carried as the resolved FP8Config fields rather
+                # than raw strings so the engine never parses a recipe name, and
+                # so one place decides what an "AMD FP8 recipe" means -- see
+                # quantization/fp8_config.megatron_fp8_kwargs. Absent/bf16 leaves
+                # every fp8 field unset and the BF16 path byte-identical.
+                "fp8_precision": str(
+                    get_nested_config(self.config, "quantization", "training", "fp8",
+                                      default=None) or ""
+                ),
+                "fp8_recipe": str(
+                    get_nested_config(self.config, "quantization", "training",
+                                      "fp8_recipe", default="blockwise")
+                ),
+                "fp8_num_first_layers_in_bf16": _layers_in_bf16(
+                    self.config, "num_first_layers_in_bf16"
+                ),
+                "fp8_num_last_layers_in_bf16": _layers_in_bf16(
+                    self.config, "num_last_layers_in_bf16"
+                ),
                 "param_offload": meg_cfg.get("param_offload", False),
                 "optimizer_cpu_offload": meg_cfg.get("optimizer_cpu_offload", meg_cfg.get("optimizer_offload", False)),
                 "optimizer_offload_fraction": meg_cfg.get("optimizer_offload_fraction", 1.0),
