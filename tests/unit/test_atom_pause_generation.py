@@ -111,3 +111,48 @@ def test_the_pool_pauses_in_the_modes_every_replica_takes(monkeypatch) -> None:
 
     assert [s.pause_generation.args for s in servers] == [[("keep", True)]] * 2
     assert [s.resume_generation.args for s in servers] == [[()]] * 2
+
+
+class SessionCoreMgr(CoreMgr):
+    """A CoreManager whose session the buckets have to be sent inside."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.open = False
+
+    def weight_sync_session(self):
+        import contextlib
+
+        @contextlib.contextmanager
+        def session():
+            self.open = True
+            try:
+                yield
+            finally:
+                self.open = False
+
+        return session()
+
+
+@pytest.mark.parametrize("use_shm", [False, True])
+def test_a_bucketed_sync_is_sent_inside_the_engines_session(use_shm) -> None:
+    """An ATOM since ROCm/ATOM#2297 refuses a non-final bucket outside it."""
+    core_mgr = SessionCoreMgr()
+    server = _server(core_mgr)
+    seen = []
+    server._update_weights_from_ipc_sync = lambda version: seen.append(core_mgr.open)
+    server._update_weights_from_shm_sync = lambda version: seen.append(core_mgr.open)
+
+    asyncio.run(server.update_weights_from_ipc(use_shm, 3))
+
+    assert seen == [True] and not core_mgr.open
+
+
+def test_an_atom_with_no_session_is_sent_buckets_as_before() -> None:
+    server = _server(CoreMgr())
+    seen = []
+    server._update_weights_from_ipc_sync = lambda version: seen.append(version)
+
+    asyncio.run(server.update_weights_from_ipc(False, 3))
+
+    assert seen == [3]

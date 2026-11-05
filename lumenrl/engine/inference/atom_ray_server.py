@@ -15,6 +15,7 @@ import os
 import socket
 import sys
 import time
+from contextlib import nullcontext
 from multiprocessing import shared_memory
 from typing import Any, Optional
 from uuid import uuid4
@@ -449,10 +450,14 @@ class ATOMRayServer:
             raise RuntimeError(
                 "ATOMRayServer.launch() must be called before weight sync."
             )
-        if use_shm:
-            self._update_weights_from_shm_sync(version)
-        else:
-            self._update_weights_from_ipc_sync(version)
+        # An ATOM since ROCm/ATOM#2297 takes a bucket that is not the last only
+        # inside CoreManager's session, so another sync cannot interleave.
+        session = getattr(self.engine.core_mgr, "weight_sync_session", None)
+        with nullcontext() if session is None else session():
+            if use_shm:
+                self._update_weights_from_shm_sync(version)
+            else:
+                self._update_weights_from_ipc_sync(version)
         return True
 
     def _get_zmq_handle(self) -> str:
