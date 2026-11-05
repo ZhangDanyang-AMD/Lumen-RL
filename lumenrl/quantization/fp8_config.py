@@ -63,7 +63,9 @@ class FP8Config:
                 if training.num_last_layers_in_bf16 is not None
                 else rollout.num_last_layers_in_bf16
             ),
-            use_weight_pow2_scale=False,
+            use_weight_pow2_scale=bool(getattr(rollout, "use_weight_pow2_scale", False)),
+            # Rollout *activation* scales are quantised inside the inference engine
+            # (vLLM/SGLang), not here, so this stays off on the LumenRL side.
             use_activation_pow2_scale=False,
         )
         logger.debug("Built FP8Config: %s", cfg)

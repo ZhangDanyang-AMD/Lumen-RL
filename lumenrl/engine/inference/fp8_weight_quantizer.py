@@ -77,6 +77,29 @@ def _is_rocm() -> bool:
     return hasattr(torch.version, "hip") and torch.version.hip is not None
 
 
+def _is_fp8_fnuz() -> bool:
+    """True only where the platform FP8 format is e4m3*fnuz* (gfx942 and earlier).
+
+    Not all of ROCm is fnuz: gfx950 (MI355X) uses OCP e4m3 with max 448, the same
+    format as CUDA. Gating on "is ROCm" quantised gfx950 weights as fnuz with a
+    224 cap -- a 2x-too-small range, and a different format from the one TE and
+    vLLM use on that arch.
+    """
+    if not _is_rocm():
+        return False
+    try:
+        arch = torch.cuda.get_device_properties(0).gcnArchName
+    except Exception:
+        return False
+    return any(a in arch for a in ("gfx940", "gfx941", "gfx942"))
+
+
+# Elements per FP32 chunk in _per_block_cast_to_fp8. 16M bf16 elements -> a 64 MiB
+# FP32 temporary, small enough to stay under the BF16 path's peak on every tensor
+# Qwen3-8B/DSV4 produce, large enough that the loop runs a handful of iterations.
+_FP32_CHUNK_ELEMS = 1 << 24
+
+
 def _scale_name_for_weight(name: str) -> str:
     if not name.endswith(".weight"):
         raise ValueError(f"FP8 scale source must end with '.weight': {name}")
@@ -87,6 +110,7 @@ def _scale_name_for_weight(name: str) -> str:
 def _per_block_cast_to_fp8(
     tensor: torch.Tensor,
     block_size: tuple[int, int] = (128, 128),
+    pow2_scales: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Cast a BF16/FP32 tensor to FP8 e4m3 with per-block scaling.
 
@@ -99,7 +123,7 @@ def _per_block_cast_to_fp8(
     M, N = tensor.shape
     block_m, block_n = block_size
 
-    fp8_dtype = torch.float8_e4m3fnuz if _is_rocm() else torch.float8_e4m3fn
+    fp8_dtype = torch.float8_e4m3fnuz if _is_fp8_fnuz() else torch.float8_e4m3fn
     if fp8_dtype is torch.float8_e4m3fnuz:
         # Match vLLM.utils.deep_gemm.get_fp8_min_max(). PyTorch reports
         # +/-240 for fnuz, but vLLM uses +/-224 on ROCm for accuracy.
@@ -123,11 +147,40 @@ def _per_block_cast_to_fp8(
     # Per-block amax in bf16 -> FP32 scale (only the scale grid is FP32, not the full tensor)
     amax = blocks.abs().amax(dim=(2, 3)).float().clamp(min=1e-12)  # (bm, bn) FP32
     scale = amax / FP8_MAX
+    if pow2_scales:
+        # Round the dequant multiplier UP to a power of two, matching TE. TE's
+        # compute_scale_from_amax() truncates the mantissa of FP8_MAX/amax, so its
+        # reciprocal -- the scale_inv the GEMM consumes -- is rounded up. ceil here,
+        # not round-to-nearest, or roughly half the blocks disagree with TE by 2x.
+        scale = torch.exp2(torch.ceil(torch.log2(scale)))
     weight_scale_inv = scale.to(torch.float32)
 
-    # Quantize: divide in bf16 then cast (avoids full FP32 copy)
-    blocks_scaled = blocks / scale.to(blocks.dtype).unsqueeze(-1).unsqueeze(-1)
-    blocks_fp8 = blocks_scaled.clamp(FP8_MIN, FP8_MAX).to(fp8_dtype)
+    # Quantize through an FP32 reciprocal, in chunks of block-rows.
+    #
+    # Dividing in BF16 first (which this used to do, to avoid an FP32 copy) rounds
+    # the quotient to 8 mantissa bits before the cast rounds it again to e4m3's 3,
+    # and that double rounding is never in our favour: measured against vLLM's
+    # per_block_cast_to_fp8 on Qwen3-8B, 3.01% of elements came out one ULP worse
+    # and none came out better (RMSE 0.8% higher). vLLM's online fp8_per_block
+    # quantizer -- the thing the rollout uses when the actor does NOT pre-quantize
+    # -- multiplies by an FP32 reciprocal, so matching it here makes pre-quantized
+    # and online weight sync bit-identical rather than merely close.
+    #
+    # Chunking keeps that accuracy without paying for it: one FP32 temp per chunk
+    # peaks at 96 MiB on a 12288x4096 tensor, against 192 MiB for the BF16 divide
+    # it replaces (and 384 MiB if the whole tensor goes through FP32 at once).
+    # Keep the block-grid dims on the reciprocal. A 0-dim tensor is a "wrapped
+    # number" for type promotion, so ``bf16 * zero_dim_fp32`` comes back BF16 and
+    # would silently restore the double rounding.
+    recip = scale.reciprocal().unsqueeze(-1).unsqueeze(-1)
+    elems_per_block_row = max(1, blocks[0].numel())
+    step = max(1, _FP32_CHUNK_ELEMS // elems_per_block_row)
+    blocks_fp8 = torch.empty(blocks.shape, dtype=fp8_dtype, device=blocks.device)
+    for i in range(0, blocks.shape[0], step):
+        sl = slice(i, i + step)
+        blocks_fp8[sl] = (
+            (blocks[sl] * recip[sl]).clamp(FP8_MIN, FP8_MAX).to(fp8_dtype)
+        )
 
     # Reshape back and trim padding
     fp8_padded = blocks_fp8.permute(0, 2, 1, 3).reshape(PM, PN)
@@ -139,6 +192,7 @@ def _per_block_cast_to_fp8(
 def quantize_weights_fp8_per_block(
     weights: Iterable[tuple[str, torch.Tensor]],
     block_size: tuple[int, int] = (128, 128),
+    pow2_scales: bool = False,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Wrap a BF16 weight generator to yield FP8-quantized weights.
 
@@ -156,7 +210,9 @@ def quantize_weights_fp8_per_block(
         if _should_quantize(name) and tensor.ndim == 2 and tensor.is_floating_point():
             if not tensor.is_cuda:
                 tensor = tensor.cuda()
-            fp8_weight, scale_inv = _per_block_cast_to_fp8(tensor, block_size)
+            fp8_weight, scale_inv = _per_block_cast_to_fp8(
+                tensor, block_size, pow2_scales=pow2_scales
+            )
             yield name, fp8_weight
             scale_name = _scale_name_for_weight(name)
             yield scale_name, scale_inv

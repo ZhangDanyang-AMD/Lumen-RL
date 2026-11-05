@@ -287,14 +287,22 @@ class VLLMRayServer:
         )
 
     async def update_weights_from_ipc(
-        self, use_shm: bool = False, version: int | None = None
+        self,
+        use_shm: bool = False,
+        version: int | None = None,
+        prequantized_fp8: bool = False,
     ) -> list:
         """Start the in-worker IPC receiver; blocks until the sender completes.
 
         Returns each vLLM worker's receive summary (timing dicts on the BF16 path).
         """
         results = await self.engine.collective_rpc(
-            "update_weights_from_ipc", kwargs={"use_shm": use_shm, "version": version}
+            "update_weights_from_ipc",
+            kwargs={
+                "use_shm": use_shm,
+                "version": version,
+                "prequantized_fp8": bool(prequantized_fp8),
+            },
         )
         t0 = time.perf_counter()
         await self.engine.reset_prefix_cache()

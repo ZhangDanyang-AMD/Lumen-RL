@@ -589,6 +589,8 @@ class MegatronNativeEngine(MegatronBaseEngine):
 
         if fp8_kwargs:
             self._check_fp8_usable(fp8_kwargs, tfcfg)
+            if str(fp8_kwargs.get("fp8_recipe", "")).lower() == "blockwise":
+                self._check_te_supports_blockwise()
             if self._rank() == 0:
                 # print, not logger: Ray forwards worker stdout, not log records.
                 print(
@@ -1318,6 +1320,44 @@ class MegatronNativeEngine(MegatronBaseEngine):
             ids_list = [seqs[rows[j][0], rows[j][1]:rows[j][1] + rows[j][2]].to("cuda") for j in bin_rows]
             mbs.append({"rows": [rows[j] for j in bin_rows], "ids_list": ids_list})
         return mbs
+
+    # Blockwise FP8 on ROCm needs a TransformerEngine that carries the CDNA4
+    # running-scale fix. Before it, the gfx950 blockwise GEMM divided by a denormal
+    # block scale and produced non-finite wgrads part-way into training -- silent
+    # until the gradient norm blew up. Fixed by ROCm/TransformerEngine #737 (a
+    # scale_inv floor) and properly by #744 (scale-then-accumulate, which removes
+    # the division entirely); #744 landed in 2.20.
+    #
+    # This is a version gate rather than a functional probe on purpose: a synthetic
+    # GEMM with a large per-block magnitude spread does NOT reproduce the fault
+    # (measured against the pre-#737 build -- 0 non-finite across K and spread), so
+    # there is no cheap startup check that would actually discriminate.
+    _TE_BLOCKWISE_MIN = (2, 20)
+
+    @classmethod
+    def _check_te_supports_blockwise(cls) -> None:
+        if os.environ.get("LUMENRL_SKIP_TE_BLOCKWISE_CHECK") == "1":
+            return
+        try:
+            import transformer_engine as te_root
+            raw = str(te_root.__version__)
+        except Exception:
+            return  # cannot tell; let TE speak for itself
+        base = raw.split("+", 1)[0]
+        try:
+            parts = tuple(int(x) for x in base.split(".")[:2])
+        except ValueError:
+            return
+        if parts < cls._TE_BLOCKWISE_MIN:
+            want = ".".join(str(x) for x in cls._TE_BLOCKWISE_MIN)
+            raise RuntimeError(
+                f"quantization.training.fp8_recipe='blockwise' needs TransformerEngine "
+                f">= {want} on ROCm, found {raw}. Earlier builds hit the CDNA4 "
+                f"running-scale bug and produce non-finite weight gradients mid-run "
+                f"(ROCm/TransformerEngine #737, #744). Point PYTHONPATH at a newer TE "
+                f"prefix, or set LUMENRL_SKIP_TE_BLOCKWISE_CHECK=1 if you know your "
+                f"build carries the fix."
+            )
 
     def _token_align(self) -> int:
         """LCM of every token-count divisibility this run requires.
