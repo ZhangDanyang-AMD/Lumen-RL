@@ -140,3 +140,61 @@ def test_trainer_side_fp8_is_rejected_not_ignored():
     server = object.__new__(ATOMRayServer)
     with pytest.raises(NotImplementedError, match="BF16-only"):
         asyncio.run(server.receive_weights_rdma("g", 1, True, prequantized_fp8=True))
+
+
+class _Engine:
+    """An ATOM engine with the receive as a weight-sync command, or without."""
+
+    def __init__(self, with_receive: bool) -> None:
+        self.calls = []
+        if with_receive:
+            self.receive_weights_rdma = lambda *a, **kw: (
+                self.calls.append(("receive_weights_rdma", a, kw)) or [435]
+            )
+
+    def collective_rpc(self, method, **kw):
+        self.calls.append(("collective_rpc", method, kw["kwargs"]))
+        from atom.model_engine.collective_rpc import RpcResult
+
+        return [RpcResult("r", 0, value={"buckets": 1.0})]
+
+    def clear_kv_cache(self):
+        self.calls.append(("clear_kv_cache",))
+
+
+def _atom_server(engine):
+    from lumenrl.engine.inference.atom_ray_server import ATOMRayServer
+
+    server = object.__new__(ATOMRayServer)
+    server.engine = engine
+    return server
+
+
+def test_the_stream_is_a_weight_sync_where_atom_has_the_command(monkeypatch):
+    """The engine fences serving around it and drops the KV the old weights
+    computed, so no prefix-cache reset follows."""
+    import asyncio
+
+    monkeypatch.setenv("LUMENRL_RDMA_RECV_TIMEOUT_S", "42")
+    engine = _Engine(with_receive=True)
+
+    assert asyncio.run(_atom_server(engine).receive_weights_rdma("g", 3)) == [435]
+    assert engine.calls == [("receive_weights_rdma", ("g", 3), {"timeout": 42.0})]
+
+
+def test_an_atom_with_2946_still_takes_the_stream_as_a_collective_rpc():
+    import asyncio
+
+    pytest.importorskip("atom.model_engine.collective_rpc", exc_type=ImportError)
+    engine = _Engine(with_receive=False)
+
+    asyncio.run(_atom_server(engine).receive_weights_rdma("g", 3))
+
+    assert engine.calls == [
+        (
+            "collective_rpc",
+            "receive_weights_rdma",
+            {"group_name": "g", "version": 3, "verify_full_load": True},
+        ),
+        ("clear_kv_cache",),
+    ]

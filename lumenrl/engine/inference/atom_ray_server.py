@@ -733,7 +733,14 @@ class ATOMRayServer:
         return True
 
     async def generation_pause_modes(self) -> list[str]:
-        """Modes ``pause_generation`` takes here; empty on an ATOM that cannot pause."""
+        """Modes ``pause_generation`` takes here; empty on an ATOM that cannot pause.
+
+        ATOM reports it as the ``pause_generation`` capability, which takes
+        ``keep``; one built with ROCm/ATOM#2946 named its modes in a constant.
+        """
+        if hasattr(self.engine, "get_capabilities"):
+            if (await self.get_capabilities()).supports("pause_generation"):
+                return ["keep"]
         try:
             from atom.model_engine.engine_utility import GENERATION_PAUSE_MODES
         except ImportError:
@@ -889,6 +896,17 @@ class ATOMRayServer:
                 "ATOM's RDMA receive path is BF16-only; "
                 "weight_sync fp8 quantization on the trainer is not supported yet"
             )
+        # A weight stream is tens of GB; the default RPC budget is far too
+        # short for it.
+        timeout = float(os.environ.get("LUMENRL_RDMA_RECV_TIMEOUT_S", "1800"))
+        receive = getattr(self.engine, "receive_weights_rdma", None)
+        if receive is not None:
+            # A weight sync: the engine fences serving around it and drops the
+            # KV the old weights computed.
+            return await asyncio.get_event_loop().run_in_executor(
+                None, lambda: receive(group_name, int(version), timeout=timeout)
+            )
+        # An ATOM built with ROCm/ATOM#2946 runs the stream as a collective RPC.
         stats = await self.collective_rpc(
             "receive_weights_rdma",
             kwargs={
@@ -896,9 +914,7 @@ class ATOMRayServer:
                 "version": int(version),
                 "verify_full_load": bool(verify_full_load),
             },
-            # A weight stream is tens of GB; the default RPC budget is far too
-            # short for it.
-            timeout=float(os.environ.get("LUMENRL_RDMA_RECV_TIMEOUT_S", "1800")),
+            timeout=timeout,
         )
         await self.reset_prefix_cache()
         return stats

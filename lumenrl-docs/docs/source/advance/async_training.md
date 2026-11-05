@@ -21,10 +21,11 @@ correct for it.
   (`generation_backend: vllm`, `vllm_cfg.transport: ray_http`). Both modes
   have been run with the FSDP2 training backend.
 - Or the ATOM rollout (`generation_backend: atom`, `atom_cfg.transport:
-  ray_http`). Its RCCL weight sync and `fully_async.partial_rollout` need
-  [ROCm/ATOM#2946](https://github.com/ROCm/ATOM/pull/2946) in the ATOM build:
-  the RCCL weight receive, and the engine's `pause_generation` utility (mode
-  `keep`). An older ATOM fails at start with `weight_sync.backend: rdma`, as it
+  ray_http`). Its RCCL weight sync and `fully_async.partial_rollout` need an
+  ATOM build with the RCCL weight receive and the engine's `pause_generation`
+  (mode `keep`): ATOM's pause and RCCL-receive PRs, which replace
+  [ROCm/ATOM#2946](https://github.com/ROCm/ATOM/pull/2946), or #2946 itself.
+  An older ATOM fails at start with `weight_sync.backend: rdma`, as it
   cannot report RDMA support, and is refused partial rollout; run it with
   `weight_sync.backend: shared_folder` and `partial_rollout: false`, and each
   sync waits for the groups in flight and goes through shared memory (about

@@ -50,14 +50,34 @@ def test_a_refused_pause_fails_the_sync() -> None:
         asyncio.run(server.pause_generation())
 
 
-@pytest.mark.parametrize(("modes", "expected"), [(("keep",), ["keep"]), (None, [])])
-def test_pause_modes_come_from_the_atom_build(monkeypatch, modes, expected) -> None:
+class Caps:
+    def __init__(self, features) -> None:
+        self.features = set(features)
+
+    def supports(self, feature: str) -> bool:
+        return feature in self.features
+
+
+@pytest.mark.parametrize(
+    ("features", "modes", "expected"),
+    [
+        ({"pause_generation"}, None, ["keep"]),
+        (set(), ("keep",), ["keep"]),
+        (set(), None, []),
+        (None, ("keep",), ["keep"]),
+    ],
+    ids=["capability", "constant-of-atom-2946", "neither", "no-capability-discovery"],
+)
+def test_pause_modes_come_from_the_atom_build(monkeypatch, features, modes, expected):
     module = types.ModuleType("atom.model_engine.engine_utility")
     if modes is not None:
         module.GENERATION_PAUSE_MODES = modes
     monkeypatch.setitem(sys.modules, "atom.model_engine.engine_utility", module)
+    server = _server(CoreMgr())
+    if features is not None:
+        server.engine.get_capabilities = lambda: Caps(features)
 
-    assert asyncio.run(_server(CoreMgr()).generation_pause_modes()) == expected
+    assert asyncio.run(server.generation_pause_modes()) == expected
 
 
 class Remote:
