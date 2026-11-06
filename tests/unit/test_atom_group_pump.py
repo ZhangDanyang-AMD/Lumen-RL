@@ -24,7 +24,9 @@ class FakeEngine:
         self.io_processor = SimpleNamespace(
             preprocess_fanout=self._preprocess_fanout, postprocess=self._postprocess,
         )
-        self.core_mgr = SimpleNamespace(add_request=self.added.append)
+        self.core_mgr = SimpleNamespace(
+            add_request=self.added.append, keep_finished_outputs=False
+        )
 
     def _preprocess_fanout(self, prompt_ids, sampling_params, parent_request_id):
         return [
@@ -45,7 +47,10 @@ class FakeEngine:
         return item
 
     def finish(self, *seqs) -> None:
-        self._finished.put(list(seqs))
+        # As CoreManager since ROCm/ATOM#2912: finished sequences reach step()
+        # only once a reader has asked for them.
+        if self.core_mgr.keep_finished_outputs:
+            self._finished.put(list(seqs))
 
     def fail(self, exc: BaseException) -> None:
         self._finished.put(exc)
@@ -74,6 +79,14 @@ def test_concurrent_groups_get_their_own_outputs_in_fanout_order() -> None:
     assert [out["token_ids"] for out in first] == [[seq.id] for seq in a]
     assert [out["token_ids"] for out in second] == [[seq.id] for seq in b]
     assert [seq.request for seq in a] == ["a"] * 3
+
+
+def test_the_pump_asks_for_finished_sequences() -> None:
+    """Without it an ATOM since #2912 drops every finished sequence, and no
+    group ever comes back."""
+    engine = FakeEngine()
+    AtomGroupPump(engine)
+    assert engine.core_mgr.keep_finished_outputs is True
 
 
 def test_a_reader_failure_reaches_every_waiting_group_and_later_submits() -> None:

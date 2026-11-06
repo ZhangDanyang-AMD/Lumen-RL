@@ -54,6 +54,10 @@ class AtomGroupPump:
 
     def __init__(self, engine: Any) -> None:
         self._engine = engine
+        # CoreManager queues finished sequences only for a reader that asks
+        # (ROCm/ATOM#2912), as LLMEngine.add_request does; this pump is one. An
+        # older ATOM queues them anyway and never reads the attribute.
+        engine.core_mgr.keep_finished_outputs = True
         self._lock = threading.Lock()
         self._pending: dict[Any, _PendingGroup] = {}
         self._thread: threading.Thread | None = None
