@@ -340,6 +340,10 @@ class TrainingConfig:
     # lost to bf16 rounding. Use "bf16" for mixed precision (recommended) or
     # "fp32" for full FP32. Reduce dtype is always FP32 for stability.
     optimizer_dtype: str = "bf16"
+    # Cap on the actor's caching allocator, as a fraction of device memory. With a
+    # colocated rollout engine the uncapped cache grows into every free byte, and
+    # allocations it cannot reclaim (the engine's, RCCL's) then OOM. None = no cap.
+    max_memory_fraction: Optional[float] = None
 
 
 @dataclass

@@ -44,6 +44,23 @@ from lumenrl.engine.training.base_engine import BaseEngine, EngineRegistry
 logger = logging.getLogger(__name__)
 
 
+def apply_memory_cap(training_cfg: Mapping[str, Any]) -> None:
+    """Apply ``policy.training.max_memory_fraction`` to this process's allocator.
+
+    At the cap PyTorch frees its cached blocks and retries before raising, so the
+    trainer keeps working memory while leaving the rest of the device to the
+    colocated rollout engine and RCCL.
+    """
+    frac = training_cfg.get("max_memory_fraction")
+    if frac is None or not torch.cuda.is_available():
+        return
+    frac = float(frac)
+    if not 0.0 < frac <= 1.0:
+        raise ValueError(f"policy.training.max_memory_fraction must be in (0, 1], got {frac}")
+    torch.cuda.set_per_process_memory_fraction(frac, device=torch.cuda.current_device())
+    logger.info("Actor allocator capped at %.2f of device memory.", frac)
+
+
 def _normalize_streamed_optimizer_chunk_size_mib(value: Any) -> int:
     if isinstance(value, bool):
         raise ValueError(
@@ -108,6 +125,7 @@ class LumenActorWorker(BaseWorker):
 
         model_name = str(policy.get("model_name", ""))
         training_cfg = policy.get("training", {}) or {}
+        apply_memory_cap(training_cfg)
         quant = get_nested_config(self.config, "quantization", "training", default={}) or {}
 
         megatron_cfg = training_cfg.get("megatron_cfg", {}) or {}
