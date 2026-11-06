@@ -123,6 +123,36 @@ class RayWorkerRoleConfig:
 
 
 @dataclass
+class FullyAsyncRolloutConfig:
+    """Streaming rollout ahead of training, as in verl's fully_async_policy.
+
+    Needs controller.ray.rollout.num_workers > 0 and the vLLM rollout.
+    """
+
+    enabled: bool = False
+    # Optimizer steps between two weight syncs.
+    trigger_parameter_sync_step: int = 1
+    # Per sync period the rollout budgets (1 + this) periods' worth of prompt
+    # groups, counting the ones in flight at the recent filter_groups keep rate,
+    # so a period can end over budget when more of them are kept. Even at 0
+    # some groups train one sync late: those still in flight at a sync, and
+    # with filter_groups the surplus submitted to make up for dropped groups.
+    staleness_threshold: float = 0.0
+    # On a weight sync, freeze in-flight requests and continue them on the new
+    # weights instead of waiting for them to finish.
+    partial_rollout: bool = False
+    # Prompt groups generating at once; 0 = max_num_seqs // n per replica.
+    max_inflight_groups: int = 0
+    # Validate on a background thread while training goes on, sharing the
+    # rollout pool with the training groups. With partial_rollout a weight sync
+    # freezes validation requests along with the groups and they finish on the
+    # newer weights (val/finished_version says how much newer); without it the
+    # next sync waits for validation to finish. The final step validates in
+    # the foreground.
+    overlap_validation: bool = False
+
+
+@dataclass
 class RayControllerConfig:
     """Ray-controller runtime options for the trainer main path."""
 
@@ -133,6 +163,11 @@ class RayControllerConfig:
     rollout: RayWorkerRoleConfig = field(default_factory=RayWorkerRoleConfig)
     # Optional role->pool name mapping for complex topology routing.
     topology_map: dict[str, str] = field(default_factory=dict)
+    # Generate step s+1 on the rollout pool while step s trains, as in verl's
+    # one_step_off_policy. Needs rollout.num_workers > 0; every batch after the
+    # first then trains one update after the weights that generated it.
+    one_step_off_policy: bool = False
+    fully_async: FullyAsyncRolloutConfig = field(default_factory=FullyAsyncRolloutConfig)
 
 
 @dataclass

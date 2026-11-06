@@ -72,6 +72,20 @@ def _layers_in_bf16(config: dict[str, Any], key: str) -> int:
     return 0
 
 
+def _whole_tensors(params):
+    """Each parameter whole, gathered on every rank in the same order.
+
+    FSDP2 yields DTensor shards, and ``full_tensor()`` is a collective: a rank
+    that skips one leaves its peers in that all-gather. So every rank consumes
+    this, and only the writer keeps what it yields. Megatron's tensors are
+    already whole and pass through.
+    """
+    from torch.distributed.tensor import DTensor
+
+    for name, param in params:
+        yield name, param.full_tensor() if isinstance(param, DTensor) else param
+
+
 class LumenActorWorker(BaseWorker):
     """Trainable policy worker using the Engine abstraction layer.
 
@@ -1133,9 +1147,10 @@ class LumenActorWorker(BaseWorker):
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         params, _ = self._engine.get_per_tensor_param()
+        params = _whole_tensors(params)
         if self.rank != 0:
-            # Consume the conversion iterator on every rank. Megatron TP/EP
-            # collectives in get_per_tensor_param have already run collectively.
+            # Consume the conversion iterator on every rank: Megatron's TP/EP
+            # collectives and FSDP2's all-gathers run as it advances.
             for _ in params:
                 pass
             return {"writer": False}
@@ -1143,6 +1158,13 @@ class LumenActorWorker(BaseWorker):
         group = getattr(self, "_rdma_weight_group", None)
         if group is None:
             raise RuntimeError("RDMA weight group is not initialized")
+
+        if os.environ.get("LUMENRL_SYNC_FP32") != "1":
+            # The same FP32 -> BF16 cast as update_weights_ipc_send.
+            params = (
+                (name, t.to(torch.bfloat16) if t.dtype == torch.float32 else t)
+                for name, t in params
+            )
 
         integrity_enabled = bool(integrity_check) or os.environ.get(
             "LUMENRL_WEIGHT_SYNC_INTEGRITY", "0"
@@ -1220,6 +1242,7 @@ class LumenActorWorker(BaseWorker):
                 old.unlink()
 
         params, _ = self._engine.get_per_tensor_param()
+        params = _whole_tensors(params)
         shard: dict[str, torch.Tensor] = {}
         shard_keys: list[list[str]] = []
         temp_paths: list[Path] = []
