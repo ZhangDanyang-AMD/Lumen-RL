@@ -2,17 +2,16 @@ name: ATOM Receiver Contract
 
 # ATOM's RDMA weight receiver (ROCm/ATOM, atom/rollout/rdma_weight_receiver.py)
 # decodes the stream lumenrl/engine/inference/rdma_weight_transfer.py sends.
-# ATOM's tests hold the receiver to a snapshot of this sender,
-# tests/fixtures/lumenrl_rdma_sender.txt; this job holds the snapshot to the
-# sender -- on any change to it, and daily, since ATOM can move without LumenRL
-# changing. The sender is only read as text by ATOM's tests; nothing of
-# LumenRL runs.
+# tests/unit/test_atom_receiver_contract.py holds the two to one protocol -- on
+# any change to the sender, and daily, since ATOM can move without LumenRL
+# changing. Both are read as text; nothing of either runs.
 
 on:
   pull_request:
     branches: [main]
     paths:
       - 'lumenrl/engine/inference/rdma_weight_transfer.py'
+      - 'tests/unit/test_atom_receiver_contract.py'
       - '.github/workflows/atom-receiver-contract.yaml'
   workflow_dispatch:
   schedule:
@@ -24,7 +23,7 @@ concurrency:
 
 jobs:
   receiver-contract:
-    name: Check the sender against ATOM's snapshot of it
+    name: Check the sender against ATOM's receiver
     runs-on: ubuntu-latest
     steps:
       - name: Checkout LumenRL
@@ -35,25 +34,25 @@ jobs:
           repository: ROCm/ATOM
           path: ATOM
           persist-credentials: false
-      - name: Take the receiver from its PR until it is on ATOM main
-        # Drop this step once ROCm/ATOM#2946 is merged.
+      - name: Find the receiver
+        id: atom
         run: |
-          if [ ! -f ATOM/tests/fixtures/lumenrl_rdma_sender.txt ]; then
-            git -C ATOM fetch --depth 1 origin pull/2946/head
-            git -C ATOM checkout --detach FETCH_HEAD
-          fi
           git -C ATOM log -1 --format='ATOM under test: %H %s'
+          if [ -f ATOM/atom/rollout/rdma_weight_receiver.py ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::ATOM main has no RDMA receiver yet; nothing to check"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Set up Python environment
+        if: steps.atom.outputs.present == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install dependencies
-        run: |
-          pip3 install torch --index-url https://download.pytorch.org/whl/cpu
-          SETUPTOOLS_SCM_PRETEND_VERSION_FOR_ATOM=0.0.0+cpu.ci pip3 install -e ./ATOM
-          pip3 install pytest
-      - name: Run ATOM's sender contract tests against this sender
-        working-directory: ATOM
+      - name: Check the sender against the receiver
+        if: steps.atom.outputs.present == 'true'
         env:
-          LUMENRL_ROOT: ${{ github.workspace }}
-        run: python -m pytest tests/test_rdma_weight_receiver.py -k "sender or snapshot" -rA
+          ATOM_ROOT: ${{ github.workspace }}/ATOM
+        run: |
+          pip3 install pytest
+          python -m pytest tests/unit/test_atom_receiver_contract.py -rA
