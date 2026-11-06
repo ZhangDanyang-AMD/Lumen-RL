@@ -27,7 +27,6 @@ from lumenrl.engine.training import megatron_engine, megatron_lumen_dsv4_engine
 from lumenrl.engine.training.base_engine import EngineRegistry
 from lumenrl.engine.training.megatron_base_engine import (
     MegatronBaseEngine,
-    _FusedTokenLogProb,
     moe_dispatcher_kwargs,
 )
 from lumenrl.engine.training.megatron_native_engine import MegatronNativeEngine
@@ -445,7 +444,7 @@ def test_safetensors_export_can_select_diagnostic_weights(
     assert result["num_params"] == 2
 
 
-def test_fused_token_log_prob_matches_reference_value_and_gradient() -> None:
+def test_token_log_prob_train_matches_reference_value_and_gradient() -> None:
     torch.manual_seed(7)
     target = torch.tensor([0, 3, 1, 4, 2], dtype=torch.long)
     weight = torch.randn(target.numel())
@@ -453,7 +452,9 @@ def test_fused_token_log_prob_matches_reference_value_and_gradient() -> None:
     fused_logits = torch.randn(target.numel(), 7, requires_grad=True)
     reference_logits = fused_logits.detach().clone().requires_grad_(True)
 
-    fused = _FusedTokenLogProb.apply(fused_logits, target)
+    engine = object.__new__(MegatronBaseEngine)
+    engine._logprob_chunk_size = 2
+    fused = engine._token_logprob_train(fused_logits, target)
     reference = torch.log_softmax(reference_logits, dim=-1).gather(
         -1, target.unsqueeze(-1)
     ).squeeze(-1)

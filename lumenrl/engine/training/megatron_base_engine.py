@@ -101,38 +101,6 @@ def _gap_dump_dir() -> str | None:
         return None
 
 
-class _FusedTokenLogProb(torch.autograd.Function):
-    """Memory-efficient per-token log-prob: ``log p(target) = logit_target - logsumexp``.
-
-    Retains a single ``[L, V]`` softmax buffer for backward instead of the
-    several ``[L, V]`` tensors that ``log_softmax(logits).gather(...)`` keeps
-    alive (the full log_softmax output plus its gradient). Values/gradients are
-    exact. Backward uses ``grad_logits = (onehot(target) - softmax) * grad_lp``.
-    """
-
-    @staticmethod
-    def forward(ctx, logits, target):
-        logits = logits.float()
-        m = logits.max(dim=-1, keepdim=True).values          # [L,1]
-        shifted = logits.sub(m)                               # new [L,V]
-        exp = shifted.exp_()                                  # in-place -> exp
-        Z = exp.sum(dim=-1, keepdim=True)                     # [L,1]
-        softmax = exp.div_(Z)                                 # in-place -> softmax
-        logZ = Z.log_().add_(m)                               # logsumexp [L,1]
-        tgt_logit = logits.gather(-1, target.unsqueeze(-1))   # [L,1]
-        log_prob = (tgt_logit - logZ).squeeze(-1)             # [L]
-        ctx.save_for_backward(softmax, target)
-        return log_prob
-
-    @staticmethod
-    def backward(ctx, grad_lp):
-        softmax, target = ctx.saved_tensors                   # softmax [L,V]
-        grad = softmax.neg_()                                 # -softmax (reuse buffer)
-        grad.scatter_add_(-1, target.unsqueeze(-1), torch.ones_like(grad[:, :1]))
-        grad.mul_(grad_lp.unsqueeze(-1))
-        return grad, None
-
-
 def _accum_sc(acc: dict[str, float], stats: dict[str, float]) -> None:
     """Sum the score-centering token sums (``sc/*_sum``, ``sc_tok``) of one row."""
     for key, val in stats.items():
@@ -202,8 +170,9 @@ class MegatronBaseEngine(BaseEngine):
         return
 
     # ------------------------------------------------------------------
-    def _forward_logits(self, ids: torch.Tensor, model=None) -> torch.Tensor:
-        """Run the model on a single unpadded sequence -> logits [L, V] (float).
+    def _forward_logits(self, ids: torch.Tensor, model=None, upcast: bool = True) -> torch.Tensor:
+        """Run the model on a single unpadded sequence -> logits [L, V] (float, or the
+        model dtype with ``upcast=False``).
 
         ``model`` defaults to the unwrapped GPTModel (eval); pass ``self._ddp``
         during training so DDP grad hooks fire and grads land in the buffer.
@@ -214,12 +183,16 @@ class MegatronBaseEngine(BaseEngine):
         pos = torch.arange(L, device=ids.device).view(1, L)
         out = m(input_ids=inp, position_ids=pos, attention_mask=None)
         logits = out.logits if hasattr(out, "logits") else out
-        return logits.view(L, -1).float()
+        logits = logits.view(L, -1)
+        return logits.float() if upcast else logits
 
-    def _forward_logits_packed(self, ids_list, model=None) -> tuple[torch.Tensor, list[int]]:
+    def _forward_logits_packed(
+        self, ids_list, model=None, upcast: bool = True,
+    ) -> tuple[torch.Tensor, list[int]]:
         """Packed varlen forward: concat ``ids_list`` (per-sequence 1D token tensors)
         into one [1,T] stream and run a single GPTModel forward with thd
-        ``PackedSeqParams``. Returns ``(logits [T,V] float, offsets)`` where
+        ``PackedSeqParams``. Returns ``(logits [T,V], offsets)`` (float, or the model
+        dtype with ``upcast=False``) where
         ``offsets[i]:offsets[i+1]`` slices sequence ``i``'s logits.
 
         Rotary is applied per-segment by Megatron's thd path (via cu_seqlens);
@@ -243,7 +216,8 @@ class MegatronBaseEngine(BaseEngine):
         )
         out = m(input_ids=tokens, position_ids=pos, attention_mask=None, packed_seq_params=pp)
         logits = out.logits if hasattr(out, "logits") else out
-        return logits.view(T, -1).float(), offsets
+        logits = logits.view(T, -1)
+        return (logits.float() if upcast else logits), offsets
 
     def _build_bins(self, lengths: list[int], budget: int) -> list[list[int]]:
         """Greedy bin-packing of row indices into groups whose summed token length
@@ -275,18 +249,22 @@ class MegatronBaseEngine(BaseEngine):
         return int(idx[0].item()), int(idx.numel())
 
     # ---- memory-efficient log-prob helpers ----
-    def _token_logprob_train(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """Per-token log-prob with grad. Uses the fused single-buffer CE (optionally
-        chunked over the sequence) when ``log_probs_chunk_size>0``; otherwise the
-        original ``log_softmax(...).gather(...)`` path (kept for the smoke config)."""
+    def _token_logprob_train(
+        self, logits: torch.Tensor, targets: torch.Tensor, *, temperature: float = 1.0,
+    ) -> torch.Tensor:
+        """Per-token log-prob ``[L]`` (fp32) with grad, of ``softmax(logits / T)``.
+
+        Takes the model's bf16 logits directly: the op upcasts one
+        ``log_probs_chunk_size`` row chunk at a time and saves only the input for
+        backward, so no fp32 ``[L, V]`` copy or softmax is kept.
+        """
+        from lumenrl.engine.training.packing import selected_log_probs
+
         cs = self._logprob_chunk_size
-        if cs and cs > 0:
-            outs = []
-            for s in range(0, logits.shape[0], cs):
-                outs.append(_FusedTokenLogProb.apply(logits[s:s + cs], targets[s:s + cs]))
-            return torch.cat(outs, dim=0)
-        lp = torch.log_softmax(logits, dim=-1)
-        return lp.gather(-1, targets.view(-1, 1)).squeeze(-1)
+        chunk = cs if cs and cs > 0 else max(1, logits.shape[0])
+        return selected_log_probs(
+            logits, targets.view(-1, 1), temperature=temperature, chunk_rows=chunk,
+        )[:, 0]
 
     def _token_head_logprob_train(
         self,
@@ -295,14 +273,15 @@ class MegatronBaseEngine(BaseEngine):
         head_ids: torch.Tensor,
         *,
         chunk_rows: int = 4096,
+        temperature: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Score centering: log-probs of the sampled token ``[L]`` and of the
         sampler's head ids ``[L, k]`` under one log-sum-exp per row (so ``p_y``
-        and ``p_H`` are consistent). ``logits`` are already temperature-scaled."""
+        and ``p_H`` are consistent), of ``softmax(logits / temperature)``."""
         from lumenrl.engine.training.packing import selected_log_probs
 
         ids = torch.cat([targets.view(-1, 1).long(), head_ids.long()], dim=1)
-        out = selected_log_probs(logits, ids, chunk_rows=chunk_rows)
+        out = selected_log_probs(logits, ids, temperature=temperature, chunk_rows=chunk_rows)
         return out[:, 0], out[:, 1:]
 
     @staticmethod
@@ -596,10 +575,11 @@ class MegatronBaseEngine(BaseEngine):
         def _row_lp(seg_logits, ids_row, r, start):
             """(token_lp [1, L-1], head_lp [1, L-1, k] | None) for one row."""
             if sc is None:
-                return self._token_logprob_train(seg_logits, ids_row).view(1, -1), None
+                lp = self._token_logprob_train(seg_logits, ids_row, temperature=temperature)
+                return lp.view(1, -1), None
             head_ids = self._sc_row_head_ids(t, r, start, seg_logits.shape[0], seg_logits.device)
             tok, head = self._token_head_logprob_train(
-                seg_logits, ids_row, head_ids, chunk_rows=sc_chunk,
+                seg_logits, ids_row, head_ids, chunk_rows=sc_chunk, temperature=temperature,
             )
             return tok.view(1, -1), head.unsqueeze(0)
 
@@ -616,8 +596,11 @@ class MegatronBaseEngine(BaseEngine):
             lengths = [L for (_, _, L) in rows]
             for bin_rows in self._build_bins(lengths, budget):
                 ids_list = [seqs[rows[j][0], rows[j][1]:rows[j][1] + rows[j][2]].to("cuda") for j in bin_rows]
-                logits_packed, offsets = self._forward_logits_packed(ids_list, model=self._ddp)
-                logits_packed = logits_packed / temperature  # [T,V] (grad)
+                # Model-dtype [T,V] logits: the log-prob op upcasts per row chunk and
+                # applies temperature, so no full fp32 copy (12 GiB at T=21.5K) exists.
+                logits_packed, offsets = self._forward_logits_packed(
+                    ids_list, model=self._ddp, upcast=False,
+                )
                 bin_loss = None
                 for k, j in enumerate(bin_rows):
                     r, start, _L = rows[j]
@@ -637,7 +620,7 @@ class MegatronBaseEngine(BaseEngine):
             # ---- per-sequence forward (original path) ----
             for (r, start, L) in rows:
                 ids = seqs[r, start:start + L].to("cuda")
-                logits = self._forward_logits(ids, model=self._ddp) / temperature  # [L,V] (grad)
+                logits = self._forward_logits(ids, model=self._ddp, upcast=False)  # [L,V] (grad)
                 token_lp, head_lp = _row_lp(logits[:-1], ids[1:], r, start)  # [1,L-1]
                 loss, stats = self._row_policy_loss(
                     t, r, start, token_lp, algo_name, _cfg, bnt, dp,
