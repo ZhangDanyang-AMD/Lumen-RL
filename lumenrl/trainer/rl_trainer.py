@@ -927,6 +927,10 @@ class RLTrainer:
         # an error here instead of a slow train/rollout divergence later.
         version = int(self.global_step) + 1
 
+        # 0) return the actors' training-peak allocator cache first: the receivers
+        # allocate their reload buffers as soon as they start, in their own
+        # processes, and cannot reclaim it (204 of 206 GB on MI300X otherwise).
+        self._actor_wg.execute_all_sync("free_cached_memory")
         # 1) wake weight memory before loading (only when sleep is in use).
         if sleeping:
             rollout_engine.wake(tags=["weights"])
