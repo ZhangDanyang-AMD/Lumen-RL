@@ -1608,6 +1608,10 @@ class LumenActorWorker(BaseWorker):
             )
             alloc0 = float(torch.cuda.memory_allocated())
             torch.cuda.reset_peak_memory_stats()
+            # Return the training-peak cache before the colocated rollout engine
+            # allocates its reload buffers in its own process (as the RDMA path does).
+            gc.collect()
+            torch.cuda.empty_cache()
 
         is_atom = str(get_nested_config(
             self.config, "policy", "generation_backend", default="",
