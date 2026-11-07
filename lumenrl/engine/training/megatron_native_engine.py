@@ -1981,6 +1981,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
         per-rank ``torch.save`` path, this is sharded (no DP weight duplication)
         and can be reloaded under a different TP/PP/DP topology."""
         import megatron.core.dist_checkpointing as dc
+        force_gloo_dp_zero_gather(self.optimizer)
         sharded_sd = self._dist_sharded_state_dict(is_loading=False)
         # common (non-sharded) metadata replicated on every rank
         sharded_sd["global_step"] = int(global_step)
@@ -2002,9 +2003,58 @@ class MegatronNativeEngine(MegatronBaseEngine):
         self.optimizer.load_state_dict(loaded["optimizer"])
         if self.lr_scheduler is not None and loaded.get("lr_scheduler") is not None:
             self.lr_scheduler.load_state_dict(loaded["lr_scheduler"])
+        step = int(loaded.get("global_step", 0))
+        del loaded  # the loaded state is a full CPU copy of the checkpoint
+        self.check_main_params_match_model(f"after loading {local_path}")
         if dist.is_initialized():
             dist.barrier()
-        return int(loaded.get("global_step", 0))
+        return step
+
+    def check_main_params_match_model(self, tag: str, rtol: float = 1e-2) -> None:
+        """Raise if the optimizer's fp32 main param shards disagree with the bf16
+        model params (they must match to bf16 rounding, ~4e-3 relative). A
+        mismatch means the optimizer state was not restored, and the next step
+        would copy it into the model."""
+        opts = getattr(self.optimizer, "chained_optimizers", [self.optimizer])
+        worst, n = 0.0, 0
+        for o in opts:
+            for mg, sg in zip(o.model_float16_groups, o.shard_fp32_from_float16_groups):
+                for mp, sp in zip(mg, sg):
+                    r = o._get_model_param_range_map(mp)["param"]
+                    m = mp.detach().reshape(-1)[r.start:r.end].float()
+                    if m.numel() == 0:
+                        continue
+                    rel = float((m - sp.detach().float()).abs().max() / (m.abs().max() + 1e-12))
+                    worst, n = max(worst, rel), n + 1
+        if worst > rtol:
+            raise RuntimeError(
+                f"rank {self._rank()}: optimizer main params do not match the model {tag} "
+                f"(max relative diff {worst:.3e} over {n} shards); the checkpoint's "
+                f"optimizer state is corrupt"
+            )
+        logger.info("rank %d: main params match the model %s (max rel diff %.2e, %d shards)",
+                    self._rank(), tag, worst, n)
+
+
+def force_gloo_dp_zero_gather(optimizer) -> None:
+    """Make Megatron's dp_zero optimizer-state gather use gloo (CPU), not RCCL.
+
+    ``sharded_param_state_dp_zero`` hard-codes ``use_gloo_comm=False``. On RCCL
+    2.27.7 a world-size-7 ``torch.distributed.gather`` delivers only the first
+    half of each non-root rank's tensor once it is >= ~256 MiB, which saved
+    checkpoints with zeroed main params and Adam moments.
+    """
+    for o in getattr(optimizer, "chained_optimizers", [optimizer]):
+        orig = o.get_parameter_state_dp_zero
+        if getattr(orig, "_lumenrl_gloo", False):
+            continue
+
+        def _gloo(*args, _orig=orig, **kwargs):
+            kwargs["use_gloo_comm"] = True
+            return _orig(*args, **kwargs)
+
+        _gloo._lumenrl_gloo = True
+        o.get_parameter_state_dp_zero = _gloo
 
 
 @EngineRegistry.register(model_type="language_model", backend="megatron_native")
