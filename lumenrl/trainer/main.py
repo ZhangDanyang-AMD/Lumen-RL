@@ -82,7 +82,11 @@ def main() -> None:
                 config.num_training_steps, config.async_training.enabled)
 
     algo_name = config.algorithm.name.lower()
-    if config.assembly.use_new_assembler:
+    if config.embodied.enabled:
+        from lumenrl.trainer.embodied_trainer import EmbodiedTrainer
+
+        trainer = EmbodiedTrainer(config)
+    elif config.assembly.use_new_assembler:
         assembler = RuntimeAssembler(config)
         graph = assembler.build_graph()
         trainer = graph["trainer_cls"](config)
@@ -105,7 +109,8 @@ def main() -> None:
 
     cbs: list = [LoggingCallback(interval=max(1, config.logger.log_interval))]
 
-    if config.checkpointing.checkpoint_dir:
+    # EmbodiedTrainer writes its own bf16 policy checkpoints (embodied.save_interval).
+    if config.checkpointing.checkpoint_dir and not config.embodied.enabled:
         cbs.append(CheckpointCallback(
             checkpoint_dir=config.checkpointing.checkpoint_dir,
             save_interval=config.checkpointing.save_steps,

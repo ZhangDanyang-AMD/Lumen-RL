@@ -1,0 +1,70 @@
+# GRPO for OpenVLA-OFT in the OpenSora action-conditioned world model (LIBERO-Spatial).
+#
+#   torchrun --nproc_per_node=8 -m lumenrl.trainer.main \
+#       --config examples/Embodied_OpenSora_OpenVLA_OFT_LIBERO/configs/embodied_opensora_openvla_oft_grpo.yaml
+#
+# Plain HF / PyTorch everywhere by default. Lumen kernels are switched on per
+# component through LumenConfig.enable keyword arguments under embodied.lumen.
+
+embodied:
+  enabled: true
+  plugin: examples.Embodied_OpenSora_OpenVLA_OFT_LIBERO.plugin
+  policy:
+    model_type: openvla_oft
+    model_path: /work/models/Openvla-oft-SFT-libero-spatial-traj1
+    unnorm_key: libero_spatial_no_noops
+    gradient_checkpointing: true
+    freeze_vision_backbone: false
+  env:
+    model_dir: /work/models/RLinf-OpenSora-LIBERO-Spatial
+    reward_model_file: resnet_rm.pth
+    context_frames: 4
+    max_episode_steps: 200
+    world_model_kwargs:
+      sampling_steps: 10
+      context_frames: 4
+    success_logit_threshold: 0.0
+    wm_batch_size: 32
+  rollout:
+    backend: hf
+    temperature: 1.6
+    batch_size: 64
+    groups_per_rank: 4
+    recompute_old_log_probs: true
+    filter_zero_advantage_groups: true
+  train_micro_batch_size: 16
+  entropy_coeff: 0.0
+  log_dir: results/embodied_opensora_openvla_oft
+  lumen: {}
+  #   actor:       {norm: true, attn: true, ...}
+  #   rollout:     {...}
+  #   world_model: {aiter_conv: true, ...}
+
+policy:
+  model_name: /work/models/Openvla-oft-SFT-libero-spatial-traj1
+  training_backend: fsdp2
+  learning_rate: 5.0e-6
+  lr_warmup_steps: 0
+  lr_decay_style: constant
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+
+algorithm:
+  name: grpo
+  clip_ratio_high: 0.28
+  loss_agg_mode: token-mean
+  grpo:
+    num_generations: 8
+    kl_coeff: 0.0
+    clip_ratio: 0.2
+    num_ppo_epochs: 1
+    num_mini_batches: 4
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 100
+seed: 42

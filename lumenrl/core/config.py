@@ -961,6 +961,60 @@ class ProfilerConfig:
 
 
 @dataclass
+class EmbodiedPolicyConfig:
+    """VLA policy trained by the embodied trainer."""
+    model_type: str = "openvla_oft"
+    model_path: str = ""
+    unnorm_key: str = "libero_spatial_no_noops"
+    gradient_checkpointing: bool = True
+    freeze_vision_backbone: bool = False
+
+
+@dataclass
+class EmbodiedEnvConfig:
+    """Learned world-model environment."""
+    model_dir: str = ""
+    init_data_dir: str = ""            # default: <model_dir>/dataset
+    reward_model_file: str = "resnet_rm.pth"
+    context_frames: int = 5
+    max_episode_steps: int = 200
+    world_model_kwargs: dict = field(default_factory=dict)  # passed to the plugin's build_world_model
+    success_logit_threshold: float = 0.0
+    wm_batch_size: int = 32
+
+
+@dataclass
+class EmbodiedRolloutConfig:
+    backend: str = "hf"
+    temperature: float = 1.6
+    batch_size: int = 64               # policy forward micro-batch during rollout
+    groups_per_rank: int = 4           # init states per rank; each is repeated num_generations times
+    recompute_old_log_probs: bool = True
+    filter_zero_advantage_groups: bool = True
+
+
+@dataclass
+class EmbodiedConfig:
+    """Embodied RL (VLA policy + world-model environment), see ``EmbodiedTrainer``.
+
+    ``lumen`` holds ``LumenConfig`` keyword arguments per component
+    (``actor``, ``rollout``, ``world_model``); an empty dict leaves that
+    component as plain HF / PyTorch.
+    """
+    enabled: bool = False
+    plugin: str = ""                  # module exposing PLUGIN (see lumenrl.core.embodied_plugin)
+    policy: EmbodiedPolicyConfig = field(default_factory=EmbodiedPolicyConfig)
+    env: EmbodiedEnvConfig = field(default_factory=EmbodiedEnvConfig)
+    rollout: EmbodiedRolloutConfig = field(default_factory=EmbodiedRolloutConfig)
+    train_micro_batch_size: int = 16
+    entropy_coeff: float = 0.0
+    log_dir: str = ""                  # per-step metrics as embodied_metrics.jsonl
+    save_interval: int = 0             # save the policy every N steps (and at the end) when > 0
+    save_dir: str = ""                 # default: <log_dir>/checkpoints
+    lumen: dict = field(default_factory=dict)
+
+
+@dataclass
 class LumenRLConfig:
     """Top-level configuration for LumenRL."""
 
@@ -981,6 +1035,7 @@ class LumenRLConfig:
     assembly: RuntimeAssemblyConfig = field(default_factory=RuntimeAssemblyConfig)
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
+    embodied: EmbodiedConfig = field(default_factory=EmbodiedConfig)
     num_training_steps: int = 1000
     seed: int = 42
     val_dataset: str = ""
