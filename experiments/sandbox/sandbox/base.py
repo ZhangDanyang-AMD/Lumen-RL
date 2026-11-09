@@ -1,11 +1,15 @@
-"""Abstract sandbox interfaces for GPU kernel evaluation."""
+"""Abstract sandbox interfaces for single-shot GPU kernel evaluation.
+
+Multi-turn agent environments implement
+``lumenrl.agentic.core.AgentEnvironment`` instead (see ``sandbox.micake``).
+"""
 
 from __future__ import annotations
 
 import abc
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 
 @dataclass
@@ -177,51 +181,3 @@ class SandboxBackend(abc.ABC):
             )
         finally:
             self.cleanup(workspace)
-
-
-class StatefulTool(abc.ABC):
-    """Abstract tool with session lifecycle for multi-turn agent interaction.
-
-    Each tool manages sessions: create -> execute (N times) -> release.
-    Compatible with ToolAgentLoop for driving model-tool interaction.
-    """
-
-    name: str
-
-    @abc.abstractmethod
-    def schemas(self) -> list[dict[str, Any]]:
-        """Return OpenAI function-calling schemas for this tool."""
-
-    @abc.abstractmethod
-    def create(
-        self, create_kwargs: Mapping[str, Any],
-    ) -> tuple[str, Mapping[str, Any]]:
-        """Create a new tool session. Returns (session_id, initial_observation)."""
-
-    @abc.abstractmethod
-    def execute(
-        self, instance_id: str, parameters: Mapping[str, Any],
-    ) -> tuple[Mapping[str, Any], float, Mapping[str, Any]]:
-        """Execute a tool call. Returns (result, reward, metrics)."""
-
-    @abc.abstractmethod
-    def calc_reward(self, instance_id: str) -> float:
-        """Compute the final reward for a session."""
-
-    @abc.abstractmethod
-    def release(self, instance_id: str) -> None:
-        """Release session resources."""
-
-
-class Environment(abc.ABC):
-    """Abstract environment for agent evaluation loops."""
-
-    @abc.abstractmethod
-    def case_observation(self, case_id: str) -> dict[str, Any]:
-        """Get initial observation for a task case."""
-
-    @abc.abstractmethod
-    def verify(
-        self, session_id: str,
-    ) -> tuple[dict[str, Any], RewardBreakdown, dict[str, Any]]:
-        """Verify current state and compute reward."""

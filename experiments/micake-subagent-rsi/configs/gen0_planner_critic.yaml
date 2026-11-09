@@ -1,0 +1,196 @@
+# Generation 0 of the MICake specialist-subagent RSI loop.
+# Frozen DSV4.1 Manager; Planner + Performance Critic served from the untuned
+# Qwen3-Coder-30B-A3B base on ATOM (adapter "none" = champion reference).
+# Secrets: only environment-variable names appear here.
+
+rsi:
+  root: output/micake-subagent-rsi
+  generation_id: gen0
+  parent_generation_id: null
+  episodes_per_task: 2
+  specialist_max_no_tool_nudges: 1
+  tasks:
+    - task_id: c144-gemm-portfolio
+      max_submissions: 10
+  rewards:
+    global_weight: 0.5          # lambda on clipped log(best speedup) of the Manager episode
+    contribution_weight: 1.0    # weight on clipped log(best_after / best_before) of the child
+    log_clip: 0.5
+    gamma: 1.0
+  sft_min_total_reward: 0.5
+  promotion:
+    min_role_episodes: 2
+    max_schema_invalid_rate: 0.3
+    max_correctness_regression: 0.05
+    min_speedup_gain: 0.01      # raised to the measured noise band when that is larger
+    max_flagged_rate: 0.5
+
+manager:
+  binding:
+    base_model_id: deepseek-ai/DeepSeek-V4.1-Flash
+    adapter_id: none
+    adapter_version: frozen
+    policy_version: dsv41-frozen
+    trainable: false
+  endpoint:
+    base_url: https://127.0.0.1:8443/v1   # SSH reverse tunnel to the DSV4.1 endpoint
+    model: deepseek-ai/DeepSeek-V4.1-Flash
+    api_key_env: DSV4_API_KEY
+    verify_tls: false
+    timeout_s: 900
+    max_retries: 3
+    sampling:
+      max_tokens: 16384
+      temperature: 1.0
+      top_p: 0.95
+    extra_body: {}
+  rollout:
+    max_turns: 20
+    max_no_tool_nudges: 2
+  settings:
+    allow_direct_submit: true
+    max_delegations: 6
+    history_limit: 12
+    planner_report_reward: 0.0
+    critic_rewards:
+      valid_diagnosis: 0.1
+      invalid_diagnosis: -0.3
+      probe: true
+
+specialists:
+  planner:
+    binding:
+      base_model_id: Qwen3-Coder-30B-A3B-Instruct
+      adapter_id: none
+      adapter_version: "0"
+      policy_version: planner-g0
+      trainable: true
+    endpoint:
+      base_url: http://127.0.0.1:8100/v1   # ATOM, container atom-qwen3-specialist
+      model: /home/danyzhan/Lumen/experiments/GEAK-agent-coder/models/Qwen3-Coder-30B-A3B-Instruct
+      api_key_env: null
+      verify_tls: false
+      timeout_s: 600
+      max_retries: 2
+      sampling:
+        max_tokens: 2048
+        temperature: 0.8
+        top_p: 0.95
+      extra_body: {}
+    max_turns: 8
+    max_submissions: 3
+  critic:
+    binding:
+      base_model_id: Qwen3-Coder-30B-A3B-Instruct
+      adapter_id: none
+      adapter_version: "0"
+      policy_version: critic-g0
+      trainable: true
+    endpoint:
+      base_url: http://127.0.0.1:8100/v1
+      model: /home/danyzhan/Lumen/experiments/GEAK-agent-coder/models/Qwen3-Coder-30B-A3B-Instruct
+      api_key_env: null
+      verify_tls: false
+      timeout_s: 600
+      max_retries: 2
+      sampling:
+        max_tokens: 2048
+        temperature: 0.8
+        top_p: 0.95
+      extra_body: {}
+    max_turns: 3
+    max_submissions: 1
+
+micake:
+  backend: micake_gemm
+  module: sandbox.micake
+  kwargs:
+    micake_root: /home/danyzhan/MICake
+    micake_python: /home/danyzhan/MICake/.venv/bin/python   # MICake-pinned Triton 3.5.1
+    gpu_id: 7
+    rocm_path: /opt/rocm
+    request_timeout_s: 600
+    fidelity: performance
+    max_submissions: 10
+    new_best_min_gain: 0.005    # GEAK default noise band: a new best must beat the old one by 0.5%
+    measurement:
+      warmup_count: 5
+      paired_repeats: 5
+      dispatches_per_block: 10
+    reward:
+      schema_invalid: -1.0
+      verify_fail: -0.3
+      compile_fail: -0.5
+      compile_pass: 0.0
+      correctness_fail: -0.8
+      correctness_pass: 0.2
+      performance_log_clip: 0.5
+      new_best_bonus: 0.3
+      repeat_penalty: -0.3
+      unknown_outcome: -0.5
+      terminal_best_speedup: 0.5
+
+# Frozen DSV4.1 patches MICake only after an unknown harness outcome, then retries that submission once.
+debug:
+  enabled: true
+  max_repairs_per_episode: 1
+  max_turns: 6
+  max_read_bytes: 16000
+  max_file_bytes: 200000
+  editable_roots:
+    - /home/danyzhan/MICake/experiments/cake_gemm_optimization_workflow_v1
+    - /home/danyzhan/Lumen-RL/experiments/sandbox/sandbox/micake
+  check:
+    python: /home/danyzhan/MICake/.venv/bin/python
+    cwd: /home/danyzhan/MICake
+    test_prefix: experiments.cake_gemm_optimization_workflow_v1.
+    timeout_s: 180
+  # Frozen oracle: tests, contract (BASELINE_CONFIG), verification receipts and the reward environment.
+  protected_globs:
+    - "test_*.py"
+    - contract.py
+    - check.py
+    - cold_verify.py
+    - "*.json"
+    - "*/sandbox/micake/environment.py"
+  # Measurement contract that every edit must keep verbatim.
+  pinned:
+    /home/danyzhan/MICake/experiments/cake_gemm_optimization_workflow_v1/gpu_runtime.py:
+      - "abs_tolerance: float = 0.05"
+      - "rel_tolerance: float = 0.01"
+      - 'for pair_order, roles in (("AB", ("incumbent", "challenger")), ("BA", ("challenger", "incumbent"))):'
+    /home/danyzhan/Lumen-RL/experiments/sandbox/sandbox/micake/worker.py:
+      - 'per_workload[workload_id] = statistics.median(roles["incumbent"]) / statistics.median(roles["challenger"])'
+      - '"baseline": "C144_BASELINE_CONFIG"'
+  require_check_before_retry: true
+
+# GEAK-style measurement guards: independent re-measurement, Director arbitration, noise band,
+# and champion re-verification whenever the harness fingerprint differs.
+guards:
+  enabled: true
+  verify_repeats: 2
+  max_repeat_spread: 0.05       # runs disagreeing by more than 5% are marked noisy (median is official)
+  max_claim_shortfall: 0.10     # verified more than 10% below the claim -> flagged
+  noise_band_cap: 0.05
+  max_flagged_rate: 0.5
+  harness_roots:
+    - /home/danyzhan/MICake/experiments/cake_gemm_optimization_workflow_v1
+    - /home/danyzhan/Lumen-RL/experiments/sandbox/sandbox/micake
+
+train:
+  max_steps: 1
+  min_advantage: 0.0
+  max_sequence_length: 8192
+  base_model: /home/danyzhan/Lumen/experiments/GEAK-agent-coder/models/Qwen3-Coder-30B-A3B-Instruct
+  model_revision: b2cff646eb4bb1d68355c01b18ae02e7cf42d120
+  tokenizer_sha256: 94bee6a983ac11efd608bbe76fe7d1f8977cc098e565eb537766ce55bc52cf5c
+  hardware_profile: /home/danyzhan/Lumen/experiments/GEAK-agent-coder/configs/hardware/amd_mi350_gfx950.yaml
+  recipe_profile: /home/danyzhan/Lumen/experiments/GEAK-agent-coder/configs/recipes/geak_mi308_dev.yaml
+  image: lumen/mxfp4-atom:gfx950-local
+  nproc_per_node: 8
+  challenger_episodes: 2
+  serve:
+    image: micake-atom-serve:local
+    # One TP=2 ATOM server per host: a second one fails in aiter custom all-reduce (hipIpcGetMemHandle).
+    planner: {port: 8100, gpus: "0,1", tp: 2}
+    critic: {port: 8101, gpus: "2", tp: 1}

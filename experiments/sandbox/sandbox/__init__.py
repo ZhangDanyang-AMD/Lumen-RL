@@ -1,21 +1,25 @@
-"""Sandbox: pluggable GPU kernel evaluation framework.
+"""Sandbox: pluggable GPU kernel evaluation backends.
 
-Provides abstract interfaces for kernel evaluation backends (compile,
-correctness, performance) and multi-turn agent tool interaction.
+Two kinds of backends live here:
 
-Usage:
-    from sandbox import get_backend, SandboxBackend
-    backend = get_backend("geak")
-    result = backend.evaluate(task_id, kernel_source, task_dir, gpu_id)
+* ``SandboxBackend`` (``sandbox.base``): single-shot compile -> correctness ->
+  performance evaluation of a kernel source, used by GRPO reward functions.
+  Usage::
+
+      from sandbox import get_backend
+      backend = get_backend("geak")
+      result = backend.evaluate(task_id, kernel_source, task_dir, gpu_id)
+
+* Multi-turn ``lumenrl.agentic.core.AgentEnvironment`` plugins (e.g.
+  ``sandbox.micake``), which register into LumenRL's environment registry on
+  import and are built with ``lumenrl.agentic.core.build_environment``.
 """
 
 from .base import (
     CommandResult,
-    Environment,
     EvalResult,
     RewardBreakdown,
     SandboxBackend,
-    StatefulTool,
 )
 from .registry import get_backend, list_backends, register_backend
 from .reward import sandbox_reward_batch
@@ -28,11 +32,9 @@ except ImportError:
 
 __all__ = [
     "CommandResult",
-    "Environment",
     "EvalResult",
     "RewardBreakdown",
     "SandboxBackend",
-    "StatefulTool",
     "get_backend",
     "list_backends",
     "register_backend",
