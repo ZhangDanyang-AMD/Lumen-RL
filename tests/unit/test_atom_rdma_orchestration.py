@@ -153,13 +153,8 @@ class _Engine:
             )
 
     def collective_rpc(self, method, **kw):
-        self.calls.append(("collective_rpc", method, kw["kwargs"]))
-        from atom.model_engine.collective_rpc import RpcResult
-
-        return [RpcResult("r", 0, value={"buckets": 1.0})]
-
-    def clear_kv_cache(self):
-        self.calls.append(("clear_kv_cache",))
+        self.calls.append(("collective_rpc", method, kw))
+        return []
 
 
 def _atom_server(engine):
@@ -182,19 +177,11 @@ def test_the_stream_is_a_weight_sync_where_atom_has_the_command(monkeypatch):
     assert engine.calls == [("receive_weights_rdma", ("g", 3), {"timeout": 42.0})]
 
 
-def test_an_atom_with_2946_still_takes_the_stream_as_a_collective_rpc():
+def test_an_atom_without_the_command_refuses_the_stream():
     import asyncio
 
-    pytest.importorskip("atom.model_engine.collective_rpc", exc_type=ImportError)
     engine = _Engine(with_receive=False)
 
-    asyncio.run(_atom_server(engine).receive_weights_rdma("g", 3))
-
-    assert engine.calls == [
-        (
-            "collective_rpc",
-            "receive_weights_rdma",
-            {"group_name": "g", "version": 3, "verify_full_load": True},
-        ),
-        ("clear_kv_cache",),
-    ]
+    with pytest.raises(NotImplementedError, match="receive_weights_rdma"):
+        asyncio.run(_atom_server(engine).receive_weights_rdma("g", 3))
+    assert engine.calls == []

@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import sys
-import types
 from types import SimpleNamespace
 
 import pytest
@@ -38,7 +36,7 @@ def test_pause_and_resume_reach_every_engine_with_the_mode() -> None:
     asyncio.run(server.resume_generation())
 
     assert core_mgr.calls == [
-        ("pause_generation", {"mode": "keep", "clear_cache": True}),
+        ("pause_generation", {"mode": "keep"}),
         ("resume_generation", {}),
     ]
 
@@ -59,20 +57,11 @@ class Caps:
 
 
 @pytest.mark.parametrize(
-    ("features", "modes", "expected"),
-    [
-        ({"pause_generation"}, None, ["keep"]),
-        (set(), ("keep",), ["keep"]),
-        (set(), None, []),
-        (None, ("keep",), ["keep"]),
-    ],
-    ids=["capability", "constant-of-atom-2946", "neither", "no-capability-discovery"],
+    ("features", "expected"),
+    [({"pause_generation"}, ["keep"]), (set(), []), (None, [])],
+    ids=["capability", "no-capability", "no-capability-discovery"],
 )
-def test_pause_modes_come_from_the_atom_build(monkeypatch, features, modes, expected):
-    module = types.ModuleType("atom.model_engine.engine_utility")
-    if modes is not None:
-        module.GENERATION_PAUSE_MODES = modes
-    monkeypatch.setitem(sys.modules, "atom.model_engine.engine_utility", module)
+def test_pause_modes_come_from_the_atom_build(features, expected):
     server = _server(CoreMgr())
     if features is not None:
         server.engine.get_capabilities = lambda: Caps(features)

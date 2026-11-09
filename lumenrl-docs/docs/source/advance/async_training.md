@@ -23,8 +23,9 @@ correct for it.
 - Or the ATOM rollout (`generation_backend: atom`, `atom_cfg.transport:
   ray_http`). Its RCCL weight sync and `fully_async.partial_rollout` need an
   ATOM build with the RCCL weight receive and the engine's `pause_generation`
-  (mode `keep`): ATOM's pause and RCCL-receive PRs, which replace
-  [ROCm/ATOM#2946](https://github.com/ROCm/ATOM/pull/2946), or #2946 itself.
+  (mode `keep`): ATOM's pause PR
+  ([ROCm/ATOM#3059](https://github.com/ROCm/ATOM/pull/3059)) and its RCCL-receive
+  PR ([ROCm/ATOM#3058](https://github.com/ROCm/ATOM/pull/3058)).
   An older ATOM fails at start with `weight_sync.backend: rdma`, as it
   cannot report RDMA support, and is refused partial rollout; run it with
   `weight_sync.backend: shared_folder` and `partial_rollout: false`, and each
@@ -288,8 +289,10 @@ last step's, in the foreground, took 590 s. Staleness averaged 2.2 against
 
 The two-node layout above with the ATOM BF16 rollout
 (`dapo_qwen3moe_a3b_ray_atom_bf16_longrun.yaml`: the same hyperparameters with
-`generation_backend: atom`), `s = 2`, `max_num_seqs: 768`, on an ATOM with
-ROCm/ATOM#2946:
+`generation_backend: atom`), `s = 2`, `max_num_seqs: 768`. This table ran on
+ATOM `0795f0e` with the changes since split into #3059 and #3058. On ATOM
+main with both PRs, steps 2–10 take 60.1 s a step against vLLM's 65.1 s, at
+the same `reward/accuracy` (0.240 / 0.244) and `k3_kl` (0.00151 / 0.00150).
 
 | Steps 2–10, no validation | vLLM, partial | ATOM, no partial | ATOM, partial |
 | --- | --- | --- | --- |

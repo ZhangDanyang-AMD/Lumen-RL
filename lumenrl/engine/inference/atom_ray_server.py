@@ -740,25 +740,22 @@ class ATOMRayServer:
     async def generation_pause_modes(self) -> list[str]:
         """Modes ``pause_generation`` takes here; empty on an ATOM that cannot pause.
 
-        ATOM reports it as the ``pause_generation`` capability, which takes
-        ``keep``; one built with ROCm/ATOM#2946 named its modes in a constant.
+        ATOM reports it as the ``pause_generation`` capability, which takes ``keep``.
         """
         if hasattr(self.engine, "get_capabilities"):
             if (await self.get_capabilities()).supports("pause_generation"):
                 return ["keep"]
-        try:
-            from atom.model_engine.engine_utility import GENERATION_PAUSE_MODES
-        except ImportError:
-            return []
-        return list(GENERATION_PAUSE_MODES)
+        return []
 
     async def pause_generation(self, mode: str = "keep", clear_cache: bool = True) -> bool:
         """Freeze generation for a weight update, as ``VLLMRayServer`` does.
 
-        "keep" preempts the running requests; after ``resume_generation`` they
-        recompute their context on the new weights and go on.
+        What runs waits. The weight update preempts it and drops the KV the old
+        weights computed, so ``clear_cache`` leaves ATOM nothing to do. After
+        ``resume_generation`` the requests recompute their context on the new
+        weights and go on.
         """
-        await self._engine_utility("pause_generation", mode=mode, clear_cache=clear_cache)
+        await self._engine_utility("pause_generation", mode=mode)
         return True
 
     async def resume_generation(self) -> bool:
@@ -892,7 +889,11 @@ class ATOMRayServer:
         verify_full_load: bool = True,
         prequantized_fp8: bool = False,
     ) -> Any:
-        """Receive one weight version into every rank of this replica."""
+        """Receive one weight version into every rank of this replica.
+
+        ATOM checks that the stream covered its weights when the sync completes,
+        so ``verify_full_load`` only matters to the vLLM receiver.
+        """
         if prequantized_fp8:
             # Rejected rather than ignored: silently dropping it would leave the
             # trainer quantising and ATOM expecting BF16, which shows up as
@@ -905,24 +906,16 @@ class ATOMRayServer:
         # short for it.
         timeout = float(os.environ.get("LUMENRL_RDMA_RECV_TIMEOUT_S", "1800"))
         receive = getattr(self.engine, "receive_weights_rdma", None)
-        if receive is not None:
-            # A weight sync: the engine fences serving around it and drops the
-            # KV the old weights computed.
-            return await asyncio.get_event_loop().run_in_executor(
-                None, lambda: receive(group_name, int(version), timeout=timeout)
+        if receive is None:
+            raise NotImplementedError(
+                "this ATOM cannot take a weight stream over RCCL: it has no "
+                "AsyncLLMEngine.receive_weights_rdma (ROCm/ATOM#3058)"
             )
-        # An ATOM built with ROCm/ATOM#2946 runs the stream as a collective RPC.
-        stats = await self.collective_rpc(
-            "receive_weights_rdma",
-            kwargs={
-                "group_name": group_name,
-                "version": int(version),
-                "verify_full_load": bool(verify_full_load),
-            },
-            timeout=timeout,
+        # A weight sync: the engine fences serving around it and drops the
+        # KV the old weights computed.
+        return await asyncio.get_event_loop().run_in_executor(
+            None, lambda: receive(group_name, int(version), timeout=timeout)
         )
-        await self.reset_prefix_cache()
-        return stats
 
     async def destroy_rdma_weight_group(self, group_name: str) -> bool:
         if self.engine is None:
