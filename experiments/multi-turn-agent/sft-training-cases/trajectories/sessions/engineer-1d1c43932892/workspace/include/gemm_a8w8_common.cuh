@@ -1,0 +1,1 @@
+/home/danyzhan/aiter/csrc/ck_gemm_a8w8/include/gemm_a8w8_common.cuh

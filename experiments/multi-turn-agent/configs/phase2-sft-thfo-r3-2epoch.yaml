@@ -1,0 +1,27 @@
+geak_root: /home/danyzhan/GEAK
+cases_path: /home/danyzhan/agent-phase2-held-out-aiter/receipts/phase2_benchmark_cases.yaml
+trajectory_root: /home/danyzhan/agent-phase2-held-out-aiter/receipts/geak-flow-sft-thfo-r3-2epoch
+base_url: http://127.0.0.1:8000/v1
+model: model
+gpu_ids: "2,3,4,5,6,7"
+bootstrap_enabled: false
+bootstrap_auto_promote: false
+aiter_root: /home/danyzhan/aiter
+generated_template_root: /home/danyzhan/Lumen-RL/experiments/multi-tune-agent/examples/tasks/generated
+sft_enabled: false
+sft_compat: false
+docker_container: atom-k3-radix-bench
+
+request_timeout: 600
+request_max_tokens: 4096
+command_timeout: 300
+baseline_repeats: 1
+
+max_rounds: 1
+engineers_per_round: 1
+engineer_tool_rounds: 200
+integrator_tool_rounds: 10
+candidate_floor: 0.8
+min_improvement: 0.01
+target_speedup: 1.1
+keep_sessions: true

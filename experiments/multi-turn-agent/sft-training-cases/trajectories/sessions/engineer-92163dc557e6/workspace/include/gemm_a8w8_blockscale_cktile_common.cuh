@@ -1,0 +1,1 @@
+/home/danyzhan/aiter/csrc/ck_gemm_a8w8_blockscale/include/gemm_a8w8_blockscale_cktile_common.cuh

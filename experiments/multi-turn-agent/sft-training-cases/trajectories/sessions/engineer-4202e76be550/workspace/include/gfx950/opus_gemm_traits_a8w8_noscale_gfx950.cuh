@@ -1,0 +1,1 @@
+/home/danyzhan/aiter/csrc/opus_gemm/include/gfx950/opus_gemm_traits_a8w8_noscale_gfx950.cuh

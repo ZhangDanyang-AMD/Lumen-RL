@@ -1,0 +1,1 @@
+/home/danyzhan/aiter/csrc/opus_moe/include/gfx950/opus_moe_arch_gfx950.cuh

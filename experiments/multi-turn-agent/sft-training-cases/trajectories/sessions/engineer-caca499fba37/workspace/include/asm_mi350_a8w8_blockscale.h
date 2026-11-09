@@ -1,0 +1,1 @@
+/home/danyzhan/aiter/csrc/include/asm_mi350_a8w8_blockscale.h

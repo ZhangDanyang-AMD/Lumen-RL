@@ -1,0 +1,1 @@
+/home/danyzhan/aiter/csrc/ck_gemm_a4w4_blockscale/include/gemm_a4w4_blockscale_common.cuh

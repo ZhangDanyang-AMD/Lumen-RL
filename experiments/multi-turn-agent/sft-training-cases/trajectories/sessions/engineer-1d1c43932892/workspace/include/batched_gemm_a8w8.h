@@ -1,0 +1,1 @@
+/home/danyzhan/aiter/csrc/ck_batched_gemm_a8w8/include/batched_gemm_a8w8.h

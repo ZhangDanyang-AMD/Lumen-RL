@@ -1,0 +1,1 @@
+/home/danyzhan/aiter/csrc/include/hip_host_minimal.h

@@ -1,0 +1,1 @@
+/home/danyzhan/aiter/csrc/opus_gemm/include/gfx950/opus_gemm_pipeline_a16w16_persistent_4g_safe_gfx950.cuh

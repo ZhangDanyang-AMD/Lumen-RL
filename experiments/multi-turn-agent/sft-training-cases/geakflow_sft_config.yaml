@@ -1,0 +1,29 @@
+geak_root: /home/danyzhan/GEAK
+cases_path: /home/danyzhan/Lumen-RL/experiments/multi-tune-agent/sft-training-cases/sft_training_cases.yaml
+trajectory_root: /home/danyzhan/Lumen-RL/experiments/multi-tune-agent/sft-training-cases/trajectories
+base_url: http://127.0.0.1:8000/v1
+model: null
+gpu_ids: "2,3,4,5,6,7"
+bootstrap_enabled: true
+bootstrap_auto_promote: true
+aiter_root: /home/danyzhan/aiter
+docker_container: aiter-mi400-regress
+generated_template_root: /home/danyzhan/Lumen-RL/experiments/multi-tune-agent/sft-training-cases/generated-templates
+bootstrap_min_aiter_score: 60
+sft_enabled: true
+sft_dataset_root: /home/danyzhan/Lumen-RL/experiments/multi-tune-agent/sft-training-cases/sft_dataset
+sft_task_type: direction_conditioned
+
+request_timeout: 600
+request_max_tokens: 8192
+command_timeout: 300
+baseline_repeats: 1
+
+max_rounds: 1
+engineers_per_round: 1
+engineer_tool_rounds: 50
+integrator_tool_rounds: 10
+candidate_floor: 0.8
+min_improvement: 0.01
+target_speedup: 1.0
+keep_sessions: true

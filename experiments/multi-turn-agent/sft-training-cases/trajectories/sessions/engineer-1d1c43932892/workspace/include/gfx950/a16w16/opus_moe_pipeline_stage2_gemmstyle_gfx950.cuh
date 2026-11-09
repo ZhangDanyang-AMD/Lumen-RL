@@ -1,0 +1,1 @@
+/home/danyzhan/aiter/csrc/opus_moe/include/gfx950/a16w16/opus_moe_pipeline_stage2_gemmstyle_gfx950.cuh

@@ -1,0 +1,1 @@
+/home/danyzhan/aiter/csrc/kernels/mla/hk/mi35x_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1.cuh

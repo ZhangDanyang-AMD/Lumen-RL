@@ -1,0 +1,1 @@
+/home/danyzhan/aiter/csrc/opus_gemm/include/gfx1250/opus_gemm_pipeline_a16w16_cluster_tdm_splitk_ws_gfx1250.cuh

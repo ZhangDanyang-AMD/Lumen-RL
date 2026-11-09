@@ -1,0 +1,1 @@
+/home/danyzhan/aiter/csrc/kernels/mha_native/fmha_fwd_d64_bf16_msk1_split.cu

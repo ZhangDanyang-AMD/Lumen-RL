@@ -1,0 +1,1 @@
+/home/danyzhan/aiter/csrc/opus_gemm/include/gfx950/opus_gemm_traits_a16w16_gfx950.cuh

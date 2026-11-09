@@ -1,0 +1,1 @@
+/home/danyzhan/aiter/csrc/opus_gemm/include/gfx1250/splitk_reduce_gfx1250.cuh

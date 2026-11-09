@@ -1,0 +1,1 @@
+/home/danyzhan/aiter/csrc/opus_gemm/include/gfx942/opus_gemm_arch_gfx942.cuh

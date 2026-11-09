@@ -1,0 +1,1 @@
+/home/danyzhan/aiter/csrc/include/aiter_hip_common.h

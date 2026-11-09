@@ -1,0 +1,1 @@
+/home/danyzhan/aiter/csrc/opus_gemm/include/gfx942/a16w16/opus_gemm_asm_mma32x32x8.cuh
