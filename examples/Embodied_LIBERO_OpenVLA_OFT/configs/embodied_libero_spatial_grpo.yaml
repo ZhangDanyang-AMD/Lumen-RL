@@ -1,0 +1,71 @@
+# GRPO for OpenVLA-OFT inside the LIBERO simulator (robosuite / MuJoCo).
+# Rendering is CPU OSMesa: Instinct has no graphics hardware.
+#
+# The checkpoint on disk is the LIBERO-Spatial SFT policy, so this case runs
+# libero_spatial. The RLinf libero_10 recipe needs a separate LoRA base that
+# is not downloaded here.
+#
+# Cameras must be 256x256: the OpenVLA-OFT LIBERO data was rendered at 256, and
+# at 128 the same SFT policy drops from 61.5% to 38% greedy success.
+#
+#   bash examples/Embodied_LIBERO_OpenVLA_OFT/run_embodied_grpo.sh
+
+embodied:
+  enabled: true
+  plugin: examples.Embodied_LIBERO_OpenVLA_OFT.plugin
+  policy:
+    model_type: openvla_oft
+    model_path: /work/models/Openvla-oft-SFT-libero-spatial-traj1
+    unnorm_key: libero_spatial_no_noops
+    gradient_checkpointing: true
+    freeze_vision_backbone: false
+  env:
+    backend: libero
+    task_suite: libero_spatial
+    max_episode_steps: 220
+    camera_height: 256
+    camera_width: 256
+    num_steps_wait: 10
+    num_workers: 16
+  rollout:
+    backend: hf
+    temperature: 1.6
+    batch_size: 16
+    groups_per_rank: 2
+    recompute_old_log_probs: true
+    filter_zero_advantage_groups: true
+  train_micro_batch_size: 8
+  entropy_coeff: 0.0
+  log_dir: /work/runs/libero_spatial_grpo_256
+  save_interval: 10
+  save_dir: /work/runs/libero_spatial_grpo_256/checkpoints
+  lumen: {}
+
+policy:
+  model_name: /work/models/Openvla-oft-SFT-libero-spatial-traj1
+  training_backend: fsdp2
+  learning_rate: 5.0e-6
+  lr_warmup_steps: 0
+  lr_decay_style: constant
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+
+algorithm:
+  name: grpo
+  clip_ratio_high: 0.28
+  loss_agg_mode: token-mean
+  grpo:
+    num_generations: 8
+    kl_coeff: 0.0
+    clip_ratio: 0.2
+    num_ppo_epochs: 1
+    num_mini_batches: 2
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 20
+seed: 42

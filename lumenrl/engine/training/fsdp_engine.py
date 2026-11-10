@@ -95,6 +95,12 @@ class FSDP2Engine(BaseEngine):
         self.optimizer: torch.optim.Optimizer | None = None
         self.lr_scheduler = None
 
+        # Free the allocator's cached blocks after each micro-batch (verl-aligned,
+        # helps variable-length LLM batches). Fixed-shape engines turn this off:
+        # under FSDP2 the pool holds the all-gather buffers and re-allocating
+        # them every micro-batch costs more than the forward/backward itself.
+        self.empty_cache_per_micro_batch = True
+
     @property
     def is_param_offload_enabled(self) -> bool:
         return self._is_offload_param
@@ -291,7 +297,7 @@ class FSDP2Engine(BaseEngine):
             # not accumulate fragmentation across the ~batch/micro-bsz iterations.
             # Default-on (matches verl); the small sync cost is worth the lower peak.
             del loss, meta
-            if torch.cuda.is_available():
+            if self.empty_cache_per_micro_batch and torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
         return self._postprocess_batch(output_lst)

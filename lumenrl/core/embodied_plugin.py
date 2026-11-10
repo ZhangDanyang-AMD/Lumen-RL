@@ -30,14 +30,17 @@ class EmbodiedPlugin:
         Provides ``cfg.chunk_size``, ``device``, ``context_frame_step`` (usable
         context lengths are ``1 + k * context_frame_step``) and
         ``predict_frames(ctx_frames, ctx_actions, tgt_actions, generator)``.
+        Optional: a simulator backend (``embodied.env.backend: libero``) does
+        not call it.
     build_reward_model(path, device) -> nn.Module
         Maps frames scaled to ``[-1, 1]`` to one success logit per frame.
+        Optional, same as ``build_world_model``.
     """
 
     build_policy: Callable[..., Any]
     build_processor: Callable[..., Any]
-    build_world_model: Callable[..., Any]
-    build_reward_model: Callable[..., Any]
+    build_world_model: Callable[..., Any] | None = None
+    build_reward_model: Callable[..., Any] | None = None
 
 
 def load_embodied_plugin(module_path: str) -> EmbodiedPlugin:

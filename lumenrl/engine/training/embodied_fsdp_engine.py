@@ -43,6 +43,7 @@ class EmbodiedFSDP2Engine(FSDP2Engine):
             optimizer_config=optimizer_config,
             model_name=model_path,
         )
+        self.empty_cache_per_micro_batch = False  # fixed-shape batches; see FSDP2Engine
         self.freeze_vision_backbone = freeze_vision_backbone
         self.lumen_kwargs = lumen_kwargs or {}
         self.build_policy = build_policy

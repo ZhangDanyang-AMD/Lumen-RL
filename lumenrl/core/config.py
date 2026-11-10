@@ -972,7 +972,8 @@ class EmbodiedPolicyConfig:
 
 @dataclass
 class EmbodiedEnvConfig:
-    """Learned world-model environment."""
+    """Rollout environment. ``backend=world_model`` imagines frames; ``libero`` steps robosuite/MuJoCo."""
+    backend: str = "world_model"       # "world_model" or "libero"
     model_dir: str = ""
     init_data_dir: str = ""            # default: <model_dir>/dataset
     reward_model_file: str = "resnet_rm.pth"
@@ -981,6 +982,11 @@ class EmbodiedEnvConfig:
     world_model_kwargs: dict = field(default_factory=dict)  # passed to the plugin's build_world_model
     success_logit_threshold: float = 0.0
     wm_batch_size: int = 32
+    task_suite: str = "libero_spatial"  # libero backend
+    camera_height: int = 128
+    camera_width: int = 128
+    num_steps_wait: int = 10           # physics settle steps after set_init_state
+    num_workers: int = 0               # >0: one process per sim slot
 
 
 @dataclass

@@ -1,0 +1,73 @@
+# GRPO for one OpenVLA-OFT policy over all 130 LIBERO tasks, following RLinf's
+# libero_130_grpo_openvlaoft.yaml (Spatial 51.61% -> 98.69% in the RLinf model card).
+#
+# Base: RLinf/RLinf-OpenVLAOFT-LIBERO-130-Base-Lora. Its root safetensors are the
+# SFT weights RLinf trains (is_lora is off there); lora_adapter/ is not used.
+#
+# RLinf collects 64 envs x 64 rollout epochs = 4096 episodes per step and runs
+# 16 optimizer steps on them (global batch 16384 of 262144 chunk samples).
+#
+#   bash examples/Embodied_LIBERO_OpenVLA_OFT/run_embodied_grpo.sh \
+#     examples/Embodied_LIBERO_OpenVLA_OFT/configs/embodied_libero_130_grpo.yaml
+
+embodied:
+  enabled: true
+  plugin: examples.Embodied_LIBERO_OpenVLA_OFT.plugin
+  policy:
+    model_type: openvla_oft
+    model_path: /work/models/RLinf-OpenVLAOFT-LIBERO-130-Base-Lora
+    unnorm_key: libero_130_no_noops_trajall
+    gradient_checkpointing: true
+    freeze_vision_backbone: false
+  env:
+    backend: libero
+    task_suite: libero_130
+    max_episode_steps: 512
+    camera_height: 256
+    camera_width: 256
+    num_steps_wait: 10
+    num_workers: 16
+  rollout:
+    backend: hf
+    temperature: 1.6
+    batch_size: 16
+    # 8 ranks x 64 groups x 8 generations = 4096 episodes per step, matching
+    # RLinf's 64 envs x 64 rollout epochs.
+    groups_per_rank: 64
+    recompute_old_log_probs: true
+    filter_zero_advantage_groups: true
+  train_micro_batch_size: 8
+  entropy_coeff: 0.0
+  log_dir: /work/runs/libero_130_grpo
+  save_interval: 10
+  save_dir: /work/runs/libero_130_grpo/checkpoints
+  lumen: {}
+
+policy:
+  model_name: /work/models/RLinf-OpenVLAOFT-LIBERO-130-Base-Lora
+  training_backend: fsdp2
+  learning_rate: 2.0e-5
+  lr_warmup_steps: 0
+  lr_decay_style: constant
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+
+algorithm:
+  name: grpo
+  clip_ratio_high: 0.28
+  loss_agg_mode: token-mean
+  grpo:
+    num_generations: 8
+    kl_coeff: 0.0
+    clip_ratio: 0.2
+    num_ppo_epochs: 1
+    num_mini_batches: 16
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 100
+seed: 42

@@ -66,22 +66,40 @@ class EmbodiedTrainer:
         lumen = dict(e.lumen or {})
 
         env_cfg = e.env
-        wm = self.plugin.build_world_model(env_cfg.model_dir, device, **dict(env_cfg.world_model_kwargs or {}))
-        wm = apply_lumen(wm, lumen.get("world_model"), "world_model")
-        rm = self.plugin.build_reward_model(os.path.join(env_cfg.model_dir, env_cfg.reward_model_file), device)
-        self.env = WorldModelEnv(
-            wm, rm,
-            max_episode_steps=env_cfg.max_episode_steps,
-            context_frames=env_cfg.context_frames,
-            success_logit_threshold=env_cfg.success_logit_threshold,
-            wm_batch_size=env_cfg.wm_batch_size,
-            seed=cfg.seed * 1000 + self._rank,
-        )
-        self.init_states = WorldModelInitDataset(
-            env_cfg.init_data_dir or os.path.join(env_cfg.model_dir, "dataset"),
-            env_cfg.context_frames,
-            context_frame_step=self.env.ctx_step,
-        )
+        if env_cfg.backend == "libero":
+            from lumenrl.envs.libero_env import LiberoEnv, LiberoInitDataset
+
+            self.init_states = LiberoInitDataset(env_cfg.task_suite)
+            self.env = LiberoEnv(
+                task_suite=env_cfg.task_suite,
+                max_episode_steps=env_cfg.max_episode_steps,
+                camera_height=env_cfg.camera_height,
+                camera_width=env_cfg.camera_width,
+                num_steps_wait=env_cfg.num_steps_wait,
+                seed=cfg.seed * 1000 + self._rank,
+                num_workers=env_cfg.num_workers,
+            )
+        elif env_cfg.backend == "world_model":
+            if self.plugin.build_world_model is None or self.plugin.build_reward_model is None:
+                raise ValueError("world_model backend requires plugin build_world_model and build_reward_model")
+            wm = self.plugin.build_world_model(env_cfg.model_dir, device, **dict(env_cfg.world_model_kwargs or {}))
+            wm = apply_lumen(wm, lumen.get("world_model"), "world_model")
+            rm = self.plugin.build_reward_model(os.path.join(env_cfg.model_dir, env_cfg.reward_model_file), device)
+            self.env = WorldModelEnv(
+                wm, rm,
+                max_episode_steps=env_cfg.max_episode_steps,
+                context_frames=env_cfg.context_frames,
+                success_logit_threshold=env_cfg.success_logit_threshold,
+                wm_batch_size=env_cfg.wm_batch_size,
+                seed=cfg.seed * 1000 + self._rank,
+            )
+            self.init_states = WorldModelInitDataset(
+                env_cfg.init_data_dir or os.path.join(env_cfg.model_dir, "dataset"),
+                env_cfg.context_frames,
+                context_frame_step=self.env.ctx_step,
+            )
+        else:
+            raise ValueError(f"unknown embodied.env.backend {env_cfg.backend!r}")
 
         self.processor = self.plugin.build_processor(e.policy.model_path, e.policy.unnorm_key)
         p = cfg.policy
@@ -125,8 +143,8 @@ class EmbodiedTrainer:
             Path(e.log_dir).mkdir(parents=True, exist_ok=True)
             self._metrics_file = open(os.path.join(e.log_dir, "embodied_metrics.jsonl"), "a")
         logger.info(
-            "EmbodiedTrainer ready: world=%d, envs/rank=%d (groups=%d x G=%d), init states=%d",
-            self._world, e.rollout.groups_per_rank * cfg.algorithm.grpo.num_generations,
+            "EmbodiedTrainer ready: world=%d, backend=%s, envs/rank=%d (groups=%d x G=%d), init states=%d",
+            self._world, e.env.backend, e.rollout.groups_per_rank * cfg.algorithm.grpo.num_generations,
             e.rollout.groups_per_rank, cfg.algorithm.grpo.num_generations, len(self.init_states),
         )
 
@@ -148,6 +166,8 @@ class EmbodiedTrainer:
             last = step + 1 == self.config.num_training_steps
             if interval > 0 and ((step + 1) % interval == 0 or last):
                 self.save_policy(step + 1)
+        if hasattr(self.env, "close"):
+            self.env.close()
         for cb in self.callbacks:
             cb.on_train_end(self)
 
@@ -182,7 +202,15 @@ class EmbodiedTrainer:
         metrics["timing/weight_sync_s"] = time.time() - t0
 
         t0 = time.time()
-        batch = self.rollout.collect(self.env, self._sample_inits(step))
+        # One wave uses ``batch_size`` sims. A step's groups are collected over
+        # several waves so 4096 episodes do not mean 4096 live simulators.
+        inits = self._sample_inits(step)
+        width = self.ecfg.rollout.batch_size
+        parts = [
+            self.rollout.collect(self.env, inits[s:s + width])
+            for s in range(0, len(inits), width)
+        ]
+        batch = EmbodiedTrajectoryBatch.cat(parts)
         metrics["timing/rollout_s"] = time.time() - t0
         metrics.update(batch.metrics)
 
