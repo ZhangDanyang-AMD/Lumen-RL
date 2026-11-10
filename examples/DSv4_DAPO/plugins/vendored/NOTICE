@@ -1,0 +1,58 @@
+miles_plugins (DeepSeek-V4 model plugin, kernel-free)
+=====================================================
+
+Part of this directory is taken from radixark/miles
+(https://github.com/radixark/miles), commit
+5400905d59d4c03ed7a8fd559b287e4337ff3897, licensed under the Apache License,
+Version 2.0. A copy of that license is in LICENSE.miles next to this file. The
+upstream repository ships no NOTICE file of its own.
+
+The import path `miles_plugins.models.deepseek_v4.*` is kept unchanged so that the
+call sites in the patched Megatron (../../megatron/megatron_dsv4.patch) resolve
+against this directory instead of an installed miles.
+
+Files copied from upstream without changes:
+
+  miles_plugins/__init__.py
+  miles_plugins/models/__init__.py
+  miles_plugins/models/dsa_topk.py
+  miles_plugins/models/deepseek_v4/__init__.py
+  miles_plugins/models/deepseek_v4/ops/__init__.py
+  miles_plugins/models/deepseek_v4/ops/compressor.py
+  miles_plugins/models/deepseek_v4/ops/cp_utils.py
+  miles_plugins/models/deepseek_v4/ops/rope.py
+  miles_plugins/models/deepseek_v4/ops/v4_indexer.py
+  miles_plugins/models/deepseek_v4/ops/kernel/__init__.py
+  miles_plugins/models/deepseek_v4/ops/kernel/precision_aligned_ops.py
+
+Files modified from upstream (each carries a header comment saying so):
+
+  miles_plugins/models/deepseek_v4/deepseek_v4.py
+      The grouped `wo_a` einsum is replaced by one plain GEMM per group. The
+      batched form reads past the end of its allocation on gfx950 once the
+      sequence exceeds about 2040 tokens.
+  miles_plugins/models/deepseek_v4/ops/qat.py
+      `tile_kernels.quant.per_token_cast_back` is replaced by a stub that raises.
+      Only reachable with FP8 QAT on.
+  miles_plugins/models/deepseek_v4/ops/utils.py
+      Falls back to the PyTorch Hadamard transform (../../hadamard_torch.py) when
+      fast_hadamard_transform is absent, and re-exports
+      `wrapped_precompute_freqs_cis` from ops/rope.py for the patched dsa.py.
+
+Files replaced entirely by forwarding stubs (written for this example; same file
+names as upstream, no upstream code):
+
+  miles_plugins/models/deepseek_v4/ops/hyper_connection.py   -> ../../mhc_shim.py
+  miles_plugins/models/deepseek_v4/ops/kernel/act_quant.py   (raises; FP8 QAT only)
+  miles_plugins/models/deepseek_v4/ops/kernel/tilelang_indexer_fwd.py -> ../../indexer_torch.py
+  miles_plugins/models/deepseek_v4/ops/kernel/tilelang_sparse_mla.py  -> ../../sparse_mqa_torch.py
+
+The stubs locate the replacement modules relative to their own file, by walking up
+to the parent directory of `vendored/`. Keep that layout if you move the tree.
+
+Upstream files that are deliberately not included (tilelang kernels, unused here):
+
+  miles_plugins/models/deepseek_v4/ops/kernel/tilelang_indexer.py
+  miles_plugins/models/deepseek_v4/ops/kernel/tilelang_indexer_bwd.py
+  miles_plugins/models/deepseek_v4/ops/kernel/tilelang_sparse_mla_bwd.py
+  miles_plugins/models/deepseek_v4/ops/kernel/tilelang_sparse_mla_fwd.py
