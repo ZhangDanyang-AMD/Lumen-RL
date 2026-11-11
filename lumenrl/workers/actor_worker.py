@@ -728,6 +728,10 @@ class LumenActorWorker(BaseWorker):
             output = self._engine.train_batch(data, self._policy_loss_fn)
 
         metrics: dict[str, float] = {}
+        # Same normalization either way, applied at a different point: the
+        # diagnostics are normalized by the controller, so reducing them here
+        # cancels; ``loss`` is already normalized per unit because backward()
+        # needs it there, which is why it is summed rather than averaged.
         for k, v in output.get("metrics", {}).items():
             metrics[k] = (sum(v) / len(v)) if isinstance(v, list) and v else float(v)
         if "loss" in output:
