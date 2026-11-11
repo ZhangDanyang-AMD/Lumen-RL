@@ -40,6 +40,26 @@ if not logger.handlers and not logging.getLogger().handlers:
     logger.addHandler(_h)
 
 
+def atom_finish_reason(reason: Any) -> Optional[str]:
+    """ATOM's leave reason in ``VLLMRayServer``'s terms: "stop", "length" or "abort".
+
+    ATOM stops on its EOS id ("eos"), on any other stop id ("stop_<id>"), on a
+    stop string ("stop_sequence"), at max_tokens ("max_tokens"), or when the
+    request is aborted ("aborted"). An unknown reason passes through unchanged;
+    an ATOM that reports none gives ``None``.
+    """
+    if reason is None:
+        return None
+    reason = str(reason)
+    if reason == "eos" or reason.startswith("stop"):
+        return "stop"
+    if reason == "max_tokens":
+        return "length"
+    if reason == "aborted":
+        return "abort"
+    return reason
+
+
 class ATOMRayServer:
     """Ray actor hosting one ATOM AsyncLLMEngine on a colocated GPU."""
 
@@ -58,8 +78,8 @@ class ATOMRayServer:
         # ATOM's preemption counter is cumulative; keep the last reading so
         # each batch can report its own.
         self._preemptions_seen = 0
-        # Set by the first generate_group(); from then on every request goes
-        # through it (see AtomGroupPump).
+        # Set by the first generate() or generate_group(); from then on every
+        # request goes through it (see AtomGroupPump).
         self._pump: Any = None
 
     async def launch(self) -> bool:
@@ -226,30 +246,21 @@ class ATOMRayServer:
         sampling_params: dict[str, Any],
         request_id: Optional[str] = None,
     ) -> dict[str, Any]:
+        """One completion of ``prompt``, safe to run concurrently.
+
+        Callers such as the multi-turn agent loop issue many of these at once,
+        so it always goes through the AtomGroupPump: ``engine.generate`` would
+        wait for every request on the engine and take their outputs too.
+        """
         if self.engine is None:
             raise RuntimeError(
                 "ATOMRayServer.launch() must be called before generate()."
             )
-
-        prompt_ids = list(prompt)
-        rid = request_id or uuid4().hex
-        if self._pump is not None:
-            [result] = await self._generate_on_pump(prompt_ids, 1, sampling_params, rid)
-            return result
-        sp = self._build_sampling_params(sampling_params, prompt_length=len(prompt_ids))
-
-        def _generate_blocking():
-            return self.engine.generate([prompt_ids], sp, request_ids=[rid])[0]
-
-        out = await asyncio.get_event_loop().run_in_executor(None, _generate_blocking)
-        token_ids = list(out.get("token_ids", [])) if isinstance(out, dict) else []
-        logprobs = out.get("logprobs") if isinstance(out, dict) else None
-        return {
-            "text": out.get("text", "") if isinstance(out, dict) else "",
-            "prompt_token_ids": prompt_ids,
-            "token_ids": token_ids,
-            "logprobs": [float(x) for x in logprobs] if logprobs is not None else None,
-        }
+        self._group_pump()
+        [result] = await self._generate_on_pump(
+            list(prompt), 1, sampling_params, request_id or uuid4().hex,
+        )
+        return result
 
     async def generate_batch(
         self,
@@ -310,6 +321,9 @@ class ATOMRayServer:
                     "logprobs": (
                         [float(x) for x in logprobs] if logprobs is not None else None
                     ),
+                    "finish_reason": atom_finish_reason(
+                        out.get("finish_reason") if isinstance(out, dict) else None
+                    ),
                 }
             )
         return results
@@ -330,11 +344,16 @@ class ATOMRayServer:
             raise RuntimeError(
                 "ATOMRayServer.launch() must be called before generate_group()."
             )
+        self._group_pump()
+        return await self._generate_on_pump(list(prompt), num_generations, sampling_params)
+
+    def _group_pump(self) -> Any:
+        """The engine's AtomGroupPump, started on first use."""
         if self._pump is None:
             from lumenrl.engine.inference.atom_group_pump import AtomGroupPump
 
             self._pump = AtomGroupPump(self.engine)
-        return await self._generate_on_pump(list(prompt), num_generations, sampling_params)
+        return self._pump
 
     async def _generate_on_pump(
         self,
@@ -355,6 +374,7 @@ class ATOMRayServer:
                 "prompt_token_ids": list(prompt_ids),
                 "token_ids": list(out.get("token_ids", [])),
                 "logprobs": [float(x) for x in logprobs] if logprobs is not None else None,
+                "finish_reason": atom_finish_reason(out.get("finish_reason")),
             })
         return results
 

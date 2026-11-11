@@ -1,4 +1,4 @@
-"""AtomGroupPump and ATOMRayServer.generate_group against a fake ATOM engine."""
+"""AtomGroupPump and ATOMRayServer's generate paths against a fake ATOM engine."""
 
 from __future__ import annotations
 
@@ -21,6 +21,8 @@ class FakeEngine:
         self.added: list[list[SimpleNamespace]] = []
         self._finished: queue.Queue = queue.Queue()
         self.offline_calls = 0
+        # seq id -> ATOM leave reason; unset ones report none, as an older ATOM.
+        self.reasons: dict[int, str] = {}
         self.io_processor = SimpleNamespace(
             preprocess_fanout=self._preprocess_fanout, postprocess=self._postprocess,
         )
@@ -35,10 +37,12 @@ class FakeEngine:
         ]
 
     def _postprocess(self, seqs):
-        return {
-            seq.id: {"text": "", "token_ids": [seq.id], "logprobs": [-float(seq.id)]}
-            for seq in seqs
-        }
+        outputs = {}
+        for seq in seqs:
+            outputs[seq.id] = {"text": "", "token_ids": [seq.id], "logprobs": [-float(seq.id)]}
+            if seq.id in self.reasons:
+                outputs[seq.id]["finish_reason"] = self.reasons[seq.id]
+        return outputs
 
     def step(self):
         item = self._finished.get()
@@ -57,7 +61,10 @@ class FakeEngine:
 
     def generate(self, prompts, params, request_ids=None):
         self.offline_calls += 1
-        return [{"text": "", "token_ids": [7], "logprobs": [-7.0]} for _ in prompts]
+        return [
+            {"text": "", "token_ids": [7], "logprobs": [-7.0], "finish_reason": "max_tokens"}
+            for _ in prompts
+        ]
 
 
 def test_concurrent_groups_get_their_own_outputs_in_fanout_order() -> None:
@@ -135,3 +142,61 @@ def test_generate_group_moves_every_later_request_onto_the_pump() -> None:
     assert [len(seqs) for seqs in engine.added] == [2, 2, 1], "the batch's repeats stay one fan-out"
     assert group[0]["logprobs"] == [-float(engine.added[0][0].id)]
     assert before[0]["token_ids"] == [7]
+
+
+def test_concurrent_generate_calls_each_get_their_own_output() -> None:
+    """The agent loop has one turn of every rollout in flight at once;
+    engine.generate would run them one after another and could hand a call
+    another's output."""
+    engine = FakeEngine()
+    server = _server(engine)
+
+    async def run():
+        calls = [asyncio.ensure_future(server.generate([p], {})) for p in (1, 2, 3)]
+        await asyncio.sleep(0.05)
+        first, second, third = engine.added
+        engine.finish(*third)
+        engine.finish(*first)
+        engine.finish(*second)
+        return await asyncio.wait_for(asyncio.gather(*calls), timeout=5)
+
+    results = asyncio.run(run())
+
+    assert engine.offline_calls == 0, "generate went to engine.generate, not the pump"
+    assert [r["prompt_token_ids"] for r in results] == [[1], [2], [3]]
+    assert [r["token_ids"] for r in results] == [[seqs[0].id] for seqs in engine.added]
+
+
+@pytest.mark.parametrize(("leave_reason", "finish_reason"), [
+    ("eos", "stop"),
+    ("stop_151645", "stop"),
+    ("stop_sequence", "stop"),
+    ("max_tokens", "length"),
+    ("aborted", "abort"),
+    (None, None),
+])
+def test_generate_reports_why_the_completion_ended_as_vllm_does(
+    leave_reason, finish_reason,
+) -> None:
+    """A multi-turn rollout goes on only after a "stop"; "length" and
+    "abort" end it."""
+    engine = FakeEngine()
+    server = _server(engine)
+
+    async def run():
+        call = asyncio.ensure_future(server.generate([1], {}))
+        await asyncio.sleep(0.05)
+        [seqs] = engine.added
+        if leave_reason is not None:
+            engine.reasons[seqs[0].id] = leave_reason
+        engine.finish(*seqs)
+        return await asyncio.wait_for(call, timeout=5)
+
+    assert asyncio.run(run())["finish_reason"] == finish_reason
+
+
+def test_an_offline_batch_reports_why_each_completion_ended() -> None:
+    engine = FakeEngine()
+    [result] = asyncio.run(_server(engine).generate_batch([[5]], {}))
+    assert engine.offline_calls == 1
+    assert result["finish_reason"] == "length"
