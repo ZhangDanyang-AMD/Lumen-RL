@@ -51,19 +51,27 @@ def test_a_bare_scalar_passes_through():
 
 
 def test_both_engines_route_through_the_shared_reduction():
-    """Pin that neither call site re-implements the reduction.
+    """Pin that no call site re-implements the reduction.
 
-    The bug existed because the two engines each had their own inline reduction
-    and they disagreed. If a future edit inlines one again, this fails.
+    The bug existed because each engine had its own inline reduction and they
+    disagreed. If a future edit inlines one again, this fails.
+
+    ``lumenrl.engine.training.actor_worker`` is a second ``LumenActorWorker``
+    carrying its own ``update_policy``; it had the same divisor. It is listed
+    here explicitly because that is how the copies came to drift -- the rest of
+    the suite (``tests/unit/workers/test_actor_worker_engine_config.py``)
+    parametrizes over both classes, so both are maintained.
     """
     import inspect
 
+    from lumenrl.engine.training import actor_worker as training_actor_worker
     from lumenrl.engine.training import megatron_base_engine
     from lumenrl.workers import actor_worker
 
     for mod, fn in (
         (megatron_base_engine, "engine_update_policy"),
         (actor_worker, "update_policy"),
+        (training_actor_worker, "update_policy"),
     ):
         cls = next(
             o for _, o in inspect.getmembers(mod, inspect.isclass)
