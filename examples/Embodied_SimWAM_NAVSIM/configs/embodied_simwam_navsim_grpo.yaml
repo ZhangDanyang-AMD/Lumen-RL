@@ -9,6 +9,9 @@
 # aiter_conv (Conv2d and Conv3d, including the VAE).
 
 task: navsim_grpo_action_pdm_384x672_flowgrpo_lora
+# DiffSynth-Studio/Wan-Series-Converted-Safetensors is gated. Use the
+# Wan-AI/Wan2.2-TI2V-5B VAE and T5 checkpoints directly.
+model.redirect_common_files: false
 num_workers: 4
 max_steps: 20000
 save_every: 1000

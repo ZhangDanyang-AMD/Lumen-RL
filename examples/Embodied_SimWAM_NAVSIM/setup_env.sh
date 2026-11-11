@@ -25,7 +25,9 @@ python3 -m pip install \
     "hydra-core>=1.3" "omegaconf>=2.3" einops accelerate deepspeed \
     safetensors imageio imageio-ffmpeg "huggingface-hub>=0.29" modelscope \
     "transformers>=4.46" scipy matplotlib pandas pyquaternion tqdm pillow av \
-    tensorboard
+    tensorboard \
+    "nuplan-devkit==1.1.1" shapely geopandas sqlalchemy pyogrio fiona rasterio \
+    affine pyproj aioboto3 retry
 
 python3 - <<PY
 import os, sys

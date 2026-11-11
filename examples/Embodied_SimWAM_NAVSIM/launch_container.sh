@@ -19,6 +19,7 @@ docker run -d --init --name "$NAME" \
     --security-opt seccomp=unconfined --cap-add SYS_PTRACE \
     --ulimit memlock=-1 --ulimit stack=67108864 \
     -v "$ROOT:$ROOT" \
+    -v /mnt/k3:/mnt/k3 \
     -e CUDA_VISIBLE_DEVICES="$GPUS" \
     -e HIP_VISIBLE_DEVICES="$GPUS" \
     -e LUMEN_DIR="$ROOT/Lumen" \
