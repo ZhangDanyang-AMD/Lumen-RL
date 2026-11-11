@@ -674,7 +674,17 @@ class LumenActorWorker(BaseWorker):
 
         metrics: dict[str, float] = {}
         for k, v in output.get("metrics", {}).items():
-            metrics[k] = (sum(v) / len(v)) if isinstance(v, list) and v else float(v)
+            if isinstance(v, list) and v:
+                # A per-token max must stay the max across micro-batches. Averaging
+                # it would hide the single largest train/rollout disagreement.
+                if k == "mismatch_abs_max":
+                    metrics[k] = max(v)
+                elif k == "mismatch_count":
+                    metrics[k] = float(sum(v))
+                else:
+                    metrics[k] = sum(v) / len(v)
+            else:
+                metrics[k] = float(v)
         if "loss" in output:
             lv = output["loss"]
             if isinstance(lv, list) and lv:
@@ -844,6 +854,10 @@ class LumenActorWorker(BaseWorker):
                 tok = float(mask.sum())
                 out_metrics["ppo_kl_sum"] = float(((old_logp - token_log_probs) * mask).sum())
                 out_metrics["ppo_kl_tok"] = tok
+                if kl_c > 0.0 and ref_logp is not None:
+                    # Token mean of (ref - policy) before kl_coeff scales the loss.
+                    out_metrics["kl_sum"] = float(((ref_logp - token_log_probs) * mask).sum())
+                    out_metrics["kl_tok"] = tok
                 rlp = data.get("rollout_log_probs")
                 if rlp is not None:
                     rlp = rlp.to(dev)[..., :L]
@@ -876,6 +890,8 @@ class LumenActorWorker(BaseWorker):
         return {
             # mean |delta|: the magnitude that the signed mean cancels away
             "mismatch_abs_sum": float(delta.abs().sum()),
+            # max |delta| over response tokens. Reduced by max, never by token count.
+            "mismatch_abs_max": float(delta.abs().max()) if delta.numel() else 0.0,
             # k3 estimator E[e^r - r - 1] >= 0, unbiased and low-variance for small KL
             "mismatch_k3_sum": float((((w - 1.0) - delta) * mask).sum()),
             # second moment of the token-level IS weight: predicts gradient variance
@@ -885,6 +901,9 @@ class LumenActorWorker(BaseWorker):
             "mismatch_seq_n": n_seq,
             # tail mass: the population driving the divergence (expert flips)
             "mismatch_tail_sum": float(((delta.abs() > 0.1).float() * mask).sum()),
+            # Count of masked tokens whose train/rollout delta is nonzero.
+            # Reduced by sum, never divided by the token count.
+            "mismatch_count": float((delta != 0).sum()),
             "mismatch_tok": tok,
         }
 

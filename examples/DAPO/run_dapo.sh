@@ -112,6 +112,38 @@ if [ "$MODE" = "atomfp8" ] || [ "$MODE" = "atom_fp8" ] || \
   # 这条路径本身，不属于某几个例子编号——手工调 run_dapo.sh 的人同样漏不掉。
   # ATOM 自己的修复进入所钉的 commit 后即可删除。
   export ATOM_FORCE_ATTN_TRITON="${ATOM_FORCE_ATTN_TRITON:-1}"
+  if [ "$ATOM_BF16" = "1" ]; then
+    # Train with the six ATOM ops. Decode, q_len=1 prefill, and the packed
+    # trainer all use aiter RoPE plus one q_len=1 varlen launch, so the loss
+    # sees the decode logprob. The gather allocates each step, so this path
+    # stays eager; level=3 FULL graphs replay fixed addresses and abort.
+    # Prefill rescore stays off: it would replace those decode scores with a
+    # second prefill and hide a real train/decode gap.
+    export LUMEN_ATOM_OPS="${LUMEN_ATOM_OPS:-rmsnorm,residual_rmsnorm,qkv,rope,varlen_attn,gate_up}"
+    export LUMENRL_ALIGN_DECODE="${LUMENRL_ALIGN_DECODE:-1}"
+    export LUMENRL_ALIGN_SYNC_OUTPUT="${LUMENRL_ALIGN_SYNC_OUTPUT:-1}"
+    export LUMENRL_ALIGN_CONTIG_KV="${LUMENRL_ALIGN_CONTIG_KV:-1}"
+    export LUMENRL_ALIGN_BATCHED_DECODE="${LUMENRL_ALIGN_BATCHED_DECODE:-1}"
+    export LUMENRL_PREFILL_DECODE_ATTN="${LUMENRL_PREFILL_DECODE_ATTN:-1}"
+    export LUMENRL_ROWWISE_TRAIN_ATTN="${LUMENRL_ROWWISE_TRAIN_ATTN:-1}"
+    export LUMENRL_PREFILL_RESCORE="${LUMENRL_PREFILL_RESCORE:-0}"
+    if [ "${LUMENRL_PREFILL_RESCORE}" = "1" ]; then
+      export LUMENRL_RESCORE_DIR="${LUMENRL_RESCORE_DIR:-/tmp/lumenrl-prefill-rescore}"
+    fi
+    # ATOM blanks the padded lm_head tail before log_softmax. Training has to
+    # use the same denominator or every rollout score sits above the actor.
+    if [ -z "${LUMENRL_TRAIN_VOCAB_MASK:-}" ] && [ -d "$MODEL_PATH" ]; then
+      _vocab_mask="$(PYTHONPATH="$USER_PYTHONPATH" python3 - "$MODEL_PATH" <<'PY' || true
+import sys
+from transformers import AutoTokenizer
+print(len(AutoTokenizer.from_pretrained(sys.argv[1], trust_remote_code=True)))
+PY
+)"
+      if [[ "$_vocab_mask" =~ ^[0-9]+$ ]]; then
+        export LUMENRL_TRAIN_VOCAB_MASK="$_vocab_mask"
+      fi
+    fi
+  fi
   export VLLM_ROCM_USE_AITER=0 VLLM_ROCM_USE_AITER_MHA=0 VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=0 VLLM_ROCM_USE_AITER_LINEAR=0
   # Match the vLLM fp8 training-side configuration exactly: standard Lumen FP8
   # blockwise2d linear + norm, no HF attention patch and no rollout-specific
@@ -148,13 +180,24 @@ if [ "$MODE" = "atomfp8" ] || [ "$MODE" = "atom_fp8" ] || \
   fi
   # no-eager level=3 正式方案：enforce_eager=false + compilation_config.level=3 + sleep2
   # （sleep_mode 训练前释放 rollout KV/weights/CUDA graph，避免 backward OOM）。
-  EXTRA_ARGS+=(
-    policy.generation.vllm_cfg.enforce_eager=false
-    policy.generation.atom_cfg.engine_kwargs.enforce_eager=false
-    policy.generation.atom_cfg.engine_kwargs.compilation_config.level=3
-    policy.generation.vllm_cfg.enable_sleep_mode=true
-    policy.generation.vllm_cfg.sleep_level=2
-  )
+  # BF16 对齐 decode 在每次 forward 里 gather KV，地址不固定，FULL graph 重放会失败。
+  if [ "${LUMENRL_ALIGN_DECODE:-0}" = "1" ]; then
+    EXTRA_ARGS+=(
+      policy.generation.vllm_cfg.enforce_eager=true
+      policy.generation.atom_cfg.engine_kwargs.enforce_eager=true
+      policy.generation.atom_cfg.engine_kwargs.compilation_config.level=0
+      policy.generation.vllm_cfg.enable_sleep_mode=true
+      policy.generation.vllm_cfg.sleep_level=2
+    )
+  else
+    EXTRA_ARGS+=(
+      policy.generation.vllm_cfg.enforce_eager=false
+      policy.generation.atom_cfg.engine_kwargs.enforce_eager=false
+      policy.generation.atom_cfg.engine_kwargs.compilation_config.level=3
+      policy.generation.vllm_cfg.enable_sleep_mode=true
+      policy.generation.vllm_cfg.sleep_level=2
+    )
+  fi
   if [ "$ATOM_BF16" = "0" ]; then
     ATOM_ONLINE_QUANT="${ATOM_ONLINE_QUANT:-per_block_fp8}"
     EXTRA_ARGS+=(

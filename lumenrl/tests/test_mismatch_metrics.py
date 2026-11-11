@@ -31,6 +31,8 @@ def test_matches_bruteforce():
         "mismatch/k3_kl": sum(math.exp(v) - v - 1 for v in vals) / n,
         "mismatch/chi2_token": sum((math.exp(v) - 1) ** 2 for v in vals) / n,
         "mismatch/frac_abs_gt_0.1": sum(1.0 for v in vals if abs(v) > 0.1) / n,
+        "mismatch/abs_max": max(abs(v) for v in vals),
+        "mismatch/count": sum(1 for v in vals if v != 0),
     }
     seq = [sum(float(delta[i, j]) for j in range(L)) for i in range(B)]
     want["mismatch/chi2_seq"] = sum((math.exp(s) - 1) ** 2 for s in seq) / B

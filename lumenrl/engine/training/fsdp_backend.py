@@ -234,9 +234,15 @@ def _load_hf_model(model_name: str, torch_dtype: torch.dtype = torch.bfloat16) -
     model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
     _unify_param_dtype(model, torch_dtype, rank)
 
-    model.gradient_checkpointing_enable(
-        gradient_checkpointing_kwargs={"use_reentrant": False},
-    )
+    # Short alignment smokes set LUMENRL_DISABLE_GRAD_CKPT=1. The ATOM linear
+    # autograd saves a 2D activation; non-reentrant checkpoint recomputes the
+    # same tensor as 3D and aborts before the step metrics are returned.
+    if os.environ.get("LUMENRL_DISABLE_GRAD_CKPT", "0") == "1":
+        logger.info("[rank %d] gradient checkpointing left off (LUMENRL_DISABLE_GRAD_CKPT=1).", rank)
+    else:
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False},
+        )
 
     # MoE only: a BF16 router makes top-k expert selection disagree with the
     # rollout engine on ~6% of (token, layer) decisions, which shows up as a
@@ -248,13 +254,39 @@ def _load_hf_model(model_name: str, torch_dtype: torch.dtype = torch.bfloat16) -
     return model
 
 
+def _apply_atom_gemm_only(model: nn.Module) -> nn.Module:
+    """Run the actor's BF16 linears through aiter ``tgemm.mm``, like ATOM rollout.
+
+    Opt-in with ``LUMENRL_TRAIN_ATOM_GEMM=1`` when no other Lumen feature is on.
+    q/k/v and gate/up are each one GEMM on the concatenated weight, the shapes
+    ATOM's ``qkv_proj`` and ``gate_up_proj`` look up in ``AITER_CONFIG_GEMM_BF16``.
+    Norm, RoPE, attention and activation stay on the HF modules. Backward stays
+    on torch matmul.
+    """
+    from lumen.config import LumenConfig
+
+    cfg = LumenConfig(
+        scaling="none",
+        quantize_activation=False,
+        fp8_wgrad=False,
+        hf_attn_patch=False,
+    )
+    cfg._patch_linear(model, atom_mode=True)
+    cfg._patch_qwen3_qkv(model)
+    cfg._patch_qwen3_gate_up(model)
+    logger.info(
+        "Actor linears use aiter tgemm.mm (LUMENRL_TRAIN_ATOM_GEMM=1, table=%s)",
+        os.environ.get("AITER_CONFIG_GEMM_BF16", "<aiter default>"),
+    )
+    return model
+
+
 def _apply_lumen_fp8(model: nn.Module, quant_config: dict[str, Any]) -> nn.Module:
     """Apply Lumen optimizations to the model before FSDP2 sharding.
 
     Supports both FP8 and BF16 Lumen features (norm, fused_mlp, fused_rope).
     """
-    if not quant_config:
-        return model
+    quant_config = quant_config or {}
 
     fp8_enabled = quant_config.get("fp8") or os.environ.get("LUMEN_FP8", "0") == "1"
     fp8_pm = quant_config.get("fp8_param_manager") or os.environ.get("FP8_PARAM_MANAGER", "0") == "1"
@@ -265,8 +297,23 @@ def _apply_lumen_fp8(model: nn.Module, quant_config: dict[str, Any]) -> nn.Modul
     # norm/sdpa/linear/mlp with AITER kernels so the training-side forward matches
     # the AITER-based vLLM rollout. Works in pure BF16 (no FP8 quant).
     lumen_rollout = quant_config.get("rollout") or os.environ.get("LUMEN_ROLLOUT", "")
+    # Opt-in. Empty by default. LumenConfig.atom_op_tags() also reads the env,
+    # but enable() only applies the tags inside the rollout=ATOM branch, and an
+    # empty quant dict used to return before that branch was reached.
+    atom_ops = str(quant_config.get("atom_ops") or os.environ.get("LUMEN_ATOM_OPS", "") or "").strip()
+    if atom_ops and not lumen_rollout:
+        lumen_rollout = "ATOM"
+    # Stable GEMM (splitK=1 enforcement) is always required alongside atom_ops:
+    # FlyDSL kernels with splitK>1 are non-deterministic in BF16, which breaks
+    # training-rollout consistency for any prompt length in M=17-48 or M=81-96.
+    # Set the env var so it propagates to ATOM rollout workers via
+    # _VLLM_RUNTIME_ENV_KEYS without a separate user-facing switch.
+    if atom_ops:
+        os.environ.setdefault("LUMENRL_STABLE_GEMM", "1")
 
-    if not (fp8_enabled or fp8_pm or lumen_norm or fused_mlp or fused_rope or lumen_rollout):
+    if not (fp8_enabled or fp8_pm or lumen_norm or fused_mlp or fused_rope or lumen_rollout or atom_ops):
+        if os.environ.get("LUMENRL_TRAIN_ATOM_GEMM", "0") == "1":
+            return _apply_atom_gemm_only(model)
         return model
 
     # Alignment mode: delegate the exact FP8 model modification to verl's
@@ -305,6 +352,8 @@ def _apply_lumen_fp8(model: nn.Module, quant_config: dict[str, Any]) -> nn.Modul
         )
         if lumen_rollout:
             kwargs["rollout"] = lumen_rollout
+        if atom_ops:
+            kwargs["atom_ops"] = atom_ops
         if fp8_enabled:
             # FP8 mode: enable quantized linear and related features. Attention
             # FP8 knobs (fp8_attn/attn_quant_type/attn_backend) are forwarded so
@@ -355,8 +404,9 @@ def _apply_lumen_fp8(model: nn.Module, quant_config: dict[str, Any]) -> nn.Modul
 
         logger.info(
             "Lumen optimizations applied (fp8=%s, fp8pm=%s, norm=%s, fused_mlp=%s, "
-            "fused_rope=%s, rollout=%s)",
-            fp8_enabled, fp8_pm, lumen_norm, fused_mlp, fused_rope, lumen_rollout or "(none)",
+            "fused_rope=%s, rollout=%s, atom_ops=%s)",
+            fp8_enabled, fp8_pm, lumen_norm, fused_mlp, fused_rope,
+            lumen_rollout or "(none)", atom_ops or "(none)",
         )
     except ImportError:
         logger.warning("lumen package not installed; skipping Lumen optimizations.")
