@@ -5,13 +5,18 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 
 @dataclass(frozen=True)
 class ToolCall:
     name: str
     arguments: dict[str, Any]
+
+
+class ToolCallParser(Protocol):
+    def parse(self, text: str) -> tuple[list[ToolCall], int]:
+        """The well-formed calls in a model turn and the number of malformed ones."""
 
 
 class HermesToolParser:

@@ -399,7 +399,8 @@ class MultiTurnConfig:
     """
 
     enabled: bool = False
-    # Tool-call syntax the model writes; only "hermes" (Qwen) is supported.
+    # Tool-call syntax the model writes: "hermes" (Qwen, rendered by its chat
+    # template) or "dsml" (DeepSeek-V4, rendered by its own encoding).
     format: str = "hermes"
     max_assistant_turns: int = 8
     # Tool calls run per turn; later calls in the same turn are dropped.
@@ -409,7 +410,8 @@ class MultiTurnConfig:
     tool_response_truncate_side: str = "middle"
     # Prepended to every prompt as a system message when non-empty.
     system_prompt: str = ""
-    # Passed to apply_chat_template, e.g. {enable_thinking: false} for Qwen3.
+    # Passed to apply_chat_template, e.g. {enable_thinking: false} for Qwen3;
+    # for "dsml", {thinking_mode: chat|thinking}.
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     code_interpreter: SandboxFusionToolConfig = field(default_factory=SandboxFusionToolConfig)
 

@@ -11,8 +11,10 @@ from typing import Any
 import torch
 
 from lumenrl.agent.chat import ChatTemplateTokenizer
+from lumenrl.agent.deepseek_v4 import DeepSeekV4ChatTokenizer, DsmlToolParser
 from lumenrl.agent.loop import ToolAgentLoop
 from lumenrl.agent.runner import AgentRunner
+from lumenrl.agent.tool_parser import HermesToolParser
 from lumenrl.agent.tools import SandboxFusionCodeTool
 from lumenrl.agent.trajectory import Trajectory
 
@@ -103,11 +105,22 @@ class AgentGroupRollout:
         )))
 
 
+def _chat_and_parser(mt: Any, tokenizer: Any) -> tuple[Any, Any]:
+    """The tokenization and tool-call parser of ``multi_turn.format``."""
+    kwargs = dict(mt.chat_template_kwargs or {})
+    if mt.format == "hermes":
+        return ChatTemplateTokenizer(tokenizer, kwargs), HermesToolParser()
+    if mt.format == "dsml":
+        return DeepSeekV4ChatTokenizer(tokenizer, **kwargs), DsmlToolParser()
+    raise ValueError(
+        f"multi_turn.format={mt.format!r}: supported are 'hermes' (Qwen) and 'dsml' (DeepSeek-V4)"
+    )
+
+
 def build_agent_rollout(config: Any, tokenizer: Any, servers: list[Any]) -> AgentGroupRollout:
     """The agent rollout ``policy.generation.multi_turn`` describes."""
     mt = config.policy.generation.multi_turn
-    if mt.format != "hermes":
-        raise ValueError(f"multi_turn.format={mt.format!r}: only 'hermes' tool calls are supported")
+    chat, parser = _chat_and_parser(mt, tokenizer)
     tools = []
     ci = mt.code_interpreter
     if ci.enabled:
@@ -119,8 +132,9 @@ def build_agent_rollout(config: Any, tokenizer: Any, servers: list[Any]) -> Agen
             max_concurrency=ci.max_concurrency,
         ))
     agent = ToolAgentLoop(
-        ChatTemplateTokenizer(tokenizer, dict(mt.chat_template_kwargs or {})),
+        chat,
         tools,
+        parser=parser,
         max_assistant_turns=mt.max_assistant_turns,
         max_parallel_calls=mt.max_parallel_calls,
         max_tool_response_length=mt.max_tool_response_length,

@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
 from lumenrl.agent.chat import ChatTemplateTokenizer
-from lumenrl.agent.tool_parser import HermesToolParser, ToolCall
+from lumenrl.agent.tool_parser import HermesToolParser, ToolCall, ToolCallParser
 from lumenrl.agent.tools import Tool, ToolResult
 from lumenrl.agent.trajectory import Trajectory
 
@@ -45,7 +45,7 @@ class ToolAgentLoop:
         chat: ChatTemplateTokenizer,
         tools: Sequence[Tool],
         *,
-        parser: HermesToolParser | None = None,
+        parser: ToolCallParser | None = None,
         max_assistant_turns: int = 8,
         max_parallel_calls: int = 1,
         max_tool_response_length: int = 256,

@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from lumenrl.agent.chat import ChatTemplateTokenizer
+from lumenrl.agent.deepseek_v4 import DeepSeekV4ChatTokenizer, DsmlToolParser
 from lumenrl.agent.loop import ToolAgentLoop
 from lumenrl.agent.trajectory import Trajectory
 from lumenrl.core.config import LumenRLConfig
@@ -124,8 +125,24 @@ def test_config_rejects_an_unknown_tool_call_format():
     config = LumenRLConfig()
     config.policy.generation.multi_turn.format = "json"
 
-    with pytest.raises(ValueError, match="hermes"):
+    with pytest.raises(ValueError, match="'hermes' .* 'dsml'"):
         build_agent_rollout(config, ChatMLTokenizer(), [object()])
+
+
+def test_config_picks_deepseek_v4_encoding_for_dsml_calls():
+    config = LumenRLConfig()
+    mt = config.policy.generation.multi_turn
+    mt.enabled = True
+    mt.format = "dsml"
+    mt.chat_template_kwargs = {"thinking_mode": "thinking"}
+
+    rollout = build_agent_rollout(config, ChatMLTokenizer(), [object()])
+    try:
+        assert isinstance(rollout._agent._chat, DeepSeekV4ChatTokenizer)
+        assert rollout._agent._chat._assistant_start.endswith("<think>")
+        assert isinstance(rollout._agent._parser, DsmlToolParser)
+    finally:
+        rollout.close()
 
 
 # -- masks --------------------------------------------------------------------
