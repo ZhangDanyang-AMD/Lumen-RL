@@ -1,0 +1,163 @@
+# Agentic RL long run on the ATOM rollout: dapo_qwen3_8b_ray_vllm_retool_longrun.yaml
+# with 4 ATOM replicas in place of the vLLM ones. ATOM runs no-eager (CUDA graphs)
+# under run_dapo.sh MODE=atombf16; partial rollout under controller.ray.fully_async
+# needs an ATOM with pause_generation (ROCm/ATOM#3059) and the RCCL weight sync one
+# with RDMA weight receive (ROCm/ATOM#3058), passed in as ATOM_DIR.
+#
+# Two settings differ from the vLLM config, both for throughput. A multi-turn
+# rollout re-sends its whole context every turn and the 16 rollouts of a group
+# share their prompt, so prefix caching is on; a weight update drops the cached
+# prefixes. And max_num_seqs is 512: rollouts waiting on the code interpreter
+# hold no batch slot, so at 256 the replicas ran about half full (KV cache ~8%
+# used) and fully async waited on them. Measured fully async, s=1, 8k responses,
+# steps 2-10: 48.6 s/step at 256, 43.2 s at 512, 37.6 s at 512 with prefix
+# caching (vLLM at 256: 43.5 s), k3_kl unchanged at 3.3e-4.
+#
+# Use a torch.compile cache of its own (ATOM_TORCH_COMPILE_CACHE_ROOT): one left
+# by another model fails the first replay with a size/stride assertion. And
+# run_dapo.sh MODE=atombf16 turns enable_sleep_mode on for the colocated layout,
+# after this file is read; with the rollout on GPUs of its own pass
+# policy.generation.vllm_cfg.enable_sleep_mode=false again on the command line.
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    actor:
+      num_workers: 4
+      dispatch_mode: dp_compute_proto
+    rollout:
+      num_workers: 4
+
+policy:
+  model_name: "${oc.env:DATA_ROOT}/models/Qwen3-8B"
+  training_backend: fsdp2
+  generation_backend: atom
+  max_total_sequence_length: 17408     # prompt with the tool schema + response
+  max_response_length: 16384           # model turns and tool output together
+  train_global_batch_size: 512         # 32 prompts x 16 rollouts
+  gen_batch_size: 64
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 34816
+  learning_rate: 1.0e-6
+  lr_warmup_steps: 10
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  training:
+    optimizer_dtype: bf16
+    fsdp_cfg:
+      param_offload: false
+      optimizer_offload: false
+  generation:
+    atom_cfg:
+      transport: ray_http
+      tensor_parallel_size: 1
+      kv_cache_dtype: bf16
+      gpu_memory_utilization: 0.85
+      enable_prefix_caching: true
+    vllm_cfg:
+      transport: ray_http
+      ray_http_start_server: false
+      gpu_memory_utilization: 0.85
+      max_model_len: 17408
+      dtype: bfloat16
+      # run_dapo.sh sets TORCHDYNAMO_DISABLE=1, and vLLM's CUDA graphs need
+      # torch.compile ("aot_compile is not supported" at engine start).
+      enforce_eager: true
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 8192
+      max_num_seqs: 512
+      quantization: ""
+      calculate_log_probs: true
+      enable_sleep_mode: false
+      sleep_level: 2
+      update_weights_bucket_megabytes: 512
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+    multi_turn:
+      enabled: true
+      format: hermes
+      max_assistant_turns: 8
+      max_parallel_calls: 1
+      max_tool_response_length: 256
+      tool_response_truncate_side: middle
+      system_prompt: >-
+        You can call the code_interpreter tool to run Python code. Use it to
+        calculate and to check your reasoning before you give the final answer.
+      chat_template_kwargs:
+        enable_thinking: false
+      code_interpreter:
+        url: http://localhost:8080/run_code
+        run_timeout_s: 30
+        memory_limit_mb: 1024
+        max_concurrency: 128
+
+algorithm:
+  name: dapo
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  loss_agg_mode: token-mean
+  dapo:
+    num_generations: 16
+    kl_coeff: 0.0
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 10.0
+    dynamic_sampling: true
+    token_level_pg: true
+    overlong_reward_shaping: false
+    max_resp_len: 16384
+    filter_groups:
+      enable: true
+      metric: acc
+      max_num_gen_batches: 10
+    overlong_buffer:
+      enable: false
+
+reward:
+  type: function
+  function: lumenrl.rewards.math_reward.dapo_math_reward
+  dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet"
+  shuffle: true
+  shuffle_seed: 10086
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+    rollout_is_batch_normalize: false
+
+val_dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/aime-2024.filtered.parquet"
+val_steps: 10
+val_batch_size: 0
+eval:
+  enabled: false
+  num_samples: 0                       # the whole file: 30 problems x 32 copies
+  num_generations: 1
+  temperature: 1.0
+  top_p: 0.6
+
+checkpointing:
+  checkpoint_dir: "${oc.env:DATA_ROOT}/ckpts/lumenrl-dapo/retool-longrun-8b-atom"
+  save_steps: 20
+  save_total_limit: 1
+  resume: true
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+  wandb:
+    project: LUMEN-RL-AGENTIC
+    name: retool-longrun-8b-atom
+
+num_training_steps: 100
+seed: 10086
