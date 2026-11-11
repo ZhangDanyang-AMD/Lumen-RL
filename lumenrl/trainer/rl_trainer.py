@@ -788,7 +788,7 @@ class RLTrainer:
         return bool(getattr(getattr(generation, "multi_turn", None), "enabled", False))
 
     def _get_agent_rollout(self) -> Any:
-        """The tool-calling agent rollout on the Ray vLLM replicas, built on first use."""
+        """The tool-calling agent rollout on the Ray rollout replicas, built on first use."""
         if self._agent_rollout is None:
             from lumenrl.trainer.agent_rollout import build_agent_rollout
 
@@ -4805,10 +4805,11 @@ class RLTrainer:
         """Reject rollout setups the agent loop cannot drive."""
         if not self._multi_turn:
             return
-        if not use_ray_rollout or not getattr(self, "_ray_use_vllm", False):
+        ray_backend = getattr(self, "_ray_use_vllm", False) or getattr(self, "_ray_use_atom", False)
+        if not use_ray_rollout or not ray_backend:
             raise ValueError(
-                "policy.generation.multi_turn needs the Ray controller with the vLLM "
-                "rollout: the agent loop generates turn by turn on VLLMRayServer."
+                "policy.generation.multi_turn needs the Ray controller with the vLLM or "
+                "ATOM rollout: the agent loop generates turn by turn on its Ray servers."
             )
         if self._r3_rollout_replay or getattr(self.config.moe.r3, "enabled", False):
             raise ValueError(

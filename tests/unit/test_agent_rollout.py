@@ -320,7 +320,7 @@ def test_fully_async_picks_the_agent_backend(monkeypatch):
     assert built == [4]
 
 
-def _multi_turn_trainer(*, vllm=True, r3=False) -> RLTrainer:
+def _multi_turn_trainer(*, vllm=True, atom=False, r3=False) -> RLTrainer:
     trainer = object.__new__(RLTrainer)
     trainer.config = SimpleNamespace(
         controller=SimpleNamespace(ray=SimpleNamespace(
@@ -330,18 +330,20 @@ def _multi_turn_trainer(*, vllm=True, r3=False) -> RLTrainer:
         moe=SimpleNamespace(r3=SimpleNamespace(enabled=r3, rollout_replay=False)),
     )
     trainer._ray_use_vllm = vllm
+    trainer._ray_use_atom = atom
     return trainer
 
 
-def test_multi_turn_runs_on_the_ray_vllm_rollout():
-    assert _multi_turn_trainer()._resolve_rollout_pipeline(True) == "sync"
+@pytest.mark.parametrize("kwargs", [{}, {"vllm": False, "atom": True}], ids=["vllm", "atom"])
+def test_multi_turn_runs_on_a_ray_rollout(kwargs):
+    assert _multi_turn_trainer(**kwargs)._resolve_rollout_pipeline(True) == "sync"
 
 
 @pytest.mark.parametrize(
     ("use_ray_rollout", "kwargs", "message"),
     [
-        (False, {}, "Ray controller with the vLLM"),
-        (True, {"vllm": False}, "Ray controller with the vLLM"),
+        (False, {}, "Ray controller with the vLLM or ATOM"),
+        (True, {"vllm": False}, "Ray controller with the vLLM or ATOM"),
         (True, {"r3": True}, "moe.r3"),
     ],
 )

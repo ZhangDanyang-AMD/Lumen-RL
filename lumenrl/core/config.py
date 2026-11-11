@@ -394,8 +394,8 @@ class SandboxFusionToolConfig:
 class MultiTurnConfig:
     """Multi-turn rollouts with tool calls, as verl's ``rollout.multi_turn``.
 
-    Needs the Ray controller with the vLLM rollout. Tool output enters the
-    response as environment tokens, which carry no loss.
+    Needs the Ray controller with the vLLM or ATOM rollout. Tool output enters
+    the response as environment tokens, which carry no loss.
     """
 
     enabled: bool = False

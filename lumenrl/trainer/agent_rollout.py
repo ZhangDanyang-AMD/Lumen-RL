@@ -1,4 +1,4 @@
-"""Multi-turn, tool-calling rollouts of prompt groups on the Ray vLLM replicas."""
+"""Multi-turn, tool-calling rollouts of prompt groups on the Ray vLLM or ATOM replicas."""
 
 from __future__ import annotations
 
