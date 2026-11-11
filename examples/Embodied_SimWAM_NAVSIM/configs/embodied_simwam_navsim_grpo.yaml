@@ -1,0 +1,15 @@
+# FlowGRPO for SimWAM's action expert on NAVSIM (4x MI350X).
+#
+#   NPROC=4 CUDA_VISIBLE_DEVICES=4,5,6,7 \
+#     bash examples/Embodied_SimWAM_NAVSIM/run_embodied_grpo.sh
+#
+# Top-level scalars are forwarded as Hydra overrides. Lumen comes from
+# $LUMEN_DIR (dev/world-model-rl). LUMEN_ENABLE applies LumenConfig.enable:
+# hf_attn_patch (attention), lumen_linear (tuned bf16 GEMM),
+# aiter_conv (Conv2d and Conv3d, including the VAE).
+
+task: navsim_grpo_action_pdm_384x672_flowgrpo_lora
+num_workers: 4
+max_steps: 20000
+save_every: 1000
+grpo.eval.num_batches: 8
