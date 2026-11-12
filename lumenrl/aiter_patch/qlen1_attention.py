@@ -20,6 +20,25 @@ Both were checked bit for bit against the one-row calls at lengths 127 to 4096
 import torch
 
 
+def _launch(cache, key, warmup, grid, args, device_index):
+    """Launch a compiled Triton kernel, compiling it with ``warmup`` on first use.
+
+    Calls the compiled launcher directly on the raw current stream: no launch
+    hooks and no ``torch.cuda.Stream`` object, about 4 us less host time than
+    ``compiled[grid](...)`` with ``torch.cuda.current_stream()``. ``args``
+    include the constexpr values, as ``compiled[grid]`` takes them.
+    """
+    entry = cache.get(key)
+    if entry is None:
+        compiled = warmup()
+        compiled._init_handles()
+        entry = (compiled.run, compiled.function, compiled.packed_metadata)
+        cache[key] = entry
+    run, function, metadata = entry
+    run(grid[0], grid[1], grid[2], torch._C._cuda_getCurrentRawStream(device_index),
+        function, metadata, None, None, None, *args)
+
+
 def row_prefix_attention(
     q,
     k,
@@ -89,6 +108,34 @@ def row_prefix_attention_planned(q, k, v, cu_q, cu_k, padded_starts, max_len, so
     return out.view(rows, rep, hk, dim).transpose(1, 2).reshape(rows, hq, dim)
 
 
+def grouped_padding(src, hq, rep):
+    """``cu_seqlens_q_padded`` of ``row_prefix_attention_inplace``: entry ``e`` is row ``src[e]``."""
+    rows = len(src)
+    return [int(r) * hq for r in src] + [(rows - 1) * hq + rep]
+
+
+def row_prefix_attention_inplace(q, k, v, cu_q, q_padded, cu_k, padded_starts, max_len, softmax_scale):
+    """``row_prefix_attention_planned`` reading and writing ``(rows, hq, d)`` in place.
+
+    Query head ``g * rep + j`` of row ``r`` is token ``r * hq + j`` of KV head
+    ``g`` under token stride ``d`` and head stride ``rep * d``, so the grouped
+    layout is a strided view and ``q_padded`` (from ``grouped_padding``) puts
+    each entry at its row. The kernel and every entry's data are those of the
+    copied layout; only the addresses change. ``q`` must be contiguous.
+    """
+    rows, hq, dim = q.shape
+    hk = k.shape[1]
+    rep = hq // hk
+    total = (rows - 1) * hq + rep
+    out = torch.empty_like(q)
+    _varlen_fwd(
+        q.as_strided((total, hk, dim), (dim, rep * dim, 1)), k, v, cu_q, cu_k, rep, max_len,
+        softmax_scale, False, out=out.as_strided((total, hk, dim), (dim, rep * dim, 1)),
+        q_padded=q_padded, k_padded=padded_starts,
+    )
+    return out
+
+
 # Must not exceed the Q tile of the hd128 bf16 asm group kernels (256 rows in
 # hsa/gfx950/fmha_v3_fwd/fmha_fwd.csv). A batch entry that fits in one Q tile
 # takes the same per-row path as a q_len=1 call; a longer causal entry
@@ -138,9 +185,14 @@ def _varlen_fwd(q, k, v, cu_q, cu_k, max_q, max_k, softmax_scale, causal,
             cu_seqlens_k_padded=k_padded,
         )
         return result[0], result[1]
-    from aiter.ops.mha import fmha_v3_varlen_fwd
-
-    result = fmha_v3_varlen_fwd(
+    global _v3_op
+    compiling = torch.compiler.is_compiling()
+    op = _v3_op
+    if op is None or compiling:
+        # aiter's wrapper builds and loads the module on first use; later
+        # eager calls go to the pybind op it ends in, about 4 us less host time.
+        from aiter.ops.mha import fmha_v3_varlen_fwd as op
+    result = op(
         q, k, v, cu_q, cu_k, int(max_q), int(max_k),
         0,  # min_seqlen_q
         0.0,  # dropout_p
@@ -159,7 +211,14 @@ def _varlen_fwd(q, k, v, cu_q, cu_k, max_q, max_k, softmax_scale, causal,
         q_padded,
         k_padded,
     )
+    if _v3_op is None and not compiling:
+        from aiter.jit.core import get_module
+
+        _v3_op = get_module("module_fmha_v3_varlen_fwd").fmha_v3_varlen_fwd
     return result[0], result[1]
+
+
+_v3_op = None
 
 
 def _merge_partials(o, lse, o_strides, l_strides, idx, npart, dst, out, rep):
@@ -207,11 +266,10 @@ def _merge_partials(o, lse, o_strides, l_strides, idx, npart, dst, out, rep):
     args = (*tensors, *o_strides, *l_strides, idx.stride(0), out.stride(0))
     grid = (idx.shape[0], heads, 1)
     key = (rep, dim) + tuple((t.dtype, t.data_ptr() % 16 == 0) for t in tensors)
-    compiled = _merge_compiled.get(key)
-    if compiled is None:
-        compiled = _merge_kernel.warmup(*args, REP=rep, D=dim, grid=grid)
-        _merge_compiled[key] = compiled
-    compiled[grid](*args, rep, dim, stream=torch.cuda.current_stream().cuda_stream)
+    _launch(
+        _merge_compiled, key, lambda: _merge_kernel.warmup(*args, REP=rep, D=dim, grid=grid),
+        grid, (*args, rep, dim), out.get_device(),
+    )
 
 
 _copy_kernel = None
@@ -246,11 +304,109 @@ def pool_write(k_new, v_new, dst, k_pool, v_pool):
     args = (*tensors, k_new.stride(0), v_new.stride(0))
     grid = (rows, 2, 1)
     key = (width,) + tuple((t.dtype, t.data_ptr() % 16 == 0) for t in tensors)
-    compiled = _copy_compiled.get(key)
-    if compiled is None:
-        compiled = _copy_kernel.warmup(*args, ROW=width, grid=grid)
-        _copy_compiled[key] = compiled
-    compiled[grid](*args, width, stream=torch.cuda.current_stream().cuda_stream)
+    _launch(
+        _copy_compiled, key, lambda: _copy_kernel.warmup(*args, ROW=width, grid=grid),
+        grid, (*args, width), k_pool.get_device(),
+    )
+
+
+_group_kernel = None
+_group_compiled = {}
+
+
+def group_queries(q, src, hk):
+    """``grouped[e * rep + j, g] = q[src[e], g * rep + j]`` in one launch.
+
+    The grouped layout of ``row_prefix_attention`` with row ``src[e]`` as
+    entry ``e``. ``q`` is ``(rows, hq, d)`` with contiguous heads (any row
+    stride). A plain copy, so the values are those of the view and gather.
+    """
+    global _group_kernel
+    if _group_kernel is None:
+        import triton
+        import triton.language as tl
+
+        @triton.jit(do_not_specialize=["q_sr"])
+        def kernel(q_ptr, src_ptr, out_ptr, q_sr, HQ: tl.constexpr, HK: tl.constexpr, D: tl.constexpr):
+            e = tl.program_id(0)
+            row = tl.load(src_ptr + e).to(tl.int64)
+            offs = tl.arange(0, HQ * D)
+            h = offs // D
+            c = offs % D
+            rep = HQ // HK
+            val = tl.load(q_ptr + row * q_sr + offs)
+            dst = ((h % rep) * HK + h // rep) * D + c
+            tl.store(out_ptr + e.to(tl.int64) * (HQ * D) + dst, val)
+
+        _group_kernel = kernel
+    entries = src.shape[0]
+    _rows, hq, dim = q.shape
+    out = torch.empty((entries * (hq // hk), hk, dim), dtype=q.dtype, device=q.device)
+    tensors = (q, src, out)
+    args = (*tensors, q.stride(0))
+    grid = (entries, 1, 1)
+    key = (hq, hk, dim) + tuple((t.dtype, t.data_ptr() % 16 == 0) for t in tensors)
+    _launch(
+        _group_compiled, key, lambda: _group_kernel.warmup(*args, HQ=hq, HK=hk, D=dim, grid=grid),
+        grid, (*args, hq, hk, dim), out.get_device(),
+    )
+    return out
+
+
+_write_group_kernel = None
+_write_group_compiled = {}
+
+
+def pool_write_group_queries(k_new, v_new, dst, k_pool, v_pool, q, src, hk):
+    """``pool_write`` and ``group_queries`` in one launch; returns the grouped queries.
+
+    Program ``(i, 0)``/``(i, 1)`` writes K/V row ``i``, program ``(e, 2)``
+    groups entry ``e``. Plain copies, so the values are those of the two calls.
+    """
+    global _write_group_kernel
+    if _write_group_kernel is None:
+        import triton
+        import triton.language as tl
+
+        @triton.jit(do_not_specialize=["n_kv", "n_q", "k_sr", "v_sr", "q_sr"])
+        def kernel(k_ptr, v_ptr, dst_ptr, kp_ptr, vp_ptr, q_ptr, src_ptr, out_ptr,
+                   n_kv, n_q, k_sr, v_sr, q_sr,
+                   ROW: tl.constexpr, HQ: tl.constexpr, HK: tl.constexpr, D: tl.constexpr):
+            i = tl.program_id(0)
+            which = tl.program_id(1)
+            if which == 2:
+                if i < n_q:
+                    row = tl.load(src_ptr + i).to(tl.int64)
+                    offs = tl.arange(0, HQ * D)
+                    h = offs // D
+                    c = offs % D
+                    rep = HQ // HK
+                    val = tl.load(q_ptr + row * q_sr + offs)
+                    tl.store(out_ptr + i.to(tl.int64) * (HQ * D) + ((h % rep) * HK + h // rep) * D + c, val)
+            elif i < n_kv:
+                offs = tl.arange(0, ROW)
+                row = tl.load(dst_ptr + i).to(tl.int64)
+                if which == 0:
+                    tl.store(kp_ptr + row * ROW + offs, tl.load(k_ptr + i.to(tl.int64) * k_sr + offs))
+                else:
+                    tl.store(vp_ptr + row * ROW + offs, tl.load(v_ptr + i.to(tl.int64) * v_sr + offs))
+
+        _write_group_kernel = kernel
+    n_kv = k_new.shape[0]
+    n_q = src.shape[0]
+    _rows, hq, dim = q.shape
+    out = torch.empty((n_q * (hq // hk), hk, dim), dtype=q.dtype, device=q.device)
+    width = k_new.shape[1] * k_new.shape[2]
+    tensors = (k_new, v_new, dst, k_pool, v_pool, q, src, out)
+    args = (*tensors, n_kv, n_q, k_new.stride(0), v_new.stride(0), q.stride(0))
+    grid = (max(n_kv, n_q), 3, 1)
+    key = (width, hq, hk, dim) + tuple((t.dtype, t.data_ptr() % 16 == 0) for t in tensors)
+    _launch(
+        _write_group_compiled, key,
+        lambda: _write_group_kernel.warmup(*args, ROW=width, HQ=hq, HK=hk, D=dim, grid=grid),
+        grid, (*args, width, hq, hk, dim), out.get_device(),
+    )
+    return out
 
 
 def _upload(parts, device):
@@ -401,20 +557,29 @@ def decode_split_plan(src, starts, lens, pool_rows, rep, device):
     }
 
 
-def decode_split_attention(q, k_pool, v_pool, plan, softmax_scale):
+def decode_split_attention(q, k_pool, v_pool, plan, softmax_scale, pending=None):
     """Decode rows over the pool, split as ``causal_chunk_meta`` splits them.
 
     The grouped layout of ``row_prefix_attention`` (query heads of one KV head
     as the rows of one entry) with each row repeated once per block. The merge
-    writes every row back to its own index of ``q``.
+    writes every row back to its own index of ``q``. ``pending`` is a
+    ``(k_new, v_new, dst)`` ``pool_write`` still to run before the attention;
+    it needs contiguous heads in ``q``.
     """
     rows, hq, dim = q.shape
     hk = k_pool.shape[1]
     rep = hq // hk
-    grouped = q.contiguous().view(rows, hk, rep, dim).transpose(1, 2).index_select(0, plan["gather"])
+    if pending is not None:
+        k_new, v_new, dst = pending
+        grouped = pool_write_group_queries(k_new, v_new, dst, k_pool, v_pool, q, plan["gather"], hk)
+    elif q.stride(2) == 1 and q.stride(1) == dim:
+        grouped = group_queries(q, plan["gather"], hk)
+    else:
+        grouped = q.contiguous().view(rows, hk, rep, dim).transpose(1, 2).index_select(0, plan["gather"])
+        grouped = grouped.reshape(-1, hk, dim)
     cu_q, cu_k, k_start = plan["attn"]
     o, lse = _varlen_fwd(
-        grouped.reshape(-1, hk, dim), k_pool, v_pool, cu_q, cu_k, rep, SPLIT_KEYS,
+        grouped, k_pool, v_pool, cu_q, cu_k, rep, SPLIT_KEYS,
         softmax_scale, False, k_padded=k_start,
     )
     out = torch.empty_like(q)

@@ -168,7 +168,8 @@ def _install_logprob_snapshot():
 
 
 def _aiter_rope(prefill, align):
-    if os.environ.get("ATOM_FORCE_ATTN_TRITON", "0") != "1":
+    # Read before rope_cache first flips the variable, so this is the launch value.
+    if not _flag("ATOM_FORCE_ATTN_TRITON"):
         return False
     return prefill or align
 
@@ -348,14 +349,17 @@ def _absorb_index(device):
     return index
 
 
-def _attn_tensors(device, rep, pool_rows):
-    """cu_seqlens_q, cu_seqlens_k and padded K starts for this step's rows.
+def _attn_tensors(device, rep, pool_rows, hq):
+    """cu_seqlens_q, cu_seqlens_k, padded K starts and padded Q starts of this step's rows.
 
     The same values ``row_prefix_attention`` computes on every call, built on
     the host once per step instead of with five device ops in every layer.
+    The Q starts place entry ``e`` at its query row (``grouped_padding``).
     """
+    from qlen1_attention import grouped_padding
+
     attn = _plan["attn"]
-    if attn is not None and attn[0] == (rep, pool_rows):
+    if attn is not None and attn[0] == (rep, pool_rows, hq):
         return attn[1]
     rows = len(_plan["lens"])
     cu_q = list(range(0, rep * rows + 1, rep))
@@ -363,8 +367,9 @@ def _attn_tensors(device, rep, pool_rows):
     for n in _plan["lens"]:
         cu_k.append(cu_k[-1] + int(n))
     padded = list(_plan["starts"]) + [int(pool_rows)]
-    tensors = _to_device([cu_q, cu_k, padded], torch.int32, device)
-    _plan["attn"] = ((rep, pool_rows), tensors)
+    src = _plan["perm"] if _plan["perm"] is not None else range(rows)
+    tensors = _to_device([cu_q, cu_k, padded, grouped_padding(src, hq, rep)], torch.int32, device)
+    _plan["attn"] = ((rep, pool_rows, hq), tensors)
     return tensors
 
 
@@ -389,7 +394,26 @@ def _pool(module, like):
     return module._lumenrl_pool
 
 
-def _pool_write(module, k_out, v_out):
+_qa = None
+
+
+def _qlen1():
+    global _qa
+    if _qa is None:
+        import qlen1_attention
+
+        _qa = qlen1_attention
+    return _qa
+
+
+def _pool_write(module, k_out, v_out, defer=False):
+    """Write this step's new K/V rows into the pool.
+
+    With ``defer`` a launchable write is left in ``module._lumenrl_pending``
+    for this layer's attention, which runs it in the same launch as its own
+    query copy (``_flush_pending`` runs it on its own otherwise).
+    """
+    _flush_pending(module)
     if not _plan["write_dst"]:
         return
     if k_out.shape[0] < _plan["rows"]:
@@ -405,12 +429,27 @@ def _pool_write(module, k_out, v_out):
         v_new = v_out.index_select(0, dev["write_src"])
     dim = k_new.shape[2]
     if k_new.stride()[1:] == (dim, 1) and v_new.stride()[1:] == (dim, 1):
-        from qlen1_attention import pool_write
-
-        pool_write(k_new, v_new, dev["write_dst"], k_pool, v_pool)
+        if defer:
+            module._lumenrl_pending = (k_new, v_new, dev["write_dst"])
+            return
+        _qlen1().pool_write(k_new, v_new, dev["write_dst"], k_pool, v_pool)
         return
     k_pool.index_copy_(0, dev["write_dst"], k_new)
     v_pool.index_copy_(0, dev["write_dst"], v_new)
+
+
+def _take_pending(module):
+    pending = module.__dict__.get("_lumenrl_pending")
+    if pending is not None:
+        module._lumenrl_pending = None
+    return pending
+
+
+def _flush_pending(module):
+    pending = _take_pending(module)
+    if pending is not None:
+        k_pool, v_pool = module._lumenrl_pool
+        _qlen1().pool_write(pending[0], pending[1], pending[2], k_pool, v_pool)
 
 
 def _gather_step_kv(impl, q, k, v, k_cache, v_cache, k_scale, v_scale, meta):
@@ -447,31 +486,39 @@ def _gather_step_kv(impl, q, k, v, k_cache, v_cache, k_scale, v_scale, meta):
 
 def _split_plan(device, rep, pool_rows):
     """``decode_split_plan`` of this step's rows, built once and shared by all layers."""
-    from qlen1_attention import decode_split_plan
-
-    split = _plan.get("split")
+    split = _plan["split"]
     if split is not None and split[0] == (rep, pool_rows):
         return split[1]
     src = _plan["perm"] if _plan["perm"] is not None else range(len(_plan["lens"]))
-    plan = decode_split_plan(src, _plan["starts"], _plan["lens"], pool_rows, rep, device)
+    plan = _qlen1().decode_split_plan(src, _plan["starts"], _plan["lens"], pool_rows, rep, device)
     _plan["split"] = ((rep, pool_rows), plan)
     return plan
 
 
 def _pool_attention(module, q):
-    from qlen1_attention import decode_split_attention, row_prefix_attention_planned
-
-    pool = getattr(module, "_lumenrl_pool", None)
+    qa = _qlen1()
+    pool = module.__dict__.get("_lumenrl_pool")
     if pool is None or pool[0].shape[0] < (max(_plan["slots"]) + 1) * _plan["cap"]:
         raise RuntimeError("batched decode: attention before this step's K/V reached the pool")
     k_pool, v_pool = pool
-    split = _split_plan(q.device, q.shape[1] // k_pool.shape[1], k_pool.shape[0])
+    hq, dim = q.shape[1], q.shape[2]
+    rep = hq // k_pool.shape[1]
+    split = _split_plan(q.device, rep, k_pool.shape[0])
     if split is not None:
-        return decode_split_attention(q, k_pool, v_pool, split, module.scale)
+        pending = _take_pending(module)
+        if pending is not None and not (q.stride(2) == 1 and q.stride(1) == dim):
+            qa.pool_write(pending[0], pending[1], pending[2], k_pool, v_pool)
+            pending = None
+        return qa.decode_split_attention(q, k_pool, v_pool, split, module.scale, pending)
+    _flush_pending(module)
+    cu_q, cu_k, padded, q_padded = _attn_tensors(q.device, rep, k_pool.shape[0], hq)
+    if q.is_contiguous():
+        return qa.row_prefix_attention_inplace(
+            q, k_pool, v_pool, cu_q, q_padded, cu_k, padded, _plan["max_len"], module.scale
+        )
     dev = _plan_tensors(q.device)
-    cu_q, cu_k, padded = _attn_tensors(q.device, q.shape[1] // k_pool.shape[1], k_pool.shape[0])
     rows = q if dev["perm"] is None else q.index_select(0, dev["perm"])
-    out = row_prefix_attention_planned(
+    out = qa.row_prefix_attention_planned(
         rows, k_pool, v_pool, cu_q, cu_k, padded, _plan["max_len"], module.scale
     )
     if dev["perm"] is None:
@@ -706,18 +753,15 @@ def patch_attention(module):
                         _plan["blocked"] = True
                     else:
                         _q_out, k_out, v_out, *_ = result
-                        _pool_write(self, k_out, v_out)
+                        _pool_write(self, k_out, v_out, defer=not prefill)
             elif not _history_blocked(fwd_ctx):
                 _q_out, k_out, v_out, *_ = result
                 _write_history(self, k_out, v_out)
         return result
 
     def paged_attention_varlen(self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx):
-        import aiter
-
         meta = fwd_ctx.attn_metadata
         sliding = (self.sliding_window, 0, 0) if self.sliding_window > 0 else (-1, -1, 0)
-        slots = None if _history_blocked(fwd_ctx) else _histories_for_step(self, q)
 
         def attend_each(ks, vs, ends, new_tokens):
             """Each sequence's new rows over its own K/V, as training scores them.
@@ -738,6 +782,8 @@ def patch_attention(module):
                 return chunked_causal_attention(
                     q[: q_bounds[-1]], k_all, v_all, plan, self.scale
                 )
+            import aiter
+
             outs = []
             row = 0
             for k_i, v_i, end, new in zip(ks, vs, ends, new_tokens):
@@ -776,6 +822,7 @@ def patch_attention(module):
             and q.shape[0] == _plan["rows"]
         ):
             if not _plan["complete"]:
+                _flush_pending(self)
                 k_full, v_full, ends, new_tokens = _gather_step_kv(
                     self, q, k, v, k_cache, v_cache, k_scale, v_scale, meta
                 )
@@ -818,6 +865,8 @@ def patch_attention(module):
                     print(f"batched decode CHECK calls={_check[0]} mismatched={_check[1]}", flush=True)
             return out
 
+        _flush_pending(self)
+        slots = None if _history_blocked(fwd_ctx) else _histories_for_step(self, q)
         if slots is not None:
             # Host-side lengths, one history per request. No device assert:
             # a mismatch used to abort the GPU queue when several sequences
