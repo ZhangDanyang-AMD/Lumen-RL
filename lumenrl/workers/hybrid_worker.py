@@ -35,9 +35,9 @@ class HybridWorker(BaseWorker):
         """Delegate to the rollout worker."""
         return self._rollout.generate(batch)
 
-    def train_step(self, batch: DataProto) -> dict[str, float]:
+    def update_policy(self, batch: DataProto) -> dict[str, float]:
         """Delegate to the actor worker."""
-        return self._actor.train_step(batch)
+        return self._actor.update_policy(batch)
 
     def sync_weights(self) -> None:
         """Push actor weights into the rollout engine."""

@@ -54,7 +54,7 @@ def _run_steps(cfg: dict[str, Any], steps: int, seed: int) -> list[float]:
     )
     losses: list[float] = []
     for _ in range(steps):
-        m = worker.train_step(batch)
+        m = worker.update_policy(batch)
         losses.append(m["loss"])
     worker.cleanup()
     return losses

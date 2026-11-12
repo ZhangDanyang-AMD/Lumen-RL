@@ -521,151 +521,6 @@ class LumenActorWorker(BaseWorker):
         out = DataProto(tensors=tensors, meta=dict(batch.meta))
         return out
 
-    def train_step(self, batch: DataProto) -> dict[str, float]:
-        """Compute the RL surrogate loss, backward, and step the optimizer.
-
-        The worker recomputes the forward pass locally so gradients flow
-        through the model parameters.  The algorithm name and hyperparameters
-        are passed via ``batch.meta``.
-        """
-        if self._engine is None:
-            raise RuntimeError("init_model() must be called before train_step().")
-        if "input_ids" not in batch.tensors:
-            raise KeyError("batch must contain 'input_ids'")
-
-        def loss_fn(model_output, data):
-            token_log_probs = model_output["log_probs"]
-            input_ids = data["input_ids"]
-
-            old_logp = batch.tensors.get("old_log_probs")
-            adv = batch.tensors.get("advantages")
-            algo_name = str(batch.meta.get("algorithm", "grpo")).lower()
-
-            if old_logp is not None and adv is not None:
-                old_logp = old_logp.to(token_log_probs.device)
-                adv = adv.to(token_log_probs.device)
-                ris = batch.tensors.get("rollout_is_weights")
-                if ris is not None:
-                    ris = ris.to(token_log_probs.device)
-
-                if adv.dim() == 1:
-                    adv = adv.unsqueeze(-1).expand_as(token_log_probs)
-                elif adv.shape[-1] != token_log_probs.shape[-1]:
-                    adv = adv[..., :token_log_probs.shape[-1]]
-
-                if old_logp.shape[-1] != token_log_probs.shape[-1]:
-                    old_logp = old_logp[..., :token_log_probs.shape[-1]]
-                if ris is not None and ris.shape[-1] != token_log_probs.shape[-1]:
-                    ris = ris[..., :token_log_probs.shape[-1]]
-
-                # Prefer response_mask (PPO loss is over response tokens only).
-                # log_probs[:, j] predicts target token j+1, so shift the mask by
-                # one to align (verl-aligned); fall back to attention_mask.
-                L = token_log_probs.shape[-1]
-                resp_mask = batch.tensors.get("response_mask")
-                if resp_mask is not None:
-                    mask = resp_mask.to(token_log_probs.device).float()
-                    if mask.shape[-1] == L + 1:
-                        mask = mask[:, 1:]
-                    mask = mask[..., :L]
-                else:
-                    mask = batch.tensors.get("attention_mask")
-                    if mask is not None:
-                        mask = mask.to(token_log_probs.device)[..., :L].float()
-
-                # Algo hyperparams live under the per-algo sub-config
-                # (algo_config[algo_name]); the flat top-level keys are None.
-                algo_cfg_full = batch.meta.get("algo_config", {}) or {}
-                _sub = algo_cfg_full.get(algo_name)
-                _sub = _sub if isinstance(_sub, dict) else {}
-
-                def _cfg(key, default):
-                    v = _sub.get(key, algo_cfg_full.get(key, default))
-                    return default if v is None else v
-
-                if algo_name == AlgorithmName.DAPO.value:
-                    clip_low = float(_cfg("clip_ratio_low", 0.2))
-                    clip_high = float(_cfg("clip_ratio_high", 0.28))
-                    loss = asymmetric_clip_loss(
-                        token_log_probs, old_logp, adv, clip_low, clip_high, mask=mask,
-                        rollout_is_weights=ris,
-                    )
-                elif algo_name == AlgorithmName.GRPO.value:
-                    dp = int(batch.meta.get("dp_size", 1) or 1)
-                    loss_agg_mode = str(
-                        _cfg("loss_agg_mode", "token-mean")
-                    )
-                    global_batch_size = int(
-                        batch.meta.get("global_batch_size")
-                        or batch.batch_size * dp
-                    )
-                    loss = asymmetric_clip_loss(
-                        token_log_probs,
-                        old_logp,
-                        adv,
-                        float(_cfg("clip_ratio", 0.2)),
-                        float(_cfg("clip_ratio_high", 0.28)),
-                        mask=mask,
-                        batch_num_tokens=batch.meta.get("batch_num_tokens"),
-                        dp_size=dp,
-                        loss_agg_mode=loss_agg_mode,
-                        global_batch_size=global_batch_size,
-                        rollout_is_weights=ris,
-                    )
-                else:
-                    loss = policy_gradient_loss(
-                        token_log_probs,
-                        old_logp,
-                        adv,
-                        float(_cfg("clip_ratio", 0.2)),
-                        mask=mask,
-                    )
-
-                kl_c = float(_cfg("kl_coeff", 0.0))
-                ref_logp = batch.tensors.get("ref_log_probs")
-                if kl_c > 0.0 and ref_logp is not None:
-                    ref_logp = ref_logp.to(token_log_probs.device)
-                    if ref_logp.shape[-1] != token_log_probs.shape[-1]:
-                        ref_logp = ref_logp[..., :token_log_probs.shape[-1]]
-                    kl = kl_penalty(token_log_probs, ref_logp, mask=mask)
-                    loss = loss + kl_c * kl
-            else:
-                shift_labels = input_ids[:, 1:].contiguous().to(token_log_probs.device)
-                loss = F.cross_entropy(
-                    token_log_probs.view(-1),
-                    shift_labels.view(-1),
-                )
-
-            return loss, {"loss": float(loss.detach())}
-
-        data = {"input_ids": batch["input_ids"].to(self._device)}
-        if "attention_mask" in batch:
-            data["attention_mask"] = batch["attention_mask"].to(self._device)
-
-        with self._engine.train_mode():
-            output = self._engine.train_batch(data, loss_fn)
-
-        metrics: dict[str, float] = {}
-        if "metrics" in output:
-            for k, v in output["metrics"].items():
-                if isinstance(v, list):
-                    metrics[k] = sum(v) / max(len(v), 1)
-                else:
-                    metrics[k] = float(v)
-
-        if "loss" in output:
-            if isinstance(output["loss"], list):
-                metrics["loss"] = sum(output["loss"]) / max(len(output["loss"]), 1)
-            else:
-                metrics["loss"] = float(output["loss"])
-
-        lr = self._engine.lr_scheduler_step()
-        metrics["lr"] = lr
-
-        algo_name = str(batch.meta.get("algorithm", "grpo")).lower()
-        self._log.debug("train_step loss=%f (algo=%s)", metrics.get("loss", 0.0), algo_name)
-        return metrics
-
     def _max_token_len_per_gpu(self) -> int:
         """Per-micro-batch token budget for the packed forward (0 if unset)."""
         policy = get_nested_config(self.config, "policy", default={}) or {}
@@ -735,7 +590,13 @@ class LumenActorWorker(BaseWorker):
         for k, v in output.get("metrics", {}).items():
             metrics[k] = (sum(v) / len(v)) if isinstance(v, list) and v else float(v)
         if "loss" in output:
-            metrics["loss"] = reduce_reported_loss(output["loss"])
+            lv = output["loss"]
+            if self._pol_meta.get("task_type") == "sft":
+                # sft_loss normalizes by each micro's own token count, so a unit
+                # is already a mean and summing them would scale by the count.
+                metrics["loss"] = (sum(lv) / len(lv)) if isinstance(lv, list) and lv else float(lv)
+            else:
+                metrics["loss"] = reduce_reported_loss(lv)
         metrics["lr"] = self._engine.lr_scheduler_step()
         return metrics
 

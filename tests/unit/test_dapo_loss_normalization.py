@@ -17,6 +17,8 @@ These tests pin the invariant directly, at the reduction level, so neither path
 can reintroduce a divisor.
 """
 
+import re
+
 import pytest
 import torch
 
@@ -79,8 +81,36 @@ def test_both_engines_route_through_the_shared_reduction():
         )
         src = inspect.getsource(getattr(cls, fn))
         assert "reduce_reported_loss" in src, f"{mod.__name__}.{fn} bypasses it"
-        assert "len(lv)" not in src, f"{mod.__name__}.{fn} still divides by a unit count"
-        assert "max(1, n_rows)" not in src, f"{mod.__name__}.{fn} still divides by n_rows"
+        # SFT is the one branch that legitimately averages (see the test below);
+        # drop it, and nothing that remains may divide by a unit count.
+        rl = re.sub(r'\n +if .*task_type.*"sft":.*?\n +else:\n', "\n", src, flags=re.S)
+        assert "len(lv)" not in rl, f"{mod.__name__}.{fn} still divides by a unit count"
+        assert "max(1, n_rows)" not in rl, f"{mod.__name__}.{fn} still divides by n_rows"
+
+
+def test_sft_reports_the_mean_because_its_units_are_already_means():
+    """The sum is right for RL and wrong for SFT, so the branch must stay.
+
+    ``agg_loss`` on the RL path divides by the GLOBAL ``batch_num_tokens``, so
+    units sum. ``sft_loss`` computes ``batch_num_tokens`` from the micro's own
+    ``loss_mask``, so each unit is already a mean over its own tokens and a sum
+    would scale by the unit count -- the very defect this file pins, mirrored.
+    Unreachable today (nothing sets ``task_type``), which is exactly why it
+    needs a test rather than a reader noticing.
+    """
+    import inspect
+
+    from lumenrl.engine.training import actor_worker as training_actor_worker
+    from lumenrl.workers import actor_worker
+
+    for mod in (actor_worker, training_actor_worker):
+        cls = next(
+            o for _, o in inspect.getmembers(mod, inspect.isclass)
+            if hasattr(o, "update_policy") and o.__module__ == mod.__name__
+        )
+        src = inspect.getsource(cls.update_policy)
+        assert 'task_type") == "sft"' in src, f"{mod.__name__} sums the SFT loss"
+        assert "sum(lv) / len(lv)" in src, f"{mod.__name__} does not mean the SFT loss"
 
 
 def _loss_matrix(rows: int, cols: int) -> tuple[torch.Tensor, torch.Tensor]:

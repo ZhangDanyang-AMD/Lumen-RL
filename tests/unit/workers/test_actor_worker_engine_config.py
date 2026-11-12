@@ -607,10 +607,10 @@ def test_actor_grpo_loss_applies_rollout_importance_weights(worker_type) -> None
 def test_actor_legacy_grpo_loss_applies_rollout_importance_weights(
     worker_type,
 ) -> None:
-    source = inspect.getsource(worker_type.train_step)
+    source = inspect.getsource(worker_type._policy_loss_fn)
     grpo_branch = source.split(
         "elif algo_name == AlgorithmName.GRPO.value:", 1
-    )[1].split("\n                else:", 1)[0]
+    )[1].split("\n        else:", 1)[0]
 
     assert "rollout_is_weights=ris" in grpo_branch
 
