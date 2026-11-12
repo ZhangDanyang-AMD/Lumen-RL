@@ -4825,10 +4825,11 @@ class RLTrainer:
                 "policy.generation.multi_turn needs the Ray controller with the vLLM or "
                 "ATOM rollout: the agent loop generates turn by turn on its Ray servers."
             )
-        if self._r3_rollout_replay or getattr(self.config.moe.r3, "enabled", False):
+        r3 = self._r3_rollout_replay or getattr(self.config.moe.r3, "enabled", False)
+        if r3 and not getattr(self, "_ray_use_vllm", False):
             raise ValueError(
-                "policy.generation.multi_turn does not replay MoE routing (moe.r3) "
-                "across the turns of a rollout yet; turn off moe.r3."
+                "policy.generation.multi_turn replays MoE routing (moe.r3) from the vLLM "
+                "rollout only: ATOM does not return the experts it routed each token to."
             )
 
     def _resolve_rollout_pipeline(self, use_ray_rollout: bool) -> str:

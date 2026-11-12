@@ -33,6 +33,10 @@ class Trajectory:
     stop_reason: str = ""
     generate_s: float = 0.0
     tool_s: float = 0.0
+    # The experts the engine routed each token to, from the last turn: its input
+    # was the whole trajectory, so this is [prompt + response - 1, layers,
+    # top_k] as a single-turn completion's. Set when the engine returns them.
+    routed_experts: Any = None
 
     def add_model_turn(self, token_ids: list[int], logprobs: list[float] | None) -> None:
         if logprobs is not None and len(logprobs) != len(token_ids):
@@ -71,10 +75,13 @@ class Trajectory:
     def to_rollout_result(self) -> dict[str, Any]:
         """The trajectory in the shape ``VLLMRayServer.generate`` returns, plus
         its ``response_mask`` and ``agent_stats``."""
-        return {
+        result = {
             "prompt_token_ids": list(self.prompt_ids),
             "token_ids": list(self.response_ids),
             "logprobs": list(self.response_logprobs),
             "response_mask": list(self.response_mask),
             "agent_stats": self.stats(),
         }
+        if self.routed_experts is not None:
+            result["routed_experts"] = self.routed_experts
+        return result

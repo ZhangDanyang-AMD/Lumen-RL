@@ -314,3 +314,31 @@ def test_a_session_that_fails_to_close_does_not_lose_the_rollout():
     trajectory, *_ = run_loop([(call("a"), "stop"), ("42", "stop")], tool=tool)
 
     assert trajectory.stop_reason == "answer" and trajectory.tool_calls == 1
+
+
+class RoutingEngine(ScriptedEngine):
+    """Also returns, per call, routing rows for every input token but the last."""
+
+    async def generate(self, prompt_ids, sampling_params):
+        out = await super().generate(prompt_ids, sampling_params)
+        rows = len(prompt_ids) + len(out["token_ids"]) - 1
+        out["routed_experts"] = [[[len(self.requests), row]] for row in range(rows)]
+        return out
+
+
+def test_the_last_turn_routes_cover_the_whole_trajectory():
+    tok = ChatMLTokenizer()
+    engine = RoutingEngine(tok, [(call("6 * 7"), "stop"), ("42", "stop")])
+    loop = ToolAgentLoop(ChatTemplateTokenizer(tok), [EchoTool()])
+
+    result = asyncio.run(loop.run(engine.generate, PROMPT, {"max_tokens": 10_000}, 4096)).to_rollout_result()
+
+    routes = result["routed_experts"]
+    assert len(routes) == len(result["prompt_token_ids"]) + len(result["token_ids"]) - 1
+    assert {route[0][0] for route in routes} == {2}  # all from the second, last call
+
+
+def test_a_rollout_from_an_engine_without_routes_has_none():
+    trajectory, *_ = run_loop([("42", "stop")])
+
+    assert "routed_experts" not in trajectory.to_rollout_result()

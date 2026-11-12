@@ -121,6 +121,8 @@ class ToolAgentLoop:
             trajectory.generate_s += time.perf_counter() - t0
             turn_ids = list(out["token_ids"])
             trajectory.add_model_turn(turn_ids, out.get("logprobs"))
+            if out.get("routed_experts") is not None:
+                trajectory.routed_experts = out["routed_experts"]
 
             finish_reason = out.get("finish_reason")
             if finish_reason is None:

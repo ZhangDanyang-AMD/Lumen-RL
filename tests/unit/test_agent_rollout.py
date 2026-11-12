@@ -215,6 +215,24 @@ def assembling_trainer() -> RLTrainer:
 MODEL_TOKENS = {10, 11, 12, 13, 14, 15}
 
 
+def test_agent_rollouts_carry_their_routes_into_r3():
+    trainer = assembling_trainer()
+    trainer.config.moe.r3.enabled = True
+    rows = [
+        trajectory([1, 2, 3], [10, 11], [20, 21, 22], [12]),
+        trajectory([4, 5], [13, 14, 15]),
+    ]
+    for row in rows:
+        positions = len(row.prompt_ids) + len(row.response_ids) - 1
+        row.routed_experts = torch.arange(positions * 4, dtype=torch.uint8).reshape(positions, 2, 2)
+
+    *_, ragged = trainer._assemble_ray_rollout([row.to_rollout_result() for row in rows])
+
+    assert [tuple(routes.shape) for routes in ragged["rollout_routing"]] == [(8, 2, 2), (4, 2, 2)]
+    for routes, row in zip(ragged["rollout_routing"], rows):
+        assert torch.equal(routes, row.routed_experts.to(torch.int16))
+
+
 def test_only_model_tokens_stay_in_the_response_mask():
     trainer = assembling_trainer()
     rows = [
@@ -391,7 +409,9 @@ def _multi_turn_trainer(*, vllm=True, atom=False, r3=False) -> RLTrainer:
     return trainer
 
 
-@pytest.mark.parametrize("kwargs", [{}, {"vllm": False, "atom": True}], ids=["vllm", "atom"])
+@pytest.mark.parametrize(
+    "kwargs", [{}, {"vllm": False, "atom": True}, {"r3": True}], ids=["vllm", "atom", "vllm-r3"],
+)
 def test_multi_turn_runs_on_a_ray_rollout(kwargs):
     assert _multi_turn_trainer(**kwargs)._resolve_rollout_pipeline(True) == "sync"
 
@@ -401,7 +421,7 @@ def test_multi_turn_runs_on_a_ray_rollout(kwargs):
     [
         (False, {}, "Ray controller with the vLLM or ATOM"),
         (True, {"vllm": False}, "Ray controller with the vLLM or ATOM"),
-        (True, {"r3": True}, "moe.r3"),
+        (True, {"vllm": False, "atom": True, "r3": True}, "ATOM does not return"),
     ],
 )
 def test_multi_turn_rejects_what_it_cannot_drive(use_ray_rollout, kwargs, message):
