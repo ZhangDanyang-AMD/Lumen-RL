@@ -161,6 +161,14 @@ sudo docker exec -d "$CONTAINER" bash -lc "$ENVX STEPS=1000 MODE=atomfp8  TRAIN_
 sudo docker exec -d "$CONTAINER" bash -lc "$ENVX STEPS=1000 MODE=atombf16             bash '$S'"  # 5
 ```
 
+> To run example 5 as the train/rollout consistent path, add `LUMENRL_CONSISTENT=1`:
+>
+> ```bash
+> sudo docker exec -d "$CONTAINER" bash -lc "$ENVX STEPS=1000 MODE=atombf16 LUMENRL_CONSISTENT=1 bash '$S'"  # 5, consistent
+> ```
+>
+> It turns on the six ATOM ops, split-KV decode, and deferred logprob output. The GEMM table is not set by the switch; pass `AITER_CONFIG_GEMM_BF16` yourself. See [qwen3-8b-dense-bf16-align.md](../DAPO/qwen3-8b-dense-bf16-align.md). Leave the variable unset for the unaligned control.
+
 > Do not pass `TRAIN_FP8=1` to example 5: `MODE=atombf16` unsets `LUMEN_FP8`,
 > `FP8_PARAM_MANAGER`, `LUMEN_FP8_SCALING` and friends, so training is unconditionally
 > BF16. It also **does not import the Lumen/AITER norm patch** (HF Qwen3's RMSNorm is

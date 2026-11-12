@@ -386,39 +386,41 @@ def unpack_log_probs(
 _original_attn_fn = None  # saved reference to the previous sdpa function
 
 
-_row_meta_cache: tuple | None = None
+_chunk_meta_cache: tuple | None = None
 
 
-def _packed_rows(cu_seqlens: torch.Tensor, total: int):
-    """Row starts and lengths for ``cu_seqlens``, shared by all layers of a forward."""
-    global _row_meta_cache
-    from lumenrl.aiter_patch.qlen1_attention import packed_causal_rows
+def _chunk_meta(cu_seqlens: torch.Tensor, total: int):
+    """Chunked causal index tensors for ``cu_seqlens``, shared by all layers of a forward."""
+    global _chunk_meta_cache
+    from lumenrl.aiter_patch.qlen1_attention import causal_chunk_meta
 
-    cached = _row_meta_cache
+    cached = _chunk_meta_cache
     if cached is not None and cached[0] is cu_seqlens and cached[1] == total:
         return cached[2]
-    rows = packed_causal_rows(cu_seqlens, total)
+    bounds = cu_seqlens.tolist()
+    meta = causal_chunk_meta(bounds, bounds, total, cu_seqlens.device)
     # Holding the tensor keeps its id unique while it is the cache key.
-    _row_meta_cache = (cu_seqlens, total, rows)
-    return rows
+    _chunk_meta_cache = (cu_seqlens, total, meta)
+    return meta
 
 
 class _RowwiseAttention(torch.autograd.Function):
     """q_len=1 attention values, with the packed-varlen gradient as a stand-in.
 
-    The forward is the decode-shaped call. There is no backward for that
-    launch, so the backward differentiates the ordinary causal varlen call
-    on the same Q, K and V. Those two kernels agree on short sequences and
-    diverge once a query reads past 2048 keys, so this gradient is not the
-    gradient of the forward that produced the logprob.
+    The forward has the values of the decode-shaped call. Overlapping key
+    ranges of its chunks rule out the varlen backward on that launch, so the
+    backward differentiates the ordinary causal varlen call on the same Q, K
+    and V. Those two kernels agree on short sequences and diverge once a query
+    reads past 2048 keys, so this gradient is not the gradient of the forward
+    that produced the logprob.
     """
 
     @staticmethod
     def forward(ctx, q, k, v, cu_seqlens, max_seqlen, softmax_scale):
-        from lumenrl.aiter_patch.qlen1_attention import row_prefix_attention
+        from lumenrl.aiter_patch.qlen1_attention import chunked_causal_attention
 
-        starts, lens = _packed_rows(cu_seqlens, q.shape[0])
-        out = row_prefix_attention(q, k, v, starts, lens, max_seqlen, softmax_scale)
+        meta = _chunk_meta(cu_seqlens, q.shape[0])
+        out = chunked_causal_attention(q, k, v, meta, softmax_scale)
         ctx.save_for_backward(q, k, v, cu_seqlens)
         ctx.max_seqlen = max_seqlen
         ctx.softmax_scale = softmax_scale
@@ -461,15 +463,15 @@ def _rowwise_varlen_attention(
     """Evaluate packed causal attention with ATOM decode's q_len=1 arithmetic.
 
     Every token is one query row over its own KV prefix, the reduction ATOM
-    decode runs. All rows go through one launch per layer
+    decode runs. All rows go through one chunked causal launch per layer
     (``lumenrl.aiter_patch.qlen1_attention``).
     """
     if needs_grad:
         return _RowwiseAttention.apply(q, k, v, cu_seqlens, max_seqlen, softmax_scale)
-    from lumenrl.aiter_patch.qlen1_attention import row_prefix_attention
+    from lumenrl.aiter_patch.qlen1_attention import chunked_causal_attention
 
-    starts, lens = _packed_rows(cu_seqlens, q.shape[0])
-    return row_prefix_attention(q, k, v, starts, lens, max_seqlen, softmax_scale)
+    meta = _chunk_meta(cu_seqlens, q.shape[0])
+    return chunked_causal_attention(q, k, v, meta, softmax_scale)
 
 
 def _varlen_attention_forward(

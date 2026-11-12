@@ -32,7 +32,8 @@
 | 2 | 8B FP8 rollout | Qwen3-8B-Base | Lumen FSDP2，BF16 | vLLM / `fp8_per_block` | 同上 | 同上 | `MODE=fp8` |
 | 3 | 8B FP8 E2E | Qwen3-8B-Base | Lumen FSDP2，**FP8 blockwise2d** | vLLM / `fp8_per_block` | 同上 | 同上 | `MODE=fp8 TRAIN_FP8=1` |
 | 4 | 8B ATOM FP8 | Qwen3-8B-Base | Lumen FSDP2，**FP8 blockwise2d** | **ATOM** / `per_block_fp8` | 同上 | 同上 | `MODE=atomfp8 TRAIN_FP8=1` |
-| 5 | 8B ATOM BF16 | Qwen3-8B-Base | Lumen FSDP2，BF16（纯 BF16，不打 Lumen norm patch） | **ATOM** / BF16 | 同上 | 同上 | `MODE=atombf16` |
+| 5 | 8B ATOM BF16 | Qwen3-8B-Base | Lumen FSDP2，BF16（纯 BF16，不打 Lumen norm patch） | **ATOM** / BF16 | 同上 | 同上 | `MODE=atombf16`（不对齐的对照） |
+| 5b | 8B ATOM BF16，训推一致 | Qwen3-8B-Base | Lumen FSDP2，BF16 | **ATOM** / BF16 | 同上 | 同上 | `MODE=atombf16 LUMENRL_CONSISTENT=1`（[对齐文档](DAPO/qwen3-8b-dense-bf16-align.md)） |
 | 6 | MoE FSDP2 | Qwen3-30B-A3B-Base | Lumen FSDP2，BF16 | vLLM / BF16 | 同上 | 同上 | `MODE=bf16` + MoE config |
 | 7 | MoE Megatron EP=8 | Qwen3-30B-A3B-Base | **Megatron-Native**，TP=PP=CP=1，EP=8，DP=8 | vLLM / BF16 | 同上 | 同上 | `MODE=bf16` + Megatron config |
 | 8 | MoE 双节点 RDMA | Qwen3-30B-A3B | **Megatron-Native**，TP=4，EP=8 | vLLM TP=2 x 4 / BF16 | 2x 8x MI308X（gfx942） | `qwen3-30b-a3b:rollout` + `trainer` | [训推分离部署指南](docs/07-disaggregated-rdma_cn.md) |

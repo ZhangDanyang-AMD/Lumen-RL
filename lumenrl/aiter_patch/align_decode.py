@@ -40,6 +40,8 @@ _free_slots: list[int] = []
 _num_slots = 0
 _plan = None
 _check = [0, 0]
+# ((step, cu_seqlens_q, cu_seqlens_k, keys), plan) of the current prefill, shared by its layers.
+_prefill_plan = None
 
 
 def _configured_capacity(config) -> int:
@@ -100,12 +102,11 @@ def _install_logprob_snapshot():
 
     ``tokenIDProcessor`` queues ``gpu_logprobs.to("cpu", non_blocking=True)``
     on a side stream and reads it one step later. The source is a one-element
-    gather. Cloning it and synchronizing the compute stream still leaves that
-    copy outstanding: after a few hundred decode steps the caching allocator
-    reuses the clone's block, and the late copy observes that recycled float.
-    The align path therefore finishes a blocking host copy before returning.
-    ``send_to_cpu_async`` then sees a CPU tensor, whose ``.to("cpu")`` keeps
-    the same storage. Enable with ``LUMENRL_ALIGN_DECODE=1``.
+    gather. Nothing tells the caching allocator about the side-stream read, so
+    after a few hundred decode steps the next forward reuses the block before
+    the copy runs, and the copy observes that recycled float.
+    ``record_stream`` keeps the block until the side stream's queued work is
+    done, so the copy stays asynchronous. Enable with ``LUMENRL_ALIGN_DECODE=1``.
     """
     busy = False
 
@@ -144,13 +145,8 @@ def _install_logprob_snapshot():
                     self, gpu_tensor, cpu_tensor_handle, data_ready,
                     copy_done=None, gpu_logprobs=None,
                 ):
-                    if (
-                        gpu_logprobs is not None
-                        and os.environ.get("LUMENRL_ALIGN_DECODE", "0") == "1"
-                    ):
-                        ready = gpu_logprobs.detach().contiguous().clone()
-                        torch.cuda.current_stream().synchronize()
-                        gpu_logprobs = ready.to("cpu")
+                    if gpu_logprobs is not None and _flag("LUMENRL_ALIGN_DECODE"):
+                        gpu_logprobs.record_stream(self.async_copy_stream)
                     return orig_send(
                         self, gpu_tensor, cpu_tensor_handle, data_ready,
                         copy_done, gpu_logprobs,
@@ -205,11 +201,23 @@ def _publish_step(runner, batch):
     _step = (req_ids, new_tokens, ends, _step_spans(new_tokens, ends))
 
 
+_flags: dict[str, bool] = {}
+
+
+def _flag(name: str) -> bool:
+    """A LUMENRL_* switch. They are set before the worker starts, so read once."""
+    value = _flags.get(name)
+    if value is None:
+        value = os.environ.get(name, "0") == "1"
+        _flags[name] = value
+    return value
+
+
 def _batched() -> bool:
     return (
-        os.environ.get("LUMENRL_ALIGN_BATCHED_DECODE", "0") == "1"
-        and os.environ.get("LUMENRL_ALIGN_CONTIG_KV", "0") == "1"
-        and os.environ.get("LUMENRL_ALIGN_DECODE", "0") == "1"
+        _flag("LUMENRL_ALIGN_BATCHED_DECODE")
+        and _flag("LUMENRL_ALIGN_CONTIG_KV")
+        and _flag("LUMENRL_ALIGN_DECODE")
     )
 
 
@@ -280,6 +288,7 @@ def _plan_step():
         "absorbed": False,
         "dev": None,
         "attn": None,
+        "split": None,
     }
 
 
@@ -394,6 +403,12 @@ def _pool_write(module, k_out, v_out):
     else:
         k_new = k_out.index_select(0, dev["write_src"])
         v_new = v_out.index_select(0, dev["write_src"])
+    dim = k_new.shape[2]
+    if k_new.stride()[1:] == (dim, 1) and v_new.stride()[1:] == (dim, 1):
+        from qlen1_attention import pool_write
+
+        pool_write(k_new, v_new, dev["write_dst"], k_pool, v_pool)
+        return
     k_pool.index_copy_(0, dev["write_dst"], k_new)
     v_pool.index_copy_(0, dev["write_dst"], v_new)
 
@@ -430,13 +445,29 @@ def _gather_step_kv(impl, q, k, v, k_cache, v_cache, k_scale, v_scale, meta):
     return k_full, v_full, ends, new_tokens
 
 
+def _split_plan(device, rep, pool_rows):
+    """``decode_split_plan`` of this step's rows, built once and shared by all layers."""
+    from qlen1_attention import decode_split_plan
+
+    split = _plan.get("split")
+    if split is not None and split[0] == (rep, pool_rows):
+        return split[1]
+    src = _plan["perm"] if _plan["perm"] is not None else range(len(_plan["lens"]))
+    plan = decode_split_plan(src, _plan["starts"], _plan["lens"], pool_rows, rep, device)
+    _plan["split"] = ((rep, pool_rows), plan)
+    return plan
+
+
 def _pool_attention(module, q):
-    from qlen1_attention import row_prefix_attention_planned
+    from qlen1_attention import decode_split_attention, row_prefix_attention_planned
 
     pool = getattr(module, "_lumenrl_pool", None)
     if pool is None or pool[0].shape[0] < (max(_plan["slots"]) + 1) * _plan["cap"]:
         raise RuntimeError("batched decode: attention before this step's K/V reached the pool")
     k_pool, v_pool = pool
+    split = _split_plan(q.device, q.shape[1] // k_pool.shape[1], k_pool.shape[0])
+    if split is not None:
+        return decode_split_attention(q, k_pool, v_pool, split, module.scale)
     dev = _plan_tensors(q.device)
     cu_q, cu_k, padded = _attn_tensors(q.device, q.shape[1] // k_pool.shape[1], k_pool.shape[0])
     rows = q if dev["perm"] is None else q.index_select(0, dev["perm"])
@@ -659,7 +690,7 @@ def patch_attention(module):
 
     def rope_cache(self, q, k, v, qkv, position, fwd_ctx):
         prefill = bool(getattr(getattr(fwd_ctx, "context", None), "is_prefill", False))
-        align = os.environ.get("LUMENRL_ALIGN_DECODE", "0") == "1"
+        align = _flag("LUMENRL_ALIGN_DECODE")
         if not _aiter_rope(prefill, align):
             return orig_rope(self, q, k, v, qkv, position, fwd_ctx)
         os.environ["ATOM_FORCE_ATTN_TRITON"] = "0"
@@ -667,7 +698,7 @@ def patch_attention(module):
             result = orig_rope(self, q, k, v, qkv, position, fwd_ctx)
         finally:
             os.environ["ATOM_FORCE_ATTN_TRITON"] = "1"
-        if align and os.environ.get("LUMENRL_ALIGN_CONTIG_KV", "0") == "1":
+        if align and _flag("LUMENRL_ALIGN_CONTIG_KV"):
             _drop_retired(self)
             if _batched():
                 if _plan is not None:
@@ -689,13 +720,24 @@ def patch_attention(module):
         slots = None if _history_blocked(fwd_ctx) else _histories_for_step(self, q)
 
         def attend_each(ks, vs, ends, new_tokens):
-            """One varlen call per sequence, the same call training scores with.
+            """Each sequence's new rows over its own K/V, as training scores them.
 
-            Packing several sequences into one launch changes how the kernel
-            splits and reduces the work, so a token's logprob depended on its
-            neighbours. A single sequence per call keeps it identical to the
-            q_len=1 call used by prefill and by the trainer.
+            Without sinks or a sliding window this is the chunked causal call
+            training and prefill use, with the same split of long rows.
             """
+            if self.sinks is None and self.sliding_window <= 0:
+                from qlen1_attention import causal_chunk_meta, chunked_causal_attention
+
+                q_bounds, k_bounds = [0], [0]
+                for end, new in zip(ends, new_tokens):
+                    q_bounds.append(q_bounds[-1] + int(new))
+                    k_bounds.append(k_bounds[-1] + int(end))
+                k_all = ks[0] if len(ks) == 1 else torch.cat(ks, 0)
+                v_all = vs[0] if len(vs) == 1 else torch.cat(vs, 0)
+                plan = causal_chunk_meta(q_bounds, k_bounds, k_all.shape[0], q.device)
+                return chunked_causal_attention(
+                    q[: q_bounds[-1]], k_all, v_all, plan, self.scale
+                )
             outs = []
             row = 0
             for k_i, v_i, end, new in zip(ks, vs, ends, new_tokens):
@@ -751,7 +793,7 @@ def patch_attention(module):
                 v_pool.index_copy_(0, index, v_full)
                 _plan["absorbed"] = True
             out = _pool_attention(self, q)
-            if os.environ.get("LUMENRL_ALIGN_BATCHED_CHECK", "0") == "1":
+            if _flag("LUMENRL_ALIGN_BATCHED_CHECK"):
                 _req, new_tokens, ends, _spans = _step
                 k_pool, v_pool = self._lumenrl_pool
                 cap = _plan["cap"]
@@ -807,7 +849,7 @@ def patch_attention(module):
     def prefill_attention_decode_varlen(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx
     ):
-        """Run prefill as one q_len=1 varlen call per query row.
+        """Run prefill with the arithmetic of one q_len=1 varlen call per query row.
 
         For a prefix-cache hit, ``q`` has only the new rows while the gathered
         K/V include cached and new rows.  The bottom-right causal alignment
@@ -826,23 +868,21 @@ def patch_attention(module):
         cu_q = meta.cu_seqlens_q
         cu_k = meta.cu_seqlens_k
         if self.sinks is None and self.sliding_window <= 0:
-            from qlen1_attention import row_prefix_attention
+            from qlen1_attention import causal_chunk_meta, chunked_causal_attention
 
-            starts: list[int] = []
-            lens: list[int] = []
-            q_bounds = cu_q.tolist()
-            k_bounds = cu_k.tolist()
-            for seq in range(len(q_bounds) - 1):
-                q_len = q_bounds[seq + 1] - q_bounds[seq]
-                prefix_len = k_bounds[seq + 1] - k_bounds[seq] - q_len
-                starts.extend([k_bounds[seq]] * q_len)
-                lens.extend(range(prefix_len + 1, prefix_len + q_len + 1))
-            rows = torch.tensor([starts, lens], dtype=torch.int32).to(
-                q.device, non_blocking=True
-            )
-            return row_prefix_attention(
-                q, k, v, rows[0], rows[1], max(lens), self.scale
-            )
+            global _prefill_plan
+            # _step is rebuilt by every prepare_inputs, so it pins the plan to
+            # this forward even if ATOM refills the same cu_seqlens buffers.
+            key = (_step, cu_q, cu_k, k.shape[0])
+            cached = _prefill_plan
+            if _step is not None and cached is not None and all(
+                a is b for a, b in zip(cached[0][:3], key[:3])
+            ) and cached[0][3] == key[3]:
+                plan = cached[1]
+            else:
+                plan = causal_chunk_meta(cu_q.tolist(), cu_k.tolist(), k.shape[0], q.device)
+                _prefill_plan = (key, plan)
+            return chunked_causal_attention(q, k, v, plan, self.scale)
 
         out = torch.empty_like(q)
         one = torch.tensor([0, 1], dtype=torch.int32, device=q.device)
@@ -876,10 +916,7 @@ def patch_attention(module):
         return out
 
     def _use_qlen1_prefill():
-        return (
-            os.environ.get("LUMENRL_ALIGN_DECODE", "0") == "1"
-            or os.environ.get("LUMENRL_PREFILL_DECODE_ATTN", "0") == "1"
-        )
+        return _flag("LUMENRL_ALIGN_DECODE") or _flag("LUMENRL_PREFILL_DECODE_ATTN")
 
     def dispatch_backend(self, fwd_ctx, q, k, v):
         prefill = bool(getattr(getattr(fwd_ctx, "context", None), "is_prefill", False))
@@ -887,7 +924,7 @@ def patch_attention(module):
             if _use_qlen1_prefill():
                 return self.prefill_attention_decode_varlen
             return orig_dispatch(self, fwd_ctx, q, k, v)
-        if os.environ.get("LUMENRL_ALIGN_DECODE", "0") != "1":
+        if not _flag("LUMENRL_ALIGN_DECODE"):
             return orig_dispatch(self, fwd_ctx, q, k, v)
         return self.paged_attention_varlen
 

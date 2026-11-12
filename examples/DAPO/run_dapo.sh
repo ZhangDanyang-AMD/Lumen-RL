@@ -1,8 +1,22 @@
 #!/usr/bin/env bash
-# 统一 DAPO 启动：MODE=bf16|fp8|atomfp8|atombf16, TRAIN_FP8=0|1, STEPS=N。路径取容器内 $RL_ROOT/$DATA_ROOT。
+# 统一 DAPO 启动：MODE=bf16|fp8|atomfp8|atombf16, TRAIN_FP8=0|1, STEPS=N。
+# 训推一致性与精度分开：MODE 选引擎和数值格式，LUMENRL_CONSISTENT=1 才打开对齐。
+# 例：MODE=atombf16 LUMENRL_CONSISTENT=1 bash examples/DAPO/run_dapo.sh
+# 路径取容器内 $RL_ROOT/$DATA_ROOT。
 set -uo pipefail
 : "${RL_ROOT:?}"; : "${DATA_ROOT:?}"
 MODE="${MODE:-bf16}"; TRAIN_FP8="${TRAIN_FP8:-0}"; STEPS="${STEPS:-1000}"
+LUMENRL_CONSISTENT="${LUMENRL_CONSISTENT:-0}"
+export LUMENRL_CONSISTENT
+if [ "$LUMENRL_CONSISTENT" = "1" ]; then
+  case "$MODE" in
+    atomfp8|atom_fp8|atombf16|atom_bf16) ;;
+    *)
+      echo "LUMENRL_CONSISTENT=1 applies to ATOM modes (atombf16, atomfp8); MODE=$MODE has no consistent path" >&2
+      exit 1
+      ;;
+  esac
+fi
 MODEL_PATH="${MODEL_PATH:-$DATA_ROOT/models/Qwen3-8B-Base}"
 TRAIN_FILE="${TRAIN_FILE:-$DATA_ROOT/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet}"
 VAL_FILE="${VAL_FILE:-$DATA_ROOT/data_cached/qwen3-8b-maxprompt1024/aime-2024.filtered.parquet}"
@@ -112,16 +126,21 @@ if [ "$MODE" = "atomfp8" ] || [ "$MODE" = "atom_fp8" ] || \
   # 这条路径本身，不属于某几个例子编号——手工调 run_dapo.sh 的人同样漏不掉。
   # ATOM 自己的修复进入所钉的 commit 后即可删除。
   export ATOM_FORCE_ATTN_TRITON="${ATOM_FORCE_ATTN_TRITON:-1}"
-  if [ "$ATOM_BF16" = "1" ]; then
-    # Train with the six ATOM ops. Decode, q_len=1 prefill, and the packed
-    # trainer all use aiter RoPE plus one q_len=1 varlen launch, so the loss
-    # sees the decode logprob. The gather allocates each step, so this path
-    # stays eager; level=3 FULL graphs replay fixed addresses and abort.
-    # Prefill rescore stays off: it would replace those decode scores with a
-    # second prefill and hide a real train/decode gap.
+  if [ "$LUMENRL_CONSISTENT" = "1" ]; then
+    # Same alignment for every ATOM precision. Decode, prefill, and the packed
+    # trainer use aiter RoPE and the q_len=1 arithmetic of the varlen kernel,
+    # with keys past 1024 split into 1024-key blocks the same way on every side,
+    # so the loss sees the decode logprob. The 256-row bitwise equality is
+    # measured for bf16 hd128; other dtypes still take this launch and need
+    # their own mismatch check. Quantization stays with MODE. The gather
+    # allocates each step, so this path stays eager; level=3 FULL graphs replay
+    # fixed addresses and abort. Prefill rescore stays off: it would replace
+    # those decode scores with a second prefill and hide a real train/decode
+    # gap. Output stays deferred (SYNC_OUTPUT=0); the logprob copy is kept
+    # safe by record_stream.
     export LUMEN_ATOM_OPS="${LUMEN_ATOM_OPS:-rmsnorm,residual_rmsnorm,qkv,rope,varlen_attn,gate_up}"
     export LUMENRL_ALIGN_DECODE="${LUMENRL_ALIGN_DECODE:-1}"
-    export LUMENRL_ALIGN_SYNC_OUTPUT="${LUMENRL_ALIGN_SYNC_OUTPUT:-1}"
+    export LUMENRL_ALIGN_SYNC_OUTPUT="${LUMENRL_ALIGN_SYNC_OUTPUT:-0}"
     export LUMENRL_ALIGN_CONTIG_KV="${LUMENRL_ALIGN_CONTIG_KV:-1}"
     export LUMENRL_ALIGN_BATCHED_DECODE="${LUMENRL_ALIGN_BATCHED_DECODE:-1}"
     export LUMENRL_PREFILL_DECODE_ATTN="${LUMENRL_PREFILL_DECODE_ATTN:-1}"
@@ -180,7 +199,8 @@ PY
   fi
   # no-eager level=3 正式方案：enforce_eager=false + compilation_config.level=3 + sleep2
   # （sleep_mode 训练前释放 rollout KV/weights/CUDA graph，避免 backward OOM）。
-  # BF16 对齐 decode 在每次 forward 里 gather KV，地址不固定，FULL graph 重放会失败。
+  # LUMENRL_CONSISTENT=1 打开 ALIGN_DECODE，每次 forward gather KV，地址不固定，
+  # FULL graph 重放会失败，所以这条路径改走 eager。
   if [ "${LUMENRL_ALIGN_DECODE:-0}" = "1" ]; then
     EXTRA_ARGS+=(
       policy.generation.vllm_cfg.enforce_eager=true
@@ -231,7 +251,7 @@ if [ "${ENABLE_MORI:-false}" = "true" ] || [ "${ENABLE_MORI:-0}" = "1" ]; then
 fi
 
 echo "$LOG" > /tmp/run_dapo_log.txt
-echo "=== MODE=$MODE TRAIN_FP8=$TRAIN_FP8 STEPS=$STEPS  CONFIG=$CONFIG  LOG=$LOG ==="
+echo "=== MODE=$MODE TRAIN_FP8=$TRAIN_FP8 LUMENRL_CONSISTENT=$LUMENRL_CONSISTENT STEPS=$STEPS  CONFIG=$CONFIG  LOG=$LOG ==="
 
 # 清理旧进程
 ray stop --force >/dev/null 2>&1 || true
