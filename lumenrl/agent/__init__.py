@@ -6,8 +6,11 @@ from lumenrl.agent.loop import GenerateFn, ToolAgentLoop, truncate_tool_response
 from lumenrl.agent.tool_parser import HermesToolParser, ToolCall, ToolCallParser
 from lumenrl.agent.tools import (
     SandboxFusionCodeTool,
+    StatefulSandboxFusionCodeTool,
+    StatefulTool,
     Tool,
     ToolResult,
+    ToolSession,
     prepare_python_code,
 )
 from lumenrl.agent.trajectory import Trajectory
@@ -19,11 +22,14 @@ __all__ = [
     "GenerateFn",
     "HermesToolParser",
     "SandboxFusionCodeTool",
+    "StatefulSandboxFusionCodeTool",
+    "StatefulTool",
     "Tool",
     "ToolAgentLoop",
     "ToolCall",
     "ToolCallParser",
     "ToolResult",
+    "ToolSession",
     "Trajectory",
     "prepare_python_code",
     "truncate_tool_response",

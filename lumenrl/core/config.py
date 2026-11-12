@@ -388,6 +388,9 @@ class SandboxFusionToolConfig:
     memory_limit_mb: int = 1024
     # Requests in flight to the sandbox at once, across all rollouts.
     max_concurrency: int = 64
+    # Calls within one rollout share a Python session (variables, functions,
+    # imports), kept by re-running the earlier calls; Python only.
+    stateful: bool = False
 
 
 @dataclass

@@ -20,7 +20,7 @@ from lumenrl.agent.deepseek_v4 import (
 from lumenrl.agent.loop import ToolAgentLoop
 from lumenrl.agent.runner import AgentRunner
 from lumenrl.agent.tool_parser import HermesToolParser
-from lumenrl.agent.tools import SandboxFusionCodeTool
+from lumenrl.agent.tools import SandboxFusionCodeTool, StatefulSandboxFusionCodeTool
 from lumenrl.agent.trajectory import Trajectory
 
 STOP_REASONS = ("answer", "length", "max_turns", "abort")
@@ -132,7 +132,8 @@ def build_agent_rollout(config: Any, tokenizer: Any, servers: list[Any]) -> Agen
     tools = []
     ci = mt.code_interpreter
     if ci.enabled:
-        tools.append(SandboxFusionCodeTool(
+        tool_class = StatefulSandboxFusionCodeTool if ci.stateful else SandboxFusionCodeTool
+        tools.append(tool_class(
             ci.url,
             language=ci.language,
             run_timeout_s=ci.run_timeout_s,

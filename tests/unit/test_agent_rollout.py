@@ -16,6 +16,7 @@ from lumenrl.agent.chat import ChatTemplateTokenizer
 from lumenrl.agent.deepseek_v4 import DeepSeekV41ChatTokenizer, DeepSeekV4ChatTokenizer, DsmlToolParser
 from lumenrl.agent.loop import ToolAgentLoop
 from lumenrl.agent.tool_parser import ToolCall
+from lumenrl.agent.tools import StatefulSandboxFusionCodeTool
 from lumenrl.agent.trajectory import Trajectory
 from lumenrl.core.config import LumenRLConfig
 from lumenrl.engine.inference.atom_ray_server import ATOMRayServer
@@ -122,6 +123,20 @@ def test_config_builds_the_sandbox_tool():
         assert tool._url == "http://172.30.0.10:8080/run_code"
         assert rollout._agent._max_assistant_turns == 3
         assert rollout._max_response_tokens == config.policy.max_response_length
+    finally:
+        rollout.close()
+
+
+def test_config_makes_the_code_interpreter_stateful():
+    config = LumenRLConfig()
+    mt = config.policy.generation.multi_turn
+    mt.enabled = True
+    mt.code_interpreter.stateful = True
+
+    rollout = build_agent_rollout(config, ChatMLTokenizer(), [object()])
+    try:
+        [tool] = rollout._agent._tools.values()
+        assert isinstance(tool, StatefulSandboxFusionCodeTool)
     finally:
         rollout.close()
 

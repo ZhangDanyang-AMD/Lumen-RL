@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
 from lumenrl.agent.chat import ChatTemplateTokenizer
 from lumenrl.agent.tool_parser import HermesToolParser, ToolCall, ToolCallParser
-from lumenrl.agent.tools import Tool, ToolResult
+from lumenrl.agent.tools import StatefulTool, Tool, ToolResult, ToolSession
 from lumenrl.agent.trajectory import Trajectory
+
+logger = logging.getLogger(__name__)
 
 # (token ids so far, sampling params) -> a ``VLLMRayServer.generate`` result.
 GenerateFn = Callable[[list[int], dict[str, Any]], Awaitable[dict[str, Any]]]
@@ -37,13 +40,15 @@ class ToolAgentLoop:
     has them run and their output appended as environment tokens; a turn
     without ends the rollout. The rollout also ends after
     ``max_assistant_turns`` turns, or when the response (model and environment
-    tokens together) would exceed its token budget.
+    tokens together) would exceed its token budget. A stateful tool (one with
+    ``open``) gets a session per rollout, opened at the first call and closed
+    when the rollout ends.
     """
 
     def __init__(
         self,
         chat: ChatTemplateTokenizer,
-        tools: Sequence[Tool],
+        tools: Sequence[Tool | StatefulTool],
         *,
         parser: ToolCallParser | None = None,
         max_assistant_turns: int = 8,
@@ -83,6 +88,27 @@ class ToolAgentLoop:
             max_response_tokens = min(
                 max_response_tokens, max_sequence_tokens - len(trajectory.prompt_ids),
             )
+        sessions: dict[str, ToolSession] = {}
+        try:
+            await self._roll_out(
+                trajectory, generate, sampling_params, max_response_tokens, sessions,
+            )
+        finally:
+            for name, session in sessions.items():
+                try:
+                    await session.close()
+                except Exception as e:  # noqa: BLE001 - a failed close must not lose the rollout
+                    logger.warning("closing the %s session failed: %r", name, e)
+        return trajectory
+
+    async def _roll_out(
+        self,
+        trajectory: Trajectory,
+        generate: GenerateFn,
+        sampling_params: dict[str, Any],
+        max_response_tokens: int,
+        sessions: dict[str, ToolSession],
+    ) -> None:
         while True:
             budget = max_response_tokens - len(trajectory.response_ids)
             if budget <= 0:
@@ -114,7 +140,7 @@ class ToolAgentLoop:
 
             calls = calls[: self._max_parallel_calls]
             t0 = time.perf_counter()
-            results = await asyncio.gather(*(self._call(call) for call in calls))
+            results = await asyncio.gather(*(self._call(call, sessions) for call in calls))
             trajectory.tool_s += time.perf_counter() - t0
             trajectory.tool_calls += len(results)
             trajectory.tool_errors += sum(not result.ok for result in results)
@@ -132,13 +158,16 @@ class ToolAgentLoop:
                 trajectory.stop_reason = "length"
                 break
             trajectory.add_environment(environment)
-        return trajectory
 
-    async def _call(self, call: ToolCall) -> ToolResult:
+    async def _call(self, call: ToolCall, sessions: dict[str, ToolSession]) -> ToolResult:
         tool = self._tools.get(call.name)
         if tool is None:
             return ToolResult(f"Error: unknown tool {call.name!r}.", ok=False)
         try:
+            if hasattr(tool, "open"):
+                if call.name not in sessions:
+                    sessions[call.name] = tool.open()
+                return await sessions[call.name](call.arguments)
             return await tool(call.arguments)
         except Exception as e:  # noqa: BLE001 - a tool's failure is the model's observation
             return ToolResult(f"Error when executing tool: {e}", ok=False)

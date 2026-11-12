@@ -35,6 +35,40 @@ class EchoTool:
         return ToolResult(self.output if self.output is not None else str(arguments["code"]))
 
 
+class CountingSession:
+    def __init__(self, *, fail_close: bool = False) -> None:
+        self.calls: list[dict] = []
+        self.closed = False
+        self.fail_close = fail_close
+
+    async def __call__(self, arguments):
+        self.calls.append(arguments)
+        return ToolResult(f"call {len(self.calls)}")
+
+    async def close(self):
+        self.closed = True
+        if self.fail_close:
+            raise RuntimeError("close failed")
+
+
+class SessionTool:
+    """Opens a ``CountingSession`` per rollout."""
+
+    name = "code_interpreter"
+
+    def __init__(self, *, fail_close: bool = False) -> None:
+        self.sessions: list[CountingSession] = []
+        self.fail_close = fail_close
+
+    @property
+    def schema(self):
+        return {"type": "function", "function": {"name": self.name}}
+
+    def open(self):
+        self.sessions.append(CountingSession(fail_close=self.fail_close))
+        return self.sessions[-1]
+
+
 class ScriptedEngine:
     """Replays one ``(text, finish_reason)`` turn per generate call."""
 
@@ -244,3 +278,39 @@ def test_truncation_matches_verl(side, expected):
 def test_unknown_truncation_side_is_rejected():
     with pytest.raises(ValueError, match="truncate_side"):
         ToolAgentLoop(ChatTemplateTokenizer(ChatMLTokenizer()), [], tool_response_truncate_side="top")
+
+
+def test_a_stateful_tool_gets_one_session_per_rollout_closed_when_it_ends():
+    tool = SessionTool()
+
+    trajectory, _, _, tok = run_loop([(call("a"), "stop"), (call("b"), "stop"), ("42", "stop")], tool=tool)
+
+    [session] = tool.sessions
+    assert [c["code"] for c in session.calls] == ["a", "b"]
+    assert session.closed
+    assert "call 2" in tok.decode(trajectory.response_ids)
+
+
+def test_a_rollout_without_tool_calls_opens_no_session():
+    tool = SessionTool()
+
+    run_loop([("42", "stop")], tool=tool)
+
+    assert tool.sessions == []
+
+
+def test_the_session_is_closed_when_the_rollout_fails():
+    tool = SessionTool()
+
+    with pytest.raises(IndexError):
+        run_loop([(call("a"), "stop")], tool=tool)  # the engine has no second turn
+
+    assert tool.sessions[0].closed
+
+
+def test_a_session_that_fails_to_close_does_not_lose_the_rollout():
+    tool = SessionTool(fail_close=True)
+
+    trajectory, *_ = run_loop([(call("a"), "stop"), ("42", "stop")], tool=tool)
+
+    assert trajectory.stop_reason == "answer" and trajectory.tool_calls == 1
