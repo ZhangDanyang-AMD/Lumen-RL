@@ -14,6 +14,7 @@ import logging
 import os
 import socket
 import sys
+from contextlib import AbstractContextManager, nullcontext
 from multiprocessing import shared_memory
 from typing import Any, Optional
 from uuid import uuid4
@@ -36,6 +37,21 @@ if not logger.handlers and not logging.getLogger().handlers:
     _h = logging.StreamHandler(sys.stderr)
     _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     logger.addHandler(_h)
+
+
+def _weight_sync_session(core_mgr: Any) -> AbstractContextManager[None]:
+    """One sync id for every bucket, when this ATOM provides the session.
+
+    A current ATOM rejects a non-final weight bucket outside
+    ``weight_sync_session``, because another sender could commit the tail of
+    this update as its own. The ATOM pinned in the release image has no such
+    method and accepts each bucket as its own sync. The lookup is once per
+    weight update, off the decode path.
+    """
+    session = getattr(core_mgr, "weight_sync_session", None)
+    if session is None:
+        return nullcontext()
+    return session()
 
 
 class ATOMRayServer:
@@ -545,10 +561,10 @@ class ATOMRayServer:
             per_gpu_ipc_handles = {gpu_idx: reduce_tensor(buf) for gpu_idx, buf in per_gpu_buffers.items()}
             stats = {"buckets": 0, "weights": 0, "experts": 0}
 
-            # Non-final buckets share one sync id. ATOM rejects them outside
-            # weight_sync_session, because a second sender could otherwise
-            # commit the tail of this update as its own.
-            with self.engine.core_mgr.weight_sync_session():
+            # Non-final buckets share one sync id when ATOM provides the
+            # session. An older CoreManager has no such method; the helper
+            # then leaves the loop as it was.
+            with _weight_sync_session(self.engine.core_mgr):
               while True:
                 metadata = socket.recv_pyobj()
                 check_bucket_version(metadata, version)
@@ -674,7 +690,7 @@ class ATOMRayServer:
             comm_metadata = socket.recv_pyobj()
             socket.send(b"")
             shm = shared_memory.SharedMemory(name=comm_metadata["name"])
-            with self.engine.core_mgr.weight_sync_session():
+            with _weight_sync_session(self.engine.core_mgr):
               while True:
                 metadata = socket.recv_pyobj()
                 check_bucket_version(metadata, version)
