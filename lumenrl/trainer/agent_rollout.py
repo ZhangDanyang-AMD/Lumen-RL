@@ -11,7 +11,12 @@ from typing import Any
 import torch
 
 from lumenrl.agent.chat import ChatTemplateTokenizer
-from lumenrl.agent.deepseek_v4 import DeepSeekV4ChatTokenizer, DsmlToolParser
+from lumenrl.agent.deepseek_v4 import (
+    V41_TAGS,
+    DeepSeekV41ChatTokenizer,
+    DeepSeekV4ChatTokenizer,
+    DsmlToolParser,
+)
 from lumenrl.agent.loop import ToolAgentLoop
 from lumenrl.agent.runner import AgentRunner
 from lumenrl.agent.tool_parser import HermesToolParser
@@ -112,8 +117,11 @@ def _chat_and_parser(mt: Any, tokenizer: Any) -> tuple[Any, Any]:
         return ChatTemplateTokenizer(tokenizer, kwargs), HermesToolParser()
     if mt.format == "dsml":
         return DeepSeekV4ChatTokenizer(tokenizer, **kwargs), DsmlToolParser()
+    if mt.format == "dsml_v41":
+        return DeepSeekV41ChatTokenizer(tokenizer, **kwargs), DsmlToolParser(V41_TAGS)
     raise ValueError(
-        f"multi_turn.format={mt.format!r}: supported are 'hermes' (Qwen) and 'dsml' (DeepSeek-V4)"
+        f"multi_turn.format={mt.format!r}: supported are 'hermes' (Qwen), 'dsml' (DeepSeek-V4) "
+        "and 'dsml_v41' (DeepSeek-V4.1)"
     )
 
 

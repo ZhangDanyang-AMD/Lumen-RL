@@ -13,8 +13,9 @@ import pytest
 import torch
 
 from lumenrl.agent.chat import ChatTemplateTokenizer
-from lumenrl.agent.deepseek_v4 import DeepSeekV4ChatTokenizer, DsmlToolParser
+from lumenrl.agent.deepseek_v4 import DeepSeekV41ChatTokenizer, DeepSeekV4ChatTokenizer, DsmlToolParser
 from lumenrl.agent.loop import ToolAgentLoop
+from lumenrl.agent.tool_parser import ToolCall
 from lumenrl.agent.trajectory import Trajectory
 from lumenrl.core.config import LumenRLConfig
 from lumenrl.engine.inference.atom_ray_server import ATOMRayServer
@@ -145,6 +146,26 @@ def test_config_picks_deepseek_v4_encoding_for_dsml_calls():
         assert isinstance(rollout._agent._chat, DeepSeekV4ChatTokenizer)
         assert rollout._agent._chat._assistant_start.endswith("<think>")
         assert isinstance(rollout._agent._parser, DsmlToolParser)
+    finally:
+        rollout.close()
+
+
+def test_config_picks_deepseek_v41_encoding_for_dsml_v41_calls():
+    config = LumenRLConfig()
+    mt = config.policy.generation.multi_turn
+    mt.enabled = True
+    mt.format = "dsml_v41"
+    mt.chat_template_kwargs = {"thinking_mode": "thinking", "reasoning_effort": "max"}
+    v41_call = '\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="f">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>'
+
+    rollout = build_agent_rollout(config, ChatMLTokenizer(), [object()])
+    try:
+        chat = rollout._agent._chat
+        assert isinstance(chat, DeepSeekV41ChatTokenizer)
+        assert chat.decode(chat.encode_prompt([{"role": "user", "content": "q"}])).startswith(
+            "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 100 "
+        )
+        assert rollout._agent._parser.parse(v41_call) == ([ToolCall("f", {})], 0)
     finally:
         rollout.close()
 

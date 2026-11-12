@@ -1,8 +1,8 @@
-"""DeepSeek-V4's encoding for agent rollouts, and DSML tool-call parsing.
+"""DeepSeek-V4's and V4.1's encodings for agent rollouts, and DSML tool-call parsing.
 
-``data/deepseek_v4`` holds case 1 of the tests that come with DeepSeek-V4's
-reference encoding (MIT, see the LICENSE there): a thinking-mode conversation
-with one tool call.
+``data/deepseek_v4`` and ``data/deepseek_v41`` hold case 1 of the tests that
+come with DeepSeek-V4's and V4.1's reference encodings (MIT, see the LICENSE
+in each): a thinking-mode conversation with one tool call.
 """
 
 from __future__ import annotations
@@ -17,15 +17,21 @@ from lumenrl.agent.deepseek_v4 import (
     ASSISTANT,
     BOS,
     EOS,
+    SYSTEM,
     THINK_END,
     THINK_START,
     USER,
+    V4_TAGS,
+    V41_TAGS,
+    DeepSeekV41ChatTokenizer,
     DeepSeekV4ChatTokenizer,
     DsmlToolParser,
+    DsmlTags,
 )
 from lumenrl.agent.tool_parser import ToolCall
 
 DATA = Path(__file__).parent / "data" / "deepseek_v4"
+DATA_V41 = Path(__file__).parent / "data" / "deepseek_v41"
 SPECIALS = (BOS, EOS, USER, ASSISTANT, THINK_START, THINK_END)
 _IDS = {token: 200_000 + i for i, token in enumerate(SPECIALS)}
 _TOKENS = {i: token for token, i in _IDS.items()}
@@ -51,9 +57,14 @@ class CharTokenizer:
         return "".join(_TOKENS.get(i) or chr(i) for i in ids)
 
 
-def test_a_tool_round_appends_to_what_the_reference_encoding_renders():
-    case = json.loads((DATA / "test_input_1.json").read_text())
-    gold = (DATA / "test_output_1.txt").read_text()
+@pytest.mark.parametrize(
+    ("data", "chat_class", "tags"),
+    [(DATA, DeepSeekV4ChatTokenizer, V4_TAGS), (DATA_V41, DeepSeekV41ChatTokenizer, V41_TAGS)],
+    ids=["v4", "v41"],
+)
+def test_a_tool_round_appends_to_what_the_reference_encoding_renders(data, chat_class, tags):
+    case = json.loads((data / "test_input_1.json").read_text())
+    gold = (data / "test_output_1.txt").read_text()
     system, user, _, tool, _ = case["messages"]
     # The model's two turns, as DeepSeek's own test cuts them out of the rendering.
     marker = ASSISTANT + THINK_START
@@ -63,14 +74,14 @@ def test_a_tool_round_appends_to_what_the_reference_encoding_renders():
     second_turn = gold[second:]
 
     tok = CharTokenizer()
-    chat = DeepSeekV4ChatTokenizer(tok, thinking_mode="thinking")
+    chat = chat_class(tok, thinking_mode="thinking")
     prompt = chat.encode_prompt([system, user], case["tools"])
     turn = tok.encode(first_turn)
     environment = chat.encode_tool_responses([tool["content"]], after=turn)
 
     assert tok.decode(prompt) == gold[:first]
     assert tok.decode(prompt + turn + environment + tok.encode(second_turn)) == gold
-    calls, malformed = DsmlToolParser().parse(first_turn)
+    calls, malformed = DsmlToolParser(tags).parse(first_turn)
     assert calls == [ToolCall("get_weather", {"location": "Beijing", "unit": "celsius"})]
     assert malformed == 0
 
@@ -109,24 +120,75 @@ def test_an_unknown_thinking_mode_is_rejected():
         DeepSeekV4ChatTokenizer(CharTokenizer(), thinking_mode="think")
 
 
-def dsml_call(name: str, *params: tuple[str, str, str]) -> str:
+def effort(budget: int) -> str:
+    return f"Reasoning Effort: {budget} (range 1-100, the higher the value, the more thorough the reasoning)\n\n"
+
+
+USER_67 = {"role": "user", "content": "6*7?"}
+BRIEF = {"role": "system", "content": "Be brief."}
+
+
+@pytest.mark.parametrize(
+    ("thinking_mode", "reasoning_effort", "messages", "rendered"),
+    [
+        ("chat", "high", [USER_67], BOS + USER + "6*7?" + ASSISTANT + THINK_END),
+        ("chat", "low", [BRIEF, USER_67], BOS + SYSTEM + "Be brief." + USER + "6*7?" + ASSISTANT + THINK_END),
+        ("thinking", "max", [USER_67], BOS + SYSTEM + effort(100) + USER + "6*7?" + ASSISTANT + THINK_START),
+        ("thinking", 30, [BRIEF, USER_67], BOS + SYSTEM + effort(30) + "Be brief." + USER + "6*7?" + ASSISTANT + THINK_START),
+        ("chat", "high", [USER_67, {"role": "user", "content": "And 6*8?"}],
+         BOS + USER + "6*7?\n\nAnd 6*8?" + ASSISTANT + THINK_END),
+    ],
+    ids=["chat", "chat-system", "thinking-max", "thinking-30-system", "two-user-messages"],
+)
+def test_v41_prompts_render_as_its_reference_encoding_does(thinking_mode, reasoning_effort, messages, rendered):
+    tok = CharTokenizer()
+    chat = DeepSeekV41ChatTokenizer(tok, thinking_mode=thinking_mode, reasoning_effort=reasoning_effort)
+
+    assert tok.decode(chat.encode_prompt(messages)) == rendered
+
+
+def test_v41_tools_without_a_system_message_get_an_empty_system_turn():
+    tok = CharTokenizer()
+    chat = DeepSeekV41ChatTokenizer(tok)
+
+    prompt = tok.decode(chat.encode_prompt([USER_67], TOOLS))
+
+    assert prompt.startswith(BOS + SYSTEM + "\n\n## Tools\n")
+    assert '"<｜DSML｜ calls>" block' in prompt and "<｜DSML｜tool_calls>" not in prompt
+    assert prompt.endswith('{"name": "code_interpreter", "parameters": {}}\n\n'
+                           "You MUST strictly follow the above defined tool name and parameter schemas "
+                           "to invoke tool calls.\n" + USER + "6*7?" + ASSISTANT + THINK_END)
+
+
+@pytest.mark.parametrize("reasoning_effort", [0, 101, "medium", 7.5, True])
+def test_v41_rejects_a_reasoning_effort_outside_its_budget(reasoning_effort):
+    with pytest.raises(ValueError, match="reasoning_effort"):
+        DeepSeekV41ChatTokenizer(CharTokenizer(), thinking_mode="thinking", reasoning_effort=reasoning_effort)
+
+
+TAGS = pytest.mark.parametrize("tags", [V4_TAGS, V41_TAGS], ids=["v4", "v41"])
+
+
+def dsml_call(name: str, *params: tuple[str, str, str], tags: DsmlTags = V4_TAGS) -> str:
     body = "".join(
-        f'<｜DSML｜parameter name="{k}" string="{s}">{v}</｜DSML｜parameter>\n' for k, s, v in params
+        f'<｜DSML｜{tags.parameter} name="{k}" string="{s}">{v}</｜DSML｜{tags.parameter}>\n' for k, s, v in params
     )
-    return f'<｜DSML｜invoke name="{name}">\n{body}</｜DSML｜invoke>\n'
+    return f'<｜DSML｜{tags.invoke} name="{name}">\n{body}</｜DSML｜{tags.invoke}>\n'
 
 
-def tool_calls(*calls: str) -> str:
-    return "\n\n<｜DSML｜tool_calls>\n" + "".join(calls) + "</｜DSML｜tool_calls>" + EOS
+def tool_calls(*calls: str, tags: DsmlTags = V4_TAGS) -> str:
+    return f"\n\n<｜DSML｜{tags.calls}>\n" + "".join(calls) + f"</｜DSML｜{tags.calls}>" + EOS
 
 
-def test_parser_reads_string_and_json_parameters_of_every_call():
+@TAGS
+def test_parser_reads_string_and_json_parameters_of_every_call(tags):
     text = "Let me run it." + tool_calls(
-        dsml_call("code_interpreter", ("code", "true", 'print("a < b")\nx = 1')),
-        dsml_call("search", ("q", "true", "x"), ("n", "false", "3"), ("opts", "false", '{"a": [1]}')),
+        dsml_call("code_interpreter", ("code", "true", 'print("a < b")\nx = 1'), tags=tags),
+        dsml_call("search", ("q", "true", "x"), ("n", "false", "3"), ("opts", "false", '{"a": [1]}'), tags=tags),
+        tags=tags,
     )
 
-    calls, malformed = DsmlToolParser().parse(text)
+    calls, malformed = DsmlToolParser(tags).parse(text)
 
     assert calls == [
         ToolCall("code_interpreter", {"code": 'print("a < b")\nx = 1'}),
@@ -135,27 +197,40 @@ def test_parser_reads_string_and_json_parameters_of_every_call():
     assert malformed == 0
 
 
-@pytest.mark.parametrize(
-    "bad",
-    [
-        dsml_call("", ("code", "true", "1")),
-        dsml_call("code_interpreter", ("n", "false", "not json")),
-        dsml_call("code_interpreter", ("code", "true", "1"), ("code", "true", "2")),
-        '<｜DSML｜invoke name="code_interpreter">\nstray text\n</｜DSML｜invoke>\n',
-        "not an invoke\n",
-    ],
-    ids=["no-name", "bad-json", "repeated-parameter", "text-in-invoke", "text-in-block"],
-)
-def test_parser_counts_malformed_calls(bad):
-    text = tool_calls(bad, dsml_call("ok"))
+BAD_CALLS = {
+    "no-name": lambda tags: dsml_call("", ("code", "true", "1"), tags=tags),
+    "bad-json": lambda tags: dsml_call("code_interpreter", ("n", "false", "not json"), tags=tags),
+    "repeated-parameter": lambda tags: dsml_call(
+        "code_interpreter", ("code", "true", "1"), ("code", "true", "2"), tags=tags,
+    ),
+    "text-in-invoke": lambda tags: (
+        f'<｜DSML｜{tags.invoke} name="code_interpreter">\nstray text\n</｜DSML｜{tags.invoke}>\n'
+    ),
+    "text-in-block": lambda tags: "not an invoke\n",
+}
 
-    calls, malformed = DsmlToolParser().parse(text)
+
+@TAGS
+@pytest.mark.parametrize("bad", list(BAD_CALLS))
+def test_parser_counts_malformed_calls(tags, bad):
+    text = tool_calls(BAD_CALLS[bad](tags), dsml_call("ok", tags=tags), tags=tags)
+
+    calls, malformed = DsmlToolParser(tags).parse(text)
 
     assert calls == [ToolCall("ok", {})]
     assert malformed == 1
 
 
-def test_parser_ignores_an_unclosed_block():
-    text = "\n\n<｜DSML｜tool_calls>\n" + dsml_call("code_interpreter", ("code", "true", "1"))
+@TAGS
+def test_parser_ignores_an_unclosed_block(tags):
+    text = f"\n\n<｜DSML｜{tags.calls}>\n" + dsml_call("code_interpreter", ("code", "true", "1"), tags=tags)
 
-    assert DsmlToolParser().parse(text) == ([], 0)
+    assert DsmlToolParser(tags).parse(text) == ([], 0)
+
+
+def test_each_parser_reads_only_its_own_version_of_dsml():
+    v4 = tool_calls(dsml_call("code_interpreter", ("code", "true", "1")))
+    v41 = tool_calls(dsml_call("code_interpreter", ("code", "true", "1"), tags=V41_TAGS), tags=V41_TAGS)
+
+    assert DsmlToolParser(V4_TAGS).parse(v41) == ([], 0)
+    assert DsmlToolParser(V41_TAGS).parse(v4) == ([], 0)
