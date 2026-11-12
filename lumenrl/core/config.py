@@ -571,6 +571,11 @@ class AlgorithmConfig:
     clip_ratio_low: Optional[float] = None
     clip_ratio_high: Optional[float] = None
     clip_ratio_c: float = 3.0
+    # Embodied GRPO: drop a group unless its mean episode return is inside the band.
+    # RLinf wan_libero_spatial_grpo_openvlaoft.yaml uses 0.5 and 4.5 with reward_coef 5.
+    filter_rewards: bool = False
+    rewards_lower_bound: float = 0.5
+    rewards_upper_bound: float = 4.5
     # Rollout correction (also available via quantization.rollout_correction)
     rollout_correction: Optional[RolloutCorrectionConfig] = None
 
@@ -968,6 +973,7 @@ class EmbodiedPolicyConfig:
     unnorm_key: str = "libero_spatial_no_noops"
     gradient_checkpointing: bool = True
     freeze_vision_backbone: bool = False
+    reshard_after_forward: bool = True
 
 
 @dataclass
@@ -981,6 +987,8 @@ class EmbodiedEnvConfig:
     max_episode_steps: int = 200
     world_model_kwargs: dict = field(default_factory=dict)  # passed to the plugin's build_world_model
     success_logit_threshold: float = 0.0
+    use_rel_reward: bool = False       # RLinf: reward_coef * r_t - r_{t-1} per generated frame
+    reward_coef: float = 5.0
     wm_batch_size: int = 32
     task_suite: str = "libero_spatial"  # libero backend
     camera_height: int = 128
@@ -1017,6 +1025,8 @@ class EmbodiedConfig:
     log_dir: str = ""                  # per-step metrics as embodied_metrics.jsonl
     save_interval: int = 0             # save the policy every N steps (and at the end) when > 0
     save_dir: str = ""                 # default: <log_dir>/checkpoints
+    resume_from: str = ""              # policy.safetensors written by save_policy
+    resume_step: int = 0               # last finished step; the loop continues at this index
     lumen: dict = field(default_factory=dict)
 
 

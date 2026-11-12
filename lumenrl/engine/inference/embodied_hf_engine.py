@@ -47,6 +47,7 @@ class EmbodiedTrajectoryBatch:
     success: torch.Tensor            # bool [N]
     episode_chunks: torch.Tensor     # long [N] action chunks executed
     metrics: dict[str, float] = field(default_factory=dict)
+    returns: Optional[torch.Tensor] = None  # float [N], RLinf relative-reward return
 
     @property
     def num_samples(self) -> int:
@@ -79,6 +80,10 @@ class EmbodiedTrajectoryBatch:
             "rollout/episode_chunks": sum(p.metrics["rollout/episode_chunks"] * n for p, n in zip(parts, episodes)) / n_ep,
             "rollout/num_samples": float(sum(p.metrics["rollout/num_samples"] for p in parts)),
         }
+        if all("rollout/episode_return" in p.metrics for p in parts):
+            metrics["rollout/episode_return"] = sum(
+                p.metrics["rollout/episode_return"] * n for p, n in zip(parts, episodes)
+            ) / n_ep
         for key in (
             "timing/rollout_policy_s", "timing/rollout_env_s",
             "timing/env_reset_s", "timing/env_sim_s", "rollout/env_sim_steps",
@@ -96,6 +101,7 @@ class EmbodiedTrajectoryBatch:
             success=torch.cat([p.success for p in parts]),
             episode_chunks=torch.cat([p.episode_chunks for p in parts]),
             metrics=metrics,
+            returns=torch.cat([p.returns for p in parts]) if all(p.returns is not None for p in parts) else None,
         )
 
 
@@ -189,6 +195,9 @@ class EmbodiedHFRollout:
 
         env_ids = torch.cat(rec["env"])
         success = env.success.cpu()
+        returns = None
+        if getattr(env, "use_rel_reward", False):
+            returns = env.episode_return.detach().float().cpu()
         metrics = {
             "rollout/success_rate": success.float().mean().item(),
             "rollout/episode_chunks": chunks.float().mean().item(),
@@ -196,6 +205,8 @@ class EmbodiedHFRollout:
             "timing/rollout_policy_s": policy_s,
             "timing/rollout_env_s": env_s,
         }
+        if returns is not None:
+            metrics["rollout/episode_return"] = returns.mean().item()
         env_timing = getattr(env, "timing", None)
         if env_timing:
             metrics["timing/env_reset_s"] = float(env_timing["reset_s"])
@@ -212,6 +223,7 @@ class EmbodiedHFRollout:
             success=success,
             episode_chunks=chunks,
             metrics=metrics,
+            returns=returns,
         )
 
 

@@ -1,0 +1,80 @@
+# Wan GRPO with RLinf's update scale and RLinf's reward.
+#
+# Reward matches rlinf/envs/sim/world_model/env.py and algorithms/utils.py:
+#   each generated frame is 0/1 (logit > 0, their round(sigmoid)),
+#   the step reward is reward_coef * r_t - r_{t-1} with reward_coef 5,
+#   the episode return is the sum of those steps,
+#   a group is kept only when its mean return is inside [0.5, 4.5].
+# The episode still ends when any frame is classified as success.
+#
+# Update scale matches wan_libero_spatial_grpo_openvlaoft.yaml:
+#   1024 episodes per step, lr 2e-5, weight decay 0.01, Adam eps 1e-5,
+#   max episode steps 256.
+
+embodied:
+  enabled: true
+  plugin: examples.Embodied_Wan_OpenVLA_OFT_LIBERO.plugin
+  policy:
+    model_type: openvla_oft
+    model_path: /work/models/Openvla-oft-SFT-libero-spatial-traj1
+    unnorm_key: libero_spatial_no_noops
+    gradient_checkpointing: false
+    reshard_after_forward: false
+    freeze_vision_backbone: false
+  env:
+    model_dir: /work/models/RLinf-Wan-LIBERO-Spatial
+    reward_model_file: resnet_rm.pth
+    context_frames: 5
+    max_episode_steps: 256
+    world_model_kwargs:
+      sampling_steps: 5
+      sigma_shift: 5.0
+    success_logit_threshold: 0.0
+    use_rel_reward: true
+    reward_coef: 5.0
+    wm_batch_size: 32
+  rollout:
+    backend: hf
+    temperature: 1.6
+    batch_size: 64
+    groups_per_rank: 16
+    recompute_old_log_probs: true
+    filter_zero_advantage_groups: true
+  train_micro_batch_size: 32
+  entropy_coeff: 0.0
+  log_dir: /work/runs/wan_grpo_v3
+  save_interval: 10
+  lumen: {}
+
+policy:
+  model_name: /work/models/Openvla-oft-SFT-libero-spatial-traj1
+  training_backend: fsdp2
+  learning_rate: 2.0e-5
+  lr_warmup_steps: 0
+  lr_decay_style: constant
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_eps: 1.0e-5
+
+algorithm:
+  name: grpo
+  clip_ratio_high: 0.28
+  loss_agg_mode: token-mean
+  filter_rewards: true
+  rewards_lower_bound: 0.5
+  rewards_upper_bound: 4.5
+  grpo:
+    num_generations: 8
+    kl_coeff: 0.0
+    clip_ratio: 0.2
+    num_ppo_epochs: 1
+    num_mini_batches: 4
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 50
+seed: 42

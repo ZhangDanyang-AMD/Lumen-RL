@@ -94,6 +94,8 @@ class WorldModelEnv:
         wm_batch_size: int = 32,
         seed: int = 0,
         record_frames: bool = False,
+        use_rel_reward: bool = False,
+        reward_coef: float = 5.0,
     ) -> None:
         self.ctx_step = int(getattr(world_model, "context_frame_step", 1))
         if (context_frames - 1) % self.ctx_step != 0:
@@ -105,6 +107,11 @@ class WorldModelEnv:
         self.context_frames = context_frames
         self.threshold = success_logit_threshold
         self.wm_batch_size = wm_batch_size
+        # RLinf scores each generated frame, then trains on the sum of
+        # reward_coef * r_t - r_{t-1}. That sum equals reward_coef times the
+        # last frame's 0/1 label, so a one-frame false positive is not a reward.
+        self.use_rel_reward = use_rel_reward
+        self.reward_coef = float(reward_coef)
         self.device = world_model.device
         self.generator = torch.Generator(device=self.device).manual_seed(seed)
         # Keeps every frame of every episode on the CPU (for videos).
@@ -136,6 +143,8 @@ class WorldModelEnv:
         self.elapsed = torch.zeros(n, dtype=torch.long, device=self.device)
         self.done = torch.zeros(n, dtype=torch.bool, device=self.device)
         self.success = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.prev_step_reward = torch.zeros(n, device=self.device)
+        self.episode_return = torch.zeros(n, device=self.device)
         self.instructions = [s.instruction for s in inits]
         if self.record_frames:
             self.history = [[torch.from_numpy(s.frames[-1:])] for s in inits]
@@ -174,6 +183,15 @@ class WorldModelEnv:
         self.ctx_len[active] = c
 
         self.elapsed[active] += self.chunk
+        if self.use_rel_reward and active.numel() > 0:
+            alive = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            alive[active] = True
+            binary = (frame_logits > self.threshold).float()
+            for i in range(self.chunk):
+                raw = self.reward_coef * binary[:, i]
+                rel = raw - self.prev_step_reward
+                self.episode_return = self.episode_return + rel * alive.float()
+                self.prev_step_reward = torch.where(alive, raw, self.prev_step_reward)
         hit = (frame_logits > self.threshold).any(dim=1) & ~self.done
         reward[hit] = 1.0
         self.success |= hit

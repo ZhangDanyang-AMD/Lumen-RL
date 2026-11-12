@@ -25,6 +25,29 @@ from lumenrl.engine.training.fsdp_engine import FSDP2Engine
 logger = logging.getLogger(__name__)
 
 
+def load_policy_weights(module: nn.Module, path: str) -> None:
+    """Load a ``policy.safetensors`` of named parameters onto ``module``.
+
+    Buffers (for example the rotary ``inv_freq``) stay as the base checkpoint
+    left them. The file is the bf16 rollout replica, so an fp32 training
+    module receives a cast copy.
+    """
+    from safetensors.torch import load_file
+
+    saved = load_file(path, device="cpu")
+    params = dict(module.named_parameters())
+    missing = [name for name in params if name not in saved]
+    unexpected = [name for name in saved if name not in params]
+    if missing or unexpected:
+        raise RuntimeError(
+            f"{path} does not match this policy: "
+            f"{len(missing)} missing (e.g. {missing[:3]}), "
+            f"{len(unexpected)} unexpected (e.g. {unexpected[:3]})"
+        )
+    module.load_state_dict(saved, strict=False)
+    logger.info("Loaded %d policy tensors from %s", len(saved), path)
+
+
 class EmbodiedFSDP2Engine(FSDP2Engine):
     def __init__(
         self,
@@ -36,6 +59,7 @@ class EmbodiedFSDP2Engine(FSDP2Engine):
         gradient_checkpointing: bool = True,
         freeze_vision_backbone: bool = False,
         lumen_kwargs: Optional[dict[str, Any]] = None,
+        resume_from: str = "",
     ) -> None:
         super().__init__(
             model_config=HFModelConfig(local_path=model_path, enable_gradient_checkpointing=gradient_checkpointing),
@@ -46,11 +70,14 @@ class EmbodiedFSDP2Engine(FSDP2Engine):
         self.empty_cache_per_micro_batch = False  # fixed-shape batches; see FSDP2Engine
         self.freeze_vision_backbone = freeze_vision_backbone
         self.lumen_kwargs = lumen_kwargs or {}
+        self.resume_from = resume_from
         self.build_policy = build_policy
         self.processor = processor
 
     def _build_model_optimizer(self) -> None:
         module = self.build_policy(self.model_name, dtype=torch.float32, device="cpu")
+        if self.resume_from:
+            load_policy_weights(module, self.resume_from)
         if self.freeze_vision_backbone:
             module.vision_backbone.requires_grad_(False)
         if self.model_config.enable_gradient_checkpointing:

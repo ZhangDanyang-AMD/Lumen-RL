@@ -17,7 +17,8 @@ embodied:
     model_type: openvla_oft
     model_path: /work/models/RLinf-OpenVLAOFT-LIBERO-130-Base-Lora
     unnorm_key: libero_130_no_noops_trajall
-    gradient_checkpointing: true
+    gradient_checkpointing: false
+    reshard_after_forward: false
     freeze_vision_backbone: false
   env:
     backend: libero
@@ -36,12 +37,22 @@ embodied:
     groups_per_rank: 64
     recompute_old_log_probs: true
     filter_zero_advantage_groups: true
-  train_micro_batch_size: 8
+  train_micro_batch_size: 32
   entropy_coeff: 0.0
   log_dir: /work/runs/libero_130_grpo
   save_interval: 10
   save_dir: /work/runs/libero_130_grpo/checkpoints
-  lumen: {}
+  # step_10 is the last finished policy. Adam moments were not saved.
+  resume_from: /work/runs/libero_130_grpo/checkpoints/step_10/policy.safetensors
+  resume_step: 10
+  # BF16 Lumen on the actor. scaling "none" keeps FP8 linear off.
+  # GEMM solutions: examples/Embodied_LIBERO_OpenVLA_OFT/openvla_bf16_tuned_gemm.csv
+  # (AITER_CONFIG_GEMM_BF16, set by run_embodied_grpo.sh).
+  lumen:
+    actor:
+      scaling: "none"
+      lumen_norm: true
+      lumen_linear: true
 
 policy:
   model_name: /work/models/RLinf-OpenVLAOFT-LIBERO-130-Base-Lora

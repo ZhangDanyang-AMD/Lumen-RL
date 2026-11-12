@@ -11,8 +11,10 @@ One training step:
 1. sync actor weights into the rollout replica (from the second step on),
 2. each rank resets ``groups_per_rank`` init states x ``num_generations``
    copies and rolls the policy out until success or the step budget,
-3. episode success (0/1) is group-normalized into a GRPO advantage that
-   every action token of the episode shares,
+3. the episode return is group-normalized into a GRPO advantage that
+   every action token of the episode shares. With ``use_rel_reward`` the
+   return is the sum of per-frame ``reward_coef * r_t - r_{t-1}``;
+   otherwise it is 0/1 success,
 4. PPO-style clipped updates over all executed action chunks.
 """
 
@@ -35,7 +37,7 @@ from lumenrl.core.config import FSDPEngineConfig, LumenRLConfig, OptimizerConfig
 from lumenrl.core.protocol import DataProto
 from lumenrl.core.embodied_plugin import load_embodied_plugin
 from lumenrl.engine.inference.embodied_hf_engine import EmbodiedHFRollout, EmbodiedTrajectoryBatch
-from lumenrl.engine.training.embodied_fsdp_engine import EmbodiedFSDP2Engine
+from lumenrl.engine.training.embodied_fsdp_engine import EmbodiedFSDP2Engine, load_policy_weights
 from lumenrl.envs.world_model_env import WorldModelEnv, WorldModelInitDataset
 from lumenrl.utils.lumen_patch import apply_lumen
 
@@ -92,6 +94,8 @@ class EmbodiedTrainer:
                 success_logit_threshold=env_cfg.success_logit_threshold,
                 wm_batch_size=env_cfg.wm_batch_size,
                 seed=cfg.seed * 1000 + self._rank,
+                use_rel_reward=env_cfg.use_rel_reward,
+                reward_coef=env_cfg.reward_coef,
             )
             self.init_states = WorldModelInitDataset(
                 env_cfg.init_data_dir or os.path.join(env_cfg.model_dir, "dataset"),
@@ -103,9 +107,16 @@ class EmbodiedTrainer:
 
         self.processor = self.plugin.build_processor(e.policy.model_path, e.policy.unnorm_key)
         p = cfg.policy
+        resume = e.resume_from or ""
+        if resume and e.resume_step <= 0:
+            raise ValueError("embodied.resume_from needs embodied.resume_step, the last finished step")
         self.actor = EmbodiedFSDP2Engine(
             model_path=e.policy.model_path,
-            engine_config=FSDPEngineConfig(model_dtype="bf16", seed=cfg.seed),
+            engine_config=FSDPEngineConfig(
+                model_dtype="bf16",
+                seed=cfg.seed,
+                reshard_after_forward=e.policy.reshard_after_forward,
+            ),
             optimizer_config=OptimizerConfig(
                 lr=p.learning_rate,
                 weight_decay=p.weight_decay,
@@ -123,12 +134,15 @@ class EmbodiedTrainer:
             build_policy=self.plugin.build_policy,
             processor=self.processor,
             lumen_kwargs=lumen.get("actor"),
+            resume_from=resume,
         )
         self.actor.initialize()
         self._actor_model = self.actor.module
         self._optimizer = self.actor.optimizer
 
         rollout_policy = self.plugin.build_policy(e.policy.model_path, dtype=torch.bfloat16, device=device)
+        if resume:
+            load_policy_weights(rollout_policy, resume)
         rollout_policy = apply_lumen(rollout_policy, lumen.get("rollout"), "rollout")
         self.rollout = EmbodiedHFRollout(
             rollout_policy, self.processor,
@@ -143,9 +157,10 @@ class EmbodiedTrainer:
             Path(e.log_dir).mkdir(parents=True, exist_ok=True)
             self._metrics_file = open(os.path.join(e.log_dir, "embodied_metrics.jsonl"), "a")
         logger.info(
-            "EmbodiedTrainer ready: world=%d, backend=%s, envs/rank=%d (groups=%d x G=%d), init states=%d",
+            "EmbodiedTrainer ready: world=%d, backend=%s, envs/rank=%d (groups=%d x G=%d), init states=%d, resume_step=%d",
             self._world, e.env.backend, e.rollout.groups_per_rank * cfg.algorithm.grpo.num_generations,
             e.rollout.groups_per_rank, cfg.algorithm.grpo.num_generations, len(self.init_states),
+            e.resume_step,
         )
 
     # ------------------------------------------------------------------ loop
@@ -153,7 +168,13 @@ class EmbodiedTrainer:
     def train(self) -> None:
         for cb in self.callbacks:
             cb.on_train_begin(self)
-        for step in range(self.config.num_training_steps):
+        start = int(self.ecfg.resume_step)
+        if start:
+            logger.info(
+                "Continuing after step %d (%s); next logged step is %d. Optimizer moments start at zero.",
+                start, self.ecfg.resume_from, start + 1,
+            )
+        for step in range(start, self.config.num_training_steps):
             for cb in self.callbacks:
                 cb.on_step_begin(self, step)
             metrics = self.train_step(step)
@@ -253,15 +274,25 @@ class EmbodiedTrainer:
 
     def _build_training_data(self, batch: EmbodiedTrajectoryBatch) -> tuple[dict[str, Any], dict[str, float]]:
         g = self.config.algorithm.grpo.num_generations
-        rewards = batch.success.float()
+        # Relative reward: one return per episode, the sum of per-frame
+        # reward_coef * r_t - r_{t-1}. Otherwise the episode is 0/1 success.
+        rewards = batch.returns if batch.returns is not None else batch.success.float()
         adv_env = compute_grpo_advantage(DataProto(tensors={"rewards": rewards}), self.config).tensors["advantages"]
-        group_has_signal = rewards.view(-1, g).std(dim=1, unbiased=False) > 0
-        metrics = {"train/groups_with_signal_frac": group_has_signal.float().mean().item()}
+        grouped = rewards.view(-1, g)
+        algo = self.config.algorithm
+        if batch.returns is not None and algo.filter_rewards:
+            mean = grouped.mean(dim=1)
+            group_keep = (mean >= algo.rewards_lower_bound) & (mean <= algo.rewards_upper_bound)
+        else:
+            group_keep = grouped.std(dim=1, unbiased=False) > 0
+        metrics = {"train/groups_with_signal_frac": group_keep.float().mean().item()}
+        if batch.returns is not None:
+            metrics["train/episode_return"] = rewards.mean().item()
 
         adv = adv_env[batch.env_ids]
         keep = torch.ones(batch.num_samples, dtype=torch.bool)
-        if self.ecfg.rollout.filter_zero_advantage_groups:
-            keep = group_has_signal.repeat_interleave(g)[batch.env_ids]
+        if (batch.returns is not None and algo.filter_rewards) or self.ecfg.rollout.filter_zero_advantage_groups:
+            keep = group_keep.repeat_interleave(g)[batch.env_ids]
         metrics["train/samples_kept"] = float(keep.sum())
 
         idx = keep.nonzero().squeeze(-1)

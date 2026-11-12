@@ -16,7 +16,14 @@ export MUJOCO_GL=osmesa
 export PYOPENGL_PLATFORM=osmesa
 # llvmpipe threads per sim process; NPROC x num_workers processes render at once.
 export LP_NUM_THREADS="${LP_NUM_THREADS:-2}"
-export PYTHONPATH="/work/third_party/LIBERO${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="/src/Lumen:/work/third_party/LIBERO${PYTHONPATH:+:$PYTHONPATH}"
+# 512 sim workers exceed the default soft nofile of 1024.
+ulimit -n 65536
+# OpenVLA BF16 GEMM table. Shapes that are absent fall back to torch.mm.
+TUNED_GEMM="$HERE/openvla_bf16_tuned_gemm.csv"
+if [[ -f "$TUNED_GEMM" ]]; then
+  export AITER_CONFIG_GEMM_BF16="$TUNED_GEMM"
+fi
 
 cd "$REPO"
 exec torchrun --nproc_per_node="$NPROC" --master_port="$MASTER_PORT" \
