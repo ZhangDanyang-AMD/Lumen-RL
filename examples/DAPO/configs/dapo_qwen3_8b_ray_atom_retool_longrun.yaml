@@ -2,7 +2,9 @@
 # with 4 ATOM replicas in place of the vLLM ones. ATOM runs no-eager (CUDA graphs)
 # under run_dapo.sh MODE=atombf16; partial rollout under controller.ray.fully_async
 # needs an ATOM with pause_generation (ROCm/ATOM#3059) and the RCCL weight sync one
-# with RDMA weight receive (ROCm/ATOM#3058), passed in as ATOM_DIR.
+# with RDMA weight receive (ROCm/ATOM#3058), passed in as ATOM_DIR. The ATOM also
+# needs Config.sampler_independent_noise (ROCm/ATOM#3083), which the trainer turns
+# on for multi-turn runs so a group's n=1 rollouts stop sharing sampling noise.
 #
 # Two settings differ from the vLLM config, both for throughput. A multi-turn
 # rollout re-sends its whole context every turn and the 16 rollouts of a group

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import dataclasses
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +17,7 @@ from lumenrl.agent.deepseek_v4 import DeepSeekV4ChatTokenizer, DsmlToolParser
 from lumenrl.agent.loop import ToolAgentLoop
 from lumenrl.agent.trajectory import Trajectory
 from lumenrl.core.config import LumenRLConfig
+from lumenrl.engine.inference.atom_ray_server import ATOMRayServer
 from lumenrl.trainer import rl_trainer
 from lumenrl.trainer.agent_rollout import (
     AgentGroupRollout,
@@ -415,3 +419,99 @@ def test_sync_collection_sends_chat_messages_to_the_agent_loop():
         [{"role": "user", "content": "What is 1 + 2?"}],
     ]
     assert len(ragged["agent_stats"]) == 4
+
+
+# -- ATOM sampling noise --------------------------------------------------------
+
+
+def _atom_trainer(*, multi_turn: bool = True) -> RLTrainer:
+    trainer = object.__new__(RLTrainer)
+    trainer.config = LumenRLConfig()
+    trainer.config.policy.generation.multi_turn.enabled = multi_turn
+    return trainer
+
+
+def test_atom_agent_rollouts_draw_sampling_noise_of_their_own():
+    kwargs: dict = {}
+
+    _atom_trainer()._atom_agent_sampling(kwargs)
+
+    assert kwargs == {"sampler_independent_noise": True}
+
+
+def test_an_explicit_sampler_noise_setting_is_kept():
+    kwargs = {"sampler_independent_noise": False}
+
+    _atom_trainer()._atom_agent_sampling(kwargs)
+
+    assert kwargs == {"sampler_independent_noise": False}
+
+
+def test_single_turn_atom_rollouts_keep_the_default_noise():
+    kwargs: dict = {}
+
+    _atom_trainer(multi_turn=False)._atom_agent_sampling(kwargs)
+
+    assert kwargs == {}
+
+
+def test_the_atom_replicas_of_an_agent_run_get_independent_noise(monkeypatch):
+    seen: dict = {}
+
+    class Built(Exception):
+        pass
+
+    def manager(colocation_wg, model_name, engine_kwargs, **kwargs):
+        seen.update(engine_kwargs)
+        raise Built
+
+    monkeypatch.setattr("lumenrl.engine.inference.atom_ray_server.ATOMReplicaManager", manager)
+    trainer = _atom_trainer()
+    trainer._actor_wg = object()
+    trainer._rollout_wg = None
+    generation = trainer.config.policy.generation
+
+    with pytest.raises(Built):
+        trainer._setup_ray_atom_rollout("model", generation.vllm_cfg, generation.atom_cfg)
+
+    assert seen["sampler_independent_noise"] is True
+
+
+def _launch_atom(monkeypatch, engine_kwargs: dict, *, independent_noise: bool) -> list[dict]:
+    fields = [("model", str, dataclasses.field(default=""))]
+    if independent_noise:
+        fields.append(("sampler_independent_noise", bool, dataclasses.field(default=False)))
+    built: list[dict] = []
+
+    class AsyncLLMEngine:
+        def __init__(self, **kwargs):
+            built.append(kwargs)
+
+    names = ("atom", "atom.config", "atom.rollout", "atom.rollout.async_engine")
+    modules = {name: types.ModuleType(name) for name in names}
+    modules["atom.config"].Config = dataclasses.make_dataclass("Config", fields)
+    modules["atom.rollout.async_engine"].AsyncLLMEngine = AsyncLLMEngine
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(ATOMRayServer, "_get_node_ip", staticmethod(lambda: "127.0.0.1"))
+    monkeypatch.setattr(ATOMRayServer, "_get_free_port", staticmethod(lambda: 1234))
+
+    asyncio.run(ATOMRayServer("model", engine_kwargs, 0).launch())
+    return built
+
+
+def test_an_atom_that_cannot_sample_n1_requests_independently_is_refused(monkeypatch):
+    with pytest.raises(ValueError, match="sampler_independent_noise"):
+        _launch_atom(monkeypatch, {"sampler_independent_noise": True}, independent_noise=False)
+
+
+def test_the_independent_noise_setting_reaches_an_atom_that_has_it(monkeypatch):
+    built = _launch_atom(monkeypatch, {"sampler_independent_noise": True}, independent_noise=True)
+
+    assert built[0]["sampler_independent_noise"] is True
+
+
+def test_an_atom_without_the_setting_still_serves_single_turn_runs(monkeypatch):
+    built = _launch_atom(monkeypatch, {}, independent_noise=False)
+
+    assert "sampler_independent_noise" not in built[0]

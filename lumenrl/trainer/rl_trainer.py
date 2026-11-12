@@ -663,6 +663,19 @@ class RLTrainer:
             freed_gb, len(stats),
         )
 
+    def _atom_agent_sampling(self, engine_kwargs: dict[str, Any]) -> None:
+        """Give ATOM's n=1 requests sampling noise of their own under the agent loop.
+
+        Without top-k or top-p ATOM samples by Gumbel-max and, unless a request
+        fans out (n>1), draws one noise row per batch step for every row. The
+        agent loop sends each rollout's turn as an n=1 request, and a group's
+        rollouts start together from one prompt, so they draw the same tokens
+        while they decode in step. ATOMRayServer refuses an ATOM too old to
+        take the setting.
+        """
+        if self._multi_turn:
+            engine_kwargs.setdefault("sampler_independent_noise", True)
+
     def _setup_ray_atom_rollout(self, model_name: str, vcfg: Any, atom_cfg: Any) -> None:
         """Build colocated ATOM rollout replicas + client on the Ray controller path."""
         from lumenrl.engine.inference.atom_ray_server import ATOMReplicaManager
@@ -699,6 +712,7 @@ class RLTrainer:
         extra = getattr(atom_cfg, "engine_kwargs", {}) or {}
         if extra:
             engine_kwargs.update(dict(extra))
+        self._atom_agent_sampling(engine_kwargs)
 
         colocation_wg = getattr(self, "_rollout_wg", None) or self._actor_wg
         if colocation_wg is not self._actor_wg:

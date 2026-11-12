@@ -86,6 +86,7 @@ class ATOMRayServer:
         from atom.rollout.async_engine import AsyncLLMEngine
 
         kwargs = dict(self.engine_kwargs)
+        self._require_independent_noise(kwargs)
         kwargs.setdefault("model", self.model_name)
         kwargs.setdefault("master_addr", self._get_node_ip())
         kwargs.setdefault("port", self._get_free_port())
@@ -99,6 +100,28 @@ class ATOMRayServer:
             kwargs.get("online_quant_config"),
         )
         return True
+
+    @staticmethod
+    def _require_independent_noise(kwargs: dict[str, Any]) -> None:
+        """Refuse sampler_independent_noise on an ATOM that cannot honour it.
+
+        ATOM's engine keeps only the keyword arguments its Config declares, and
+        Config.sampler_independent_noise arrived with ROCm/ATOM#3083. On an
+        older ATOM the setting would vanish and the rollouts of a group would
+        share their sampling noise again.
+        """
+        if not kwargs.get("sampler_independent_noise"):
+            return
+        import dataclasses
+
+        from atom.config import Config
+
+        if "sampler_independent_noise" not in {f.name for f in dataclasses.fields(Config)}:
+            raise ValueError(
+                "sampler_independent_noise needs an ATOM whose Config has it "
+                "(ROCm/ATOM#3083); this one would drop it, and the rollouts of a "
+                "group would share their sampling noise."
+            )
 
     @staticmethod
     def _is_no_eager(kwargs: dict[str, Any]) -> bool:
