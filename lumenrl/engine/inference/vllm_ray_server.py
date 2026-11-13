@@ -220,6 +220,9 @@ class VLLMRayServer:
         from vllm.inputs import TokensPrompt
 
         want_lp = sampling_params.get("logprobs", None) is not None
+        # Routing rows to skip: those of the leading prompt positions an earlier
+        # request of the same rollout already returned.
+        routes_from = int(sampling_params.get("routed_experts_prompt_start") or 0)
         sp = SamplingParams(
             n=1,
             max_tokens=int(sampling_params.get("max_tokens", 512)),
@@ -229,6 +232,7 @@ class VLLMRayServer:
             logprobs=(0 if want_lp else None),
             seed=sampling_params.get("seed", None),
             stop_token_ids=sampling_params.get("stop_token_ids", None),
+            **({"routed_experts_prompt_start": routes_from} if routes_from else {}),
         )
         vllm_prompt = prompt if isinstance(prompt, str) else TokensPrompt(prompt_token_ids=list(prompt))
         rid = request_id or uuid4().hex
@@ -254,10 +258,12 @@ class VLLMRayServer:
             "routed_experts": getattr(comp, "routed_experts", None),
         }
         # Rollout Routing Replay: the expert ids this engine actually selected,
-        # uint8 [prompt + response - 1, num_layers, top_k]. Row t is the routing
-        # of the forward at position t, i.e. the one that produced token t+1 --
-        # the same alignment as `logprobs`. Present only when the engine was
-        # built with enable_return_routed_experts.
+        # uint8 [prompt + response - 1, num_layers, top_k], less the first
+        # routed_experts_prompt_start rows. Row t is the routing of the forward at
+        # position t, i.e. the one that produced token t+1 -- the same alignment
+        # as `logprobs`. vLLM emits each row as it computes it, so a request that a
+        # pause preempted and re-prefilled keeps the rows of its earlier decodes.
+        # Present only when the engine was built with enable_return_routed_experts.
         routed = getattr(comp, "routed_experts", None)
         if routed is not None:
             out["routed_experts"] = routed

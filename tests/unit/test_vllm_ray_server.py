@@ -282,3 +282,23 @@ def test_generate_reports_why_the_completion_ended(monkeypatch, finish_reason):
 
     assert out["token_ids"] == [7, 8]
     assert out["finish_reason"] == finish_reason
+
+
+@pytest.mark.parametrize(("params", "expected"), [({}, None), ({"routed_experts_prompt_start": 5}, 5)])
+def test_generate_skips_the_routing_rows_an_earlier_turn_returned(monkeypatch, params, expected):
+    install_fake_vllm(monkeypatch)
+    seen = []
+
+    class Engine:
+        async def generate(self, prompt, sampling_params, request_id):
+            seen.append(sampling_params)
+            completion = SimpleNamespace(text="", token_ids=[7], logprobs=None, finish_reason="stop")
+            yield SimpleNamespace(prompt_token_ids=[1, 2], outputs=[completion])
+
+    server = object.__new__(VLLMRayServer)
+    server.engine = Engine()
+
+    asyncio.run(server.generate([1, 2], {"max_tokens": 1, **params}))
+
+    # Absent unless asked for: a vLLM without the field rejects it.
+    assert getattr(seen[0], "routed_experts_prompt_start", None) == expected

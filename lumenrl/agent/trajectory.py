@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
+
 
 @dataclass
 class Trajectory:
@@ -33,9 +35,11 @@ class Trajectory:
     stop_reason: str = ""
     generate_s: float = 0.0
     tool_s: float = 0.0
-    # The experts the engine routed each token to, from the last turn: its input
-    # was the whole trajectory, so this is [prompt + response - 1, layers,
-    # top_k] as a single-turn completion's. Set when the engine returns them.
+    # The experts the engine routed each forwarded token to, [positions, layers,
+    # top_k]; row t is the forward at position t. Each turn appends the rows of
+    # the positions it forwarded first, so a row is the routing of the forward
+    # that sampled the next token even when a later request re-prefills it. Set
+    # when the engine returns them.
     routed_experts: Any = None
 
     def add_model_turn(self, token_ids: list[int], logprobs: list[float] | None) -> None:
@@ -47,6 +51,28 @@ class Trajectory:
         self.response_mask.extend([1] * len(token_ids))
         self.response_logprobs.extend(logprobs if logprobs is not None else [0.0] * len(token_ids))
         self.assistant_turns += 1
+
+    @property
+    def routed_positions(self) -> int:
+        return 0 if self.routed_experts is None else len(self.routed_experts)
+
+    def add_routes(self, routes: Any, through: int) -> None:
+        """Append the routing of positions ``routed_positions`` to ``through - 1``."""
+        routes = np.asarray(routes)
+        need = through - self.routed_positions
+        # Some vLLM revisions also return the row of the last sampled token,
+        # which no forward has consumed.
+        if len(routes) == need + 1:
+            routes = routes[:need]
+        if len(routes) != need:
+            raise ValueError(
+                f"the engine returned {len(routes)} routing rows for positions "
+                f"{self.routed_positions}..{through - 1}"
+            )
+        self.routed_experts = (
+            routes if self.routed_experts is None
+            else np.concatenate([self.routed_experts, routes])
+        )
 
     def add_environment(self, token_ids: list[int]) -> None:
         self.response_ids.extend(token_ids)

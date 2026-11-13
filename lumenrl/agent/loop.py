@@ -116,13 +116,19 @@ class ToolAgentLoop:
                 break
             turn_params = dict(sampling_params)
             turn_params["max_tokens"] = min(int(sampling_params.get("max_tokens", budget)), budget)
+            if trajectory.routed_experts is not None:
+                # The earlier positions keep the routing of the turn that sampled
+                # them: on a prefix-cache miss (no cache, eviction, or the reset
+                # of a weight sync) this request re-prefills them.
+                turn_params["routed_experts_prompt_start"] = trajectory.routed_positions
+            context = trajectory.prompt_ids + trajectory.response_ids
             t0 = time.perf_counter()
-            out = await generate(trajectory.prompt_ids + trajectory.response_ids, turn_params)
+            out = await generate(context, turn_params)
             trajectory.generate_s += time.perf_counter() - t0
             turn_ids = list(out["token_ids"])
             trajectory.add_model_turn(turn_ids, out.get("logprobs"))
             if out.get("routed_experts") is not None:
-                trajectory.routed_experts = out["routed_experts"]
+                trajectory.add_routes(out["routed_experts"], through=len(context) + len(turn_ids) - 1)
 
             finish_reason = out.get("finish_reason")
             if finish_reason is None:

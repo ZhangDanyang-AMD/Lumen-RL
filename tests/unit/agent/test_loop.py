@@ -317,25 +317,58 @@ def test_a_session_that_fails_to_close_does_not_lose_the_rollout():
 
 
 class RoutingEngine(ScriptedEngine):
-    """Also returns, per call, routing rows for every input token but the last."""
+    """Also returns routing rows the way vLLM does: one per forwarded position,
+    from ``routed_experts_prompt_start`` on. Every call recomputes every position
+    (no prefix cache), and a row records ``[call, position]``, so a row tells
+    which request computed it. ``extra`` rows past the last forwarded position
+    mimic revisions that also return the last sampled token's."""
+
+    def __init__(self, *args, extra: int = 0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.extra = extra
+        self.generated: list[int] = []
 
     async def generate(self, prompt_ids, sampling_params):
         out = await super().generate(prompt_ids, sampling_params)
-        rows = len(prompt_ids) + len(out["token_ids"]) - 1
-        out["routed_experts"] = [[[len(self.requests), row]] for row in range(rows)]
+        self.generated.append(len(out["token_ids"]))
+        start = sampling_params.get("routed_experts_prompt_start", 0)
+        end = len(prompt_ids) + len(out["token_ids"]) - 1 + self.extra
+        out["routed_experts"] = [[[len(self.requests), row]] for row in range(start, end)]
         return out
 
 
-def test_the_last_turn_routes_cover_the_whole_trajectory():
+def run_routing(turns, **engine_kwargs):
     tok = ChatMLTokenizer()
-    engine = RoutingEngine(tok, [(call("6 * 7"), "stop"), ("42", "stop")])
+    engine = RoutingEngine(tok, turns, **engine_kwargs)
     loop = ToolAgentLoop(ChatTemplateTokenizer(tok), [EchoTool()])
+    trajectory = asyncio.run(loop.run(engine.generate, PROMPT, {"max_tokens": 10_000}, 4096))
+    return trajectory, engine
 
-    result = asyncio.run(loop.run(engine.generate, PROMPT, {"max_tokens": 10_000}, 4096)).to_rollout_result()
 
+def test_each_position_keeps_the_routing_of_the_turn_that_forwarded_it_first():
+    trajectory, engine = run_routing([(call("6 * 7"), "stop"), ("42", "stop")])
+    result = trajectory.to_rollout_result()
+
+    first_end = len(engine.requests[0][0]) + engine.generated[0] - 1
     routes = result["routed_experts"]
     assert len(routes) == len(result["prompt_token_ids"]) + len(result["token_ids"]) - 1
-    assert {route[0][0] for route in routes} == {2}  # all from the second, last call
+    assert [row[0].tolist() for row in routes] == (
+        [[1, p] for p in range(first_end)] + [[2, p] for p in range(first_end, len(routes))]
+    )
+    assert "routed_experts_prompt_start" not in engine.requests[0][1]
+    assert engine.requests[1][1]["routed_experts_prompt_start"] == first_end
+
+
+def test_the_row_of_the_last_sampled_token_is_dropped_when_the_engine_returns_it():
+    trajectory, _ = run_routing([(call("6 * 7"), "stop"), ("42", "stop")], extra=1)
+    result = trajectory.to_rollout_result()
+
+    assert len(result["routed_experts"]) == len(result["prompt_token_ids"]) + len(result["token_ids"]) - 1
+
+
+def test_routing_rows_that_do_not_fit_the_turn_fail():
+    with pytest.raises(ValueError, match="routing rows for positions"):
+        run_routing([("42", "stop")], extra=2)
 
 
 def test_a_rollout_from_an_engine_without_routes_has_none():
