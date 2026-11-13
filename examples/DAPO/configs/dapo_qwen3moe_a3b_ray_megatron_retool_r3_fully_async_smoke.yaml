@@ -1,0 +1,181 @@
+# Agentic RL on MoE with Megatron-Native training, rollout routing replay (R3)
+# and fully async training.
+#
+# dapo_qwen3moe_a3b_ray_megatron_retool_r3_smoke.yaml (Qwen3-30B-A3B, code
+# interpreter, 8 turns, non-thinking, 16 prompts x 16 rollouts, 4k responses)
+# on a separated layout: 4 Megatron actors (EP=4) and 4 vLLM replicas (TP=1),
+# so the rollout keeps generating while the trainer trains. Prompt groups stream
+# to the trainer with staleness threshold 1, partial rollout and a weight sync
+# after every update; weights go to the replicas over RCCL
+# (weight_sync.backend=rdma, GPU P2P on one node). A sync preempts the requests
+# in flight, but each completion keeps the routing of the forwards that sampled
+# it, and each agent turn keeps its own, so replay holds across syncs.
+#
+# Measured (MI355X, 8 steps each, same seed): rollout_corr/k3_kl 3.8e-4 with
+# replay and 1.23e-3 without, the same 69% as the synchronous config; mean
+# staleness 0.95, about 5 of 16 groups a step caught in flight by a sync, 55 s
+# a step.
+#
+# Run it with LUMENRL_FP32_MOE_ROUTER=0 like the other MoE runs, against a
+# SandboxFusion service at policy.generation.multi_turn.code_interpreter.url.
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    actor:
+      num_workers: 4
+      dispatch_mode: dp_compute_proto
+    rollout:
+      num_workers: 4
+    fully_async:
+      enabled: true
+      trigger_parameter_sync_step: 1
+      staleness_threshold: 1.0
+      partial_rollout: true
+
+policy:
+  model_name: "${oc.env:DATA_ROOT}/models/Qwen3-30B-A3B"
+  training_backend: megatron_native
+  generation_backend: vllm
+  max_total_sequence_length: 6144      # prompt with the tool schema + response
+  max_response_length: 4096            # model turns and tool output together
+  train_global_batch_size: 256         # 16 prompts x 16 rollouts
+  gen_batch_size: 32
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 6144
+  learning_rate: 1.0e-6
+  lr_warmup_steps: 0
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  training:
+    optimizer_dtype: bf16
+    megatron_cfg:
+      use_distributed_optimizer: true
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      context_parallel_size: 1
+      expert_model_parallel_size: 4
+      sequence_parallel: false
+      moe_grouped_gemm: true
+      moe_token_dispatcher_type: alltoall
+      moe_flex_dispatcher_backend: mori
+      moe_mori_max_tokens_per_rank: null
+      moe_mori_kernel_type: null
+      moe_aux_loss_coeff: 0.0
+      moe_router_dtype: null
+      log_probs_chunk_size: 1024
+      enable_dynamic_batch: true
+      max_tokens_per_gpu: 6144
+  generation:
+    vllm_cfg:
+      transport: ray_http
+      ray_http_start_server: false
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.85
+      max_model_len: 6144
+      dtype: bfloat16
+      enforce_eager: true
+      enable_chunked_prefill: true
+      enable_prefix_caching: true
+      max_num_batched_tokens: 16384
+      max_num_seqs: 256
+      quantization: ""
+      calculate_log_probs: true
+      enable_sleep_mode: false
+      update_weights_bucket_megabytes: 512
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+    multi_turn:
+      enabled: true
+      format: hermes
+      max_assistant_turns: 8
+      max_parallel_calls: 1
+      max_tool_response_length: 256
+      tool_response_truncate_side: middle
+      system_prompt: >-
+        You can call the code_interpreter tool to run Python code. Use it to
+        calculate and to check your reasoning before you give the final answer.
+      chat_template_kwargs:
+        enable_thinking: false
+      code_interpreter:
+        url: http://localhost:8080/run_code
+        run_timeout_s: 30
+        memory_limit_mb: 1024
+        max_concurrency: 128
+
+weight_sync:
+  backend: rdma
+  rdma:
+    require_rdma: false
+
+moe:
+  r3:
+    enabled: true
+    rollout_replay: false
+    print_train_rollout_mismatch: true
+
+algorithm:
+  name: dapo
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  loss_agg_mode: token-mean
+  dapo:
+    num_generations: 16
+    kl_coeff: 0.0
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 10.0
+    dynamic_sampling: true
+    token_level_pg: true
+    overlong_reward_shaping: false
+    max_resp_len: 4096
+    filter_groups:
+      enable: true
+      metric: acc
+      max_num_gen_batches: 10
+    overlong_buffer:
+      enable: false
+
+reward:
+  type: function
+  function: lumenrl.rewards.math_reward.dapo_math_reward
+  dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet"
+  shuffle: true
+  shuffle_seed: 10086
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+    rollout_is_batch_normalize: false
+
+val_dataset: ""
+val_steps: 0
+val_batch_size: 0
+eval:
+  enabled: false
+  num_samples: 0
+
+checkpointing:
+  checkpoint_dir: ""
+  save_steps: 1000
+  save_total_limit: 0
+  resume: false
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 8
+seed: 10086

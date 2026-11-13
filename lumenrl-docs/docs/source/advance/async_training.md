@@ -339,7 +339,9 @@ synchronous.
 - No decoupled PPO: the trainer recomputes the old log-probs with its current
   weights and TIS corrects against the rollout's.
 - Rejected with fully async: partial rollout on an ATOM without
-  `pause_generation`, and MoE routing replay (`moe.r3`) on ATOM. Untested: the Megatron training backend. The two-node layout
+  `pause_generation`, and MoE routing replay (`moe.r3`) on ATOM. The Megatron
+  training backend has run 8 steps
+  (`dapo_qwen3moe_a3b_ray_megatron_retool_r3_fully_async_smoke.yaml`). The two-node layout
   has run 30 steps at most.
 
 ## The `async_training` section
