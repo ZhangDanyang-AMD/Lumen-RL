@@ -241,6 +241,10 @@ class MegatronNativeEngine(MegatronBaseEngine):
     # answerable before then, with ``_caps`` falling back to the defaults.
     _spec = None
     _dsv4_align = 1
+    # Parameters are BF16 -- the FP32 master copy lives in the optimizer -- so
+    # an FP32 tensor in the weight export is FP32 on purpose (DSv4's _keep_fp32
+    # params, a router's expert bias) and the rollout holds it in FP32 too.
+    exports_fp32_on_purpose = True
 
     @staticmethod
     def _fp8_kwargs(ec, num_layers: int, pp: int) -> dict:

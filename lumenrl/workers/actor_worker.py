@@ -86,6 +86,19 @@ def _whole_tensors(params):
         yield name, param.full_tensor() if isinstance(param, DTensor) else param
 
 
+def _sync_keeps_fp32(engine) -> bool:
+    """Whether weight sync sends FP32 tensors as FP32 rather than BF16.
+
+    The cast suits an FSDP2 actor, whose FP32 tensors are master weights the
+    rollout holds in BF16. An engine whose FP32 tensors are FP32 on purpose
+    keeps them: BF16 rounds DSv4's expert bias (~9.0, experts 0.03 apart) to
+    one value and halves its hyper-connection weights' precision.
+    """
+    return os.environ.get("LUMENRL_SYNC_FP32") == "1" or bool(
+        getattr(engine, "exports_fp32_on_purpose", False)
+    )
+
+
 class LumenActorWorker(BaseWorker):
     """Trainable policy worker using the Engine abstraction layer.
 
@@ -1159,7 +1172,7 @@ class LumenActorWorker(BaseWorker):
         if group is None:
             raise RuntimeError("RDMA weight group is not initialized")
 
-        if os.environ.get("LUMENRL_SYNC_FP32") != "1":
+        if not _sync_keeps_fp32(self._engine):
             # The same FP32 -> BF16 cast as update_weights_ipc_send.
             params = (
                 (name, t.to(torch.bfloat16) if t.dtype == torch.float32 else t)
@@ -1590,7 +1603,7 @@ class LumenActorWorker(BaseWorker):
             f"ipc:///tmp/lumen-colocate-zmq-{job_id}"
             f"-replica-{replica_rank}-rank-{local_rank}.sock"
         )
-        keep_fp32 = os.environ.get("LUMENRL_SYNC_FP32") == "1"
+        keep_fp32 = _sync_keeps_fp32(self._engine)
 
         gb = 1024.0 ** 3
         alloc0 = 0.0
