@@ -229,6 +229,28 @@ class StageRecipe:
     stacked: bool = False
 
 
+def ddp_config_kwargs(ec: dict) -> dict:
+    """``DistributedDataParallelConfig`` arguments from the engine config.
+
+    ``grad_reduce_in_fp32`` keeps 4-byte main grads, the default; BF16 halves
+    them, which on a model as large as full DeepSeek-V4 is the difference
+    between fitting a GPU and not. A single monolithic coalesced all-gather of
+    the whole param set can hit a pathological RCCL path: a finite
+    ``ddp_bucket_size`` splits it into pipelined gathers, and
+    ``overlap_param_gather`` defers those behind the next forward; it requires
+    ``overlap_grad_reduce``.
+    """
+    bucket = ec.get("ddp_bucket_size", None)
+    overlap_param_gather = bool(ec.get("overlap_param_gather", False))
+    return dict(
+        grad_reduce_in_fp32=bool(ec.get("grad_reduce_in_fp32", True)),
+        overlap_grad_reduce=bool(ec.get("overlap_grad_reduce", False)) or overlap_param_gather,
+        overlap_param_gather=overlap_param_gather,
+        use_distributed_optimizer=True, average_in_collective=True,
+        bucket_size=(int(bucket) if bucket else None),
+    )
+
+
 class MegatronNativeEngine(MegatronBaseEngine):
     """Megatron-Core GPTModel engine using the TransformerEngine layer spec.
 
@@ -649,23 +671,10 @@ class MegatronNativeEngine(MegatronBaseEngine):
 
         oc = self.optimizer_config
         self._clip = float(oc.get("clip_grad", 1.0))
-        # A single monolithic coalesced all-gather of the whole param set can hit
-        # a pathological RCCL path. A finite ``bucket_size`` splits it into pipelined
-        # gathers, and ``overlap_param_gather`` defers those behind the next
-        # forward. Both default to the previous behaviour and are opt-in via
-        # megatron_cfg. ``overlap_param_gather`` requires ``overlap_grad_reduce``.
-        _bucket = ec.get("ddp_bucket_size", None)
-        self._overlap_grad_reduce = bool(ec.get("overlap_grad_reduce", False))
-        self._overlap_param_gather = bool(ec.get("overlap_param_gather", False))
-        if self._overlap_param_gather and not self._overlap_grad_reduce:
-            self._overlap_grad_reduce = True
-        ddp_cfg = DistributedDataParallelConfig(
-            grad_reduce_in_fp32=True,
-            overlap_grad_reduce=self._overlap_grad_reduce,
-            overlap_param_gather=self._overlap_param_gather,
-            use_distributed_optimizer=True, average_in_collective=True,
-            bucket_size=(int(_bucket) if _bucket else None),
-        )
+        ddp_kwargs = ddp_config_kwargs(ec)
+        self._overlap_grad_reduce = ddp_kwargs["overlap_grad_reduce"]
+        self._overlap_param_gather = ddp_kwargs["overlap_param_gather"]
+        ddp_cfg = DistributedDataParallelConfig(**ddp_kwargs)
         self._ddp = DDP(config=tfcfg, ddp_config=ddp_cfg, module=self.module)
 
         opt_kwargs = {}
