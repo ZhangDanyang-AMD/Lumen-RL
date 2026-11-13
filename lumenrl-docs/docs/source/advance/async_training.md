@@ -45,8 +45,8 @@ correct for it.
 
 Setups that cannot overlap are rejected when training starts: both switches
 on, no separate rollout pool, a sleeping rollout, and for fully async also
-partial rollout on an ATOM that cannot pause generation, and `moe.r3`
-(routing replay is not carried across a weight sync).
+partial rollout on an ATOM that cannot pause generation, and `moe.r3` on ATOM
+(it does not return the experts it routed each token to).
 
 ## One-step off-policy
 
@@ -104,7 +104,10 @@ A background thread (`StreamingRollout` in
    engines are paused with vLLM's `pause_generation(mode="keep")`: requests in
    flight are preempted and, after `resume_generation()`, re-prefilled and
    continued on the new weights, with no resubmission. Without it, the sync
-   waits for the groups in flight to finish.
+   waits for the groups in flight to finish. Routing replay (`moe.r3`) holds
+   across the sync: vLLM returns each position's experts as it computes them,
+   so a re-prefilled request keeps those of its earlier decodes, and the agent
+   loop keeps each turn's.
 
 The budget counts the groups queued from before the sync, the groups kept since
 it, and the groups in flight weighted by the recent keep rate. Groups dropped by
@@ -336,7 +339,7 @@ synchronous.
 - No decoupled PPO: the trainer recomputes the old log-probs with its current
   weights and TIS corrects against the rollout's.
 - Rejected with fully async: partial rollout on an ATOM without
-  `pause_generation`, and MoE routing replay (`moe.r3`). Untested: the Megatron training backend. The two-node layout
+  `pause_generation`, and MoE routing replay (`moe.r3`) on ATOM. Untested: the Megatron training backend. The two-node layout
   has run 30 steps at most.
 
 ## The `async_training` section

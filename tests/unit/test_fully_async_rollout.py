@@ -326,13 +326,20 @@ def test_layout_check_accepts_partial_rollout_on_an_atom_that_can_pause() -> Non
     assert trainer._resolve_rollout_pipeline(True) == "fully_async"
 
 
+@pytest.mark.parametrize("partial", [False, True])
+def test_layout_check_accepts_routing_replay_on_the_vllm_rollout(partial) -> None:
+    trainer = _layout_trainer(r3=True, partial=partial)
+
+    assert trainer._resolve_rollout_pipeline(True) == "fully_async"
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
         ({"one_step": True}, "are alternatives"),
         ({"vllm": False}, "needs the Ray vLLM or ATOM rollout"),
         ({"vllm": False, "atom": True, "partial": True}, "an ATOM that can pause"),
-        ({"r3": True}, "R3 rollout routing"),
+        ({"vllm": False, "atom": True, "r3": True}, "ATOM does not return"),
     ],
 )
 def test_layout_check_rejects_what_fully_async_cannot_run(kwargs, message) -> None:

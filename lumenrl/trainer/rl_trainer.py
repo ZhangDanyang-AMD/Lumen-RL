@@ -4871,6 +4871,11 @@ class RLTrainer:
         if not fully_async:
             return "one_step"
         if getattr(self, "_ray_use_atom", False):
+            if self._r3_rollout_replay or getattr(self.config.moe.r3, "enabled", False):
+                raise ValueError(
+                    "controller.ray.fully_async with moe.r3 needs the vLLM rollout: "
+                    "ATOM does not return the experts it routed each token to."
+                )
             if bool(getattr(ray_cfg.fully_async, "partial_rollout", False)) and (
                 "keep" not in self._ray_rollout_mgr.generation_pause_modes()
             ):
@@ -4883,11 +4888,6 @@ class RLTrainer:
         elif not getattr(self, "_ray_use_vllm", False):
             raise ValueError(
                 "controller.ray.fully_async needs the Ray vLLM or ATOM rollout."
-            )
-        if self._r3_rollout_replay or getattr(self.config.moe.r3, "enabled", False):
-            raise ValueError(
-                "controller.ray.fully_async does not carry R3 rollout routing across "
-                "a weight sync yet; turn off moe.r3."
             )
         return "fully_async"
 
