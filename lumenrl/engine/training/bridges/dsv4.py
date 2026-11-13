@@ -735,6 +735,10 @@ def build_dsv4_config(
         # ---- parallelism / dtype / determinism ----
         tensor_model_parallel_size=tp,
         pipeline_model_parallel_size=pp,
+        # 43 layers do not split evenly over any PP > 1; Megatron takes the first
+        # and/or last stage's count and spreads the rest.
+        num_layers_in_first_pipeline_stage=ec.get("num_layers_in_first_pipeline_stage"),
+        num_layers_in_last_pipeline_stage=ec.get("num_layers_in_last_pipeline_stage"),
         context_parallel_size=cp,
         expert_model_parallel_size=ep,
         expert_tensor_parallel_size=etp,

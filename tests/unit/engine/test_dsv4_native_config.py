@@ -27,6 +27,13 @@ def build(monkeypatch, ec):
     return dsv4.build_dsv4_config(HF, ec, tp=1, pp=1, cp=1, ep=8, etp=1, sp=False)
 
 
+def test_an_uneven_pipeline_split_reaches_megatron(monkeypatch):
+    config = build(monkeypatch, {"num_layers_in_first_pipeline_stage": 22})
+
+    assert config["num_layers_in_first_pipeline_stage"] == 22
+    assert config["num_layers_in_last_pipeline_stage"] is None
+
+
 @pytest.mark.parametrize(("ec", "rate"), [({}, 0.0), ({"moe_router_bias_update_rate": 1e-3}, 1e-3)])
 def test_the_expert_bias_stays_frozen_unless_asked(monkeypatch, ec, rate):
     config = build(monkeypatch, ec)
