@@ -304,14 +304,18 @@ class MegatronBaseEngine(BaseEngine):
 
     def _logprob_entropy_nograd(
         self, logits: torch.Tensor, targets: torch.Tensor, want_entropy: bool,
+        temperature: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """No-grad per-token log-prob (+ optional entropy), chunked over the
-        sequence to bound the ``[chunk, V]`` softmax memory."""
+        """No-grad per-token log-prob (+ optional entropy) of ``softmax(logits / T)``,
+        chunked over the sequence. Takes the model's bf16 logits: each ``[chunk, V]``
+        slice is upcast to fp32 and temperature-scaled here, so no full fp32 copy."""
         cs = self._logprob_chunk_size if (self._logprob_chunk_size and self._logprob_chunk_size > 0) else logits.shape[0]
         cs = max(1, cs)
         lps, ents = [], []
         for s in range(0, logits.shape[0], cs):
-            lg = logits[s:s + cs]
+            lg = logits[s:s + cs].float()
+            if temperature != 1.0:
+                lg = lg / temperature
             lsm = torch.log_softmax(lg, dim=-1)
             lps.append(lsm.gather(-1, targets[s:s + cs].view(-1, 1)).squeeze(-1))
             if want_entropy:
@@ -489,7 +493,9 @@ class MegatronBaseEngine(BaseEngine):
         self.module.eval()
 
         def _emit(r, start, L, seg_logits, ids_row):
-            tok_lp, ent = self._logprob_entropy_nograd(seg_logits[:-1], ids_row[1:], want_ent)  # [L-1]
+            tok_lp, ent = self._logprob_entropy_nograd(
+                seg_logits[:-1], ids_row[1:], want_ent, temperature=temperature,
+            )  # [L-1]
             lp_out[r, start:start + L - 1] = tok_lp.cpu()
             if want_ent and ent is not None:
                 ent_out[r, start:start + L - 1] = ent.cpu()
@@ -505,15 +511,17 @@ class MegatronBaseEngine(BaseEngine):
                 lengths = [L for (_, _, L) in rows]
                 for bin_rows in self._build_bins(lengths, budget):
                     ids_list = [seqs[rows[j][0], rows[j][1]:rows[j][1] + rows[j][2]].to("cuda") for j in bin_rows]
-                    logits_packed, offsets = self._forward_logits_packed(ids_list, model=self.module)
-                    logits_packed = logits_packed / temperature
+                    # Model-dtype logits; _emit upcasts per chunk and applies temperature.
+                    logits_packed, offsets = self._forward_logits_packed(
+                        ids_list, model=self.module, upcast=False,
+                    )
                     for k, j in enumerate(bin_rows):
                         r, start, L = rows[j]
                         _emit(r, start, L, logits_packed[offsets[k]:offsets[k + 1]], ids_list[k])
             else:
                 for (r, start, L) in rows:
                     ids = seqs[r, start:start + L].to("cuda")
-                    logits = self._forward_logits(ids) / temperature  # [L,V]
+                    logits = self._forward_logits(ids, upcast=False)  # [L,V]
                     _emit(r, start, L, logits, ids)
         tensors = {"log_probs": lp_out, "input_ids": batch["input_ids"]}
         if want_ent:
