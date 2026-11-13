@@ -185,6 +185,35 @@ def test_dsv4_supplies_construction_hooks():
     assert spec.sequence_alignment is not None
 
 
+def test_dsv4_hooks_call_functions_the_bridge_has():
+    """The DSv4 hooks are lambdas over ``bridges.dsv4``, so a missing function
+    surfaces only when a DSv4 run builds its model. Every ``dsv4.<name>`` the
+    spec and the native engine use must exist, and the config builder must take
+    every keyword the engine passes it."""
+    import ast
+    import inspect
+    import re
+    from pathlib import Path
+
+    from lumenrl.engine.training import megatron_native_engine
+    from lumenrl.engine.training.bridges import dsv4
+
+    sources = [Path(m.__file__).read_text() for m in (model_specs, megatron_native_engine)]
+    used = {name for src in sources for name in re.findall(r"\bdsv4\.([A-Za-z_]\w*)", src)}
+    assert {"build_dsv4_config", "build_dsv4_spec", "load_dsv4_dist_checkpoint"} <= used
+    assert [name for name in sorted(used) if not hasattr(dsv4, name)] == []
+
+    calls = [
+        node for node in ast.walk(ast.parse(sources[1]))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "build_config"
+    ]
+    assert calls
+    params = inspect.signature(dsv4.build_dsv4_config).parameters
+    for call in calls:
+        assert [kw.arg for kw in call.keywords if kw.arg not in params] == []
+
+
 def test_resolve_has_experts_honours_the_config_override():
     """Replaces the engine's inline ``num_experts > 1``."""
     dense = MODEL_REGISTRY.resolve(QWEN3_DENSE_CFG, {})
