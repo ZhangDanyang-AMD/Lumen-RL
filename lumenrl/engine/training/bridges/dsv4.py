@@ -698,6 +698,10 @@ def build_dsv4_config(
         moe_router_pre_softmax=True,
         moe_router_score_function=str(hf.get("scoring_func", "softmax")),
         moe_router_enable_expert_bias=expert_bias,
+        # The checkpoint's expert bias is part of DSv4's routing policy and
+        # reaches the rollout as a checkpoint-static tensor; Megatron's default
+        # rate (1e-3) would move it every optimizer step.
+        moe_router_bias_update_rate=float(ec.get("moe_router_bias_update_rate") or 0.0),
         moe_router_topk_scaling_factor=float(hf.get("routed_scaling_factor", 1.0)),
         moe_router_load_balancing_type="seq_aux_loss",
         moe_aux_loss_coeff=float(ec.get("moe_aux_loss_coeff", 0.0) or 0.0),
