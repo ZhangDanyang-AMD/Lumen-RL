@@ -395,13 +395,16 @@ def test_fully_async_picks_the_agent_backend(monkeypatch):
     assert built == [4]
 
 
-def _multi_turn_trainer(*, vllm=True, atom=False, r3=False) -> RLTrainer:
+def _multi_turn_trainer(*, vllm=True, atom=False, r3=False, prefix_caching=True) -> RLTrainer:
     trainer = object.__new__(RLTrainer)
     trainer.config = SimpleNamespace(
         controller=SimpleNamespace(ray=SimpleNamespace(
             one_step_off_policy=False, fully_async=SimpleNamespace(enabled=False),
         )),
-        policy=SimpleNamespace(generation=SimpleNamespace(multi_turn=SimpleNamespace(enabled=True))),
+        policy=SimpleNamespace(generation=SimpleNamespace(
+            multi_turn=SimpleNamespace(enabled=True),
+            vllm_cfg=SimpleNamespace(enable_prefix_caching=prefix_caching),
+        )),
         moe=SimpleNamespace(r3=SimpleNamespace(enabled=r3, rollout_replay=False)),
     )
     trainer._ray_use_vllm = vllm
@@ -422,6 +425,7 @@ def test_multi_turn_runs_on_a_ray_rollout(kwargs):
         (False, {}, "Ray controller with the vLLM or ATOM"),
         (True, {"vllm": False}, "Ray controller with the vLLM or ATOM"),
         (True, {"vllm": False, "atom": True, "r3": True}, "ATOM does not return"),
+        (True, {"r3": True, "prefix_caching": False}, "enable_prefix_caching=true"),
     ],
 )
 def test_multi_turn_rejects_what_it_cannot_drive(use_ray_rollout, kwargs, message):

@@ -12,9 +12,15 @@
 # colocated default (weight_sync.backend=auto); an RCCL backend between the
 # actors and the replicas on the same GPUs fails with "Duplicate GPU detected".
 #
-# Measured (MI355X, 5 steps each, same seed): rollout_corr/k3_kl 9.7e-4 with
-# replay against 1.19e-3 without, log_ppl_abs_diff 1.64e-3 against 1.84e-3,
-# rollout_is_std 0.042 against 0.046.
+# Prefix caching is on, which multi-turn replay needs: each turn's routes come
+# from the last turn's request, and without the cache that request re-prefills
+# the earlier turns, so their routes are a prefill's rather than those of the
+# decode that sampled them.
+#
+# Measured (MI355X, 5 steps each, same seed), rollout_corr/k3_kl: 3.7e-4 with
+# replay and the prefix cache, 1.18e-3 without replay; 9.7e-4 with replay and
+# 1.19e-3 without when the cache was off; single-turn (tool off) 3.8e-4 with
+# replay and 7.95e-4 without.
 #
 # Run it with LUMENRL_FP32_MOE_ROUTER=0 like the other MoE runs, against a
 # SandboxFusion service at policy.generation.multi_turn.code_interpreter.url.
@@ -74,6 +80,7 @@ policy:
       dtype: bfloat16
       enforce_eager: true
       enable_chunked_prefill: true
+      enable_prefix_caching: true
       max_num_batched_tokens: 16384
       max_num_seqs: 256
       quantization: ""
