@@ -256,6 +256,43 @@ def clear_replay() -> None:
     RouterReplay.clear_global_indices()
 
 
+def replay_on_recompute() -> None:
+    """Route the coming backward's recomputed forwards as the forwards before it did.
+
+    Activation recomputation runs each checkpointed layer's forward again during
+    the backward, and its router has to pick the experts the first forward
+    replayed. ``REPLAY_BACKWARD`` pops each router's own queue of the indices
+    ``install_replay(append=True)`` appended, one microbatch per backward; a
+    pipeline schedule runs backwards in forward order, so the queue's head is
+    always the microbatch being recomputed. The next forward's
+    ``install_replay`` switches back to ``REPLAY_FORWARD``.
+    """
+    from megatron.core.transformer.moe.router_replay import (
+        RouterReplay,
+        RouterReplayAction,
+    )
+
+    RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
+
+
+def queued_recompute_routes(model: Any) -> int:
+    """Indices still queued for a recomputed forward, over ``model``'s routers.
+
+    Zero after a backward that recomputed every layer of every microbatch: each
+    recompute pops one entry per router. A positive count means some recomputed
+    forward did not replay the queue -- it routed by its own choice. Hash-routed
+    routers (DSv4's first layers: experts looked up from the token id in
+    ``tid2eid``) never read the queue, in any forward, so they are left out.
+    """
+    total = 0
+    for module in model.modules():
+        replay = getattr(module, "router_replay", None)
+        if replay is None or getattr(module, "tid2eid", None) is not None:
+            continue
+        total += len(replay.replay_backward_list)
+    return total
+
+
 def install_replay(layer_tensors: list[Tensor], *, append: bool) -> None:
     """Load indices into Megatron ``RouterReplay`` and set ``REPLAY_FORWARD``."""
     from megatron.core.transformer.moe.router_replay import (

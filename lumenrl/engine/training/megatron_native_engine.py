@@ -417,12 +417,10 @@ class MegatronNativeEngine(MegatronBaseEngine):
         self._r3_batch_routes = None
         self._r3_append = False
         self._r3_layer_indices: list[int] | None = None
-        if self._r3_enabled and (ec.get("recompute_granularity") or None):
-            raise RuntimeError(
-                "MegatronNativeEngine R3 cannot use activation recomputation yet: "
-                "checkpointed forwards would replay the latest microbatch's "
-                "expert ids. Unset recompute_granularity while moe.r3.enabled."
-            )
+        self._recompute_every_layer = (
+            ec.get("recompute_granularity") == "full"
+            and (ec.get("recompute_method") or "uniform") == "uniform"
+        )
 
         # Megatron hard-requires sequence parallelism when MoE and TP are both on
         # (the MoE token dispatcher assumes SP-scattered activations under TP).
@@ -1545,6 +1543,10 @@ class MegatronNativeEngine(MegatronBaseEngine):
             attention_mask=None,
             packed_seq_params=psp,
         )
+        if self._r3_enabled and self._r3_append:
+            from lumenrl.engine.training.megatron_r3_replay import replay_on_recompute
+
+            replay_on_recompute()
         return out, layouts
 
     def _cp_row_logprob_entropy(
@@ -1873,6 +1875,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
         fwd_bwd = get_forward_backward_func()
         from lumenrl.engine.training.megatron_r3_replay import (
             clear_replay,
+            queued_recompute_routes,
             routes_from_batch,
         )
 
@@ -1885,6 +1888,15 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 forward_step_func=forward_step, data_iterator=[data_iter], model=[self._ddp],
                 num_microbatches=num_mb, seq_length=1, micro_batch_size=1, forward_only=False,
             )
+            # Full uniform recomputation reruns every layer of every microbatch, so
+            # each one must have consumed its queued routes.
+            if self._r3_enabled and self._recompute_every_layer:
+                left = queued_recompute_routes(self.module)
+                if left:
+                    raise RuntimeError(
+                        f"moe.r3 with recomputation: {left} queued routes were never "
+                        "replayed, so some recomputed layer picked its own experts."
+                    )
         finally:
             if self._r3_enabled:
                 clear_replay()

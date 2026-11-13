@@ -100,7 +100,8 @@ def test_native_forwards_require_vllm_routes_not_logit_hooks() -> None:
     assert cleanup < construction
     assert "megatron_record_router_logits" not in source
     assert "recompute_granularity" in source
-    assert "cannot use activation recomputation" in source
+    assert "cannot use activation recomputation" not in source
+    assert "_recompute_every_layer" in source
 
 
 def test_routes_from_batch_requires_vllm_payload() -> None:
