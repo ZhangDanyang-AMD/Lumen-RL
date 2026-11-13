@@ -4831,16 +4831,6 @@ class RLTrainer:
                 "policy.generation.multi_turn replays MoE routing (moe.r3) from the vLLM "
                 "rollout only: ATOM does not return the experts it routed each token to."
             )
-        if r3 and not getattr(self.config.policy.generation.vllm_cfg, "enable_prefix_caching", False):
-            # Each turn's routes come from the last turn's request. Without the
-            # prefix cache that request re-prefills the earlier turns, so their
-            # routes are a prefill's rather than those of the decode that sampled them.
-            raise ValueError(
-                "policy.generation.multi_turn with moe.r3 needs "
-                "policy.generation.vllm_cfg.enable_prefix_caching=true: without it the "
-                "earlier turns are re-prefilled and their routes are not the ones that "
-                "sampled them."
-            )
 
     def _resolve_rollout_pipeline(self, use_ray_rollout: bool) -> str:
         """``sync``, ``one_step`` or ``fully_async``; reject layouts that cannot overlap."""

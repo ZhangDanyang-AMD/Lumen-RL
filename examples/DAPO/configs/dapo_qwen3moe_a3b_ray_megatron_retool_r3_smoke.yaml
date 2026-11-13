@@ -4,23 +4,24 @@
 # (Qwen3-30B-A3B, code interpreter, 8 turns, non-thinking) on the training and
 # rollout layout of dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml: 8 GPUs
 # shared by Megatron (EP=8, DP=8) and vLLM, so it runs synchronously. With
-# moe.r3.enabled the vLLM rollout returns the experts it routed every token of
-# a trajectory to, from the last turn, and Megatron replays them; set it to
-# false for the same run without replay. 16 prompts x 16 rollouts per step,
+# moe.r3.enabled the vLLM rollout returns, turn by turn, the experts it routed
+# every token of a trajectory to, and Megatron replays them; set it to false
+# for the same run without replay. 16 prompts x 16 rollouts per step,
 # 4k responses: with 8k, Megatron's backward ran out of memory beside vLLM's
 # 0.35 of the GPU (step 2, 141.7 GiB allocated by Megatron). Weight sync is the
 # colocated default (weight_sync.backend=auto); an RCCL backend between the
 # actors and the replicas on the same GPUs fails with "Duplicate GPU detected".
 #
-# Prefix caching is on, which multi-turn replay needs: each turn's routes come
-# from the last turn's request, and without the cache that request re-prefills
-# the earlier turns, so their routes are a prefill's rather than those of the
-# decode that sampled them.
+# Prefix caching is on. Replay does not need it -- each turn keeps the routing
+# of the forwards that sampled it -- but with it a later turn attends to the KV
+# the earlier turns were sampled with, as the trainer's forward does; without
+# it, to a re-prefill's.
 #
-# Measured (MI355X, 5 steps each, same seed), rollout_corr/k3_kl: 3.7e-4 with
-# replay and the prefix cache, 1.18e-3 without replay; 9.7e-4 with replay and
-# 1.19e-3 without when the cache was off; single-turn (tool off) 3.8e-4 with
-# replay and 7.95e-4 without.
+# Measured (MI355X, 5 steps each, same seed), rollout_corr/k3_kl: 3.6e-4 with
+# replay and the prefix cache, 4.2e-4 with replay and no cache, 1.18e-3
+# without replay. Before each turn kept its own routing, replay without the
+# cache reached only 9.7e-4. Single-turn (tool off): 3.8e-4 with replay and
+# 7.95e-4 without.
 #
 # Run it with LUMENRL_FP32_MOE_ROUTER=0 like the other MoE runs, against a
 # SandboxFusion service at policy.generation.multi_turn.code_interpreter.url.

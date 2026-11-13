@@ -413,7 +413,9 @@ def _multi_turn_trainer(*, vllm=True, atom=False, r3=False, prefix_caching=True)
 
 
 @pytest.mark.parametrize(
-    "kwargs", [{}, {"vllm": False, "atom": True}, {"r3": True}], ids=["vllm", "atom", "vllm-r3"],
+    "kwargs",
+    [{}, {"vllm": False, "atom": True}, {"r3": True}, {"r3": True, "prefix_caching": False}],
+    ids=["vllm", "atom", "vllm-r3", "vllm-r3-no-prefix-cache"],
 )
 def test_multi_turn_runs_on_a_ray_rollout(kwargs):
     assert _multi_turn_trainer(**kwargs)._resolve_rollout_pipeline(True) == "sync"
@@ -425,7 +427,6 @@ def test_multi_turn_runs_on_a_ray_rollout(kwargs):
         (False, {}, "Ray controller with the vLLM or ATOM"),
         (True, {"vllm": False}, "Ray controller with the vLLM or ATOM"),
         (True, {"vllm": False, "atom": True, "r3": True}, "ATOM does not return"),
-        (True, {"r3": True, "prefix_caching": False}, "enable_prefix_caching=true"),
     ],
 )
 def test_multi_turn_rejects_what_it_cannot_drive(use_ray_rollout, kwargs, message):
