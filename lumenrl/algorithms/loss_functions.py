@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "agg_loss",
+    "reduce_reported_loss",
     "sft_loss",
     "policy_gradient_loss",
     "asymmetric_clip_loss",
@@ -25,6 +26,28 @@ __all__ = [
     "hidden_state_loss",
     "entropy_bonus",
 ]
+
+
+def reduce_reported_loss(unit_losses) -> float:
+    """Reduce per-accumulation-unit losses into the scalar reported as ``loss``.
+
+    An "accumulation unit" is whatever the engine backwards one at a time: a row
+    on the Megatron path, a packed micro-batch on the FSDP path. ``agg_loss`` has
+    already divided each unit by the GLOBAL ``batch_num_tokens`` and scaled it by
+    ``dp_size``, so the SUM over units is the globally-normalized objective -- the
+    quantity that was actually differentiated.
+
+    It must therefore be a sum and never a mean. Both engines used to average
+    instead, each over its own unit count, and those counts are properties of the
+    configuration rather than of the model: rows-per-rank is ``global_batch / DP``
+    and micro-batch count follows ``max_token_len_per_gpu``. Two runs optimizing
+    the same objective to within 2% reported losses 17x apart (Qwen3-8B DAPO,
+    DP=2 vs DP=8). Keeping the reduction here means the two paths cannot drift
+    apart again.
+    """
+    if isinstance(unit_losses, (list, tuple)):
+        return float(sum(unit_losses))
+    return float(unit_losses)
 
 
 def agg_loss(

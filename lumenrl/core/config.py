@@ -38,6 +38,9 @@ class FSDPEngineConfig:
     forward_prefetch: bool = False
     use_orig_params: bool = True
     use_torch_compile: bool = False
+    # Opt-in stub body for tests and offline development: when set, the engine
+    # builds _TinyLM with this arch instead of loading ``local_path``.
+    tiny_lm: Optional[dict] = None
 
 
 @dataclass
