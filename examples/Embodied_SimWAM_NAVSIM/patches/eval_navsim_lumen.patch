@@ -1,0 +1,26 @@
+diff --git a/experiments/navsim/eval_navsim.py b/experiments/navsim/eval_navsim.py
+index b5b93cb..c3485c6 100644
+--- a/experiments/navsim/eval_navsim.py
++++ b/experiments/navsim/eval_navsim.py
+@@ -661,9 +661,20 @@ def main(cfg: DictConfig):
+     start_time = time.time()
+     model_device = _resolve_eval_device(cfg)
+     model_dtype = _mixed_precision_to_model_dtype(cfg.get("mixed_precision", "bf16"))
+-    model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
++    model_cfg = OmegaConf.create(OmegaConf.to_container(cfg.model, resolve=True))
++    model_cfg.pop("checkpoint_path", None)
++    model = instantiate(model_cfg, model_dtype=model_dtype, device=model_device)
+     _load_model_checkpoint(model, str(cfg.ckpt))
+     model = model.to(model_device).eval()
++    lumen_spec = os.environ.get("LUMEN_ENABLE", "").strip()
++    if lumen_spec:
++        repo_root = project_root.parents[1]
++        if str(repo_root) not in sys.path:
++            sys.path.insert(0, str(repo_root))
++        from examples.Embodied_SimWAM_NAVSIM.plugin import enable_lumen
++
++        enable_lumen(model, lumen_spec)
++        logging.info("Lumen patches enabled: %s", lumen_spec)
+ 
+     dataset = _build_eval_dataset(cfg)
+     if _is_main_process():

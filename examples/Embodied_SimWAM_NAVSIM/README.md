@@ -68,7 +68,7 @@ Each name is one `LumenConfig.enable` call. Empty, `0`, `false`, `none`, and `of
 
 | Flag | What it changes | Fallback |
 |---|---|---|
-| `hf_attn_patch` | `F.scaled_dot_product_attention` goes through Lumen attention. A bool keep-mask (`True` = attend) is converted to an additive bias first. | Extra kwargs, or a kernel error, call the original SDPA. |
+| `hf_attn_patch` | `F.scaled_dot_product_attention` goes through Lumen attention. A bool keep-mask (`True` = attend) is converted to an additive bias, expanded so size-1 axes have stride 0, and a per-batch mask is launched one batch at a time (the Triton kernel ignores the batch stride). | Extra kwargs, a kernel error, or a masked call that needs a gradient: the original SDPA. Lumen's backward does not apply the bias, and those gradients overflow to inf in bf16. |
 | `lumen_linear` | `nn.Linear` forward uses the tuned bf16 GEMM (`dispatch_gemm`, `scaling="none"`). Backward is a torch matmul autograd wrapper. LoRA `A`/`B` are parameters, not `nn.Linear`, so the same GEMM is installed on `LoRALinear.forward`. | If the flag fails to load, LoRA `A`/`B` stay on torch matmul. |
 | `aiter_conv` | `nn.Conv2d` and `nn.Conv3d` forward use AITER. `CausalConv3d.forward` (the causal pad) is kept; only `_conv_forward` is rebound. This covers the Wan2.2 VAE (`WanVideoVAE38`, 48 latent channels). | Unsupported dtype or groups, or a kernel error, use the original conv. Conv3d is imported from `$AITER_SRC` when the installed aiter has no `conv3d`. |
 
@@ -115,6 +115,55 @@ NPROC=4 CUDA_VISIBLE_DEVICES=4,5,6,7 \
 
 The run uses the NAVSIM task `navsim_grpo_action_pdm_384x672_flowgrpo_lora`: front camera 384×672, 9 frames, action LoRA only. The script exits before launch if maps, logs, sensor blobs, or the metric cache directory is missing.
 
+## Worked recipe
+
+This is the run that finished on 4×MI350X and was scored on the full NAVSIM v1 `navtest` (12146 tokens).
+
+Two host checkouts have to be the ones this example was written against:
+
+- Lumen `dev/world-model-rl`, including the masked-backward fallback in `lumen/ops/attention/hf_patch.py`. Without it every optimizer step logs `gnorm=inf` and the weights do not move.
+- aiter with `conv3d`. `AITER_SRC` defaults to `/home/danyzhan/aiter`.
+
+`launch_container.sh` mounts `/mnt/k3` and creates `/work/tmp`. The image sets `TMPDIR=/work/tmp` but does not mount it; clang then fails to JIT HIP kernels and the process segfaults.
+
+The published hard filter (`navtrain_pdm_score_below0p9`, 17389 tokens) lists frames whose camera jpg is not in the OpenScene tarballs. The scene loader reads every CAM_F0 frame in the 14-frame window, so the first missing file aborts startup. `configs/navtrain_pdm_score_below0p9_complete.yaml` keeps the 2784 tokens that have all 14 frames and a metric cache.
+
+```bash
+bash examples/Embodied_SimWAM_NAVSIM/launch_container.sh
+docker exec -it simwam-rl bash examples/Embodied_SimWAM_NAVSIM/setup_env.sh
+
+docker exec -it simwam-rl bash -lc \
+  'cd /home/danyzhan/Lumen-RL && \
+   RUN_ID=formal2 \
+   bash examples/Embodied_SimWAM_NAVSIM/run_embodied_grpo.sh \
+   data.train.scene_filter=/home/danyzhan/Lumen-RL/examples/Embodied_SimWAM_NAVSIM/configs/navtrain_pdm_score_below0p9_complete.yaml'
+```
+
+`configs/embodied_simwam_navsim_grpo.yaml` already sets `model.redirect_common_files=false` (the DiffSynth Wan conversion is gated; use the local `Wan-AI/Wan2.2-TI2V-5B` VAE and T5), `max_steps=20000`, `save_every=1000`, and `num_workers=4`. Defaults elsewhere: 4 GPUs, bf16, DeepSpeed ZeRO-1, LoRA r=16 on the action expert q/k/v/o, group size 8, 10 denoising steps of which 3 are stochastic. Checkpoints land in `examples/SimWAM/runs/grpo/.../<RUN_ID>/checkpoints/weights/`. The `weights/` files are LoRA-merged.
+
+`runs/` is large (about 15 GB of optimizer state and 12 GB of weights per 1000 steps). Put it on a data disk. The root filesystem filled up at step ~13000 of this run; moving older checkpoints off the root disk while training continued was enough to finish.
+
+### navtest
+
+Official PDMS is the full `navtest` split, not the training-loop reward. The in-loop eval is 8 batches of the hard training subset.
+
+Download OpenScene `openscene_metadata_test.tgz` and `openscene_sensor_test_camera_{0..31}.tgz` (camera only; the loader uses CAM_F0). Build the metric cache with `navsim/scripts/evaluation/run_metric_caching.sh` and `train_test_split=navtest`. A thread pool stays on one core; `worker=single_machine_thread_pool worker.use_process_pool=true worker.max_workers=24` finishes the 12146 caches.
+
+```bash
+docker exec -it simwam-rl bash -lc \
+  'CKPT=/path/to/step_020000.pt \
+   bash examples/Embodied_SimWAM_NAVSIM/run_navtest_eval.sh'
+```
+
+The script applies `patches/eval_navsim_lumen.patch` to the local SimWAM checkout if it is not already applied. That drops `model.checkpoint_path` before `create_simwam_grpo` (the merged weights are loaded from `ckpt=`) and turns on `LUMEN_ENABLE`. Inference is action-only, current frame, 384×672, 10 steps, videos off. Score the `pred_actions/*.npy` with `pdm_score` at the reported weights (progress 5, TTC 5, comfort 2), not the training reward weights (10, 5, 2).
+
+`step_020000.pt` on all 12146 navtest tokens:
+
+|  | NC | DAC | EP | TTC | C | PDMS |
+|---|---:|---:|---:|---:|---:|---:|
+| this run, 20000 steps, 2784 train tokens | 98.40 | 98.53 | 86.01 | 95.20 | 100.00 | 91.10 |
+| SimWAM README, RL, 170000 steps | 98.5 | 99.1 | 86.5 | 96.1 | 99.8 | 91.9 |
+
 ## Layout
 
 | File | Role |
@@ -127,3 +176,6 @@ The run uses the NAVSIM task `navsim_grpo_action_pdm_384x672_flowgrpo_lora`: fro
 | `run_embodied_grpo.sh` | NAVSIM env, `LUMEN_ENABLE`, torchrun. |
 | `bench_kernels.py` | Kernel check without data. |
 | `configs/embodied_simwam_navsim_grpo.yaml` | Hydra overrides for the 4-GPU run. |
+| `configs/navtrain_pdm_score_below0p9_complete.yaml` | Hard-subset tokens whose 14 CAM_F0 frames and metric cache exist. |
+| `patches/eval_navsim_lumen.patch` | Load a merged checkpoint and enable Lumen inside SimWAM's navtest eval. |
+| `run_navtest_eval.sh` | 4-GPU navtest inference. |

@@ -34,6 +34,8 @@ docker run -d --init --name "$NAME" \
 mkdir -p "$ROOT/.cache/miopen"
 # The image links /root/.cache/miopen at /work/cache/miopen, which this
 # container does not mount. A real directory is required for torch Conv3d.
-docker exec "$NAME" bash -lc 'if [ -L /root/.cache/miopen ]; then rm -f /root/.cache/miopen; fi; mkdir -p /root/.cache/miopen '"$ROOT"'/.cache/miopen'
+# TMPDIR=/work/tmp is set by the image and is also unmounted; clang fails to
+# JIT HIP kernels (and then segfaults) unless that directory exists.
+docker exec "$NAME" bash -lc 'if [ -L /root/.cache/miopen ]; then rm -f /root/.cache/miopen; fi; mkdir -p /root/.cache/miopen '"$ROOT"'/.cache/miopen /work/tmp'
 
 docker inspect -f 'started {{.Name}} image={{.Config.Image}} gpus='"$GPUS" "$NAME"
