@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# PATH shim in front of the real ray CLI, for the driver only.
+#
+# run_dapo.sh opens with `ray stop --force` to clear leftovers from a previous
+# single-process run. Here the cluster is started before the driver, and that call
+# would tear down the head the driver is about to connect to. Swallow `stop` and
+# forward everything else untouched, so run_dapo.sh stays unmodified.
+if [ "${1:-}" = "stop" ]; then
+  echo "[dsv4] ignoring 'ray stop' -- the cluster is managed by scripts/run.sh" >&2
+  exit 0
+fi
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+CLEAN_PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$SELF_DIR" | paste -sd: -)"
+exec env PATH="$CLEAN_PATH" ray "$@"
