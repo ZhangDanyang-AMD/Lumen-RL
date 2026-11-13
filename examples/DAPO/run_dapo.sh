@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 统一 DAPO 启动：MODE=bf16|fp8|atomfp8|atombf16, TRAIN_FP8=0|1, STEPS=N。路径取容器内 $RL_ROOT/$DATA_ROOT。
+# 统一 DAPO 启动：MODE=bf16|fp8|atomfp8|atombf16|dsv4, TRAIN_FP8=0|1, STEPS=N。路径取容器内 $RL_ROOT/$DATA_ROOT。
 set -uo pipefail
 : "${RL_ROOT:?}"; : "${DATA_ROOT:?}"
 MODE="${MODE:-bf16}"; TRAIN_FP8="${TRAIN_FP8:-0}"; STEPS="${STEPS:-1000}"
@@ -170,6 +170,11 @@ elif [ "$MODE" = "fp8" ]; then
     export LUMEN_FP8=1 FP8_PARAM_MANAGER=0 LUMEN_NORM=1
     export LUMEN_FP8_SCALING=blockwise2d LUMEN_FP8_FORMAT=fp8_e4m3 LUMEN_FP8_BLOCK_SIZE=128 LUMEN_FP8_ATTN=none
   fi
+elif [ "$MODE" = "dsv4" ]; then
+  # DeepSeek-V4 BF16 (examples/DSv4_DAPO): its sparse attention indexer has only an
+  # AITER path on ROCm, so the switch stays on, the rest of AITER off. The rollout
+  # replicas take these from this process's environment (VLLMReplicaManager).
+  export VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_MHA=0 VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=0 VLLM_ROCM_USE_AITER_LINEAR=0
 else
   CONFIG=examples/DAPO/configs/dapo_qwen3_8b_ray_vllm_longrun.yaml
   export VLLM_ROCM_USE_AITER=0 VLLM_ROCM_USE_AITER_MHA=0 VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=0 VLLM_ROCM_USE_AITER_LINEAR=0
