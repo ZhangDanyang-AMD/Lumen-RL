@@ -48,6 +48,13 @@ class Trajectory:
         self.response_logprobs.extend(logprobs if logprobs is not None else [0.0] * len(token_ids))
         self.assistant_turns += 1
 
+    def add_scripted_turn(self, token_ids: list[int]) -> None:
+        """A turn written for the model (``multi_turn.scripted_first_turn``): it
+        carries no loss and no log-probs and is not counted as a model turn."""
+        self.response_ids.extend(token_ids)
+        self.response_mask.extend([0] * len(token_ids))
+        self.response_logprobs.extend([0.0] * len(token_ids))
+
     def add_environment(self, token_ids: list[int]) -> None:
         self.response_ids.extend(token_ids)
         self.response_mask.extend([0] * len(token_ids))

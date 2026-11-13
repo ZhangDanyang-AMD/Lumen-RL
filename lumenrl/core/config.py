@@ -414,6 +414,10 @@ class MultiTurnConfig:
     tool_response_truncate_side: str = "middle"
     # Prepended to every prompt as a system message when non-empty.
     system_prompt: str = ""
+    # Written as every rollout's first assistant turn instead of generating it,
+    # as environment tokens (no loss), and its tool calls are run: a plumbing
+    # smoke for a model that cannot call tools yet, such as a sliced DeepSeek-V4.
+    scripted_first_turn: str = ""
     # Passed to apply_chat_template, e.g. {enable_thinking: false} for Qwen3;
     # for "dsml", {thinking_mode: chat|thinking}; for "dsml_v41" also
     # {reasoning_effort: 1-100|low|high|max}.

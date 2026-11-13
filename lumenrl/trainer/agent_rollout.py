@@ -148,6 +148,7 @@ def build_agent_rollout(config: Any, tokenizer: Any, servers: list[Any]) -> Agen
         max_parallel_calls=mt.max_parallel_calls,
         max_tool_response_length=mt.max_tool_response_length,
         tool_response_truncate_side=mt.tool_response_truncate_side,
+        scripted_first_turn=mt.scripted_first_turn,
     )
 
     async def close_tools() -> None:
