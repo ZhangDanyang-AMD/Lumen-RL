@@ -133,7 +133,14 @@ class FSDP2Engine(BaseEngine):
 
     def _make_backend_config(self) -> dict[str, Any]:
         cfg: dict[str, Any] = {}
-        if self.model_config.local_path:
+        # An explicit tiny_lm arch selects the stub body even when model_name is
+        # set, so a test can name the config it stands in for. Without it only an
+        # empty local_path reached _TinyLM -- and then with the default arch,
+        # because the declared one never got this far.
+        if self.engine_config.tiny_lm:
+            cfg["use_tiny_lm"] = True
+            cfg["tiny_lm"] = dict(self.engine_config.tiny_lm)
+        elif self.model_config.local_path:
             cfg["model_dtype"] = self.engine_config.model_dtype
         else:
             cfg["use_tiny_lm"] = True

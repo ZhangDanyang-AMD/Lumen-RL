@@ -46,10 +46,27 @@ def _run_steps(cfg: dict[str, Any], steps: int, seed: int) -> list[float]:
     worker = LumenActorWorker(rank=0, world_size=1, config=cfg)
     worker.init_model()
     b, t = 2, 16
+    ids = torch.randint(0, 512, (b, t), dtype=torch.long)
+    mask = torch.ones(b, t, dtype=torch.long)
+    # old_log_probs has to come from the policy itself. Left out (or zeroed) the
+    # PPO ratio starts at exp(-log V) ~ 2e-3, the surrogate is pinned to the clip
+    # constant, and both arms then agree on a number the compute dtype never
+    # touched -- the test would pass without exercising anything.
+    old_log_probs = worker.compute_log_probs(
+        DataProto(tensors={"input_ids": ids, "attention_mask": mask})
+    )["log_probs"]
     batch = DataProto(
         tensors={
-            "input_ids": torch.randint(0, 512, (b, t), dtype=torch.long),
+            "input_ids": ids,
+            "attention_mask": mask,
+            "response_mask": mask,
+            "old_log_probs": old_log_probs,
             "advantages": torch.ones(b, t, dtype=torch.float32),
+        },
+        meta={
+            "algorithm": "dapo",
+            "dp_size": 1,
+            "batch_num_tokens": int(mask[:, 1:].sum()),
         },
     )
     losses: list[float] = []

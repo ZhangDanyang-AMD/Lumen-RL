@@ -245,6 +245,7 @@ class LumenActorWorker(BaseWorker):
                     "reduce_dtype": "fp32",
                 },
                 "seed": int(policy.get("seed", 42)),
+                "tiny_lm": training_cfg.get("tiny_lm") or None,
             }
         elif backend in ("megatron_native", "megatron-native", "megatron", "megatron_lumen_dsv4"):
             meg_cfg = training_cfg.get("megatron_cfg") or policy.get("megatron_cfg") or {}
