@@ -375,3 +375,46 @@ def test_a_rollout_from_an_engine_without_routes_has_none():
     trajectory, *_ = run_loop([("42", "stop")])
 
     assert "routed_experts" not in trajectory.to_rollout_result()
+
+
+def test_a_scripted_first_turn_runs_its_tools_and_carries_no_loss():
+    tok = ChatMLTokenizer()
+    tool = EchoTool(output="42")
+    engine = ScriptedEngine(tok, [("The answer is 42.", "stop")])
+    loop = ToolAgentLoop(ChatTemplateTokenizer(tok), [tool], scripted_first_turn=call("6 * 7"))
+
+    t = asyncio.run(loop.run(engine.generate, PROMPT, {"max_tokens": 10_000}, 4096))
+
+    assert tool.calls == [{"code": "6 * 7"}]
+    assert (t.assistant_turns, t.tool_calls, t.tool_rounds, t.stop_reason) == (1, 1, 1, "answer")
+    [(engine_input, _)] = engine.requests
+    assert engine_input == t.prompt_ids + t.response_ids[: len(engine_input) - len(t.prompt_ids)]
+    answer = tok.encode("The answer is 42.") + [IM_END]
+    assert segments(t.response_mask) == [(0, len(t.response_ids) - len(answer)), (1, len(answer))]
+    assert tok.decode(t.response_ids[: len(t.response_ids) - len(answer)]).startswith(call("6 * 7"))
+
+
+def test_the_routes_cover_a_scripted_first_turn():
+    tok = ChatMLTokenizer()
+    engine = RoutingEngine(tok, [("The answer is 42.", "stop")])
+    loop = ToolAgentLoop(
+        ChatTemplateTokenizer(tok), [EchoTool(output="42")], scripted_first_turn=call("6 * 7"),
+    )
+
+    result = asyncio.run(loop.run(engine.generate, PROMPT, {"max_tokens": 10_000}, 4096)).to_rollout_result()
+
+    # No request wrote the scripted turn, so the first one returns its routing too.
+    assert "routed_experts_prompt_start" not in engine.requests[0][1]
+    assert len(result["routed_experts"]) == len(result["prompt_token_ids"]) + len(result["token_ids"]) - 1
+
+
+def test_a_scripted_turn_without_calls_lets_the_model_answer():
+    tok = ChatMLTokenizer()
+    tool = EchoTool()
+    engine = ScriptedEngine(tok, [("42", "stop")])
+    loop = ToolAgentLoop(ChatTemplateTokenizer(tok), [tool], scripted_first_turn="Let me think.")
+
+    t = asyncio.run(loop.run(engine.generate, PROMPT, {"max_tokens": 10_000}, 4096))
+
+    assert tool.calls == [] and t.tool_rounds == 0 and t.stop_reason == "answer"
+    assert segments(t.response_mask) == [(0, len(tok.encode("Let me think."))), (1, len(tok.encode("42")) + 1)]

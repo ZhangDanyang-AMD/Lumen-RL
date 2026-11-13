@@ -42,7 +42,9 @@ class ToolAgentLoop:
     ``max_assistant_turns`` turns, or when the response (model and environment
     tokens together) would exceed its token budget. A stateful tool (one with
     ``open``) gets a session per rollout, opened at the first call and closed
-    when the rollout ends.
+    when the rollout ends. ``scripted_first_turn`` writes the first assistant
+    turn instead of generating it, as environment tokens, and runs the tools it
+    calls: for plumbing smokes of a model that cannot call tools yet.
     """
 
     def __init__(
@@ -55,6 +57,7 @@ class ToolAgentLoop:
         max_parallel_calls: int = 1,
         max_tool_response_length: int = 256,
         tool_response_truncate_side: str = "middle",
+        scripted_first_turn: str = "",
     ) -> None:
         if tool_response_truncate_side not in _TRUNCATE_SIDES:
             raise ValueError(
@@ -68,6 +71,7 @@ class ToolAgentLoop:
         self._max_parallel_calls = max(1, int(max_parallel_calls))
         self._max_tool_response_length = int(max_tool_response_length)
         self._truncate_side = tool_response_truncate_side
+        self._scripted_first_turn = scripted_first_turn
 
     @property
     def tool_schemas(self) -> list[dict[str, Any]]:
@@ -109,6 +113,15 @@ class ToolAgentLoop:
         max_response_tokens: int,
         sessions: dict[str, ToolSession],
     ) -> None:
+        if self._scripted_first_turn:
+            turn_ids = self._chat.encode_text(self._scripted_first_turn)
+            trajectory.add_scripted_turn(turn_ids)
+            calls, malformed = self._parser.parse(self._scripted_first_turn)
+            trajectory.malformed_tool_calls += malformed
+            if calls and not await self._run_tools(
+                trajectory, calls, turn_ids, sessions, max_response_tokens,
+            ):
+                return
         while True:
             budget = max_response_tokens - len(trajectory.response_ids)
             if budget <= 0:
@@ -146,26 +159,40 @@ class ToolAgentLoop:
                 trajectory.stop_reason = "max_turns"
                 break
 
-            calls = calls[: self._max_parallel_calls]
-            t0 = time.perf_counter()
-            results = await asyncio.gather(*(self._call(call, sessions) for call in calls))
-            trajectory.tool_s += time.perf_counter() - t0
-            trajectory.tool_calls += len(results)
-            trajectory.tool_errors += sum(not result.ok for result in results)
-
-            environment = self._chat.encode_tool_responses(
-                [
-                    truncate_tool_response(
-                        result.text, self._max_tool_response_length, self._truncate_side,
-                    )
-                    for result in results
-                ],
-                after=turn_ids,
-            )
-            if len(trajectory.response_ids) + len(environment) >= max_response_tokens:
-                trajectory.stop_reason = "length"
+            if not await self._run_tools(trajectory, calls, turn_ids, sessions, max_response_tokens):
                 break
-            trajectory.add_environment(environment)
+
+    async def _run_tools(
+        self,
+        trajectory: Trajectory,
+        calls: list[ToolCall],
+        after: list[int],
+        sessions: dict[str, ToolSession],
+        max_response_tokens: int,
+    ) -> bool:
+        """Run the turn's calls and append their output after it; False, with
+        the rollout ended, when the output does not fit."""
+        calls = calls[: self._max_parallel_calls]
+        t0 = time.perf_counter()
+        results = await asyncio.gather(*(self._call(call, sessions) for call in calls))
+        trajectory.tool_s += time.perf_counter() - t0
+        trajectory.tool_calls += len(results)
+        trajectory.tool_errors += sum(not result.ok for result in results)
+
+        environment = self._chat.encode_tool_responses(
+            [
+                truncate_tool_response(
+                    result.text, self._max_tool_response_length, self._truncate_side,
+                )
+                for result in results
+            ],
+            after=after,
+        )
+        if len(trajectory.response_ids) + len(environment) >= max_response_tokens:
+            trajectory.stop_reason = "length"
+            return False
+        trajectory.add_environment(environment)
+        return True
 
     async def _call(self, call: ToolCall, sessions: dict[str, ToolSession]) -> ToolResult:
         tool = self._tools.get(call.name)
