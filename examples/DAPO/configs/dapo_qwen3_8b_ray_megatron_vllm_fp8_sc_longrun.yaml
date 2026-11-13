@@ -51,10 +51,11 @@ policy:
   lr_decay_style: constant
   training:
     optimizer_dtype: bf16               # COMPUTE dtype (master weights stay fp32)
-    # 192 GB MI300X: uncapped, Megatron's allocator cache (105-109 GB live, up to
-    # 150+ reserved) filled the device during training, and vLLM's weight-sync and
-    # RCCL's allocations OOMed. 0.70 trainer + 0.20 vLLM leaves ~19 GiB for the rest.
-    max_memory_fraction: 0.70
+    # 192 GB MI300X: uncapped, Megatron's allocator cache filled the device during
+    # training, and vLLM's weight-sync and RCCL's allocations OOMed. Live peak is
+    # ~90 GiB. At 0.70 the end-of-step param all-gather (RCCL buffers outside the
+    # cap) still took the device to 203 of 206 GB; 0.65 + vLLM 0.20 leaves ~29 GiB.
+    max_memory_fraction: 0.65
     megatron_cfg:
       use_distributed_optimizer: true
       # Full activation recomputation: recompute one transformer layer at a time
