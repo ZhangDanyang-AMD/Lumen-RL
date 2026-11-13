@@ -6,6 +6,7 @@ An AMD native **Post-Training Framework for LLMs**, powered by [Lumen](https://g
 
 ## 📢 News
 
+- **[2026/11]** LumenRL now supports **one-step off-policy and fully async training** on the Ray controller path — the rollout keeps generating on GPUs of its own while the trainer trains; 2.7× faster on Qwen3-30B-A3B DAPO (example 6) at comparable accuracy. See [Asynchronous Training](#asynchronous-training)
 - **[2026/11]** LumenRL now supports **diffusion RL: Qwen-Image full-parameter FlowGRPO** on 8× MI350X — verl-omni's official recipe (VeOmni training, vLLM-Omni rollout) reaches validation reward 0.978 at step 300 (official reference best 0.975), and Lumen patches on the actor cut actor time by 8% ([example](examples/QwenImage_FlowGRPO/README.md))
 - **[2026/09]** The ATOM-side fixes LumenRL's rollout depends on — FP8 expert weight synchronization and CUDA graph release across sleep/wake — are **merged into upstream [ROCm/ATOM](https://github.com/ROCm/ATOM) `main`** ([#2028](https://github.com/ROCm/ATOM/pull/2028)), so ATOM is now pinned to a main commit instead of a PR head
 - **[2026/07]** LumenRL now supports **MoE RL training (Qwen3-30B-A3B)** — fused routing + aux loss, R3 router alignment for stable MoE RL training
@@ -27,7 +28,7 @@ An AMD native **Post-Training Framework for LLMs**, powered by [Lumen](https://g
   - [SDDD Models](#sddd-models)
 - [Requirements](#requirements)
 - [Quick Start](#quick-start)
-- [Fully Async Training](#fully-async-training)
+- [Asynchronous Training](#asynchronous-training)
 - [Quantization](#quantization)
 - [MoE Training with R3](#moe-training-with-r3)
 - [Backend Support Matrix](#backend-support-matrix)
@@ -159,40 +160,35 @@ bash scripts/launch_slurm.sh 2 configs/grpo_dense_fp8.yaml \
     logger.wandb_enabled=true
 ```
 
-## Fully Async Training
+## Asynchronous Training
 
-LumenRL supports **fully-async training** that decouples rollout and training for up to 2.7× throughput improvement, inspired by [VERL's fully_async_policy](https://github.com/verl-project/verl/blob/main/docs/advance/fully_async.md).
+On the Ray controller path the rollout can run on GPUs of its own and keep generating while the trainer trains, in two opt-in modes modeled on [verl](https://github.com/verl-project/verl):
 
-<div align="center">
-  <img src="figures/async_architecture.svg" alt="LumenRL Fully Async Training Architecture" width="960">
-</div>
-
-Key features:
-- **Parallel generation and training** — Rollouter generates while Trainer updates
-- **Streaming samples** — Single-sample granularity with configurable batching
-- **Staleness control** — Tunable `staleness_threshold` for freshness vs throughput tradeoff
-- **Partial rollout** — Interrupt in-progress generation on weight sync to minimize wait
-- **Filesystem weight sync** — safetensors snapshots for cross-process parameter transfer
+- `controller.ray.one_step_off_policy` — step *s+1* generates while step *s* trains.
+- `controller.ray.fully_async` — prompt groups stream to the trainer as they finish, with a staleness budget and partial rollout over vLLM's pause/resume.
 
 ```yaml
-async_training:
-  enabled: true
-  require_batches: 4
-  trigger_parameter_sync_step: 4
-  staleness_threshold: 0.5
-  partial_rollout: true
+controller:
+  ray:
+    actor:
+      num_workers: 4
+    rollout:
+      num_workers: 4          # a rollout pool of its own
+    fully_async:
+      enabled: true
+      staleness_threshold: 1.0
+      partial_rollout: true
+weight_sync:
+  backend: rdma               # RCCL, about 2 s per sync; GPU P2P on one node
+  rdma:
+    require_rdma: false
 ```
 
-Four modes supported:
+On example 6 (Qwen3-30B-A3B-Base, DAPO, 8× MI355X), fully async on 4 + 4 GPUs reached step 60 in 204 min against 555 min for synchronous training on 8 GPUs, with the same hyperparameters and comparable accuracy (training reward 0.421 vs 0.426, AIME24 0.211 vs 0.225). The configuration is [`dapo_qwen3moe_a3b_ray_vllm_verlref_fully_async_longrun.yaml`](examples/DAPO/configs/dapo_qwen3moe_a3b_ray_vllm_verlref_fully_async_longrun.yaml); requirements, tuning, the full settings of that comparison and the limitations are in [docs/advance/async_training.md](lumenrl-docs/docs/source/advance/async_training.md).
 
-| Mode | Settings | Use Case |
-| --- | --- | --- |
-| On-policy | `staleness=0, sync_step=1` | Small-scale, stability-first |
-| Stream off-policy | `staleness=0, sync_step>1` | Moderate throughput gain |
-| Async + stale | `staleness>0, partial=False` | Large-scale, balanced |
-| Async + partial | `staleness>0, partial=True` | Maximum throughput |
+On two nodes (8 actors and 8 vLLM replicas, RCCL over RoCE) with `staleness_threshold: 2`, `max_num_seqs: 768` and `fully_async.overlap_validation: true`, which validates beside training instead of holding it, the same run reached step 30 in 47 min against 108 min on 4 + 4 GPUs, with AIME24 0.225 vs 0.228 at step 30.
 
-See [docs/advance/async_training.md](lumenrl-docs/docs/source/advance/async_training.md) for detailed configuration and tuning.
+The ATOM rollout runs fully async too, with partial rollout on an ATOM whose engine has `pause_generation`; on the same two-node layout it matched vLLM step for step (41 min to step 30, training reward 0.470 vs 0.467 over steps 21–30).
 
 ## Quantization
 
