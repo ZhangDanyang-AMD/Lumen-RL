@@ -119,6 +119,11 @@ policy:
       # TP=1 is not optional: it faults with `Memory access fault` on gfx950 for
       # every MoE backend / AITER combination tried.
       tensor_parallel_size: 8
+      # Colocated, so NCCL_CUMEM_ENABLE=0 for the CUDA-IPC weight sync; vLLM's
+      # custom all-reduce allocates its shared buffers through cuMem, and with
+      # both every TP worker dies in create_shared_buffer ("HIP error: invalid
+      # argument"). pynccl does the intra-node all-reduce instead.
+      disable_custom_all_reduce: true
       kv_cache_dtype: fp8_e4m3
       # The default auto-selects AITER and dies in the first forward at
       # `moe_sorting_opus_fwd`; `triton_unfused` is FP4-only.
