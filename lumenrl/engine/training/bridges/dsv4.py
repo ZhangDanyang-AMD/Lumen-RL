@@ -657,10 +657,10 @@ def build_dsv4_config(
         hidden_dropout=0.0,
         attention_dropout=0.0,
         attention_softmax_in_fp32=True,
-        # SwiGLU is clamped in DSv4 (``swiglu_limit``), and the clamp is not
-        # applied to the shared expert.
+        # SwiGLU is clamped in DSv4 (``swiglu_limit``), in the shared expert as
+        # in the routed ones: the reference builds both as the same ``Expert``.
         activation_func_clamp_value=float(hf["swiglu_limit"]),
-        activation_func_clamp_shared_expert=False,
+        activation_func_clamp_shared_expert=True,
         bias_activation_fusion=False,
         masked_softmax_fusion=False,
         # Megatron's argument parser defaults these on and the DSv4 reference run

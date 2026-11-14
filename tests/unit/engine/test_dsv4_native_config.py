@@ -40,3 +40,10 @@ def test_the_expert_bias_stays_frozen_unless_asked(monkeypatch, ec, rate):
 
     assert config["moe_router_enable_expert_bias"] is True
     assert config["moe_router_bias_update_rate"] == rate
+
+
+def test_the_swiglu_clamp_covers_the_shared_expert_too(monkeypatch):
+    config = build(monkeypatch, {})
+
+    assert config["activation_func_clamp_value"] == 10.0
+    assert config["activation_func_clamp_shared_expert"] is True
