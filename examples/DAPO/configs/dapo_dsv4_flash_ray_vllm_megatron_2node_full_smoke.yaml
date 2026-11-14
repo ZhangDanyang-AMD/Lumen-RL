@@ -1,0 +1,217 @@
+# DeepSeek-V4-Flash (all 43 layers) DAPO smoke on TWO nodes (2 x 8 MI355X):
+# Megatron-Native training with PP2 (one stage per node) x EP8 (inside a node),
+# vLLM rollout as one TP8 replica per node, colocated and synchronous, with
+# routing replay (R3).
+#
+# The parameters cannot all live on 16 GPUs: 284B parameters at 18 bytes each
+# (BF16 weight, FP32 grad, FP32 master weight and two Adam moments) is ~344 GB a
+# GPU. So the optimizer state goes to host RAM (optimizer_cpu_offload, 85%),
+# activations are recomputed (a 12-layer slice keeps ~8.5 GB per layer for a
+# 4k-token microbatch), vLLM sleeps through the update so the two peaks do not
+# stack, and the actors free their FP32 gradient buffers (~78 GB a GPU) while
+# vLLM wakes. Responses are capped at 2048 tokens for this first smoke.
+#
+# Measured (3 steps, sync, 128 rollouts a step): exit 0, every step with a
+# gradient; ~10 min a step (rollout 330 s, update 240-280 s); actor resident
+# 73 GB and peak 165 GB a GPU, vLLM ~130 GB; device peak 306-309 GB of 309 on
+# the first stage's node -- no headroom, so longer responses or larger batches
+# need more memory found first; 308 GB of host RAM per actor (~2.47 TB a node).
+# rollout_corr/kl 3.7-7.1e-3 with replay, above the 4- and 12-layer slices.
+# Start from a node whose page cache is small: with ~1.1 TB of it on one node the
+# first update's pinned-memory setup took 33 min instead of under 5.
+#
+# Everything else -- data, reward, DAPO settings, determinism -- is the
+# single-node smoke's (dapo_dsv4_flash_ray_vllm_megatron_1node_smoke.yaml),
+# whose header explains the DSv4-specific choices kept here.
+
+cluster:
+  num_nodes: 2
+  gpus_per_node: 8
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    actor:
+      num_workers: 16
+      dispatch_mode: dp_compute_proto
+
+policy:
+  # BF16 weights under the CHECKPOINT's own tensor names, built by
+  # ~/dsv4/mhc_probe/make_native_bf16.py. Neither of the obvious candidates
+  # works: the released FP8 dir leaves vLLM holding FP8 parameters that the
+  # trainer's BF16 weight sync cannot write ("'Parameter' object has no
+  # attribute 'load_merged_column_weight'"), and the `fp8_cast_bf16` output is
+  # BF16 but renamed into DeepSeek-HF form, which vLLM's DSv4 loader rejects
+  # ("KeyError: 'layers.0.input_layernorm.weight'"). The trainer reads only
+  # config.json from here and takes its weights from dist_checkpoint_path.
+  model_name: "${oc.env:DATA_ROOT}/models/dsv4-L43-bf16-native"
+  training_backend: megatron_native
+  generation_backend: vllm
+  max_total_sequence_length: 4096       # 2048 prompt budget + 2048 response
+  max_response_length: 2048
+  train_global_batch_size: 128          # 8 prompts x 16 generations
+  gen_batch_size: 24                    # 8 * 3, verl's train:gen ratio
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 4096
+  learning_rate: 1.0e-6
+  lr_warmup_steps: 0
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  training:
+    optimizer_dtype: bf16
+    megatron_cfg:
+      use_distributed_optimizer: true
+      # ---- PP2 (one stage per node) x EP8 (inside a node) ----
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 2
+      num_layers_in_first_pipeline_stage: 22   # 43 layers: 22 + embedding, 21 + head
+      context_parallel_size: 1
+      expert_model_parallel_size: 8
+      # 20 bytes a parameter in host RAM for the offloaded share (fp32 master
+      # weights, Adam moments, grad and param staging): all of it would be ~2.9 TB a
+      # node against the container's 2.69 TiB, so 15% stays on the GPU (~32 GB).
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 0.85
+      # FP32 main grads: BF16 ones would save ~43 GB a GPU, but with the optimizer
+      # offloaded the update hits a HIP illegal memory access (4-layer slice; fine
+      # without offload).
+      grad_reduce_in_fp32: true
+      # ~8.5 GB of activations per layer for a 4k-token microbatch (12-layer slice),
+      # so a 22-layer stage with two microbatches in flight needs recomputation.
+      recompute_granularity: full
+      recompute_method: uniform
+      recompute_num_layers: 1
+      # Offline-converted weights; dist_checkpointing.load reshards them to this
+      # topology on the way in.
+      dist_checkpoint_path: "${oc.env:DATA_ROOT}/models/dsv4-L43_torch_dist"
+      # Bitwise reproducibility. Without it ~1.6% of argmaxes flip run to run,
+      # which is larger than the train/rollout gap DAPO is trying to measure.
+      # Needs NCCL_ALGO=Ring in the environment, which ray_env_dsv4.sh sets.
+      deterministic_mode: true
+      # DSv4 has its own routing (sqrtsoftplus + expert bias + hash layers); the
+      # rest of the MoE shape comes from the HF config.
+      moe_grouped_gemm: true
+      moe_token_dispatcher_type: alltoall
+      moe_flex_dispatcher_backend: mori
+      moe_mori_max_tokens_per_rank: null
+      moe_mori_kernel_type: null
+      moe_aux_loss_coeff: 0.0
+      log_probs_chunk_size: 1024
+      # See the header. Not a tuning choice.
+      enable_dynamic_batch: false
+    fsdp_cfg:
+      param_offload: false
+      optimizer_offload: false
+  generation:
+    vllm_cfg:
+      transport: ray_http
+      ray_http_start_server: false
+      # TP=1 is not optional: it faults with `Memory access fault` on gfx950 for
+      # every MoE backend / AITER combination tried.
+      tensor_parallel_size: 8
+      # Colocated, so NCCL_CUMEM_ENABLE=0 for the CUDA-IPC weight sync; vLLM's
+      # custom all-reduce allocates its shared buffers through cuMem, and with
+      # both every TP worker dies in create_shared_buffer ("HIP error: invalid
+      # argument"). pynccl does the intra-node all-reduce instead.
+      disable_custom_all_reduce: true
+      kv_cache_dtype: fp8_e4m3
+      # The default auto-selects AITER and dies in the first forward at
+      # `moe_sorting_opus_fwd`; `triton_unfused` is FP4-only.
+      moe_backend: triton
+      # BF16 weights of the full model over TP8 are ~71 GB a GPU; the rest is KV.
+      gpu_memory_utilization: 0.28
+      max_model_len: 4096
+      dtype: bfloat16
+      enforce_eager: true
+      enable_chunked_prefill: true
+      # The profiling batch the validated rollout probe used; larger shrinks
+      # nothing and the block-FP8 GEMM faults.
+      max_num_batched_tokens: 2048
+      max_num_seqs: 64
+      quantization: ""
+      calculate_log_probs: true
+      # Level 2: release weights and KV cache during the update; the weight sync
+      # refills them every step anyway. Training and rollout then peak separately.
+      enable_sleep_mode: true
+      sleep_level: 2
+      update_weights_bucket_megabytes: 512
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+
+moe:
+  r3:
+    enabled: true
+    rollout_replay: false
+
+algorithm:
+  name: dapo
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  loss_agg_mode: token-mean
+  dapo:
+    num_generations: 16
+    kl_coeff: 0.0
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 10.0
+    dynamic_sampling: true
+    token_level_pg: true
+    overlong_reward_shaping: true
+    max_resp_len: 2048
+    # OFF for the sliced model, and only for it. A 4-layer slice feeds
+    # `model.norm` and `lm_head` the layer-3 residual instead of the layer-42
+    # one, so it emits gibberish and never solves a math problem. With filtering
+    # on, every group is dropped for acc=0 and the run dies at `filter_groups
+    # collected no valid groups`. Turn it back on for the full model.
+    filter_groups:
+      enable: false
+      metric: acc
+      max_num_gen_batches: 10
+    overlong_buffer:
+      enable: true
+      len: 256
+      penalty_factor: 1.0
+      log: false
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+    rollout_is_batch_normalize: false
+
+reward:
+  type: function
+  function: lumenrl.rewards.math_reward.dapo_math_reward
+  # Reused as-is. The parquet was filtered with Qwen3-8B-Base's tokenizer, so its
+  # 1024-token cutoff does not transfer to V4's 129280-token vocab; the raw text
+  # is what matters, and `_tokenize_prompts` truncates at 1024 anyway.
+  dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet"
+  shuffle: true
+  shuffle_seed: 10086
+
+val_dataset: ""
+val_steps: 0
+val_batch_size: 0
+eval:
+  enabled: false
+  num_samples: 0
+
+checkpointing:
+  checkpoint_dir: ""
+  save_steps: 1000
+  save_total_limit: 0
+  resume: false
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 3
+seed: 10086
