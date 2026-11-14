@@ -641,15 +641,15 @@ class RLTrainer:
         )
 
     def _release_actor_cached_memory(self) -> None:
-        """Drop the actors' cached-but-unused device memory before an ATOM replica
-        sizes its KV cache.
+        """Drop the actors' cached-but-unused device memory before a colocated
+        rollout claims device memory.
 
         ATOM subtracts everything the driver reports as occupied on the device
         (``non_torch``) from ``gpu_memory_utilization x total``, so the post-shard
         allocator cache of a colocated FSDP2 actor -- 113.6 GiB for
         Qwen3-30B-A3B -- would otherwise be charged against the KV budget and
-        drive it negative. vLLM only charges its own increments, which is why
-        this is needed on the ATOM path alone.
+        drive it negative. vLLM only charges its own increments at creation, but
+        a sleeping vLLM maps its weights back on wake-up into whatever is free.
         """
         if self._actor_wg is None:
             return
@@ -659,7 +659,7 @@ class RLTrainer:
             for s in stats
         ) / (1 << 30)
         logger.info(
-            "Released actor allocator cache before ATOM rollout: %.2f GiB over %d ranks.",
+            "Released actor allocator cache: %.2f GiB over %d ranks.",
             freed_gb, len(stats),
         )
 
@@ -1063,8 +1063,11 @@ class RLTrainer:
         # an error here instead of a slow train/rollout divergence later.
         version = int(self.global_step) + 1
 
-        # 1) wake weight memory before loading (only when sleep is in use).
+        # 1) wake weight memory before loading (only when sleep is in use). The
+        # update leaves its activations in the actors' allocator cache, and a waking
+        # engine maps its weights into whatever the device has free.
         if sleeping:
+            self._release_actor_cached_memory()
             rollout_engine.wake(tags=["weights"])
         # 2) start receivers + senders concurrently, then join both.
         recv = [
