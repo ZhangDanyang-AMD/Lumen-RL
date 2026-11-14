@@ -1517,28 +1517,7 @@ class RLTrainer:
             )
             return
 
-        from transformers import AutoTokenizer
-        self._tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        if self._tokenizer.pad_token is None:
-            self._tokenizer.pad_token = self._tokenizer.eos_token
-        self._tokenizer.padding_side = "left"
-
-        vcfg = self.config.policy.generation.vllm_cfg
-        atom_cfg = self.config.policy.generation.atom_cfg
-        self._ray_use_vllm = self._use_vllm and str(getattr(vcfg, "transport", "fifo")) == "ray_http"
-        self._ray_use_atom = self._gen_backend == "atom" and str(getattr(atom_cfg, "transport", "fifo")) == "ray_http"
-        self._ray_rollout_mgr = None
-        self._ray_vllm_engine = None
-        if self._ray_use_vllm:
-            self._setup_ray_vllm_rollout(model_name, vcfg)
-            self._atom_engine = None
-        elif self._ray_use_atom:
-            self._release_actor_cached_memory()
-            self._setup_ray_atom_rollout(model_name, vcfg, atom_cfg)
-            self._atom_engine = None
-        else:
-            from lumenrl.engine.inference.atom_engine import AtomEngine
-            self._atom_engine = AtomEngine(config=atom_cfg, model_name=model_name)
+        self._setup_ray_rollout_engine(model_name)
         if os.environ.get("LUMENRL_SKIP_DATASET_INIT", "0") == "1":
             logger.info("Diagnostic setup: skipped train and validation datasets")
             return
@@ -1560,6 +1539,38 @@ class RLTrainer:
             self._resume_step,
         )
         self._init_profiler()
+
+    def _setup_ray_rollout_engine(self, model_name: str) -> None:
+        """Tokenizer and rollout engine for the Ray-controller setup."""
+        from transformers import AutoTokenizer
+        self._tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        if self._tokenizer.pad_token is None:
+            self._tokenizer.pad_token = self._tokenizer.eos_token
+        self._tokenizer.padding_side = "left"
+
+        vcfg = self.config.policy.generation.vllm_cfg
+        atom_cfg = self.config.policy.generation.atom_cfg
+        self._ray_use_vllm = self._use_vllm and str(getattr(vcfg, "transport", "fifo")) == "ray_http"
+        self._ray_use_atom = self._gen_backend == "atom" and str(getattr(atom_cfg, "transport", "fifo")) == "ray_http"
+        self._ray_rollout_mgr = None
+        self._ray_vllm_engine = None
+        if self._ray_use_vllm:
+            if self._rollout_wg is None:
+                # A colocated vLLM refuses to start unless gpu_memory_utilization
+                # x total is free, and later rollouts run in what the actors
+                # leave. Before the first update their gradient buffers hold
+                # nothing, and loading leaves its staging in their cache.
+                self._release_actor_grad_buffers()
+                self._release_actor_cached_memory()
+            self._setup_ray_vllm_rollout(model_name, vcfg)
+            self._atom_engine = None
+        elif self._ray_use_atom:
+            self._release_actor_cached_memory()
+            self._setup_ray_atom_rollout(model_name, vcfg, atom_cfg)
+            self._atom_engine = None
+        else:
+            from lumenrl.engine.inference.atom_engine import AtomEngine
+            self._atom_engine = AtomEngine(config=atom_cfg, model_name=model_name)
 
     @staticmethod
     def _to_plain_dict(config: Any) -> dict[str, Any]:

@@ -40,3 +40,38 @@ def test_actors_free_their_gradients_and_cache_before_a_sleeping_rollout_wakes(m
     assert events == [
         "release_grad_buffers", "free_cached_memory", "wake weights", "update_weights_ipc_send", "wake kv_cache",
     ]
+
+
+def _rollout_setup_trainer(monkeypatch, events, *, separated):
+    fake_transformers = ModuleType("transformers")
+    fake_transformers.AutoTokenizer = SimpleNamespace(
+        from_pretrained=lambda name, trust_remote_code: SimpleNamespace(pad_token="<pad>", eos_token="</s>"),
+    )
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    trainer = object.__new__(RLTrainer)
+    trainer.config = SimpleNamespace(policy=SimpleNamespace(generation=SimpleNamespace(
+        vllm_cfg=SimpleNamespace(transport="ray_http"), atom_cfg=SimpleNamespace(transport="fifo"),
+    )))
+    trainer._use_vllm = True
+    trainer._gen_backend = "vllm"
+    trainer._rollout_wg = object() if separated else None
+    trainer._actor_wg = SimpleNamespace(execute_all_sync=lambda name: events.append(name) or [{}])
+    trainer._setup_ray_vllm_rollout = lambda model_name, vcfg: events.append("start vllm")
+    return trainer
+
+
+def test_actors_free_their_gradients_and_cache_before_a_colocated_rollout_starts(monkeypatch):
+    events = []
+
+    _rollout_setup_trainer(monkeypatch, events, separated=False)._setup_ray_rollout_engine("model")
+
+    assert events == ["release_grad_buffers", "free_cached_memory", "start vllm"]
+
+
+def test_a_separated_rollout_starts_without_touching_the_actors(monkeypatch):
+    events = []
+
+    _rollout_setup_trainer(monkeypatch, events, separated=True)._setup_ray_rollout_engine("model")
+
+    assert events == ["start vllm"]
