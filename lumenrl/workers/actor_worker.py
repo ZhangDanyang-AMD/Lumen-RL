@@ -638,7 +638,17 @@ class LumenActorWorker(BaseWorker):
         # cancels; ``loss`` is already normalized per unit because backward()
         # needs it there, which is why it is summed rather than averaged.
         for k, v in output.get("metrics", {}).items():
-            metrics[k] = (sum(v) / len(v)) if isinstance(v, list) and v else float(v)
+            if isinstance(v, list) and v:
+                # A per-token max must stay the max across micro-batches. Averaging
+                # it would hide the single largest train/rollout disagreement.
+                if k == "mismatch_abs_max":
+                    metrics[k] = max(v)
+                elif k == "mismatch_count":
+                    metrics[k] = float(sum(v))
+                else:
+                    metrics[k] = sum(v) / len(v)
+            else:
+                metrics[k] = float(v)
         if "loss" in output:
             lv = output["loss"]
             if self._pol_meta.get("task_type") == "sft":
@@ -834,6 +844,10 @@ class LumenActorWorker(BaseWorker):
                 tok = float(mask.sum())
                 out_metrics["ppo_kl_sum"] = float(((old_logp - token_log_probs) * mask).sum())
                 out_metrics["ppo_kl_tok"] = tok
+                if kl_c > 0.0 and ref_logp is not None:
+                    # Token mean of (ref - policy) before kl_coeff scales the loss.
+                    out_metrics["kl_sum"] = float(((ref_logp - token_log_probs) * mask).sum())
+                    out_metrics["kl_tok"] = tok
                 rlp = data.get("rollout_log_probs")
                 if rlp is not None:
                     rlp = rlp.to(dev)[..., :L]
@@ -866,6 +880,8 @@ class LumenActorWorker(BaseWorker):
         return {
             # mean |delta|: the magnitude that the signed mean cancels away
             "mismatch_abs_sum": float(delta.abs().sum()),
+            # max |delta| over response tokens. Reduced by max, never by token count.
+            "mismatch_abs_max": float(delta.abs().max()) if delta.numel() else 0.0,
             # k3 estimator E[e^r - r - 1] >= 0, unbiased and low-variance for small KL
             "mismatch_k3_sum": float((((w - 1.0) - delta) * mask).sum()),
             # second moment of the token-level IS weight: predicts gradient variance
@@ -875,6 +891,9 @@ class LumenActorWorker(BaseWorker):
             "mismatch_seq_n": n_seq,
             # tail mass: the population driving the divergence (expert flips)
             "mismatch_tail_sum": float(((delta.abs() > 0.1).float() * mask).sum()),
+            # Count of masked tokens whose train/rollout delta is nonzero.
+            # Reduced by sum, never divided by the token count.
+            "mismatch_count": float((delta != 0).sum()),
             "mismatch_tok": tok,
         }
 
@@ -1100,12 +1119,22 @@ class LumenActorWorker(BaseWorker):
             shard = {}
             current_bytes = 0
 
+        from torch.distributed.tensor import DTensor
+
+        keep_fp32 = os.environ.get("LUMENRL_SYNC_FP32") == "1"
         for name, param in params:
+            # FSDP2 shards are DTensors; full_tensor() is a collective, so every
+            # rank gathers before the writer filters.
+            if isinstance(param, DTensor):
+                param = param.full_tensor()
             if not is_writer:
                 continue
             if selected_names is not None and name not in selected_names:
                 continue
-            tensor = param.detach().to("cpu").contiguous()
+            tensor = param.detach()
+            if tensor.dtype == torch.float32 and not keep_fp32:
+                tensor = tensor.to(torch.bfloat16)
+            tensor = tensor.to("cpu").contiguous()
             tensor_bytes = tensor.numel() * tensor.element_size()
             if shard and current_bytes + tensor_bytes > max_shard_bytes:
                 flush_shard()
@@ -1485,6 +1514,19 @@ class LumenActorWorker(BaseWorker):
                 if not full.is_cuda:
                     full = full.to("cuda", non_blocking=True)
                 gather_s += time.perf_counter() - t0
+                if (
+                    os.environ.get("LUMENRL_ALIGN_SYNC_WEIGHTS") == "1"
+                    and name.endswith("layers.0.self_attn.q_proj.weight")
+                ):
+                    import zlib
+
+                    sample = full.detach().contiguous().view(torch.int16).reshape(-1)[:256]
+                    crc = zlib.crc32(sample.cpu().numpy().tobytes()) & 0xFFFFFFFF
+                    print(
+                        f"lumenrl weight fingerprint side=train rank={self.rank} "
+                        f"crc={crc:08x} numel={full.numel()}",
+                        flush=True,
+                    )
                 yield name, full
 
         # ATOM's ModelRunner opens the staging buffer once per update cycle and

@@ -30,6 +30,11 @@ LUMENRL_SRC="${LUMENRL_SRC:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 # §8.5.1 and the launcher says so on every run.
 ATOM_SRC="${ATOM_SRC:-}"
 
+# LUMEN_SRC mounts a Lumen checkout over the image's /opt/lumenrl/Lumen.
+# Empty by default: the reference values were measured on the Lumen commit
+# baked into the image. Set it when the run should execute a local Lumen tree.
+LUMEN_SRC="${LUMEN_SRC:-}"
+
 # Set DOCKER="sudo docker" if your user is not in the docker group.
 DOCKER_CLI="${DOCKER:-docker}"
 read -r -a DOCKER <<<"$DOCKER_CLI"
@@ -192,6 +197,8 @@ ENVIRONMENT
   ATOM_SRC    an ATOM checkout to mount in place of the image's. Unset by
               default: ATOM is pinned by versions.env and is part of what the
               reference values mean, so this is for A/B work only.
+  LUMEN_SRC   a Lumen checkout to mount over the image's Lumen. Unset by
+              default for the same reason.
   CONTAINER   default $CONTAINER
   DOCKER      docker CLI to use, e.g. DOCKER="sudo docker" if your user is not
               in the docker group. Default $DOCKER_CLI
@@ -450,6 +457,7 @@ $DOCKER_CLI run -d --name $CONTAINER \\
   --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --shm-size 64G \\
   -v \$DATA_ROOT:\$DATA_ROOT -e DATA_ROOT=\$DATA_ROOT \\
   -v $LUMENRL_SRC:$RL_ROOT_IN_IMAGE/Lumen-RL \\
+  ${LUMEN_SRC:+-v $LUMEN_SRC:$RL_ROOT_IN_IMAGE/Lumen} \\
   $IMAGE sleep infinity
 
 # 2. the example. Every variable below is required: MODE alone does NOT pick
@@ -488,6 +496,13 @@ if [ -n "$ATOM_SRC" ]; then
   echo "   ATOM   $ATOM_SRC @ $atom_rev"
   echo "   WARNING: ATOM is not the tree the reference values were measured on."
   echo "            A PASS or FAIL against them says nothing on its own."
+fi
+if [ -n "$LUMEN_SRC" ]; then
+  lumen_rev="$(git -C "$LUMEN_SRC" rev-parse --short HEAD 2>/dev/null || echo '?')"
+  lumen_dirty=""
+  git -C "$LUMEN_SRC" diff --quiet 2>/dev/null || lumen_dirty=" (uncommitted changes)"
+  echo "   Lumen  $LUMEN_SRC @ $lumen_rev$lumen_dirty"
+  echo "   WARNING: Lumen is not the tree the reference values were measured on."
 fi
 
 command -v "${DOCKER[0]}" >/dev/null || die "'${DOCKER[*]}' not found on this host. Set DOCKER='sudo docker' if needed."
@@ -559,6 +574,7 @@ create_container() {
     --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --shm-size 64G \
     -v "$DATA_ROOT":"$DATA_ROOT" -e DATA_ROOT="$DATA_ROOT" \
     -v "$LUMENRL_SRC":"$RL_ROOT_IN_IMAGE/Lumen-RL" \
+    ${LUMEN_SRC:+-v "$LUMEN_SRC":"$RL_ROOT_IN_IMAGE/Lumen"} \
     ${ATOM_SRC:+-v "$ATOM_SRC":"$RL_ROOT_IN_IMAGE/ATOM"} \
     "$IMAGE" sleep infinity >/dev/null
 }
@@ -574,9 +590,11 @@ if "${DOCKER[@]}" container inspect "$CONTAINER" >/dev/null 2>&1; then
     --format "{{range .Mounts}}{{if eq .Destination \"$RL_ROOT_IN_IMAGE/Lumen-RL\"}}{{.Source}}{{end}}{{end}}" 2>/dev/null || true)"
   mounted_atom="$("${DOCKER[@]}" container inspect "$CONTAINER" \
     --format "{{range .Mounts}}{{if eq .Destination \"$RL_ROOT_IN_IMAGE/ATOM\"}}{{.Source}}{{end}}{{end}}" 2>/dev/null || true)"
+  mounted_lumen="$("${DOCKER[@]}" container inspect "$CONTAINER" \
+    --format "{{range .Mounts}}{{if eq .Destination \"$RL_ROOT_IN_IMAGE/Lumen\"}}{{.Source}}{{end}}{{end}}" 2>/dev/null || true)"
   mounted_img="$("${DOCKER[@]}" container inspect "$CONTAINER" --format '{{.Config.Image}}' 2>/dev/null || true)"
-  if [ "$mounted_src" != "$LUMENRL_SRC" ] || [ "$mounted_atom" != "$ATOM_SRC" ] || [ "$mounted_img" != "$IMAGE" ]; then
-    echo "   container $CONTAINER was built from ${mounted_img:-?} with code ${mounted_src:-<none, baked copy>}, ATOM ${mounted_atom:-<image>}; recreating"
+  if [ "$mounted_src" != "$LUMENRL_SRC" ] || [ "$mounted_atom" != "$ATOM_SRC" ] || [ "$mounted_lumen" != "$LUMEN_SRC" ] || [ "$mounted_img" != "$IMAGE" ]; then
+    echo "   container $CONTAINER was built from ${mounted_img:-?} with code ${mounted_src:-<none, baked copy>}, Lumen ${mounted_lumen:-<image>}, ATOM ${mounted_atom:-<image>}; recreating"
     "${DOCKER[@]}" rm -f "$CONTAINER" >/dev/null
     create_container
     echo "   container $CONTAINER created"
