@@ -8,7 +8,7 @@ from types import ModuleType, SimpleNamespace
 from lumenrl.trainer.rl_trainer import RLTrainer
 
 
-def test_actors_free_their_cache_before_a_sleeping_rollout_wakes(monkeypatch):
+def test_actors_free_their_gradients_and_cache_before_a_sleeping_rollout_wakes(monkeypatch):
     events = []
     fake_ray = ModuleType("ray")
     fake_ray.wait = lambda pending, num_returns=1: ([pending[0]], pending[1:])
@@ -37,4 +37,6 @@ def test_actors_free_their_cache_before_a_sleeping_rollout_wakes(monkeypatch):
 
     trainer._sync_weights_ipc()
 
-    assert events == ["free_cached_memory", "wake weights", "update_weights_ipc_send", "wake kv_cache"]
+    assert events == [
+        "release_grad_buffers", "free_cached_memory", "wake weights", "update_weights_ipc_send", "wake kv_cache",
+    ]

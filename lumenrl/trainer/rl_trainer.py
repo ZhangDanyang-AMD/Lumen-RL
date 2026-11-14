@@ -663,6 +663,17 @@ class RLTrainer:
             freed_gb, len(stats),
         )
 
+    def _release_actor_grad_buffers(self) -> None:
+        """Free the actors' gradient buffers until their next update, so that a
+        sleeping rollout wakes into the memory they would otherwise hold."""
+        if self._actor_wg is None:
+            return
+        stats = self._actor_wg.execute_all_sync("release_grad_buffers")
+        logger.info(
+            "Released actor gradient buffers: %.2f GiB over %d ranks.",
+            sum(s.get("grad_buffer_bytes_freed", 0.0) for s in stats) / (1 << 30), len(stats),
+        )
+
     def _atom_agent_sampling(self, engine_kwargs: dict[str, Any]) -> None:
         """Give ATOM's n=1 requests sampling noise of their own under the agent loop.
 
@@ -1065,8 +1076,10 @@ class RLTrainer:
 
         # 1) wake weight memory before loading (only when sleep is in use). The
         # update leaves its activations in the actors' allocator cache, and a waking
-        # engine maps its weights into whatever the device has free.
+        # engine maps its weights into whatever the device has free. The gradient
+        # buffers go first, so that emptying the cache returns them too.
         if sleeping:
+            self._release_actor_grad_buffers()
             self._release_actor_cached_memory()
             rollout_engine.wake(tags=["weights"])
         # 2) start receivers + senders concurrently, then join both.

@@ -844,6 +844,11 @@ class LumenActorWorker(BaseWorker):
             "reserved_after_bytes": float(torch.cuda.memory_reserved()),
         }
 
+    def release_grad_buffers(self) -> dict[str, float]:
+        """Free the engine's gradient buffers until its next update, if it can."""
+        release = getattr(self._engine, "release_grad_buffers", None)
+        return {"grad_buffer_bytes_freed": float(release()) if callable(release) else 0.0}
+
     def get_memory_stats(self) -> dict[str, float]:
         """Return current-step peak memory counters for this actor rank."""
         # Linux reports ru_maxrss in KiB. Keep this alongside HIP memory so the

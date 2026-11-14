@@ -1811,7 +1811,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
         num_mb = len(mbs)
 
         self.module.train()
-        self._ddp.zero_grad_buffer()
+        self._zero_grad_buffer()
         self.optimizer.zero_grad()
         _mem_diag_begin("update", mbs)
 

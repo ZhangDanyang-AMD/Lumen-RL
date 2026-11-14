@@ -163,6 +163,37 @@ class MegatronBaseEngine(BaseEngine):
     def train_mode(self, **kwargs):
         return nullcontext()
 
+    def _grad_buffers(self) -> list[Any]:
+        if self._ddp is None:
+            return []
+        return [*getattr(self._ddp, "buffers", []), *getattr(self._ddp, "expert_parallel_buffers", [])]
+
+    def release_grad_buffers(self) -> float:
+        """Free the DDP gradient buffers' device memory until the next update; return the bytes freed.
+
+        Nothing reads them between an optimizer step and the next backward, and
+        they are the actor's largest resident tensors after its parameters (FP32
+        under grad_reduce_in_fp32). Every ``main_grad`` is a view of one, so the
+        storage is shrunk in place rather than replaced: ``_zero_grad_buffer``
+        grows it back and the views are valid again.
+        """
+        freed = 0
+        for buf in self._grad_buffers():
+            storage = buf.grad_data.untyped_storage()
+            if storage.nbytes():
+                buf._lumenrl_grad_nbytes = storage.nbytes()
+                freed += storage.nbytes()
+                storage.resize_(0)
+        return float(freed)
+
+    def _zero_grad_buffer(self) -> None:
+        for buf in self._grad_buffers():
+            nbytes = getattr(buf, "_lumenrl_grad_nbytes", 0)
+            storage = buf.grad_data.untyped_storage()
+            if nbytes and not storage.nbytes():
+                storage.resize_(nbytes)
+        self._ddp.zero_grad_buffer()
+
     def eval_mode(self, **kwargs):
         return nullcontext()
 
@@ -526,7 +557,7 @@ class MegatronBaseEngine(BaseEngine):
         global_batch_size = int(meta.get("global_batch_size") or B * dp)
 
         self.module.train()
-        self._ddp.zero_grad_buffer()
+        self._zero_grad_buffer()
         self.optimizer.zero_grad()
 
         loss_accum = 0.0
@@ -626,7 +657,7 @@ class MegatronBaseEngine(BaseEngine):
         dp = int(meta.get("dp_size", self.get_data_parallel_size()) or 1)
 
         self.module.train()
-        self._ddp.zero_grad_buffer()
+        self._zero_grad_buffer()
         self.optimizer.zero_grad()
 
         rows = []
