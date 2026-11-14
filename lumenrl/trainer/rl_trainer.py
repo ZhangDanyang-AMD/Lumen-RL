@@ -544,6 +544,18 @@ class RLTrainer:
             freed_gb, len(stats),
         )
 
+    def _release_actor_cache_before_kv_wake(self) -> None:
+        """Release the actor allocator cache when the rollout backend is ATOM.
+
+        ATOM's wake sizes the KV cache from memory the driver still reports
+        as used, and that reading includes the colocated actor's allocator
+        cache. The saved-block resume in sitecustomize is what keeps the
+        budget from going negative after sleep; this only drops the actor
+        cache on that same path.
+        """
+        if self._gen_backend == "atom":
+            self._release_actor_cached_memory()
+
     def _setup_ray_atom_rollout(self, model_name: str, vcfg: Any, atom_cfg: Any) -> None:
         """Build colocated ATOM rollout replicas + client on the Ray controller path."""
         from lumenrl.engine.inference.atom_ray_server import ATOMReplicaManager
@@ -950,6 +962,7 @@ class RLTrainer:
                 )
         # 3) wake KV cache so the next rollout can run.
         if sleeping:
+            self._release_actor_cache_before_kv_wake()
             rollout_engine.wake(tags=["kv_cache"])
 
     def _sync_weights_rdma(self, mgr) -> None:
@@ -1046,6 +1059,7 @@ class RLTrainer:
             ),
         )
         if sleeping:
+            self._release_actor_cache_before_kv_wake()
             rollout_engine.wake(tags=["kv_cache"])
 
     def _sync_weights_safetensors(self, mgr) -> None:
@@ -1119,6 +1133,7 @@ class RLTrainer:
             ),
         }
         if sleeping:
+            self._release_actor_cache_before_kv_wake()
             rollout_engine.wake(tags=["kv_cache"])
 
     def _setup_ray_controller(self) -> None:
