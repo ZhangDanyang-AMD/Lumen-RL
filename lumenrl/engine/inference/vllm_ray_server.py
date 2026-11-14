@@ -72,6 +72,12 @@ def _copy_vllm_runtime_env(env_vars: dict[str, str]) -> None:
     for key in _VLLM_RUNTIME_ENV_KEYS:
         if key in os.environ:
             env_vars[key] = os.environ[key]
+    # ROCm vLLM pads unquantized MoE weights in process_weights_after_loading,
+    # and the first load's kernel setup copies them back to contiguous, so the
+    # padding only ever takes effect on a weight update -- where it allocates a
+    # second copy of every expert outside the sleep-mode pool (1.2x the expert
+    # weights under TP8, whose w2 is narrow), which sleeping never frees.
+    env_vars["VLLM_ROCM_MOE_PADDING"] = os.environ.get("VLLM_ROCM_MOE_PADDING", "0")
 
 
 class VLLMRayServer:

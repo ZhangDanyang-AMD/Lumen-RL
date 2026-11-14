@@ -77,6 +77,24 @@ def test_vllm_runtime_env_propagates_weight_integrity_diagnostic(monkeypatch):
     assert env_vars["LUMENRL_WEIGHT_SYNC_INTEGRITY"] == "1"
 
 
+def test_vllm_runtime_env_turns_off_rocm_moe_padding(monkeypatch):
+    monkeypatch.delenv("VLLM_ROCM_MOE_PADDING", raising=False)
+    env_vars = {}
+
+    vllm_ray_server._copy_vllm_runtime_env(env_vars)
+
+    assert env_vars["VLLM_ROCM_MOE_PADDING"] == "0"
+
+
+def test_vllm_runtime_env_keeps_an_explicit_rocm_moe_padding(monkeypatch):
+    monkeypatch.setenv("VLLM_ROCM_MOE_PADDING", "1")
+    env_vars = {}
+
+    vllm_ray_server._copy_vllm_runtime_env(env_vars)
+
+    assert env_vars["VLLM_ROCM_MOE_PADDING"] == "1"
+
+
 class RemoteMethod:
     def __init__(self, result=True):
         self.result = result
