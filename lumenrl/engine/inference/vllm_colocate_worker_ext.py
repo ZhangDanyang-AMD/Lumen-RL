@@ -15,6 +15,7 @@ matches the training-side ``BucketedWeightSender`` regardless of per-worker
 from __future__ import annotations
 
 import ctypes
+import dataclasses
 import logging
 import os
 import platform
@@ -76,6 +77,37 @@ def _install_all_gather_lifecycle_diagnostics(group_cls=None) -> None:
 
     all_gather._lumenrl_lifecycle_diagnostic = True
     group_cls.all_gather = all_gather
+
+
+def _clamp_unquantized_moe_swiglu(method_cls=None) -> None:
+    """Give vLLM's unquantized MoE the SwiGLU clamp its quantized paths apply.
+
+    A model's ``swiglu_limit`` (DeepSeek-V4: 10) reaches the experts only as the
+    quant config's ``gemm1_clamp_limit``, which the FP8 / MXFP4 / NVFP4 paths set
+    and the unquantized path never does -- its config is a shared constant. BF16
+    experts then run an unclamped SwiGLU, and in V4-Flash's last layers the
+    occasional token's expert output comes out 20-1700x the others', so vLLM
+    samples tokens the trainer (which clamps) puts at e^-20..e^-50.
+    """
+    if method_cls is None:
+        from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+            UnquantizedFusedMoEMethod,
+        )
+
+        method_cls = UnquantizedFusedMoEMethod
+    original = method_cls.get_fused_moe_quant_config
+    if getattr(original, "_lumenrl_swiglu_clamp", False):
+        return
+
+    def get_fused_moe_quant_config(self, layer):
+        config = original(self, layer)
+        limit = getattr(layer, "swiglu_limit", None)
+        if config is None or not limit or getattr(config, "gemm1_clamp_limit", 0) is not None:
+            return config
+        return dataclasses.replace(config, gemm1_clamp_limit=float(limit))
+
+    get_fused_moe_quant_config._lumenrl_swiglu_clamp = True
+    method_cls.get_fused_moe_quant_config = get_fused_moe_quant_config
 
 
 def _monkey_patch_compute_logits(model, vocab_size: int) -> None:
@@ -156,6 +188,11 @@ class vLLMColocateWorkerExtension:
 
     def __new__(cls, **kwargs):
         set_death_signal()
+        # Before the model is built: the patch applies when the MoE kernels are set up.
+        try:
+            _clamp_unquantized_moe_swiglu()
+        except (ImportError, AttributeError) as exc:  # a vLLM without this layout
+            logger.warning("unquantized MoE SwiGLU clamp not installed: %s", exc)
         # Online per-block FP8 (verl-aligned `fp8_per_block`): the BF16 actor
         # weights are re-quantized to per-128-block FP8 inside vLLM. On ROCm the
         # per-block weight post-processing needs a guard patch, applied here in

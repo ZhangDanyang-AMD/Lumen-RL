@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import sys
@@ -94,6 +95,60 @@ def test_monkey_patch_model_installs_all_gather_lifecycle_diagnostic(monkeypatch
         ("compute_logits", model, 1024),
         ("router", model),
     ]
+
+
+@dataclasses.dataclass(frozen=True)
+class _MoEQuantConfig:
+    gemm1_clamp_limit: float | None = None
+
+
+def _unquantized_moe_method(config):
+    class FakeUnquantizedFusedMoEMethod:
+        def get_fused_moe_quant_config(self, layer):
+            return config
+
+    return FakeUnquantizedFusedMoEMethod
+
+
+def test_unquantized_moe_takes_the_layers_swiglu_limit():
+    method_cls = _unquantized_moe_method(_MoEQuantConfig())
+
+    worker_ext._clamp_unquantized_moe_swiglu(method_cls)
+
+    config = method_cls().get_fused_moe_quant_config(SimpleNamespace(swiglu_limit=10.0))
+    assert config.gemm1_clamp_limit == 10.0
+
+
+def test_unquantized_moe_without_a_limit_or_with_a_clamp_already_is_left_alone():
+    plain = _unquantized_moe_method(_MoEQuantConfig())
+    clamped = _unquantized_moe_method(_MoEQuantConfig(gemm1_clamp_limit=7.0))
+
+    worker_ext._clamp_unquantized_moe_swiglu(plain)
+    worker_ext._clamp_unquantized_moe_swiglu(clamped)
+
+    assert plain().get_fused_moe_quant_config(SimpleNamespace()).gemm1_clamp_limit is None
+    assert plain().get_fused_moe_quant_config(SimpleNamespace(swiglu_limit=None)).gemm1_clamp_limit is None
+    assert clamped().get_fused_moe_quant_config(SimpleNamespace(swiglu_limit=10.0)).gemm1_clamp_limit == 7.0
+
+
+def test_unquantized_moe_clamp_installs_once():
+    method_cls = _unquantized_moe_method(_MoEQuantConfig())
+    worker_ext._clamp_unquantized_moe_swiglu(method_cls)
+    patched = method_cls.get_fused_moe_quant_config
+
+    worker_ext._clamp_unquantized_moe_swiglu(method_cls)
+
+    assert method_cls.get_fused_moe_quant_config is patched
+
+
+def test_worker_installs_the_moe_clamp_before_the_model_is_built(monkeypatch):
+    events = []
+    monkeypatch.setattr(worker_ext, "set_death_signal", lambda: None)
+    monkeypatch.setattr(worker_ext, "_clamp_unquantized_moe_swiglu", lambda: events.append("clamp"))
+
+    vLLMColocateWorkerExtension.__new__(vLLMColocateWorkerExtension)
+
+    assert events == ["clamp"]
 
 
 def test_rdma_capability_is_immutable_and_json_serializable():
