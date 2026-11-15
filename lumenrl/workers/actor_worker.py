@@ -1635,9 +1635,20 @@ class LumenActorWorker(BaseWorker):
         # bucket and needs no such floor.
         min_bucket_bytes = 0
         if is_atom:
-            min_bucket_bytes = max(
-                (self._sent_nbytes(p, keep_fp32) for _, p in params), default=0,
-            )
+            if hasattr(self._engine, "max_export_tensor_nbytes"):
+                min_bucket_bytes = self._engine.max_export_tensor_nbytes(
+                    stack_experts=stack_experts,
+                )
+            elif iter(params) is params:
+                # Sizing would drain the stream and leave nothing to send.
+                raise TypeError(
+                    f"{type(self._engine).__name__}.get_per_tensor_param returned a "
+                    "one-shot iterator; ATOM needs the largest tensor size first"
+                )
+            else:
+                min_bucket_bytes = max(
+                    (self._sent_nbytes(p, keep_fp32) for _, p in params), default=0,
+                )
 
         # ATOM's receive loop needs the whole bucket for its largest tensor
         # and one mapping per cycle, so it keeps the verl protocol.

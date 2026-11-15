@@ -1251,6 +1251,23 @@ class MegatronNativeEngine(MegatronBaseEngine):
         )
         return _mem_diag_stream("weight_sync gather", gen), None
 
+    def max_export_tensor_nbytes(self, stack_experts: bool = False) -> int:
+        """Bytes of the largest tensor ``get_per_tensor_param`` yields, without gathering.
+
+        That stream can be read only once, so a receiver that needs its largest
+        tensor up front asks here. The plan describes the gathered Megatron
+        tensors; renaming to rollout names only splits them (fused QKV, gate/up),
+        so the plan's largest tensor bounds the stream's.
+        """
+        return max(
+            (
+                math.prod(o.shape) * o.dtype.itemsize
+                for recipe in self._stage_plan(stack_experts=stack_experts)
+                for o in recipe.outputs
+            ),
+            default=0,
+        )
+
     def is_mp_src_rank_with_outputs(self) -> bool:
         """Only TP-rank 0 / CP-rank 0 on the last pipeline stage reports output.
 
