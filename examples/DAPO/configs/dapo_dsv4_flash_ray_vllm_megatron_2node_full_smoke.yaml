@@ -12,11 +12,13 @@
 # vLLM wakes. Responses are capped at 2048 tokens for this first smoke.
 #
 # Measured (3 steps, sync, 128 rollouts a step): exit 0, every step with a
-# gradient; ~10 min a step (rollout 330 s, update 240-280 s); actor resident
-# 73 GB and peak 165 GB a GPU, vLLM ~130 GB; device peak 306-309 GB of 309 on
-# the first stage's node -- no headroom, so longer responses or larger batches
-# need more memory found first; 308 GB of host RAM per actor (~2.47 TB a node).
-# rollout_corr/kl 3.7-7.1e-3 with replay, above the 4- and 12-layer slices.
+# gradient; ~10 min a step (rollout 330 s, update 240-280 s) plus a weight sync
+# of 360-590 s over RCCL's TCP transport (weight_sync.expert_tp_slice brings it
+# to ~1 min); actor resident 55 GB through the rollout, update peak ~170 GB;
+# device peak 243-251 GB of 309; 250 GB of host RAM per actor (~2 TB a node).
+# rollout_corr/kl 7-10e-4 with replay. On this base model a 20-step run
+# collapses (its reward is nearly all overlong penalty); for a long run see
+# dapo_dsv4_flash_instruct_ray_vllm_megatron_2node_chat.yaml.
 # Start from a node whose page cache is small: with ~1.1 TB of it on one node the
 # first update's pinned-memory setup took 33 min instead of under 5.
 #
