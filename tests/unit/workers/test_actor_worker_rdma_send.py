@@ -61,3 +61,54 @@ def test_the_megatron_engine_declares_its_fp32_deliberate() -> None:
     from lumenrl.engine.training.megatron_native_engine import MegatronNativeEngine
 
     assert MegatronNativeEngine.exports_fp32_on_purpose is True
+
+
+def _ipc_export_kwargs(monkeypatch, *, expert_tp_slice: bool, backend: str = "vllm", rollout_tp: int = 8) -> dict:
+    import sys
+    from types import ModuleType
+
+    import lumenrl.engine.inference.bucketed_weight_transfer as bwt
+
+    fake_ray = ModuleType("ray")
+    fake_ray.get_runtime_context = lambda: SimpleNamespace(get_job_id=lambda: "job")
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+
+    class Sender:
+        stats: dict = {}
+
+        def __init__(self, **kwargs):
+            pass
+
+        async def async_send_weights(self, weights):
+            list(weights)
+
+    monkeypatch.setattr(bwt, "BucketedWeightSender", Sender)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    asked: dict = {}
+
+    def get_per_tensor_param(**kwargs):
+        asked.update(kwargs)
+        return [], None
+
+    worker = SimpleNamespace(
+        _engine=SimpleNamespace(get_per_tensor_param=get_per_tensor_param),
+        rank=11,
+        config={
+            "policy": {"generation_backend": backend,
+                       "generation": {"vllm_cfg": {"tensor_parallel_size": rollout_tp}}},
+            "weight_sync": {"expert_tp_slice": expert_tp_slice},
+        },
+        _sent_nbytes=lambda param, keep_fp32: 0,
+    )
+    LumenActorWorker.update_weights_ipc_send(worker)
+    return asked
+
+
+def test_ipc_send_asks_for_the_rollout_tp_ranks_expert_slice(monkeypatch) -> None:
+    assert _ipc_export_kwargs(monkeypatch, expert_tp_slice=True)["expert_tp_slice"] == (3, 8)
+
+
+def test_ipc_send_asks_for_whole_experts_unless_configured_for_vllm(monkeypatch) -> None:
+    assert _ipc_export_kwargs(monkeypatch, expert_tp_slice=False)["expert_tp_slice"] is None
+    assert _ipc_export_kwargs(monkeypatch, expert_tp_slice=True, backend="atom")["expert_tp_slice"] is None
+    assert _ipc_export_kwargs(monkeypatch, expert_tp_slice=True, rollout_tp=1)["expert_tp_slice"] is None

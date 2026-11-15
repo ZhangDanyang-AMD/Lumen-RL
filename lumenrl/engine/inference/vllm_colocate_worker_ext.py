@@ -604,12 +604,16 @@ class vLLMColocateWorkerExtension:
         # transformers 5.x sends MoE experts as fused 3D tensors, whose names
         # match none of vLLM's per-expert mappings; the router loads those and
         # everything else goes through vLLM's own load_weights.
+        from lumenrl.engine.inference.vllm_moe_weight_sync import TpSlicedExpertLoader
+
         router = FusedMoEWeightRouter(model)
+        sliced = TpSlicedExpertLoader(model)
         loaded: set[str] = set()
         timing = {"route_s": 0.0, "load_weights_s": 0.0}
 
         def _load(weights):
             t0 = time.perf_counter()
+            weights = sliced.take(weights, loaded)
             passthrough, moe_loaded = router.route(weights)
             t1 = time.perf_counter()
             loaded.update(moe_loaded)

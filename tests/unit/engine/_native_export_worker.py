@@ -42,6 +42,7 @@ from lumenrl.engine.training.megatron_native_engine import (  # noqa: E402
     MegatronNativeEngine,
     _pp_layer_offset,
     _to_global_key,
+    slice_expert_for_tp,
 )
 
 TP = int(os.environ.get("NATIVE_TP", "1"))
@@ -331,6 +332,26 @@ def _assert_stacked(engine, per_expert, rank: int) -> None:
         assert torch.equal(t1, t2), f"[rank{rank}] stacked {n1} differs"
 
 
+def _assert_tp_sliced(engine, full, rank: int) -> None:
+    """``expert_tp_slice``: each expert is its full gather's ``slice_expert_for_tp``,
+    the rest unchanged; a PP group asking for different slices gets whole experts."""
+    tp = 4
+    agreed = (rank % tp, tp)  # the PP peers rank and rank + world / PP share rank % 4
+    sliced = _to_cpu(engine._full_megatron_named_params_moe(expert_tp_slice=agreed))
+    assert engine._applied_expert_tp_slice == agreed, f"[rank{rank}] slice not applied"
+    assert [n for n, _ in sliced] == [n for n, _ in full], f"[rank{rank}] sliced name/order mismatch"
+    for (n, t), (_, whole) in zip(sliced, full, strict=True):
+        exp = expert_local_index(n)
+        want = whole if exp is None else slice_expert_for_tp(whole, exp[1], *agreed)
+        assert torch.equal(t, want), f"[rank{rank}] sliced {n} differs"
+    dist.barrier()
+    if PP > 1:
+        whole = _to_cpu(engine._full_megatron_named_params_moe(expert_tp_slice=(rank, 2 * tp)))
+        assert engine._applied_expert_tp_slice is None, f"[rank{rank}] disagreeing PP group sliced anyway"
+        for (n, t), (_, w) in zip(whole, full, strict=True):
+            assert torch.equal(t, w), f"[rank{rank}] fallback {n} differs"
+
+
 def main() -> None:
     rank = int(os.environ["RANK"])
     if os.environ.get("LUMENRL_SYNC_PREFETCH_MB") == "mixed":
@@ -373,6 +394,10 @@ def main() -> None:
     if MOE and EP > 1:
         dist.barrier()
         _assert_stacked(engine, new, rank)
+
+    if MOE:
+        dist.barrier()
+        _assert_tp_sliced(engine, new, rank)
 
     dist.barrier()
     if rank == 0:

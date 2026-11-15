@@ -1631,7 +1631,14 @@ class LumenActorWorker(BaseWorker):
             not is_atom
             and os.environ.get("LUMENRL_WEIGHT_SYNC_STACK_EXPERTS", "1") != "0"
         )
-        params, _ = self._engine.get_per_tensor_param(stack_experts=stack_experts)
+        expert_tp_slice = None
+        if not is_atom and rollout_tp > 1 and get_nested_config(
+            self.config, "weight_sync", "expert_tp_slice", default=False,
+        ):
+            expert_tp_slice = (local_rank, rollout_tp)
+        params, _ = self._engine.get_per_tensor_param(
+            stack_experts=stack_experts, expert_tp_slice=expert_tp_slice,
+        )
         gather_s = 0.0
 
         def _gen():

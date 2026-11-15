@@ -442,6 +442,78 @@ class FusedMoEWeightRouter:
         return int(getattr(parallel, attr, 1) or 1)
 
 
+_DSV4_ROUTED_EXPERT = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.w([123])\.weight$")
+_DSV4_EXPERTS_MODULE = re.compile(r"(?:^|\.)layers\.(\d+)\.ffn\.experts(?:\.|$)")
+
+
+class TpSlicedExpertLoader:
+    """Copies DeepSeek-V4 routed experts that arrive already cut to this TP rank.
+
+    The sender marks them ``<name>@tp<rank>of<size>`` (``weight_sync.expert_tp_slice``):
+    a w1 / w3 slice is this rank's rows of ``w13_weight[e]`` (gate first, then
+    up), a w2 slice its columns of ``w2_weight[e]`` -- what vLLM's own loader
+    would have cut. A marked tensor this rank cannot place is an error, never a
+    silent skip; unmarked tensors are left for the usual loaders.
+    """
+
+    def __init__(self, model: torch.nn.Module):
+        self._experts: dict[int, tuple[torch.nn.Module, str]] = {}
+        for name, module in model.named_modules():
+            own = dict(module.named_parameters(recurse=False))
+            m = _DSV4_EXPERTS_MODULE.search(name)
+            if m and "w13_weight" in own and "w2_weight" in own:
+                self._experts[int(m.group(1))] = (module, name)
+
+    @staticmethod
+    def _tp(module: torch.nn.Module) -> tuple[int, int, bool]:
+        pc = getattr(getattr(module, "moe_config", None), "moe_parallel_config", None)
+        if pc is not None:
+            return int(pc.tp_rank), int(pc.tp_size), bool(pc.use_ep)
+        from vllm.distributed import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
+
+        return get_tensor_model_parallel_rank(), get_tensor_model_parallel_world_size(), False
+
+    def take(self, weights, loaded: set[str]) -> list[tuple[str, torch.Tensor]]:
+        """Copy the marked tensors in ``weights``, add their params to ``loaded``,
+        and return the rest."""
+        from lumenrl.engine.training.bridges.dsv4 import split_tp_slice_suffix
+
+        rest = []
+        for name, tensor in weights:
+            marked = split_tp_slice_suffix(name)
+            if marked is None:
+                rest.append((name, tensor))
+                continue
+            base, rank, size = marked
+            m = _DSV4_ROUTED_EXPERT.match(base)
+            if m is None or int(m.group(1)) not in self._experts:
+                raise KeyError(f"TP-sliced weight {name!r} has no routed-expert layer to load into")
+            module, module_name = self._experts[int(m.group(1))]
+            tp_rank, tp_size, use_ep = self._tp(module)
+            if use_ep or (rank, size) != (tp_rank, tp_size):
+                raise ValueError(
+                    f"{name!r} is the slice of TP rank {rank}/{size}; this worker is "
+                    f"{tp_rank}/{tp_size}{' with expert parallelism' if use_ep else ''}"
+                )
+            e, which = int(m.group(2)), m.group(3)
+            w13, w2 = module.w13_weight, module.w2_weight
+            inter, hidden = w13.shape[1] // 2, w13.shape[2]
+            want = (inter, hidden) if which in "13" else (w2.shape[1], inter)
+            if e >= w13.shape[0] or tuple(tensor.shape) != want:
+                raise ValueError(f"{name!r}: {tuple(tensor.shape)} for expert {e} of {tuple(w13.shape)}, expected {want}")
+            if which == "1":
+                w13.data[e, :inter].copy_(tensor)
+            elif which == "3":
+                w13.data[e, inter:].copy_(tensor)
+            else:
+                w2.data[e, :, :inter].copy_(tensor)
+            loaded.add(f"{module_name}.{'w2_weight' if which == '2' else 'w13_weight'}")
+        return rest
+
+
 def assert_weight_sync_coverage(
     model: torch.nn.Module,
     loaded: Iterable[str],

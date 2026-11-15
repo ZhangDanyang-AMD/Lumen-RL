@@ -25,14 +25,21 @@ def _effective_num_experts(hf: Mapping[str, Any], ec: Mapping[str, Any]) -> int:
     return int(ec.get("num_experts") or hf_num_experts(hf) or 0)
 
 
-def _export_dsv4(engine, **_):
+def _export_dsv4(engine, expert_tp_slice: tuple[int, int] | None = None, **_):
     """Gathers like Qwen3-MoE but renames to the DSv4 *checkpoint* names, which
-    the rollout feeds straight to vLLM's ``load_weights``."""
+    the rollout feeds straight to vLLM's ``load_weights``.
+
+    With ``expert_tp_slice`` every routed expert comes out as that rollout TP
+    rank's slice, its name marked by ``dsv4.mark_tp_sliced_experts`` (an unmarked
+    name is a whole tensor -- the PP group may have declined the slice)."""
     named = itertools.chain(
-        engine._full_megatron_named_params_moe(),
+        engine._full_megatron_named_params_moe(expert_tp_slice=expert_tp_slice),
         engine._router_bias_buffers(),
     )
-    return dsv4.megatron_to_dsv4_native(named)
+    native = dsv4.megatron_to_dsv4_native(named)
+    if expert_tp_slice is None:
+        return native
+    return dsv4.mark_tp_sliced_experts(native, lambda: engine._applied_expert_tp_slice)
 
 
 def _export_dsv3(engine, **_):

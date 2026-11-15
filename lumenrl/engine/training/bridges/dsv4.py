@@ -891,6 +891,9 @@ _LAYER_SAME_PREFIXES = ("hc_attn_", "hc_ffn_")
 
 _MCORE_LAYER = re.compile(r"^decoder\.layers\.(\d+)\.(.*)$")
 _GROUPED_EXPERT = re.compile(r"^mlp\.experts\.linear_fc([12])\.weight(\d+)$")
+# A routed expert, in checkpoint names, and one sent as a rollout TP rank's slice.
+_ROUTED_EXPERT_NATIVE = re.compile(r"^layers\.\d+\.ffn\.experts\.\d+\.w[123]\.weight$")
+_TP_SLICE_SUFFIX = re.compile(r"^(?P<name>.+)@tp(?P<rank>\d+)of(?P<size>\d+)$")
 
 
 def megatron_to_dsv4_native(named_params):
@@ -956,3 +959,20 @@ def megatron_to_dsv4_native(named_params):
                 yield f"{base}.w3.weight", up
             else:
                 yield f"{base}.w2.weight", t
+
+
+def mark_tp_sliced_experts(named_params, applied):
+    """Suffix each routed expert's name with ``@tp<rank>of<size>`` when ``applied()``
+    -- read per tensor, the gather decides only once it starts -- reports the
+    ``(rank, size)`` slice the gather emitted; ``None`` leaves names alone."""
+    for name, t in named_params:
+        tp_slice = applied()
+        if tp_slice is not None and _ROUTED_EXPERT_NATIVE.match(name):
+            name = f"{name}@tp{tp_slice[0]}of{tp_slice[1]}"
+        yield name, t
+
+
+def split_tp_slice_suffix(name: str) -> tuple[str, int, int] | None:
+    """``(name, tp_rank, tp_size)`` of a ``mark_tp_sliced_experts`` name, else None."""
+    m = _TP_SLICE_SUFFIX.match(name)
+    return None if m is None else (m["name"], int(m["rank"]), int(m["size"]))

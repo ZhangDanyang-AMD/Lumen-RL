@@ -227,6 +227,35 @@ class StageRecipe:
     which_fc: str | None = None
     # One ``[ep, out, in]`` output instead of ``ep`` per-expert ones.
     stacked: bool = False
+    # ``(tp_rank, tp_size)``: emit only that rollout TP rank's slice of the expert.
+    tp_slice: tuple[int, int] | None = None
+
+
+def tp_sliced_expert_shape(
+    shape: tuple[int, ...], which_fc: str, tp_size: int,
+) -> tuple[int, ...]:
+    """Shape of one rollout TP rank's slice of an expert's ``linear_fc{which_fc}``.
+
+    ``fc1`` is ``[2 * inter, hidden]`` (gate rows, then up rows) and keeps the
+    rank's rows of each half; ``fc2`` is ``[hidden, inter]`` and keeps its columns.
+    """
+    out = list(shape)
+    dim, parts = (0, 2 * tp_size) if which_fc == "1" else (1, tp_size)
+    if out[dim] % parts:
+        raise ValueError(f"expert fc{which_fc} {tuple(shape)} does not split over {tp_size} TP ranks")
+    out[dim] //= tp_size
+    return tuple(out)
+
+
+def slice_expert_for_tp(t: torch.Tensor, which_fc: str, tp_rank: int, tp_size: int) -> torch.Tensor:
+    """The rollout TP rank's slice of a full expert tensor, as vLLM shards it."""
+    if which_fc == "1":
+        inter = t.shape[0] // 2
+        per = inter // tp_size
+        lo = tp_rank * per
+        return torch.cat([t[lo:lo + per], t[inter + lo:inter + lo + per]], dim=0)
+    per = t.shape[1] // tp_size
+    return t[:, tp_rank * per:(tp_rank + 1) * per].contiguous()
 
 
 def ddp_config_kwargs(ec: dict) -> dict:
@@ -862,7 +891,9 @@ class MegatronNativeEngine(MegatronBaseEngine):
         return local_sd
 
     # ---- weight sync: Megatron(TE) -> full (TP+PP gathered) named tensors ----
-    def _stage_plan(self, stack_experts: bool = False) -> list[StageRecipe]:
+    def _stage_plan(
+        self, stack_experts: bool = False, expert_tp_slice: tuple[int, int] | None = None,
+    ) -> list[StageRecipe]:
         """Describe this PP stage's gathered tensors without communicating.
 
         Shapes come from local shards, ``sharded_state_dict()`` global shapes,
@@ -874,6 +905,9 @@ class MegatronNativeEngine(MegatronBaseEngine):
         named with ``stacked_expert_index``. The stack is the EP all-gather's
         output buffer, so it costs nothing extra; at EP=1 there is no gather,
         and stacking would mean copying every expert each sync.
+
+        ``expert_tp_slice`` (unstacked only) emits each expert as one rollout TP
+        rank's slice (``slice_expert_for_tp``); the gathers are unchanged.
         """
         from megatron.core import parallel_state as mpu
         from megatron.core.dist_checkpointing.mapping import (
@@ -969,6 +1003,8 @@ class MegatronNativeEngine(MegatronBaseEngine):
                     ),),
                 ))
                 continue
+            if expert_tp_slice is not None:
+                out_shape = tp_sliced_expert_shape(out_shape, which_fc, expert_tp_slice[1])
             outputs = []
             for j in range(max(ep, 1)):
                 global_e = j * num_local + local_e
@@ -981,7 +1017,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 ))
             recipes.append(StageRecipe(
                 local_name=name, kind="expert",
-                outputs=tuple(outputs), which_fc=which_fc,
+                outputs=tuple(outputs), which_fc=which_fc, tp_slice=expert_tp_slice,
             ))
         return recipes
 
@@ -1070,6 +1106,8 @@ class MegatronNativeEngine(MegatronBaseEngine):
                     p = torch.cat(g, dim=1)
                 del g
             if ep <= 1:
+                if recipe.tp_slice is not None:
+                    p = slice_expert_for_tp(p, recipe.which_fc, *recipe.tp_slice)
                 _check(recipe.outputs[0].name, p, recipe.outputs[0])
                 yield recipe.outputs[0].name, p
                 continue
@@ -1082,12 +1120,15 @@ class MegatronNativeEngine(MegatronBaseEngine):
             g = [torch.empty_like(p) for _ in range(ep)]
             dist.all_gather(g, p, group=ep_group)
             for j, expected in enumerate(recipe.outputs):
-                _check(expected.name, g[j], expected)
-                yield expected.name, g[j]
-                g[j] = None
+                t = g[j]
+                if recipe.tp_slice is not None:
+                    t = slice_expert_for_tp(t, recipe.which_fc, *recipe.tp_slice)
+                _check(expected.name, t, expected)
+                yield expected.name, t
+                g[j] = t = None
 
     def _full_named_params(
-        self, stack_experts: bool = False,
+        self, stack_experts: bool = False, expert_tp_slice: tuple[int, int] | None = None,
     ) -> Iterator[tuple[str, torch.Tensor]]:
         """Stream the full model as (global_name, tensor) on every rank.
 
@@ -1103,11 +1144,26 @@ class MegatronNativeEngine(MegatronBaseEngine):
         the same on every rank. It is read from each rank's environment, so the
         ranks agree on the smallest value set anywhere (with a warning if they
         differ) before the first refill.
+
+        A stage broadcasts what its owner's plan emits, so ``expert_tp_slice``
+        applies only when every rank of the PP group asks for the same slice
+        (one rollout TP rank on every node); otherwise the experts go whole.
         """
         from megatron.core import parallel_state as mpu
 
         pp = mpu.get_pipeline_model_parallel_world_size()
-        recipes = self._stage_plan(stack_experts)
+        if expert_tp_slice is not None and pp > 1:
+            asked: list = [None] * pp
+            dist.all_gather_object(asked, expert_tp_slice, group=mpu.get_pipeline_model_parallel_group())
+            if len(set(asked)) != 1:
+                if mpu.get_pipeline_model_parallel_rank() == 0:
+                    logger.warning(
+                        "weight sync: PP group asks for expert TP slices %s; sending whole experts",
+                        asked,
+                    )
+                expert_tp_slice = None
+        self._applied_expert_tp_slice = expert_tp_slice
+        recipes = self._stage_plan(stack_experts, expert_tp_slice)
         if pp == 1:
             yield from self._stage_named_params(recipes)
             return
@@ -1189,10 +1245,12 @@ class MegatronNativeEngine(MegatronBaseEngine):
         actors (collective)."""
         yield from self._full_named_params()
 
-    def _full_megatron_named_params_moe(self, stack_experts: bool = False):
+    def _full_megatron_named_params_moe(
+        self, stack_experts: bool = False, expert_tp_slice: tuple[int, int] | None = None,
+    ):
         """Reconstruct the COMPLETE MoE model as (global_name, tensor) on every rank.
         """
-        yield from self._full_named_params(stack_experts)
+        yield from self._full_named_params(stack_experts, expert_tp_slice)
 
     def _router_bias_buffers(self):
         """The aux-loss-free load-balancing bias, which is a buffer, not a param.
@@ -1247,6 +1305,10 @@ class MegatronNativeEngine(MegatronBaseEngine):
         This is Lazy, and every tensor comes out of a collective, so the caller must
         drain the generator on every rank. Consuming it partially deadlocks.
 
+        ``expert_tp_slice=(tp_rank, tp_size)`` asks for each routed expert as
+        that rollout TP rank's slice, from families that support it (DSv4); the
+        others ignore it.
+
         ``stack_experts=True`` asks for expert stacks (see ``_stage_plan``) from
         families that support them; the others ignore it. Only a receiver that
         understands stacked names (vLLM's ``FusedMoEWeightRouter``) may ask.
@@ -1257,6 +1319,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
         # owned by the family. See ``model_specs`` for the three implementations.
         gen = self._spec.export_weights(
             self, stack_experts=bool(kwargs.get("stack_experts", False)),
+            expert_tp_slice=kwargs.get("expert_tp_slice"),
         )
         return _mem_diag_stream("weight_sync gather", gen), None
 
