@@ -141,14 +141,51 @@ def test_unquantized_moe_clamp_installs_once():
     assert method_cls.get_fused_moe_quant_config is patched
 
 
-def test_worker_installs_the_moe_clamp_before_the_model_is_built(monkeypatch):
+def _cuda_wrapper(loaded):
+    return SimpleNamespace(find_loaded_library=lambda name: loaded.get(name))
+
+
+_TILELANG_STUB = "/usr/local/lib/python3.12/dist-packages/tilelang/lib/libcudart_stub.so"
+_HIP = "/opt/rocm/lib/libamdhip64.so.7"
+
+
+def test_cudart_lookup_binds_the_hip_runtime_on_rocm_even_with_a_libcudart_stub_loaded():
+    wrapper = _cuda_wrapper({"libcudart": _TILELANG_STUB, "libamdhip64": _HIP})
+
+    worker_ext._bind_hip_runtime_for_cudart(wrapper, is_rocm=True)
+
+    assert wrapper.find_loaded_library("libcudart") is None
+    assert wrapper.find_loaded_library("libamdhip64") == _HIP
+
+
+def test_cudart_lookup_is_left_alone_off_rocm():
+    wrapper = _cuda_wrapper({"libcudart": "/usr/local/cuda/lib64/libcudart.so.12"})
+    original = wrapper.find_loaded_library
+
+    worker_ext._bind_hip_runtime_for_cudart(wrapper, is_rocm=False)
+
+    assert wrapper.find_loaded_library is original
+
+
+def test_cudart_lookup_binding_installs_once():
+    wrapper = _cuda_wrapper({"libamdhip64": _HIP})
+    worker_ext._bind_hip_runtime_for_cudart(wrapper, is_rocm=True)
+    patched = wrapper.find_loaded_library
+
+    worker_ext._bind_hip_runtime_for_cudart(wrapper, is_rocm=True)
+
+    assert wrapper.find_loaded_library is patched
+
+
+def test_worker_installs_its_vllm_patches_before_the_model_is_built(monkeypatch):
     events = []
     monkeypatch.setattr(worker_ext, "set_death_signal", lambda: None)
+    monkeypatch.setattr(worker_ext, "_bind_hip_runtime_for_cudart", lambda: events.append("hip_runtime"))
     monkeypatch.setattr(worker_ext, "_clamp_unquantized_moe_swiglu", lambda: events.append("clamp"))
 
     vLLMColocateWorkerExtension.__new__(vLLMColocateWorkerExtension)
 
-    assert events == ["clamp"]
+    assert events == ["hip_runtime", "clamp"]
 
 
 def test_rdma_capability_is_immutable_and_json_serializable():

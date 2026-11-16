@@ -79,6 +79,36 @@ def _install_all_gather_lifecycle_diagnostics(group_cls=None) -> None:
     group_cls.all_gather = all_gather
 
 
+def _bind_hip_runtime_for_cudart(cuda_wrapper=None, is_rocm=None) -> None:
+    """Make vLLM's ``CudaRTLibrary`` bind the HIP runtime on ROCm.
+
+    It takes the first loaded library whose path contains ``libcudart`` and looks
+    for ``libamdhip64`` only when there is none. tilelang, which vLLM's mHC
+    kernels use when it is installed, loads ``tilelang/lib/libcudart_stub.so``;
+    bound to that, sleep mode's ``CuMemAllocator`` dies on import with
+    ``undefined symbol: hipSetDevice``.
+    """
+    if is_rocm is None:
+        from vllm.platforms import current_platform
+
+        is_rocm = current_platform.is_rocm()
+    if not is_rocm:
+        return
+    if cuda_wrapper is None:
+        from vllm.distributed.device_communicators import cuda_wrapper
+    original = cuda_wrapper.find_loaded_library
+    if getattr(original, "_lumenrl_hip_runtime", False):
+        return
+
+    def find_loaded_library(lib_name):
+        if lib_name == "libcudart":
+            return None
+        return original(lib_name)
+
+    find_loaded_library._lumenrl_hip_runtime = True
+    cuda_wrapper.find_loaded_library = find_loaded_library
+
+
 def _clamp_unquantized_moe_swiglu(method_cls=None) -> None:
     """Give vLLM's unquantized MoE the SwiGLU clamp its quantized paths apply.
 
@@ -188,6 +218,11 @@ class vLLMColocateWorkerExtension:
 
     def __new__(cls, **kwargs):
         set_death_signal()
+        # Before load_model, whose CuMemAllocator import binds the runtime library.
+        try:
+            _bind_hip_runtime_for_cudart()
+        except (ImportError, AttributeError) as exc:  # a vLLM without this layout
+            logger.warning("HIP runtime binding for CudaRTLibrary not installed: %s", exc)
         # Before the model is built: the patch applies when the MoE kernels are set up.
         try:
             _clamp_unquantized_moe_swiglu()
