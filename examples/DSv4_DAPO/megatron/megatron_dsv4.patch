@@ -638,7 +638,7 @@ index 98d4d5f..9b2810c 100644
          return outputs
  
 diff --git a/megatron/core/transformer/moe/moe_utils.py b/megatron/core/transformer/moe/moe_utils.py
-index e732219..0bdf1ec 100644
+index e732219..0f303e3 100644
 --- a/megatron/core/transformer/moe/moe_utils.py
 +++ b/megatron/core/transformer/moe/moe_utils.py
 @@ -620,6 +620,8 @@ def topk_routing_with_score_function(
@@ -650,7 +650,24 @@ index e732219..0bdf1ec 100644
      router_replay: Optional['RouterReplay'] = None,
  ) -> Tuple[torch.Tensor, torch.Tensor]:
      """Compute the routing probabilities and map for top-k selection with score function.
-@@ -730,6 +732,22 @@ def topk_routing_with_score_function(
+@@ -711,8 +713,14 @@ def topk_routing_with_score_function(
+                 scores, topk, num_groups, group_topk, _compute_topk
+             )
+ 
+-    from vime.utils.routing_replay import get_routing_replay_compute_topk
+-    compute_topk = get_routing_replay_compute_topk(compute_topk)
++    # vime is absent outside the vime image; its wrapper is a pass-through unless
++    # ENABLE_ROUTING_REPLAY=1, which LumenRL never sets.
++    try:
++        from vime.utils.routing_replay import get_routing_replay_compute_topk
++    except ImportError:
++        pass
++    else:
++        compute_topk = get_routing_replay_compute_topk(compute_topk)
+ 
+     if score_function == "softmax":
+         if use_pre_softmax:
+@@ -730,6 +738,22 @@ def topk_routing_with_score_function(
          else:
              scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
          probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores

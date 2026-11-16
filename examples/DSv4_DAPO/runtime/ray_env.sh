@@ -38,8 +38,8 @@ export HF_HOME="$DATA_ROOT/hf_home" WANDB_DIR="$DATA_ROOT/wandb" LUMENRL_LOG_LEV
 # kept for parity with the validated environment.
 export MODEL_NAME="${DSV4_SRC_MODEL_DIR:-}"
 
-# Replaces the image's PYTHONPATH (it is assigned, not prepended). vime and
-# megatron-core stay importable through the image's editable installs.
+# Replaces the image's PYTHONPATH (it is assigned, not prepended). megatron-core
+# (and vime, in the images that have it) stay importable through the image's installs.
 export PYTHONPATH="$RL_ROOT/Lumen-RL:$RL_ROOT/aiter:$RL_ROOT/Lumen:$RL_ROOT/ATOM"
 
 export LUMENRL_FSDP_CHUNK_CAT_FALLBACK=1

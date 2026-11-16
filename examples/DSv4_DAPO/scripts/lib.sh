@@ -29,7 +29,7 @@ PIN_HF_REPO=deepseek-ai/DeepSeek-V4-Flash-Base
 PIN_HF_REV=8855555deef230a27a21a8d6f294b7b7497759b6
 # sha256 over `sha256sum` lines of every file in the rebuilt megatron/ tree
 # (LC_ALL=C path order, __pycache__ excluded). See build_megatron.sh.
-MEGATRON_TREE_SHA256=60cd2a97717fb695485ff570486a61c61b45ed842fc852144c6cd0359c95fb45
+MEGATRON_TREE_SHA256=387ccd54fadb2b3e1002539b2db61749caddfd8b5511e1eb4e40bc3700709c84
 MODEL_LAYERS_FULL=43
 
 # Validated hardware: 8 GPUs of gfx950 per node, 288 GiB each.

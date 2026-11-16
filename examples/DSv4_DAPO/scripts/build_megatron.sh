@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Rebuild the DeepSeek-V4-patched Megatron into $WORK_DIR/megatron_dsv4/megatron:
 #
-#   base   /root/Megatron-LM/megatron from IMAGE (NVIDIA/Megatron-LM dev @ 1dcf0dafa
-#          plus the image's own uncommitted changes, megatron-core 0.16.0rc0)
+#   base   /root/Megatron-LM/megatron from MEGATRON_SRC_IMAGE, default the pinned vime
+#          image (NVIDIA/Megatron-LM dev @ 1dcf0dafa plus the image's own uncommitted
+#          changes, megatron-core 0.16.0rc0); IMAGE may be one without that tree
 #   patch  megatron/megatron_dsv4.patch (18 files)
 #
 # The result is checked against MEGATRON_TREE_SHA256, a digest over every file of the
@@ -16,7 +17,8 @@ source "$(dirname "$0")/lib.sh"
 load_env
 out=$MEGATRON_DSV4_DIR
 patch=$DSV4_EXAMPLE_DIR/megatron/megatron_dsv4.patch
-image_present "$IMAGE" || die "IMAGE not pulled; run scripts/pull_images.sh"
+src_image=${MEGATRON_SRC_IMAGE:-$PIN_IMAGE}
+image_present "$src_image" || die "$src_image not pulled; run scripts/pull_images.sh"
 
 if [ -f "$out/.tree.sha256" ] && [ "$(cat "$out/.tree.sha256")" = "$MEGATRON_TREE_SHA256" ] && [ "${REBUILD:-0}" != 1 ]; then
   log "megatron_dsv4 already built and verified: $out"
@@ -24,13 +26,13 @@ if [ -f "$out/.tree.sha256" ] && [ "$(cat "$out/.tree.sha256")" = "$MEGATRON_TRE
 fi
 if [ -e "$out" ]; then
   [ "${REBUILD:-0}" = 1 ] || die "$out exists but is not a verified build; set REBUILD=1 to replace it"
-  dk_util "$IMAGE" "rm -rf $(printf %q "$out")"
+  dk_util "$src_image" "rm -rf $(printf %q "$out")"
 fi
 mkdir -p "$(dirname "$out")"
 
 manifest='find megatron -type f ! -path "*/__pycache__/*" ! -name "*.pyc" -print0 | LC_ALL=C sort -z | xargs -0 sha256sum'
-log "building $out from IMAGE + $(basename "$patch")"
-dk_util "$IMAGE" "
+log "building $out from $src_image + $(basename "$patch")"
+dk_util "$src_image" "
 set -euo pipefail
 tmp=\$(mktemp -d /tmp/megatron-build.XXXXXX)
 cp -a /root/Megatron-LM/megatron \"\$tmp/\"
@@ -51,7 +53,7 @@ log "tree sha256: $got ($(wc -l <"$out/.manifest") files)"
 if [ -n "${VERIFY_AGAINST:-}" ]; then
   ref=$(realpath "$VERIFY_AGAINST")
   log "comparing file by file against $ref"
-  dk run --rm -v "$ref:$ref:ro" --entrypoint /bin/bash "$IMAGE" -c "cd $(printf %q "$ref") && $manifest" \
+  dk run --rm -v "$ref:$ref:ro" --entrypoint /bin/bash "$src_image" -c "cd $(printf %q "$ref") && $manifest" \
     > "$out/.manifest.ref"
   if [ "$(sha256sum <"$out/.manifest")" = "$(sha256sum <"$out/.manifest.ref")" ]; then
     log "identical to $ref: $(wc -l <"$out/.manifest") files, every sha256 equal"
