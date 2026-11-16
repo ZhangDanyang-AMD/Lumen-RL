@@ -11,6 +11,8 @@ REPO="$(cd "$HERE/../.." && pwd)"
 NPROC="${NPROC:-8}"
 CONFIG="${CONFIG:-$HERE/configs/embodied_opensora_openvla_oft_grpo.yaml}"
 MASTER_PORT="${MASTER_PORT:-29500}"
+LUMEN_DIR="${LUMEN_DIR:-/src/Lumen}"
+export PYTHONPATH="$LUMEN_DIR/examples/openvla_oft${PYTHONPATH:+:$PYTHONPATH}"
 
 cd "$REPO"
 exec torchrun --nproc_per_node="$NPROC" --master_port="$MASTER_PORT" \

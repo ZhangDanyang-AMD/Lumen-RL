@@ -142,8 +142,10 @@ class EmbodiedHFRollout:
         for s in range(0, len(instructions), self.batch_size):
             ids, mask = self.processor.build_text_batch(instructions[s:s + self.batch_size])
             pix = self.processor.preprocess_images(images[s:s + self.batch_size].to(self.device))
-            out = self.policy(ids.to(self.device), mask.to(self.device), pix, temperature=self.temperature)
-            tok, lp = sample_action_tokens(out["logits"], greedy=greedy, generator=self.generator)
+            logits = self.policy(ids.to(self.device), mask.to(self.device), pix).float()
+            if self.temperature != 1.0:
+                logits = logits / self.temperature
+            tok, lp = sample_action_tokens(logits, greedy=greedy, generator=self.generator)
             tokens.append(tok)
             logps.append(lp)
         tokens = torch.cat(tokens)

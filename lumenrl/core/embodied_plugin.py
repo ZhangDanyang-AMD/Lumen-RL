@@ -18,10 +18,9 @@ class EmbodiedPlugin:
     """Model factories supplied by a project.
 
     build_policy(model_path, dtype=..., device=...) -> nn.Module
-        Policy whose ``forward(input_ids, attention_mask, pixel_values,
-        action_tokens=None, temperature=1.0, calculate_entropy=False)`` returns
-        a dict with ``logits`` ``[B, A, V]`` and, when ``action_tokens`` is
-        given, ``log_probs`` ``[B, A]``. It must expose
+        Policy whose ``forward(input_ids, attention_mask, pixel_values)``
+        returns action-bin logits ``[B, A, V]``. Temperature, sampling,
+        log-probs and entropy are computed by LumenRL. It must expose
         ``gradient_checkpointing_enable()`` and ``fsdp_wrap_modules()``.
     build_processor(model_path, unnorm_key) -> processor
         Provides ``num_action_tokens``, ``build_text_batch(instructions)``,

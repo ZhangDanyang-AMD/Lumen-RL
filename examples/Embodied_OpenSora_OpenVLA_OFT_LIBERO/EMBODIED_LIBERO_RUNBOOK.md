@@ -96,7 +96,7 @@ would be a different run.
 
 ```bash
 docker exec -d wm-rl bash -lc '
-  cd /src/Lumen-RL
+  cd /src/Lumen-RL && export PYTHONPATH=/src/Lumen/examples/openvla_oft${PYTHONPATH:+:$PYTHONPATH}
   CUDA_VISIBLE_DEVICES=0,1,3,4,5,6 \
   NPROC=6 MASTER_PORT=29500 \
   bash examples/Embodied_Wan_OpenVLA_OFT_LIBERO/run_embodied_grpo.sh \
@@ -129,7 +129,7 @@ eight cards (32 groups/step). The 2-GPU setting diverges.
 
 ```bash
 docker exec -d wm-rl bash -lc '
-  cd /src/Lumen-RL
+  cd /src/Lumen-RL && export PYTHONPATH=/src/Lumen/examples/openvla_oft${PYTHONPATH:+:$PYTHONPATH}
   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
   NPROC=8 MASTER_PORT=29640 \
   bash examples/Embodied_OpenSora_OpenVLA_OFT_LIBERO/run_embodied_grpo.sh \
@@ -160,7 +160,7 @@ Table numbers (128 episodes, no video):
 
 ```bash
 docker exec wm-rl bash -lc '
-  cd /src/Lumen-RL
+  cd /src/Lumen-RL && export PYTHONPATH=/src/Lumen/examples/openvla_oft${PYTHONPATH:+:$PYTHONPATH}
   CUDA_VISIBLE_DEVICES=0 python -m lumenrl.trainer.embodied_eval \
     --config examples/Embodied_Wan_OpenVLA_OFT_LIBERO/configs/embodied_wan_openvla_oft_grpo.yaml \
     --policy base \
@@ -180,7 +180,7 @@ the last policy newly solves come first. Green border is success, red is fail.
 
 ```bash
 docker exec wm-rl bash -lc '
-  cd /src/Lumen-RL
+  cd /src/Lumen-RL && export PYTHONPATH=/src/Lumen/examples/openvla_oft${PYTHONPATH:+:$PYTHONPATH}
   CUDA_VISIBLE_DEVICES=0 python -m lumenrl.trainer.embodied_eval \
     --config examples/Embodied_Wan_OpenVLA_OFT_LIBERO/configs/embodied_wan_openvla_oft_grpo.yaml \
     --policy base \

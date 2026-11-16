@@ -25,6 +25,23 @@ from lumenrl.engine.training.fsdp_engine import FSDP2Engine
 logger = logging.getLogger(__name__)
 
 
+def action_log_probs(
+    logits: torch.Tensor,
+    action_tokens: torch.Tensor,
+    temperature: float = 1.0,
+    calculate_entropy: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Action-bin logits ``[B, A, V]`` -> ``log_probs`` ``[B, A]`` of ``action_tokens`` (and ``entropy``)."""
+    logits = logits.float()
+    if temperature != 1.0:
+        logits = logits / temperature
+    logp_all = torch.log_softmax(logits, dim=-1)
+    out = {"log_probs": logp_all.gather(-1, action_tokens.long().unsqueeze(-1)).squeeze(-1)}
+    if calculate_entropy:
+        out["entropy"] = -(logp_all.exp() * logp_all).sum(-1)
+    return out
+
+
 def load_policy_weights(module: nn.Module, path: str) -> None:
     """Load a ``policy.safetensors`` of named parameters onto ``module``.
 
@@ -121,15 +138,17 @@ class EmbodiedFSDP2Engine(FSDP2Engine):
         assert self.module is not None
         device = self._device_or_cuda()
         meta = micro_batch.get("meta", {}) or {}
-        out = self.module(
+        logits = self.module(
             input_ids=micro_batch["input_ids"].to(device),
             attention_mask=micro_batch["attention_mask"].to(device),
             pixel_values=self.processor.preprocess_images(micro_batch["images"].to(device)),
-            action_tokens=micro_batch["action_tokens"].to(device),
+        )
+        model_output = action_log_probs(
+            logits,
+            micro_batch["action_tokens"].to(device),
             temperature=float(micro_batch.get("temperature", 1.0)),
             calculate_entropy=bool(meta.get("calculate_entropy", False)),
         )
-        model_output = {k: v for k, v in out.items() if k != "logits"}
         if loss_function is not None:
             loss, metrics = loss_function(model_output=model_output, data=micro_batch)
         else:

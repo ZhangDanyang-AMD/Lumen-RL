@@ -10,10 +10,8 @@ from examples.Embodied_OpenSora_OpenVLA_OFT_LIBERO.models.opensora_world_model i
     OpenSoraActionWorldModel,
     OpenSoraWorldModelConfig,
 )
-from examples.Embodied_Wan_OpenVLA_OFT_LIBERO.models.openvla_oft import (
-    OpenVLAOFTProcessor,
-    load_openvla_oft,
-)
+from modeling_openvla_oft import load_openvla_oft
+from processing_openvla_oft import OpenVLAOFTProcessor
 from examples.Embodied_Wan_OpenVLA_OFT_LIBERO.models.world_model_reward import load_reward_model
 
 
