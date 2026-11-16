@@ -325,7 +325,7 @@ inline_env() {
   local v
   for v in WORK_DIR RL_ROOT DATA_ROOT DSV4_LAYERS CONTAINER IMAGE MILES_IMAGE DOCKER DOCKER_HOST \
            RAY_PORT RAY_DASHBOARD_PORT HEAD_IP NODES FORCE STEPS HF_ENDPOINT HF_TOKEN MODEL_SRC_DIR \
-           HTTP_PROXY HTTPS_PROXY NO_PROXY; do
+           EXTRA_DOCKER_ARGS HTTP_PROXY HTTPS_PROXY NO_PROXY; do
     if [ -n "${!v:-}" ]; then printf 'export %s=%q\n' "$v" "${!v}"; fi
   done
   if [ "${NET_IF_FROM_USER:-}" = 1 ]; then printf 'export NET_IF=%q\n' "$NET_IF"; fi

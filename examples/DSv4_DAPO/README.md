@@ -138,6 +138,18 @@ bash scripts/stop.sh --rm       # 停止 Ray 并删除本示例创建的容器
 
 worker 数和每节点的放置都由 `NODES` 自动推出，保证每个 TP=8 的 rollout replica 都在同一个节点内。
 
+### 节点间走 RDMA
+
+默认节点间走 TCP（`NET_IF`）。要走 RDMA，镜像里的 RCCL 必须不低于 2.27（ROCm 7.2）：固定镜像的 RCCL 2.26.6 在这类网卡上 `ibv_reg_mr` 失败。换镜像时设置 `IMAGE`；Megatron 源码树仍从固定镜像取（`MEGATRON_SRC_IMAGE`），换后的镜像不需要带 Megatron 源码或 vime。在 env.sh 中加上：
+
+```bash
+export EXTRA_DOCKER_ARGS="--device=/dev/infiniband --cap-add=IPC_LOCK -e NCCL_IB_HCA=<RDMA 设备，逗号分隔> -e NCCL_IB_GID_INDEX=<GID 序号>"
+```
+
+`EXTRA_DOCKER_ARGS` 会随命令传到每个节点。`runtime/ray_env.sh` 看到 `NCCL_IB_HCA` 就打开 IB，GPU Direct RDMA 走 DMA-BUF（`NCCL_NET_GDR_LEVEL=3`、`NCCL_DMABUF_ENABLE=1`）。镜像自带的 verbs 驱动不支持宿主机内核 ABI 时（`Driver ... does not support the kernel ABI`），把可用的驱动用 `-v` 挂进去。在两台 MI355X（每台 8 块 400G ionic）上，两机同号卡之间的广播每对 35.8 GiB/s，走 TCP 是 1.45 GiB/s。
+
+ROCm 7.2.3 / 7.2.4 的 ROCr 中，`hipMemRelease` 要等虚拟地址区间释放后才归还物理显存，而 vLLM 的 sleep 模式保留地址区间，所以 sleep 之后 rollout 的显存仍然被占着（7.0.2、7.2.0 没有这个问题）。开 sleep 模式的配置在这类镜像上，训练阶段每卡会多占 rollout 的那部分显存（全量 43 层约 81 GB）。
+
 ## 配置
 
 `env.example.sh` 里每一项都有说明，常用的几项：

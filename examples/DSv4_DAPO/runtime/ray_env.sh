@@ -49,8 +49,17 @@ export LUMENRL_WEIGHT_SYNC_VERIFY=1
 
 export NCCL_SOCKET_IFNAME="$NET_IF"
 export GLOO_SOCKET_IFNAME="$NET_IF"
-# TCP between nodes; RDMA was never part of this recipe.
-export NCCL_IB_DISABLE=1
+# TCP between nodes, unless the container was started with NCCL_IB_HCA (and
+# NCCL_IB_GID_INDEX) naming RDMA devices -- see the README section on RDMA. That
+# needs RCCL >= 2.27: the pinned image's 2.26.6 fails ibv_reg_mr on these NICs.
+# There is no peer-memory module, so GPU Direct RDMA goes through DMA-BUF.
+if [ -n "${NCCL_IB_HCA:-}" ]; then
+  : "${NCCL_IB_GID_INDEX:?NCCL_IB_GID_INDEX must accompany NCCL_IB_HCA}"
+  export NCCL_IB_DISABLE=0 NCCL_IB_HCA NCCL_IB_GID_INDEX
+  export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-3}" NCCL_DMABUF_ENABLE="${NCCL_DMABUF_ENABLE:-1}"
+else
+  export NCCL_IB_DISABLE=1
+fi
 
 # The DSv4-patched Megatron and the kernel-free model plugin. `megatron` is an
 # implicit namespace package on both sides, so the patched tree merges with the
