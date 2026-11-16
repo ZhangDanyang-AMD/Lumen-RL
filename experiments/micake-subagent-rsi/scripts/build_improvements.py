@@ -25,21 +25,48 @@ import yaml
 SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from run_ab_eval import DEFAULT_CONFIG, TASK  # noqa: E402
+from run_ab_eval import DEFAULT_CONFIG, REPO_ROOT, TASK  # noqa: E402
 from lumenrl.agentic.core.backends import build_environment  # noqa: E402
 from micake_rsi.improve import (  # noqa: E402
-    config_key, correctable, exploit_candidates, exploit_sample, improvement_sample, improves, planner_children, walk_steps,
+    child_element_bytes, config_key, correctable, exploit_candidates, exploit_sample, improvement_sample, improves,
+    planner_children, record_dtype, walk_steps,
 )
 
 logger = logging.getLogger("build_improvements")
 
 
+TRAIN_PORTFOLIOS = {"c144", "large"}
+C144_IDS = {"gemm.small-square", "gemm.large-square", "gemm.tall", "gemm.wide", "gemm.deep-k"}
+
+
 def experience(dirs: list[Path]) -> list[dict]:
+    """Training-portfolio records only. ``c144`` and ``large`` are disjoint from the held-out test shapes."""
     records = []
     for directory in dirs:
         for path in sorted(glob.glob(str(directory / "e2e*.jsonl"))):
             records += [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
-    return records
+    return [r for r in records if record_portfolio(r) in TRAIN_PORTFOLIOS]
+
+
+def experience_stamp(directory: Path) -> str:
+    """Stable id for a record's source directory, relative to the repo when it lives there."""
+    resolved = directory.resolve()
+    try:
+        return str(resolved.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(resolved)
+
+
+def record_portfolio(record: dict) -> str:
+    """Recorded portfolio; older records are classified from the workload ids in the Manager's task packet."""
+    if record.get("portfolio"):
+        return record["portfolio"]
+    try:
+        packet = json.loads(record["episode"]["messages"][1]["content"])
+        ids = {item["workload_id"] for item in packet["portfolio"]}
+    except (KeyError, IndexError, TypeError, ValueError):
+        return "unknown"
+    return "c144" if ids == C144_IDS else "extended"
 
 
 async def main_async(args) -> None:
@@ -56,7 +83,7 @@ async def main_async(args) -> None:
     targets: dict[tuple[str, str], int] = {}
 
     async def evaluate(config):
-        key = config_key(config)
+        key = config_key(config) if micake.dtype == "fp16" else f"{micake.dtype}|{config_key(config)}"
         if key not in cache:
             result = await micake.measure(config)
             perf = result.get("performance") or {}
@@ -68,20 +95,25 @@ async def main_async(args) -> None:
     await micake.reset(TASK)
     domain = micake.domain
     try:
-        for n, record in enumerate(experience(args.exp_dir)):
+        indexed = [(experience_stamp(directory), record) for directory in args.exp_dir for record in experience([directory])]
+        for n, (stamp, record) in enumerate(indexed):
             if n % args.shards != args.shard:
                 continue
             stats["records"] += 1
+            if record_dtype(record) != micake.dtype:
+                await micake.reset({**TASK, "dtype": record_dtype(record)})
             for c, child in enumerate(planner_children(record)):
                 stats["children"] += 1
                 key = f"{record['key']}@{record.get('arm')}#{c}"
                 positive = improvement_sample(child, f"{key}:positive")
                 if positive:
+                    positive["experience_dir"] = stamp
                     samples.append(positive)
                     stats["positives"] += 1
                 for entry in correctable(list(walk_steps(child)))[: args.max_corrections]:
                     chosen, chosen_speedup = None, 0.0
-                    for i, candidate in enumerate(exploit_candidates(entry["best_config"], domain, entry["submitted"])):
+                    candidates = exploit_candidates(entry["best_config"], domain, entry["submitted"], child_element_bytes(child))
+                    for i, candidate in enumerate(candidates):
                         if i >= args.max_attempts:
                             break
                         measured = await evaluate(candidate)
@@ -95,7 +127,9 @@ async def main_async(args) -> None:
                     if targets[target] > args.max_per_target:
                         stats["repeated_target"] += 1
                         continue
-                    samples.append(exploit_sample(child, entry, chosen, f"{key}:exploit{entry['step']['step_index']}"))
+                    correction = exploit_sample(child, entry, chosen, f"{key}:exploit{entry['step']['step_index']}")
+                    correction["experience_dir"] = stamp
+                    samples.append(correction)
                     stats["corrected"] += 1
     finally:
         await micake.close()

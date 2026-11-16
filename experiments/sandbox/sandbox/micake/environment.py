@@ -36,11 +36,17 @@ logger = logging.getLogger(__name__)
 
 BACKEND_NAME = "micake_gemm"
 FIDELITY_LEVELS = ("verify", "compile", "correctness", "performance")
+INPUT_DTYPES = {
+    "fp16": {"name": "FP16", "element_bytes": 2},
+    "bf16": {"name": "BF16", "element_bytes": 2},
+    "fp8": {"name": "FP8 e4m3 (OCP, Triton fp8e4nv)", "element_bytes": 1},
+}
 
 SYSTEM_PROMPT = """You are an AMD GPU kernel optimization agent working inside the MICake sandbox.
 
-Goal: find a GEMM schedule (FP16 x FP16 -> FP32, Triton, AMD MI355X / gfx950, wave64) that is correct on
-every workload in the portfolio and as fast as possible relative to the baseline schedule.
+Goal: find a GEMM schedule (A x B -> FP32 accumulate, Triton, AMD MI355X / gfx950, wave64) that is correct on
+every workload in the portfolio and as fast as possible relative to the baseline schedule. The A/B element
+type is `input_dtype` in the task packet (FP16 when absent); speedups compare against the baseline in that type.
 
 How to work:
 - You can only act through tools. Call exactly one tool per turn.
@@ -135,11 +141,16 @@ class MicakeGemmEnvironment(AgentEnvironment):
             backend=BACKEND_NAME, snapshot=True, async_step=True, fidelity_levels=FIDELITY_LEVELS,
         )
 
+    @property
+    def dtype(self) -> str:
+        """A/B element type of the current episode."""
+        return self._state.get("dtype", "fp16")
+
     async def _evaluate(self, config: Mapping[str, Any], fidelity: str) -> tuple[dict[str, Any], bool]:
-        key = (json.dumps(config, sort_keys=True), fidelity)
+        key = (json.dumps(config, sort_keys=True), fidelity, self.dtype)
         if key in self._result_cache:
             return copy.deepcopy(self._result_cache[key]), True
-        result = await self._evaluator.evaluate(config, fidelity, self._measurement)
+        result = await self._call_evaluator(config, fidelity)
         if result.get("stage") not in UNKNOWN_STAGES:
             self._result_cache[key] = copy.deepcopy(result)
         return result, False
@@ -152,8 +163,13 @@ class MicakeGemmEnvironment(AgentEnvironment):
         if fidelity not in FIDELITY_LEVELS:
             raise ValueError(f"task fidelity {fidelity!r} not in {FIDELITY_LEVELS}")
         max_submissions = int(task.get("max_submissions", self._default_max_submissions))
+        dtype = task.get("dtype", "fp16")
+        if dtype not in INPUT_DTYPES:
+            raise ValueError(f"task dtype {dtype!r} not in {sorted(INPUT_DTYPES)}")
+        self._state = {"dtype": dtype}
         baseline, _ = await self._evaluate(description["baseline_config"], "compile")
         self._state = {
+            "dtype": dtype,
             "task_id": task.get("task_id", "c144-gemm-portfolio"),
             "fidelity": fidelity,
             "max_submissions": max_submissions,
@@ -176,6 +192,10 @@ class MicakeGemmEnvironment(AgentEnvironment):
             "evaluation_fidelity": fidelity,
             "budget": {"max_submissions": max_submissions},
         }
+        if dtype != "fp16":
+            element = INPUT_DTYPES[dtype]
+            observation["input_dtype"] = element["name"]
+            observation["resource_limits"] = {**(observation["resource_limits"] or {}), "lds_element_bytes": element["element_bytes"]}
         return ResetResult(
             system_prompt=SYSTEM_PROMPT,
             observation=observation,
@@ -186,6 +206,7 @@ class MicakeGemmEnvironment(AgentEnvironment):
                 "candidate_profile": description["candidate_profile"],
                 "portfolio_profile": description["portfolio_profile"],
                 "fidelity": fidelity,
+                "dtype": dtype,
                 "max_submissions": max_submissions,
                 "measurement": self._measurement,
                 "reward_weights": self._weights.__dict__,
@@ -347,7 +368,12 @@ class MicakeGemmEnvironment(AgentEnvironment):
 
     async def measure(self, config: Mapping[str, Any], fidelity: str = "performance") -> dict[str, Any]:
         """Evaluate ``config`` outside the episode: no budget, no result cache, no state change."""
-        return dict(await self._evaluator.evaluate(dict(config), fidelity, self._measurement))
+        return dict(await self._call_evaluator(dict(config), fidelity))
+
+    async def _call_evaluator(self, config: Mapping[str, Any], fidelity: str) -> dict[str, Any]:
+        if self.dtype == "fp16":
+            return await self._evaluator.evaluate(config, fidelity, self._measurement)
+        return await self._evaluator.evaluate(config, fidelity, self._measurement, dtype=self.dtype)
 
     async def restart_evaluator(self) -> None:
         """Drop the worker so the next evaluation starts from a fresh process."""
@@ -377,6 +403,7 @@ class MicakeGemmEnvironment(AgentEnvironment):
             reward = self._weights.terminal_best_speedup * _clipped_log(best["speedup"], self._weights.performance_log_clip)
         return reward, {
             "terminal_state": terminal_state,
+            "dtype": self.dtype,
             "submissions": self._state.get("submissions", 0),
             "correct_count": self._state.get("correct_count", 0),
             "best_speedup": best["speedup"],

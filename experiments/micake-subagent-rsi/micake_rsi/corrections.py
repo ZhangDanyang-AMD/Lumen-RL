@@ -112,12 +112,12 @@ def corrected_message(original: Mapping[str, Any], rejected: Mapping[str, Any], 
     return message
 
 
-def annotate_lds(message: Mapping[str, Any], config: Mapping[str, Any]) -> dict[str, Any]:
+def annotate_lds(message: Mapping[str, Any], config: Mapping[str, Any], element: int = 2) -> dict[str, Any]:
     """``message`` with its submitted config's exact LDS arithmetic as the only LDS line (model-written ones dropped)."""
     annotated = copy.deepcopy(dict(message))
     lines = (annotated.get("content") or "").strip().splitlines()
     rest = "\n".join(line for line in lines if not line.lstrip().startswith("LDS check")).strip()
-    line = f"LDS check: {lds_check(config)}."
+    line = f"LDS check: {lds_check(config, element)}."
     annotated["content"] = f"{line}\n{rest}" if rest else line
     return annotated
 

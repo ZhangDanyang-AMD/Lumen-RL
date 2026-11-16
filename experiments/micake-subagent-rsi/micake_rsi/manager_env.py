@@ -34,8 +34,9 @@ DELEGATE_TOOL = "delegate"
 
 MANAGER_PROMPT = """You are the Manager of an AMD GPU kernel optimization team working inside the MICake sandbox.
 
-Goal: find a GEMM schedule (FP16 x FP16 -> FP32, Triton, MI355X / gfx950, wave64) that is correct on every
-workload and as fast as possible vs. the baseline. All candidates share one submission budget.
+Goal: find a GEMM schedule (A x B -> FP32 accumulate, Triton, MI355X / gfx950, wave64) that is correct on every
+workload and as fast as possible vs. the baseline. The A/B element type is `input_dtype` in the task packet
+(FP16 when absent). All candidates share one submission budget.
 
 Your team (call `delegate`):
 - planner: give it a focused search direction (e.g. "explore larger N tiles with GROUPED_M for the wide

@@ -87,6 +87,28 @@ def _served_model(port: int) -> str | None:
         return None
 
 
+def _release_port(port: int, keep: str) -> None:
+    """Remove any other atom-micake container bound to ``port``.
+
+    A stale container on the port makes the new server fail to bind while the old one still answers
+    /v1/models, so readiness would pass for the wrong checkpoint.
+    """
+    names = subprocess.run(["docker", "ps", "-a", "--format", "{{.Names}}"], capture_output=True, text=True,
+                           check=False).stdout.split()
+    for name in names:
+        if not name.startswith("atom-micake-") or name == keep:
+            continue
+        raw = subprocess.run(["docker", "inspect", "--format", "{{json .Args}}", name], capture_output=True,
+                             text=True, check=False).stdout.strip()
+        try:
+            args = json.loads(raw or "[]")
+        except ValueError:
+            continue
+        if "--server-port" in args and args[args.index("--server-port") + 1] == str(port):
+            LOGGER.warning("removing %s, which holds port %s", name, port)
+            subprocess.run(["docker", "rm", "-f", name], check=False, capture_output=True)
+
+
 def _serve(image: str, update: dict) -> None:
     name = f"atom-micake-{update['role']}"
     model = update["checkpoint"]
@@ -94,6 +116,7 @@ def _serve(image: str, update: dict) -> None:
         LOGGER.info("%s already serves %s on port %s", update["role"], model, update["port"])
         return
     subprocess.run(["docker", "rm", "-f", name], check=False, capture_output=True)
+    _release_port(update["port"], keep=name)
     command = [
         "docker", "run", "-d", "--name", name, "--device", "/dev/kfd", "--device", "/dev/dri",
         "--group-add", "video", "--ipc", "host", "--network", "host", "--shm-size", "32g",
@@ -106,15 +129,11 @@ def _serve(image: str, update: dict) -> None:
     LOGGER.info("serving %s on port %s", update["role"], update["port"])
     subprocess.run(command, check=True)
     deadline = time.monotonic() + 900
-    url = f"http://127.0.0.1:{update['port']}/v1/models"
     while time.monotonic() < deadline:
-        try:
-            with urllib.request.urlopen(url, timeout=5) as response:
-                if response.status == 200:
-                    LOGGER.info("%s is accepting requests", update["role"])
-                    return
-        except OSError:
-            time.sleep(10)
+        if _served_model(update["port"]) == model:
+            LOGGER.info("%s is accepting requests", update["role"])
+            return
+        time.sleep(10)
     raise TimeoutError(f"{update['role']} did not become ready on port {update['port']}")
 
 

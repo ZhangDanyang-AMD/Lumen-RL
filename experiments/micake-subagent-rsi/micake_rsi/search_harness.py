@@ -32,7 +32,7 @@ LINKED = {("realization", "num_stages"): ("schedule", "pipeline_depth")}
 
 
 def lds_multiplier(schedule: Mapping[str, Any]) -> int:
-    """Buffered FP16 A+B tiles held in LDS: (pipeline_depth - 1) * unroll_factor, except depth 4 / unroll 2 -> 2.
+    """Buffered A+B tiles held in LDS: (pipeline_depth - 1) * unroll_factor, except depth 4 / unroll 2 -> 2.
 
     Fitted exactly on every compiled MICake C144 config (653 configs, zero
     mismatches); num_stages, num_warps and vectorize_factor do not change it.
@@ -41,29 +41,34 @@ def lds_multiplier(schedule: Mapping[str, Any]) -> int:
     return 2 if (depth, unroll) == (4, 2) else (depth - 1) * unroll
 
 
-def shared_bytes(config: Mapping[str, Any]) -> int:
+def element_bytes(packet: Mapping[str, Any] | None) -> int:
+    """A/B element size of a task packet: 2 (FP16/BF16) unless ``resource_limits.lds_element_bytes`` says otherwise."""
+    return int(((packet or {}).get("resource_limits") or {}).get("lds_element_bytes") or 2)
+
+
+def shared_bytes(config: Mapping[str, Any], element: int = 2) -> int:
     s = config["schedule"]
-    return (s["tile_m"] + s["tile_n"]) * s["tile_k"] * 2 * lds_multiplier(s)
+    return (s["tile_m"] + s["tile_n"]) * s["tile_k"] * element * lds_multiplier(s)
 
 
-def lds_check(config: Mapping[str, Any]) -> str:
+def lds_check(config: Mapping[str, Any], element: int = 2) -> str:
     """Step-by-step arithmetic of ``shared_bytes`` against the cap; each step only uses numbers already written."""
     s = config["schedule"]
     depth, unroll = s["pipeline_depth"], s["unroll_factor"]
     buffers = lds_multiplier(s)
-    per_buffer = (s["tile_m"] + s["tile_n"]) * s["tile_k"] * 2
+    per_buffer = (s["tile_m"] + s["tile_n"]) * s["tile_k"] * element
     value = per_buffer * buffers
     if (depth, unroll) == (4, 2):
         buffers_text = f"buffers = {buffers} (pipeline_depth 4 with unroll 2)"
     else:
         buffers_text = f"buffers = (pipeline_depth {depth} - 1) * unroll {unroll} = {buffers}"
     verdict = f"<= {LDS_CAP_BYTES} B, fits" if value <= LDS_CAP_BYTES else f"> {LDS_CAP_BYTES} B, too big"
-    return (f"{buffers_text}; per buffer = (tile_m {s['tile_m']} + tile_n {s['tile_n']}) * tile_k {s['tile_k']} * 2 B "
+    return (f"{buffers_text}; per buffer = (tile_m {s['tile_m']} + tile_n {s['tile_n']}) * tile_k {s['tile_k']} * {element} B "
             f"= {per_buffer} B; LDS = {per_buffer} * {buffers} = {value} B {verdict}")
 
 
-def fits_lds(config: Mapping[str, Any]) -> bool:
-    return shared_bytes(config) <= LDS_CAP_BYTES
+def fits_lds(config: Mapping[str, Any], element: int = 2) -> bool:
+    return shared_bytes(config, element) <= LDS_CAP_BYTES
 
 
 def config_key(config: Mapping[str, Any]) -> str:
@@ -101,9 +106,10 @@ def submission_arguments(config: Mapping[str, Any], hypothesis: str) -> dict[str
 class GreedySearch:
     """Stateful proposer: call :meth:`propose`, then :meth:`observe` with the outcome."""
 
-    def __init__(self, baseline: Mapping[str, Any], domain: Mapping[str, Any], min_gain: float = 0.005) -> None:
+    def __init__(self, baseline: Mapping[str, Any], domain: Mapping[str, Any], min_gain: float = 0.005, element: int = 2) -> None:
         self.domain = domain
         self.min_gain = min_gain
+        self.element = element
         self.incumbent = copy.deepcopy(dict(baseline))
         self.best = 1.0
         self.tried = {config_key(baseline)}
@@ -112,7 +118,7 @@ class GreedySearch:
     def propose(self) -> dict[str, Any] | None:
         for candidate in self._pending:
             key = config_key(candidate)
-            if key in self.tried or not fits_lds(candidate):
+            if key in self.tried or not fits_lds(candidate, self.element):
                 continue
             self.tried.add(key)
             return candidate

@@ -58,6 +58,9 @@ class MicakeWorkerClient:
                 "PYTHONDONTWRITEBYTECODE": "1",
             }
         )
+        for key in ("MICAKE_EXTRA_PORTFOLIO", "MICAKE_PORTFOLIO"):
+            if os.environ.get(key):
+                env[key] = os.environ[key]
         return env
 
     async def _ensure_started(self) -> asyncio.subprocess.Process:
@@ -100,14 +103,15 @@ class MicakeWorkerClient:
         config: Mapping[str, Any],
         fidelity: str,
         measurement: Mapping[str, Any],
+        dtype: str = "fp16",
     ) -> dict[str, Any]:
-        """Evaluate one typed candidate; never retries.
+        """Evaluate one typed candidate with A/B element type ``dtype``; never retries.
 
         Returns:
             Worker result with a ``stage`` field. Timeouts and worker loss yield
             ``stage == "evaluation_unknown"``.
         """
-        payload = {"op": "evaluate", "config": dict(config), "fidelity": fidelity, "measurement": dict(measurement)}
+        payload = {"op": "evaluate", "config": dict(config), "fidelity": fidelity, "measurement": dict(measurement), "dtype": dtype}
         try:
             response = await self._request(payload)
         except (asyncio.TimeoutError, ConnectionError, json.JSONDecodeError) as exc:

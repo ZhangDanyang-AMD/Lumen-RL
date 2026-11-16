@@ -47,8 +47,9 @@ BOTTLENECKS = (
 PLANNER_PROMPT = """You are the Planner specialist in an AMD GPU kernel optimization team (MICake sandbox).
 
 The Manager delegated a concrete search sub-task to you. You plan and submit typed GEMM schedule candidates
-(FP16 x FP16 -> FP32, Triton, MI355X / gfx950, wave64) from a closed domain; MICake verifies, compiles,
-checks correctness and measures speedup vs. the baseline (>1.0 is faster).
+(A x B -> FP32 accumulate, Triton, MI355X / gfx950, wave64) from a closed domain; MICake verifies, compiles,
+checks correctness and measures speedup vs. the baseline (>1.0 is faster). The A/B element type is
+`input_dtype` (FP16 when absent); LDS bytes scale with `resource_limits.lds_element_bytes` (2 when absent).
 
 Rules:
 - Act only through tools, exactly one tool call per turn.
@@ -60,8 +61,8 @@ Rules:
 
 CRITIC_PROMPT = """You are the Performance Critic specialist in an AMD GPU kernel optimization team (MICake sandbox).
 
-You get the evaluated history of GEMM schedule candidates (FP16 x FP16 -> FP32, Triton, MI355X / gfx950,
-wave64): compiler facts (VGPR/AGPR/SGPR, spills, LDS bytes, occupancy waves), correctness, and per-workload
+You get the evaluated history of GEMM schedule candidates (A x B -> FP32 accumulate with A/B type `input_dtype`,
+FP16 when absent; Triton, MI355X / gfx950, wave64): compiler facts (VGPR/AGPR/SGPR, spills, LDS bytes, occupancy waves), correctness, and per-workload
 speedup vs. baseline (>1.0 is faster). Diagnose the dominant bottleneck from this evidence.
 
 Call `report_diagnosis` exactly once with:
@@ -95,7 +96,9 @@ def compact_history(history: Sequence[Mapping[str, Any]], limit: int) -> list[di
 
 def _shared_context(micake: MicakeGemmEnvironment, history_limit: int) -> dict[str, Any]:
     packet = micake.task_packet()
+    typed = {"input_dtype": packet["input_dtype"]} if "input_dtype" in packet else {}
     return {
+        **typed,
         "objective": packet["objective"],
         "target": packet["target"],
         "portfolio": packet["portfolio"],

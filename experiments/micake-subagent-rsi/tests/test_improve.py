@@ -77,6 +77,32 @@ def test_exploit_candidates_are_untested_fitting_neighbours():
     assert target["content"].count("LDS check") == 1
 
 
+def test_fp8_packet_halves_lds_in_candidates_and_annotations():
+    child = _child()
+    packet = json.loads(child["messages"][1]["content"])
+    child["messages"][1]["content"] = json.dumps({**packet, "input_dtype": "FP8", "resource_limits": {"lds_element_bytes": 1}})
+    big = _with(tile_m=128, tile_n=128, tile_k=64, pipeline_depth=3, unroll_factor=4)
+    assert not fits_lds(big) and fits_lds(big, 1)
+    content = improvement_sample(child, "k")["messages"][2]["content"]
+    assert "* 1 B" in content and "* 2 B" not in content
+
+
+def test_training_experience_excludes_held_out_shapes(tmp_path):
+    sys.path.insert(0, str(EXPERIMENT_DIR / "scripts"))
+    from build_improvements import experience
+
+    def legacy(ids):
+        packet = {"portfolio": [{"workload_id": i} for i in ids]}
+        return {"key": "k", "episode": {"messages": [{}, {"content": json.dumps(packet)}]}}
+
+    c144 = ["gemm.small-square", "gemm.large-square", "gemm.tall", "gemm.wide", "gemm.deep-k"]
+    rows = [legacy(c144), legacy(c144 + ["gemm.decode"]), {"key": "t", "portfolio": "heldout"},
+            {"key": "c", "portfolio": "c144"}, {"key": "l", "portfolio": "large"}]
+    (tmp_path / "e2e_s0.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    kept = experience([tmp_path])
+    assert [r.get("portfolio") for r in kept] == [None, "c144", "large"]
+
+
 def _record(arm, best, t104, wasted=0.1, wall=300.0):
     failed = round(10 * wasted)
     trace = [{"stage": "resource_rejected"}] * failed + [{"stage": "measured"}] * (10 - failed) + [{"stage": "duplicate"}] * 5

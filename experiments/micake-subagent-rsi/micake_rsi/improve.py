@@ -16,7 +16,7 @@ import json
 from typing import Any, Iterator, Mapping, Sequence
 
 from micake_rsi.corrections import annotate_lds, describe_changes, describe_config
-from micake_rsi.search_harness import fits_lds, lds_check, neighbours, submission_arguments
+from micake_rsi.search_harness import element_bytes, fits_lds, lds_check, neighbours, submission_arguments
 from sandbox.micake.tool_runtime import HIDDEN_FIXED_FIELDS, SUBMIT_TOOL
 
 NEW_BEST_GAIN = 0.005
@@ -57,6 +57,15 @@ def _packet(child: Mapping[str, Any]) -> dict[str, Any]:
 
 def _has_parallel_calls(child: Mapping[str, Any]) -> bool:
     return any(len(m.get("tool_calls") or ()) > 1 for m in child["messages"])
+
+
+def child_element_bytes(child: Mapping[str, Any]) -> int:
+    return element_bytes(_packet(child))
+
+
+def record_dtype(record: Mapping[str, Any]) -> str:
+    """A/B element type of an end-to-end record (records before mixed-dtype RSI are FP16)."""
+    return record.get("dtype") or "fp16"
 
 
 def planner_children(record: Mapping[str, Any]) -> Iterator[Mapping[str, Any]]:
@@ -105,13 +114,14 @@ def improvement_sample(child: Mapping[str, Any], source_key: str) -> dict[str, A
         return None
     assistant = _assistant_indices(child)
     messages = list(child["messages"])
+    element = child_element_bytes(child)
     steps = []
     for step in child["steps"]:
         is_report = step["action"]["name"] == "report"
         advantage = 1.0 if (step["step_index"] in kept or is_report) else -1.0
         index = assistant[step["turn_index"]]
         if step["step_index"] in kept:
-            messages[index] = annotate_lds(messages[index], step["action"]["arguments"])
+            messages[index] = annotate_lds(messages[index], step["action"]["arguments"], element)
         steps.append({"step_id": step["step_index"], "turn_index": step["turn_index"], "assistant_message_index": index,
                       "tool": step["action"]["name"], "execution_result": step["result"].get("execution_result"),
                       "advantage": advantage})
@@ -119,23 +129,24 @@ def improvement_sample(child: Mapping[str, Any], source_key: str) -> dict[str, A
             "messages": messages, "tools": _tools(child), "steps": steps}
 
 
-def exploit_candidates(best_config: Mapping[str, Any], domain: Mapping[str, Any], submitted: set[str]) -> Iterator[dict[str, Any]]:
+def exploit_candidates(best_config: Mapping[str, Any], domain: Mapping[str, Any], submitted: set[str],
+                       element: int = 2) -> Iterator[dict[str, Any]]:
     """Untested, LDS-fitting one-axis moves from the session best."""
     seen = set(submitted)
     for candidate in neighbours(best_config, domain):
         key = config_key(candidate)
-        if key in seen or not fits_lds(candidate):
+        if key in seen or not fits_lds(candidate, element):
             continue
         seen.add(key)
         yield candidate
 
 
 def exploit_message(original: Mapping[str, Any], best_config: Mapping[str, Any], best_speedup: float,
-                    candidate: Mapping[str, Any], variant: int) -> dict[str, Any]:
+                    candidate: Mapping[str, Any], variant: int, element: int = 2) -> dict[str, Any]:
     fields = {"best": best_speedup, "best_config": describe_config(best_config), "changes": describe_changes(best_config, candidate)}
     content = EXPLOIT_CONTENT[variant % len(EXPLOIT_CONTENT)].format(**fields)
     message = copy.deepcopy(dict(original))
-    message["content"] = f"{content}\nLDS check: {lds_check(candidate)}."
+    message["content"] = f"{content}\nLDS check: {lds_check(candidate, element)}."
     call = copy.deepcopy(message["tool_calls"][0])
     call["function"]["arguments"] = json.dumps(submission_arguments(candidate, EXPLOIT_HYPOTHESIS.format(**fields)))
     message["tool_calls"] = [call]
@@ -147,7 +158,8 @@ def exploit_sample(child: Mapping[str, Any], entry: Mapping[str, Any], candidate
     step = entry["step"]
     target = _assistant_indices(child)[step["turn_index"]]
     variant = sum(map(ord, source_key))
-    corrected = exploit_message(child["messages"][target], entry["best_config"], entry["best_speedup"], candidate, variant)
+    corrected = exploit_message(child["messages"][target], entry["best_config"], entry["best_speedup"], candidate, variant,
+                                child_element_bytes(child))
     return {"role": "planner", "episode_id": child["episode_id"], "source_key": source_key,
             "messages": list(child["messages"][:target]) + [corrected], "tools": _tools(child),
             "steps": [{"step_id": step["step_index"], "turn_index": step["turn_index"], "assistant_message_index": target,

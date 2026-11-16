@@ -23,6 +23,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 import time
 import uuid
@@ -45,7 +46,7 @@ from micake_rsi.guards import remeasure  # noqa: E402
 from micake_rsi.manager_env import ManagerEnvironment, ManagerSettings  # noqa: E402
 from micake_rsi.e2e_contexts import e2e_planner_contexts  # noqa: E402
 from micake_rsi.roles import Endpoint, PolicyBinding, RoleSpec, build_endpoint_policy, load_role_specs  # noqa: E402
-from micake_rsi.search_harness import GreedySearch, submission_arguments  # noqa: E402
+from micake_rsi.search_harness import GreedySearch, element_bytes, submission_arguments  # noqa: E402
 from micake_rsi.subagent_envs import CriticEnvironment, CriticRewards, PlannerEnvironment  # noqa: E402
 from sandbox.micake.tool_runtime import SUBMIT_TOOL  # noqa: E402
 
@@ -287,8 +288,13 @@ async def run_critic(cfg, micake, timed, arms, samples, out: Path) -> None:
                     record["metrics"]["probe_speedup"], context_best)
 
 
+def sample_task(k: int, dtypes: list[str]) -> dict[str, Any]:
+    """C144 task of e2e sample ``k``; with ``dtypes`` the A/B element type rotates over samples."""
+    return {**TASK, "dtype": dtypes[k % len(dtypes)]} if dtypes else dict(TASK)
+
+
 async def run_search_episode(micake, budget: int) -> dict[str, Any]:
-    search = GreedySearch(micake.task_packet()["baseline_config"], micake.domain)
+    search = GreedySearch(micake.task_packet()["baseline_config"], micake.domain, element=element_bytes(micake.task_packet()))
     while micake.remaining_submissions() > 0:
         candidate = search.propose()
         if candidate is None:
@@ -299,7 +305,8 @@ async def run_search_episode(micake, budget: int) -> dict[str, Any]:
     return {"terminal_state": "BUDGET_EXHAUSTED" if micake.remaining_submissions() <= 0 else "SEARCH_EXHAUSTED"}
 
 
-async def run_e2e(cfg, micake, timed, arms, samples, out: Path, verify_repeats: int, sample_start: int = 0) -> None:
+async def run_e2e(cfg, micake, timed, arms, samples, out: Path, verify_repeats: int, sample_start: int = 0,
+                  dtypes: list[str] | None = None) -> None:
     manager_cfg = cfg["manager"]
     settings = ManagerSettings.from_dict({**manager_cfg["settings"], "allow_direct_submit": False})
     nudges = int(cfg["rsi"]["specialist_max_no_tool_nudges"])
@@ -322,18 +329,24 @@ async def run_e2e(cfg, micake, timed, arms, samples, out: Path, verify_repeats: 
         key = f"e2e:{arm}:{k}"
         if key in finished:
             continue
+        task = sample_task(k, dtypes or [])
         micake.clear_result_cache()
         timed.start()
         began = time.monotonic()
         if arm == "search":
-            await micake.reset(TASK)
+            await micake.reset(task)
             summary = await run_search_episode(micake, budget)
             manager_s, specialist_s, children, episode_data = 0.0, 0.0, [], None
         else:
             env, engine = teams[arm]
             episode_id = uuid.uuid4().hex
             env.bind_episode(episode_id)
-            episode = await engine.run_episode(env, TASK, group_id=TASK["task_id"], role="manager", episode_id=episode_id)
+            episode = await engine.run_episode(env, task, group_id=task["task_id"], role="manager", episode_id=episode_id)
+            if episode.terminal_state == "ERROR" and not episode.turns:
+                # Manager never reached a turn (transport failure, e.g. tunnel 502). Not a Planner outcome:
+                # do not record it, so rerunning retries the same trial.
+                logger.warning("%s infrastructure failure before first turn; not recorded", key)
+                continue
             children = list(env.child_episodes)
             manager_s, specialist_s = llm_seconds([episode]), llm_seconds(children)
             summary = {"terminal_state": episode.terminal_state, "delegations": len(children),
@@ -345,19 +358,22 @@ async def run_e2e(cfg, micake, timed, arms, samples, out: Path, verify_repeats: 
         verified = None
         if best["source"] == "agent" and verify_repeats > 0:
             verified = await remeasure(micake, best["config"], verify_repeats)
-        record = {"key": key, "study": "e2e", "arm": arm, "sample": k, "wall_s": wall, "eval_s": timed.eval_s,
+        record = {"key": key, "study": "e2e", "arm": arm, "sample": k, "dtype": task.get("dtype", "fp16"),
+                  "portfolio": os.environ.get("MICAKE_PORTFOLIO", "c144"),
+                  "wall_s": wall, "eval_s": timed.eval_s,
                   "manager_llm_s": manager_s, "specialist_llm_s": specialist_s, "metrics": metrics, "summary": summary,
                   "best": best, "verified": verified, "trace": timed.trace, "episode": episode_data,
                   "children": [c.to_dict() for c in children]}
         append(out, record)
-        logger.info("%s best=%.4f wasted=%d/%d wall=%.0fs eval=%.0fs", key, metrics["final_best"], metrics["wasted"],
-                    metrics["actions"], wall, timed.eval_s)
+        logger.info("%s [%s] best=%.4f wasted=%d/%d wall=%.0fs eval=%.0fs", key, record["dtype"], metrics["final_best"],
+                    metrics["wasted"], metrics["actions"], wall, timed.eval_s)
 
 
 async def main_async(args) -> None:
     for spec in args.planner_arm:
         register_planner_arm(spec)
     FALLBACK["role_arm"] = args.fallback
+    os.environ["MICAKE_PORTFOLIO"] = "all" if args.extra_shapes else args.portfolio
     cfg = yaml.safe_load(args.config.read_text(encoding="utf-8"))
     kwargs = dict(cfg["micake"]["kwargs"])
     if args.gpu is not None:
@@ -377,7 +393,8 @@ async def main_async(args) -> None:
         elif args.study == "critic":
             await run_critic(cfg, micake, timed, arms, args.samples, out)
         else:
-            await run_e2e(cfg, micake, timed, arms, args.samples, out, args.verify_repeats, args.sample_start)
+            await run_e2e(cfg, micake, timed, arms, args.samples, out, args.verify_repeats, args.sample_start,
+                          [d for d in args.dtypes.split(",") if d])
     finally:
         await micake.close()
 
@@ -398,6 +415,11 @@ def main() -> None:
     parser.add_argument("--planner-arm", action="append", default=[],
                         help="name=port:checkpoint Planner arm (repeatable); its other roles use --fallback")
     parser.add_argument("--fallback", choices=("base", "dsv4"), default="base", help="non-Planner roles of --planner-arm arms")
+    parser.add_argument("--extra-shapes", action="store_true",
+                        help="score every submission on the C144 portfolio plus the extended shapes (= --portfolio all)")
+    parser.add_argument("--portfolio", choices=("c144", "large", "heldout", "all"), default="c144",
+                        help="workloads scored per submission: C144 (training shapes), held-out extended shapes, or both")
+    parser.add_argument("--dtypes", default="", help="e2e: comma-separated A/B element types rotated over samples (fp16, bf16, fp8)")
     parser.add_argument("--out-name", help="results file stem (default: the study name)")
     parser.add_argument("--out", type=Path, default=REPO_ROOT / "output" / "micake-subagent-rsi" / "ab_eval")
     args = parser.parse_args()

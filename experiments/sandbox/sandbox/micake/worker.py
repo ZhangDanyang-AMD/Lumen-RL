@@ -17,15 +17,22 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import logging
 import math
+import os
 import statistics
 import sys
 import tempfile
 import traceback
 from pathlib import Path
 from typing import Any
+
+try:
+    from sandbox.micake import dtypes
+except ImportError:  # run as a script under MICake's Python
+    import dtypes
 
 logger = logging.getLogger("micake.worker")
 
@@ -35,6 +42,48 @@ FACT_KEYS = (
     "shared_bytes", "reported_occupancy_waves", "code_size_bytes",
 )
 MESSAGE_LIMIT = 800
+LOWERING_FAILURE = "PassManager::run failed"
+# Shapes beyond the five-workload C144 portfolio. Enabled with MICAKE_EXTRA_PORTFOLIO=1.
+# Regimes here are labels for the agent; the GPU harness only reads m, n and k.
+# Training shapes for the large-tile regime. Disjoint from C144 and from EXTRA_SHAPES,
+# which is the held-out test portfolio.
+LARGE_SHAPES = (
+    {"workload_id": "gemm.square-3k", "regime": "LARGE_SQUARE", "m": 3072, "n": 3072, "k": 3072},
+    {"workload_id": "gemm.square-1536", "regime": "LARGE_SQUARE", "m": 1536, "n": 1536, "k": 1536},
+    {"workload_id": "gemm.wide-3k", "regime": "WIDE", "m": 1024, "n": 3072, "k": 2048},
+    {"workload_id": "gemm.tall-3k", "regime": "TALL", "m": 3072, "n": 1024, "k": 2048},
+    {"workload_id": "gemm.deep-2k", "regime": "DEEP_K", "m": 1024, "n": 1024, "k": 8192},
+)
+EXTRA_SHAPES = (
+    {"workload_id": "gemm.tail-balanced", "regime": "TAIL_BALANCED", "m": 272, "n": 272, "k": 288},
+    {"workload_id": "gemm.tail-rectangular", "regime": "TAIL_RECTANGULAR", "m": 1025, "n": 257, "k": 513},
+    {"workload_id": "gemm.square-4k", "regime": "LARGE_SQUARE", "m": 4096, "n": 4096, "k": 4096},
+    {"workload_id": "gemm.prefill-wide", "regime": "WIDE", "m": 8192, "n": 1024, "k": 4096},
+    {"workload_id": "gemm.prefill-tall", "regime": "TALL", "m": 1024, "n": 8192, "k": 4096},
+    {"workload_id": "gemm.decode", "regime": "WIDE", "m": 128, "n": 4096, "k": 4096},
+    {"workload_id": "gemm.mlp-7168", "regime": "WIDE", "m": 4096, "n": 7168, "k": 2048},
+)
+
+
+PORTFOLIOS = ("c144", "large", "heldout", "all")
+
+
+def portfolio_mode() -> str:
+    """``MICAKE_PORTFOLIO`` (c144 | heldout | all); ``MICAKE_EXTRA_PORTFOLIO=1`` means ``all``."""
+    mode = os.environ.get("MICAKE_PORTFOLIO") or ("all" if os.environ.get("MICAKE_EXTRA_PORTFOLIO") == "1" else "c144")
+    if mode not in PORTFOLIOS:
+        raise ValueError(f"MICAKE_PORTFOLIO={mode!r} not in {PORTFOLIOS}")
+    return mode
+
+
+def portfolio_items(contract: Any, mode: str) -> list[Any]:
+    """C144 workloads, the disjoint large training shapes, the held-out shapes, or C144 plus held-out."""
+    if mode == "large":
+        return list(LARGE_SHAPES)
+    items: list[Any] = [] if mode == "heldout" else list(contract.WORKLOAD_PORTFOLIO)
+    if mode in ("heldout", "all"):
+        items.extend(EXTRA_SHAPES)
+    return items
 
 
 class Worker:
@@ -53,14 +102,19 @@ class Worker:
         self.gpu = gpu_runtime
         self.workdir = Path(tempfile.mkdtemp(prefix="micake-worker-"))
         self.artifacts: dict[str, tuple[Any, Any]] = {}
+        self.harnesses: dict[str, Any] = {}
         self.session_counter = 0
+        self.portfolio = portfolio_mode()
+        self.workloads = portfolio_items(contract, self.portfolio)
 
     def describe(self) -> dict[str, Any]:
         c = self.contract
         return {
             "candidate_profile": c.CANDIDATE_PROFILE,
-            "portfolio_profile": c.WORKLOAD_PORTFOLIO_PROFILE,
-            "portfolio": [item.to_dict() for item in c.WORKLOAD_PORTFOLIO],
+            "portfolio_profile": {"c144": c.WORKLOAD_PORTFOLIO_PROFILE, "all": c.WORKLOAD_PORTFOLIO_PROFILE + "+extra",
+                                  "heldout": "LUMENRL_HELDOUT_EXTRA_SHAPES",
+                                  "large": "LUMENRL_LARGE_TRAIN_SHAPES"}[self.portfolio],
+            "portfolio": [item.to_dict() if hasattr(item, "to_dict") else dict(item) for item in self.workloads],
             "baseline_config": c.BASELINE_CONFIG.to_dict(),
             "domain": {
                 "schedule": {
@@ -83,34 +137,59 @@ class Worker:
             },
             "target": dict(self.compile_runtime.TARGET),
             "resource_limits": {"max_group_segment_bytes": self.gpu.GFX950_MAX_GROUP_SEGMENT_BYTES},
+            "dtypes": {name: {"element_bytes": t.element_bytes, "triton": t.triton} for name, t in dtypes.DTYPES.items()},
         }
 
-    def _compile(self, config: dict[str, Any]) -> tuple[Any, Any, dict[str, Any]]:
-        key = json.dumps(config, sort_keys=True)
+    def _compile(self, config: dict[str, Any], dtype: str = "fp16") -> tuple[Any, Any, dict[str, Any]]:
+        key = json.dumps(config, sort_keys=True) if dtype == "fp16" else f"{dtype}|{json.dumps(config, sort_keys=True)}"
         if key in self.artifacts:
             record, artifact = self.artifacts[key]
             return record, artifact, {}
         record = self.candidate.build_candidate(self.contract.CandidateConfig.from_dict(config))
         source = self.emitter.emit_candidate_source(record)
-        root = self.workdir / source.source_sha256[:16]
+        text, digest, compiler = source.source, source.source_sha256, None
+        if dtype != "fp16":
+            element = dtypes.DTYPES[dtype]
+            text = dtypes.emit_source(source.source, element)
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            compiler = dtypes.compiler_for(element, self.compile_runtime.SIGNATURE)
+        root = self.workdir / digest[:16]
         root.mkdir(exist_ok=True)
         path = root / "kernel.py"
-        path.write_text(source.source, encoding="utf-8")
+        path.write_text(text, encoding="utf-8")
         artifact = self.compile_runtime.compile_candidate(
-            path, root, source.source_sha256, source.entrypoint, record.config,
+            path, root, digest, source.entrypoint, record.config, compiler=compiler,
         )
         self.artifacts[key] = (record, artifact)
-        return record, artifact, {"source_sha256": source.source_sha256}
+        return record, artifact, {"source_sha256": digest}
 
     def _session(self, record: Any, artifact: Any) -> Any:
         self.session_counter += 1
-        session = self.gpu.PreparedSession(artifact, 0, record.config, self.contract.WORKLOAD_PORTFOLIO)
+        session = self.gpu.PreparedSession(artifact, 0, record.config, self.workloads)
         session.authorize(f"lumenrl-micake-{self.session_counter}")
         return session
 
-    def evaluate(self, config: dict[str, Any], fidelity: str, measurement: dict[str, Any] | None) -> dict[str, Any]:
+    def _harness(self, dtype: str) -> Any:
+        if dtype == "fp16":
+            return contextlib.nullcontext()
+        if dtype not in self.harnesses:
+            self.harnesses[dtype] = dtypes.TypedHarness(self.gpu, dtypes.DTYPES[dtype])
+        return self.harnesses[dtype].installed()
+
+    def evaluate(self, config: dict[str, Any], fidelity: str, measurement: dict[str, Any] | None,
+                 dtype: str = "fp16") -> dict[str, Any]:
         if fidelity not in FIDELITY_LEVELS:
             return {"stage": "request_invalid", "diagnostic": {"code": f"UNKNOWN_FIDELITY:{fidelity}"}}
+        if dtype not in dtypes.DTYPES:
+            return {"stage": "request_invalid", "diagnostic": {"code": f"UNKNOWN_DTYPE:{dtype}"}}
+        with self._harness(dtype):
+            result = self._evaluate(config, fidelity, measurement, dtype)
+        if dtype != "fp16":
+            result["dtype"] = dtype
+        return result
+
+    def _evaluate(self, config: dict[str, Any], fidelity: str, measurement: dict[str, Any] | None,
+                  dtype: str) -> dict[str, Any]:
         result: dict[str, Any] = {"fidelity": fidelity}
         try:
             record = self.candidate.build_candidate(self.contract.CandidateConfig.from_dict(config))
@@ -121,11 +200,16 @@ class Worker:
             return {**result, "stage": "verified"}
 
         try:
-            record, artifact, extra = self._compile(config)
+            record, artifact, extra = self._compile(config, dtype)
         except self.compile_runtime.CompileRejected as exc:
             return {**result, "stage": "compile_fail", "diagnostic": _compile_diagnostic(exc)}
         except self.compile_runtime.CompileUnknown as exc:
-            return {**result, "stage": "compile_unknown", "diagnostic": _compile_diagnostic(exc)}
+            diagnostic = _compile_diagnostic(exc)
+            if dtype != "fp16" and LOWERING_FAILURE in diagnostic["message"]:
+                # Deterministic on this Triton build (e.g. fp8 with matrix_instr_nonkdim 16): a candidate failure.
+                return {**result, "stage": "compile_fail", "diagnostic": {
+                    **diagnostic, "code": f"C144_TRITON_COMPILE_REJECTED:{dtype.upper()}_LOWERING_UNSUPPORTED"}}
+            return {**result, "stage": "compile_unknown", "diagnostic": diagnostic}
         observation = artifact.observation
         facts = observation.get("binary_facts") or {}
         result.update(extra)
@@ -170,7 +254,7 @@ class Worker:
 
         baseline = self.contract.BASELINE_CONFIG.to_dict()
         try:
-            base_record, base_artifact, _ = self._compile(baseline)
+            base_record, base_artifact, _ = self._compile(baseline, dtype)
             with self._session(base_record, base_artifact) as session:
                 measured = session.measure_pair(artifact, dict(measurement or {}), record.config)
                 session.close()
@@ -269,7 +353,8 @@ def serve(worker: Worker, protocol_out: Any) -> None:
                 elif request.get("op") == "evaluate":
                     response = {
                         "ok": True,
-                        "result": worker.evaluate(request["config"], request["fidelity"], request.get("measurement")),
+                        "result": worker.evaluate(request["config"], request["fidelity"], request.get("measurement"),
+                                                  request.get("dtype", "fp16")),
                     }
                 else:
                     response = {"ok": False, "error": f"unknown op {request.get('op')!r}"}

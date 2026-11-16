@@ -195,6 +195,65 @@ def test_budget_and_cross_episode_cache() -> None:
     assert len([c for c in fake.calls if c[1] == "performance"]) == 1
 
 
+def test_extra_portfolio_appends_shapes_without_replacing_c144() -> None:
+    from sandbox.micake.worker import EXTRA_SHAPES, portfolio_items
+
+    class Contract:
+        WORKLOAD_PORTFOLIO = ("c144",)
+
+    assert portfolio_items(Contract, "c144") == ["c144"]
+    extended = portfolio_items(Contract, "all")
+    assert extended[0] == "c144" and len(extended) == 1 + len(EXTRA_SHAPES)
+    assert portfolio_items(Contract, "heldout") == list(EXTRA_SHAPES)
+    from sandbox.micake.worker import LARGE_SHAPES
+    assert portfolio_items(Contract, "large") == list(LARGE_SHAPES)
+    assert not {item["workload_id"] for item in LARGE_SHAPES} & {item["workload_id"] for item in EXTRA_SHAPES}
+    assert {item["workload_id"] for item in EXTRA_SHAPES} >= {"gemm.tail-rectangular", "gemm.square-4k", "gemm.decode"}
+
+
+class TypedFakeEvaluator(FakeEvaluator):
+    async def evaluate(self, config: Mapping[str, Any], fidelity: str, measurement: Mapping[str, Any],
+                       dtype: str = "fp16") -> dict[str, Any]:
+        self.calls.append((json.dumps(config, sort_keys=True), f"{fidelity}:{dtype}"))
+        if config == BASELINE:
+            return {"stage": "compiled", "compiled_facts": FACTS}
+        return copy.deepcopy(self.outcomes[config["schedule"]["tile_m"]])
+
+
+def test_task_dtype_reaches_packet_worker_and_cache_key() -> None:
+    fake = TypedFakeEvaluator({128: _measured(1.2)})
+    env, _ = _env({}, max_submissions=2)
+    env._evaluator = fake
+
+    async def scenario() -> tuple[Any, Any, Any]:
+        fp8 = await env.reset({"dtype": "fp8"})
+        await env.step(_submit(128))
+        bf16 = await env.reset({"dtype": "bf16"})
+        second = await env.step(_submit(128))
+        return fp8, bf16, second
+
+    fp8, bf16, second = asyncio.run(scenario())
+    assert fp8.observation["input_dtype"].startswith("FP8") and fp8.observation["resource_limits"]["lds_element_bytes"] == 1
+    assert bf16.observation["resource_limits"]["lds_element_bytes"] == 2
+    assert second.metadata["cached"] is False
+    assert [c[1] for c in fake.calls if c[1].startswith("performance")] == ["performance:fp8", "performance:bf16"]
+    with pytest.raises(ValueError, match="dtype"):
+        asyncio.run(env.reset({"dtype": "int4"}))
+
+
+def test_fp8_and_bf16_codecs_round_to_nearest() -> None:
+    from sandbox.micake import dtypes
+
+    assert dtypes.decode_e4m3(dtypes.encode_e4m3(448.0)) == 448.0
+    assert dtypes.decode_e4m3(dtypes.encode_e4m3(1e6)) == 448.0
+    assert dtypes.decode_e4m3(dtypes.encode_e4m3(-0.1)) == pytest.approx(-0.1015625)
+    assert dtypes.decode_e4m3(dtypes.encode_e4m3(2.0 ** -9)) == 2.0 ** -9
+    for value in (0.0, 0.0078125, -0.2109375, 1.0):
+        assert dtypes.decode_bf16(dtypes.encode_bf16(value)) == value
+    fp16 = 'a.to(tl.float16)\n            input_precision="ieee",\n'
+    assert dtypes.emit_source(fp16, dtypes.DTYPES["fp8"]) == "a.to(tl.float8e4nv)\n"
+
+
 def test_reward_config_must_be_complete() -> None:
     with pytest.raises(ValueError, match="reward keys mismatch"):
         _env_kwargs = dict(REWARD)
