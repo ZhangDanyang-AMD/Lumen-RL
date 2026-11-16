@@ -1,0 +1,23 @@
+architecture: gfx950
+benchmark_shapes:
+- K: 4096
+  M: 4096
+  N: 7168
+  architecture: gfx1250/gfx950
+  case_id: mxfp4_gemm-flydsl-6bcddbef
+  dtype: bfloat16
+  kernel_prompt: 'Kernel: batched_gemm_mxfp4 (mxfp4_gemm, flydsl, gfx1250/gfx950)
+    | Real aiter FlyDSL kernel'
+compile_command:
+- python3 scripts/task_runner.py compile
+correctness_command:
+- python3 scripts/task_runner.py correctness
+eval_mode: direction_conditioned
+language: flydsl
+operator: mxfp4_gemm
+performance_command:
+- python3 scripts/task_runner.py performance
+task_id: train-gfx950-mxfp4_gemm-flydsl-ad36dfeb
+timeout_seconds: 120
+baseline_ms:
+  mxfp4_gemm-flydsl-6bcddbef: 0.155193

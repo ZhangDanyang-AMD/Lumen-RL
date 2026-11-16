@@ -1,0 +1,23 @@
+{
+  "task_id": "train-gfx950-conv-triton-e0bd02c6",
+  "operator": "conv",
+  "architecture": "gfx950",
+  "language": "triton",
+  "source": "aiter:aiter/ops/triton/_triton_kernels/gated_delta_rule/prefill/causal_conv1d_fwd_split_qkv.py",
+  "content_sha256": "ba82eec671be0ee4159f4b61c8df4e0c5e373bca0c81902d2ec7869200198313",
+  "baseline_performance": {
+    "test_cases": [
+      {
+        "test_case_id": "conv-ba82eec6",
+        "execution_time_ms": 2.15216
+      }
+    ],
+    "geomean_ms": 2.15216,
+    "architecture": "gfx950",
+    "measurement_method": "torch.profiler CUDA device_time_total, warmup=360, rep=50, median",
+    "measured_at": "2026-10-13"
+  },
+  "cloned_from": "heldout-gfx950-conv-ba82eec6",
+  "split_group": "train",
+  "repeat_idx": 20
+}

@@ -1,0 +1,23 @@
+{
+  "task_id": "train-gfx950-moe_sorting-flydsl-91325578",
+  "operator": "moe_sorting",
+  "architecture": "gfx950",
+  "language": "flydsl",
+  "source": "aiter/ops/flydsl/kernels/moe_sorting_kernel.py::launch_p0",
+  "content_sha256": "be258c468ea18e23122fcdcaa34f51070ee5d9aa71e05ad4c0c3a547f822f0c2",
+  "baseline_performance": {
+    "test_cases": [
+      {
+        "test_case_id": "moe_sorting-tokens4096-experts8-be258c46",
+        "execution_time_ms": 0.003119
+      }
+    ],
+    "geomean_ms": 0.003119,
+    "architecture": "gfx950",
+    "measurement_method": "torch.profiler CUDA device_time_total, warmup=360, rep=50, median",
+    "measured_at": "2026-10-13"
+  },
+  "cloned_from": "heldout-gfx950-moe_sorting-flydsl-be258c46",
+  "split_group": "train",
+  "repeat_idx": 4
+}

@@ -1,0 +1,23 @@
+architecture: gfx950
+benchmark_shapes:
+- K: 4096
+  M: 4096
+  N: 7168
+  architecture: gfx950/gfx942
+  case_id: moe_grouped_gemm-flydsl-e6b938db
+  dtype: bfloat16
+  kernel_prompt: 'Kernel: utils (moe_grouped_gemm, flydsl, gfx950/gfx942) | Real aiter
+    FlyDSL kernel'
+compile_command:
+- python3 scripts/task_runner.py compile
+correctness_command:
+- python3 scripts/task_runner.py correctness
+eval_mode: direction_conditioned
+language: flydsl
+operator: moe_grouped_gemm
+performance_command:
+- python3 scripts/task_runner.py performance
+task_id: train-gfx950-moe_grouped_gemm-flydsl-62adf992
+timeout_seconds: 120
+baseline_ms:
+  moe_grouped_gemm-flydsl-e6b938db: 0.185751

@@ -1,0 +1,23 @@
+{
+  "task_id": "train-gfx950-mxfp4_gemm-flydsl-5c4d023e",
+  "operator": "mxfp4_gemm",
+  "architecture": "gfx950",
+  "language": "flydsl",
+  "source": "aiter/ops/flydsl/kernels/mxfp4_gemm2.py::gemm2_kernel",
+  "content_sha256": "311201f9f8f3a20b1ee866bb62ed9e698a90fcb2cc597407bd168343e4aaa1ed",
+  "baseline_performance": {
+    "test_cases": [
+      {
+        "test_case_id": "mxfp4_gemm-m4096-n7168-k4096-311201f9",
+        "execution_time_ms": 0.154513
+      }
+    ],
+    "geomean_ms": 0.154513,
+    "architecture": "gfx950",
+    "measurement_method": "torch.profiler CUDA device_time_total, warmup=360, rep=50, median",
+    "measured_at": "2026-10-13"
+  },
+  "cloned_from": "heldout-gfx950-mxfp4_gemm-flydsl-311201f9",
+  "split_group": "train",
+  "repeat_idx": 0
+}

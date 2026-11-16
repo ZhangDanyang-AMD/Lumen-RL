@@ -1,0 +1,26 @@
+architecture: gfx950
+benchmark_shapes:
+- B: 1
+  D: 128
+  HK: 128
+  HQ: 128
+  SK: 4096
+  SQ: 1
+  case_id: mla-b1-sq1-sk4096-hq128-624b9405
+  dtype: bfloat16
+  kernel_prompt: 'Kernel: mla (flydsl, gfx950) | Shape: B=1, SQ=1, SK=4096, HQ=128,
+    HK=128, D=128 | Use gfx950 FlyDSL API (e.g. gemm_a8w8_bpreshuffle_flydsl, flydsl_moe_stage1/2,
+    aiter.flash_attn_func)'
+compile_command:
+- python3 scripts/task_runner.py compile
+correctness_command:
+- python3 scripts/task_runner.py correctness
+eval_mode: direction_conditioned
+language: flydsl
+operator: mla
+performance_command:
+- python3 scripts/task_runner.py performance
+task_id: train-gfx950-mla-flydsl-4824e381
+timeout_seconds: 120
+baseline_ms:
+  mla-b1-sq1-sk4096-hq128-624b9405: 0.162591

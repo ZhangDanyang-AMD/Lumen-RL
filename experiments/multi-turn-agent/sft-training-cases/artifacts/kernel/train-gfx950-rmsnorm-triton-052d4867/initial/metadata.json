@@ -1,0 +1,23 @@
+{
+  "task_id": "train-gfx950-rmsnorm-triton-052d4867",
+  "operator": "rmsnorm",
+  "architecture": "gfx950",
+  "language": "triton",
+  "source": "aiter:aiter/ops/triton/_triton_kernels/normalization/rmsnorm.py",
+  "content_sha256": "b3569eec00000000000000000000000000000000000000000000000000000000",
+  "baseline_performance": {
+    "test_cases": [
+      {
+        "test_case_id": "rmsnorm-m4096-n7168-b3569eec",
+        "execution_time_ms": 0.023718
+      }
+    ],
+    "geomean_ms": 0.023718,
+    "architecture": "gfx950",
+    "measurement_method": "torch.profiler CUDA device_time_total, warmup=360, rep=50, median",
+    "measured_at": "2026-10-13"
+  },
+  "cloned_from": "heldout-gfx950-rmsnorm-b3569eec",
+  "split_group": "train",
+  "repeat_idx": 11
+}

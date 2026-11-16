@@ -1,0 +1,23 @@
+{
+  "task_id": "train-gfx950-unknown-flydsl-d719d622",
+  "operator": "unknown",
+  "architecture": "gfx950",
+  "language": "flydsl",
+  "source": "aiter/ops/flydsl/kernels/chunk_gated_delta_h.py::gdn_h_kernel",
+  "content_sha256": "76307f453768023f4fbc82f8edbe2d2602a6adf87cb1d9c69db2f696f5990f8b",
+  "baseline_performance": {
+    "test_cases": [
+      {
+        "test_case_id": "unknown-m4096-n7168-k4096-76307f45",
+        "execution_time_ms": 0.182913
+      }
+    ],
+    "geomean_ms": 0.182913,
+    "architecture": "gfx950",
+    "measurement_method": "torch.profiler CUDA device_time_total, warmup=360, rep=50, median",
+    "measured_at": "2026-10-13"
+  },
+  "cloned_from": "heldout-gfx950-unknown-flydsl-76307f45",
+  "split_group": "train",
+  "repeat_idx": 28
+}

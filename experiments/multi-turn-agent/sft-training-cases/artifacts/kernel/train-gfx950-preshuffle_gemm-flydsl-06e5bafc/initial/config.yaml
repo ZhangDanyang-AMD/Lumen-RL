@@ -1,0 +1,23 @@
+architecture: gfx950
+benchmark_shapes:
+- K: 4096
+  M: 4096
+  N: 7168
+  case_id: preshuffle_gemm-m4096-n7168-k4096-52d496f5
+  dtype: bfloat16
+  kernel_prompt: 'Kernel: preshuffle_gemm (flydsl, gfx950) | Shape: M=4096, N=7168,
+    K=4096 | Use gfx950 FlyDSL API (e.g. gemm_a8w8_bpreshuffle_flydsl, flydsl_moe_stage1/2,
+    aiter.flash_attn_func)'
+compile_command:
+- python3 scripts/task_runner.py compile
+correctness_command:
+- python3 scripts/task_runner.py correctness
+eval_mode: direction_conditioned
+language: flydsl
+operator: preshuffle_gemm
+performance_command:
+- python3 scripts/task_runner.py performance
+task_id: train-gfx950-preshuffle_gemm-flydsl-06e5bafc
+timeout_seconds: 120
+baseline_ms:
+  preshuffle_gemm-m4096-n7168-k4096-52d496f5: 0.155793

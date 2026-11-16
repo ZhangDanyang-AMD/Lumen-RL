@@ -1,0 +1,23 @@
+architecture: gfx950
+benchmark_shapes:
+- K: 4096
+  M: 4096
+  N: 7168
+  case_id: gemm-m4096-n7168-k4096-0f8c324c
+  dtype: bfloat16
+  kernel_prompt: 'Kernel: splitk_reduce (gemm, triton, gfx950) | Shape: M=4096, N=7168,
+    K=4096, dtype=bfloat16 | Best config: BM=128, BN=256, BK=128, nw=4 | Description:
+    Entry: batched_gemm_bf16()'
+compile_command:
+- python3 scripts/task_runner.py compile
+correctness_command:
+- python3 scripts/task_runner.py correctness
+eval_mode: direction_conditioned
+language: triton
+operator: gemm
+performance_command:
+- python3 scripts/task_runner.py performance
+task_id: train-gfx950-gemm-triton-c89e3000
+timeout_seconds: 120
+baseline_ms:
+  gemm-m4096-n7168-k4096-0f8c324c: 0.154551

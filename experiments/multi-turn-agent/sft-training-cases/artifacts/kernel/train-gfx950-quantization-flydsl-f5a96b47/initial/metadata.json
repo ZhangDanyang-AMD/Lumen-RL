@@ -1,0 +1,27 @@
+{
+  "task_id": "train-gfx950-quantization-flydsl-f5a96b47",
+  "operator": "quantization",
+  "architecture": "gfx950",
+  "language": "flydsl",
+  "source": "aiter/ops/flydsl/kernels/mega_moe/quant.py",
+  "content_sha256": "3cd161a5ea3f438aa88db7e5a64a48fb480909ffd41876715ac9da4bc1b84947",
+  "target_architectures": [
+    "gfx950",
+    "gfx942"
+  ],
+  "baseline_performance": {
+    "test_cases": [
+      {
+        "test_case_id": "quantization-flydsl-3cd161a5",
+        "execution_time_ms": 0.198626
+      }
+    ],
+    "geomean_ms": 0.198626,
+    "architecture": "gfx950",
+    "measurement_method": "torch.profiler CUDA device_time_total, warmup=360, rep=50, median",
+    "measured_at": "2026-10-13"
+  },
+  "cloned_from": "heldout-gfx950-quantization-flydsl-3cd161a5",
+  "split_group": "train",
+  "repeat_idx": 8
+}

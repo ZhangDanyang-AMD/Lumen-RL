@@ -1,0 +1,23 @@
+{
+  "task_id": "train-gfx950-moe-triton-9d41c65d",
+  "operator": "moe",
+  "architecture": "gfx950",
+  "language": "triton",
+  "source": "aiter:aiter/ops/triton/_triton_kernels/moe/quant_moe.py",
+  "content_sha256": "94dddaa8f89780acf2af08028b9dd9761f1c83713767a79504ff6b384a211b9a",
+  "baseline_performance": {
+    "test_cases": [
+      {
+        "test_case_id": "moe-t4096-e8-94dddaa8",
+        "execution_time_ms": 0.003719
+      }
+    ],
+    "geomean_ms": 0.003719,
+    "architecture": "gfx950",
+    "measurement_method": "torch.profiler CUDA device_time_total, warmup=360, rep=50, median",
+    "measured_at": "2026-10-13"
+  },
+  "cloned_from": "heldout-gfx950-moe-94dddaa8",
+  "split_group": "train",
+  "repeat_idx": 2
+}

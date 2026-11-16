@@ -1,0 +1,23 @@
+architecture: gfx950
+benchmark_shapes:
+- K: 4096
+  M: 4096
+  N: 7168
+  architecture: gfx950/gfx942
+  case_id: causal_conv1d-flydsl-162748b7
+  dtype: bfloat16
+  kernel_prompt: 'Kernel: causal_conv1d_flydsl (causal_conv1d, flydsl, gfx950/gfx942)
+    | Real aiter FlyDSL kernel'
+compile_command:
+- python3 scripts/task_runner.py compile
+correctness_command:
+- python3 scripts/task_runner.py correctness
+eval_mode: direction_conditioned
+language: flydsl
+operator: causal_conv1d
+performance_command:
+- python3 scripts/task_runner.py performance
+task_id: train-gfx950-causal_conv1d-flydsl-a15a4010
+timeout_seconds: 120
+baseline_ms:
+  causal_conv1d-flydsl-162748b7: 0.179429

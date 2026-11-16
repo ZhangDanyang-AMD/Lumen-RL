@@ -1,0 +1,27 @@
+{
+  "task_id": "train-gfx950-moe_routing-flydsl-dae3ce00",
+  "operator": "moe_routing",
+  "architecture": "gfx950",
+  "language": "flydsl",
+  "source": "aiter/ops/flydsl/kernels/moe_route_maps.py",
+  "content_sha256": "accd22b968a3755c4fbd086796811e614d952ff40c928f580a6dcce1b06f69b2",
+  "target_architectures": [
+    "gfx950",
+    "gfx942"
+  ],
+  "baseline_performance": {
+    "test_cases": [
+      {
+        "test_case_id": "moe_routing-flydsl-accd22b9",
+        "execution_time_ms": 0.183471
+      }
+    ],
+    "geomean_ms": 0.183471,
+    "architecture": "gfx950",
+    "measurement_method": "torch.profiler CUDA device_time_total, warmup=360, rep=50, median",
+    "measured_at": "2026-10-13"
+  },
+  "cloned_from": "heldout-gfx950-moe_routing-flydsl-accd22b9",
+  "split_group": "train",
+  "repeat_idx": 22
+}

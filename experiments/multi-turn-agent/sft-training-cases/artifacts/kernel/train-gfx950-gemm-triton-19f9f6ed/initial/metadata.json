@@ -1,0 +1,38 @@
+{
+  "task_id": "train-gfx950-gemm-triton-19f9f6ed",
+  "operator": "gemm",
+  "architecture": "gfx950",
+  "language": "triton",
+  "source": "aiter:aiter/ops/triton/_triton_kernels/gemm/basic/gemm_a8wfp4.py",
+  "content_sha256": "b0e3c0a5b8c48c30450d2d0d7ba8505ca9f43972b035d972517b7acb39f8463c",
+  "baseline_performance": {
+    "test_cases": [
+      {
+        "test_case_id": "gemm-m4096-n7168-k4096-b0e3c0a5",
+        "execution_time_ms": 0.154471
+      }
+    ],
+    "geomean_ms": 0.154471,
+    "architecture": "gfx950",
+    "measurement_method": "torch.profiler CUDA device_time_total, warmup=360, rep=50, median",
+    "measured_at": "2026-10-13"
+  },
+  "best_config": {
+    "gemm-m4096-n7168-k4096-b0e3c0a5": {
+      "BLOCK_SIZE_K": 128,
+      "BLOCK_SIZE_M": 128,
+      "BLOCK_SIZE_N": 256,
+      "GROUP_SIZE_M": 16,
+      "NUM_KSPLIT": 1,
+      "SPLITK_BLOCK_SIZE": 8192,
+      "cache_modifier": null,
+      "matrix_instr_nonkdim": 16,
+      "num_stages": 2,
+      "num_warps": 4,
+      "waves_per_eu": 2
+    }
+  },
+  "cloned_from": "heldout-gfx950-gemm-b0e3c0a5",
+  "split_group": "train",
+  "repeat_idx": 7
+}

@@ -1,0 +1,22 @@
+architecture: gfx950
+benchmark_shapes:
+- M: 4096
+  N: 4096
+  case_id: rmsnorm-m4096-n4096-b49323d7
+  dtype: bfloat16
+  kernel_prompt: 'Kernel: fused_reduce_qk_norm_rope_swa_write (rmsnorm, triton, gfx950)
+    | Shape: M=4096, N=4096, dtype=bfloat16 | Description: Pick BLOCK_SIZE_M for the
+    fused reduce/norm/rope kernel.'
+compile_command:
+- python3 scripts/task_runner.py compile
+correctness_command:
+- python3 scripts/task_runner.py correctness
+eval_mode: direction_conditioned
+language: triton
+operator: rmsnorm
+performance_command:
+- python3 scripts/task_runner.py performance
+task_id: train-gfx950-rmsnorm-triton-e9c8283b
+timeout_seconds: 120
+baseline_ms:
+  rmsnorm-m4096-n4096-b49323d7: 0.014398

@@ -1,0 +1,23 @@
+{
+  "task_id": "train-gfx950-paged_attention-triton-82ccfff7",
+  "operator": "paged_attention",
+  "architecture": "gfx950",
+  "language": "triton",
+  "source": "aiter:aiter/ops/triton/_triton_kernels/attention/pa_decode.py",
+  "content_sha256": "8f2429793d524f701ee487989ae6bd36f65f647389910a2e1f7354eecb920cd0",
+  "baseline_performance": {
+    "test_cases": [
+      {
+        "test_case_id": "paged_attention-b32-sk4096-8f242979",
+        "execution_time_ms": 0.181311
+      }
+    ],
+    "geomean_ms": 0.181311,
+    "architecture": "gfx950",
+    "measurement_method": "torch.profiler CUDA device_time_total, warmup=360, rep=50, median",
+    "measured_at": "2026-10-13"
+  },
+  "cloned_from": "heldout-gfx950-paged_attention-8f242979",
+  "split_group": "train",
+  "repeat_idx": 29
+}

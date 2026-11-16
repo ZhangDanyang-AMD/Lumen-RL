@@ -1,0 +1,26 @@
+architecture: gfx950
+benchmark_shapes:
+- B: 32
+  BLOCK: 16
+  D: 128
+  HK: 8
+  HQ: 32
+  SK: 4096
+  SQ: 1
+  case_id: paged_attention-b32-sk4096-8f242979
+  dtype: bfloat16
+  kernel_prompt: 'Kernel: pa_decode (paged_attention, triton, gfx950) | Shape: B=32,
+    SQ=1, SK=4096, HQ=32, HK=8, D=128, dtype=bfloat16 | Description: Entry: paged_attention_decode()'
+compile_command:
+- python3 scripts/task_runner.py compile
+correctness_command:
+- python3 scripts/task_runner.py correctness
+eval_mode: direction_conditioned
+language: triton
+operator: paged_attention
+performance_command:
+- python3 scripts/task_runner.py performance
+task_id: train-gfx950-paged_attention-triton-b9258e52
+timeout_seconds: 120
+baseline_ms:
+  paged_attention-b32-sk4096-8f242979: 0.181311

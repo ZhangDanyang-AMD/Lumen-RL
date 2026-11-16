@@ -1,0 +1,27 @@
+{
+  "task_id": "train-gfx950-dispatch_combine-flydsl-bd901fe0",
+  "operator": "dispatch_combine",
+  "architecture": "gfx950",
+  "language": "flydsl",
+  "source": "aiter/ops/flydsl/kernels/flydsl_dispatch_combine_intranode_kernel.py",
+  "content_sha256": "937cac497f37375b923559151f8d80908c1b9825b029b84f9f111fc77ac020e9",
+  "target_architectures": [
+    "gfx950",
+    "gfx942"
+  ],
+  "baseline_performance": {
+    "test_cases": [
+      {
+        "test_case_id": "dispatch_combine-flydsl-937cac49",
+        "execution_time_ms": 0.184429
+      }
+    ],
+    "geomean_ms": 0.184429,
+    "architecture": "gfx950",
+    "measurement_method": "torch.profiler CUDA device_time_total, warmup=360, rep=50, median",
+    "measured_at": "2026-10-13"
+  },
+  "cloned_from": "heldout-gfx950-dispatch_combine-flydsl-937cac49",
+  "split_group": "train",
+  "repeat_idx": 28
+}

@@ -1,0 +1,23 @@
+architecture: gfx950
+benchmark_shapes:
+- K: 4096
+  M: 4096
+  N: 7168
+  architecture: gfx950/gfx942
+  case_id: dispatch_combine-flydsl-a54f3527
+  dtype: bfloat16
+  kernel_prompt: 'Kernel: flydsl_dispatch_combine_intranode_op (dispatch_combine,
+    flydsl, gfx950/gfx942) | Real aiter FlyDSL kernel'
+compile_command:
+- python3 scripts/task_runner.py compile
+correctness_command:
+- python3 scripts/task_runner.py correctness
+eval_mode: direction_conditioned
+language: flydsl
+operator: dispatch_combine
+performance_command:
+- python3 scripts/task_runner.py performance
+task_id: train-gfx950-dispatch_combine-flydsl-c904d305
+timeout_seconds: 120
+baseline_ms:
+  dispatch_combine-flydsl-a54f3527: 0.181949

@@ -1,0 +1,23 @@
+{
+  "task_id": "train-gfx950-mla-triton-5eacda2f",
+  "operator": "mla",
+  "architecture": "gfx950",
+  "language": "triton",
+  "source": "aiter:aiter/ops/triton/_triton_kernels/fusions/fused_kv_cache.py",
+  "content_sha256": "a795e2e7c706bf1d9ced1a8daae52955d15f97ed32f67041e0fde04226f00e58",
+  "baseline_performance": {
+    "test_cases": [
+      {
+        "test_case_id": "mla-b1-sq1-sk4096-a795e2e7",
+        "execution_time_ms": 0.163711
+      }
+    ],
+    "geomean_ms": 0.163711,
+    "architecture": "gfx950",
+    "measurement_method": "torch.profiler CUDA device_time_total, warmup=360, rep=50, median",
+    "measured_at": "2026-10-13"
+  },
+  "cloned_from": "heldout-gfx950-mla-a795e2e7",
+  "split_group": "train",
+  "repeat_idx": 5
+}

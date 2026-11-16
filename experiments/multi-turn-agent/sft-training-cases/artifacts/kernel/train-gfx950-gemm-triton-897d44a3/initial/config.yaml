@@ -1,0 +1,23 @@
+architecture: gfx950
+benchmark_shapes:
+- K: 4096
+  M: 4096
+  N: 4096
+  case_id: gemm-m4096-n4096-k4096-ca903d83
+  dtype: float8_e4m3fnuz
+  kernel_prompt: 'Kernel: gemm_afp8wfp8 (gemm, triton, gfx950) | Shape: M=4096, N=4096,
+    K=4096, dtype=float8_e4m3fnuz | Best config: BM=64, BN=128, BK=128, nw=4 | Description:
+    Entry: gemm_afp8wfp8()'
+compile_command:
+- python3 scripts/task_runner.py compile
+correctness_command:
+- python3 scripts/task_runner.py correctness
+eval_mode: direction_conditioned
+language: triton
+operator: gemm
+performance_command:
+- python3 scripts/task_runner.py performance
+task_id: train-gfx950-gemm-triton-897d44a3
+timeout_seconds: 120
+baseline_ms:
+  gemm-m4096-n4096-k4096-ca903d83: 0.077034

@@ -1,0 +1,22 @@
+architecture: gfx950
+benchmark_shapes:
+- M: 4096
+  N: 7168
+  case_id: rmsnorm-m4096-n7168-1b7db776
+  dtype: bfloat16
+  kernel_prompt: 'Kernel: fused_rmsnorm_add (rmsnorm, triton, gfx950) | Shape: M=4096,
+    N=7168, dtype=bfloat16 | Description: Shared RMSNorm (+ optional residual add)
+    launcher.'
+compile_command:
+- python3 scripts/task_runner.py compile
+correctness_command:
+- python3 scripts/task_runner.py correctness
+eval_mode: direction_conditioned
+language: triton
+operator: rmsnorm
+performance_command:
+- python3 scripts/task_runner.py performance
+task_id: train-gfx950-rmsnorm-triton-a37310a3
+timeout_seconds: 120
+baseline_ms:
+  rmsnorm-m4096-n7168-1b7db776: 0.024038

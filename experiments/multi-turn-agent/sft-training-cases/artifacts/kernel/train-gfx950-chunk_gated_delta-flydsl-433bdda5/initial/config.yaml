@@ -1,0 +1,23 @@
+architecture: gfx950
+benchmark_shapes:
+- K: 4096
+  M: 4096
+  N: 7168
+  architecture: gfx950/gfx942
+  case_id: chunk_gated_delta-flydsl-90591513
+  dtype: bfloat16
+  kernel_prompt: 'Kernel: chunk_gated_delta_h_mfma16x16x16 (chunk_gated_delta, flydsl,
+    gfx950/gfx942) | Real aiter FlyDSL kernel'
+compile_command:
+- python3 scripts/task_runner.py compile
+correctness_command:
+- python3 scripts/task_runner.py correctness
+eval_mode: direction_conditioned
+language: flydsl
+operator: chunk_gated_delta
+performance_command:
+- python3 scripts/task_runner.py performance
+task_id: train-gfx950-chunk_gated_delta-flydsl-433bdda5
+timeout_seconds: 120
+baseline_ms:
+  chunk_gated_delta-flydsl-90591513: 0.185909

@@ -1,0 +1,27 @@
+{
+  "task_id": "train-gfx950-causal_conv1d-flydsl-c0697d68",
+  "operator": "causal_conv1d",
+  "architecture": "gfx950",
+  "language": "flydsl",
+  "source": "aiter/ops/flydsl/causal_conv1d_flydsl.py",
+  "content_sha256": "162748b7f2d4b589b3afba1d9cd0ef1c4757c801ec4553fc21b2d66841ff8492",
+  "target_architectures": [
+    "gfx950",
+    "gfx942"
+  ],
+  "baseline_performance": {
+    "test_cases": [
+      {
+        "test_case_id": "causal_conv1d-flydsl-162748b7",
+        "execution_time_ms": 0.179429
+      }
+    ],
+    "geomean_ms": 0.179429,
+    "architecture": "gfx950",
+    "measurement_method": "torch.profiler CUDA device_time_total, warmup=360, rep=50, median",
+    "measured_at": "2026-10-13"
+  },
+  "cloned_from": "heldout-gfx950-causal_conv1d-flydsl-162748b7",
+  "split_group": "train",
+  "repeat_idx": 0
+}

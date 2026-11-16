@@ -1,0 +1,23 @@
+architecture: gfx950
+benchmark_shapes:
+- EXPERTS: 8
+  TOKENS: 4096
+  TOPK: 2
+  case_id: moe_sorting-tokens4096-experts8-8bd28b4c
+  dtype: bfloat16
+  kernel_prompt: 'Kernel: moe_sorting (flydsl, gfx950) | Shape: TOKENS=4096, EXPERTS=8,
+    TOPK=2 | Use gfx950 FlyDSL API (e.g. gemm_a8w8_bpreshuffle_flydsl, flydsl_moe_stage1/2,
+    aiter.flash_attn_func)'
+compile_command:
+- python3 scripts/task_runner.py compile
+correctness_command:
+- python3 scripts/task_runner.py correctness
+eval_mode: direction_conditioned
+language: flydsl
+operator: moe_sorting
+performance_command:
+- python3 scripts/task_runner.py performance
+task_id: train-gfx950-moe_sorting-flydsl-63c299a6
+timeout_seconds: 120
+baseline_ms:
+  moe_sorting-tokens4096-experts8-8bd28b4c: 0.003839

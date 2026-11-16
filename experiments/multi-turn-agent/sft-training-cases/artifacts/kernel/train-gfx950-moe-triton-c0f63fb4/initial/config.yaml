@@ -1,0 +1,22 @@
+architecture: gfx950
+benchmark_shapes:
+- K: 4096
+  M: 4096
+  N: 4096
+  case_id: moe-m4096-n4096-k4096-49975ad0
+  dtype: bfloat16
+  kernel_prompt: 'Kernel: moe_op_mxfp4_silu_fused (moe, triton, gfx950) | Shape: M=4096,
+    N=4096, K=4096, dtype=bfloat16 | Description: Entry: fused_moe_mxfp4_silu()'
+compile_command:
+- python3 scripts/task_runner.py compile
+correctness_command:
+- python3 scripts/task_runner.py correctness
+eval_mode: direction_conditioned
+language: triton
+operator: moe
+performance_command:
+- python3 scripts/task_runner.py performance
+task_id: train-gfx950-moe-triton-c0f63fb4
+timeout_seconds: 120
+baseline_ms:
+  moe-m4096-n4096-k4096-49975ad0: 0.002439

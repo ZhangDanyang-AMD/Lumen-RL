@@ -1,0 +1,23 @@
+architecture: gfx950
+benchmark_shapes:
+- K: 4096
+  M: 4096
+  N: 7168
+  architecture: gfx950
+  case_id: gemm_a8w8-flydsl-eb86d7fd
+  dtype: bfloat16
+  kernel_prompt: 'Kernel: gemm_a8w8_8wave (gemm_a8w8, flydsl, gfx950) | Real aiter
+    FlyDSL kernel'
+compile_command:
+- python3 scripts/task_runner.py compile
+correctness_command:
+- python3 scripts/task_runner.py correctness
+eval_mode: direction_conditioned
+language: flydsl
+operator: gemm_a8w8
+performance_command:
+- python3 scripts/task_runner.py performance
+task_id: train-gfx950-gemm_a8w8-flydsl-01a722e3
+timeout_seconds: 120
+baseline_ms:
+  gemm_a8w8-flydsl-eb86d7fd: 0.155832

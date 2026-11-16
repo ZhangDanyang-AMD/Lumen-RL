@@ -1,0 +1,25 @@
+architecture: gfx950
+benchmark_shapes:
+- B: 1
+  D: 64
+  HK: 16
+  HQ: 16
+  SK: 1024
+  SQ: 1024
+  case_id: attention-b1-sk1024-56c464c9
+  dtype: bfloat16
+  kernel_prompt: 'Kernel: wy_representation (attention, triton, gfx950) | Shape: B=1,
+    SQ=1024, SK=1024, HQ=16, HK=16, D=64, dtype=bfloat16 | Description: Entry: chunk_scaled_dot_kkt_fwd_kernel()'
+compile_command:
+- python3 scripts/task_runner.py compile
+correctness_command:
+- python3 scripts/task_runner.py correctness
+eval_mode: direction_conditioned
+language: triton
+operator: attention
+performance_command:
+- python3 scripts/task_runner.py performance
+task_id: train-gfx950-attention-triton-0d6bf89b
+timeout_seconds: 120
+baseline_ms:
+  attention-b1-sk1024-56c464c9: 0.024558

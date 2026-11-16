@@ -1,0 +1,23 @@
+architecture: gfx950
+benchmark_shapes:
+- B: 4
+  C: 4096
+  S: 4096
+  case_id: conv-5447dddd
+  dtype: bfloat16
+  kernel_prompt: 'Kernel: causal_conv1d_prefill (conv, triton, gfx950) | Shape: B=4,
+    C=4096, S=4096, dtype=bfloat16 | Description: Triton prefill causal-conv1d (fused
+    split q/k/v) — public host entry points.; Entry: causal_conv1d_split_qkv_triton_fn()'
+compile_command:
+- python3 scripts/task_runner.py compile
+correctness_command:
+- python3 scripts/task_runner.py correctness
+eval_mode: direction_conditioned
+language: triton
+operator: conv
+performance_command:
+- python3 scripts/task_runner.py performance
+task_id: train-gfx950-conv-triton-b99a246a
+timeout_seconds: 120
+baseline_ms:
+  conv-5447dddd: 2.123038

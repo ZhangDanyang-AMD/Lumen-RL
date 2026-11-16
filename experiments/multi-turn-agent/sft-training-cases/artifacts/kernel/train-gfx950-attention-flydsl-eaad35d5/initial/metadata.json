@@ -1,0 +1,26 @@
+{
+  "task_id": "train-gfx950-attention-flydsl-eaad35d5",
+  "operator": "attention",
+  "architecture": "gfx950",
+  "language": "flydsl",
+  "source": "aiter/ops/flydsl/kernels/fused_compress_attn_gfx1250.py",
+  "content_sha256": "c59c406d6babb5f16eab91e527a58757182447a600ed68c5e3aa4471ddfe859e",
+  "target_architectures": [
+    "gfx1250"
+  ],
+  "baseline_performance": {
+    "test_cases": [
+      {
+        "test_case_id": "attention-flydsl-c59c406d",
+        "execution_time_ms": 0.010358
+      }
+    ],
+    "geomean_ms": 0.010358,
+    "architecture": "gfx950",
+    "measurement_method": "torch.profiler CUDA device_time_total, warmup=360, rep=50, median",
+    "measured_at": "2026-10-13"
+  },
+  "cloned_from": "heldout-gfx950-attention-flydsl-c59c406d",
+  "split_group": "train",
+  "repeat_idx": 29
+}

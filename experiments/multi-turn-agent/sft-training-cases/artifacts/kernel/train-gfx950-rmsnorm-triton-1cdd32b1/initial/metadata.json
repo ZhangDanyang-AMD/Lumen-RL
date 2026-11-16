@@ -1,0 +1,23 @@
+{
+  "task_id": "train-gfx950-rmsnorm-triton-1cdd32b1",
+  "operator": "rmsnorm",
+  "architecture": "gfx950",
+  "language": "triton",
+  "source": "aiter:aiter/ops/triton/_triton_kernels/fusions/fused_reduce_qk_norm_rope_swa_write.py",
+  "content_sha256": "b49323d7772f32a8d2614ac3c3d9567aca23928b1a47cd9879f29942ac135be2",
+  "baseline_performance": {
+    "test_cases": [
+      {
+        "test_case_id": "rmsnorm-m4096-n4096-b49323d7",
+        "execution_time_ms": 0.014398
+      }
+    ],
+    "geomean_ms": 0.014398,
+    "architecture": "gfx950",
+    "measurement_method": "torch.profiler CUDA device_time_total, warmup=360, rep=50, median",
+    "measured_at": "2026-10-13"
+  },
+  "cloned_from": "heldout-gfx950-rmsnorm-b49323d7",
+  "split_group": "train",
+  "repeat_idx": 23
+}

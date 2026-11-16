@@ -1,0 +1,23 @@
+{
+  "task_id": "train-gfx950-attention-triton-18a7341e",
+  "operator": "attention",
+  "architecture": "gfx950",
+  "language": "triton",
+  "source": "aiter:aiter/ops/triton/_triton_kernels/gated_delta_rule/prefill/chunk_delta_h.py",
+  "content_sha256": "8ce6ee355039246bab1049c6f6cb08c3a12de66d5ced871dd0458a8a4e188160",
+  "baseline_performance": {
+    "test_cases": [
+      {
+        "test_case_id": "attention-b1-sk1024-8ce6ee35",
+        "execution_time_ms": 0.024838
+      }
+    ],
+    "geomean_ms": 0.024838,
+    "architecture": "gfx950",
+    "measurement_method": "torch.profiler CUDA device_time_total, warmup=360, rep=50, median",
+    "measured_at": "2026-10-13"
+  },
+  "cloned_from": "heldout-gfx950-attention-8ce6ee35",
+  "split_group": "train",
+  "repeat_idx": 23
+}

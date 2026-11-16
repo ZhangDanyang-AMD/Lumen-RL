@@ -1,0 +1,23 @@
+{
+  "task_id": "train-gfx950-topk-flydsl-c5e725a5",
+  "operator": "topk",
+  "architecture": "gfx950",
+  "language": "flydsl",
+  "source": "aiter/ops/flydsl/kernels/silu_and_mul_fq.py::build_silu_and_mul_fq_module",
+  "content_sha256": "88d66d169210b74b31f0dd41a00eee8954031e0a7f95f294d6d545505c133119",
+  "baseline_performance": {
+    "test_cases": [
+      {
+        "test_case_id": "topk-tokens4096-experts8-88d66d16",
+        "execution_time_ms": 0.003759
+      }
+    ],
+    "geomean_ms": 0.003759,
+    "architecture": "gfx950",
+    "measurement_method": "torch.profiler CUDA device_time_total, warmup=360, rep=50, median",
+    "measured_at": "2026-10-13"
+  },
+  "cloned_from": "heldout-gfx950-topk-flydsl-88d66d16",
+  "split_group": "train",
+  "repeat_idx": 5
+}

@@ -1,0 +1,23 @@
+{
+  "task_id": "train-gfx950-splitk_gemm-flydsl-4e3fa77b",
+  "operator": "splitk_gemm",
+  "architecture": "gfx950",
+  "language": "flydsl",
+  "source": "aiter/ops/flydsl/kernels/splitk_hgemm.py::launch_hgemm_kernel",
+  "content_sha256": "84d3074dfc8da55d0ce1be56f926d26087494f8d859400650b53a8347a6d51d0",
+  "baseline_performance": {
+    "test_cases": [
+      {
+        "test_case_id": "splitk_gemm-m4096-n7168-k4096-84d3074d",
+        "execution_time_ms": 0.155754
+      }
+    ],
+    "geomean_ms": 0.155754,
+    "architecture": "gfx950",
+    "measurement_method": "torch.profiler CUDA device_time_total, warmup=360, rep=50, median",
+    "measured_at": "2026-10-13"
+  },
+  "cloned_from": "heldout-gfx950-splitk_gemm-flydsl-84d3074d",
+  "split_group": "train",
+  "repeat_idx": 22
+}

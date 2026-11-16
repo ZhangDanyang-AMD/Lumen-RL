@@ -1,0 +1,26 @@
+{
+  "task_id": "train-gfx950-gemm_a8w8-flydsl-5769485f",
+  "operator": "gemm_a8w8",
+  "architecture": "gfx950",
+  "language": "flydsl",
+  "source": "aiter/ops/flydsl/kernels/gemm_a8w8_gfx1250.py",
+  "content_sha256": "51d7e3654bbb44ca5bf94dd5859aaa2e7fb580c245083dc85b306d54d4f55c30",
+  "target_architectures": [
+    "gfx1250"
+  ],
+  "baseline_performance": {
+    "test_cases": [
+      {
+        "test_case_id": "gemm_a8w8-flydsl-51d7e365",
+        "execution_time_ms": 0.154471
+      }
+    ],
+    "geomean_ms": 0.154471,
+    "architecture": "gfx950",
+    "measurement_method": "torch.profiler CUDA device_time_total, warmup=360, rep=50, median",
+    "measured_at": "2026-10-13"
+  },
+  "cloned_from": "heldout-gfx950-gemm_a8w8-flydsl-51d7e365",
+  "split_group": "train",
+  "repeat_idx": 24
+}

@@ -1,0 +1,23 @@
+{
+  "task_id": "train-gfx950-attention-triton-ffc09e5a",
+  "operator": "attention",
+  "architecture": "gfx950",
+  "language": "triton",
+  "source": "aiter:aiter/ops/triton/_triton_kernels/attention/sparse_attention_dsv4.py",
+  "content_sha256": "d6a61c3bfdb93e2db7c978c0ea64b708c884a221f933021b0618af1d2dc97a8b",
+  "baseline_performance": {
+    "test_cases": [
+      {
+        "test_case_id": "attention-b1-sk8192-d6a61c3b",
+        "execution_time_ms": 0.621203
+      }
+    ],
+    "geomean_ms": 0.621203,
+    "architecture": "gfx950",
+    "measurement_method": "torch.profiler CUDA device_time_total, warmup=360, rep=50, median",
+    "measured_at": "2026-10-13"
+  },
+  "cloned_from": "heldout-gfx950-attention-d6a61c3b",
+  "split_group": "train",
+  "repeat_idx": 27
+}

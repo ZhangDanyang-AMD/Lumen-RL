@@ -1,0 +1,23 @@
+{
+  "task_id": "train-gfx950-conv-triton-10b5dda1",
+  "operator": "conv",
+  "architecture": "gfx950",
+  "language": "triton",
+  "source": "aiter:aiter/ops/triton/_triton_kernels/conv/conv_3x3_winograd_f4x3.py",
+  "content_sha256": "26620a8d83b0fd8debf57073e083bdf0f79ee7dfed36cf484441a2371dcff47d",
+  "baseline_performance": {
+    "test_cases": [
+      {
+        "test_case_id": "conv-26620a8d",
+        "execution_time_ms": 0.042633
+      }
+    ],
+    "geomean_ms": 0.042633,
+    "architecture": "gfx950",
+    "measurement_method": "torch.profiler CUDA device_time_total, warmup=360, rep=50, median",
+    "measured_at": "2026-10-13"
+  },
+  "cloned_from": "heldout-gfx950-conv-26620a8d",
+  "split_group": "train",
+  "repeat_idx": 5
+}

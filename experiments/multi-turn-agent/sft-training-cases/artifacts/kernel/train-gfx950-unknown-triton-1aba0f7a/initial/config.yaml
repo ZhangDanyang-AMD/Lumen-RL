@@ -1,0 +1,22 @@
+architecture: gfx950
+benchmark_shapes:
+- K: 4096
+  M: 4096
+  N: 4096
+  case_id: unknown-m4096-n4096-k4096-15fd4e4e
+  dtype: bfloat16
+  kernel_prompt: 'Kernel: gmm (unknown, triton, gfx950) | Shape: M=4096, N=4096, K=4096,
+    dtype=bfloat16'
+compile_command:
+- python3 scripts/task_runner.py compile
+correctness_command:
+- python3 scripts/task_runner.py correctness
+eval_mode: direction_conditioned
+language: triton
+operator: unknown
+performance_command:
+- python3 scripts/task_runner.py performance
+task_id: train-gfx950-unknown-triton-1aba0f7a
+timeout_seconds: 120
+baseline_ms:
+  unknown-m4096-n4096-k4096-15fd4e4e: 0.095476

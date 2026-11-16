@@ -1,0 +1,24 @@
+architecture: gfx950
+benchmark_shapes:
+- B: 4
+  C: 256
+  S: 512
+  case_id: conv-26620a8d
+  dtype: bfloat16
+  kernel_prompt: 'Kernel: conv_3x3_winograd_f4x3 (conv, triton, gfx950) | Shape: B=4,
+    C=256, S=512, dtype=bfloat16 | Description: Grid for the GEMM-style conv kernels
+    (1x1, 3x3 nhwc/cblocked, general):; one program per (BLOCK_M tile of M_total)
+    x (BLOCK_N tile of K_out).'
+compile_command:
+- python3 scripts/task_runner.py compile
+correctness_command:
+- python3 scripts/task_runner.py correctness
+eval_mode: direction_conditioned
+language: triton
+operator: conv
+performance_command:
+- python3 scripts/task_runner.py performance
+task_id: train-gfx950-conv-triton-65009d78
+timeout_seconds: 120
+baseline_ms:
+  conv-26620a8d: 0.042633

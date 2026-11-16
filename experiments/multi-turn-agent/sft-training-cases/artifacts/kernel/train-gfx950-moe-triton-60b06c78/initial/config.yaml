@@ -1,0 +1,22 @@
+architecture: gfx950
+benchmark_shapes:
+- EXPERTS: 256
+  TOKENS: 4096
+  TOPK: 8
+  case_id: moe-t4096-e256-31f1edce
+  dtype: bfloat16
+  kernel_prompt: 'Kernel: routing (moe, triton, gfx950) | Shape: TOKENS=4096, EXPERTS=256,
+    TOPK=8, dtype=bfloat16'
+compile_command:
+- python3 scripts/task_runner.py compile
+correctness_command:
+- python3 scripts/task_runner.py correctness
+eval_mode: direction_conditioned
+language: triton
+operator: moe
+performance_command:
+- python3 scripts/task_runner.py performance
+task_id: train-gfx950-moe-triton-60b06c78
+timeout_seconds: 120
+baseline_ms:
+  moe-t4096-e256-31f1edce: 0.008959

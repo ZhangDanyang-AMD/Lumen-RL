@@ -1,0 +1,22 @@
+architecture: gfx950
+benchmark_shapes:
+- EXPERTS: 8
+  TOKENS: 4096
+  TOPK: 2
+  case_id: moe-t4096-e8-94dddaa8
+  dtype: bfloat16
+  kernel_prompt: 'Kernel: quant_moe (moe, triton, gfx950) | Shape: TOKENS=4096, EXPERTS=8,
+    TOPK=2, dtype=bfloat16'
+compile_command:
+- python3 scripts/task_runner.py compile
+correctness_command:
+- python3 scripts/task_runner.py correctness
+eval_mode: direction_conditioned
+language: triton
+operator: moe
+performance_command:
+- python3 scripts/task_runner.py performance
+task_id: train-gfx950-moe-triton-ece40b3c
+timeout_seconds: 120
+baseline_ms:
+  moe-t4096-e8-94dddaa8: 0.003719

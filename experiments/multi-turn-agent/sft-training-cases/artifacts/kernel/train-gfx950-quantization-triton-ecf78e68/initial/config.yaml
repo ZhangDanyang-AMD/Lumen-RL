@@ -1,0 +1,21 @@
+architecture: gfx950
+benchmark_shapes:
+- M: 4096
+  N: 7168
+  case_id: quantization-m4096-n7168-577177aa
+  dtype: bfloat16
+  kernel_prompt: 'Kernel: quant (quantization, triton, gfx950) | Shape: M=4096, N=7168,
+    dtype=bfloat16'
+compile_command:
+- python3 scripts/task_runner.py compile
+correctness_command:
+- python3 scripts/task_runner.py correctness
+eval_mode: direction_conditioned
+language: triton
+operator: quantization
+performance_command:
+- python3 scripts/task_runner.py performance
+task_id: train-gfx950-quantization-triton-ecf78e68
+timeout_seconds: 120
+baseline_ms:
+  quantization-m4096-n7168-577177aa: 0.023598

@@ -1,0 +1,23 @@
+{
+  "task_id": "train-gfx950-preshuffle_gemm-flydsl-4db04919",
+  "operator": "preshuffle_gemm",
+  "architecture": "gfx950",
+  "language": "flydsl",
+  "source": "aiter/ops/flydsl/kernels/moe_fused_route_quant_scatter.py::build_moe_fused_route_quant_scatter_st_ksplit_module",
+  "content_sha256": "ee50a9ad7e2ee7fbe10e682fc576c0e3f67121b15ea597337d6ef3e99ce11c5d",
+  "baseline_performance": {
+    "test_cases": [
+      {
+        "test_case_id": "preshuffle_gemm-m4096-n7168-k4096-ee50a9ad",
+        "execution_time_ms": 0.154433
+      }
+    ],
+    "geomean_ms": 0.154433,
+    "architecture": "gfx950",
+    "measurement_method": "torch.profiler CUDA device_time_total, warmup=360, rep=50, median",
+    "measured_at": "2026-10-13"
+  },
+  "cloned_from": "heldout-gfx950-preshuffle_gemm-flydsl-ee50a9ad",
+  "split_group": "train",
+  "repeat_idx": 11
+}

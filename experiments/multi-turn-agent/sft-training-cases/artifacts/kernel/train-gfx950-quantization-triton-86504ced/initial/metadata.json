@@ -1,0 +1,23 @@
+{
+  "task_id": "train-gfx950-quantization-triton-86504ced",
+  "operator": "quantization",
+  "architecture": "gfx950",
+  "language": "triton",
+  "source": "aiter:aiter/ops/triton/_triton_kernels/quant/quant.py",
+  "content_sha256": "577177aab8ab0046c079335d07744811bd3c636b6441f71fd8d624b97cc4fa31",
+  "baseline_performance": {
+    "test_cases": [
+      {
+        "test_case_id": "quantization-m4096-n7168-577177aa",
+        "execution_time_ms": 0.023598
+      }
+    ],
+    "geomean_ms": 0.023598,
+    "architecture": "gfx950",
+    "measurement_method": "torch.profiler CUDA device_time_total, warmup=360, rep=50, median",
+    "measured_at": "2026-10-13"
+  },
+  "cloned_from": "heldout-gfx950-quantization-577177aa",
+  "split_group": "train",
+  "repeat_idx": 13
+}

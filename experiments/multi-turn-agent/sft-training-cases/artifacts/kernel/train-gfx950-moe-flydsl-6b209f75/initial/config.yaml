@@ -1,0 +1,23 @@
+architecture: gfx950
+benchmark_shapes:
+- EXPERTS: 8
+  TOKENS: 4096
+  TOPK: 2
+  case_id: moe-tokens4096-experts8-c70acf89
+  dtype: bfloat16
+  kernel_prompt: 'Kernel: moe (flydsl, gfx950) | Shape: TOKENS=4096, EXPERTS=8, TOPK=2
+    | Use gfx950 FlyDSL API (e.g. gemm_a8w8_bpreshuffle_flydsl, flydsl_moe_stage1/2,
+    aiter.flash_attn_func)'
+compile_command:
+- python3 scripts/task_runner.py compile
+correctness_command:
+- python3 scripts/task_runner.py correctness
+eval_mode: direction_conditioned
+language: flydsl
+operator: moe
+performance_command:
+- python3 scripts/task_runner.py performance
+task_id: train-gfx950-moe-flydsl-6b209f75
+timeout_seconds: 120
+baseline_ms:
+  moe-tokens4096-experts8-c70acf89: 0.003439

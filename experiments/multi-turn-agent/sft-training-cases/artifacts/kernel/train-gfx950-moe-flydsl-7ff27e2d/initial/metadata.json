@@ -1,0 +1,28 @@
+{
+  "task_id": "train-gfx950-moe-flydsl-7ff27e2d",
+  "operator": "moe",
+  "architecture": "gfx950",
+  "language": "flydsl",
+  "source": "aiter/ops/flydsl/kernels/moe_gather_reduce.py::launch_moe_gather_reduce",
+  "content_sha256": "a10384ed689c37a993fa0ea6fced8e2d8df3c00c25d11da89c9f5da2456a038e",
+  "baseline_performance": {
+    "test_cases": [
+      {
+        "test_case_id": "moe-tokens4096-experts8-a10384ed",
+        "execution_time_ms": 0.003399
+      }
+    ],
+    "geomean_ms": 0.003399,
+    "architecture": "gfx950",
+    "measurement_method": "torch.profiler CUDA device_time_total, warmup=360, rep=50, median",
+    "measured_at": "2026-10-13"
+  },
+  "best_config": {
+    "moe-tokens4096-experts8-a10384ed": {
+      "split_k": 4
+    }
+  },
+  "cloned_from": "heldout-gfx950-moe-flydsl-a10384ed",
+  "split_group": "train",
+  "repeat_idx": 9
+}
