@@ -98,6 +98,19 @@ def _output(name: str, shape: tuple[int, ...], dtype: torch.dtype) -> StageOutpu
     )
 
 
+def _engine_with_plans(monkeypatch, plans, pp: int = 1) -> MegatronNativeEngine:
+    from megatron.core import parallel_state as mpu
+
+    # Other suites may leave a stub parallel_state in sys.modules.
+    monkeypatch.setattr(mpu, "get_pipeline_model_parallel_world_size", lambda: pp, raising=False)
+    monkeypatch.setattr(mpu, "get_pipeline_model_parallel_group", lambda: "pp-group", raising=False)
+    engine = object.__new__(MegatronNativeEngine)
+    monkeypatch.setattr(
+        engine, "_stage_plan", lambda stack_experts=False: plans[stack_experts], raising=False,
+    )
+    return engine
+
+
 def test_engine_bound_is_the_largest_planned_tensor(monkeypatch) -> None:
     plans = {
         False: [
@@ -112,9 +125,26 @@ def test_engine_bound_is_the_largest_planned_tensor(monkeypatch) -> None:
             _output("w", (8, 1536, 2048), torch.bfloat16),
         ), stacked=True)],
     }
-    engine = object.__new__(MegatronNativeEngine)
-    monkeypatch.setattr(
-        engine, "_stage_plan", lambda stack_experts=False: plans[stack_experts], raising=False,
-    )
+    engine = _engine_with_plans(monkeypatch, plans)
     assert engine.max_export_tensor_nbytes() == 151936 * 4096 * 2
     assert engine.max_export_tensor_nbytes(stack_experts=True) == 8 * 1536 * 2048 * 2
+
+
+def test_engine_bound_covers_other_pipeline_stages(monkeypatch) -> None:
+    """A middle stage holds neither embedding nor lm_head but streams both."""
+    from lumenrl.engine.training import megatron_native_engine as mne
+
+    layer = (_output("fc1", (24576, 4096), torch.bfloat16),)
+    plans = {False: [StageRecipe("fc1", "pass", layer)]}
+    engine = _engine_with_plans(monkeypatch, plans, pp=4)
+    embedding = 151936 * 4096 * 2
+    calls = []
+
+    def all_reduce(t, op=None, group=None):
+        calls.append((int(t.item()), op, group))
+        t.fill_(max(int(t.item()), embedding))
+
+    monkeypatch.setattr(mne.dist, "all_reduce", all_reduce)
+    monkeypatch.setattr(mne.torch, "tensor", lambda data, **kw: torch.as_tensor(data, dtype=kw.get("dtype")))
+    assert engine.max_export_tensor_nbytes() == embedding
+    assert calls == [(24576 * 4096 * 2, mne.dist.ReduceOp.MAX, "pp-group")]

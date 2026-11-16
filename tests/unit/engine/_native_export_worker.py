@@ -323,6 +323,11 @@ def _assert_stacked(engine, per_expert, rank: int) -> None:
     )
     stacked = _to_cpu(engine._full_megatron_named_params_moe(stack_experts=True))
     assert any("::" in n for n, _ in stacked), f"[rank{rank}] no expert stacks emitted"
+    bound = engine.max_export_tensor_nbytes(stack_experts=True)
+    largest = max(t.nbytes for _, t in stacked)
+    assert bound == largest, (
+        f"[rank{rank}] stacked export bound {bound} B != largest streamed {largest} B"
+    )
     expanded = _expand_stacks(stacked)
     assert [n for n, _ in expanded] == [n for n, _ in per_expert], (
         f"[rank{rank}] stacked name/order mismatch"
@@ -369,6 +374,10 @@ def main() -> None:
     for (n1, t1), (n2, t2) in zip(new, old, strict=True):
         assert n1 == n2
         assert torch.equal(t1, t2), f"[rank{rank}] {n1} tensors differ"
+
+    bound = engine.max_export_tensor_nbytes()
+    largest = max(t.nbytes for _, t in new)
+    assert bound == largest, f"[rank{rank}] export bound {bound} B != largest streamed {largest} B"
 
     if MOE and EP > 1:
         dist.barrier()

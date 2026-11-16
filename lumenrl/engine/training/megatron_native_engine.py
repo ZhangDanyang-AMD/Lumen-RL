@@ -1258,8 +1258,14 @@ class MegatronNativeEngine(MegatronBaseEngine):
         tensor up front asks here. The plan describes the gathered Megatron
         tensors; renaming to rollout names only splits them (fused QKV, gate/up),
         so the plan's largest tensor bounds the stream's.
+
+        The plan covers only this PP stage, but every rank streams the whole
+        model, so under PP the bound is the max over the stage group. That
+        makes this a collective over the PP group whenever PP > 1.
         """
-        return max(
+        from megatron.core import parallel_state as mpu
+
+        local = max(
             (
                 math.prod(o.shape) * o.dtype.itemsize
                 for recipe in self._stage_plan(stack_experts=stack_experts)
@@ -1267,6 +1273,11 @@ class MegatronNativeEngine(MegatronBaseEngine):
             ),
             default=0,
         )
+        if mpu.get_pipeline_model_parallel_world_size() == 1:
+            return local
+        bound = torch.tensor([local], dtype=torch.int64, device="cuda")
+        dist.all_reduce(bound, op=dist.ReduceOp.MAX, group=mpu.get_pipeline_model_parallel_group())
+        return int(bound.item())
 
     def is_mp_src_rank_with_outputs(self) -> bool:
         """Only TP-rank 0 / CP-rank 0 on the last pipeline stage reports output.
