@@ -47,11 +47,13 @@ class ATOMRayServer:
         engine_kwargs: dict[str, Any],
         replica_rank: int,
         base_seed: Optional[int] = None,
+        ipc_staging_mb: int = 2048,
     ) -> None:
         self.model_name = model_name
         self.engine_kwargs = dict(engine_kwargs)
         self.replica_rank = int(replica_rank)
         self.base_seed = base_seed
+        self.ipc_staging_bytes = int(ipc_staging_mb) << 20
         self.engine = None
         # ATOM's preemption counter is cumulative; keep the last reading so
         # each batch can report its own.
@@ -437,7 +439,10 @@ class ATOMRayServer:
             comm_metadata = socket.recv_pyobj()
             socket.send(b"")
             ipc_buffer = rebuild_ipc_handle(comm_metadata, device_id=0)
-            bucket_size = int(ipc_buffer.numel())
+            # Sized on its own, not to the sender's bucket: tensors larger than
+            # that bucket arrive by direct handle and are copied in here, and
+            # the staging buffer cannot grow once the runner has mapped it.
+            bucket_size = max(int(ipc_buffer.numel()), self.ipc_staging_bytes)
             num_gpus = int(self.engine_kwargs.get("tensor_parallel_size", 1) or 1) * int(
                 self.engine_kwargs.get("data_parallel_size", 1) or 1
             )
@@ -476,8 +481,8 @@ class ATOMRayServer:
                         raise RuntimeError(
                             f"bucket needs {used_bytes} B but the staging buffer is "
                             f"{bucket_size} B and ATOM's runner has already mapped it; "
-                            "the sender must size its bucket to the largest tensor "
-                            "(see LumenActorWorker.update_weights_ipc_send)"
+                            "raise policy.generation.atom_cfg.ipc_staging_mb above "
+                            "the largest tensor"
                         )
                     del per_gpu_buffers
                     del per_gpu_ipc_handles
@@ -681,12 +686,14 @@ class ATOMReplicaManager:
         *,
         max_concurrency: int = 64,
         base_seed: Optional[int] = None,
+        ipc_staging_mb: int = 2048,
     ) -> None:
         self.actor_wg = actor_wg
         self.model_name = model_name
         self.engine_kwargs = dict(engine_kwargs)
         self.max_concurrency = int(max_concurrency)
         self.base_seed = base_seed
+        self.ipc_staging_mb = int(ipc_staging_mb)
         self.num_replicas = actor_wg.num_workers
         self.servers: list = []
 
@@ -789,6 +796,7 @@ class ATOMReplicaManager:
                 engine_kwargs=engine_kwargs,
                 replica_rank=r,
                 base_seed=self.base_seed,
+                ipc_staging_mb=self.ipc_staging_mb,
             )
             self.servers.append(server)
 

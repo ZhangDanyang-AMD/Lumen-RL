@@ -248,6 +248,11 @@ class AtomConfig:
     expert_parallel_size: int = 1
     enable_prefix_caching: bool = False
     online_quant_config: Optional[dict] = None
+    # Colocated CUDA-IPC weight sync, in MiB: ATOM's per-GPU staging buffer, and
+    # the floor for the trainer's bucket (vllm_cfg.update_weights_bucket_megabytes).
+    # ATOM maps the staging buffer once per sync, so it must hold the largest
+    # single tensor; 2048 is the bucket ATOM's own load_weights_via_ipc defaults to.
+    ipc_staging_mb: int = 2048
     engine_kwargs: dict[str, Any] = field(default_factory=dict)
 
 

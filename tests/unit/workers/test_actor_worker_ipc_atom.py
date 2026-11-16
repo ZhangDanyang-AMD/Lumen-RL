@@ -1,9 +1,12 @@
-"""ATOM bucket sizing over the colocated CUDA-IPC weight sync.
+"""ATOM over the colocated CUDA-IPC weight sync.
 
-ATOM needs the bucket to hold the largest tensor before the first one is sent.
-The sender used to find it by iterating the engine's weights, which drained the
-Megatron-native engine's one-shot stream: nothing was sent, and ATOM generated
-from the weights it had discarded for the update.
+ATOM's runner maps the staging buffer on the first bucket and keeps that mapping
+until the last, so the buffer cannot grow mid-sync. The sender used to size its
+bucket to the largest tensor by iterating the engine's weights first, which
+drained the Megatron-native engine's one-shot stream: nothing was sent, and ATOM
+generated from the weights it had discarded for the update. The sender now
+streams a plain bucket and ATOM's receiver stages oversized tensors in a buffer
+sized by ``atom_cfg.ipc_staging_mb``.
 """
 from __future__ import annotations
 
@@ -13,22 +16,16 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
-from lumenrl.engine.training.megatron_native_engine import (
-    MegatronNativeEngine,
-    StageOutput,
-    StageRecipe,
-)
 from lumenrl.workers.actor_worker import LumenActorWorker
 
 PARAMS = [
     ("model.embed_tokens.weight", torch.randn(64, 32).bfloat16()),
     ("model.layers.0.input_layernorm.weight", torch.randn(32).bfloat16()),
 ]
-LARGEST = 64 * 32 * 2
 
 
 class _Sender:
-    """Captures the stream and the bucket floor instead of using a socket."""
+    """Captures the stream and the sender's settings instead of using a socket."""
 
     captured: list[str] = []
     kwargs: dict = {}
@@ -62,89 +59,105 @@ def _worker(monkeypatch, engine) -> LumenActorWorker:
     return w
 
 
-class _StreamingEngine:
-    """Like the Megatron-native engine: a stream readable once, plus its bound."""
-
-    def get_per_tensor_param(self, **kw):
-        return (p for p in PARAMS), None
-
-    def max_export_tensor_nbytes(self, stack_experts: bool = False) -> int:
-        return LARGEST
-
-
 def test_one_shot_stream_is_sent_whole(monkeypatch) -> None:
-    _worker(monkeypatch, _StreamingEngine()).update_weights_ipc_send()
+    engine = SimpleNamespace(get_per_tensor_param=lambda **kw: ((p for p in PARAMS), None))
+    _worker(monkeypatch, engine).update_weights_ipc_send(bucket_size_mb=512)
     assert _Sender.captured == [n for n, _ in PARAMS]
-    assert _Sender.kwargs["min_bucket_bytes"] == LARGEST
+    assert _Sender.kwargs["bucket_size_mb"] == 512
 
 
-def test_reiterable_weights_are_sized_by_reading_them(monkeypatch) -> None:
-    engine = SimpleNamespace(get_per_tensor_param=lambda **kw: (PARAMS, None))
-    _worker(monkeypatch, engine).update_weights_ipc_send()
-    assert _Sender.captured == [n for n, _ in PARAMS]
-    assert _Sender.kwargs["min_bucket_bytes"] == LARGEST
+# --- ATOM receiver -----------------------------------------------------------
+
+KIB = 1 << 10
 
 
-def test_one_shot_stream_without_a_bound_is_refused(monkeypatch) -> None:
-    engine = SimpleNamespace(get_per_tensor_param=lambda **kw: (iter(PARAMS), None))
-    with pytest.raises(TypeError, match="one-shot iterator"):
-        _worker(monkeypatch, engine).update_weights_ipc_send()
+class _Socket:
+    """REP socket that replays the sender's messages."""
+
+    def __init__(self, messages):
+        self.messages = list(messages)
+
+    def recv_pyobj(self):
+        return self.messages.pop(0)
+
+    def send(self, _data):
+        pass
+
+    def setsockopt(self, *_a):
+        pass
+
+    def connect(self, _addr):
+        pass
+
+    def close(self):
+        pass
 
 
-def _output(name: str, shape: tuple[int, ...], dtype: torch.dtype) -> StageOutput:
-    return StageOutput(
-        name=name, shape=shape, dtype=dtype, pp_stage=0, ep_owner=None,
-        local_e=None, tp_split_dim=None, tp_size=1, etp_size=1, gate_up=False,
+def _meta(name, t, offset, handle=None):
+    return {"name": name, "shape": t.shape, "dtype": t.dtype, "offset": offset, "handle": handle}
+
+
+def _receive(monkeypatch, messages, staging_mb):
+    """Run ATOM's IPC receive loop; return what the runner read for each tensor."""
+    from lumenrl.engine.inference import atom_moe_weight_sync, atom_ray_server
+
+    fake_zmq = SimpleNamespace(
+        REP=0, LINGER=0,
+        Context=lambda: SimpleNamespace(socket=lambda _kind: _Socket(messages), term=lambda: None),
     )
+    monkeypatch.setattr(atom_ray_server, "zmq", fake_zmq)
+    # Handles stand for the tensors themselves.
+    fake_sync = ModuleType("atom.rollout.weight_sync")
+    fake_sync.rebuild_ipc_handle = lambda handle, device_id=None: handle
+    monkeypatch.setitem(sys.modules, "atom.rollout.weight_sync", fake_sync)
+    monkeypatch.setattr("torch.multiprocessing.reductions.reduce_tensor", lambda t: t)
+    monkeypatch.setattr(atom_moe_weight_sync, "assert_bucket_fully_applied", lambda *a, **k: None)
+    monkeypatch.setattr(atom_moe_weight_sync, "atom_routes_fused_experts", lambda: True)
 
+    loaded: dict[str, torch.Tensor] = {}
 
-def _engine_with_plans(monkeypatch, plans, pp: int = 1) -> MegatronNativeEngine:
-    from megatron.core import parallel_state as mpu
+    def runner(_cmd, ipc_handles, bucket_meta, **_kw):
+        staging = ipc_handles[0]
+        for name, m in bucket_meta.items():
+            dtype = getattr(torch, m["dtype"].replace("torch.", ""))
+            raw = staging[m["offset"]: m["offset"] + m["nbytes"]]
+            loaded[name] = raw.view(dtype).view(m["shape"]).clone()
+        return []
 
-    # Other suites may leave a stub parallel_state in sys.modules.
-    monkeypatch.setattr(mpu, "get_pipeline_model_parallel_world_size", lambda: pp, raising=False)
-    monkeypatch.setattr(mpu, "get_pipeline_model_parallel_group", lambda: "pp-group", raising=False)
-    engine = object.__new__(MegatronNativeEngine)
-    monkeypatch.setattr(
-        engine, "_stage_plan", lambda stack_experts=False: plans[stack_experts], raising=False,
+    server = atom_ray_server.ATOMRayServer(
+        model_name="m", engine_kwargs={}, replica_rank=0, ipc_staging_mb=staging_mb,
     )
-    return engine
+    server.engine = SimpleNamespace(
+        core_mgr=SimpleNamespace(broadcast_utility_command_sync=runner),
+    )
+    server._update_weights_from_ipc_sync()
+    return loaded
 
 
-def test_engine_bound_is_the_largest_planned_tensor(monkeypatch) -> None:
-    plans = {
-        False: [
-            StageRecipe("embedding", "pass", (_output("e", (151936, 4096), torch.bfloat16),)),
-            StageRecipe("qkv", "split", (
-                _output("q", (4096, 4096), torch.bfloat16),
-                _output("k", (1024, 4096), torch.bfloat16),
-            )),
-            StageRecipe("bias", "pass", (_output("b", (128,), torch.float32),)),
-        ],
-        True: [StageRecipe("experts", "pass", (
-            _output("w", (8, 1536, 2048), torch.bfloat16),
-        ), stacked=True)],
-    }
-    engine = _engine_with_plans(monkeypatch, plans)
-    assert engine.max_export_tensor_nbytes() == 151936 * 4096 * 2
-    assert engine.max_export_tensor_nbytes(stack_experts=True) == 8 * 1536 * 2048 * 2
+def _sync_with_large_tensor_second():
+    """Sender with a 64 KiB bucket: one small bucket, then a 512 KiB direct send."""
+    small = torch.randn(16, 16, device="cuda").bfloat16()
+    large = torch.randn(512, 256, device="cuda").float()
+    sender_buf = torch.zeros(64 * KIB, dtype=torch.uint8, device="cuda")
+    sender_buf[: small.nbytes].copy_(small.view(-1).view(torch.uint8))
+    messages = [
+        sender_buf,
+        {"bucket_meta": {"small": _meta("small", small, 0)}, "is_last": False},
+        {"bucket_meta": {"large": _meta("large", large, 0, handle=large)}, "is_last": True},
+    ]
+    return messages, small, large
 
 
-def test_engine_bound_covers_other_pipeline_stages(monkeypatch) -> None:
-    """A middle stage holds neither embedding nor lm_head but streams both."""
-    from lumenrl.engine.training import megatron_native_engine as mne
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_staging_holds_a_tensor_larger_than_the_sender_bucket(monkeypatch) -> None:
+    messages, small, large = _sync_with_large_tensor_second()
+    loaded = _receive(monkeypatch, messages, staging_mb=1)
+    assert torch.equal(loaded["small"], small)
+    assert torch.equal(loaded["large"], large)
 
-    layer = (_output("fc1", (24576, 4096), torch.bfloat16),)
-    plans = {False: [StageRecipe("fc1", "pass", layer)]}
-    engine = _engine_with_plans(monkeypatch, plans, pp=4)
-    embedding = 151936 * 4096 * 2
-    calls = []
 
-    def all_reduce(t, op=None, group=None):
-        calls.append((int(t.item()), op, group))
-        t.fill_(max(int(t.item()), embedding))
-
-    monkeypatch.setattr(mne.dist, "all_reduce", all_reduce)
-    monkeypatch.setattr(mne.torch, "tensor", lambda data, **kw: torch.as_tensor(data, dtype=kw.get("dtype")))
-    assert engine.max_export_tensor_nbytes() == embedding
-    assert calls == [(24576 * 4096 * 2, mne.dist.ReduceOp.MAX, "pp-group")]
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_tensor_larger_than_staging_after_first_bucket_is_refused(monkeypatch) -> None:
+    messages, _, _ = _sync_with_large_tensor_second()
+    with pytest.raises(RuntimeError, match="ipc_staging_mb"):
+        _receive(monkeypatch, messages, staging_mb=0)
