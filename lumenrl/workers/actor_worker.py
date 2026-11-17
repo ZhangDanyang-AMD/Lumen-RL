@@ -1381,18 +1381,6 @@ class LumenActorWorker(BaseWorker):
                 torch.distributed.destroy_process_group(checkpoint_group)
         return global_step
 
-    @staticmethod
-    def _sent_nbytes(param: torch.Tensor, keep_fp32: bool) -> int:
-        """Bytes ``update_weights_ipc_send`` puts on the wire for one parameter.
-
-        Mirrors the FP32 -> BF16 cast below; ``numel()`` on a DTensor is already
-        the global count, which is what the receiver sees.
-        """
-        itemsize = param.element_size()
-        if param.dtype == torch.float32 and not keep_fp32:
-            itemsize = torch.bfloat16.itemsize
-        return itemsize * param.numel()
-
     def update_weights_ipc_send(
         self, bucket_size_mb: int = 512, use_shm: bool = False,
         version: int | None = None, fp8_quantize: bool = False,
@@ -1487,20 +1475,9 @@ class LumenActorWorker(BaseWorker):
                 gather_s += time.perf_counter() - t0
                 yield name, full
 
-        # ATOM's ModelRunner opens the staging buffer once per update cycle and
-        # holds that mapping until the last bucket, so the bucket must be able to
-        # hold the largest single tensor -- growing it mid-cycle would leave the
-        # runner reading through a stale, shorter mapping. Qwen3-30B-A3B's fused
-        # expert weight is 768 MiB, past the 512 MiB default. vLLM re-opens per
-        # bucket and needs no such floor.
-        min_bucket_bytes = 0
-        if is_atom:
-            min_bucket_bytes = max(
-                (self._sent_nbytes(p, keep_fp32) for _, p in params), default=0,
-            )
-
-        # ATOM's receive loop needs the whole bucket for its largest tensor
-        # and one mapping per cycle, so it keeps the verl protocol.
+        # ATOM's receive loop keeps one mapping per cycle, so it keeps the verl
+        # protocol. Tensors past the bucket go out by direct handle and its
+        # receiver stages them (atom_cfg.ipc_staging_mb).
         legacy = {"gc_collect": True, "double_buffer": False} if is_atom else {}
 
         stream = _gen()
@@ -1522,7 +1499,7 @@ class LumenActorWorker(BaseWorker):
 
         sender = BucketedWeightSender(
             zmq_handle=handle, bucket_size_mb=int(bucket_size_mb), use_shm=bool(use_shm),
-            version=version, min_bucket_bytes=min_bucket_bytes, **legacy,
+            version=version, **legacy,
         )
         t_send = time.perf_counter()
         asyncio.run(sender.async_send_weights(stream))
