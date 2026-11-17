@@ -44,7 +44,10 @@ class AgentGroupRollout:
         max_sequence_tokens: int | None = None,
         system_prompt: str = "",
         cleanup: Callable[[], Awaitable[None]] | None = None,
+        environment: Any = None,
     ) -> None:
+        """``environment``, when given, runs each rollout (``SweRolloutEnvironment``:
+        a task sandbox per rollout, rewarded by its tests) from the group's ground truth."""
         if not servers:
             raise ValueError("AgentGroupRollout needs at least one rollout replica")
         self._agent = agent
@@ -53,6 +56,7 @@ class AgentGroupRollout:
         self._max_sequence_tokens = max_sequence_tokens
         self._system_prompt = system_prompt
         self._cleanup = cleanup
+        self._environment = environment
         self._runner = AgentRunner()
         self._lock = threading.Lock()
         self._load = [0] * len(self._servers)
@@ -62,14 +66,17 @@ class AgentGroupRollout:
         messages: list[dict[str, Any]],
         num_generations: int,
         sampling_params: dict[str, Any],
+        ground_truth: str | None = None,
     ) -> concurrent.futures.Future[list[Trajectory]]:
+        if self._environment is not None and ground_truth is None:
+            raise ValueError("an environment rollout needs the group's ground truth (its task)")
         if self._system_prompt and (not messages or messages[0].get("role") != "system"):
             messages = [{"role": "system", "content": self._system_prompt}, *messages]
         with self._lock:
             replica = min(range(len(self._load)), key=self._load.__getitem__)
             self._load[replica] += 1
         future = self._runner.submit(
-            self._group(self._servers[replica], messages, num_generations, dict(sampling_params)),
+            self._group(self._servers[replica], messages, num_generations, dict(sampling_params), ground_truth),
         )
         future.add_done_callback(lambda _done: self._release(replica))
         return future
@@ -79,9 +86,11 @@ class AgentGroupRollout:
         messages_list: list[list[dict[str, Any]]],
         num_generations: int,
         sampling_params: dict[str, Any],
+        ground_truths: list[str] | None = None,
     ) -> list[list[Trajectory]]:
         """Roll out every prompt group and return them in order."""
-        futures = [self.submit(m, num_generations, sampling_params) for m in messages_list]
+        gts = ground_truths if ground_truths is not None else [None] * len(messages_list)
+        futures = [self.submit(m, num_generations, sampling_params, gt) for m, gt in zip(messages_list, gts)]
         return [future.result() for future in futures]
 
     def close(self) -> None:
@@ -97,17 +106,23 @@ class AgentGroupRollout:
         messages: list[dict[str, Any]],
         num_generations: int,
         sampling_params: dict[str, Any],
+        ground_truth: str | None = None,
     ) -> list[Trajectory]:
         async def generate(prompt_ids: list[int], params: dict[str, Any]) -> dict[str, Any]:
             return await server.generate.remote(prompt_ids, params)
 
-        return list(await asyncio.gather(*(
-            self._agent.run(
+        def one():
+            if self._environment is not None:
+                return self._environment.rollout(
+                    self._agent, generate, messages, sampling_params,
+                    self._max_response_tokens, self._max_sequence_tokens, ground_truth,
+                )
+            return self._agent.run(
                 generate, messages, sampling_params,
                 self._max_response_tokens, self._max_sequence_tokens,
             )
-            for _ in range(num_generations)
-        )))
+
+        return list(await asyncio.gather(*(one() for _ in range(num_generations))))
 
 
 def _chat_and_parser(mt: Any, tokenizer: Any) -> tuple[Any, Any]:
@@ -130,7 +145,12 @@ def build_agent_rollout(config: Any, tokenizer: Any, servers: list[Any]) -> Agen
     mt = config.policy.generation.multi_turn
     chat, parser = _chat_and_parser(mt, tokenizer)
     tools = []
+    closers: list[Any] = []
+    environment = None
     ci = mt.code_interpreter
+    swe = mt.swe
+    if swe.enabled and ci.enabled:
+        raise ValueError("multi_turn.swe gives the agent its bash tool alone; disable multi_turn.code_interpreter")
     if ci.enabled:
         tool_class = StatefulSandboxFusionCodeTool if ci.stateful else SandboxFusionCodeTool
         tools.append(tool_class(
@@ -140,20 +160,35 @@ def build_agent_rollout(config: Any, tokenizer: Any, servers: list[Any]) -> Agen
             memory_limit_mb=ci.memory_limit_mb,
             max_concurrency=ci.max_concurrency,
         ))
+        closers.append(tools[-1])
+    if swe.enabled:
+        from lumenrl.agent.swe.bash import MiniSweBashTool
+        from lumenrl.agent.swe.environment import SweRolloutEnvironment
+        from lumenrl.agent.swe.sandbox_client import SandboxClient
+        from lumenrl.agent.swe.swebench import SweBenchEnvironment
+
+        client = SandboxClient(swe.url)
+        closers.append(client)
+        tools.append(MiniSweBashTool())
+        environment = SweRolloutEnvironment(
+            SweBenchEnvironment(client, eval_timeout_s=swe.eval_timeout_s, command_timeout_s=swe.command_timeout_s),
+            resolved_reward=swe.resolved_reward, unresolved_reward=swe.unresolved_reward,
+        )
     agent = ToolAgentLoop(
         chat,
         tools,
         parser=parser,
         max_assistant_turns=mt.max_assistant_turns,
         max_parallel_calls=mt.max_parallel_calls,
-        max_tool_response_length=mt.max_tool_response_length,
+        # A SWE observation already keeps the head and tail of a long output, as mini-swe-agent's does.
+        max_tool_response_length=0 if swe.enabled else mt.max_tool_response_length,
         tool_response_truncate_side=mt.tool_response_truncate_side,
         scripted_first_turn=mt.scripted_first_turn,
     )
 
     async def close_tools() -> None:
-        for tool in tools:
-            await tool.close()
+        for closer in closers:
+            await closer.close()
 
     return AgentGroupRollout(
         agent,
@@ -162,6 +197,7 @@ def build_agent_rollout(config: Any, tokenizer: Any, servers: list[Any]) -> Agen
         max_sequence_tokens=int(config.policy.max_total_sequence_length),
         system_prompt=mt.system_prompt,
         cleanup=close_tools,
+        environment=environment,
     )
 
 

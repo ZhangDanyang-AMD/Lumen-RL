@@ -31,10 +31,15 @@ class Trajectory:
     tool_errors: int = 0
     malformed_tool_calls: int = 0
     # Why the rollout ended: "answer" (a turn without tool calls), "max_turns",
-    # "length" (out of response budget) or "abort" (the engine aborted it).
+    # "length" (out of response budget), "abort" (the engine aborted it) or
+    # "submitted" (a tool call ended it, as a SWE submission does).
     stop_reason: str = ""
     generate_s: float = 0.0
     tool_s: float = 0.0
+    # The reward the environment gave the rollout (a SWE task's tests), which
+    # replaces scoring the response text; None when there is no environment.
+    env_reward: float | None = None
+    env_s: float = 0.0
     # The experts the engine routed each forwarded token to, [positions, layers,
     # top_k]; row t is the forward at position t. Each turn appends the rows of
     # the positions it forwarded first, so a row is the routing of the forward
@@ -103,11 +108,13 @@ class Trajectory:
             "environment_tokens": len(self.response_ids) - self.model_tokens,
             "generate_s": self.generate_s,
             "tool_s": self.tool_s,
+            "env_s": self.env_s,
         }
 
     def to_rollout_result(self) -> dict[str, Any]:
         """The trajectory in the shape ``VLLMRayServer.generate`` returns, plus
-        its ``response_mask`` and ``agent_stats``."""
+        its ``response_mask``, ``agent_stats`` and, from an environment,
+        ``env_reward``."""
         result = {
             "prompt_token_ids": list(self.prompt_ids),
             "token_ids": list(self.response_ids),
@@ -117,4 +124,6 @@ class Trajectory:
         }
         if self.routed_experts is not None:
             result["routed_experts"] = self.routed_experts
+        if self.env_reward is not None:
+            result["env_reward"] = float(self.env_reward)
         return result

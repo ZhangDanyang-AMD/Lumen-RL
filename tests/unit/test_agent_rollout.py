@@ -335,8 +335,11 @@ def test_fully_async_backend_scores_and_filters_agent_groups():
     trainer._get_prompts_range = get_prompts_range
     accs = {0: [1.0, 0.0], 1: [1.0, 1.0]}
 
+    submitted_gts = []
+
     class Rollout:
-        def submit(self, messages, n, sp):
+        def submit(self, messages, n, sp, ground_truth=None):
+            submitted_gts.append(ground_truth)
             index = int(messages[0]["content"][1:])
             future = concurrent.futures.Future()
             future.set_result([trajectory([1, 2], [10 + index], [20], [12]) for _ in range(n)])
@@ -344,7 +347,7 @@ def test_fully_async_backend_scores_and_filters_agent_groups():
             return future
 
     trainer._get_agent_rollout = lambda: Rollout()
-    trainer._compute_rewards_full = lambda seqs, mask, plen, gts, verbose: (
+    trainer._compute_rewards_full = lambda seqs, mask, plen, gts, verbose, env_rewards=None: (
         torch.zeros(2), ["a", "b"], accs[int(gts[0][2:])],
     )
     backend = rl_trainer._AgentRolloutGroups(trainer, num_generations=2, use_filter=True)
@@ -355,6 +358,7 @@ def test_fully_async_backend_scores_and_filters_agent_groups():
     assert backend.finish(handles[1]) is None, "an all-correct group carries no signal"
 
     assert requested == [(0, True), (1, True)]
+    assert submitted_gts == ["gt0", "gt1"], "the rollout gets its group's ground truth"
     assert rows[5] == ["gt0", "gt0"]
     assert len(rows[7]["agent_response_mask"]) == 2
     assert rows[7]["agent_response_mask"][0] == [1, 0, 1]
@@ -464,22 +468,105 @@ def test_sync_collection_sends_chat_messages_to_the_agent_loop():
     trainer._prompt_cursor = 0
     seen = []
 
-    def rollout_with_agent_loop(prompts, g):
-        seen.append((prompts, g))
-        return torch.zeros(4, 3), torch.ones(4, 3), [1] * 4, None, {"agent_stats": [{}] * 4}
+    def rollout_with_agent_loop(prompts, g, ground_truths=None):
+        seen.append((prompts, g, ground_truths))
+        return (torch.zeros(4, 3), torch.ones(4, 3), [1] * 4, None,
+                {"agent_stats": [{}] * 4, "env_rewards": [1.0, 0.0, 0.0, 1.0]})
 
+    scored = []
     trainer._rollout_with_agent_loop = rollout_with_agent_loop
-    trainer._compute_rewards_full = lambda seqs, mask, plen, gts: (torch.zeros(4), ["r"] * 4, [0.0] * 4)
+    trainer._compute_rewards_full = lambda seqs, mask, plen, gts, env_rewards=None: (
+        scored.append(env_rewards) or (torch.zeros(4), ["r"] * 4, [0.0] * 4)
+    )
 
     *_, ragged = trainer._collect_rollout_batch(step=0, num_generations=2)
 
-    [(prompts, g)] = seen
-    assert g == 2
+    [(prompts, g, gts)] = seen
+    assert g == 2 and gts == ["1", "3"]
     assert prompts == [
         [{"role": "user", "content": "What is 0 + 1?"}],
         [{"role": "user", "content": "What is 1 + 2?"}],
     ]
     assert len(ragged["agent_stats"]) == 4
+    assert scored == [[1.0, 0.0, 0.0, 1.0]], "the environment's rewards are what is scored"
+
+
+def test_environment_rewards_replace_scoring_the_text():
+    trainer = assembling_trainer()
+    trainer._rank, trainer._is_distributed = 0, False
+    trainer._tokenizer = SimpleNamespace(pad_token_id=0, decode=lambda ids, skip_special_tokens: "Answer: 7")
+    seqs, mask = torch.ones(3, 4, dtype=torch.long), torch.ones(3, 4, dtype=torch.long)
+
+    rewards, responses, accs = trainer._compute_rewards_full(
+        seqs, mask, [2, 2, 2], ["7", "7", "7"], verbose=False, env_rewards=[1.0, 0.0, 0.5],
+    )
+
+    assert rewards.tolist() == [1.0, 0.0, 0.5] and accs == [1.0, 0.0, 1.0] and len(responses) == 3
+    with pytest.raises(ValueError, match="2 environment rewards for 3 rows"):
+        trainer._compute_rewards_full(seqs, mask, [2] * 3, ["7"] * 3, env_rewards=[1.0, 0.0])
+
+
+def test_rollout_results_carry_their_environment_rewards_into_the_batch():
+    trainer = assembling_trainer()
+    rows = [trajectory([1, 2], [10, 11]), trajectory([3], [12])]
+    rows[0].env_reward, rows[1].env_reward = 1.0, 0.0
+
+    *_, ragged = trainer._assemble_ray_rollout([t.to_rollout_result() for t in rows])
+
+    assert ragged["env_rewards"] == [1.0, 0.0]
+    rows[1].env_reward = None
+    with pytest.raises(ValueError, match="1 of 2 rollouts carry an environment reward"):
+        trainer._assemble_ray_rollout([t.to_rollout_result() for t in rows])
+
+
+class TaskEnvironment:
+    """Records each rollout's ground truth and rewards it 1.0."""
+
+    def __init__(self):
+        self.ground_truths = []
+
+    async def rollout(self, agent, generate, messages, sampling_params, max_response_tokens,
+                      max_sequence_tokens, ground_truth):
+        self.ground_truths.append(ground_truth)
+        t = await agent.run(generate, messages, sampling_params, max_response_tokens, max_sequence_tokens)
+        t.env_reward = 1.0
+        return t
+
+
+def test_an_environment_runs_every_rollout_of_a_group_from_its_ground_truth():
+    tok = ChatMLTokenizer()
+    env = TaskEnvironment()
+    rollout = make_rollout([AnsweringServer(tok)], tok, environment=env)
+    try:
+        [group] = rollout.run([PROMPT], 3, {"max_tokens": 16}, ["task-json"])
+        with pytest.raises(ValueError, match="needs the group's ground truth"):
+            rollout.submit(PROMPT, 1, {"max_tokens": 16})
+    finally:
+        rollout.close()
+
+    assert env.ground_truths == ["task-json"] * 3
+    assert [t.to_rollout_result()["env_reward"] for t in group] == [1.0, 1.0, 1.0]
+
+
+def test_config_builds_the_swe_environment():
+    config = LumenRLConfig()
+    mt = config.policy.generation.multi_turn
+    mt.enabled, mt.code_interpreter.enabled = True, False
+    mt.swe.enabled, mt.swe.url, mt.swe.resolved_reward = True, "http://172.30.0.11:8090", 2.0
+
+    rollout = build_agent_rollout(config, ChatMLTokenizer(), [object()])
+    try:
+        [schema] = rollout._agent.tool_schemas
+        assert schema["function"]["name"] == "bash"
+        assert rollout._agent._max_tool_response_length == 0
+        assert rollout._environment._env._client._url == "http://172.30.0.11:8090"
+        assert rollout._environment._resolved == 2.0
+    finally:
+        rollout.close()
+
+    mt.code_interpreter.enabled = True
+    with pytest.raises(ValueError, match="bash tool alone"):
+        build_agent_rollout(config, ChatMLTokenizer(), [object()])
 
 
 # -- ATOM sampling noise --------------------------------------------------------

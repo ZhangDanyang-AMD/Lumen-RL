@@ -159,7 +159,7 @@ class _RayRolloutGroups:
         )
         gts = [gt] * self._num_generations
         rewards, responses, accs = self._trainer._compute_rewards_full(
-            sequences, seq_mask, prompt_lengths, gts, verbose=False,
+            sequences, seq_mask, prompt_lengths, gts, verbose=False, env_rewards=ragged.get("env_rewards"),
         )
         if self._use_filter:
             _, kept = filter_groups_keep_mask(accs, [0] * self._num_generations)
@@ -184,7 +184,7 @@ class _AgentRolloutGroups(_RayRolloutGroups):
     def submit(self, index: int) -> Any:
         [messages], gts = self._trainer._get_prompts_range(index, 1, messages=True)
         handle = self._trainer._get_agent_rollout().submit(
-            messages, self._num_generations, self._sampling_params,
+            messages, self._num_generations, self._sampling_params, ground_truth=gts[0],
         )
         self._groups[handle] = gts[0]
         return handle
@@ -827,15 +827,18 @@ class RLTrainer:
         prompts: list[list[dict[str, Any]]],
         num_generations: int,
         sampling_params: dict[str, Any] | None = None,
+        ground_truths: list[str] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, list[int], torch.Tensor | None, dict[str, list[Any]]]:
         """``_rollout_with_ray_vllm`` for chat-message prompts, one agent
-        rollout per completion; the ragged dict carries the agent masks."""
+        rollout per completion; the ragged dict carries the agent masks, and
+        the environment's rewards when an environment (``multi_turn.swe``)
+        ran the rollouts from their ``ground_truths``."""
         want_lp = bool(self.config.policy.generation.vllm_cfg.calculate_log_probs)
         sp = dict(sampling_params) if sampling_params is not None else self._ray_sampling_params(want_lp)
         if getattr(self._ray_vllm_engine, "_sleeping", False):
             logger.info("Ray rollout engine sleeping before generation; refreshing weights before wake.")
             self._sync_weights_ipc()
-        groups = self._get_agent_rollout().run(prompts, num_generations, sp)
+        groups = self._get_agent_rollout().run(prompts, num_generations, sp, ground_truths)
         return self._assemble_ray_rollout(
             [trajectory.to_rollout_result() for group in groups for trajectory in group],
         )
@@ -969,6 +972,11 @@ class RLTrainer:
             # filter_groups and group merging.
             ragged["agent_response_mask"] = [list(res["response_mask"]) for res in results]
             ragged["agent_stats"] = [dict(res["agent_stats"]) for res in results]
+        with_env = [res for res in results if "env_reward" in res]
+        if with_env:
+            if len(with_env) != len(results):
+                raise ValueError(f"{len(with_env)} of {len(results)} rollouts carry an environment reward")
+            ragged["env_rewards"] = [float(res["env_reward"]) for res in results]
         return sequences, seq_mask, prompt_lengths, rollout_lp, ragged
 
     def _ray_sampling_params(self, want_logprobs: bool) -> dict[str, Any]:
@@ -2512,6 +2520,7 @@ class RLTrainer:
         prompt_lengths: list[int],
         gts_expanded: list[str],
         verbose: bool = True,
+        env_rewards: list[float] | None = None,
     ) -> tuple[torch.Tensor, list[str], list[float]]:
         """Compute rewards + accuracy on the FULL (unsharded) rollout set.
 
@@ -2519,11 +2528,15 @@ class RLTrainer:
         rank can run identical dynamic-sampling filtering. Returns
         ``(rewards [N] on device, responses, acc [N] floats)``. ``verbose=False``
         drops the per-call reward and sample log lines, for callers that score
-        one prompt group at a time.
+        one prompt group at a time. ``env_rewards`` (one per row, from an agent
+        environment such as a SWE task's tests) are the rewards instead of
+        scoring the response text, and a positive one counts as correct.
         """
         from lumenrl.rewards.math_reward import compute_math_reward
 
         N = int(sequences.shape[0])
+        if env_rewards is not None and len(env_rewards) != N:
+            raise ValueError(f"{len(env_rewards)} environment rewards for {N} rows")
         responses: list[str] = []
         response_lengths: list[int] = []
         if self._rank == 0:
@@ -2535,8 +2548,12 @@ class RLTrainer:
                 response_lengths.append(int(response_ids.numel()))
                 text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
                 responses.append(text)
-            rewards_t, details = compute_math_reward(responses, gts_expanded)
-            rewards = rewards_t.to(self._device)
+            if env_rewards is not None:
+                rewards = torch.tensor(env_rewards, dtype=torch.float32, device=self._device)
+                details = [{"acc": r > 0, "pred": "[ENV]"} for r in env_rewards]
+            else:
+                rewards_t, details = compute_math_reward(responses, gts_expanded)
+                rewards = rewards_t.to(self._device)
             accs = torch.tensor(
                 [1.0 if d["acc"] else 0.0 for d in details],
                 dtype=torch.float32, device=self._device,
@@ -2630,10 +2647,10 @@ class RLTrainer:
 
         multi_turn = self._multi_turn
 
-        def _one_round(prompts: list[Any]):
+        def _one_round(prompts: list[Any], gts: list[str]):
             rag: dict[str, list[Any]] = {}
             if multi_turn:
-                seqs, mask, plen, lp, rag = self._rollout_with_agent_loop(prompts, g)
+                seqs, mask, plen, lp, rag = self._rollout_with_agent_loop(prompts, g, ground_truths=gts)
             elif (
                 (getattr(self, "_ray_use_vllm", False) or getattr(self, "_ray_use_atom", False))
                 and self._ray_vllm_engine is not None
@@ -2658,13 +2675,15 @@ class RLTrainer:
             self._prompt_cursor += gen_prompts
             if LUMENRL_DEBUG:
                 logger.info("[DBG] _collect_rollout: no-filter path, %d prompts × %d gen", gen_prompts, g)
-            seqs, mask, plen, lp, rag = _one_round(prompts)
+            seqs, mask, plen, lp, rag = _one_round(prompts, gts)
             if LUMENRL_DEBUG:
                 logger.info("[DBG] _collect_rollout: seqs=%s mask=%s plen=%s lp=%s",
                             list(seqs.shape), list(mask.shape), list(plen.shape) if hasattr(plen, 'shape') else len(plen),
                             list(lp.shape) if lp is not None else None)
             gts_exp = [gt for gt in gts for _ in range(g)]
-            rewards, responses, _accs = self._compute_rewards_full(seqs, mask, plen, gts_exp)
+            rewards, responses, _accs = self._compute_rewards_full(
+                seqs, mask, plen, gts_exp, env_rewards=rag.get("env_rewards"),
+            )
             if LUMENRL_DEBUG:
                 _acc_mean = float(torch.tensor(_accs).float().mean()) if _accs is not None and len(_accs) > 0 else -1.0
                 logger.info("[DBG] _collect_rollout: rewards=%s  acc_mean=%.4f  nonzero_reward=%d/%d",
@@ -2694,9 +2713,11 @@ class RLTrainer:
                 self._prompt_cursor, gen_prompts, messages=multi_turn,
             )
             self._prompt_cursor += gen_prompts
-            seqs, mask, plen, lp, rag = _one_round(prompts)
+            seqs, mask, plen, lp, rag = _one_round(prompts, gts)
             gts_exp = [gt for gt in gts for _ in range(g)]
-            rewards, _responses, accs = self._compute_rewards_full(seqs, mask, plen, gts_exp)
+            rewards, _responses, accs = self._compute_rewards_full(
+                seqs, mask, plen, gts_exp, env_rewards=rag.get("env_rewards"),
+            )
 
             uids = [i // g for i in range(seqs.shape[0])]
             keep_mask, kept_uids = filter_groups_keep_mask(accs, uids)
@@ -5054,12 +5075,14 @@ class RLTrainer:
             # Eval generation (colocated). Ray-controller path generates via the
             # colocated vLLM replicas (self._actor_model is None on the driver, so
             # the torchrun _rollout_phase fallback would crash).
+            val_env_rewards = None
             if self._multi_turn:
                 sequences, seq_mask, prompt_lengths, _, val_ragged = self._rollout_with_agent_loop(
-                    prompts, num_generations=eval_n, sampling_params=eval_sp,
+                    prompts, num_generations=eval_n, sampling_params=eval_sp, ground_truths=ground_truths,
                 )
                 keep_stats = len(samples) * eval_n
                 all_agent_stats.extend(val_ragged["agent_stats"][:keep_stats])
+                val_env_rewards = val_ragged.get("env_rewards")
             elif getattr(self, "_ray_vllm_engine", None) is not None:
                 sequences, seq_mask, prompt_lengths, _, _ = self._rollout_with_ray_vllm(
                     prompts, num_generations=eval_n, sampling_params=eval_sp,
@@ -5093,7 +5116,11 @@ class RLTrainer:
                 plen = int(prompt_lengths[i]) if i < len(prompt_lengths) else 0
                 response_ids = _response_token_ids(seq_cpu[i], mask_cpu[i], plen)
                 responses.append(self._tokenizer.decode(response_ids, skip_special_tokens=True))
-            rewards_t, details = compute_math_reward(responses, ground_truths)
+            if val_env_rewards is not None:
+                rewards_t = torch.tensor(val_env_rewards[:keep], dtype=torch.float32)
+                details = [{"acc": r > 0, "pred": "[ENV]"} for r in val_env_rewards[:keep]]
+            else:
+                rewards_t, details = compute_math_reward(responses, ground_truths)
 
             all_scores.extend(rewards_t.tolist())
             all_acc.extend([1.0 if d["acc"] else 0.0 for d in details])

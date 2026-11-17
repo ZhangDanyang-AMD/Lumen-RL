@@ -370,7 +370,7 @@ def test_ray_backend_sends_a_group_to_the_least_loaded_replica_and_filters_it(
     trainer._assemble_ray_rollout = lambda results: (
         torch.zeros(2, 3), torch.ones(2, 3), [2, 2], None, {},
     )
-    trainer._compute_rewards_full = lambda seqs, mask, plen, gts, verbose: (
+    trainer._compute_rewards_full = lambda seqs, mask, plen, gts, verbose, env_rewards: (
         torch.zeros(2), ["a", "b"], accs[current["server"]],
     )
     current = {}

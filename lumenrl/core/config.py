@@ -398,6 +398,24 @@ class SandboxFusionToolConfig:
 
 
 @dataclass
+class SweEnvironmentConfig:
+    """SWE-bench tasks with one sandboxed task container per rollout
+    (``lumenrl.agent.swe``): mini-swe-agent's bash tool, rewarded by the task's tests.
+
+    A row's ground truth is its task, the v5 SWE-bench row as JSON (``image``,
+    ``eval_script``, ``FAIL_TO_PASS``, ...); its prompt the task's messages.
+    """
+
+    enabled: bool = False
+    # The sandbox service (lumenrl.agent.swe.sandbox_server).
+    url: str = "http://localhost:8090"
+    command_timeout_s: float = 60.0
+    eval_timeout_s: float = 1800.0
+    resolved_reward: float = 1.0
+    unresolved_reward: float = 0.0
+
+
+@dataclass
 class MultiTurnConfig:
     """Multi-turn rollouts with tool calls, as verl's ``rollout.multi_turn``.
 
@@ -427,6 +445,7 @@ class MultiTurnConfig:
     # {reasoning_effort: 1-100|low|high|max}.
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     code_interpreter: SandboxFusionToolConfig = field(default_factory=SandboxFusionToolConfig)
+    swe: SweEnvironmentConfig = field(default_factory=SweEnvironmentConfig)
 
 
 @dataclass
