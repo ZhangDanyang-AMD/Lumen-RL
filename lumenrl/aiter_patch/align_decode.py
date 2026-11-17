@@ -95,6 +95,7 @@ def install():
 
     sys.meta_path.insert(0, _Finder())
     _install_logprob_snapshot()
+    _install_o_quant_linear()
 
 
 def _install_logprob_snapshot():
@@ -227,6 +228,7 @@ def _plan_step():
     global _plan, _num_slots
     _plan = None
     for req in _retired:
+        _paged_write_skipped.discard(req)
         slot = _slot_of.pop(req, None)
         _slot_len.pop(req, None)
         if slot is not None:
@@ -373,11 +375,60 @@ def _attn_tensors(device, rep, pool_rows, hq):
     return tensors
 
 
+def _pool_slots() -> int:
+    return int(os.environ.get("LUMENRL_ALIGN_POOL_SLOTS", "8") or 8)
+
+
+def _pool_cap() -> int:
+    """Cap the indices were built with. A planless capture uses the engine config."""
+    if _plan is not None:
+        return int(_plan["cap"])
+    return _cap()
+
+
+def _pool_mismatch(pool, like) -> bool:
+    return pool[0].shape[1:] != like.shape[1:] or pool[0].dtype != like.dtype
+
+
 def _pool(module, like):
-    """This layer's K/V pool, grown to hold every assigned slot."""
-    cap = _plan["cap"]
+    """This layer's K/V pool.
+
+    Static decode captures a CUDA graph on the pool's address, so that path
+    allocates ``_pool_slots()`` sequence slots plus one scratch slot once and
+    never moves it. The eager path grows, as it did before static decode.
+    """
+    if _flag("LUMENRL_ALIGN_STATIC_DECODE"):
+        return _pool_fixed(module, like)
+    return _pool_grow(module, like)
+
+
+def _pool_fixed(module, like):
+    cap = _pool_cap()
+    slots = _pool_slots()
+    if _num_slots > slots:
+        raise RuntimeError(
+            f"batched decode: {_num_slots} concurrent sequences exceed "
+            f"LUMENRL_ALIGN_POOL_SLOTS={slots}"
+        )
+    need = (slots + 1) * cap
     pool = getattr(module, "_lumenrl_pool", None)
-    if pool is not None and (pool[0].shape[1:] != like.shape[1:] or pool[0].dtype != like.dtype):
+    if pool is not None:
+        if _pool_mismatch(pool, like) or pool[0].shape[0] != need:
+            raise RuntimeError(
+                f"batched decode: K/V {tuple(like.shape)} {like.dtype} does not match "
+                f"fixed pool {tuple(pool[0].shape)} {pool[0].dtype} for cap={cap} slots={slots}"
+            )
+        return pool
+    k = torch.zeros((need, *like.shape[1:]), dtype=like.dtype, device=like.device)
+    v = torch.zeros_like(k)
+    module._lumenrl_pool = (k, v)
+    return module._lumenrl_pool
+
+
+def _pool_grow(module, like):
+    cap = _pool_cap()
+    pool = getattr(module, "_lumenrl_pool", None)
+    if pool is not None and _pool_mismatch(pool, like):
         raise RuntimeError(
             f"batched decode: K/V {tuple(like.shape[1:])} {like.dtype} does not match "
             f"pool {tuple(pool[0].shape[1:])} {pool[0].dtype}"
@@ -394,7 +445,185 @@ def _pool(module, like):
     return module._lumenrl_pool
 
 
+# Index buffers of decode_static_attention, at fixed addresses for CUDA graphs.
+_static = None
+
+
+def _cap() -> int:
+    """Slot capacity from the engine config, so capture and later steps agree."""
+    global _capacity
+    try:
+        from atom.config import get_current_atom_config
+
+        _capacity = _configured_capacity(get_current_atom_config())
+    except Exception:
+        pass
+    return _capacity
+
+
+def _static_rows() -> int:
+    """Largest decode batch: every captured graph size is at most max_num_seqs."""
+    try:
+        from atom.config import get_current_atom_config
+
+        return int(get_current_atom_config().max_num_seqs)
+    except Exception:
+        return int(os.environ.get("LUMENRL_ALIGN_STATIC_ROWS", "64"))
+
+
+def _static_buffers(device, rep):
+    global _static
+    cap = _pool_cap()
+    slots = _pool_slots()
+    if _static is not None:
+        same = (
+            _static["rep"] == rep
+            and _static["cap"] == cap
+            and _static["slots"] == slots
+            and _static["gather"].device == device
+        )
+        if not same:
+            raise RuntimeError(
+                f"batched decode: static buffers are rep={_static['rep']} cap={_static['cap']} "
+                f"slots={_static['slots']} device={_static['gather'].device}, "
+                f"this step is rep={rep} cap={cap} slots={slots} device={device}"
+            )
+        return _static
+    qa = _qlen1()
+    rows = _static_rows()
+    width = -(-cap // qa.SPLIT_KEYS)
+    entries = rows * width
+    if entries + 1 + rows > cap:
+        raise RuntimeError(f"batched decode: scratch slot of {cap} rows cannot hold {entries} entries")
+    i32 = dict(dtype=torch.int32, device=device)
+    _static = {
+        "rows": rows,
+        "width": width,
+        "rep": rep,
+        "cap": cap,
+        "slots": slots,
+        "scratch": slots * cap,
+        "write_dst": torch.zeros(rows, dtype=torch.long, device=device),
+        "gather": torch.zeros(entries, dtype=torch.long, device=device),
+        "cu_q": torch.arange(0, rep * (entries + 1), rep, **i32),
+        "cu_k": torch.zeros(entries + 1, **i32),
+        "k_start": torch.zeros(entries + 1, **i32),
+        "idx": torch.zeros((rows, width), **i32),
+        "npart": torch.zeros(rows, **i32),
+        "dst": torch.arange(rows, **i32),
+    }
+    _fill_static(None)
+    return _static
+
+
+def _static_lists(row_starts, row_lens, order, rows, width, scratch, split, rep):
+    """Host contents of the decode_static_attention buffers.
+
+    ``row_starts[i]``/``row_lens[i]`` are pool start and key count of real
+    row ``i``; ``order`` lists the real rows by pool start, so entry starts
+    stay non-decreasing. Rows past the real ones and entries past the real
+    ones read scratch rows. Every padded row merges the first padded entry;
+    the entries after it get no query rows and gather ``-1``, so attention
+    and the query copy skip them.
+    """
+    n = len(row_lens)
+    entries = rows * width
+    write_dst = [row_starts[i] + row_lens[i] - 1 for i in range(n)] + [scratch + i for i in range(n, rows)]
+    gather, k_start, k_len = [], [], []
+    idx = [[0] * width for _ in range(rows)]
+    npart = [1] * rows
+    for i in order:
+        parts = 0
+        for p in range(0, row_lens[i], split):
+            idx[i][parts] = len(gather)
+            parts += 1
+            gather.append(i)
+            k_start.append(row_starts[i] + p)
+            k_len.append(min(split, row_lens[i] - p))
+        if parts > width:
+            raise RuntimeError(f"batched decode: row of {row_lens[i]} keys needs {parts} > {width} blocks")
+        npart[i] = parts
+    real = len(gather)
+    for i in range(n, rows):
+        idx[i][0] = real
+    for e in range(real, entries):
+        gather.append(0 if e == real else -1)
+        k_start.append(scratch + (e - real))
+        k_len.append(1)
+    k_start.append(scratch + (entries - real))
+    cu_k = [0]
+    for x in k_len:
+        cu_k.append(cu_k[-1] + x)
+    cu_q = [min(e, real + 1) * rep for e in range(entries + 1)]
+    flat_idx = [x for row in idx for x in row]
+    return write_dst, gather, cu_k, k_start, flat_idx, npart, cu_q
+
+
+def _fill_static(plan):
+    """Upload this step's decode indices (or all-padding) into ``_static``."""
+    st = _static
+    if st is None:
+        return
+    if plan is None:
+        starts, lens, order = [], [], []
+    else:
+        lens = [int(x) for x in plan["lens"]]
+        starts = [int(x) for x in plan["starts"]]
+        perm = plan["perm"] if plan["perm"] is not None else list(range(len(lens)))
+        # plan["starts"]/["lens"] are listed in perm order; map them back to rows.
+        row_starts = [0] * len(lens)
+        row_lens = [0] * len(lens)
+        for pos, row in enumerate(perm):
+            row_starts[row] = starts[pos]
+            row_lens[row] = lens[pos]
+        starts, lens = row_starts, row_lens
+        order = list(perm)
+    write_dst, gather, cu_k, k_start, idx, npart, cu_q = _static_lists(
+        starts, lens, order, st["rows"], st["width"], st["scratch"], _qlen1().SPLIT_KEYS, st["rep"]
+    )
+    device = st["gather"].device
+    # dst never changes, but is uploaded too: sleep mode may drop device
+    # memory between steps.
+    longs = _to_device([write_dst, gather], torch.long, device)
+    ints = _to_device([cu_k, k_start, idx, npart, cu_q, list(range(st["rows"]))], torch.int32, device)
+    st["write_dst"].copy_(longs[0], non_blocking=True)
+    st["gather"].copy_(longs[1], non_blocking=True)
+    st["cu_k"].copy_(ints[0], non_blocking=True)
+    st["k_start"].copy_(ints[1], non_blocking=True)
+    st["idx"].view(-1).copy_(ints[2], non_blocking=True)
+    st["npart"].copy_(ints[3], non_blocking=True)
+    st["cu_q"].copy_(ints[4], non_blocking=True)
+    st["dst"].copy_(ints[5], non_blocking=True)
+    if plan is not None:
+        plan["static"] = True
+
+
+def _static_step(plan) -> bool:
+    """A decode step that decode_static_attention can run: one new row per sequence."""
+    return (
+        plan is not None
+        and plan["complete"]
+        and plan["rows"] == len(plan["slots"])
+        and plan["rows"] <= (_static["rows"] if _static is not None else _static_rows())
+    )
+
+
 _qa = None
+
+
+def _static_decode(impl, fwd_ctx, rows) -> bool:
+    """Decode through decode_static_attention, the CUDA-graph-capturable path.
+
+    Without a plan this is a graph capture or a dummy step: every row is padding.
+    """
+    return (
+        _flag("LUMENRL_ALIGN_STATIC_DECODE")
+        and not _history_blocked(fwd_ctx)
+        and impl.sinks is None
+        and impl.sliding_window <= 0
+        and rows <= (_static["rows"] if _static is not None else _static_rows())
+        and (_plan is None or (_static_step(_plan) and rows >= _plan["rows"]))
+    )
 
 
 def _qlen1():
@@ -454,6 +683,11 @@ def _flush_pending(module):
 
 def _gather_step_kv(impl, q, k, v, k_cache, v_cache, k_scale, v_scale, meta):
     """Gather each sequence's paged K/V, back to back, plus host lengths."""
+    if _step is not None and _paged_write_skipped.intersection(_step[0]):
+        raise RuntimeError(
+            "aligned decode: static decode skipped the paged K/V write, "
+            "but this step gathers K/V from the paged cache"
+        )
     lengths = meta.context_lens.to(dtype=torch.int32)
     nseq = int(lengths.shape[0])
     cu_k = torch.empty(nseq + 1, dtype=torch.int32, device=q.device)
@@ -539,6 +773,12 @@ def _patch_runner_kv_plan(module):
         _publish_step(self, batch)
         if _batched():
             _plan_step()
+            # A replayed graph runs no Python, so its indices are uploaded here.
+            if _static is not None and _flag("LUMENRL_ALIGN_STATIC_DECODE"):
+                if _plan is None:
+                    _fill_static(None)
+                elif _static_step(_plan):
+                    _fill_static(_plan)
         return orig_prepare(self, batch, *args, **kwargs)
 
     def run_model(self, *args, **kwargs):
@@ -730,6 +970,175 @@ def _absorb_gathered(module, k_full, v_full):
         offset += end
 
 
+# Requests whose decode tokens were written to the pool and not the paged
+# cache. Gathering one of them would read a stale cache. Other requests are
+# unaffected, and a request leaves the set when the scheduler frees it.
+# A dummy or graph-capture step has no request ids and must not mark anyone.
+_paged_write_skipped: set[int] = set()
+# (data_ptr, xq, xs) of the last static decode attention output, quantized by
+# its merge for the o_proj that reads it next.
+_o_quant = None
+
+
+def _fuse_o_quant() -> bool:
+    """Static decode quantizes o_proj's input in the merge; LUMENRL_ALIGN_FUSE_O_QUANT=0 turns it off."""
+    value = _flags.get("LUMENRL_ALIGN_FUSE_O_QUANT")
+    if value is None:
+        value = os.environ.get("LUMENRL_ALIGN_FUSE_O_QUANT", "1") == "1" and _o_quant_linear_ok()
+        _flags["LUMENRL_ALIGN_FUSE_O_QUANT"] = value
+    return value
+
+
+def _o_quant_linear_ok() -> bool:
+    """ATOM's per_1x128 linear quantizes its input with row-major scales here."""
+    try:
+        from atom.utils import envs
+    except ImportError:
+        return False
+    return not envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+
+
+def _install_o_quant_linear():
+    """Let the linear right after a static decode attention take ``_o_quant``.
+
+    It skips its own input quantization only when the input is that attention
+    output and the layer would quantize it with aiter's per-1x128 kernel,
+    which ``_merge_partials`` reproduces bit for bit. Any other first linear
+    drops the stash and runs unchanged.
+    """
+    busy = False
+
+    def patch(module):
+        base = getattr(module, "LinearBase", None)
+        if base is None or getattr(base.forward, "_lumenrl_o_quant", False):
+            return
+        orig = base.forward
+        per_1x128 = module.QuantType.per_1x128.value
+
+        def forward(self, x, x_scale=None, otype=module.dtypes.bf16, out=None):
+            global _o_quant
+            pre = _o_quant
+            if pre is not None:
+                _o_quant = None
+                if (
+                    x_scale is None
+                    and x.data_ptr() == pre[0]
+                    and x.dtype == torch.bfloat16
+                    and x.is_contiguous()
+                    and tuple(x.shape) == tuple(pre[1].shape)
+                    and self.native_a8_group_rows is None
+                    and self.quant_type.value == per_1x128
+                    and not self.blockscale_e8m0_scale
+                    and self.params_dtype == pre[1].dtype
+                    and getattr(self, "input_scale", None) is None
+                ):
+                    return orig(self, pre[1], x_scale=pre[2], otype=otype, out=out)
+            return orig(self, x, x_scale, otype, out)
+
+        forward._lumenrl_o_quant = True
+        base.forward = forward
+
+    class _Finder:
+        def find_spec(self, fullname, path, target=None):
+            nonlocal busy
+            if busy or fullname != "atom.model_ops.linear":
+                return None
+            busy = True
+            try:
+                spec = importlib.machinery.PathFinder.find_spec(fullname, path)
+            finally:
+                busy = False
+            if spec is None or spec.loader is None:
+                return spec
+            orig_exec = spec.loader.exec_module
+
+            def exec_module(module, _orig=orig_exec):
+                _orig(module)
+                patch(module)
+
+            spec.loader.exec_module = exec_module
+            return spec
+
+    if "atom.model_ops.linear" in sys.modules:
+        patch(sys.modules["atom.model_ops.linear"])
+    else:
+        sys.meta_path.insert(0, _Finder())
+
+
+def _rope_without_cache(impl, q, k, v, position, fwd_ctx):
+    """ATOM's aiter-RoPE ``rope_cache`` branch without its paged K/V write.
+
+    Static decode attends over the pool alone, so nothing reads that write.
+    When ``_deferred_rope`` allows it, q and k come back unrotated and
+    ``impl._lumenrl_rope`` holds what decode_static_attention needs to rotate
+    them in its pool write. ``None`` when this layer would take another ATOM
+    branch (fused QK norm, Triton attention or no rotary), which then runs
+    unchanged.
+    """
+    if (
+        impl.rotary_emb is None
+        or impl.q_norm is not None
+        or impl.k_norm is not None
+        or impl.sliding_window != -1
+        or impl.head_dim != 128
+        or position is None
+    ):
+        return None
+    layer = fwd_ctx.kv_cache_data[f"layer_{impl.layer_num}"]
+    impl.use_triton_attn = False
+    asm_layout = impl._use_asm_cache_layout(layer.k_cache, layer.v_cache, use_triton_attn=False)
+    rope = _deferred_rope(impl.rotary_emb, q, k, position)
+    if rope is None:
+        q, k = impl.rotary_emb(position, q, k)
+    impl._lumenrl_rope = rope
+    impl._cache_format = "SHUFFLE" if asm_layout else "NHD"
+    return q, k, v, layer.k_cache, layer.v_cache, layer.k_scale, layer.v_scale
+
+
+def _deferred_rope(rotary, q, k, position):
+    """``(positions, cos, sin)`` for decode_static_attention to rotate q and k itself.
+
+    Only for a plain neox ``RotaryEmbedding`` over the whole head, ATOM's or
+    aiter's on its HIP backend: both end in
+    ``aiter.rope_cached_positions_2c_fwd_inplace`` over the per-position
+    half-width cache. q/k rows need contiguous heads. ``None`` leaves the
+    rotation to ATOM.
+    """
+    import aiter.rotary_embedding as aiter_rope
+    from atom.model_ops.rotary_embedding import RotaryEmbedding
+
+    dim = q.shape[-1]
+    if type(rotary) is aiter_rope.RotaryEmbedding:
+        if aiter_rope.AITER_ROPE_TRITON_BACKEND or aiter_rope.AITER_ROPE_NATIVE_BACKEND:
+            return None
+    elif type(rotary) is RotaryEmbedding:
+        rotary.cos_cache = rotary.cos_cache.to(q.device, dtype=q.dtype)
+        rotary.sin_cache = rotary.sin_cache.to(q.device, dtype=q.dtype)
+    else:
+        return None
+    if (
+        not rotary.is_neox_style
+        or rotary.rotary_dim != dim
+        or q.dim() != 3
+        or k.dim() != 3
+        or q.stride()[1:] != (dim, 1)
+        or k.stride()[1:] != (dim, 1)
+        or position.dim() != 1
+        or position.shape[0] < q.shape[0]
+    ):
+        return None
+    cos, sin = rotary.cos_cache, rotary.sin_cache
+    if (
+        cos.dtype != q.dtype
+        or sin.dtype != q.dtype
+        or cos.device != q.device
+        or cos.shape[-1] * 2 != dim
+        or not (cos.is_contiguous() and sin.is_contiguous())
+    ):
+        return None
+    return position, cos, sin
+
+
 def patch_attention(module):
     impl = module.PagedAttentionImpl
     orig_rope = impl.rope_cache
@@ -740,15 +1149,30 @@ def patch_attention(module):
         align = _flag("LUMENRL_ALIGN_DECODE")
         if not _aiter_rope(prefill, align):
             return orig_rope(self, q, k, v, qkv, position, fwd_ctx)
-        os.environ["ATOM_FORCE_ATTN_TRITON"] = "0"
-        try:
-            result = orig_rope(self, q, k, v, qkv, position, fwd_ctx)
-        finally:
-            os.environ["ATOM_FORCE_ATTN_TRITON"] = "1"
+        static = (
+            align
+            and not prefill
+            and _flag("LUMENRL_ALIGN_CONTIG_KV")
+            and _batched()
+            and _static_decode(self, fwd_ctx, q.shape[0])
+        )
+        result = _rope_without_cache(self, q, k, v, position, fwd_ctx) if static else None
+        if result is not None:
+            if _step is not None:
+                _paged_write_skipped.update(_step[0])
+        else:
+            os.environ["ATOM_FORCE_ATTN_TRITON"] = "0"
+            try:
+                result = orig_rope(self, q, k, v, qkv, position, fwd_ctx)
+            finally:
+                os.environ["ATOM_FORCE_ATTN_TRITON"] = "1"
         if align and _flag("LUMENRL_ALIGN_CONTIG_KV"):
             _drop_retired(self)
             if _batched():
-                if _plan is not None:
+                if static:
+                    _q_out, k_out, v_out, *_ = result
+                    self._lumenrl_static_kv = (k_out, v_out)
+                elif _plan is not None:
                     if _history_blocked(fwd_ctx):
                         _plan["blocked"] = True
                     else:
@@ -760,6 +1184,28 @@ def patch_attention(module):
         return result
 
     def paged_attention_varlen(self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx):
+        static_kv = self.__dict__.get("_lumenrl_static_kv")
+        if static_kv is not None:
+            self._lumenrl_static_kv = None
+            k_pool, v_pool = _pool(self, static_kv[0])
+            st = _static_buffers(q.device, q.shape[1] // k_pool.shape[1])
+            if _plan is not None and not _plan.get("static"):
+                _fill_static(_plan)
+            rope = self.__dict__.get("_lumenrl_rope")
+            self._lumenrl_rope = None
+            if not _fuse_o_quant():
+                return _qlen1().decode_static_attention(
+                    q, static_kv[0], static_kv[1], k_pool, v_pool, st, self.scale, rope
+                )
+            from aiter import dtypes
+
+            global _o_quant
+            out, xq, xs = _qlen1().decode_static_attention(
+                q, static_kv[0], static_kv[1], k_pool, v_pool, st, self.scale, rope, dtypes.fp8
+            )
+            _o_quant = (out.data_ptr(), xq, xs)
+            return out
+
         meta = fwd_ctx.attn_metadata
         sliding = (self.sliding_window, 0, 0) if self.sliding_window > 0 else (-1, -1, 0)
 

@@ -234,6 +234,94 @@ def _install_weight_sync_fence():
 if os.environ.get("LUMENRL_ALIGN_SYNC_WEIGHTS") == "1":
     _install_weight_sync_fence()
 
+
+def _install_fp8_decode_gemm_config():
+    """Narrow BLOCK_N of the Triton blockscale GEMM at decode M.
+
+    aiter's M<=8 tile is often BLOCK_N=32, so a narrow N launches fewer
+    programs than the GPU has CUs. Halve BLOCK_N (down to 16) until the grid
+    covers the CUs. Only configs that already reduce K as one split of 128
+    are touched: that is the order training uses, so a row at M<=8 stays the
+    same value as the row training computes at any M. Every other shape keeps
+    aiter's own tile.
+    """
+    target = "aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale"
+    cu_count = None
+
+    def _cus():
+        nonlocal cu_count
+        if cu_count is None:
+            import torch
+
+            cu_count = torch.cuda.get_device_properties(0).multi_processor_count
+        return cu_count
+
+    def _narrow_block_n(config, M, N):
+        block_n = config.get("BLOCK_SIZE_N")
+        block_m = config.get("BLOCK_SIZE_M")
+        if (
+            not isinstance(block_n, int)
+            or not isinstance(block_m, int)
+            or block_m <= 0
+            or block_n <= 16
+            or config.get("NUM_KSPLIT", 1) != 1
+            or config.get("BLOCK_SIZE_K") != 128
+        ):
+            return
+        cus = _cus()
+
+        def grid(width):
+            return ((M + block_m - 1) // block_m) * ((N + width - 1) // width)
+
+        while block_n > 16 and block_n % 2 == 0 and grid(block_n) < cus:
+            block_n //= 2
+        config["BLOCK_SIZE_N"] = block_n
+
+    def _wrap(module):
+        current = module._get_config
+        if getattr(current, "_lumenrl_decode_tile", False):
+            return
+
+        def _get_config(M, N, K, *args, **kwargs):
+            shuffle = args[0] if args else kwargs.get("shuffle", False)
+            config, tuned = current(M, N, K, *args, **kwargs)
+            if M <= 8 and not shuffle:
+                _narrow_block_n(config, M, N)
+            return config, tuned
+
+        _get_config._lumenrl_decode_tile = True
+        module._get_config = _get_config
+
+    if target in sys.modules:
+        _wrap(sys.modules[target])
+        return
+
+    class _Finder:
+        def find_spec(self, fullname, path, target_=None):
+            if fullname != target:
+                return None
+            sys.meta_path.remove(self)
+            try:
+                spec = importlib.machinery.PathFinder.find_spec(fullname, path)
+            finally:
+                sys.meta_path.insert(0, self)
+            if spec is None or spec.loader is None:
+                return spec
+            orig_exec = spec.loader.exec_module
+
+            def exec_module(module, _orig=orig_exec):
+                _orig(module)
+                _wrap(module)
+
+            spec.loader.exec_module = exec_module
+            return spec
+
+    sys.meta_path.insert(0, _Finder())
+
+
+if os.environ.get("LUMENRL_FP8_DECODE_GEMM", "0") == "1":
+    _install_fp8_decode_gemm_config()
+
 if os.environ.get("LUMENRL_PREFILL_RESCORE", "0") == "1":
     from prefill_rescore import install as _install_prefill_rescore
 
