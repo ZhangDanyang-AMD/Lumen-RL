@@ -116,6 +116,34 @@ def segments(mask: list[int]) -> list[tuple[int, int]]:
     return runs
 
 
+def test_a_session_the_caller_gives_is_used_and_left_open():
+    tok = ChatMLTokenizer()
+    tool, given = SessionTool(), CountingSession()
+    engine = ScriptedEngine(tok, [(call("1"), "stop"), ("done", "stop")])
+    loop = ToolAgentLoop(ChatTemplateTokenizer(tok), [tool])
+
+    trajectory = asyncio.run(loop.run(
+        engine.generate, PROMPT, {"max_tokens": 10_000}, 4096, sessions={"code_interpreter": given},
+    ))
+
+    assert given.calls == [{"code": "1"}] and not given.closed
+    assert tool.sessions == [] and trajectory.stop_reason == "answer"
+
+
+class SubmittingTool(EchoTool):
+    async def __call__(self, arguments):
+        self.calls.append(arguments)
+        return ToolResult("ignored", done=True)
+
+
+def test_a_call_that_is_done_ends_the_rollout_as_submitted():
+    trajectory, engine, tool, _ = run_loop([(call("x"), "stop"), ("never generated", "stop")], tool=SubmittingTool())
+
+    assert trajectory.stop_reason == "submitted" and tool.calls == [{"code": "x"}]
+    assert trajectory.assistant_turns == 1 and len(engine.turns) == 1
+    assert set(trajectory.response_mask) == {1}
+
+
 def test_tool_round_trip_masks_the_tool_output():
     trajectory, _, tool, tok = run_loop([(call("42"), "stop"), ("Answer: 42", "stop")])
 

@@ -23,7 +23,7 @@ from lumenrl.agent.tool_parser import HermesToolParser
 from lumenrl.agent.tools import SandboxFusionCodeTool, StatefulSandboxFusionCodeTool
 from lumenrl.agent.trajectory import Trajectory
 
-STOP_REASONS = ("answer", "length", "max_turns", "abort")
+STOP_REASONS = ("answer", "length", "max_turns", "abort", "submitted")
 
 
 class AgentGroupRollout:

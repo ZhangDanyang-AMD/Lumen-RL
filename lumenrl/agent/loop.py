@@ -84,21 +84,29 @@ class ToolAgentLoop:
         sampling_params: dict[str, Any],
         max_response_tokens: int,
         max_sequence_tokens: int | None = None,
+        sessions: dict[str, ToolSession] | None = None,
     ) -> Trajectory:
         """Roll out ``messages``; the response stays within ``max_response_tokens``
-        and, with ``max_sequence_tokens``, prompt plus response within that."""
+        and, with ``max_sequence_tokens``, prompt plus response within that.
+
+        ``sessions`` are the caller's, by tool name, for tools whose state the
+        caller sets up before the rollout and reads after it (a SWE sandbox): the
+        loop uses them and leaves closing them to the caller."""
         trajectory = Trajectory(prompt_ids=self._chat.encode_prompt(messages, self.tool_schemas))
         if max_sequence_tokens is not None:
             max_response_tokens = min(
                 max_response_tokens, max_sequence_tokens - len(trajectory.prompt_ids),
             )
-        sessions: dict[str, ToolSession] = {}
+        given = dict(sessions or {})
+        live: dict[str, ToolSession] = dict(given)
         try:
             await self._roll_out(
-                trajectory, generate, sampling_params, max_response_tokens, sessions,
+                trajectory, generate, sampling_params, max_response_tokens, live,
             )
         finally:
-            for name, session in sessions.items():
+            for name, session in live.items():
+                if name in given:
+                    continue
                 try:
                     await session.close()
                 except Exception as e:  # noqa: BLE001 - a failed close must not lose the rollout
@@ -178,6 +186,9 @@ class ToolAgentLoop:
         trajectory.tool_s += time.perf_counter() - t0
         trajectory.tool_calls += len(results)
         trajectory.tool_errors += sum(not result.ok for result in results)
+        if any(result.done for result in results):
+            trajectory.stop_reason = "submitted"
+            return False
 
         environment = self._chat.encode_tool_responses(
             [

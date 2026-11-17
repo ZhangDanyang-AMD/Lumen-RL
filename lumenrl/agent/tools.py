@@ -21,6 +21,8 @@ class ToolResult:
     # or the sandbox itself failing. An exception in the model's code is a
     # successful call whose output is the traceback.
     ok: bool = True
+    # True when the call ends the rollout, as a SWE submission does.
+    done: bool = False
 
 
 class Tool(Protocol):
