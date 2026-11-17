@@ -1,0 +1,9 @@
+DeepSeek-V4.1-Flash reference implementation (test oracle)
+==========================================================
+
+model.py, engram.py, image_processor.py and vision.py are copied without changes from the
+`inference/` folder of the deepseek-ai/DeepSeek-V4.1-Flash model repository, licensed under the
+MIT License (copy in LICENSE next to this file).
+
+kernel.py is not the released file: the released one is tilelang. This one maps the same
+functions onto lumenrl.models.deepseek_v41.ops so the reference runs on CPU with BF16 weights.
