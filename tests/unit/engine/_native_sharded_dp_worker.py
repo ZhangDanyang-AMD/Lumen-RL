@@ -2,7 +2,8 @@
 
 Not collected by pytest. Env: ``LUMENRL_ROOT``, ``SHARDED_DP`` (``torch_fsdp2`` or
 ``megatron_fsdp``), ``SHARDED_DP_MODEL_DIR`` (a directory every rank can see; rank 0
-writes a tiny random Qwen3 checkpoint there), ``SHARDED_DP_TP``.
+writes a tiny random Qwen3 checkpoint there), ``SHARDED_DP_TP``, ``SHARDED_DP_STRATEGY``
+(Megatron FSDP's ``data_parallel_sharding_strategy``, default ``optim_grads_params``).
 
 Both engines load the same weights and see the same rows; data-parallel rank ``r``
 gets ``r + 2`` rows, so the sharded engine has to pad microbatch counts into lockstep. Prints
@@ -28,6 +29,7 @@ from lumenrl.engine.training.megatron_native_engine import MegatronNativeEngine 
 VOCAB = 512
 TP = int(os.environ.get("SHARDED_DP_TP", "1"))
 MODE = os.environ.get("SHARDED_DP", "torch_fsdp2")
+STRATEGY = os.environ.get("SHARDED_DP_STRATEGY", "optim_grads_params")
 LR = 1e-3
 
 
@@ -47,7 +49,8 @@ def _engine(model_dir: str, data_parallel: str) -> MegatronNativeEngine:
     engine = MegatronNativeEngine(
         model_config={"local_path": model_dir},
         engine_config={"data_parallel": data_parallel, "seed": 0,
-                       "tensor_model_parallel_size": TP},
+                       "tensor_model_parallel_size": TP,
+                       "data_parallel_sharding_strategy": STRATEGY},
         optimizer_config={"lr": LR, "lr_warmup_steps": 0, "clip_grad": 1.0,
                           "weight_decay": 0.0},
         model_name=model_dir,
@@ -141,7 +144,7 @@ def main() -> None:
 
     dist.barrier()
     if rank == 0:
-        print(f"SHARDED_DP_OK {MODE} world={world} tp={TP} grad_norm ddp={gn_ddp:.6g} "
+        print(f"SHARDED_DP_OK {MODE} {STRATEGY} world={world} tp={TP} grad_norm ddp={gn_ddp:.6g} "
               f"sharded={gn_fsdp:.6g} "
               f"tensors={len(after_fsdp)} stream={n_stream}", flush=True)
     dist.destroy_process_group()

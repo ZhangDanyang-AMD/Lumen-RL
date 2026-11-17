@@ -89,21 +89,36 @@ def test_dist_checkpoint_refused_when_sharded(flag):
         engine._dist_sharded_state_dict(is_loading=False)
 
 
+def _run_worker(mode, nproc, tp, strategy, port, tmp_path):
+    env = dict(os.environ, LUMENRL_ROOT=str(REPO_ROOT), SHARDED_DP=mode,
+               SHARDED_DP_TP=str(tp), SHARDED_DP_STRATEGY=strategy,
+               SHARDED_DP_MODEL_DIR=str(tmp_path / "tiny"))
+    proc = subprocess.run(
+        [sys.executable, "-m", "torch.distributed.run", f"--nproc_per_node={nproc}",
+         f"--master_port={port}", str(WORKER)],
+        capture_output=True, text=True, timeout=1800, env=env, cwd=str(REPO_ROOT),
+    )
+    assert "SHARDED_DP_OK" in proc.stdout, (
+        f"{WORKER.name} failed (rc={proc.returncode}) {mode} {strategy} nproc={nproc} tp={tp}\n"
+        f"--- stdout tail ---\n{proc.stdout[-3000:]}\n"
+        f"--- stderr tail ---\n{proc.stderr[-3000:]}"
+    )
+
+
 @pytest.mark.multigpu
 @pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("nproc, tp", [(1, 1), (2, 1), (4, 1), (4, 2)])
 def test_sharded_dp_matches_ddp(mode, nproc, tp, tmp_path):
     if _visible_gpus() < nproc:
         pytest.skip(f"needs {nproc} GPUs")
-    env = dict(os.environ, LUMENRL_ROOT=str(REPO_ROOT), SHARDED_DP=mode,
-               SHARDED_DP_TP=str(tp), SHARDED_DP_MODEL_DIR=str(tmp_path / "tiny"))
-    proc = subprocess.run(
-        [sys.executable, "-m", "torch.distributed.run", f"--nproc_per_node={nproc}",
-         f"--master_port={29760 + 4 * nproc + tp + 20 * MODES.index(mode)}", str(WORKER)],
-        capture_output=True, text=True, timeout=1800, env=env, cwd=str(REPO_ROOT),
-    )
-    assert "SHARDED_DP_OK" in proc.stdout, (
-        f"{WORKER.name} failed (rc={proc.returncode}) {mode} nproc={nproc} tp={tp}\n"
-        f"--- stdout tail ---\n{proc.stdout[-3000:]}\n"
-        f"--- stderr tail ---\n{proc.stderr[-3000:]}"
-    )
+    _run_worker(mode, nproc, tp, "optim_grads_params",
+                29760 + 4 * nproc + tp + 20 * MODES.index(mode), tmp_path)
+
+
+@pytest.mark.multigpu
+@pytest.mark.parametrize("nproc, tp", [(2, 1), (4, 2)])
+def test_megatron_fsdp_optim_grads_matches_ddp(nproc, tp, tmp_path):
+    """ZeRO-2: whole weights, sharded gradients and optimizer state."""
+    if _visible_gpus() < nproc:
+        pytest.skip(f"needs {nproc} GPUs")
+    _run_worker("megatron_fsdp", nproc, tp, "optim_grads", 29820 + 4 * nproc + tp, tmp_path)
