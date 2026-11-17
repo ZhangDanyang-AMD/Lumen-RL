@@ -705,6 +705,8 @@ class MegatronBaseEngine(BaseEngine):
                 g, src = prm.grad, "grad"
             if g is None:
                 continue
+            if hasattr(g, "to_local"):                   # FSDP2: this rank's shard
+                g = g.to_local()
             n_with_grad += 1
             if not torch.isfinite(g).all():
                 offenders.append(

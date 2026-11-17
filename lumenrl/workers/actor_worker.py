@@ -380,6 +380,11 @@ class LumenActorWorker(BaseWorker):
                 "dist_checkpoint_path": meg_cfg.get("dist_checkpoint_path", None),
                 "deterministic_mode": meg_cfg.get("deterministic_mode", None),
                 "build_optimizer": meg_cfg.get("build_optimizer", True),
+                "data_parallel": meg_cfg.get("data_parallel", "ddp"),
+                "reshard_after_forward": meg_cfg.get("reshard_after_forward", True),
+                "data_parallel_sharding_strategy": meg_cfg.get(
+                    "data_parallel_sharding_strategy", "optim_grads_params"
+                ),
                 # Adam step for the offloaded fraction runs on the CPU; see
                 # optimizer_cpu_offload above.
                 "overlap_cpu_optimizer_d2h_h2d": meg_cfg.get(

@@ -193,6 +193,15 @@ class MegatronConfig:
     moe_permute_fusion: bool = False
     # Distributed optimizer: shard FP32 master + Adam state across DP ranks.
     use_distributed_optimizer: bool = True
+    # Data parallelism of the native engine: "ddp" (Megatron DDP with the
+    # distributed optimizer), "torch_fsdp2" (Megatron's PyTorch FSDP2 wrapper:
+    # parameters, FP32 master and Adam state sharded across DP; PP=1 and EP=1)
+    # or "megatron_fsdp" (Megatron FSDP; PP=1).
+    data_parallel: str = "ddp"
+    # torch_fsdp2: free each layer's gathered parameters after its forward.
+    reshard_after_forward: bool = True
+    # megatron_fsdp: no_shard | optim | optim_grads | optim_grads_params.
+    data_parallel_sharding_strategy: str = "optim_grads_params"
     # MILES numerical-alignment knobs for BF16 training.
     grad_reduce_in_fp32: bool = True
     attention_softmax_in_fp32: bool = True

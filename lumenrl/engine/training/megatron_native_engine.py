@@ -26,6 +26,7 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor
 
 from lumenrl.core.protocol import DataProto
 from lumenrl.engine.training.base_engine import EngineRegistry
@@ -196,6 +197,37 @@ def _to_global_key(key: str, offset: int) -> str:
     return f"{key[:m.start(2)]}{int(m.group(2)) + offset}{key[m.end(2):]}"
 
 
+def _torch_fsdp2(tfcfg, ddp_cfg, module):
+    """Megatron's ``TorchFullyShardedDataParallel`` around ``module``, reducing
+    gradients in FP32.
+
+    The wrapper passes ``fully_shard`` only a mesh and ``reshard_after_forward``,
+    so without a policy FSDP2 would reduce-scatter BF16 gradients; the classic
+    DDP path reduces in FP32 (``grad_reduce_in_fp32``). Microbatch gradients
+    accumulated with sync off are kept in the reduce dtype too. Forward inputs
+    keep their dtypes: casting them would round the FP32 rotary embeddings each
+    layer receives to BF16.
+    """
+    import functools
+
+    import megatron.core.distributed.torch_fully_sharded_data_parallel as tfsdp
+    from torch.distributed.fsdp import MixedPrecisionPolicy
+
+    class TorchFSDP2(tfsdp.TorchFullyShardedDataParallel):
+        def finish_grad_sync(self, force_all_reduce: bool = False) -> None:
+            # ``finalize_model_grads`` passes ``force_all_reduce``, which the
+            # base class does not take. FSDP2 reduce-scatters during backward.
+            pass
+
+    policy = MixedPrecisionPolicy(reduce_dtype=torch.float32, cast_forward_inputs=False)
+    fully_shard = tfsdp.fully_shard
+    tfsdp.fully_shard = functools.partial(fully_shard, mp_policy=policy)
+    try:
+        return TorchFSDP2(config=tfcfg, ddp_config=ddp_cfg, module=module)
+    finally:
+        tfsdp.fully_shard = fully_shard
+
+
 @dataclass(frozen=True)
 class StageOutput:
     """One tensor the stage gather will emit, described before any collective.
@@ -241,6 +273,13 @@ class MegatronNativeEngine(MegatronBaseEngine):
     # answerable before then, with ``_caps`` falling back to the defaults.
     _spec = None
     _dsv4_align = 1
+    _fsdp2 = False
+    _mfsdp = False
+
+    @property
+    def _sharded_dp(self) -> bool:
+        """Parameters are sharded across DP, so every forward is a DP collective."""
+        return self._fsdp2 or self._mfsdp
 
     @staticmethod
     def _fp8_kwargs(ec, num_layers: int, pp: int) -> dict:
@@ -335,6 +374,16 @@ class MegatronNativeEngine(MegatronBaseEngine):
         self._ep = ep
         self._etp = etp
         self._sp = sp
+        data_parallel = str(ec.get("data_parallel", "ddp")).lower()
+        if data_parallel not in ("ddp", "torch_fsdp2", "megatron_fsdp"):
+            raise ValueError(
+                "megatron_cfg.data_parallel must be 'ddp', 'torch_fsdp2' or "
+                f"'megatron_fsdp', got {data_parallel!r}"
+            )
+        # A forward-only engine is never wrapped, so it keeps whole parameters.
+        wrapped = bool(ec.get("build_optimizer", True))
+        self._fsdp2 = data_parallel == "torch_fsdp2" and wrapped
+        self._mfsdp = data_parallel == "megatron_fsdp" and wrapped
         # Forward-side knobs shared with the base log-prob helpers.
         self._logprob_chunk_size = int(ec.get("log_probs_chunk_size") or 0)
         self._dynamic_batch = bool(ec.get("enable_dynamic_batch") or False)
@@ -657,14 +706,42 @@ class MegatronNativeEngine(MegatronBaseEngine):
         self._overlap_param_gather = bool(ec.get("overlap_param_gather", False))
         if self._overlap_param_gather and not self._overlap_grad_reduce:
             self._overlap_grad_reduce = True
-        ddp_cfg = DistributedDataParallelConfig(
-            grad_reduce_in_fp32=True,
-            overlap_grad_reduce=self._overlap_grad_reduce,
-            overlap_param_gather=self._overlap_param_gather,
-            use_distributed_optimizer=True, average_in_collective=True,
-            bucket_size=(int(_bucket) if _bucket else None),
-        )
-        self._ddp = DDP(config=tfcfg, ddp_config=ddp_cfg, module=self.module)
+        if self._fsdp2:
+            self._check_sharded_dp(tfcfg, "torch_fsdp2")
+            ddp_cfg = DistributedDataParallelConfig(
+                grad_reduce_in_fp32=True, use_distributed_optimizer=False,
+            )
+            ddp_cfg.reshard_after_forward = bool(ec.get("reshard_after_forward", True))
+            # The export plan reads ``sharded_state_dict()``, built for whole
+            # parameters; it depends only on shapes, so take it before sharding.
+            self._cache_stage_plans()
+            self._ddp = _torch_fsdp2(tfcfg, ddp_cfg, self.module)
+        elif self._mfsdp:
+            from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+                FullyShardedDataParallel,
+            )
+
+            self._check_sharded_dp(tfcfg, "megatron_fsdp")
+            strategy = str(ec.get("data_parallel_sharding_strategy", "optim_grads_params"))
+            ddp_cfg = DistributedDataParallelConfig(
+                grad_reduce_in_fp32=True,
+                overlap_grad_reduce=self._overlap_grad_reduce,
+                overlap_param_gather=self._overlap_param_gather,
+                use_distributed_optimizer=True, use_megatron_fsdp=True,
+                data_parallel_sharding_strategy=strategy,
+                bucket_size=(int(_bucket) if _bucket else None),
+            )
+            self._cache_stage_plans()
+            self._ddp = FullyShardedDataParallel(config=tfcfg, ddp_config=ddp_cfg, module=self.module)
+        else:
+            ddp_cfg = DistributedDataParallelConfig(
+                grad_reduce_in_fp32=True,
+                overlap_grad_reduce=self._overlap_grad_reduce,
+                overlap_param_gather=self._overlap_param_gather,
+                use_distributed_optimizer=True, average_in_collective=True,
+                bucket_size=(int(_bucket) if _bucket else None),
+            )
+            self._ddp = DDP(config=tfcfg, ddp_config=ddp_cfg, module=self.module)
 
         opt_kwargs = {}
         if bool(ec.get("optimizer_cpu_offload", False)):
@@ -698,7 +775,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
             adam_beta2=float(oc.get("adam_beta2", 0.95)),
             adam_eps=float(oc.get("adam_eps", 1e-8)),
             clip_grad=self._clip, bf16=True, fp16=False,
-            params_dtype=torch.bfloat16, use_distributed_optimizer=True,
+            params_dtype=torch.bfloat16, use_distributed_optimizer=not self._fsdp2,
             **opt_kwargs,
         )
         self.optimizer = get_megatron_optimizer(opt_cfg, model_chunks=[self._ddp])
@@ -715,7 +792,9 @@ class MegatronNativeEngine(MegatronBaseEngine):
         if self._rank() == 0:
             n = sum(p.numel() for p in self.module.parameters() if p.requires_grad)
             logger.info(
-                "MegatronNativeEngine: TE model+distributed-optimizer ready, %d params, dp_size=%d",
+                "MegatronNativeEngine: TE model+%s ready, %d params, dp_size=%d",
+                "torch FSDP2" if self._fsdp2 else
+                "Megatron FSDP" if self._mfsdp else "distributed-optimizer",
                 n, self.get_data_parallel_size(),
             )
 
@@ -866,6 +945,9 @@ class MegatronNativeEngine(MegatronBaseEngine):
         output buffer, so it costs nothing extra; at EP=1 there is no gather,
         and stacking would mean copying every expert each sync.
         """
+        plans = getattr(self, "_stage_plans", None)
+        if plans is not None:
+            return plans[bool(stack_experts) and self._ep > 1]
         from megatron.core import parallel_state as mpu
         from megatron.core.dist_checkpointing.mapping import (
             ShardedTensor,
@@ -986,6 +1068,38 @@ class MegatronNativeEngine(MegatronBaseEngine):
             for o in rec.outputs
         ]
 
+    def _whole_named_params(self) -> Iterator[tuple[str, torch.Tensor]]:
+        """This rank's model-parallel parameters, each whole across DP, in module order.
+
+        Under sharded data parallelism this is a DP collective per parameter or
+        bucket, so it must be drained on every rank. FSDP2 holds a dim-0 slice per
+        DP rank and ``full_tensor`` gathers it. Megatron FSDP swaps its sharded
+        parameters for whole ones only in forward, so this does the same: gather
+        one bucket, copy its parameters out (the bucket is freed for the next),
+        and put the sharded parameters back at the end.
+        """
+        if not self._mfsdp:
+            for name, param in self.module.named_parameters():
+                p = param.detach()
+                yield name, (p.full_tensor() if isinstance(p, DTensor) else p)
+            return
+        fsdp = self._ddp.module
+        fsdp._replace_param_with_raw_if_needed()
+        buckets = fsdp.param_and_grad_buffer.param_to_param_group
+        held = None
+        try:
+            for name, param in self.module.named_parameters():
+                if buckets[param] != held:
+                    if held is not None:
+                        fsdp.all_gather_pipeline.release_bucket(held, False)
+                    held = buckets[param]
+                    fsdp.all_gather_and_wait_parameters_ready([param], prefetch=False)
+                yield name, param.detach().clone()
+        finally:
+            if held is not None:
+                fsdp.all_gather_pipeline.release_bucket(held, False)
+            fsdp.synchronize_param_gather()
+
     def _stage_named_params(self, recipes: list[StageRecipe] | None = None):
         """Yield this PP stage's params as (global_name, tensor), gathered.
 
@@ -1018,14 +1132,12 @@ class MegatronNativeEngine(MegatronBaseEngine):
                     f"stage plan predicted {want}, gather produced {got}"
                 )
 
-        for recipe, (name, param) in zip(
-            recipes, self.module.named_parameters(), strict=True,
-        ):
+        for recipe, (name, p) in zip(recipes, self._whole_named_params(), strict=True):
             if recipe.local_name != name:
                 raise AssertionError(
                     f"stage plan name {recipe.local_name!r} != parameter {name!r}"
                 )
-            p = param.detach().contiguous()
+            p = p.contiguous()
             if recipe.kind == "pass":
                 _check(recipe.outputs[0].name, p, recipe.outputs[0])
                 yield recipe.outputs[0].name, p
@@ -1274,12 +1386,69 @@ class MegatronNativeEngine(MegatronBaseEngine):
     # because it gives both topologies the same packed-microbatch semantics and
     # gradient finalization. Each microbatch is one packed bin of sequences.
 
+    def _check_sharded_dp(self, tfcfg, mode: str) -> None:
+        """Reject what ``data_parallel: torch_fsdp2`` or ``megatron_fsdp`` cannot run.
+
+        Megatron's torch-FSDP2 wrapper supports neither pipeline nor expert
+        parallelism. Gradient-accumulation fusion writes ``main_grad``, a buffer
+        only the classic DDP wrapper allocates (Megatron FSDP needs a newer TE).
+        Overlapped parameter gathers belong to the distributed optimizer, which
+        FSDP2 replaces. The rest is untested with either: pipeline parallelism
+        with Megatron FSDP, FP8 training, optimizer CPU offload, and families
+        that need the pipeline forward.
+        """
+        problems = []
+        if self._pp != 1:
+            problems.append(f"pipeline_model_parallel_size={self._pp} (needs 1)")
+        if mode == "torch_fsdp2" and self._ep != 1:
+            problems.append(f"expert_model_parallel_size={self._ep} (needs 1)")
+        if self._caps.requires_pipeline_forward:
+            problems.append(f"model family {self._spec.name!r} needs the pipeline forward")
+        if bool(getattr(tfcfg, "gradient_accumulation_fusion", False)):
+            problems.append("gradient_accumulation_fusion")
+        if getattr(tfcfg, "fp8", None):
+            problems.append("FP8 training (untested)")
+        if mode == "torch_fsdp2" and self._overlap_param_gather:
+            problems.append("overlap_param_gather")
+        if bool(self.engine_config.get("optimizer_cpu_offload", False)):
+            problems.append("optimizer_cpu_offload")
+        if problems:
+            raise ValueError(
+                f"megatron_cfg.data_parallel={mode} does not support: " + "; ".join(problems)
+            )
+
+    def _cache_stage_plans(self) -> None:
+        """Take the export plans while parameters are whole.
+
+        ``_stage_plan`` reads ``sharded_state_dict()``, built for whole parameters;
+        the plans depend only on shapes, so they hold after sharding.
+        """
+        plain = self._stage_plan()
+        stacked = self._stage_plan(stack_experts=True) if self._ep > 1 else plain
+        self._stage_plans = {False: plain, True: stacked}
+
+    def _no_grad_sync(self):
+        """Context in which backward accumulates gradients without reducing them."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def no_sync():
+            self.module.set_requires_gradient_sync(False)
+            try:
+                yield
+            finally:
+                self.module.set_requires_gradient_sync(True)
+
+        return no_sync()
+
     def _pp_setup_config(self) -> None:
         """Wire the schedule's grad hooks onto the transformer config (once).
 
         Both hooks are backward-only, so a forward-only engine
         (``build_optimizer=False``) leaves them unset rather than dereferencing
-        an optimizer it never built.
+        an optimizer it never built. Under either FSDP every backward
+        reduce-scatters unless sync is off, so the schedule turns it off for all
+        microbatches but the last, as it does for DDP's ``no_sync``.
         """
         if getattr(self, "_pp_cfg_ready", False):
             return
@@ -1287,6 +1456,10 @@ class MegatronNativeEngine(MegatronBaseEngine):
         if self.optimizer is not None:
             self._tfcfg.finalize_model_grads_func = finalize_model_grads
             self._tfcfg.grad_scale_func = self.optimizer.scale_loss
+            if self._fsdp2:
+                self._tfcfg.no_sync_func = self._no_grad_sync
+            elif self._mfsdp:
+                self._tfcfg.no_sync_func = self._ddp.no_sync
         self._tfcfg.timers = None
         self._pp_cfg_ready = True
 
@@ -1680,19 +1853,27 @@ class MegatronNativeEngine(MegatronBaseEngine):
         return full_lp, full_ent
 
     def _pad_mbs_for_ep(self, mbs: list) -> list:
-        """Lockstep the microbatch COUNT across the Expert-Parallel group.
+        """Lockstep the microbatch COUNT across the Expert-Parallel group, or every
+        rank under sharded data parallelism.
 
         MoE's all-to-all token dispatch is a collective over the EP group, so every
         EP rank must run the same NUMBER of forward passes or the collective hangs.
-        RL microbatch counts are data-dependent and differ per DP/EP rank, so we
-        all-reduce the max count over the EP group and pad short ranks with dummy
-        2-token microbatches (empty ``rows`` -> zero loss / zero grad, but they
-        still participate in the expert all-to-all)."""
-        if not getattr(self, "_is_moe", False) or self._ep <= 1:
-            return mbs
+        Sharded data parallelism all-gathers parameters in every forward and
+        backward over the DP x CP group (and the expert-DP group for experts),
+        with the same consequence; at PP=1 the whole world covers every such
+        group. RL microbatch counts are data-dependent and differ per DP/EP rank,
+        so we all-reduce the max count over the group and pad short ranks with
+        dummy 2-token microbatches (empty ``rows`` -> zero loss / zero grad, but
+        they still join the collectives)."""
         from megatron.core import parallel_state as mpu
+        if self._sharded_dp:
+            group = None
+        elif getattr(self, "_is_moe", False) and self._ep > 1:
+            group = mpu.get_expert_model_parallel_group()
+        else:
+            return mbs
         cnt = torch.tensor([len(mbs)], device="cuda", dtype=torch.long)
-        dist.all_reduce(cnt, op=dist.ReduceOp.MAX, group=mpu.get_expert_model_parallel_group())
+        dist.all_reduce(cnt, op=dist.ReduceOp.MAX, group=group)
         target = int(cnt.item())
         while len(mbs) < target:
             mbs.append({"rows": [], "ids_list": [torch.zeros(2, dtype=torch.long, device="cuda")]})
@@ -1797,6 +1978,12 @@ class MegatronNativeEngine(MegatronBaseEngine):
             self._spec.pre_forward_check(self)
         if self._caps.requires_pipeline_forward:
             return self._pp_update_policy(batch)
+        if self._sharded_dp:
+            if batch.meta.get("task_type") == "sft":
+                raise NotImplementedError(
+                    "SFT is not supported with a sharded data_parallel (torch_fsdp2, megatron_fsdp)"
+                )
+            return self._pp_update_policy(batch)
         if self._pp == 1 and self._cp == 1 and not getattr(self, "_is_moe", False):
             return super().engine_update_policy(batch)
         return self._pp_update_policy(batch)
@@ -1804,7 +1991,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
     def _pp_update_policy(self, batch) -> dict[str, float]:
         from megatron.core.pipeline_parallel import get_forward_backward_func
 
-        if batch.batch_size == 0 and not getattr(self, "_is_moe", False):
+        if batch.batch_size == 0 and not (getattr(self, "_is_moe", False) or self._sharded_dp):
             return {"loss": 0.0, "lr": self._cur_lr(), "grad_norm": 0.0}
         self._pp_setup_config()
         meta = dict(batch.meta)
@@ -1976,7 +2163,8 @@ class MegatronNativeEngine(MegatronBaseEngine):
             self._spec.pre_forward_check(self)
         if self._caps.requires_pipeline_forward:
             return self._pp_compute_log_probs(batch)
-        if self._pp == 1 and self._cp == 1 and not getattr(self, "_is_moe", False):
+        if (self._pp == 1 and self._cp == 1 and not getattr(self, "_is_moe", False)
+                and not self._sharded_dp):
             return super().engine_compute_log_probs(batch)
         return self._pp_compute_log_probs(batch)
 
@@ -2040,7 +2228,9 @@ class MegatronNativeEngine(MegatronBaseEngine):
             try:
                 with torch.no_grad():
                     data_store = fwd_bwd(
-                        forward_step_func=forward_step, data_iterator=[data_iter], model=[self.module],
+                        forward_step_func=forward_step, data_iterator=[data_iter],
+                        # Megatron FSDP swaps whole parameters in only in its own forward.
+                        model=[self._ddp if self._mfsdp else self.module],
                         num_microbatches=num_mb, seq_length=1, micro_batch_size=1,
                         forward_only=True, collect_non_loss_data=True,
                     )
@@ -2071,6 +2261,11 @@ class MegatronNativeEngine(MegatronBaseEngine):
         which the torch_dist save strategy rejects. gather_scatter is torch_dist
         compatible and still supports DP-resharding on load.
         """
+        if self._sharded_dp:
+            raise NotImplementedError(
+                "dist-checkpoints are not supported with a sharded data_parallel "
+                "(torch_fsdp2, megatron_fsdp) yet"
+            )
         model_ssd = self.module.sharded_state_dict()
         opt_ssd = self.optimizer.sharded_state_dict(
             model_ssd, is_loading=is_loading,
