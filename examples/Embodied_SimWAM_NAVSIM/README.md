@@ -61,10 +61,12 @@ ROOT=/home/danyzhan CUDA_VISIBLE_DEVICES=4,5,6,7 \
 `LUMEN_ENABLE` is a comma-separated list. Default in `run_embodied_grpo.sh` and the Dockerfile:
 
 ```bash
-export LUMEN_ENABLE=lumen_linear,aiter_conv
+export LUMEN_ENABLE=aiter_conv
 ```
 
 `hf_attn_patch` is not in the training default. SimWAM passes a bool mask on every attention call, so Lumen only takes the `no_grad` ones (rollout, old and reference log-probs) and launches a per-batch mask one batch at a time, with the mask materialised as a bias each call. On 2×MI350X that path made a rollout cycle (1 rollout + 4 optimizer steps) 36% slower than torch SDPA, which runs aotriton `attn_fwd` once per call.
+
+`lumen_linear` is not in the training default either. The AITER tuned bf16 GEMM has no entry for the SimWAM shapes and falls back to the torch GEMM, so the outputs are bit-identical to `nn.Linear` and only the dispatch cost is added: without it a rollout cycle was 14% faster.
 
 Each name is one `LumenConfig.enable` call. Empty, `0`, `false`, `none`, and `off` turn patching off.
 

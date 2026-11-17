@@ -17,12 +17,12 @@
 #   docker exec -it simwam-rl bash examples/Embodied_SimWAM_NAVSIM/setup_env.sh
 #
 # Patches are selected at run time, not at build time:
-#   LUMEN_ENABLE=lumen_linear,aiter_conv
+#   LUMEN_ENABLE=aiter_conv
 
 FROM zhangdanyangamd/lumen-rl:embodied-MI350X
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    LUMEN_ENABLE=lumen_linear,aiter_conv \
+    LUMEN_ENABLE=aiter_conv \
     LUMEN_DIR=/home/danyzhan/Lumen \
     AITER_SRC=/home/danyzhan/aiter \
     HF_HOME=/home/danyzhan/.cache/huggingface \
