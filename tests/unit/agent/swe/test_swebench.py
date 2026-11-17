@@ -97,6 +97,21 @@ def test_the_agent_sandbox_has_no_history_but_the_same_tracked_files(repo, tmp_p
     assert not (repo / "pkg" / "__pycache__").exists() and (repo / "build" / "artifact.so").exists()
 
 
+def test_the_task_setup_runs_first_in_the_agent_sandbox(repo, tmp_path):
+    seen = tmp_path / "commits_at_setup"
+    task = SweBenchTask({"instance_id": "x", "image": "img", "problem_statement": "p",
+                         "setup_script": f"git -C {repo} rev-list --count HEAD > {seen}"})
+
+    async def scenario():
+        async with SweBenchEnvironment(LocalClient(tmp_path), cwd=str(repo)).agent_session(task) as bash:
+            return (await bash({"command": "git log --oneline | wc -l"})).text
+
+    log = asyncio.run(scenario())
+
+    assert seen.read_text().strip() == "2", "setup sees the image as shipped"
+    assert "<output>\n1\n</output>" in log
+
+
 def test_the_prompt_is_mini_swe_with_the_problem_statement():
     messages = SweBenchTask({"problem_statement": "Fix the frobnicator."}).messages()
 

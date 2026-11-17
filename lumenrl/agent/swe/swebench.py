@@ -62,6 +62,11 @@ class SweBenchTask:
     def image(self) -> str:
         return self.row["image"]
 
+    @property
+    def setup_script(self) -> str:
+        """Run first in every sandbox of the task, where its image needs repairing (SWE-rebench's)."""
+        return self.row.get("setup_script") or ""
+
     def messages(self) -> list[dict[str, str]]:
         return [
             {"role": "system", "content": render(mini_swe.SYSTEM_TEMPLATE)},
@@ -104,6 +109,8 @@ class SweBenchEnvironment:
         """The agent's `bash` session in a prepared sandbox of `task`, closed on exit."""
         sandbox = await self._client.open(task.image, workdir=self._cwd)
         try:
+            if task.setup_script:
+                await _check(sandbox, task.setup_script, timeout_s=600.0)
             commits = (await _check(sandbox, PREPARE.format(cwd=self._cwd), timeout_s=600.0)).strip()
             if commits.splitlines()[-1:] != ["1"]:
                 raise RuntimeError(f"{task.instance_id}: history not removed: {commits[-500:]}")
@@ -121,6 +128,8 @@ class SweBenchEnvironment:
         spec = make_test_spec(task.row)
         sandbox = await self._client.open(task.image, workdir=self._cwd)
         try:
+            if task.setup_script:
+                await _check(sandbox, task.setup_script, timeout_s=600.0)
             await write_file(sandbox, "/tmp/patch.diff", patch)
             applied = None
             for cmd in GIT_APPLY_CMDS:
