@@ -18,12 +18,13 @@ directly on a truncated slice. MoE here is a per-expert loop; the Megatron path 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import lru_cache
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 from lumenrl.models.deepseek_v41 import ops
 from lumenrl.models.deepseek_v41.config import AttnMode, DSV41Config, LayerSpec
@@ -58,7 +59,6 @@ class SharedAttention:
     index_k: Tensor | None = None
     topk_idxs: Tensor | None = None
     candidates: Tensor | None = None
-    extras: dict = field(default_factory=dict)
 
 
 class RMSNorm(nn.Module):
@@ -386,8 +386,153 @@ class Block(nn.Module):
         return self.hc_post(x, residual, ffn_post, ffn_comb), ffn_pre
 
 
-class DSV41Model(nn.Module):
-    """embed -> hc_mult copies -> blocks (engram before its layers) -> collapse -> norm -> head."""
+SHARED_FIELDS = ("compress_kv", "index_k", "topk_idxs", "candidates")
+
+
+def _pre_mix_width(dtype: torch.dtype) -> int:
+    size = torch.empty((), dtype=dtype).element_size()
+    if 4 % size:
+        raise TypeError(f"cannot carry an fp32 pre_mix in {dtype}")
+    return 4 // size
+
+
+class _Pack(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, h: Tensor, pre_mix: Tensor) -> Tensor:
+        ctx.dim = h.size(-1)
+        return torch.cat([h, pre_mix.float().unsqueeze(-1).view(h.dtype)], dim=-1)
+
+    @staticmethod
+    def backward(ctx, grad: Tensor):
+        return grad[..., : ctx.dim], grad[..., ctx.dim :].contiguous().view(torch.float32).squeeze(-1)
+
+
+class _Unpack(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, packed: Tensor) -> tuple[Tensor, Tensor]:
+        width = _pre_mix_width(packed.dtype)
+        ctx.shape, ctx.dtype, ctx.width = packed.shape, packed.dtype, width
+        h = packed[..., :-width].contiguous()
+        return h, packed[..., -width:].contiguous().view(torch.float32).squeeze(-1)
+
+    @staticmethod
+    def backward(ctx, grad_h: Tensor | None, grad_pre: Tensor | None):
+        device = (grad_h if grad_h is not None else grad_pre).device
+        out = torch.zeros(ctx.shape, dtype=ctx.dtype, device=device)
+        if grad_h is not None:
+            out[..., : -ctx.width] = grad_h
+        if grad_pre is not None:
+            out[..., -ctx.width :] = grad_pre.float().unsqueeze(-1).view(ctx.dtype)
+        return out
+
+
+def pack_stream(h: Tensor, pre_mix: Tensor) -> Tensor:
+    """What crosses a pipeline stage boundary: the residual stream [b, s, hc, d] and the fp32
+    `pre_mix` [b, s, hc] the last FFN computed for the next attention (it cannot be recomputed
+    from `h`), as one tensor [b, s, hc, d + w] -- each fp32 reinterpreted as `w` elements of
+    `h`'s dtype, so a single-tensor send carries both bit for bit. Gradients travel packed the
+    same way."""
+    return _Pack.apply(h, pre_mix)
+
+
+def unpack_stream(packed: Tensor) -> tuple[Tensor, Tensor]:
+    return _Unpack.apply(packed)
+
+
+def _run_layer(layer: Block, hashes: Tensor | None, h: Tensor, pre_mix: Tensor, *fields):
+    shared = SharedAttention(*fields)
+    if layer.engram is not None:
+        h = layer.engram(h, hashes[:, :, layer.engram.hash_index, :])
+    h, pre_mix = layer(h, pre_mix, shared)
+    return (h, pre_mix, *(getattr(shared, f) for f in SHARED_FIELDS))
+
+
+class DSV41Stage(nn.Module):
+    """Layers [start, end) of `cfg`, as one pipeline stage holds them. The first stage embeds and
+    expands to hc_mult copies; the last collapses them and projects to the vocabulary; any other
+    returns `pack_stream(h, pre_mix)`. A layer whose KV, index or candidate source is in an
+    earlier stage is refused, so nothing else ever has to cross.
+
+    Each layer gets the shared attention tensors as explicit inputs and returns them, which is
+    what makes `recompute` (one non-reentrant checkpoint per layer) correct: in backward a layer
+    is recomputed from what the earlier layers produced. Parameter names keep the model's layer
+    numbering, so a stage loads with `convert.load_released` as the whole model does.
+
+    `dtype` is what the release keeps in bf16 (most weights, norms, embedding); the fp32 tensors
+    (hc mixes, sinks, gate bias, ratio-2 compressor, head) are fp32 regardless."""
+
+    def __init__(
+        self,
+        cfg: DSV41Config,
+        start: int = 0,
+        end: int | None = None,
+        token_map: Tensor | None = None,
+        quant: QuantPoints | None = None,
+        dtype: torch.dtype = torch.bfloat16,
+        recompute: bool = False,
+    ):
+        super().__init__()
+        end = cfg.n_layers if end is None else end
+        if not 0 <= start < end <= cfg.n_layers:
+            raise ValueError(f"stage [{start}, {end}) is not inside {cfg.n_layers} layers")
+        specs = cfg.layer_specs()[start:end]
+        for s in specs:
+            for what in ("kv_source", "index_source", "candidate_source"):
+                src = getattr(s, what)
+                if src is not None and src < start:
+                    raise ValueError(
+                        f"stage [{start}, {end}): layer {s.layer} takes its {what} from layer {src}, "
+                        "which is in an earlier stage"
+                    )
+        self.cfg, self.quant, self.recompute = cfg, quant or QuantPoints(), recompute
+        self.start, self.end = start, end
+        self.pre_process, self.post_process = start == 0, end == cfg.n_layers
+        self.layout = EngramLayout.from_config(cfg)
+        self.hasher = None
+        if any(s.engram_hash_index is not None for s in specs):
+            if token_map is None:
+                raise ValueError("an engram model needs the compressed token map")
+            self.hasher = EngramHasher(cfg, self.layout, token_map)
+        previous = torch.get_default_dtype()
+        torch.set_default_dtype(dtype)
+        try:
+            if self.pre_process:
+                self.embed = nn.Embedding(cfg.vocab_size, cfg.dim)
+            self.layers = nn.ModuleDict({str(s.layer): Block(cfg, s, self.quant, self.layout) for s in specs})
+            if self.post_process:
+                self.norm = RMSNorm(cfg.dim, cfg.norm_eps)
+        finally:
+            torch.set_default_dtype(previous)
+        if self.post_process:
+            self.head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False, dtype=torch.float32)
+
+    def forward(self, input_ids: Tensor, stream: Tensor | None = None) -> Tensor:
+        """input_ids [b, s] (every stage: Engram hashes them); `stream` is the previous stage's
+        output. Returns fp32 logits [b, s, vocab] from the last stage."""
+        if self.pre_process:
+            h = self.embed(input_ids).unsqueeze(2).repeat(1, 1, self.cfg.hc_mult, 1)
+            pre_mix = h.new_zeros(*h.shape[:2], self.cfg.hc_mult, dtype=torch.float32)
+            pre_mix[..., 0] = 1.0
+        elif stream is None:
+            raise ValueError(f"stage [{self.start}, {self.end}) needs the previous stage's stream")
+        else:
+            h, pre_mix = unpack_stream(stream)
+        hashes = self.hasher(input_ids) if self.hasher is not None else None
+        fields = (None,) * len(SHARED_FIELDS)
+        for layer in self.layers.values():
+            if self.recompute and torch.is_grad_enabled():
+                h, pre_mix, *fields = checkpoint(_run_layer, layer, hashes, h, pre_mix, *fields, use_reentrant=False)
+            else:
+                h, pre_mix, *fields = _run_layer(layer, hashes, h, pre_mix, *fields)
+        if not self.post_process:
+            return pack_stream(h, pre_mix)
+        h = Block.hc_pre(h, pre_mix)
+        return F.linear(self.norm(h).float(), self.head.weight)
+
+
+class DSV41Model(DSV41Stage):
+    """The whole model: embed -> hc_mult copies -> blocks (Engram before its layers) -> collapse
+    -> norm -> head. input_ids [B, S] -> fp32 logits [B, S, vocab]."""
 
     def __init__(
         self,
@@ -395,37 +540,6 @@ class DSV41Model(nn.Module):
         token_map: Tensor | None = None,
         quant: QuantPoints | None = None,
         dtype: torch.dtype = torch.bfloat16,
+        recompute: bool = False,
     ):
-        """`dtype` is what the release keeps in bf16 (most weights, norms, embedding); the fp32
-        tensors (hc mixes, sinks, gate bias, ratio-2 compressor, head) are fp32 regardless."""
-        super().__init__()
-        self.cfg, self.quant = cfg, quant or QuantPoints()
-        self.layout = EngramLayout.from_config(cfg)
-        self.hasher = None
-        if self.layout is not None and cfg.engram_layers:
-            if token_map is None:
-                raise ValueError("an engram model needs the compressed token map")
-            self.hasher = EngramHasher(cfg, self.layout, token_map)
-        previous = torch.get_default_dtype()
-        torch.set_default_dtype(dtype)
-        try:
-            self.embed = nn.Embedding(cfg.vocab_size, cfg.dim)
-            self.layers = nn.ModuleList(Block(cfg, s, self.quant, self.layout) for s in cfg.layer_specs())
-            self.norm = RMSNorm(cfg.dim, cfg.norm_eps)
-        finally:
-            torch.set_default_dtype(previous)
-        self.head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False, dtype=torch.float32)
-
-    def forward(self, input_ids: Tensor) -> Tensor:
-        """input_ids [B, S] -> fp32 logits [B, S, vocab]."""
-        hashes = self.hasher(input_ids) if self.hasher is not None else None
-        h = self.embed(input_ids).unsqueeze(2).repeat(1, 1, self.cfg.hc_mult, 1)
-        pre_mix = h.new_zeros(*h.shape[:2], self.cfg.hc_mult, dtype=torch.float32)
-        pre_mix[..., 0] = 1.0
-        shared = SharedAttention()
-        for layer in self.layers:
-            if layer.engram is not None:
-                h = layer.engram(h, hashes[:, :, layer.engram.hash_index, :])
-            h, pre_mix = layer(h, pre_mix, shared)
-        h = Block.hc_pre(h, pre_mix)
-        return F.linear(self.norm(h).float(), self.head.weight)
+        super().__init__(cfg, 0, cfg.n_layers, token_map, quant, dtype, recompute)
