@@ -23,6 +23,7 @@ from omegaconf import DictConfig
 
 from examples.Embodied_SimWAM_NAVSIM.plugin import (
     install_action_velocity_graphs,
+    install_batched_logprobs,
     install_grpo_hook,
     install_ref_logprob_cache,
 )
@@ -30,6 +31,8 @@ from simwam.runtime_grpo import run_grpo_training
 from simwam.utils.config_resolvers import register_default_resolvers
 
 install_grpo_hook()
+# before the reference cache, which wraps action_chain_logprobs
+install_batched_logprobs()
 install_ref_logprob_cache()
 install_action_velocity_graphs()
 register_default_resolvers()

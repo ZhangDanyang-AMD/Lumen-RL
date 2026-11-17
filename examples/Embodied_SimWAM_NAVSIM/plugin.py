@@ -252,6 +252,96 @@ def install_action_velocity_graphs() -> None:
     logger.info("action_velocity replays CUDA graphs under no_grad (verify=%s)", verify)
 
 
+def install_batched_logprobs() -> None:
+    """Score all stochastic steps of a chain with one ``action_velocity`` call.
+
+    ``action_chain_logprobs`` calls the action expert once per stochastic step (3 by
+    default), each on the same ``B*G`` samples. Stacking the steps along the batch runs
+    the expert once on ``W*B*G`` samples, so its forward and backward launch a third of
+    the kernels. The per-step SDE mean, std, clamping and reduction are unchanged; the
+    condition (video K/V cache, context) is repeated once per condition and reused.
+    Only the rigorous-SDE, unmerged path is batched; anything else uses the original.
+    ``SIMWAM_GRPO_BATCHED_LOGP=0`` turns this off.
+    """
+    if os.environ.get("SIMWAM_GRPO_BATCHED_LOGP", "1").strip().lower() in _OFF:
+        return
+    import math
+
+    import torch
+    from torch.distributions import Normal
+    from simwam.models.wan22.simwam_grpo import ActionGRPOMixin
+
+    if getattr(ActionGRPOMixin.action_chain_logprobs, "_batched", False):
+        return
+    original = ActionGRPOMixin.action_chain_logprobs
+
+    def repeat_cond(cond, w):
+        key = f"_batched_logp_x{w}"
+        rep = cond.get(key)
+        if rep is None:
+            rep = dict(cond)
+            rep.pop("_cuda_graph_tag", None)
+            rep["video_kv_cache"] = [
+                {"k": torch.cat([layer["k"]] * w, dim=0), "v": torch.cat([layer["v"]] * w, dim=0)}
+                for layer in cond["video_kv_cache"]
+            ]
+            rep["context"] = torch.cat([cond["context"]] * w, dim=0)
+            rep["context_mask"] = torch.cat([cond["context_mask"]] * w, dim=0)
+            cond[key] = rep
+        return rep
+
+    def action_chain_logprobs(self, cond, chain, timesteps, deltas, stoch_idx=None, use_ref=False,
+                              return_terms=False):
+        if getattr(self, "grpo_merge_sde_window", False) or self.grpo_sde_mode != "rigorous":
+            return original(self, cond, chain, timesteps, deltas, stoch_idx=stoch_idx, use_ref=use_ref,
+                            return_terms=return_terms)
+        sched = self.infer_action_scheduler
+        device = self.device
+        dtype = getattr(self, "grpo_action_dtype", self.torch_dtype)
+        batch_size = int(chain.shape[0])
+        steps = self._normalize_stoch_idx(stoch_idx, int(timesteps.shape[0]))
+        if len(steps) < 2:
+            return original(self, cond, chain, timesteps, deltas, stoch_idx=stoch_idx, use_ref=use_ref,
+                            return_terms=return_terms)
+        x_all = torch.cat([chain[:, k] for k in steps], dim=0)
+        t_all = torch.cat([
+            timesteps[k].to(device=device, dtype=dtype).reshape(1).expand(batch_size) for k in steps
+        ])
+        v_all = self.action_velocity(x_all, t_all, repeat_cond(cond, len(steps)), use_ref=use_ref)
+        logps, means, vels, stds = [], [], [], []
+        for i, k in enumerate(steps):
+            x_k = x_all[i * batch_size:(i + 1) * batch_size]
+            v = v_all[i * batch_size:(i + 1) * batch_size]
+            x_next = chain[:, k + 1]
+            sigma_k = float(timesteps[k].item()) / float(sched.num_train_timesteps)
+            mean_f32, std = self._sde_mean_std(x_k, v, sigma_k, float(deltas[k].item()))
+            mean = mean_f32.to(dtype)
+            dist = Normal(mean.float(), torch.tensor(std, device=device, dtype=torch.float32))
+            if self.grpo_logprob_clamp_mode == "relative":
+                peak = -math.log(std) - 0.5 * math.log(2.0 * math.pi)
+                lo, hi = peak - self.grpo_logprob_clamp_width, peak
+            else:
+                lo, hi = -5.0, 2.0
+            logps.append(dist.log_prob(x_next.float()).clamp(min=lo, max=hi).mean(dim=(1, 2)))
+            if return_terms:
+                means.append(mean_f32)
+                vels.append(v.float())
+                stds.append(std)
+        logp = torch.stack(logps, dim=1)
+        if not return_terms:
+            return logp
+        return logp, {
+            "mean": torch.stack(means, dim=1),
+            "vel": torch.stack(vels, dim=1),
+            "std": torch.tensor(stds, device=device, dtype=torch.float32),
+        }
+
+    action_chain_logprobs._batched = True
+    action_chain_logprobs.original = original
+    ActionGRPOMixin.action_chain_logprobs = action_chain_logprobs
+    logger.info("action_chain_logprobs scores all stochastic steps in one action_velocity call")
+
+
 def enable_lumen(model, spec: str):
     """Apply ``LumenConfig.enable`` once per requested patch."""
     requested = []
