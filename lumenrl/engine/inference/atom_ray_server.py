@@ -788,6 +788,30 @@ class ATOMRayServer:
         return True
 
 
+def consistent_fp8_gemm_env(engine_kwargs: dict[str, Any]) -> dict[str, str]:
+    """Worker env for the FP8 blockscale GEMM the consistent path measured.
+
+    Only ``per_block_fp8``. BF16 and mxfp4 keep ATOM's own GEMM; those formats
+    need their own kernel choice and a new mismatch run. The caller exports
+    these two names itself when it wants a different value, and ``setdefault``
+    at the use site leaves that export in place.
+
+    ``ATOM_USE_TRITON_GEMM`` is not FP8-specific: on gfx95, with
+    ``ATOM_USE_TRITON_MOE`` unset, it also selects the Triton MoE kernel.
+    Qwen3-8B dense has no experts, so that branch does not run.
+    """
+    if os.environ.get("LUMENRL_CONSISTENT", "0") != "1":
+        return {}
+    quant = engine_kwargs.get("online_quant_config") or {}
+    name = quant.get("global_quant_config") if hasattr(quant, "get") else None
+    if name != "per_block_fp8":
+        return {}
+    return {
+        "ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE": "0",
+        "ATOM_USE_TRITON_GEMM": "1",
+    }
+
+
 class ATOMReplicaManager:
     """Driver-side controller for colocated ATOM rollout actors."""
 
@@ -877,6 +901,10 @@ class ATOMReplicaManager:
                 "LUMENRL_ALIGN_CONTIG_KV_CAPACITY",
                 "LUMENRL_ALIGN_BATCHED_DECODE",
                 "LUMENRL_ALIGN_BATCHED_CHECK",
+                "LUMENRL_ALIGN_STATIC_DECODE",
+                "LUMENRL_ALIGN_POOL_SLOTS",
+                "LUMENRL_ALIGN_SPLIT_KEYS",
+                "LUMENRL_FP8_DECODE_GEMM",
                 "LUMENRL_ALIGN_SYNC_WEIGHTS",
                 "LUMENRL_PREFILL_DECODE_ATTN",
                 "LUMENRL_STABLE_GEMM",
@@ -886,6 +914,8 @@ class ATOMReplicaManager:
                 "ATOM_LOG_LEVEL",
                 "ATOM_USE_TORCH_RMSNORM",
                 "ATOM_FORCE_ATTN_TRITON",
+                "ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE",
+                "ATOM_USE_TRITON_GEMM",
                 "VERL_ATOM_AGENT_LOG",
                 "VERL_MEMORY_AGENT_LOG",
                 "AITER_CONFIG_GEMM_BF16",
@@ -901,6 +931,8 @@ class ATOMReplicaManager:
                 env_vars["LUMENRL_RESCORE_DIR"] = replica_dir
 
             engine_kwargs = self._engine_kwargs_for_replica(r, job_id)
+            for key, value in consistent_fp8_gemm_env(engine_kwargs).items():
+                env_vars.setdefault(key, value)
             if true_vocab_size is not None:
                 # Belt and braces across two ATOM generations. The pinned build
                 # reads LUMENRL_ATOM_TRUE_VOCAB_SIZE from the environment above;

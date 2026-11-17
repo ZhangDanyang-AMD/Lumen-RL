@@ -384,12 +384,29 @@ def _apply_lumen_fp8(model: nn.Module, quant_config: dict[str, Any]) -> nn.Modul
         cfg = LumenConfig(**kwargs)
         _manager, model = cfg.enable(model)
 
+        if (
+            fp8_enabled
+            and os.environ.get("LUMEN_FP8_DENSE", "0") == "1"
+            and kwargs.get("scaling") == "blockwise2d"
+        ):
+            from lumen.ops.gemm.fp8_dense import patch_qwen3_fp8_dense
+
+            # Training logprobs match ATOM rollout only on the GEMM rollout runs:
+            # its Triton kernel unless LUMEN_FP8_DENSE_FWD names another.
+            fwd = "triton" if atom_ops else None
+            n_dense = patch_qwen3_fp8_dense(model, forward_kind=fwd)
+            print(f"[lumenrl] LUMEN_FP8_DENSE=1: {n_dense} Qwen3 blocks on FP8 dense linears "
+                  f"(atom_ops={atom_ops or '(none)'})", flush=True)
+
         # verl-aligned (fsdp_utils._maybe_apply_lumen): restore lm_head to BF16.
         # The lm_head FP8 blockscale GEMM overflows INT32 on the huge vocab GEMM
         # (vocab ~152k x hidden 4096) -> garbage logits -> exploding grad_norm /
         # near-zero entropy / policy collapse. Keep every other Linear in FP8 but
         # run lm_head in BF16. Only relevant when FP8 quantized linear is active.
-        if fp8_enabled:
+        # Rollout=ATOM returns before that quant path and keeps lm_head on the
+        # BF16 TunedGemm ATOM runs. Replacing its forward with nn.Linear here
+        # would drop that GEMM, so the restore stays off for ATOM.
+        if fp8_enabled and str(lumen_rollout).upper() != "ATOM":
             import torch.nn as nn
 
             restored = 0

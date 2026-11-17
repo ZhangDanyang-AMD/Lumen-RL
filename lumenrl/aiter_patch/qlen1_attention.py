@@ -17,6 +17,8 @@ Both were checked bit for bit against the one-row calls at lengths 127 to 4096
 (``atom_stability/test_qlen1_batched_attn.py``).
 """
 
+import os
+
 import torch
 
 
@@ -148,13 +150,20 @@ CAUSAL_CHUNK = 256
 # SPLIT_KEYS keys is one entry and needs no merge. The split depends on the
 # row's own position only, so decode, prefill and training split it alike.
 # A multiple of CAUSAL_CHUNK, so no chunk straddles a block boundary.
-SPLIT_KEYS = 1024
+# LUMENRL_ALIGN_SPLIT_KEYS changes it; the trainer and every ATOM worker must
+# read the same value, or their logprobs stop matching.
+SPLIT_KEYS = int(os.environ.get("LUMENRL_ALIGN_SPLIT_KEYS", "1024") or 1024)
+if SPLIT_KEYS <= 0 or SPLIT_KEYS % CAUSAL_CHUNK:
+    raise ValueError(
+        f"LUMENRL_ALIGN_SPLIT_KEYS={SPLIT_KEYS} must be a positive multiple of {CAUSAL_CHUNK}"
+    )
 
 _merge_kernel = None
 # Compiled merge kernels by argument dtypes and 16-byte pointer alignment, the
 # properties Triton specializes on. Launching a compiled kernel skips about
 # 8 us of JIT dispatch per call.
 _merge_compiled = {}
+_MERGE_CHUNK = 8
 
 
 def _varlen_fwd(q, k, v, cu_q, cu_k, max_q, max_k, softmax_scale, causal,
@@ -221,7 +230,7 @@ def _varlen_fwd(q, k, v, cu_q, cu_k, max_q, max_k, softmax_scale, causal,
 _v3_op = None
 
 
-def _merge_partials(o, lse, o_strides, l_strides, idx, npart, dst, out, rep):
+def _merge_partials(o, lse, o_strides, l_strides, idx, npart, dst, out, rep, quant=None):
     """``out[dst[r]] = sum_p w_p * o_p / sum_p w_p`` over row ``r``'s partials.
 
     ``idx[r, :npart[r]]`` are the partial entries of row ``r`` in block order
@@ -229,46 +238,75 @@ def _merge_partials(o, lse, o_strides, l_strides, idx, npart, dst, out, rep):
     at ``e * se + (h // rep) * skv + (h % rep) * sj`` in ``o`` (strides
     ``o_strides``) and in ``lse`` (``l_strides``), which covers the grouped
     decode layout and the flat training layout with one kernel.
+
+    ``quant=(xq, xs)`` also writes the per-1x128 FP8 quantization of each
+    bf16 output row, ``xq`` fp8 ``(rows, hq * d)`` and ``xs`` fp32
+    ``(rows, hq)`` row-major: the values of aiter's
+    ``dynamic_per_group_scaled_quant_kernel`` on gfx950 (d must be 128).
     """
     global _merge_kernel
     if _merge_kernel is None:
         import triton
         import triton.language as tl
 
-        @triton.jit(do_not_specialize=["o_se", "o_skv", "o_sj", "l_se", "l_skv", "l_sj", "idx_s", "out_sr"])
-        def kernel(o_ptr, lse_ptr, idx_ptr, np_ptr, dst_ptr, out_ptr,
-                   o_se, o_skv, o_sj, l_se, l_skv, l_sj, idx_s, out_sr,
-                   REP: tl.constexpr, D: tl.constexpr):
+        # The partials of a row are summed one by one in block order. The
+        # unrolled CHUNK only lets the loads of CHUNK partials overlap. A
+        # partial past npart reads lse -inf and o 0, so it adds exactly 0 to
+        # s and acc; a select there would stop the multiply-add from fusing.
+        # The quantization follows aiter's: amax floored at 1e-10, scale
+        # amax * float(1 / 448), then x * (1 / scale) saturated to the fp8 range.
+        @triton.jit(do_not_specialize=["o_se", "o_skv", "o_sj", "l_se", "l_skv", "l_sj", "idx_s", "out_sr",
+                                       "xq_sr", "xs_sr"])
+        def kernel(o_ptr, lse_ptr, idx_ptr, np_ptr, dst_ptr, out_ptr, xq_ptr, xs_ptr,
+                   o_se, o_skv, o_sj, l_se, l_skv, l_sj, idx_s, out_sr, xq_sr, xs_sr,
+                   REP: tl.constexpr, D: tl.constexpr, CHUNK: tl.constexpr, QUANT: tl.constexpr):
             r = tl.program_id(0)
             h = tl.program_id(1)
             kvh = h // REP
             j = h % REP
             n = tl.load(np_ptr + r)
             offs = tl.arange(0, D)
+            lse_head = lse_ptr + kvh * l_skv + j * l_sj
+            o_head = o_ptr + kvh * o_skv + j * o_sj + offs
             m = tl.full((), float("-inf"), tl.float32)
-            for p in range(0, n):
-                e = tl.load(idx_ptr + r * idx_s + p).to(tl.int64)
-                m = tl.maximum(m, tl.load(lse_ptr + e * l_se + kvh * l_skv + j * l_sj))
+            for base in range(0, n, CHUNK):
+                for c in tl.static_range(CHUNK):
+                    live = base + c < n
+                    e = tl.load(idx_ptr + r * idx_s + base + c, mask=live, other=0).to(tl.int64)
+                    m = tl.maximum(m, tl.load(lse_head + e * l_se, mask=live, other=float("-inf")))
             s = tl.zeros((), tl.float32)
             acc = tl.zeros((D,), tl.float32)
-            for p in range(0, n):
-                e = tl.load(idx_ptr + r * idx_s + p).to(tl.int64)
-                w = tl.exp(tl.load(lse_ptr + e * l_se + kvh * l_skv + j * l_sj) - m)
-                part = tl.load(o_ptr + e * o_se + kvh * o_skv + j * o_sj + offs).to(tl.float32)
-                s += w
-                acc += w * part
+            for base in range(0, n, CHUNK):
+                for c in tl.static_range(CHUNK):
+                    live = base + c < n
+                    e = tl.load(idx_ptr + r * idx_s + base + c, mask=live, other=0).to(tl.int64)
+                    w = tl.exp(tl.load(lse_head + e * l_se, mask=live, other=float("-inf")) - m)
+                    part = tl.load(o_head + e * o_se, mask=live, other=0.0).to(tl.float32)
+                    s += w
+                    acc += w * part
             row = tl.load(dst_ptr + r).to(tl.int64)
-            tl.store(out_ptr + row * out_sr + h * D + offs, (acc / s).to(out_ptr.dtype.element_ty))
+            val = (acc / s).to(out_ptr.dtype.element_ty)
+            tl.store(out_ptr + row * out_sr + h * D + offs, val)
+            if QUANT:
+                f = val.to(tl.float32)
+                scale = tl.maximum(tl.max(tl.abs(f), 0), 1e-10) * (1.0 / 448.0)
+                x = f * (1.0 / scale)
+                x = tl.minimum(tl.maximum(x, -448.0), 448.0)
+                tl.store(xq_ptr + row * xq_sr + h * D + offs, x.to(xq_ptr.dtype.element_ty))
+                tl.store(xs_ptr + row * xs_sr + h, scale)
 
         _merge_kernel = kernel
     heads, dim = out.shape[1], out.shape[2]
-    tensors = (o, lse, idx, npart, dst, out)
-    args = (*tensors, *o_strides, *l_strides, idx.stride(0), out.stride(0))
+    xq, xs = quant if quant is not None else (out, out)
+    tensors = (o, lse, idx, npart, dst, out, xq, xs)
+    args = (*tensors, *o_strides, *l_strides, idx.stride(0), out.stride(0), xq.stride(0), xs.stride(0))
     grid = (idx.shape[0], heads, 1)
-    key = (rep, dim) + tuple((t.dtype, t.data_ptr() % 16 == 0) for t in tensors)
+    use_quant = quant is not None
+    key = (rep, dim, use_quant) + tuple((t.dtype, t.data_ptr() % 16 == 0) for t in tensors)
     _launch(
-        _merge_compiled, key, lambda: _merge_kernel.warmup(*args, REP=rep, D=dim, grid=grid),
-        grid, (*args, rep, dim), out.get_device(),
+        _merge_compiled, key,
+        lambda: _merge_kernel.warmup(*args, REP=rep, D=dim, CHUNK=_MERGE_CHUNK, QUANT=use_quant, grid=grid),
+        grid, (*args, rep, dim, _MERGE_CHUNK, use_quant), out.get_device(),
     )
 
 
@@ -357,37 +395,72 @@ _write_group_kernel = None
 _write_group_compiled = {}
 
 
-def pool_write_group_queries(k_new, v_new, dst, k_pool, v_pool, q, src, hk):
+def pool_write_group_queries(k_new, v_new, dst, k_pool, v_pool, q, src, hk, rope=None):
     """``pool_write`` and ``group_queries`` in one launch; returns the grouped queries.
 
     Program ``(i, 0)``/``(i, 1)`` writes K/V row ``i``, program ``(e, 2)``
-    groups entry ``e``. Plain copies, so the values are those of the two calls.
+    groups entry ``e``; an entry whose ``src`` is negative is left unwritten.
+    Plain copies, so the values are those of the two calls.
+
+    With ``rope = (positions, cos, sin)`` the q and k rows are first rotated
+    as ``aiter.rope_cached_positions_2c_fwd_inplace`` rotates them with
+    neox style and ``reuse_freqs_front_part``: ``cos``/``sin`` hold
+    ``d // 2`` values per position, and each half pair is computed in fp32 as
+    ``x0 * c - x1 * s`` and ``x1 * c + x0 * s``. The bf16 products are exact
+    in fp32, so fusing a multiply into the add cannot change a value
+    (``fp8_probe/rope_equiv_probe.py``).
     """
     global _write_group_kernel
     if _write_group_kernel is None:
         import triton
         import triton.language as tl
 
+        @triton.jit
+        def rotate(ptr, pos_ptr, cos_ptr, sin_ptr, r, H: tl.constexpr, D: tl.constexpr):
+            f = tl.arange(0, D // 2)
+            pos = tl.load(pos_ptr + r).to(tl.int64)
+            c = tl.load(cos_ptr + pos * (D // 2) + f).to(tl.float32)[None, :]
+            s = tl.load(sin_ptr + pos * (D // 2) + f).to(tl.float32)[None, :]
+            at = tl.arange(0, H)[:, None] * D + f[None, :]
+            x0 = tl.load(ptr + at).to(tl.float32)
+            x1 = tl.load(ptr + at + D // 2).to(tl.float32)
+            return at, x0 * c - x1 * s, x1 * c + x0 * s
+
         @triton.jit(do_not_specialize=["n_kv", "n_q", "k_sr", "v_sr", "q_sr"])
         def kernel(k_ptr, v_ptr, dst_ptr, kp_ptr, vp_ptr, q_ptr, src_ptr, out_ptr,
+                   pos_ptr, cos_ptr, sin_ptr,
                    n_kv, n_q, k_sr, v_sr, q_sr,
-                   ROW: tl.constexpr, HQ: tl.constexpr, HK: tl.constexpr, D: tl.constexpr):
+                   ROW: tl.constexpr, HQ: tl.constexpr, HK: tl.constexpr, D: tl.constexpr,
+                   ROPE: tl.constexpr):
             i = tl.program_id(0)
             which = tl.program_id(1)
+            rep = HQ // HK
             if which == 2:
-                if i < n_q:
-                    row = tl.load(src_ptr + i).to(tl.int64)
-                    offs = tl.arange(0, HQ * D)
-                    h = offs // D
-                    c = offs % D
-                    rep = HQ // HK
-                    val = tl.load(q_ptr + row * q_sr + offs)
-                    tl.store(out_ptr + i.to(tl.int64) * (HQ * D) + ((h % rep) * HK + h // rep) * D + c, val)
+                row = tl.load(src_ptr + i, mask=i < n_q, other=-1).to(tl.int64)
+                if row >= 0:
+                    out_row = out_ptr + i.to(tl.int64) * (HQ * D)
+                    if ROPE:
+                        at, o0, o1 = rotate(q_ptr + row * q_sr, pos_ptr, cos_ptr, sin_ptr, row, HQ, D)
+                        h = tl.arange(0, HQ)[:, None]
+                        dst_at = at + ((h % rep) * HK + h // rep - h) * D
+                        tl.store(out_row + dst_at, o0.to(out_ptr.dtype.element_ty))
+                        tl.store(out_row + dst_at + D // 2, o1.to(out_ptr.dtype.element_ty))
+                    else:
+                        offs = tl.arange(0, HQ * D)
+                        h = offs // D
+                        c = offs % D
+                        val = tl.load(q_ptr + row * q_sr + offs)
+                        tl.store(out_row + ((h % rep) * HK + h // rep) * D + c, val)
             elif i < n_kv:
                 offs = tl.arange(0, ROW)
                 row = tl.load(dst_ptr + i).to(tl.int64)
                 if which == 0:
-                    tl.store(kp_ptr + row * ROW + offs, tl.load(k_ptr + i.to(tl.int64) * k_sr + offs))
+                    if ROPE:
+                        at, o0, o1 = rotate(k_ptr + i.to(tl.int64) * k_sr, pos_ptr, cos_ptr, sin_ptr, i, HK, D)
+                        tl.store(kp_ptr + row * ROW + at, o0.to(kp_ptr.dtype.element_ty))
+                        tl.store(kp_ptr + row * ROW + at + D // 2, o1.to(kp_ptr.dtype.element_ty))
+                    else:
+                        tl.store(kp_ptr + row * ROW + offs, tl.load(k_ptr + i.to(tl.int64) * k_sr + offs))
                 else:
                     tl.store(vp_ptr + row * ROW + offs, tl.load(v_ptr + i.to(tl.int64) * v_sr + offs))
 
@@ -397,14 +470,18 @@ def pool_write_group_queries(k_new, v_new, dst, k_pool, v_pool, q, src, hk):
     _rows, hq, dim = q.shape
     out = torch.empty((n_q * (hq // hk), hk, dim), dtype=q.dtype, device=q.device)
     width = k_new.shape[1] * k_new.shape[2]
-    tensors = (k_new, v_new, dst, k_pool, v_pool, q, src, out)
+    pos, cos, sin = rope if rope is not None else (dst, dst, dst)
+    tensors = (k_new, v_new, dst, k_pool, v_pool, q, src, out, pos, cos, sin)
     args = (*tensors, n_kv, n_q, k_new.stride(0), v_new.stride(0), q.stride(0))
     grid = (max(n_kv, n_q), 3, 1)
-    key = (width, hq, hk, dim) + tuple((t.dtype, t.data_ptr() % 16 == 0) for t in tensors)
+    use_rope = rope is not None
+    key = (width, hq, hk, dim, use_rope) + tuple((t.dtype, t.data_ptr() % 16 == 0) for t in tensors)
     _launch(
         _write_group_compiled, key,
-        lambda: _write_group_kernel.warmup(*args, ROW=width, HQ=hq, HK=hk, D=dim, grid=grid),
-        grid, (*args, width, hq, hk, dim), out.get_device(),
+        lambda: _write_group_kernel.warmup(
+            *args, ROW=width, HQ=hq, HK=hk, D=dim, ROPE=use_rope, grid=grid
+        ),
+        grid, (*args, width, hq, hk, dim, use_rope), out.get_device(),
     )
     return out
 
@@ -589,6 +666,47 @@ def decode_split_attention(q, k_pool, v_pool, plan, softmax_scale, pending=None)
         idx, npart, dst, out, rep,
     )
     return out
+
+
+def decode_static_attention(q, k_new, v_new, k_pool, v_pool, st, softmax_scale, rope=None, quant_dtype=None):
+    """``decode_split_attention`` with a launch shape fixed by ``q.shape[0]``.
+
+    Every decode row owns ``st["width"]`` grouped entries, so a step of
+    ``rows`` rows always launches ``rows * width`` entries and every index
+    lives in the buffers of ``st`` (filled on the host before the step). A
+    CUDA graph captured once per batch size then replays any step. Entries a
+    row does not need get no query rows in ``st["cu_q"]``, so attention skips
+    them, and are never merged. A row of at
+    most ``SPLIT_KEYS`` keys is one entry merged alone, which returns its
+    partial unchanged. ``k_new``/``v_new`` are the step's K/V rows, written to
+    the pool rows ``st["write_dst"]`` in the launch that groups the queries.
+    With ``rope`` (see ``pool_write_group_queries``) q and k are rotated in
+    that launch too. With ``quant_dtype`` the merge also quantizes the output
+    (see ``_merge_partials``) and this returns ``(out, xq, xs)``.
+    """
+    rows, hq, dim = q.shape
+    hk = k_pool.shape[1]
+    rep = hq // hk
+    entries = rows * st["width"]
+    if not (q.stride(2) == 1 and q.stride(1) == dim):
+        q = q.contiguous()
+    grouped = pool_write_group_queries(
+        k_new, v_new, st["write_dst"][:rows], k_pool, v_pool, q, st["gather"][:entries], hk, rope
+    )
+    o, lse = _varlen_fwd(
+        grouped, k_pool, v_pool, st["cu_q"][: entries + 1], st["cu_k"][: entries + 1],
+        rep, SPLIT_KEYS, softmax_scale, False, k_padded=st["k_start"][: entries + 1],
+    )
+    out = torch.empty_like(q)
+    quant = None
+    if quant_dtype is not None:
+        quant = (torch.empty((rows, hq * dim), dtype=quant_dtype, device=q.device),
+                 torch.empty((rows, hq), dtype=torch.float32, device=q.device))
+    _merge_partials(
+        o, lse, (rep * hk * dim, dim, hk * dim), (rep, lse.stride(0), 1),
+        st["idx"][:rows], st["npart"][:rows], st["dst"][:rows], out, rep, quant,
+    )
+    return out if quant is None else (out, *quant)
 
 
 def packed_causal_rows(cu_seqlens, total):

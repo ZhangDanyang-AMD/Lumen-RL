@@ -17,7 +17,11 @@ from pathlib import Path
 
 from contextlib import contextmanager
 
-from lumenrl.engine.inference.atom_ray_server import ATOMRayServer, _weight_sync_session
+from lumenrl.engine.inference.atom_ray_server import (
+    ATOMRayServer,
+    _weight_sync_session,
+    consistent_fp8_gemm_env,
+)
 
 
 def _server() -> ATOMRayServer:
@@ -134,6 +138,22 @@ def test_weight_sync_uses_the_session_when_atom_provides_it() -> None:
     with _weight_sync_session(_Mgr()):
         seen.append("body")
     assert seen == ["enter", "body", "exit"]
+
+
+def test_consistent_fp8_gemm_env_follows_the_quant_config(monkeypatch) -> None:
+    # The Triton blockscale pair belongs to per_block_fp8. mxfp4 and BF16 keep
+    # ATOM's own GEMM; a caller export is applied later with setdefault, so this
+    # function only supplies the default.
+    fp8 = {"online_quant_config": {"global_quant_config": "per_block_fp8"}}
+    monkeypatch.delenv("LUMENRL_CONSISTENT", raising=False)
+    assert consistent_fp8_gemm_env(fp8) == {}
+    monkeypatch.setenv("LUMENRL_CONSISTENT", "1")
+    assert consistent_fp8_gemm_env(fp8) == {
+        "ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE": "0",
+        "ATOM_USE_TRITON_GEMM": "1",
+    }
+    assert consistent_fp8_gemm_env({"online_quant_config": {"global_quant_config": "mxfp4"}}) == {}
+    assert consistent_fp8_gemm_env({}) == {}
 
 
 def test_weight_sync_skips_the_session_on_an_older_atom() -> None:
