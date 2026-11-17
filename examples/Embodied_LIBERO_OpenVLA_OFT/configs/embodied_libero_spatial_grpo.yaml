@@ -12,7 +12,7 @@
 
 embodied:
   enabled: true
-  plugin: rl_plugin
+  plugin: examples.Embodied_LIBERO_OpenVLA_OFT.plugin
   policy:
     model_type: openvla_oft
     model_path: /work/models/Openvla-oft-SFT-libero-spatial-traj1
