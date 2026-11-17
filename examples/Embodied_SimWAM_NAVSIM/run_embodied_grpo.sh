@@ -23,7 +23,9 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
 export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-$CUDA_VISIBLE_DEVICES}"
 export LUMEN_DIR="${LUMEN_DIR:-/home/danyzhan/Lumen}"
 export AITER_SRC="${AITER_SRC:-/home/danyzhan/aiter}"
-export LUMEN_ENABLE="${LUMEN_ENABLE:-hf_attn_patch,lumen_linear,aiter_conv}"
+# hf_attn_patch is left out: SimWAM masks every attention call, so Lumen takes only the
+# no_grad ones and launches them one batch at a time; torch SDPA is faster here (see README).
+export LUMEN_ENABLE="${LUMEN_ENABLE:-lumen_linear,aiter_conv}"
 export SIMWAM_ROOT="$SIMWAM"
 export DIFFSYNTH_MODEL_BASE_PATH="${DIFFSYNTH_MODEL_BASE_PATH:-$SIMWAM/checkpoints}"
 export HF_HOME="${HF_HOME:-/home/danyzhan/.cache/huggingface}"
