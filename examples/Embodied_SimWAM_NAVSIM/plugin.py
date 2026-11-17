@@ -96,6 +96,49 @@ def install_grpo_hook() -> None:
     ActionGRPOMixin.configure_grpo = configure_grpo
 
 
+def install_ref_logprob_cache() -> None:
+    """Score each rollout with the frozen reference expert once, not once per inner epoch.
+
+    ``_policy_loss`` runs ``action_chain_logprobs(..., use_ref=True)`` under ``no_grad`` in
+    every inner epoch, on the same rollout (``cond_bg``, chain, timesteps, deltas, stoch_idx)
+    and with the frozen ``ref_action_expert``, so all epochs get the same result. The first
+    result is kept on the rollout dict and returned to the later epochs.
+    ``SIMWAM_GRPO_REF_CACHE=0`` turns this off.
+    """
+    if os.environ.get("SIMWAM_GRPO_REF_CACHE", "1").strip().lower() in _OFF:
+        return
+    from simwam.models.wan22.simwam_grpo import ActionGRPOMixin
+    from simwam.trainer_grpo import SimWAMGRPOTrainer
+
+    if getattr(SimWAMGRPOTrainer._policy_loss, "_ref_cache", False):
+        return
+    current = {"rollout": None}
+    policy_loss = SimWAMGRPOTrainer._policy_loss
+    logprobs = ActionGRPOMixin.action_chain_logprobs
+
+    def _policy_loss(self, model, rollout, *args, **kwargs):
+        current["rollout"] = rollout
+        try:
+            return policy_loss(self, model, rollout, *args, **kwargs)
+        finally:
+            current["rollout"] = None
+
+    def action_chain_logprobs(self, *args, **kwargs):
+        rollout = current["rollout"]
+        if not kwargs.get("use_ref") or rollout is None:
+            return logprobs(self, *args, **kwargs)
+        cached = rollout.get("_ref_logprobs")
+        if cached is None:
+            cached = logprobs(self, *args, **kwargs)
+            rollout["_ref_logprobs"] = cached
+        return cached
+
+    _policy_loss._ref_cache = True
+    SimWAMGRPOTrainer._policy_loss = _policy_loss
+    ActionGRPOMixin.action_chain_logprobs = action_chain_logprobs
+    logger.info("Reference log-probs are computed once per rollout")
+
+
 def enable_lumen(model, spec: str):
     """Apply ``LumenConfig.enable`` once per requested patch."""
     requested = []

@@ -21,11 +21,12 @@ for _path in (str(_REPO), str(_SIMWAM / "src"), str(_NAVSIM)):
 import hydra
 from omegaconf import DictConfig
 
-from examples.Embodied_SimWAM_NAVSIM.plugin import install_grpo_hook
+from examples.Embodied_SimWAM_NAVSIM.plugin import install_grpo_hook, install_ref_logprob_cache
 from simwam.runtime_grpo import run_grpo_training
 from simwam.utils.config_resolvers import register_default_resolvers
 
 install_grpo_hook()
+install_ref_logprob_cache()
 register_default_resolvers()
 
 
