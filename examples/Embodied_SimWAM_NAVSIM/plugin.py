@@ -139,6 +139,119 @@ def install_ref_logprob_cache() -> None:
     logger.info("Reference log-probs are computed once per rollout")
 
 
+def install_action_velocity_graphs() -> None:
+    """Replay ``action_velocity`` from CUDA graphs when no gradient is needed.
+
+    The action expert runs on 8 action tokens per sample, so its forward is a few
+    thousand small kernels and is bound by launch overhead. Rollout denoising, the
+    rollout's old log-probs and the reference log-probs all call ``action_velocity``
+    under ``no_grad`` with fixed shapes. One graph is captured per (expert, shapes);
+    a call copies its inputs into the graph's static tensors and replays. The KV cache
+    of a condition is copied once per condition, not once per call.
+    ``SIMWAM_GRPO_CUDA_GRAPH=0`` turns this off; ``SIMWAM_GRPO_CUDA_GRAPH_VERIFY=1``
+    also runs eager on every call and counts outputs that are not bit-identical.
+    """
+    if os.environ.get("SIMWAM_GRPO_CUDA_GRAPH", "1").strip().lower() in _OFF:
+        return
+    import torch
+    from simwam.models.wan22.simwam_grpo import ActionGRPOMixin
+
+    if getattr(ActionGRPOMixin.action_velocity, "_cuda_graph", False):
+        return
+    eager = ActionGRPOMixin.action_velocity
+    verify = os.environ.get("SIMWAM_GRPO_CUDA_GRAPH_VERIFY", "0") == "1"
+    graphs = {}
+    stats = {"replay": 0, "eager": 0, "mismatch": 0, "loads": 0}
+    serial = [0]
+
+    def cond_tensors(cond):
+        kv = [t for layer in cond["video_kv_cache"] for t in (layer["k"], layer["v"])]
+        return kv + [cond["context"], cond["context_mask"], cond["attention_mask"]]
+
+    def static_cond(cond, tensors):
+        n = len(cond["video_kv_cache"])
+        kv = [{"k": tensors[2 * i], "v": tensors[2 * i + 1]} for i in range(n)]
+        out = dict(cond)
+        out.update(video_kv_cache=kv, context=tensors[-3], context_mask=tensors[-2], attention_mask=tensors[-1])
+        return out
+
+    def capture(self, latents, timestep, cond, use_ref, tensors):
+        # ActionDiT keeps its RoPE table as a plain CPU attribute and copies it to the
+        # device on every forward; a pageable host copy cannot be captured.
+        for expert in (self.action_expert, getattr(self, "ref_action_expert", None)):
+            freqs = getattr(expert, "freqs", None)
+            if torch.is_tensor(freqs) and freqs.device != latents.device:
+                expert.freqs = freqs.to(latents.device)
+        # Keep the caller's strides: rollout log-probs pass ``chain[:, k]`` slices, and a
+        # contiguous copy takes a different GEMM path that differs in the last bf16 bit.
+        s_lat = torch.empty_strided(latents.shape, latents.stride(), dtype=latents.dtype, device=latents.device)
+        s_lat.copy_(latents)
+        s_t = timestep.clone()
+        s_tensors = [t.clone() for t in tensors]
+        s_cond = static_cond(cond, s_tensors)
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(2):
+                eager(self, s_lat, s_t, s_cond, use_ref=use_ref)
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = eager(self, s_lat, s_t, s_cond, use_ref=use_ref)
+        return {"graph": graph, "lat": s_lat, "t": s_t, "tensors": s_tensors, "out": out, "loaded": None}
+
+    def action_velocity(self, latents_action, timestep_action, cond, use_ref=False):
+        if torch.is_grad_enabled() or not latents_action.is_cuda:
+            stats["eager"] += 1
+            return eager(self, latents_action, timestep_action, cond, use_ref=use_ref)
+        tensors = cond_tensors(cond)
+        key = (bool(use_ref), tuple(latents_action.shape), tuple(latents_action.stride()), tuple(timestep_action.shape),
+               int(cond["video_seq_len"]), tuple((tuple(t.shape), t.dtype) for t in tensors))
+        g = graphs.get(key)
+        if g is None:
+            try:
+                g = capture(self, latents_action, timestep_action, cond, use_ref, tensors)
+            except Exception as exc:
+                logger.warning("CUDA graph capture of action_velocity failed (%s); using eager", exc)
+                g = False
+            graphs[key] = g
+        if g is False:
+            stats["eager"] += 1
+            return eager(self, latents_action, timestep_action, cond, use_ref=use_ref)
+        tag = cond.get("_cuda_graph_tag")
+        if tag is None:
+            serial[0] += 1
+            tag = cond["_cuda_graph_tag"] = serial[0]
+        if g["loaded"] != tag:
+            torch._foreach_copy_(g["tensors"], tensors)
+            g["loaded"] = tag
+            stats["loads"] += 1
+        g["lat"].copy_(latents_action)
+        g["t"].copy_(timestep_action)
+        g["graph"].replay()
+        out = g["out"].clone()
+        stats["replay"] += 1
+        if verify:
+            ref = eager(self, latents_action, timestep_action, cond, use_ref=use_ref)
+            ref2 = eager(self, latents_action, timestep_action, cond, use_ref=use_ref)
+            name = f"{'ref' if use_ref else 'policy'}_b{latents_action.shape[0]}"
+            by = stats.setdefault("by", {}).setdefault(name, [0, 0, 0.0, 0])
+            by[0] += 1
+            if not torch.equal(ref, out):
+                stats["mismatch"] += 1
+                by[1] += 1
+                by[2] = max(by[2], float((ref.float() - out.float()).abs().max()))
+            if not torch.equal(ref, ref2):
+                by[3] += 1
+        return out
+
+    action_velocity._cuda_graph = True
+    action_velocity.stats = stats
+    action_velocity.eager = eager
+    ActionGRPOMixin.action_velocity = action_velocity
+    logger.info("action_velocity replays CUDA graphs under no_grad (verify=%s)", verify)
+
+
 def enable_lumen(model, spec: str):
     """Apply ``LumenConfig.enable`` once per requested patch."""
     requested = []
