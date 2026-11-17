@@ -25,6 +25,7 @@ from examples.Embodied_SimWAM_NAVSIM.plugin import (
     install_action_velocity_graphs,
     install_batched_logprobs,
     install_grpo_hook,
+    install_parallel_pdm_reward,
     install_ref_logprob_cache,
 )
 from simwam.runtime_grpo import run_grpo_training
@@ -35,6 +36,7 @@ install_grpo_hook()
 install_batched_logprobs()
 install_ref_logprob_cache()
 install_action_velocity_graphs()
+install_parallel_pdm_reward()
 register_default_resolvers()
 
 

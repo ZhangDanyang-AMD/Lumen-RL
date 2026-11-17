@@ -342,6 +342,106 @@ def install_batched_logprobs() -> None:
     logger.info("action_chain_logprobs scores all stochastic steps in one action_velocity call")
 
 
+_PDM_WORKER = {}
+
+
+def _pdm_worker_init(cls, args, kwargs):
+    logging.getLogger().setLevel(logging.WARNING)
+    _PDM_WORKER["reward"] = cls(*args, **kwargs)
+    _PDM_WORKER["cache"] = {}
+
+
+def _pdm_worker_score(task):
+    token, poses = task
+    reward = _PDM_WORKER["reward"]
+    if not reward.available(token):
+        return ("missing",)
+    cache = _PDM_WORKER["cache"]
+    metric_cache = cache.get(token)
+    if metric_cache is None:
+        metric_cache = cache[token] = reward.metric_cache_loader.get_from_token(token)
+    reward._true_pdms, reward._submetric_rows = [], []
+    try:
+        value = reward.score(poses, metric_cache)
+    except Exception as exc:  # same fallback as score_batch
+        return ("failed", str(exc))
+    return ("ok", value, reward._true_pdms[-1], reward._submetric_rows[-1])
+
+
+def install_parallel_pdm_reward() -> None:
+    """Score the trajectories of one ``score_batch`` call in a process pool.
+
+    ``NavSimPDMReward.score_batch`` runs the closed-loop PDM simulation for each of the
+    ``B*G`` trajectories one after another on the trainer's CPU thread. The scores are
+    independent and deterministic, so they are computed by a persistent pool of spawned
+    workers, each holding its own reward object built with the same arguments, and are
+    reassembled in order together with the failure counters and per-sample sub-metrics.
+    ``SIMWAM_GRPO_PDM_WORKERS`` sets the pool size (default 8, ``0`` turns this off).
+    """
+    workers = int(os.environ.get("SIMWAM_GRPO_PDM_WORKERS", "8") or 0)
+    if workers <= 0:
+        return
+    import multiprocessing as mp
+
+    import numpy as np
+    import torch
+    from simwam.datasets.navsim.pdm_reward import NavSimPDMReward, _SUBMETRIC_COLUMNS
+
+    if getattr(NavSimPDMReward.score_batch, "_parallel", False):
+        return
+    init = NavSimPDMReward.__init__
+    serial = NavSimPDMReward.score_batch
+
+    def __init__(self, *args, **kwargs):
+        init(self, *args, **kwargs)
+        self._pool_init_args = (args, kwargs)
+
+    def score_batch(self, abs_poses, tokens, metric_cache_map=None, device=None):
+        if metric_cache_map is not None or len(tokens) < 2 or not hasattr(self, "_pool_init_args"):
+            return serial(self, abs_poses, tokens, metric_cache_map=metric_cache_map, device=device)
+        pool = self.__dict__.get("_pool")
+        if pool is None:
+            args, kwargs = self._pool_init_args
+            pool = self._pool = mp.get_context("spawn").Pool(
+                workers, initializer=_pdm_worker_init, initargs=(type(self), args, kwargs))
+        if isinstance(abs_poses, torch.Tensor):
+            if device is None:
+                device = abs_poses.device
+            poses_np = abs_poses.detach().to(device="cpu", dtype=torch.float32).numpy()
+        else:
+            poses_np = np.asarray(abs_poses, dtype=np.float32)
+        if device is None:
+            device = torch.device("cpu")
+        results = pool.map(_pdm_worker_score, [(t, poses_np[i]) for i, t in enumerate(tokens)])
+        self.last_num_total = len(tokens)
+        self.last_num_missing = 0
+        self.last_num_failed = 0
+        self._true_pdms, self._submetric_rows = [], []
+        nan_row = {name: float("nan") for name in _SUBMETRIC_COLUMNS}
+        rewards = []
+        for token, res in zip(tokens, results):
+            if res[0] == "ok":
+                self._true_pdms.append(res[2])
+                self._submetric_rows.append(res[3])
+                rewards.append(res[1])
+                continue
+            if res[0] == "missing":
+                self.last_num_missing += 1
+            else:
+                self.last_num_failed += 1
+                logger.warning("PDM scoring failed for token %s: %s", token, res[1])
+            rewards.append(self.failure_reward)
+            self._submetric_rows.append(dict(nan_row))
+        return torch.tensor(rewards, device=device, dtype=torch.float32)
+
+    __init__._parallel = True
+    score_batch._parallel = True
+    score_batch.serial = serial
+    NavSimPDMReward.__init__ = __init__
+    NavSimPDMReward.score_batch = score_batch
+    logger.info("PDM rewards are scored by %d worker processes", workers)
+
+
 def enable_lumen(model, spec: str):
     """Apply ``LumenConfig.enable`` once per requested patch."""
     requested = []
