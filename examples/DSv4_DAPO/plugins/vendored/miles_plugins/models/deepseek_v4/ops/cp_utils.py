@@ -1,3 +1,5 @@
+# Modified from radixark/miles@5400905d5 (Apache-2.0): the cp_size == 1 equality checks
+# against the reference builders are removed from the per-forward path. See ../../../../NOTICE.
 """
 Utility functions for DeepSeek V4 Context Parallelism support.
 """
@@ -12,7 +14,7 @@ from torch import Tensor
 @lru_cache(1)
 def _get_window_topk_idxs_ref(window_size: int, bsz: int, seqlen: int, start_pos: int):
     """Reference (single-device, no-CP) window topk index builder. Used only as
-    an equality oracle by :func:`get_window_topk_idxs_cp` when ``cp_size == 1``.
+    an equality oracle for :func:`get_window_topk_idxs_cp` in tests.
     """
 
     def _inner():
@@ -32,7 +34,7 @@ def _get_window_topk_idxs_ref(window_size: int, bsz: int, seqlen: int, start_pos
 @lru_cache(2)
 def _get_compress_topk_idxs_ref(ratio: int, bsz: int, seqlen: int, start_pos: int, offset: int):
     """Reference (single-device, no-CP) compress topk index builder. Used only as
-    an equality oracle by :func:`get_compress_topk_idxs_cp` when ``cp_size == 1``.
+    an equality oracle for :func:`get_compress_topk_idxs_cp` in tests.
     """
 
     def _inner():
@@ -83,10 +85,6 @@ def get_window_topk_idxs_cp(
     topk_idxs = torch.where(k_pos > base, -1, k_pos)
     result = topk_idxs.unsqueeze(0).expand(bsz, -1, -1)
 
-    if cp_size == 1:
-        ref_result = _get_window_topk_idxs_ref(window_size, bsz, seqlen_local, start_pos=0)
-        assert torch.equal(result.cpu(), ref_result.cpu()), "get_window_topk_idxs_cp mismatch with ref"
-
     return result
 
 
@@ -107,10 +105,6 @@ def get_compress_topk_idxs_cp(
     invalid_mask = k_group_idx >= q_first_invalid_group
     compress_topk_idxs = torch.where(invalid_mask, -1, k_group_idx + offset)
     result = compress_topk_idxs.unsqueeze(0).expand(bsz, -1, -1)
-
-    if cp_size == 1:
-        ref_result = _get_compress_topk_idxs_ref(ratio, bsz, seqlen_local, start_pos=0, offset=offset)
-        assert torch.equal(result.cpu(), ref_result.cpu()), "get_compress_topk_idxs_cp mismatch with ref"
 
     return result
 

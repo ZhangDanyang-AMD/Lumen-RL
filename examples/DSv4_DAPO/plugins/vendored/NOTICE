@@ -19,7 +19,6 @@ Files copied from upstream without changes:
   miles_plugins/models/deepseek_v4/__init__.py
   miles_plugins/models/deepseek_v4/ops/__init__.py
   miles_plugins/models/deepseek_v4/ops/compressor.py
-  miles_plugins/models/deepseek_v4/ops/cp_utils.py
   miles_plugins/models/deepseek_v4/ops/rope.py
   miles_plugins/models/deepseek_v4/ops/v4_indexer.py
   miles_plugins/models/deepseek_v4/ops/kernel/__init__.py
@@ -31,6 +30,12 @@ Files modified from upstream (each carries a header comment saying so):
       The grouped `wo_a` einsum is replaced by one plain GEMM per group. The
       batched form reads past the end of its allocation on gfx950 once the
       sequence exceeds about 2040 tokens.
+  miles_plugins/models/deepseek_v4/ops/cp_utils.py
+      With cp_size == 1, get_window_topk_idxs_cp and get_compress_topk_idxs_cp
+      compared their result with the reference builder on every call, copying
+      both index tensors to the host: a GPU synchronisation in each attention
+      forward, recomputation included. The check is gone; the reference
+      builders stay as test oracles.
   miles_plugins/models/deepseek_v4/ops/qat.py
       `tile_kernels.quant.per_token_cast_back` is replaced by a stub that raises.
       Only reachable with FP8 QAT on.
