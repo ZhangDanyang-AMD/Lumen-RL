@@ -266,6 +266,10 @@ class MegatronConfig:
     num_layers_in_last_pipeline_stage: Optional[int] = None
     # R3 routing replay (MoE only)
     moe_enable_routing_replay: bool = False
+    # DeepSeek-V4.1: the rollout's activation quantization points the training
+    # forward reproduces (``QuantPoints`` field -> bool); unset ones keep the
+    # release's.
+    dsv41_quant_points: Optional[dict] = None
 
 
 @dataclass

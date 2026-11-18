@@ -1,0 +1,185 @@
+# DeepSeek-V4.1-Flash DAPO smoke on one node: Megatron-Native training (the
+# V4.1 backbone with Megatron's expert-parallel MoE) + ATOM rollout, colocated.
+#
+# ⚠️ model_name is SLICE B, not the full 40-layer model: layers 0-7 of the release
+# (window, window, full + KV/index source, reuse, full + candidate source, reuse,
+# reindex, reuse), written by `convert.write_slice_checkpoint` in the released
+# FP8 / FP4 format, which is all ATOM loads. It keeps every attention mode and the
+# layer-1 Engram table. A slice emits gibberish, so this is a plumbing smoke:
+# group filtering is off (every group would score 0), and its log-probs swing
+# with any numerical change, so its kl is not a correctness measure (the full
+# model's is: k3 1.06e-2 from ATOM's on T=1 samples, see bridges/dsv41.py).
+#
+#   * Trained: everything but the routed experts (FP4 in the release; ATOM's
+#     weight sync cannot take them) -- the bridge freezes them.
+#   * TP, CP and ETP must be 1: the non-expert weights replicate over DP.
+#   * enable_dynamic_batch must stay false: V4.1's attention reads a microbatch
+#     as one sequence.
+#   * Two TP4 ATOM replicas (TP8 does not start: the shared expert's down
+#     projection is K=288 at TP8, which AITER's FP8 blockscale GEMM refuses).
+#     BF16 KV, FP8 index cache, block 16, and level 0 (level 3 is not validated
+#     for V4.1).
+#   * The quantization points follow ATOM with a BF16 KV pool: only the FP8
+#     input of wo_a.
+#
+# Needs the atomrl image (ATOM with deepseek_v41) with the DSv4-patched Megatron
+# first on PYTHONPATH, and in the environment:
+#   * NCCL_ALGO=Ring, for deterministic mode;
+#   * LUMENRL_DISABLE_CUSTOM_AR=0 and no HSA_DISABLE_FRAGMENT_ALLOCATOR=1: with
+#     either, ATOM's TP4 replicas die creating aiter's custom all-reduce
+#     (hipIpcGetMemHandle: invalid argument).
+#
+# Measured (1 node, 8 MI355X): 3 steps, exit 0; ~60 s a step after the first
+# (generation 40 s, training 10 s, weight sync 8 s for 181 tensors / 7 GB, every
+# one applied); 111 GiB a card at peak.
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    actor:
+      num_workers: 8
+      dispatch_mode: dp_compute_proto
+
+policy:
+  model_name: "/mnt/m2m_nobackup/xysheng/models/DeepSeek-V4.1-Flash-sliceB"
+  training_backend: megatron_native
+  generation_backend: atom
+  max_total_sequence_length: 3072
+  max_response_length: 2048
+  train_global_batch_size: 64           # 8 prompts x 8 generations
+  gen_batch_size: 8
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 3072
+  learning_rate: 1.0e-6
+  lr_warmup_steps: 0
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  training:
+    optimizer_dtype: bf16
+    megatron_cfg:
+      use_distributed_optimizer: true
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      context_parallel_size: 1
+      expert_model_parallel_size: 8
+      # Without it two forwards of one batch differ by 0.28 in mean token
+      # log-prob on this slice; with it, exactly 0.
+      deterministic_mode: true
+      recompute_granularity: full
+      moe_grouped_gemm: true
+      moe_token_dispatcher_type: alltoall
+      moe_aux_loss_coeff: 0.0
+      log_probs_chunk_size: 1024
+      enable_dynamic_batch: false
+      dsv41_quant_points:
+        window_kv_fp8: false
+        compressed_kv_fp4: false
+        indexer_fp4: false
+        attn_out_fp8: true
+        linear_act_fp8: false
+    fsdp_cfg:
+      param_offload: false
+      optimizer_offload: false
+  generation:
+    atom_cfg:
+      transport: ray_http
+      tensor_parallel_size: 4
+      kv_cache_dtype: bf16
+      # training holds ~47 GiB a card on this slice
+      gpu_memory_utilization: 0.45
+      enable_prefix_caching: false
+      online_quant_config: {}
+      engine_kwargs:
+        index_cache_dtype: fp8
+        kv_cache_block_size: 16
+        compilation_config:
+          level: 0
+    vllm_cfg:
+      transport: ray_http
+      ray_http_start_server: false
+      gpu_memory_utilization: 0.45
+      max_model_len: 3072
+      dtype: bfloat16
+      enforce_eager: true
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 8192
+      max_num_seqs: 64
+      quantization: ""
+      calculate_log_probs: true
+      enable_sleep_mode: false
+      update_weights_bucket_megabytes: 512
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+
+moe:
+  r3:
+    rollout_replay: false
+
+algorithm:
+  name: dapo
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  loss_agg_mode: token-mean
+  dapo:
+    num_generations: 8
+    kl_coeff: 0.0
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 10.0
+    dynamic_sampling: true
+    token_level_pg: true
+    overlong_reward_shaping: true
+    max_resp_len: 2048
+    filter_groups:
+      enable: false
+      metric: acc
+      max_num_gen_batches: 10
+    overlong_buffer:
+      enable: true
+      len: 512
+      penalty_factor: 1.0
+      log: false
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+    rollout_is_batch_normalize: false
+
+reward:
+  type: function
+  function: lumenrl.rewards.math_reward.dapo_math_reward
+  dataset: "/mnt/m2m_nobackup/xysheng/dsv4rel/work/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet"
+  shuffle: true
+  shuffle_seed: 10086
+
+val_dataset: ""
+val_steps: 0
+val_batch_size: 0
+eval:
+  enabled: false
+  num_samples: 0
+
+checkpointing:
+  checkpoint_dir: ""
+  save_steps: 1000
+  save_total_limit: 0
+  resume: false
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 3
+seed: 10086
