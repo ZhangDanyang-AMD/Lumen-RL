@@ -19,7 +19,7 @@ import pytest
 _REPO = Path(__file__).resolve().parents[2]
 _SENDER = _REPO / "lumenrl/engine/inference/rdma_weight_transfer.py"
 _RECEIVER = Path("atom/rollout/rdma_weight_receiver.py")
-_DECODER = Path("atom/rollout/weight_updater.py")
+_DECODER = Path("atom/rollout/weight_bucket.py")
 _HEADER = ("command", "metadata_bytes", "payload_bytes", "version")
 
 
