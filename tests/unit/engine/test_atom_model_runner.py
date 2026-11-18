@@ -20,6 +20,8 @@ class _AtomRunner:
     def __init__(self, rank, config, with_pool=False, world_size=1):
         self.rank, self.world_size, self.device = rank, world_size, torch.device("cpu")
         self.cleared, self.requantized, self.post_processed = False, [], []
+        if config == "model":
+            self.model = torch.nn.Linear(4, 3)
         if with_pool:
             self.kv_cache = types.SimpleNamespace(zero_=lambda: setattr(self, "cleared", True))
 
@@ -71,12 +73,23 @@ def _with_model(runner):
     return {n: p.detach().clone() for n, p in runner.model.named_parameters()}
 
 
+def test_the_host_copy_is_one_allocation_made_when_the_runner_starts(runner_cls, monkeypatch):
+    monkeypatch.setenv("LUMENRL_ATOM_SLEEP_KEEPS_WEIGHTS", "1")
+    runner = runner_cls(0, "model")
+
+    host = runner._host_weights
+    storages = {t.untyped_storage().data_ptr() for t in host.values()}
+    assert set(host) == {n for n, _ in runner.model.named_parameters()} and len(storages) == 1
+    runner._release_weights()
+    assert runner._host_weights is host
+
+
 def test_sleep_can_keep_the_weights_for_a_partial_sync(runner_cls, monkeypatch):
     """A trainer syncing only what it trains (V4.1's frozen experts never go) must
     wake to the weights it slept with, not to ATOM's discarded placeholders."""
-    monkeypatch.setenv("LUMENRL_ATOM_SLEEP_KEEPS_WEIGHTS", "1")
     runner = runner_cls(0, None)
     want = _with_model(runner)
+    monkeypatch.setenv("LUMENRL_ATOM_SLEEP_KEEPS_WEIGHTS", "1")
 
     for _ in range(2):  # the host copy is reused
         runner._release_weights()

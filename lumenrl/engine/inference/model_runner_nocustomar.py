@@ -134,24 +134,41 @@ def quantize_native_group(weight, rows: int, fp8_dtype):
     return q.view(n, k), scale.to(torch.float8_e8m0fnu)
 
 
+def _sleep_keeps_weights() -> bool:
+    return os.environ.get("LUMENRL_ATOM_SLEEP_KEEPS_WEIGHTS", "0") in ("1", "true", "True")
+
+
+def host_weight_buffers(runner) -> dict:
+    """Host tensors shaped like every parameter of ``runner.model``: views of one
+    pinned allocation, made when the runner starts. Pinned per parameter at the
+    first sleep instead, ~70 GB a card of V4.1 took past ATOM's timeout for
+    `release_memory` on a busy host."""
+    import torch
+
+    params = list(runner.model.named_parameters())
+    sizes = [-(-p.numel() * p.element_size() // 256) * 256 for _, p in params]  # aligned views
+    flat = torch.empty(sum(sizes), dtype=torch.uint8, pin_memory=torch.cuda.is_available())
+    views, offset = {}, 0
+    for (name, p), size in zip(params, sizes):
+        nbytes = p.numel() * p.element_size()
+        views[name] = flat[offset : offset + nbytes].view(p.dtype).view(p.shape)
+        offset += size
+    return views
+
+
 def offload_weights(runner) -> None:
     """Every parameter of ``runner.model`` to host memory, the device copy freed.
 
     ATOM's sleep discards the weights and counts on the next sync to rewrite
     every one; a trainer that syncs only what it trains (DeepSeek-V4.1 keeps its
-    routed experts and indexers frozen) would wake to empty ones. The host
-    buffers are pinned, allocated once and reused by every sleep."""
+    routed experts and indexers frozen) would wake to empty ones."""
     import torch
     from atom.rollout.memory_manager import release_cudagraphs
 
     release_cudagraphs(runner)
     host = getattr(runner, "_host_weights", None)
     if host is None:
-        pin = torch.cuda.is_available()
-        host = runner._host_weights = {
-            name: torch.empty(p.shape, dtype=p.dtype, device="cpu", pin_memory=pin)
-            for name, p in runner.model.named_parameters()
-        }
+        host = runner._host_weights = host_weight_buffers(runner)
     for name, p in runner.model.named_parameters():
         host[name].copy_(p.data, non_blocking=True)
     if torch.cuda.is_available():
@@ -223,6 +240,11 @@ class NoCustomARModelRunner(metaclass=_ResolvesToRunner):
         from atom.rollout.model_runner_ext import RLHFModelRunner
 
         class _PatchedRunner(RLHFModelRunner):
+            def __init__(self, rank, config, *args, **kwargs):
+                super().__init__(rank, config, *args, **kwargs)
+                if _sleep_keeps_weights():
+                    self._host_weights = host_weight_buffers(self)
+
             def clear_kv_cache(self) -> bool:
                 # ATOM sets `kv_cache` only when the shared paged pool is not
                 # empty. A model whose attention builders own every pool
@@ -233,7 +255,7 @@ class NoCustomARModelRunner(metaclass=_ResolvesToRunner):
                 return super().clear_kv_cache()
 
             def _release_weights(self) -> None:
-                if os.environ.get("LUMENRL_ATOM_SLEEP_KEEPS_WEIGHTS", "0") in ("1", "true", "True"):
+                if _sleep_keeps_weights():
                     return offload_weights(self)
                 return super()._release_weights()
 
