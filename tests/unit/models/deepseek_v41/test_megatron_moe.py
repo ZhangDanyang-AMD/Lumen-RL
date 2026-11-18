@@ -1,7 +1,10 @@
 import pytest
 import torch
 
-from lumenrl.models.deepseek_v41.megatron_moe import moe_state_from_reference
+from lumenrl.models.deepseek_v41.megatron_moe import (
+    moe_state_from_reference,
+    reference_names,
+)
 from lumenrl.models.deepseek_v41.model import MoE
 from tests.unit.models.deepseek_v41.test_model_vs_reference import _config
 
@@ -45,3 +48,10 @@ def test_router_and_shared_expert_are_on_every_rank(ffn):
 def test_experts_must_split_evenly(ffn):
     with pytest.raises(ValueError, match="do not split over EP 3"):
         moe_state_from_reference(ffn, n_experts=8, ep_rank=0, ep_size=3)
+
+
+def test_te_extra_state_has_no_source_and_another_ranks_expert_is_an_error():
+    assert reference_names("experts.linear_fc1._extra_state", ep_rank=0, n_local=2) == []
+    assert reference_names("experts.linear_fc2.weight1", ep_rank=3, n_local=2) == ["experts.7.w2.weight"]
+    with pytest.raises(KeyError, match="no reference counterpart"):
+        reference_names("experts.linear_fc1.weight2", ep_rank=0, n_local=2)

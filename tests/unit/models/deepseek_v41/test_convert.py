@@ -3,6 +3,7 @@ import json
 import pytest
 import torch
 from safetensors.torch import save_file
+from torch import nn
 
 from lumenrl.models.deepseek_v41 import ops
 from lumenrl.models.deepseek_v41.config import DSV41Config
@@ -11,9 +12,15 @@ from lumenrl.models.deepseek_v41.convert import (
     dequant_fp4,
     dequant_fp8_block,
     load_released,
+    mapped_tensor,
     write_slice_checkpoint,
 )
-from lumenrl.models.deepseek_v41.model import DSV41Model
+from lumenrl.models.deepseek_v41.megatron_moe import (
+    MegatronMoE,
+    local_experts,
+    moe_state_from_reference,
+)
+from lumenrl.models.deepseek_v41.model import DSV41Model, MoE
 from tests.unit.models.deepseek_v41.test_model_vs_reference import (
     TINY,
     _config,
@@ -154,6 +161,76 @@ def test_a_slice_reads_its_layers_from_their_released_ids(source):
 def test_checkpoint_name_maps_slice_positions_to_released_ids():
     assert checkpoint_name("layers.4.attn.wkv.weight", (0, 1, 2, 3, 20, 21)) == "layers.20.attn.wkv.weight"
     assert checkpoint_name("head.weight", (0, 1)) == "head.weight"
+
+
+def test_a_mapped_tensor_is_the_stored_tensor_bit_for_bit(tmp_path):
+    g = torch.Generator().manual_seed(0)
+    tensors = {
+        "a": (torch.randn(5, 64, generator=g) * 9).to(torch.float8_e4m3fn),
+        "b": _e8m0(torch.randint(-5, 5, (5, 2), generator=g)),
+        "c": torch.randn(3, 7, generator=g).to(torch.bfloat16),
+    }
+    save_file(tensors, str(tmp_path / "t.safetensors"))
+
+    for name, t in tensors.items():
+        got = mapped_tensor(str(tmp_path / "t.safetensors"), name)
+        assert got.dtype == t.dtype and got.shape == t.shape and torch.equal(_bits(got), _bits(t)), name
+
+
+def test_host_engram_tables_are_mapped_from_the_checkpoint_and_change_nothing(source):
+    model, _, path = source
+    token_map = torch.tensor(_token_map())
+    on_device = DSV41Model(model.cfg, token_map=token_map)
+    on_host = DSV41Model(model.cfg, token_map=token_map, engram_on_host=True)
+
+    load_released(on_device, str(path))
+    report = load_released(on_host, str(path))
+
+    assert report["mapped"] == 1 and not any(".engram.embed." in k for k in on_host.state_dict())
+    ids = torch.randint(0, model.cfg.vocab_size, (2, 40), generator=torch.Generator().manual_seed(1))
+    with torch.no_grad():
+        assert torch.equal(on_host(ids), on_device(ids))
+
+
+class _EPMoE(nn.Module):
+    """`MegatronMoE`'s state and naming on one EP rank, without Megatron (which needs a GPU)."""
+
+    def __init__(self, cfg, ep_rank, ep_size):
+        super().__init__()
+        self.ep_rank, self.n_local = ep_rank, local_experts(cfg.n_routed_experts, ep_size)
+        self.layer = nn.Module()
+        like = moe_state_from_reference(MoE(cfg).state_dict(), n_experts=cfg.n_routed_experts, ep_rank=ep_rank, ep_size=ep_size)
+        for key, t in like.items():
+            *path, leaf = key.split(".")
+            owner = self.layer
+            for part in path:
+                if not hasattr(owner, part):
+                    owner.add_module(part, nn.Module())
+                owner = getattr(owner, part)
+            owner.register_buffer(leaf, torch.zeros_like(t))
+
+    reference_names = MegatronMoE.reference_names
+
+
+def test_a_module_laid_out_otherwise_loads_through_its_reference_names(source):
+    model, expect, path = source
+    ep = _EPMoE(model.cfg, 1, 2)
+    fresh = DSV41Model(model.cfg, token_map=torch.tensor(_token_map()), ffn=lambda spec: _EPMoE(model.cfg, 1, 2))
+
+    report = load_released(fresh, str(path))
+
+    assert report["loaded"] == len(fresh.state_dict())
+    for name, block in fresh.layers.items():
+        prefix = f"layers.{name}.ffn."
+        ffn = {k[len(prefix) :]: v for k, v in expect.items() if k.startswith(prefix)}
+        want = moe_state_from_reference(ffn, n_experts=model.cfg.n_routed_experts, ep_rank=1, ep_size=2)
+        got = block.ffn.layer.state_dict()
+        assert got.keys() == want.keys() == ep.layer.state_dict().keys()
+        for key, t in want.items():
+            assert torch.equal(got[key], t), prefix + key
+    for name, t in fresh.state_dict().items():
+        if ".ffn." not in name:
+            assert torch.equal(_bits(t), _bits(expect[name])), name
 
 
 def test_a_tensor_without_a_source_is_an_error(source, tmp_path):

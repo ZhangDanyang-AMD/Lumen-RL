@@ -154,30 +154,55 @@ class EngramHasher(nn.Module):
 
 class EngramTable(nn.Module):
     """The frozen FP8 table of one engram layer with its per-32 E8M0 scales; rows dequantize to
-    BF16 on lookup. Kept as buffers: RL does not train the table."""
+    BF16 on lookup. Kept as buffers: RL does not train the table.
 
-    def __init__(self, num_embeddings: int, dim: int, block_size: int = 32):
+    A released table is ~98 GB, more than a training GPU can spare. `on_host` keeps it out of
+    the module's state, so it stays where `attach` puts it (CPU tensors mapped from the
+    checkpoint, which every process on a host shares), and a lookup gathers its rows there."""
+
+    def __init__(self, num_embeddings: int, dim: int, block_size: int = 32, on_host: bool = False):
         super().__init__()
-        self.block_size = block_size
-        self.register_buffer("weight", torch.empty(num_embeddings, dim, dtype=torch.float8_e4m3fn))
-        self.register_buffer("scale", torch.empty(num_embeddings, dim // block_size, dtype=torch.float8_e8m0fnu))
+        self.block_size, self.on_host = block_size, on_host
+        self.shape = (num_embeddings, dim), (num_embeddings, dim // block_size)
+        if on_host:
+            self.weight = self.scale = None
+        else:
+            self.register_buffer("weight", torch.empty(self.shape[0], dtype=torch.float8_e4m3fn))
+            self.register_buffer("scale", torch.empty(self.shape[1], dtype=torch.float8_e8m0fnu))
+
+    def attach(self, weight: Tensor, scale: Tensor) -> None:
+        """The host table; `on_host` tables only."""
+        if not self.on_host:
+            raise RuntimeError("a table kept as buffers loads through the state dict")
+        for t, shape, dtype in ((weight, self.shape[0], torch.float8_e4m3fn), (scale, self.shape[1], torch.float8_e8m0fnu)):
+            if tuple(t.shape) != shape or t.dtype != dtype or t.device.type != "cpu":
+                raise ValueError(f"engram table wants a {dtype} {shape} CPU tensor, got {t.dtype} {tuple(t.shape)} on {t.device}")
+        self.weight, self.scale = weight, scale
 
     def forward(self, indices: Tensor) -> Tensor:
-        values = self.weight[indices].float().unflatten(-1, (-1, self.block_size))
-        scales = self.scale[indices].float().unsqueeze(-1)
-        return (values * scales).flatten(-2).to(torch.bfloat16)
+        if self.on_host:
+            if self.weight is None:
+                raise RuntimeError("the host engram table was never attached")
+            rows = indices.cpu()
+            values, scales = self.weight[rows].to(indices.device), self.scale[rows].to(indices.device)
+        else:
+            values, scales = self.weight[indices], self.scale[indices]
+        values = values.float().unflatten(-1, (-1, self.block_size))
+        return (values * scales.float().unsqueeze(-1)).flatten(-2).to(torch.bfloat16)
 
 
 class Engram(nn.Module):
     """h + gate * value, written into every hyper-connection copy; the gate is a signed-sqrt
     sigmoid of the normalized dot product between each copy and its key."""
 
-    def __init__(self, cfg: DSV41Config, layout: EngramLayout, hash_index: int, act_fp8: bool = False):
+    def __init__(
+        self, cfg: DSV41Config, layout: EngramLayout, hash_index: int, act_fp8: bool = False, table_on_host: bool = False
+    ):
         super().__init__()
         self.hash_index = hash_index
         self.dim, self.hc_mult, self.eps = cfg.dim, cfg.hc_mult, cfg.norm_eps
         self.clamp_value = 1e-6
-        self.embed = EngramTable(layout.num_embeddings[hash_index], layout.head_dim)
+        self.embed = EngramTable(layout.num_embeddings[hash_index], layout.head_dim, on_host=table_on_host)
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         self.wkv = QLinear(n_hash_cols * layout.head_dim, cfg.dim * (cfg.hc_mult + 1), act_fp8=act_fp8)
         self.q_weight = nn.Parameter(torch.ones(cfg.hc_mult, cfg.dim))

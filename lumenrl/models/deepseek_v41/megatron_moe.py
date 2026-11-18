@@ -12,11 +12,14 @@ by `route_scale`, no group limit.
 
 from __future__ import annotations
 
+import re
+from collections.abc import Callable
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from lumenrl.models.deepseek_v41.config import DSV41Config
+from lumenrl.models.deepseek_v41.config import DSV41Config, LayerSpec
 
 
 def moe_config(cfg: DSV41Config, *, ep: int, pp: int = 1, dp_dtype: torch.dtype = torch.bfloat16, **overrides):
@@ -64,11 +67,42 @@ def moe_config(cfg: DSV41Config, *, ep: int, pp: int = 1, dp_dtype: torch.dtype 
     return TransformerConfig(**kwargs)
 
 
+_SAME_ON_EVERY_RANK = {
+    "router.weight": ("gate.weight",),
+    "router.expert_bias": ("gate.bias",),
+    "shared_experts.linear_fc1.weight": ("shared_experts.w1.weight", "shared_experts.w3.weight"),
+    "shared_experts.linear_fc2.weight": ("shared_experts.w2.weight",),
+}
+
+
+def local_experts(n_experts: int, ep_size: int) -> int:
+    if n_experts % ep_size:
+        raise ValueError(f"{n_experts} experts do not split over EP {ep_size}")
+    return n_experts // ep_size
+
+
+def reference_names(key: str, *, ep_rank: int, n_local: int) -> list[str]:
+    """The reference `MoE` state (`gate.*`, `experts.{e}.w1/w2/w3`, `shared_experts.*`) that the
+    `MegatronMoE.layer` state `key` of EP rank `ep_rank` is made of, in concatenation order: gate
+    before up in `linear_fc1`, local expert k is expert `ep_rank * n_local + k`. Empty for state
+    the reference has no counterpart of (TransformerEngine's `_extra_state`)."""
+    if key.endswith("_extra_state"):
+        return []
+    if key in _SAME_ON_EVERY_RANK:
+        return list(_SAME_ON_EVERY_RANK[key])
+    m = re.fullmatch(r"experts\.linear_fc([12])\.weight(\d+)", key)
+    if m is None or int(m.group(2)) >= n_local:
+        raise KeyError(f"MoE state {key!r} has no reference counterpart")
+    e = ep_rank * n_local + int(m.group(2))
+    return [f"experts.{e}.w1.weight", f"experts.{e}.w3.weight"] if m.group(1) == "1" else [f"experts.{e}.w2.weight"]
+
+
 class MegatronMoE(nn.Module):
     """Drop-in for the reference `MoE` of a block: [b, s, d] in and out."""
 
     def __init__(self, tfcfg, layer_number: int):
         super().__init__()
+        from megatron.core import parallel_state as mpu
         from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
         from megatron.core.process_groups_config import ProcessGroupCollection
         from megatron.core.transformer.spec_utils import build_module
@@ -76,6 +110,8 @@ class MegatronMoE(nn.Module):
         spec = get_moe_module_spec(use_te=True, num_experts=tfcfg.num_moe_experts, moe_grouped_gemm=True)
         pgs = ProcessGroupCollection.use_mpu_process_groups()
         self.layer = build_module(spec, config=tfcfg, layer_number=layer_number, pg_collection=pgs)
+        self.ep_rank = mpu.get_expert_model_parallel_rank()
+        self.n_local = local_experts(tfcfg.num_moe_experts, mpu.get_expert_model_parallel_world_size())
 
     def forward(self, x: Tensor) -> Tensor:
         out, bias = self.layer(x.transpose(0, 1).contiguous())
@@ -83,23 +119,31 @@ class MegatronMoE(nn.Module):
             out = out + bias
         return out.transpose(0, 1)
 
+    def reference_names(self, key: str) -> list[str]:
+        """What `convert.load_released` reads for this module's state `key`, relative to where
+        the reference `MoE` sits."""
+        return reference_names(key.removeprefix("layer."), ep_rank=self.ep_rank, n_local=self.n_local)
+
+
+def megatron_ffn(tfcfg) -> Callable[[LayerSpec], MegatronMoE]:
+    """`DSV41Stage(ffn=...)`: every layer's MoE a `MegatronMoE`, built on the current device."""
+    return lambda spec: MegatronMoE(tfcfg, layer_number=spec.layer + 1)
+
+
+def moe_keys(n_local: int) -> list[str]:
+    """The `MegatronMoE.layer` state a rank holding `n_local` experts loads."""
+    experts = [f"experts.linear_fc{i}.weight{k}" for k in range(n_local) for i in (1, 2)]
+    return [*_SAME_ON_EVERY_RANK, *experts]
+
 
 def moe_state_from_reference(ffn: dict[str, Tensor], *, n_experts: int, ep_rank: int, ep_size: int) -> dict[str, Tensor]:
-    """A reference `MoE`'s state dict (`gate.*`, `experts.{e}.w1/w2/w3`, `shared_experts.*`) as
-    this EP rank's `MegatronMoE.layer` state: its own experts, gate and up fused in `linear_fc1`."""
-    if n_experts % ep_size:
-        raise ValueError(f"{n_experts} experts do not split over EP {ep_size}")
-    local = n_experts // ep_size
-    out = {"router.weight": ffn["gate.weight"], "router.expert_bias": ffn["gate.bias"]}
-    for k in range(local):
-        e = ep_rank * local + k
-        out[f"experts.linear_fc1.weight{k}"] = torch.cat([ffn[f"experts.{e}.w1.weight"], ffn[f"experts.{e}.w3.weight"]])
-        out[f"experts.linear_fc2.weight{k}"] = ffn[f"experts.{e}.w2.weight"]
-    out["shared_experts.linear_fc1.weight"] = torch.cat(
-        [ffn["shared_experts.w1.weight"], ffn["shared_experts.w3.weight"]]
-    )
-    out["shared_experts.linear_fc2.weight"] = ffn["shared_experts.w2.weight"]
-    return out
+    """A reference `MoE`'s state dict as this EP rank's `MegatronMoE.layer` state: its own
+    experts, gate and up fused in `linear_fc1`."""
+    n_local = local_experts(n_experts, ep_size)
+    return {
+        key: torch.cat([ffn[name] for name in reference_names(key, ep_rank=ep_rank, n_local=n_local)])
+        for key in moe_keys(n_local)
+    }
 
 
 def use_megatron_moe(stage, tfcfg) -> None:

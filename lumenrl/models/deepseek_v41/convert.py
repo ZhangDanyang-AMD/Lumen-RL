@@ -49,31 +49,96 @@ def checkpoint_name(model_key: str, original_layer_ids: tuple[int, ...]) -> str:
     return f"layers.{original_layer_ids[int(m.group(1))]}.{m.group(2)}"
 
 
-def _convert(name: str, tensor: Tensor, scales: dict[str, Tensor], target: Tensor) -> Tensor:
-    if target.dtype in (torch.float8_e4m3fn, torch.float8_e8m0fnu):
-        if tensor.dtype != target.dtype:
-            raise TypeError(f"{name}: kept as {target.dtype} but stored as {tensor.dtype}")
+def _dequant(name: str, tensor: Tensor, scale: Tensor | None, dtype: torch.dtype) -> Tensor:
+    if dtype in (torch.float8_e4m3fn, torch.float8_e8m0fnu):
+        if tensor.dtype != dtype:
+            raise TypeError(f"{name}: kept as {dtype} but stored as {tensor.dtype}")
         return tensor
     if tensor.dtype == torch.float8_e4m3fn:
-        tensor = dequant_fp8_block(tensor, scales[name])
+        tensor = dequant_fp8_block(tensor, scale)
     elif tensor.dtype == torch.int8:
-        tensor = dequant_fp4(tensor, scales[name])
-    if tensor.shape != target.shape:
-        raise ValueError(f"{name}: checkpoint shape {tuple(tensor.shape)} != model {tuple(target.shape)}")
-    return tensor.to(target.dtype)
+        tensor = dequant_fp4(tensor, scale)
+    return tensor.to(dtype)
+
+
+def _sources(model) -> dict[str, list[str]]:
+    """Each state-dict key of `model` -> the reference keys it is made of, concatenated in that
+    order along dim 0. A module laid out differently from the reference (`MegatronMoE`) says how
+    with `reference_names(key)`; a key it maps to nothing is not loaded."""
+    sources = {k: [k] for k in model.state_dict()}
+    for name, module in model.named_modules():
+        remap = getattr(module, "reference_names", None)
+        if not name or remap is None:
+            continue
+        prefix = name + "."
+        for key in [k for k in sources if k.startswith(prefix)]:
+            refs = remap(key[len(prefix) :])
+            if refs:
+                sources[key] = [prefix + r for r in refs]
+            else:
+                del sources[key]
+    return sources
+
+
+_SAFETENSORS_DTYPES = {
+    "F8_E4M3": torch.float8_e4m3fn, "F8_E8M0": torch.float8_e8m0fnu, "I8": torch.int8, "U8": torch.uint8,
+    "BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32,
+}
+
+
+def mapped_tensor(path: str, name: str) -> Tensor:
+    """Tensor `name` of the safetensors file `path` as a read-only CPU tensor over the file's
+    pages: every process that maps the same file shares one copy in the page cache, and nothing
+    is read until a row is."""
+    import struct
+    import warnings
+
+    import numpy as np
+
+    with open(path, "rb") as f:
+        (size,) = struct.unpack("<Q", f.read(8))
+        meta = json.loads(f.read(size))[name]
+    begin, end = meta["data_offsets"]
+    pages = np.memmap(path, dtype=np.uint8, mode="r", offset=8 + size + begin, shape=(end - begin,))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # torch warns that the array is read-only; the table is frozen
+        raw = torch.from_numpy(pages)
+    return raw.view(_SAFETENSORS_DTYPES[meta["dtype"]]).view(meta["shape"])
+
+
+def _attach_host_tables(model, ckpt_dir: str, index: dict[str, str]) -> int:
+    from lumenrl.models.deepseek_v41.engram import EngramTable
+
+    attached = 0
+    for name, module in model.named_modules():
+        if isinstance(module, EngramTable) and module.on_host:
+            src = checkpoint_name(name, model.cfg.original_layer_ids)
+            weight, scale = f"{src}.weight", f"{src}.scale"
+            for t in (weight, scale):
+                if t not in index:
+                    raise KeyError(f"host engram table {name}: no checkpoint source {t}")
+            module.attach(
+                mapped_tensor(os.path.join(ckpt_dir, index[weight]), weight),
+                mapped_tensor(os.path.join(ckpt_dir, index[scale]), scale),
+            )
+            attached += 1
+    return attached
 
 
 @torch.no_grad()
 def load_released(model, ckpt_dir: str, device: str | torch.device = "cpu") -> dict:
-    """Fill `model` from the released checkpoint at `ckpt_dir`. Returns counts and the names it
-    left unused (other layers, MTP, vision). Raises if a model tensor has no source."""
+    """Fill `model` from the released checkpoint at `ckpt_dir`; Engram tables kept on the host
+    are mapped from the file instead. Returns counts and the names it left unused (other layers,
+    other ranks' experts, MTP, vision). Raises if a model tensor has no source."""
     from safetensors import safe_open
 
     with open(os.path.join(ckpt_dir, "model.safetensors.index.json")) as f:
         index = json.load(f)["weight_map"]
     state = model.state_dict()
-    wanted = {checkpoint_name(k, model.cfg.original_layer_ids): k for k in state}
-    missing = [src for src in wanted if src not in index]
+    ids = model.cfg.original_layer_ids
+    parts = {key: [checkpoint_name(r, ids) for r in refs] for key, refs in _sources(model).items()}
+    wanted = {src for srcs in parts.values() for src in srcs}
+    missing = sorted(src for src in wanted if src not in index)
     if missing:
         raise KeyError(f"{len(missing)} model tensors have no checkpoint source, e.g. {missing[:3]}")
     # a weight's scale is consumed by dequantization, unless the model keeps it (Engram tables)
@@ -82,31 +147,36 @@ def load_released(model, ckpt_dir: str, device: str | torch.device = "cpu") -> d
         sibling = src[: -len("weight")] + "scale" if src.endswith(".weight") else None
         if sibling in index and sibling not in wanted:
             dequant_scale[src] = sibling
-    needed = set(wanted) | set(dequant_scale.values())
+    needed = wanted | set(dequant_scale.values())
     by_file = defaultdict(list)
     for src in sorted(needed):
         by_file[index[src]].append(src)
 
     raw: dict[str, Tensor] = {}
-    loaded = 0
+    pending = dict(parts)
     for file, names in sorted(by_file.items()):
         with safe_open(os.path.join(ckpt_dir, file), framework="pt", device=str(device)) as f:
             for src in names:
                 raw[src] = f.get_tensor(src)
         # convert what is complete so far, so the raw FP8/FP4 tensors do not pile up
-        for src in [s for s in raw if s in wanted]:
-            scale_name = dequant_scale.get(src)
-            if scale_name is not None and scale_name not in raw:
+        for key, srcs in list(pending.items()):
+            if not all(s in raw and dequant_scale.get(s, s) in raw for s in srcs):
                 continue
-            scales = {src: raw.pop(scale_name)} if scale_name is not None else {}
-            key = wanted[src]
-            state[key].copy_(_convert(src, raw.pop(src), scales, state[key]))
-            loaded += 1
-    if loaded != len(wanted):
-        raise RuntimeError(f"loaded {loaded} of {len(wanted)} tensors; left: {sorted(raw)[:5]}")
-    unused = len(index) - len(needed)
+            target = state[key]
+            tensor = torch.cat(
+                [_dequant(s, raw.pop(s), raw.pop(dequant_scale[s]) if s in dequant_scale else None, target.dtype)
+                 for s in srcs]
+            )
+            if tensor.shape != target.shape:
+                raise ValueError(f"{key}: checkpoint {srcs} gives {tuple(tensor.shape)}, model has {tuple(target.shape)}")
+            target.copy_(tensor)
+            del pending[key]
+    if pending:
+        raise RuntimeError(f"loaded {len(parts) - len(pending)} of {len(parts)} tensors; left: {sorted(pending)[:5]}")
+    mapped = _attach_host_tables(model, ckpt_dir, index)
+    unused = len(index) - len(needed) - 2 * mapped
     skipped_kinds = sorted({n.split(".")[0] for n in index if n.startswith(_SKIP_PREFIXES)})
-    return {"loaded": loaded, "unused": unused, "skipped_kinds": skipped_kinds}
+    return {"loaded": len(parts), "mapped": mapped, "unused": unused, "skipped_kinds": skipped_kinds}
 
 
 def sliced_hf_config(raw: dict, keep: list[int]) -> dict:

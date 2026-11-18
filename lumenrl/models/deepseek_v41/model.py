@@ -18,6 +18,7 @@ directly on a truncated slice. MoE here is a per-expert loop; the Megatron path 
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -348,14 +349,22 @@ class MoE(nn.Module):
 class Block(nn.Module):
     """Single-pass mHC block: each sublayer's coefficients mix the input of the next one."""
 
-    def __init__(self, cfg: DSV41Config, spec: LayerSpec, quant: QuantPoints, layout: EngramLayout | None):
+    def __init__(
+        self,
+        cfg: DSV41Config,
+        spec: LayerSpec,
+        quant: QuantPoints,
+        layout: EngramLayout | None,
+        ffn: Callable[[LayerSpec], nn.Module] | None = None,
+        engram_on_host: bool = False,
+    ):
         super().__init__()
         self.norm_eps, self.hc_mult = cfg.norm_eps, cfg.hc_mult
         self.hc_sinkhorn_iters, self.hc_eps = cfg.hc_sinkhorn_iters, cfg.hc_eps
         self.attn = Attention(cfg, spec, quant)
-        self.ffn = MoE(cfg, quant)
+        self.ffn = MoE(cfg, quant) if ffn is None else ffn(spec)
         self.engram = (
-            Engram(cfg, layout, spec.engram_hash_index, act_fp8=quant.linear_act_fp8)
+            Engram(cfg, layout, spec.engram_hash_index, act_fp8=quant.linear_act_fp8, table_on_host=engram_on_host)
             if spec.engram_hash_index is not None else None
         )
         self.attn_norm = RMSNorm(cfg.dim, cfg.norm_eps)
@@ -467,7 +476,11 @@ class DSV41Stage(nn.Module):
     numbering, so a stage loads with `convert.load_released` as the whole model does.
 
     `dtype` is what the release keeps in bf16 (most weights, norms, embedding); the fp32 tensors
-    (hc mixes, sinks, gate bias, ratio-2 compressor, head) are fp32 regardless."""
+    (hc mixes, sinks, gate bias, ratio-2 compressor, head) are fp32 regardless.
+
+    `ffn(spec)` builds each layer's MoE in place of the reference one (whose experts every rank
+    would hold); `engram_on_host` keeps the Engram tables out of the module state, in host
+    memory (see `EngramTable`)."""
 
     def __init__(
         self,
@@ -478,6 +491,8 @@ class DSV41Stage(nn.Module):
         quant: QuantPoints | None = None,
         dtype: torch.dtype = torch.bfloat16,
         recompute: bool = False,
+        ffn: Callable[[LayerSpec], nn.Module] | None = None,
+        engram_on_host: bool = False,
     ):
         super().__init__()
         end = cfg.n_layers if end is None else end
@@ -506,7 +521,9 @@ class DSV41Stage(nn.Module):
         try:
             if self.pre_process:
                 self.embed = nn.Embedding(cfg.vocab_size, cfg.dim)
-            self.layers = nn.ModuleDict({str(s.layer): Block(cfg, s, self.quant, self.layout) for s in specs})
+            self.layers = nn.ModuleDict(
+                {str(s.layer): Block(cfg, s, self.quant, self.layout, ffn, engram_on_host) for s in specs}
+            )
             if self.post_process:
                 self.norm = RMSNorm(cfg.dim, cfg.norm_eps)
         finally:
@@ -549,5 +566,7 @@ class DSV41Model(DSV41Stage):
         quant: QuantPoints | None = None,
         dtype: torch.dtype = torch.bfloat16,
         recompute: bool = False,
+        ffn: Callable[[LayerSpec], nn.Module] | None = None,
+        engram_on_host: bool = False,
     ):
-        super().__init__(cfg, 0, cfg.n_layers, token_map, quant, dtype, recompute)
+        super().__init__(cfg, 0, cfg.n_layers, token_map, quant, dtype, recompute, ffn, engram_on_host)
