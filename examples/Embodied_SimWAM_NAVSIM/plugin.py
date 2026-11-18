@@ -506,6 +506,113 @@ def install_fused_lora_add() -> None:
     logger.info("LoRALinear adds the adapter with torch.add(alpha=scaling)")
 
 
+def install_overlap_reward_logprobs() -> None:
+    """Score PDM rewards in the worker pool while the rollout's log-probs run on the GPU.
+
+    ``_rollout`` scores the trajectories and only then computes the old log-probs, which do
+    not depend on the rewards. With the pool from ``install_parallel_pdm_reward`` the
+    rewards are submitted asynchronously right after sampling; the old log-probs and the
+    reference log-probs of the first inner epoch (stored where ``install_ref_logprob_cache``
+    looks) are computed while the workers simulate, and the rewards are collected before the
+    advantages. Everything else follows ``SimWAMGRPOTrainer._rollout``.
+    Needs both of those patches; ``SIMWAM_GRPO_OVERLAP_REWARD=0`` turns it off.
+    """
+    if os.environ.get("SIMWAM_GRPO_OVERLAP_REWARD", "1").strip().lower() in _OFF:
+        return
+    import multiprocessing as mp
+
+    import numpy as np
+    import torch
+    from simwam.datasets.navsim.pdm_reward import NavSimPDMReward, _SUBMETRIC_COLUMNS
+    from simwam.trainer_grpo import SimWAMGRPOTrainer
+
+    if getattr(SimWAMGRPOTrainer._rollout, "_overlap", False):
+        return
+    if not getattr(NavSimPDMReward.score_batch, "_parallel", False):
+        logger.warning("install_overlap_reward_logprobs needs install_parallel_pdm_reward; skipped")
+        return
+    rollout_orig = SimWAMGRPOTrainer._rollout
+    workers = int(os.environ.get("SIMWAM_GRPO_PDM_WORKERS", "8") or 8)
+
+    def submit(reward, abs_poses, tokens, device):
+        pool = reward.__dict__.get("_pool")
+        if pool is None:
+            args, kwargs = reward._pool_init_args
+            pool = reward._pool = mp.get_context("spawn").Pool(
+                workers, initializer=_pdm_worker_init, initargs=(type(reward), args, kwargs))
+        poses_np = abs_poses.detach().to(device="cpu", dtype=torch.float32).numpy()
+        return pool.map_async(_pdm_worker_score, [(t, poses_np[i]) for i, t in enumerate(tokens)])
+
+    def collect(reward, pending, tokens, device):
+        results = pending.get()
+        reward.last_num_total = len(tokens)
+        reward.last_num_missing = 0
+        reward.last_num_failed = 0
+        reward._true_pdms, reward._submetric_rows = [], []
+        nan_row = {name: float("nan") for name in _SUBMETRIC_COLUMNS}
+        rewards = []
+        for token, res in zip(tokens, results):
+            if res[0] == "ok":
+                reward._true_pdms.append(res[2])
+                reward._submetric_rows.append(res[3])
+                rewards.append(res[1])
+                continue
+            if res[0] == "missing":
+                reward.last_num_missing += 1
+            else:
+                reward.last_num_failed += 1
+                logger.warning("PDM scoring failed for token %s: %s", token, res[1])
+            rewards.append(reward.failure_reward)
+            reward._submetric_rows.append(dict(nan_row))
+        return torch.tensor(rewards, device=device, dtype=torch.float32)
+
+    @torch.no_grad()
+    def _rollout(self, model, batch):
+        reward = self.action_reward
+        if (not isinstance(reward, NavSimPDMReward) or not hasattr(reward, "_pool_init_args")
+                or not self.ppo_enabled or self.kl_gate_enabled):
+            return rollout_orig(self, model, batch)
+        input_image, action_horizon, context, context_mask, proprio, tokens = self._batch_condition_inputs(batch)
+        cond_b = model.build_action_condition(input_image, action_horizon, context, context_mask, proprio)
+        cond_bg = model.expand_condition(cond_b, self.group_size)
+        chain, timesteps, deltas, stoch_idx = model.sample_action_chain(cond_bg, action_horizon, deterministic=False)
+        abs_poses = self.train_dataset.denormalize_action(chain[:, -1])
+        tokens_bg = [tok for tok in tokens for _ in range(self.group_size)]
+        pending = submit(reward, abs_poses, tokens_bg, self.accelerator.device)
+        il_abs = None
+        steps_ahead = max(self.num_inner_epochs * self.rollout_buffer_batches, 1)
+        will_visualize = (
+            self.vis_enabled and self.accelerator.is_main_process and self.vis_every > 0
+            and any((self.global_step + 1 + j) % self.vis_every == 0 for j in range(steps_ahead))
+        )
+        if will_visualize:
+            det_chain, _, _, _ = model.sample_action_chain(cond_b, action_horizon, deterministic=True)
+            il_abs = self.train_dataset.denormalize_action(det_chain[:, -1])
+        old_logp = model.action_chain_logprobs(cond_bg, chain, timesteps, deltas, stoch_idx=stoch_idx).detach()
+        ref = model.action_chain_logprobs(
+            cond_bg, chain, timesteps, deltas, stoch_idx=stoch_idx, use_ref=True, return_terms=True)
+        rewards = collect(reward, pending, tokens_bg, self.accelerator.device)
+        pdm_fail_frac = float(getattr(reward, "last_fail_frac", 0.0))
+        true_pdms = float(getattr(reward, "last_true_pdms", float("nan")))
+        reward_submetrics = getattr(reward, "last_submetrics", None)
+        bsz = len(tokens)
+        rewards_mat = rewards.view(bsz, self.group_size)
+        advantage_info = self._compute_advantages(rewards_mat)
+        num_unavailable = int(sum((0 if reward.available(t) else 1 for t in tokens)))
+        return {
+            "cond_b": cond_b, "cond_bg": cond_bg, "chain": chain, "timesteps": timesteps, "deltas": deltas,
+            "stoch_idx": stoch_idx, "num_sde_steps": int(stoch_idx.numel()), "pdm_fail_frac": pdm_fail_frac,
+            "true_pdms": true_pdms, "reward_submetrics": reward_submetrics, "rewards": rewards.detach(),
+            **advantage_info, "num_unavailable": num_unavailable, "tokens": tokens,
+            "abs_group": abs_poses.reshape(bsz, self.group_size, abs_poses.shape[1], abs_poses.shape[2]),
+            "il_abs": il_abs, "old_logp": old_logp, "old_mean": None, "old_std": None, "_ref_logprobs": ref,
+        }
+
+    _rollout._overlap = True
+    SimWAMGRPOTrainer._rollout = _rollout
+    logger.info("PDM rewards are scored while the rollout's old/reference log-probs run")
+
+
 def enable_lumen(model, spec: str):
     """Apply ``LumenConfig.enable`` once per requested patch."""
     requested = []
