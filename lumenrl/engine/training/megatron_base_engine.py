@@ -133,6 +133,77 @@ class _FusedTokenLogProb(torch.autograd.Function):
         return grad, None
 
 
+class _HeadTokenLogProb(torch.autograd.Function):
+    """``log p(target)`` under ``hidden @ weight.T / temperature``, a chunk of
+    positions at a time, each chunk's logits recomputed in backward: never more
+    than one ``[chunk, V]`` alive, where ``_FusedTokenLogProb`` keeps ``[L, V]``."""
+
+    @staticmethod
+    def forward(ctx, hidden, weight, target, temperature, chunk):
+        w = weight.float()
+        out = torch.empty(hidden.shape[0], dtype=torch.float32, device=hidden.device)
+        for s in range(0, hidden.shape[0], chunk):
+            logits = hidden[s:s + chunk].float() @ w.t() / temperature
+            tgt = logits.gather(-1, target[s:s + chunk].unsqueeze(-1)).squeeze(-1)
+            out[s:s + chunk] = tgt - torch.logsumexp(logits, dim=-1)
+        ctx.save_for_backward(hidden, weight, target)
+        ctx.temperature, ctx.chunk = temperature, chunk
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_lp):
+        hidden, weight, target = ctx.saved_tensors
+        t, chunk, w = ctx.temperature, ctx.chunk, weight.float()
+        grad_h = torch.empty(hidden.shape, dtype=torch.float32, device=hidden.device)
+        grad_w = torch.zeros_like(w)
+        for s in range(0, hidden.shape[0], chunk):
+            h = hidden[s:s + chunk].float()
+            g = torch.softmax(h @ w.t() / t, dim=-1).neg_()
+            g.scatter_add_(-1, target[s:s + chunk].unsqueeze(-1), torch.ones_like(g[:, :1]))
+            g.mul_(grad_lp[s:s + chunk].unsqueeze(-1) / t)
+            grad_h[s:s + chunk] = g @ w
+            grad_w.addmm_(g.t(), h)
+        return grad_h.to(hidden.dtype), grad_w.to(weight.dtype), None, None, None
+
+
+class HeadLogits:
+    """The logits ``hidden @ weight.T / temperature`` of ``hidden`` [L, d], never
+    materialized: what a family whose last stage returns its final hidden states
+    (``ModelSpec.output_head``) hands the log-prob helpers. Sliced along positions
+    like the ``[L, V]`` tensor it stands for; at 32K positions and a 129K vocab
+    that tensor is 17 GB in fp32 before its gradient."""
+
+    def __init__(self, hidden: torch.Tensor, weight: torch.Tensor, temperature: float) -> None:
+        self.hidden, self.weight, self.temperature = hidden, weight, temperature
+
+    @property
+    def shape(self) -> torch.Size:
+        return torch.Size((self.hidden.shape[0], self.weight.shape[0]))
+
+    def __getitem__(self, rows) -> "HeadLogits":
+        if not isinstance(rows, slice):
+            raise TypeError("HeadLogits slices positions only")
+        return HeadLogits(self.hidden[rows], self.weight, self.temperature)
+
+    def sum(self) -> torch.Tensor:
+        """A scalar on the autograd graph, for a loss of zero (`logits.sum() * 0.0`)."""
+        return self.hidden.float().sum()
+
+    def token_logprob(self, targets: torch.Tensor, chunk: int) -> torch.Tensor:
+        return _HeadTokenLogProb.apply(self.hidden, self.weight, targets, self.temperature, chunk)
+
+    @torch.no_grad()
+    def logprob_entropy(self, targets: torch.Tensor, chunk: int, want_entropy: bool):
+        w = self.weight.float()
+        lps, ents = [], []
+        for s in range(0, self.hidden.shape[0], chunk):
+            lsm = torch.log_softmax(self.hidden[s:s + chunk].float() @ w.t() / self.temperature, dim=-1)
+            lps.append(lsm.gather(-1, targets[s:s + chunk].view(-1, 1)).squeeze(-1))
+            if want_entropy:
+                ents.append(-(lsm.exp() * lsm).sum(-1))
+        return torch.cat(lps), (torch.cat(ents) if want_entropy else None)
+
+
 class MegatronBaseEngine(BaseEngine):
     """Shared implementation for concrete Megatron-Core engines."""
 
@@ -351,6 +422,8 @@ class MegatronBaseEngine(BaseEngine):
         chunked over the sequence) when ``log_probs_chunk_size>0``; otherwise the
         original ``log_softmax(...).gather(...)`` path (kept for the smoke config)."""
         cs = self._logprob_chunk_size
+        if isinstance(logits, HeadLogits):
+            return logits.token_logprob(targets, cs if cs and cs > 0 else 1024)
         if cs and cs > 0:
             outs = []
             for s in range(0, logits.shape[0], cs):
@@ -364,6 +437,9 @@ class MegatronBaseEngine(BaseEngine):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """No-grad per-token log-prob (+ optional entropy), chunked over the
         sequence to bound the ``[chunk, V]`` softmax memory."""
+        if isinstance(logits, HeadLogits):
+            cs = self._logprob_chunk_size if (self._logprob_chunk_size and self._logprob_chunk_size > 0) else 1024
+            return logits.logprob_entropy(targets, cs, want_entropy)
         cs = self._logprob_chunk_size if (self._logprob_chunk_size and self._logprob_chunk_size > 0) else logits.shape[0]
         cs = max(1, cs)
         lps, ents = [], []

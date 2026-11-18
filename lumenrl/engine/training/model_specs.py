@@ -99,6 +99,7 @@ DSV41 = MODEL_REGISTRY.register(
         language_config=dsv41.language_config,
         build_config=dsv41.build_dsv41_config,
         build_model=dsv41.build_dsv41_model,
+        output_head=dsv41.output_head,
         export_weights=dsv41.export_dsv41,
     )
 )

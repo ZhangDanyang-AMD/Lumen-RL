@@ -543,9 +543,11 @@ class DSV41Stage(nn.Module):
         if self.post_process:
             self.head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False, dtype=torch.float32)
 
-    def forward(self, input_ids: Tensor, stream: Tensor | None = None) -> Tensor:
+    def forward(self, input_ids: Tensor, stream: Tensor | None = None, return_hidden: bool = False) -> Tensor:
         """input_ids [b, s] (every stage: Engram hashes them); `stream` is the previous stage's
-        output. Returns fp32 logits [b, s, vocab] from the last stage."""
+        output. Returns fp32 logits [b, s, vocab] from the last stage -- or with `return_hidden`
+        the fp32 hidden states [b, s, dim] the head projects, for a caller that applies
+        `head.weight` itself a chunk of positions at a time."""
         if self.pre_process:
             h = self.embed(input_ids).unsqueeze(2).repeat(1, 1, self.cfg.hc_mult, 1)
             pre_mix = h.new_zeros(*h.shape[:2], self.cfg.hc_mult, dtype=torch.float32)
@@ -563,8 +565,8 @@ class DSV41Stage(nn.Module):
                 h, pre_mix, *fields = _run_layer(layer, hashes, h, pre_mix, *fields)
         if not self.post_process:
             return pack_stream(h, pre_mix)
-        h = Block.hc_pre(h, pre_mix)
-        return F.linear(self.norm(h).float(), self.head.weight)
+        h = self.norm(Block.hc_pre(h, pre_mix)).float()
+        return h if return_hidden else F.linear(h, self.head.weight)
 
 
 class DSV41Model(DSV41Stage):

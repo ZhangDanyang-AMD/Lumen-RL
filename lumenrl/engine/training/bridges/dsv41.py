@@ -112,9 +112,10 @@ def megatron_model_class() -> type:
         ``forward`` takes the packed microbatch ``_pp_forward_model`` builds,
         which for V4.1 is one sequence ``[1, s]`` (its attention reads the whole
         tensor as one sequence, so ``packed_seq_params`` means nothing to it).
-        The last stage returns fp32 logits ``[1, s, vocab]``, any other the
-        packed stream for the next stage, whose input the schedule hands over
-        with ``set_input_tensor``.
+        The last stage returns the fp32 hidden states ``[1, s, dim]`` its head
+        projects (``output_head``: the engine takes the log-probs from them a
+        chunk at a time), any other the packed stream for the next stage, whose
+        input the schedule hands over with ``set_input_tensor``.
         """
 
         def __init__(self, config, stage):
@@ -131,7 +132,8 @@ def megatron_model_class() -> type:
             self.input_tensor = input_tensor
 
         def forward(self, input_ids, position_ids=None, attention_mask=None, packed_seq_params=None, **_):
-            return self.stage(input_ids, None if self.pre_process else self.input_tensor)
+            stream = None if self.pre_process else self.input_tensor
+            return self.stage(input_ids, stream, return_hidden=self.post_process)
 
     return DSV41MegatronModel
 
@@ -197,6 +199,11 @@ def build_dsv41_model(engine, hf: dict, tfcfg) -> torch.nn.Module:
         engine.model_name, held / 1e9, trained / 1e9, engine._ep, pp, recompute, quant,
     )
     return megatron_model_class()(tfcfg, stage)
+
+
+def output_head(engine) -> torch.Tensor:
+    """The last stage's head [vocab, dim], which its hidden states go through."""
+    return engine.module.stage.head.weight
 
 
 def checkpoint_names(name: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]]:

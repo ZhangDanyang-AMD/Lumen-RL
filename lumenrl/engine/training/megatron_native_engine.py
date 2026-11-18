@@ -43,6 +43,7 @@ from lumenrl.engine.training.bridges.gpt import (
     non_expert_hf_to_megatron,
 )
 from lumenrl.engine.training.megatron_base_engine import (
+    HeadLogits,
     MegatronBaseEngine,
     moe_dispatcher_kwargs,
 )
@@ -1625,6 +1626,16 @@ class MegatronNativeEngine(MegatronBaseEngine):
             replay_on_recompute()
         return out, layouts
 
+    def _packed_logits(self, out: torch.Tensor, temperature: float):
+        """The [tokens, V] logits at ``temperature`` of the last stage's output, or
+        for a family whose last stage returns its final hidden states
+        (``ModelSpec.output_head``) the ``HeadLogits`` that stand for them."""
+        if self._spec is not None and self._spec.output_head is not None:
+            if self._cp > 1:
+                raise NotImplementedError("output_head with context parallelism")
+            return HeadLogits(out.reshape(-1, out.shape[-1]), self._spec.output_head(self), temperature)
+        return out.reshape(-1, out.shape[-1]).float() / temperature
+
     def _cp_row_logprob_entropy(
         self,
         packed_logits: torch.Tensor,
@@ -1906,7 +1917,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 # a TP multiple, so the output can be longer than the real token
                 # total. Real sequences index via their (unpadded) layouts.
                 lt = output_tensor.logits if hasattr(output_tensor, "logits") else output_tensor
-                logits = lt.reshape(-1, lt.shape[-1]).float() / temperature
+                logits = self._packed_logits(lt, temperature)
                 bin_loss = None
                 agg = {"loss": 0.0, "n": 0, "ppo_kl_sum": 0.0, "ppo_kl_tok": 0.0,
                        "rc_kl_sum": 0.0, "rc_kl_tok": 0.0}
@@ -2073,7 +2084,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
 
                 def collect(output_tensor, non_loss_data=True):
                     lt = output_tensor.logits if hasattr(output_tensor, "logits") else output_tensor
-                    logits = lt.reshape(-1, lt.shape[-1]).float() / temperature
+                    logits = self._packed_logits(lt, temperature)
                     res = []
                     for k, (r, start, L) in enumerate(mb["rows"]):
                         tok_lp, ent = self._cp_row_logprob_entropy(

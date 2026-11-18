@@ -98,6 +98,11 @@ class ModelSpec:
     # must provide what that schedule calls (``set_input_tensor``, the forward
     # ``_pp_forward_model`` makes).
     build_model: Optional[Callable[[Any, Mapping[str, Any], Any], Any]] = None
+    # ``(engine) -> weight [V, d]``: for a family whose last stage returns its
+    # final hidden states, the output projection they go through. The engine then
+    # computes each token's log-prob a chunk of positions at a time
+    # (``HeadLogits``), never the whole ``[tokens, V]``.
+    output_head: Optional[Callable[[Any], Any]] = None
     # ``(tfcfg) -> int`` extra sequence-length alignment the family requires.
     sequence_alignment: Optional[Callable[[Any], int]] = None
     # ``(engine) -> None`` run before each forward, to refuse topologies the

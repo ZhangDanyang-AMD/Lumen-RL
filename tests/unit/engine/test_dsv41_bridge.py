@@ -148,7 +148,8 @@ def test_two_wrapped_stages_hand_the_stream_over_as_the_schedule_does():
     with torch.no_grad():
         stream = first(input_ids=ids, **kwargs)
         last.set_input_tensor([stream])
-        got = last(input_ids=ids, **kwargs)
+        hidden = last(input_ids=ids, **kwargs)  # the engine applies the head (output_head)
+        got = torch.nn.functional.linear(hidden, dsv41.output_head(SimpleNamespace(module=last)))
         want = whole(ids)
 
     assert (first.pre_process, first.post_process, last.pre_process, last.post_process) == (True, False, False, True)
