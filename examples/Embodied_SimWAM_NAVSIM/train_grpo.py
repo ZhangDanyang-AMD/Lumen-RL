@@ -25,6 +25,8 @@ from examples.Embodied_SimWAM_NAVSIM.plugin import (
     install_action_velocity_graphs,
     install_batched_logprobs,
     install_grpo_hook,
+    install_lean_lumen_attention,
+    install_lora_init_seed,
     install_parallel_pdm_reward,
     install_ref_logprob_cache,
 )
@@ -32,9 +34,12 @@ from simwam.runtime_grpo import run_grpo_training
 from simwam.utils.config_resolvers import register_default_resolvers
 
 install_grpo_hook()
+install_lora_init_seed()
 # before the reference cache, which wraps action_chain_logprobs
 install_batched_logprobs()
 install_ref_logprob_cache()
+# before the CUDA graphs, which capture its attention path
+install_lean_lumen_attention()
 install_action_velocity_graphs()
 install_parallel_pdm_reward()
 register_default_resolvers()

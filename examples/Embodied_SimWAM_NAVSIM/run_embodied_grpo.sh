@@ -23,10 +23,10 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
 export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-$CUDA_VISIBLE_DEVICES}"
 export LUMEN_DIR="${LUMEN_DIR:-/home/danyzhan/Lumen}"
 export AITER_SRC="${AITER_SRC:-/home/danyzhan/aiter}"
-# hf_attn_patch and lumen_linear are left out: SimWAM masks every attention call, so Lumen
-# takes only the no_grad ones and launches them one batch at a time, and the tuned GEMM has
-# no entry for these shapes and falls back to the torch GEMM. Both are faster on torch (see README).
-export LUMEN_ENABLE="${LUMEN_ENABLE:-aiter_conv}"
+# lumen_linear is left out: the tuned GEMM has no entry for these shapes and falls back to the torch
+# GEMM, so results are unchanged and only the dispatch cost goes. hf_attn_patch stays so results are
+# bit-identical to the original; aiter_conv alone (torch SDPA) is faster but changes log-probs (see README).
+export LUMEN_ENABLE="${LUMEN_ENABLE:-hf_attn_patch,aiter_conv}"
 export SIMWAM_ROOT="$SIMWAM"
 export DIFFSYNTH_MODEL_BASE_PATH="${DIFFSYNTH_MODEL_BASE_PATH:-$SIMWAM/checkpoints}"
 export HF_HOME="${HF_HOME:-/home/danyzhan/.cache/huggingface}"

@@ -23,6 +23,8 @@ import os
 logger = logging.getLogger(__name__)
 
 _OFF = {"", "0", "false", "none", "off"}
+# counters of the verify modes, by patch
+_STATS = {}
 _PATCHES = ("hf_attn_patch", "lumen_linear", "aiter_conv")
 
 
@@ -96,6 +98,35 @@ def install_grpo_hook() -> None:
     ActionGRPOMixin.configure_grpo = configure_grpo
 
 
+def install_lora_init_seed() -> None:
+    """Seed every RNG right before ``configure_grpo``, i.e. before LoRA A is initialised.
+
+    On the NAVSIM path SimWAM seeds only in the trainer, after ``configure_grpo`` has drawn
+    LoRA A with ``kaiming_uniform_``, so two runs of the same config start from different
+    adapters. This calls SimWAM's ``set_global_seed`` (which adds the rank) first; the trainer
+    re-seeds later exactly as before, so rollout noise is unchanged.
+    ``SIMWAM_GRPO_LORA_SEED`` sets the seed (default 42, the config's ``seed``); ``off`` disables.
+    """
+    value = os.environ.get("SIMWAM_GRPO_LORA_SEED", "42").strip()
+    if value.lower() in _OFF:
+        return
+    from simwam.models.wan22.simwam_grpo import ActionGRPOMixin
+    from simwam.utils.pytorch_utils import set_global_seed
+
+    if getattr(ActionGRPOMixin.configure_grpo, "_lora_seed", False):
+        return
+    seed = int(value)
+    original = ActionGRPOMixin.configure_grpo
+
+    def configure_grpo(self, grpo_cfg):
+        set_global_seed(seed)
+        original(self, grpo_cfg)
+
+    configure_grpo._lora_seed = True
+    ActionGRPOMixin.configure_grpo = configure_grpo
+    logger.info("RNGs are seeded with %d (+rank) before LoRA initialisation", seed)
+
+
 def install_ref_logprob_cache() -> None:
     """Score each rollout with the frozen reference expert once, not once per inner epoch.
 
@@ -137,6 +168,151 @@ def install_ref_logprob_cache() -> None:
     SimWAMGRPOTrainer._policy_loss = _policy_loss
     ActionGRPOMixin.action_chain_logprobs = action_chain_logprobs
     logger.info("Reference log-probs are computed once per rollout")
+
+
+_LEAN_ATTN = {"on": False, "flag": None}
+
+
+def install_lean_lumen_attention() -> None:
+    """Make ``hf_attn_patch``'s masked no-grad attention capturable, and launch it once per call.
+
+    ``hf_attn_patch`` sends masked no-grad calls to Lumen's Triton ``attn_fwd``, whose
+    dispatcher copies unit scales from the host; under CUDA graph capture that copy raises and
+    ``hf_attn_patch`` silently falls back to torch SDPA, so a captured graph would record a
+    different kernel. Both modes call the same Triton forward with resident scales instead.
+    * ``1`` (default): inside ``action_velocity`` the masks (the action rows of the MoT mask and
+      the context mask) are all True, so ``hf_attn_patch``'s bias is all zeros. The same zero
+      bias is kept resident and broadcast over the batch with stride 0, so one launch serves
+      all samples instead of one launch per sample, and the bias is not rebuilt per call.
+      Whether the masks are all True is checked once per condition, outside capture; other
+      calls go to ``hf_attn_patch`` and are never captured.
+    * ``loop``: ``hf_attn_patch``'s path op for op (bias built from the mask, one launch per
+      sample when the mask differs per sample) for every masked no-grad call.
+    Needs ``hf_attn_patch`` in ``LUMEN_ENABLE``. ``SIMWAM_GRPO_LEAN_ATTN=0`` turns this off;
+    ``SIMWAM_GRPO_LEAN_ATTN_VERIFY=1`` also runs ``hf_attn_patch`` on every uncaptured call and
+    counts outputs that are not bit-identical.
+    """
+    mode = os.environ.get("SIMWAM_GRPO_LEAN_ATTN", "1").strip().lower()
+    if mode in _OFF:
+        return
+    import torch
+    import torch.nn.functional as F
+    from simwam.models.wan22.simwam_grpo import ActionGRPOMixin
+
+    if getattr(ActionGRPOMixin.action_velocity, "_lean_attn", False):
+        return
+
+    def attention_triton_forward_impl(*args):
+        from lumen.kernels.attention.attention_impl import attention_triton_forward_impl as impl
+
+        return impl(*args)
+    verify = os.environ.get("SIMWAM_GRPO_LEAN_ATTN_VERIFY", "0") == "1"
+    stats = {"lean": 0, "mismatch": 0, "max_diff": 0.0}
+    inner = {"sdpa": None, "ones": {}, "zeros": {}}
+
+    def mask_flag(cond, action_len):
+        key = f"_lean_attn_all_true_{action_len}"
+        flag = cond.get(key)
+        if flag is None:
+            vs = int(cond["video_seq_len"])
+            flag = bool(cond["attention_mask"][vs:vs + action_len, :vs + action_len].all()) and bool(
+                cond["context_mask"].all())
+            cond[key] = flag
+        return flag
+
+    def triton(q, k, v, bias, one):
+        return attention_triton_forward_impl(q, k, v, 1.0, one, one, one, 0.0, q.shape[-1] ** (-0.5), False, -1, -1,
+                                             bias, None, False, False)[0]
+
+    def replica(query, key, value, attn_mask, q, k, v, one):
+        # hf_attn_patch's masked no-grad path, op for op
+        b, h, sq, _ = query.shape
+        target = (b, h, sq, key.shape[-2])
+        bias = torch.zeros(attn_mask.shape, dtype=query.dtype, device=attn_mask.device)
+        bias = bias.masked_fill(~attn_mask, torch.finfo(query.dtype).min)
+        if tuple(bias.shape) != target:
+            while bias.dim() < 4:
+                bias = bias.unsqueeze(0)
+            bias = bias.expand(target)
+        if q.shape[0] > 1 and bias.stride(0) != 0:
+            return torch.cat([triton(q[i:i + 1], k[i:i + 1], v[i:i + 1], bias[i:i + 1], one)
+                              for i in range(q.shape[0])], dim=0)
+        return triton(q, k, v, bias, one)
+
+    def sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, **kwargs):
+        if ((mode != "loop" and not _LEAN_ATTN["on"]) or attn_mask is None or attn_mask.dtype != torch.bool
+                or kwargs or dropout_p or is_causal or scale is not None
+                or (torch.is_grad_enabled() and (query.requires_grad or key.requires_grad or value.requires_grad))):
+            return inner["sdpa"](query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal,
+                                 scale=scale, **kwargs)
+        q = query.transpose(1, 2).contiguous()
+        k = key.transpose(1, 2).contiguous()
+        v = value.transpose(1, 2).contiguous()
+        # Lumen's dispatcher builds its unused unit scales with torch.tensor([1.0], device=...), a host
+        # copy that cannot be captured; pass resident ones instead (made on the first, eager, call:
+        # the graphs warm up eagerly before capturing)
+        one = inner["ones"].get(q.device)
+        if one is None:
+            one = inner["ones"][q.device] = torch.ones(1, device=q.device)
+        if mode == "loop":
+            out = replica(query, key, value, attn_mask, q, k, v, one).transpose(1, 2)
+            stats["lean"] += 1
+            if verify and not torch.cuda.is_current_stream_capturing():
+                ref = inner["sdpa"](query, key, value, attn_mask=attn_mask)
+                if not torch.equal(ref, out):
+                    stats["mismatch"] += 1
+                    stats["max_diff"] = max(stats["max_diff"], float((ref.float() - out.float()).abs().max()))
+            return out
+        b, h, sq, sk = query.shape[0], query.shape[1], query.shape[2], key.shape[2]
+        zkey = (q.device, q.dtype, sq, sk)
+        zero = inner["zeros"].get(zkey)
+        if zero is None:
+            zero = inner["zeros"][zkey] = torch.zeros((1, 1, sq, sk), dtype=q.dtype, device=q.device)
+        # the same zero bias hf_attn_patch builds, broadcast over batch (stride 0) so one launch serves
+        # every sample; the kernel ignores the bias batch stride, which is why hf_attn_patch loops
+        out = triton(q, k, v, zero.expand(b, h, sq, sk), one).transpose(1, 2)
+        stats["lean"] += 1
+        if verify and not torch.cuda.is_current_stream_capturing():
+            ref = inner["sdpa"](query, key, value, attn_mask=attn_mask)
+            if not torch.equal(ref, out):
+                stats["mismatch"] += 1
+                stats["max_diff"] = max(stats["max_diff"], float((ref.float() - out.float()).abs().max()))
+        return out
+
+    original = ActionGRPOMixin.configure_grpo
+
+    def configure_grpo(self, grpo_cfg):
+        original(self, grpo_cfg)
+        from lumen.ops.attention import hf_patch
+
+        if hf_patch._original_sdpa is not None and inner["sdpa"] is None:
+            inner["sdpa"] = F.scaled_dot_product_attention
+            F.scaled_dot_product_attention = sdpa
+            logger.info("hf_attn_patch: all-True masks inside action_velocity take one bias-free Triton launch "
+                        "(verify=%s)", verify)
+
+    velocity = ActionGRPOMixin.action_velocity
+
+    def action_velocity(self, latents_action, timestep_action, cond, use_ref=False):
+        if inner["sdpa"] is None:
+            return velocity(self, latents_action, timestep_action, cond, use_ref=use_ref)
+        previous = _LEAN_ATTN["on"]
+        _LEAN_ATTN["on"] = mask_flag(cond, int(latents_action.shape[1]))
+        try:
+            return velocity(self, latents_action, timestep_action, cond, use_ref=use_ref)
+        finally:
+            _LEAN_ATTN["on"] = previous
+
+    action_velocity._lean_attn = True
+    action_velocity.stats = stats
+    _STATS["lean_attn"] = stats
+    ActionGRPOMixin.configure_grpo = configure_grpo
+    ActionGRPOMixin.action_velocity = action_velocity
+    if mode == "loop":
+        # the replica is capture-safe for any mask
+        _LEAN_ATTN["flag"] = lambda cond, action_len: "loop" if inner["sdpa"] is not None else None
+    else:
+        _LEAN_ATTN["flag"] = lambda cond, action_len: mask_flag(cond, action_len) if inner["sdpa"] is not None else None
 
 
 def install_action_velocity_graphs() -> None:
@@ -205,9 +381,15 @@ def install_action_velocity_graphs() -> None:
             stats["eager"] += 1
             return eager(self, latents_action, timestep_action, cond, use_ref=use_ref)
         tensors = cond_tensors(cond)
+        # the lean attention path bakes "masks are all True" into the graph
+        lean = _LEAN_ATTN["flag"](cond, int(latents_action.shape[1])) if _LEAN_ATTN["flag"] else None
         key = (bool(use_ref), tuple(latents_action.shape), tuple(latents_action.stride()), tuple(timestep_action.shape),
-               int(cond["video_seq_len"]), tuple((tuple(t.shape), t.dtype) for t in tensors))
+               int(cond["video_seq_len"]), tuple((tuple(t.shape), t.dtype) for t in tensors), lean)
         g = graphs.get(key)
+        if g is None and lean is False:
+            # hf_attn_patch falls back to torch SDPA when a host copy fails under capture, so a
+            # masked call outside the lean path would be recorded with a different kernel
+            g = graphs[key] = False
         if g is None:
             try:
                 g = capture(self, latents_action, timestep_action, cond, use_ref, tensors)
@@ -247,21 +429,125 @@ def install_action_velocity_graphs() -> None:
 
     action_velocity._cuda_graph = True
     action_velocity.stats = stats
+    _STATS["cuda_graph"] = stats
     action_velocity.eager = eager
     ActionGRPOMixin.action_velocity = action_velocity
     logger.info("action_velocity replays CUDA graphs under no_grad (verify=%s)", verify)
 
 
-def install_batched_logprobs() -> None:
-    """Score all stochastic steps of a chain with one ``action_velocity`` call.
+_CHUNK = {"sizes": None, "views": None, "ops": frozenset(), "lumen": None}
 
-    ``action_chain_logprobs`` calls the action expert once per stochastic step (3 by
-    default), each on the same ``B*G`` samples. Stacking the steps along the batch runs
-    the expert once on ``W*B*G`` samples, so its forward and backward launch a third of
-    the kernels. The per-step SDE mean, std, clamping and reduction are unchanged; the
-    condition (video K/V cache, context) is repeated once per condition and reused.
-    Only the rigorous-SDE, unmerged path is batched; anything else uses the original.
-    ``SIMWAM_GRPO_BATCHED_LOGP=0`` turns this off.
+
+def _chunk_active(x) -> bool:
+    sizes = _CHUNK["sizes"]
+    return sizes is not None and x.dim() >= 2 and x.shape[0] == sum(sizes)
+
+
+def _install_chunked_ops() -> None:
+    """Run the GEMMs of a batched call once per original step.
+
+    While ``_CHUNK["sizes"]`` holds the per-step batch sizes, every ``nn.Linear``, LoRA matmul and
+    Lumen bf16 GEMM whose input has that total batch runs once per step on its slice and the
+    outputs are concatenated. The GEMMs then have the shapes and strides of the unbatched path,
+    so they pick the same kernels, and autograd accumulates each LoRA weight gradient from the
+    same per-step GEMMs in the same order. ``_CHUNK["views"]`` maps ``id(weight)`` to per-step
+    inputs that replace the slices: the action encoder is fed ``chain[:, k]``, a non-contiguous
+    view, which ``F.linear`` computes as a matmul plus a separate bias add.
+    ``_CHUNK["ops"]`` can add ``rmsnorm`` and ``attn`` (SDPA) to the per-step ops.
+    """
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    from simwam.models.wan22 import wan_video_dit as wvd
+    from simwam.models.wan22.lora import LoRALinear
+
+    if getattr(nn.Linear.forward, "_chunked", False):
+        return
+
+    def pieces(x, weight=None):
+        views = _CHUNK["views"]
+        if views is not None and weight is not None and id(weight) in views:
+            return views[id(weight)]
+        return torch.split(x, _CHUNK["sizes"], dim=0)
+
+    linear_forward = nn.Linear.forward
+
+    def linear(self, x):
+        if not _chunk_active(x):
+            return linear_forward(self, x)
+        return torch.cat([linear_forward(self, xc) for xc in pieces(x, self.weight)], dim=0)
+
+    lora_forward = LoRALinear.forward
+
+    def lora(self, x):
+        if not _chunk_active(x):
+            return lora_forward(self, x)
+        out = self.base(x)
+        parts = [(self.lora_dropout(xc) @ self.lora_A.t()) @ self.lora_B.t() for xc in pieces(x)]
+        return out + self.scaling * torch.cat(parts, dim=0)
+
+    rms_forward = wvd.RMSNorm.forward
+
+    def rms(self, x):
+        if "rmsnorm" not in _CHUNK["ops"] or not _chunk_active(x):
+            return rms_forward(self, x)
+        return torch.cat([rms_forward(self, xc) for xc in pieces(x)], dim=0)
+
+    sdpa = F.scaled_dot_product_attention
+
+    def chunked_sdpa(query, key, value, attn_mask=None, *args, **kwargs):
+        if "attn" not in _CHUNK["ops"] or not _chunk_active(query):
+            return sdpa(query, key, value, attn_mask, *args, **kwargs)
+        sizes = _CHUNK["sizes"]
+        qs, ks, vs = (torch.split(t, sizes, dim=0) for t in (query, key, value))
+        if attn_mask is not None and attn_mask.dim() == 4 and attn_mask.shape[0] == query.shape[0]:
+            ms = torch.split(attn_mask, sizes, dim=0)
+        else:
+            ms = [attn_mask] * len(sizes)
+        return torch.cat([sdpa(q, k, v, m, *args, **kwargs) for q, k, v, m in zip(qs, ks, vs, ms)], dim=0)
+
+    linear._chunked = True
+    nn.Linear.forward = linear
+    LoRALinear.forward = lora
+    wvd.RMSNorm.forward = rms
+    F.scaled_dot_product_attention = chunked_sdpa
+
+    def chunk_lumen_gemm():
+        # Lumen is imported by LumenConfig inside configure_grpo; importing it here, before the
+        # trainer sets the device, would open a HIP context on GPU 0 in every rank
+        import sys
+
+        bg = sys.modules.get("lumen.ops.bf16_gemm")
+        if bg is None or getattr(bg.linear, "_chunked", False):
+            return
+        bg_linear = bg.linear
+
+        def lumen_linear(x, weight, bias=None):
+            if not _chunk_active(x):
+                return bg_linear(x, weight, bias)
+            return torch.cat([bg_linear(xc, weight, bias) for xc in pieces(x, weight)], dim=0)
+
+        lumen_linear._chunked = True
+        bg.linear = lumen_linear
+
+    _CHUNK["lumen"] = chunk_lumen_gemm
+
+
+def install_batched_logprobs() -> None:
+    """Score all stochastic steps of a chain with one grad-enabled ``action_velocity`` call.
+
+    ``action_chain_logprobs`` calls the action expert once per stochastic step (3 by default),
+    each on the same ``B*G`` samples. With gradients on, the steps are stacked along the batch
+    and the expert runs once on ``W*B*G`` samples, so the element-wise kernels of its forward
+    and backward launch once instead of ``W`` times. The GEMMs still run once per step (see
+    ``_install_chunked_ops``), which keeps the result bit-identical to the unbatched path: a
+    single GEMM over ``W*B*G`` rows picks other kernels, and its LoRA weight gradient would be
+    one reduction instead of ``W`` GEMMs summed in bf16. The per-step SDE mean, std, clamping and
+    reduction are unchanged. No-grad calls (old and reference log-probs) keep the original path,
+    which the CUDA graphs already make cheap. Only the rigorous-SDE, unmerged path is batched.
+    ``SIMWAM_GRPO_BATCHED_LOGP=0`` turns this off; ``SIMWAM_GRPO_BATCHED_CHUNK`` adds ``rmsnorm``
+    and/or ``attn`` to the per-step ops; ``SIMWAM_GRPO_BATCHED_LOGP_VERIFY=1`` also runs the
+    unbatched path on every call and compares outputs and LoRA gradients bit for bit.
     """
     if os.environ.get("SIMWAM_GRPO_BATCHED_LOGP", "1").strip().lower() in _OFF:
         return
@@ -273,6 +559,11 @@ def install_batched_logprobs() -> None:
 
     if getattr(ActionGRPOMixin.action_chain_logprobs, "_batched", False):
         return
+    _install_chunked_ops()
+    _CHUNK["ops"] = frozenset(
+        x.strip() for x in os.environ.get("SIMWAM_GRPO_BATCHED_CHUNK", "").split(",") if x.strip())
+    verify = os.environ.get("SIMWAM_GRPO_BATCHED_LOGP_VERIFY", "0") == "1"
+    stats = {"batched": 0, "fwd_mismatch": 0, "grad_mismatch": 0, "grad_checked": 0, "max_grad_diff": 0.0}
     original = ActionGRPOMixin.action_chain_logprobs
 
     def repeat_cond(cond, w):
@@ -290,27 +581,28 @@ def install_batched_logprobs() -> None:
             cond[key] = rep
         return rep
 
-    def action_chain_logprobs(self, cond, chain, timesteps, deltas, stoch_idx=None, use_ref=False,
-                              return_terms=False):
-        if getattr(self, "grpo_merge_sde_window", False) or self.grpo_sde_mode != "rigorous":
-            return original(self, cond, chain, timesteps, deltas, stoch_idx=stoch_idx, use_ref=use_ref,
-                            return_terms=return_terms)
+    def batched(self, cond, chain, timesteps, deltas, steps, use_ref, return_terms):
         sched = self.infer_action_scheduler
         device = self.device
         dtype = getattr(self, "grpo_action_dtype", self.torch_dtype)
         batch_size = int(chain.shape[0])
-        steps = self._normalize_stoch_idx(stoch_idx, int(timesteps.shape[0]))
-        if len(steps) < 2:
-            return original(self, cond, chain, timesteps, deltas, stoch_idx=stoch_idx, use_ref=use_ref,
-                            return_terms=return_terms)
-        x_all = torch.cat([chain[:, k] for k in steps], dim=0)
+        expert = self.ref_action_expert if use_ref else self.action_expert
+        x_views = [chain[:, k] for k in steps]
+        x_all = torch.cat(x_views, dim=0)
         t_all = torch.cat([
             timesteps[k].to(device=device, dtype=dtype).reshape(1).expand(batch_size) for k in steps
         ])
-        v_all = self.action_velocity(x_all, t_all, repeat_cond(cond, len(steps)), use_ref=use_ref)
+        _CHUNK["lumen"]()
+        _CHUNK["sizes"] = [batch_size] * len(steps)
+        _CHUNK["views"] = {id(expert.action_encoder.weight): x_views}
+        try:
+            v_all = self.action_velocity(x_all, t_all, repeat_cond(cond, len(steps)), use_ref=use_ref)
+        finally:
+            _CHUNK["sizes"] = None
+            _CHUNK["views"] = None
         logps, means, vels, stds = [], [], [], []
         for i, k in enumerate(steps):
-            x_k = x_all[i * batch_size:(i + 1) * batch_size]
+            x_k = chain[:, k]
             v = v_all[i * batch_size:(i + 1) * batch_size]
             x_next = chain[:, k + 1]
             sigma_k = float(timesteps[k].item()) / float(sched.num_train_timesteps)
@@ -336,10 +628,64 @@ def install_batched_logprobs() -> None:
             "std": torch.tensor(stds, device=device, dtype=torch.float32),
         }
 
+    def probe(out, gen):
+        logp, terms = out
+        total = (logp * torch.randn(logp.shape, generator=gen, device=logp.device)).sum()
+        for key in ("mean", "vel"):
+            t = terms[key]
+            total = total + (t * torch.randn(t.shape, generator=gen, device=t.device)).sum()
+        return total
+
+    def check(self, args, steps, use_ref, new):
+        expert = self.ref_action_expert if use_ref else self.action_expert
+        params = [p for p in expert.parameters() if p.requires_grad]
+        cond, chain, timesteps, deltas = args
+        ref = original(self, cond, chain, timesteps, deltas, stoch_idx=steps, use_ref=use_ref, return_terms=True)
+        fwd_ok = torch.equal(ref[0], new[0]) and all(torch.equal(ref[1][k], new[1][k]) for k in ref[1])
+        stats["fwd_mismatch"] += int(not fwd_ok)
+        if params:
+            dev = new[0].device
+            g_ref = torch.autograd.grad(probe(ref, torch.Generator(device=dev).manual_seed(1234)), params,
+                                        allow_unused=True)
+            g_new = torch.autograd.grad(probe(new, torch.Generator(device=dev).manual_seed(1234)), params,
+                                        allow_unused=True, retain_graph=True)
+            bad, worst = 0, 0.0
+            for a, b in zip(g_ref, g_new):
+                if a is None or b is None:
+                    bad += int((a is None) != (b is None))
+                    continue
+                if not torch.equal(a, b):
+                    bad += 1
+                    worst = max(worst, float((a.float() - b.float()).abs().max()))
+            stats["grad_checked"] += 1
+            stats["grad_mismatch"] += int(bad > 0)
+            stats["max_grad_diff"] = max(stats["max_grad_diff"], worst)
+            logger.info("batched logp verify: forward bit-identical=%s, LoRA grads differing=%d/%d (max %.3g)",
+                        fwd_ok, bad, len(params), worst)
+
+    def action_chain_logprobs(self, cond, chain, timesteps, deltas, stoch_idx=None, use_ref=False,
+                              return_terms=False):
+        steps = self._normalize_stoch_idx(stoch_idx, int(timesteps.shape[0]))
+        expert = self.ref_action_expert if use_ref else self.action_expert
+        if (not torch.is_grad_enabled() or getattr(self, "grpo_merge_sde_window", False)
+                or self.grpo_sde_mode != "rigorous" or len(steps) < 2
+                or (self.training and getattr(expert, "use_gradient_checkpointing", False))):
+            return original(self, cond, chain, timesteps, deltas, stoch_idx=stoch_idx, use_ref=use_ref,
+                            return_terms=return_terms)
+        stats["batched"] += 1
+        if verify:
+            new = batched(self, cond, chain, timesteps, deltas, steps, use_ref, True)
+            check(self, (cond, chain, timesteps, deltas), steps, use_ref, new)
+            return new if return_terms else new[0]
+        return batched(self, cond, chain, timesteps, deltas, steps, use_ref, return_terms)
+
     action_chain_logprobs._batched = True
     action_chain_logprobs.original = original
+    action_chain_logprobs.stats = stats
+    _STATS["batched_logp"] = stats
     ActionGRPOMixin.action_chain_logprobs = action_chain_logprobs
-    logger.info("action_chain_logprobs scores all stochastic steps in one action_velocity call")
+    logger.info("action_chain_logprobs runs the grad-enabled steps in one action_velocity call (per-step ops: %s, "
+                "verify=%s)", sorted(_CHUNK["ops"] | {"gemm"}), verify)
 
 
 _PDM_WORKER = {}
