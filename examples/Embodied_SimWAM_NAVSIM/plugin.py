@@ -955,7 +955,9 @@ def install_train_graphs() -> None:
             return eager(self, latents_action, timestep_action, cond, use_ref=False)
         if verify:
             ref = eager(self, latents_action, timestep_action, cond, use_ref=False)
-            w = torch.randn_like(ref)
+            # a private generator, so verification does not advance the default CUDA RNG the rollout samples from
+            w = torch.randn(ref.shape, dtype=ref.dtype, device=ref.device,
+                            generator=torch.Generator(device=ref.device).manual_seed(1234))
             g_ref = torch.autograd.grad(ref, params, grad_outputs=w, allow_unused=True)
             out = _Replay.apply(g, *args, *params)
             g_out = torch.autograd.grad(out, params, grad_outputs=w, allow_unused=True)
