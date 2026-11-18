@@ -601,13 +601,22 @@ def install_train_graphs() -> None:
 class _MasterAdamW:
     """fp32 master copy of the trainable parameters, averaged gradients and AdamW.
 
-    Mirrors what DeepSpeed ZeRO-1 does for this model, without partitioning: the bf16
-    gradients are flattened into one fp32 buffer, all-reduced and averaged, the global norm
-    is taken (and clipped only when the trainer asked DeepSpeed to clip), AdamW steps the flat
-    fp32 master and the result is rounded back into the bf16 parameters in place.
+    Mirrors what DeepSpeed ZeRO-1 (0.19.8, bf16, ``overlap_comm`` and ``contiguous_gradients``
+    off) does for this model, without partitioning: the bf16 gradients are flattened into one
+    fp32 buffer, all-reduced and averaged, the global norm is taken (and clipped only when the
+    trainer asked DeepSpeed to clip), AdamW steps the flat fp32 master and the result is
+    rounded back into the bf16 parameters in place.
+
+    With ``round_avg`` (the default) the averaged gradient is rounded to the parameter dtype
+    before the step and the norm is accumulated the way ZeRO-1 does it (fp64 norm per gradient
+    slice of each rank's partition, fp32 sum per partition, summed over partitions), so the
+    update and the reported norm match DeepSpeed bit for bit. DeepSpeed's ``allreduce_bucket``
+    writes the fp32-reduced gradient back into the bf16 gradient tensors.
+    ``SIMWAM_GRPO_MANUAL_DP_GRAD_AVG=fp32`` keeps the averaged gradient in fp32 instead
+    (slightly more precise, not bit-identical to DeepSpeed).
     """
 
-    def __init__(self, shell, clip):
+    def __init__(self, shell, clip, round_avg=True):
         import torch
         import torch.distributed as dist
 
@@ -615,6 +624,7 @@ class _MasterAdamW:
             raise ValueError("manual data parallel expects one optimizer param group")
         self.shell = shell
         self.clip = clip
+        self.round_avg = round_avg
         self.params = list(shell.param_groups[0]["params"])
         self.world = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
         if self.world > 1:
@@ -627,6 +637,18 @@ class _MasterAdamW:
         self.low = torch.empty_like(flat, dtype=self.params[0].dtype)
         sizes = [p.numel() for p in self.params]
         self.low_views = [v.view_as(p) for v, p in zip(self.low.split(sizes), self.params)]
+        # (start, stop) of every gradient slice inside each rank's ZeRO-1 partition, in flat order
+        total, part = flat.numel(), flat.numel() // self.world
+        self.norm_slices = []
+        for r in range(self.world):
+            lo, hi = r * part, (total if r == self.world - 1 else (r + 1) * part)
+            off, slices = 0, []
+            for n in sizes:
+                a, b = off, off + n
+                off = b
+                if a < hi and b > lo:
+                    slices.append((max(a, lo), min(b, hi)))
+            self.norm_slices.append(slices)
         hp = shell.defaults
         self.adam = torch.optim.AdamW([self.master], lr=hp["lr"], betas=hp["betas"], eps=hp["eps"],
                                       weight_decay=hp["weight_decay"], amsgrad=hp.get("amsgrad", False))
@@ -644,7 +666,12 @@ class _MasterAdamW:
         if self.world > 1:
             dist.all_reduce(buf)
             buf.div_(self.world)
-        norm = torch.linalg.vector_norm(buf, 2.0)
+        if self.round_avg:
+            self.low.copy_(buf)
+            buf.copy_(self.low)
+            norm = self._zero1_norm(buf)
+        else:
+            norm = torch.linalg.vector_norm(buf, 2.0)
         if self.clip is not None:
             buf.mul_((self.clip / (norm + 1e-6)).clamp(max=1.0))
         for group in self.adam.param_groups:
@@ -654,6 +681,17 @@ class _MasterAdamW:
         if write_back:
             torch._foreach_copy_([p.data for p in self.params], self.low_views)
         return norm
+
+    def _zero1_norm(self, buf):
+        import torch
+
+        flat64 = buf.double()
+        total = None
+        for slices in self.norm_slices:
+            norms = torch._foreach_norm([flat64[a:b] for a, b in slices])
+            s = torch.stack(norms).pow(2).sum().float()
+            total = s if total is None else total + s
+        return torch.linalg.vector_norm(total.pow(0.5).reshape(1), 2.0)
 
     def state_dict(self):
         return {"master": self.master.detach().clone(), "adam": self.adam.state_dict()}
@@ -731,7 +769,8 @@ def install_manual_data_parallel() -> None:
     def __init__(self, *args, **kwargs):
         rebuilt(self, *args, **kwargs)
         clip = self.max_grad_norm if self.cfg.get("deepspeed_clip_from_max_grad_norm", False) else None
-        self._master_adamw = _MasterAdamW(self.optimizer.optimizer, clip)
+        round_avg = os.environ.get("SIMWAM_GRPO_MANUAL_DP_GRAD_AVG", "bf16").strip().lower() != "fp32"
+        self._master_adamw = _MasterAdamW(self.optimizer.optimizer, clip, round_avg=round_avg)
         self.accelerator.register_for_checkpointing(self._master_adamw)
         logger.info("Manual data parallel: world=%d, %d trainable tensors, clip=%s",
                     self._master_adamw.world, len(self._master_adamw.params), clip)
