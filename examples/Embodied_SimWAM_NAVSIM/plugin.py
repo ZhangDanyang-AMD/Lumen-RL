@@ -1035,6 +1035,13 @@ class _MasterAdamW:
         hp = shell.defaults
         self.adam = torch.optim.AdamW([self.master], lr=hp["lr"], betas=hp["betas"], eps=hp["eps"],
                                       weight_decay=hp["weight_decay"], amsgrad=hp.get("amsgrad", False))
+        self.loaded = False
+
+    def reset_from_params(self):
+        """Restart the master from the current bf16 parameters (e.g. after a weights-only load)."""
+        import torch
+
+        self.master.data.copy_(torch.cat([p.detach().reshape(-1).float() for p in self.params]))
 
     def step(self, grads=None, write_back=True):
         import torch
@@ -1086,6 +1093,7 @@ class _MasterAdamW:
         import torch
 
         torch._foreach_copy_([p.data for p in self.params], self.low_views)
+        self.loaded = True
 
 
 def install_manual_data_parallel() -> None:
@@ -1149,14 +1157,29 @@ def install_manual_data_parallel() -> None:
     accelerate.Accelerator.prepare_model = _prepare_model
     accelerate.Accelerator.autocast = lambda self, *args, **kwargs: contextlib.nullcontext()
 
-    def __init__(self, *args, **kwargs):
-        rebuilt(self, *args, **kwargs)
+    def _register_master(self):
         clip = self.max_grad_norm if self.cfg.get("deepspeed_clip_from_max_grad_norm", False) else None
         round_avg = os.environ.get("SIMWAM_GRPO_MANUAL_DP_GRAD_AVG", "bf16").strip().lower() != "fp32"
         self._master_adamw = _MasterAdamW(self.optimizer.optimizer, clip, round_avg=round_avg)
         self.accelerator.register_for_checkpointing(self._master_adamw)
-        logger.info("Manual data parallel: world=%d, %d trainable tensors, clip=%s",
-                    self._master_adamw.world, len(self._master_adamw.params), clip)
+
+    resume = T._resume_or_load_checkpoint
+
+    def _resume_or_load_checkpoint(self):
+        # Accelerate's load_state (called from here, inside __init__) restores registered objects
+        # by index, so the master must be registered before it runs
+        _register_master(self)
+        resume(self)
+        if not self._master_adamw.loaded:
+            self._master_adamw.reset_from_params()
+
+    def __init__(self, *args, **kwargs):
+        rebuilt(self, *args, **kwargs)
+        if getattr(self, "_master_adamw", None) is None:
+            _register_master(self)
+        logger.info("Manual data parallel: world=%d, %d trainable tensors, clip=%s, resumed=%s",
+                    self._master_adamw.world, len(self._master_adamw.params), self._master_adamw.clip,
+                    self._master_adamw.loaded)
 
     def _optimizer_step(self):
         grad_norm = self._master_adamw.step()
@@ -1166,6 +1189,7 @@ def install_manual_data_parallel() -> None:
 
     __init__._manual_dp = True
     T.__init__ = __init__
+    T._resume_or_load_checkpoint = _resume_or_load_checkpoint
     T._optimizer_step = _optimizer_step
     logger.info("SimWAM GRPO trains without DeepSpeed (manual gradient all-reduce, fp32-master AdamW)")
 
