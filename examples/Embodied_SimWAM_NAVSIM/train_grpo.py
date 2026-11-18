@@ -25,6 +25,7 @@ from examples.Embodied_SimWAM_NAVSIM.plugin import (
     install_action_velocity_graphs,
     install_batched_logprobs,
     install_compiled_rmsnorm,
+    install_fused_lora_add,
     install_grpo_hook,
     install_lean_lumen_attention,
     install_lora_init_seed,
@@ -44,6 +45,7 @@ install_lean_lumen_attention()
 install_action_velocity_graphs()
 install_parallel_pdm_reward()
 install_compiled_rmsnorm()
+install_fused_lora_add()
 register_default_resolvers()
 
 

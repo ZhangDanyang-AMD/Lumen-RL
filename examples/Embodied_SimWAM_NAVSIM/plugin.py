@@ -826,6 +826,32 @@ def install_compiled_rmsnorm() -> None:
     logger.info("SimWAM RMSNorm runs through torch.compile")
 
 
+def install_fused_lora_add() -> None:
+    """``LoRALinear.forward`` adds the scaled adapter output with one ``torch.add(alpha=)``.
+
+    SimWAM computes ``out + self.scaling * lora`` as a multiply and an add. With the
+    default ``alpha / r = 2.0`` the scale is a power of two, so ``torch.add(out, lora,
+    alpha=scaling)`` is expected to round the same way. ``SIMWAM_GRPO_FUSED_LORA=0``
+    turns it off.
+    """
+    if os.environ.get("SIMWAM_GRPO_FUSED_LORA", "1").strip().lower() in _OFF:
+        return
+    import torch
+    from simwam.models.wan22.lora import LoRALinear
+
+    if getattr(LoRALinear.forward, "_fused_add", False):
+        return
+
+    def forward(self, x):
+        out = self.base(x)
+        lora = (self.lora_dropout(x) @ self.lora_A.t()) @ self.lora_B.t()
+        return torch.add(out, lora, alpha=self.scaling)
+
+    forward._fused_add = True
+    LoRALinear.forward = forward
+    logger.info("LoRALinear adds the adapter with torch.add(alpha=scaling)")
+
+
 def enable_lumen(model, spec: str):
     """Apply ``LumenConfig.enable`` once per requested patch."""
     requested = []
