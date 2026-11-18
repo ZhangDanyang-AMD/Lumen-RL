@@ -1112,9 +1112,11 @@ def install_manual_data_parallel() -> None:
     * ``_optimizer_step`` runs ``_MasterAdamW`` (registered for checkpointing) and steps the
       scheduler; gradients are clipped only if ``deepspeed_clip_from_max_grad_norm`` is set,
       as DeepSpeed does.
-    ``SIMWAM_GRPO_MANUAL_DP=1`` turns this on (off by default). Call before the trainer is built.
+    On by default: with it the grad-enabled forward and backward replay from CUDA graphs
+    (``install_train_graphs``), and a run stays bit-identical to DeepSpeed ZeRO-1.
+    ``SIMWAM_GRPO_MANUAL_DP=0`` turns it off (DeepSpeed). Call before the trainer is built.
     """
-    if os.environ.get("SIMWAM_GRPO_MANUAL_DP", "0").strip().lower() in _OFF:
+    if os.environ.get("SIMWAM_GRPO_MANUAL_DP", "1").strip().lower() in _OFF:
         return
     import __future__
     import ast
