@@ -647,3 +647,17 @@ def test_actor_grpo_reports_sum_of_global_microbatch_contributions(
     metrics = worker.update_policy(batch)
 
     assert metrics["loss"] == pytest.approx(0.5)
+
+
+def test_dsv41_quant_points_reach_the_engine() -> None:
+    """The V4.1 bridge reads them from the engine config; left out of it, every
+    run trained with the release's quantization points whatever it set."""
+    worker = object.__new__(LumenActorWorker)
+    worker.config = {}
+    points = {"window_kv_fp8": False, "linear_act_fp8": False}
+
+    engine_config = worker._build_engine_config(
+        "megatron_native", {"megatron_cfg": {"dsv41_quant_points": points}}, {}
+    )
+
+    assert engine_config["dsv41_quant_points"] == points

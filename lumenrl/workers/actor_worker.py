@@ -412,6 +412,7 @@ class LumenActorWorker(BaseWorker):
                 # dist-checkpoint rather than HF safetensors.
                 "dist_checkpoint_path": meg_cfg.get("dist_checkpoint_path", None),
                 "deterministic_mode": meg_cfg.get("deterministic_mode", None),
+                "dsv41_quant_points": meg_cfg.get("dsv41_quant_points"),
                 "build_optimizer": meg_cfg.get("build_optimizer", True),
                 # Adam step for the offloaded fraction runs on the CPU; see
                 # optimizer_cpu_offload above.
