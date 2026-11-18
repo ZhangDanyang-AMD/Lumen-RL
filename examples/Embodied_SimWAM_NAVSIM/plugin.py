@@ -442,6 +442,156 @@ def install_parallel_pdm_reward() -> None:
     logger.info("PDM rewards are scored by %d worker processes", workers)
 
 
+class _MasterAdamW:
+    """fp32 master copy of the trainable parameters, averaged gradients and AdamW.
+
+    Mirrors what DeepSpeed ZeRO-1 does for this model, without partitioning: the bf16
+    gradients are flattened into one fp32 buffer, all-reduced and averaged, the global norm
+    is taken (and clipped only when the trainer asked DeepSpeed to clip), AdamW steps the flat
+    fp32 master and the result is rounded back into the bf16 parameters in place.
+    """
+
+    def __init__(self, shell, clip):
+        import torch
+        import torch.distributed as dist
+
+        if len(shell.param_groups) != 1:
+            raise ValueError("manual data parallel expects one optimizer param group")
+        self.shell = shell
+        self.clip = clip
+        self.params = list(shell.param_groups[0]["params"])
+        self.world = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+        if self.world > 1:
+            # DeepSpeed broadcasts the model from rank 0 at init; LoRA A is randomly initialised per rank
+            for p in self.params:
+                dist.broadcast(p.data, 0)
+        flat = torch.cat([p.detach().reshape(-1).float() for p in self.params])
+        self.master = torch.nn.Parameter(flat, requires_grad=False)
+        self.master.grad = torch.zeros_like(flat)
+        self.low = torch.empty_like(flat, dtype=self.params[0].dtype)
+        sizes = [p.numel() for p in self.params]
+        self.low_views = [v.view_as(p) for v, p in zip(self.low.split(sizes), self.params)]
+        hp = shell.defaults
+        self.adam = torch.optim.AdamW([self.master], lr=hp["lr"], betas=hp["betas"], eps=hp["eps"],
+                                      weight_decay=hp["weight_decay"], amsgrad=hp.get("amsgrad", False))
+
+    def step(self, grads=None, write_back=True):
+        import torch
+        import torch.distributed as dist
+
+        if grads is None:
+            grads = [p.grad for p in self.params]
+        grads = [g if g is not None else torch.zeros_like(p) for g, p in zip(grads, self.params)]
+        torch.cat([g.reshape(-1) for g in grads], out=self.low)
+        buf = self.master.grad
+        buf.copy_(self.low)
+        if self.world > 1:
+            dist.all_reduce(buf)
+            buf.div_(self.world)
+        norm = torch.linalg.vector_norm(buf, 2.0)
+        if self.clip is not None:
+            buf.mul_((self.clip / (norm + 1e-6)).clamp(max=1.0))
+        for group in self.adam.param_groups:
+            group["lr"] = self.shell.param_groups[0]["lr"]
+        self.adam.step()
+        self.low.copy_(self.master.detach())
+        if write_back:
+            torch._foreach_copy_([p.data for p in self.params], self.low_views)
+        return norm
+
+    def state_dict(self):
+        return {"master": self.master.detach().clone(), "adam": self.adam.state_dict()}
+
+    def load_state_dict(self, state):
+        self.master.data.copy_(state["master"])
+        self.adam.load_state_dict(state["adam"])
+        self.low.copy_(self.master.detach())
+        import torch
+
+        torch._foreach_copy_([p.data for p in self.params], self.low_views)
+
+
+def install_manual_data_parallel() -> None:
+    """Train on several GPUs without DeepSpeed: plain gradient all-reduce and an fp32-master AdamW.
+
+    The action expert has 15.7 M trainable (LoRA) parameters, so ZeRO-1 partitioning saves
+    about 94 MB per GPU, while its engine sits in every backward and step. This keeps
+    Accelerate (data sharding, scheduler, checkpoint files) but in its non-DeepSpeed mode:
+    * ``SimWAMGRPOTrainer.__init__`` refuses multi-GPU without DeepSpeed; it is rebuilt from
+      its source with only that check removed (installation is skipped if the check is not
+      found exactly once);
+    * the model is not wrapped in DDP and Accelerate's autocast is a no-op: the weights are
+      already bf16, as under DeepSpeed;
+    * ``_optimizer_step`` runs ``_MasterAdamW`` (registered for checkpointing) and steps the
+      scheduler; gradients are clipped only if ``deepspeed_clip_from_max_grad_norm`` is set,
+      as DeepSpeed does.
+    ``SIMWAM_GRPO_MANUAL_DP=1`` turns this on (off by default). Call before the trainer is built.
+    """
+    if os.environ.get("SIMWAM_GRPO_MANUAL_DP", "0").strip().lower() in _OFF:
+        return
+    import __future__
+    import ast
+    import contextlib
+    import inspect
+    import textwrap
+
+    import accelerate
+    import simwam.trainer_grpo as tg
+
+    T = tg.SimWAMGRPOTrainer
+    if getattr(T.__init__, "_manual_dp", False):
+        return
+    original = T.__init__
+    if "__class__" in original.__code__.co_freevars:
+        logger.warning("SimWAMGRPOTrainer.__init__ uses super(); manual data parallel not installed")
+        return
+    tree = ast.parse(textwrap.dedent(inspect.getsource(original)))
+    fn = tree.body[0]
+    body = [n for n in fn.body if not (isinstance(n, ast.If) and "DEEPSPEED" in ast.unparse(n.test))]
+    if len(body) != len(fn.body) - 1:
+        logger.warning("DeepSpeed check not found in SimWAMGRPOTrainer.__init__; manual data parallel not installed")
+        return
+    fn.body = body
+    ast.increment_lineno(tree, original.__code__.co_firstlineno - 1)
+    namespace = {}
+    exec(compile(tree, inspect.getsourcefile(original), "exec", flags=__future__.annotations.compiler_flag,
+                 dont_inherit=True), tg.__dict__, namespace)
+    rebuilt = namespace["__init__"]
+    os.environ["ACCELERATE_USE_DEEPSPEED"] = "false"
+
+    prepare_model = accelerate.Accelerator.prepare_model
+
+    def _prepare_model(self, model, device_placement=None, evaluation_mode=False):
+        native = self.native_amp
+        self.native_amp = False
+        try:
+            return prepare_model(self, model, device_placement=device_placement, evaluation_mode=True)
+        finally:
+            self.native_amp = native
+
+    accelerate.Accelerator.prepare_model = _prepare_model
+    accelerate.Accelerator.autocast = lambda self, *args, **kwargs: contextlib.nullcontext()
+
+    def __init__(self, *args, **kwargs):
+        rebuilt(self, *args, **kwargs)
+        clip = self.max_grad_norm if self.cfg.get("deepspeed_clip_from_max_grad_norm", False) else None
+        self._master_adamw = _MasterAdamW(self.optimizer.optimizer, clip)
+        self.accelerator.register_for_checkpointing(self._master_adamw)
+        logger.info("Manual data parallel: world=%d, %d trainable tensors, clip=%s",
+                    self._master_adamw.world, len(self._master_adamw.params), clip)
+
+    def _optimizer_step(self):
+        grad_norm = self._master_adamw.step()
+        self.scheduler.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        return grad_norm
+
+    __init__._manual_dp = True
+    T.__init__ = __init__
+    T._optimizer_step = _optimizer_step
+    logger.info("SimWAM GRPO trains without DeepSpeed (manual gradient all-reduce, fp32-master AdamW)")
+
+
 def enable_lumen(model, spec: str):
     """Apply ``LumenConfig.enable`` once per requested patch."""
     requested = []
