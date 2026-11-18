@@ -734,6 +734,7 @@ class RLTrainer:
             engine_kwargs,
             max_concurrency=max(8, int(vcfg.max_num_seqs)),
             base_seed=(int(seed) if seed is not None else None),
+            sleep_keeps_weights=bool(getattr(atom_cfg, "sleep_keeps_weights", False)),
         )
         mgr.create()
         self._ray_rollout_mgr = mgr

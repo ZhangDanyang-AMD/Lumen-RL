@@ -1078,12 +1078,14 @@ class ATOMReplicaManager:
         *,
         max_concurrency: int = 64,
         base_seed: Optional[int] = None,
+        sleep_keeps_weights: bool = False,
     ) -> None:
         self.actor_wg = actor_wg
         self.model_name = model_name
         self.engine_kwargs = dict(engine_kwargs)
         self.max_concurrency = int(max_concurrency)
         self.base_seed = base_seed
+        self.sleep_keeps_weights = bool(sleep_keeps_weights)
         self.num_replicas = actor_wg.num_workers
         self.servers: list = []
         # Retained rather than recomputed in create(): the RDMA rank striding
@@ -1155,6 +1157,8 @@ class ATOMReplicaManager:
                 env_vars["LUMENRL_ATOM_TRUE_VOCAB_SIZE"] = str(true_vocab_size)
             if dynamo_required:
                 env_vars["TORCHDYNAMO_DISABLE"] = "0"
+            if self.sleep_keeps_weights:
+                env_vars["LUMENRL_ATOM_SLEEP_KEEPS_WEIGHTS"] = "1"
             for key in (
                 "LUMENRL_ATOM_CHECK_ALIGNMENT",
                 "ATOM_ISOLATE_TORCH_COMPILE_CACHE",

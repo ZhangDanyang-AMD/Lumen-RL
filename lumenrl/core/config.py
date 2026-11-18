@@ -288,6 +288,12 @@ class AtomConfig:
     enable_prefix_caching: bool = False
     online_quant_config: Optional[dict] = None
     engine_kwargs: dict[str, Any] = field(default_factory=dict)
+    # A sleep moves the weights to pinned host memory and back instead of
+    # discarding them (LUMENRL_ATOM_SLEEP_KEEPS_WEIGHTS for every replica). A
+    # model whose sync leaves weights out needs it to sleep at all: V4.1 does not
+    # sync its frozen routed experts, so it would wake from ATOM's own sleep
+    # without them.
+    sleep_keeps_weights: bool = False
 
 
 @dataclass
