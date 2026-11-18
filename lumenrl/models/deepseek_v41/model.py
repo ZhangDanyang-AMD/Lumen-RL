@@ -502,9 +502,11 @@ class DSV41Stage(nn.Module):
     earlier stage is refused, so nothing else ever has to cross.
 
     Each layer gets the shared attention tensors as explicit inputs and returns them, which is
-    what makes `recompute` (one non-reentrant checkpoint per layer) correct: in backward a layer
-    is recomputed from what the earlier layers produced. Parameter names keep the model's layer
-    numbering, so a stage loads with `convert.load_released` as the whole model does.
+    what makes `recompute` (one checkpoint per layer) correct: in backward a layer is recomputed
+    from what the earlier layers produced. The checkpoint is reentrant, so a layer is recomputed
+    inside its own backward and freed before the next; a non-reentrant one had every layer's
+    recompute alive at once (~86 GB at 16K positions on 8 layers). Parameter names keep the
+    model's layer numbering, so a stage loads with `convert.load_released` as the whole model does.
 
     `dtype` is what the release keeps in bf16 (most weights, norms, embedding); the fp32 tensors
     (hc mixes, sinks, gate bias, ratio-2 compressor, head) are fp32 regardless.
@@ -579,7 +581,7 @@ class DSV41Stage(nn.Module):
         fields = (None,) * len(SHARED_FIELDS)
         for layer in self.layers.values():
             if self.recompute and torch.is_grad_enabled():
-                h, pre_mix, *fields = checkpoint(_run_layer, layer, hashes, h, pre_mix, *fields, use_reentrant=False)
+                h, pre_mix, *fields = checkpoint(_run_layer, layer, hashes, h, pre_mix, *fields, use_reentrant=True)
             else:
                 h, pre_mix, *fields = _run_layer(layer, hashes, h, pre_mix, *fields)
         if not self.post_process:
