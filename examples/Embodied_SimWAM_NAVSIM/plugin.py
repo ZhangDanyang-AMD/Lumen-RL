@@ -788,6 +788,44 @@ def install_parallel_pdm_reward() -> None:
     logger.info("PDM rewards are scored by %d worker processes", workers)
 
 
+def _emulate_eager_casts() -> None:
+    # inductor keeps fused intermediates in fp32 by default; emulate the bf16 roundings eager does
+    import torch._inductor.config as inductor_config
+
+    if hasattr(inductor_config, "emulate_precision_casts"):
+        inductor_config.emulate_precision_casts = True
+
+
+def install_compiled_rmsnorm() -> None:
+    """Compile SimWAM's own ``RMSNorm.forward`` into fused kernels (forward and backward).
+
+    Only ``simwam.models.wan22.wan_video_dit.RMSNorm`` is replaced; Lumen's class-name based
+    ``lumen_norm`` is not used, because it would also swap the affine-free ``LayerNorm``s.
+    ``SIMWAM_GRPO_COMPILE_RMSNORM=0`` turns it off.
+    """
+    if os.environ.get("SIMWAM_GRPO_COMPILE_RMSNORM", "1").strip().lower() in _OFF:
+        return
+    import torch
+    from simwam.models.wan22.wan_video_dit import RMSNorm
+
+    if getattr(RMSNorm.forward, "_compiled", False):
+        return
+    _emulate_eager_casts()
+
+    @torch.compile(dynamic=None)
+    def rmsnorm(x, weight, eps: float):
+        dtype = x.dtype
+        xf = x.float()
+        return (xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)).to(dtype) * weight
+
+    def forward(self, x):
+        return rmsnorm(x, self.weight, self.eps)
+
+    forward._compiled = True
+    RMSNorm.forward = forward
+    logger.info("SimWAM RMSNorm runs through torch.compile")
+
+
 def enable_lumen(model, spec: str):
     """Apply ``LumenConfig.enable`` once per requested patch."""
     requested = []
