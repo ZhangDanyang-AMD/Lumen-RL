@@ -22,10 +22,10 @@ correct for it.
   have been run with the FSDP2 training backend.
 - Or the ATOM rollout (`generation_backend: atom`, `atom_cfg.transport:
   ray_http`). Its RCCL weight sync and `fully_async.partial_rollout` need an
-  ATOM build with the RCCL weight receive and the engine's `pause_generation`
-  (mode `keep`): ATOM's pause PR
-  ([ROCm/ATOM#3059](https://github.com/ROCm/ATOM/pull/3059)) and its RCCL-receive
-  PR ([ROCm/ATOM#3058](https://github.com/ROCm/ATOM/pull/3058)).
+  ATOM with the RCCL weight receive and the engine's `pause_generation` (mode
+  `keep`): ATOM main since `a0221c199`, which merged the RCCL receive
+  ([ROCm/ATOM#3058](https://github.com/ROCm/ATOM/pull/3058)) on top of the
+  pause ([ROCm/ATOM#3059](https://github.com/ROCm/ATOM/pull/3059)).
   An older ATOM fails at start with `weight_sync.backend: rdma`, as it
   cannot report RDMA support, and is refused partial rollout; run it with
   `weight_sync.backend: shared_folder` and `partial_rollout: false`, and each
