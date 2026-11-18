@@ -258,6 +258,58 @@ def assert_bucket_fully_applied(
     raise RuntimeError(message)
 
 
+class RecordingCoreManager:
+    """A CoreManager that keeps, for every ``update_weights_shm`` it forwards, how
+    many tensors the bucket held and what each engine says it applied -- for a
+    loader that returns neither (ATOM's ``load_weights_via_shm``)."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.buckets: list[tuple[int, list[int]]] = []
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def broadcast_utility_command_sync(self, cmd: str, *args: Any, **kwargs: Any) -> Any:
+        responses = self._inner.broadcast_utility_command_sync(cmd, *args, **kwargs)
+        if cmd == "update_weights_shm":
+            self.buckets.append((len(kwargs.get("bucket_meta") or {}), _updated_counts(responses)))
+        return responses
+
+
+def assert_sync_applied(buckets: list[tuple[int, list[int]]], *, context: str) -> None:
+    """Fail when an engine wrote nothing in a whole sync that sent tensors.
+
+    Exact counts are not available here: a packed module's shards (``wq_a`` and
+    ``wkv``, gate and up) arrive as separate tensors and count as one update.
+    An engine that applied nothing at all is serving its old weights, though --
+    as every V4.1 sync did while ATOM's mono decode renamed its parameters.
+    ``LUMENRL_WEIGHT_SYNC_CHECK`` as in ``assert_bucket_fully_applied``.
+    """
+    mode = os.environ.get("LUMENRL_WEIGHT_SYNC_CHECK", "error").lower()
+    sent = sum(n for n, _ in buckets)
+    if mode == "off" or not sent:
+        return
+    engines = max((len(counts) for _, counts in buckets), default=0)
+    if not engines:
+        logger.warning("ATOM weight sync (%s): no engine reported an updated count; coverage unchecked", context)
+        return
+    applied = [sum(counts[i] for _, counts in buckets if i < len(counts)) for i in range(engines)]
+    logger.info("ATOM weight sync (%s): %d tensors sent, applied per engine %s", context, sent, applied)
+    if min(applied) > 0:
+        return
+    message = (
+        f"ATOM weight sync ({context}) sent {sent} tensors and an engine applied none of "
+        f"them (applied per engine {applied}): it is serving the weights it had. ATOM logs "
+        "'weight update matched NOTHING' with the reason; the sender's names did not resolve "
+        "against the model ATOM built."
+    )
+    if mode == "warn":
+        logger.warning(message)
+        return
+    raise RuntimeError(message)
+
+
 def _updated_counts(responses: Any) -> list[int]:
     """Pull the ``updated`` counts out of ``broadcast_utility_command_sync``.
 

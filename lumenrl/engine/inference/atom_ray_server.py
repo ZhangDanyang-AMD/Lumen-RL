@@ -1025,6 +1025,11 @@ class ATOMRayServer:
 
         from atom.rollout.weight_sync import load_weights_via_shm
 
+        from lumenrl.engine.inference.atom_moe_weight_sync import (
+            RecordingCoreManager,
+            assert_sync_applied,
+        )
+
         index_path = os.path.join(weight_dir, "model.safetensors.index.json")
         if os.path.exists(index_path):
             with open(index_path) as f:
@@ -1053,9 +1058,9 @@ class ATOMRayServer:
                     begin, end = entry["data_offsets"]
                     largest = max(largest, end - begin)
         bucket_size_mb = max(2048, -(-largest // (1 << 20)))
-        load_weights_via_shm(
-            self.engine.core_mgr, weight_iter(), bucket_size_mb=bucket_size_mb
-        )
+        core_mgr = RecordingCoreManager(self.engine.core_mgr)
+        load_weights_via_shm(core_mgr, weight_iter(), bucket_size_mb=bucket_size_mb)
+        assert_sync_applied(core_mgr.buckets, context=f"shm reload, replica {self.replica_rank}")
         logger.info(
             "ATOMRayServer[%d]: reloaded weights from %s", self.replica_rank, weight_dir
         )
@@ -1172,11 +1177,12 @@ class ATOMReplicaManager:
                 # know the field ignores this line rather than failing on it --
                 # and the mask cannot go quiet just because the pin moved.
                 engine_kwargs.setdefault("true_vocab_size", int(true_vocab_size))
-            if disable_custom_ar in ("1", "true", "True"):
-                engine_kwargs.setdefault(
-                    "runner_qualname",
-                    "lumenrl.engine.inference.model_runner_nocustomar.NoCustomARModelRunner",
-                )
+            # Whether or not custom all-reduce is off (the runner reads
+            # LUMENRL_DISABLE_CUSTOM_AR itself): its weight-sync fixes apply to every run.
+            engine_kwargs.setdefault(
+                "runner_qualname",
+                "lumenrl.engine.inference.model_runner_nocustomar.NoCustomARModelRunner",
+            )
 
             _dbg = os.environ.get("LUMENRL_DEBUG", "0") in ("1", "true", "True")
             if _dbg:
