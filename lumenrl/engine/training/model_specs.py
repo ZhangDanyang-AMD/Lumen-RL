@@ -1,8 +1,8 @@
 """The registered :class:`ModelSpec` entries.
 
 Separate from ``model_registry`` so the registry carries no bridge imports.
-Registration order is resolution order, most specific first: DSv4, DeepSeek-V3,
-any other config with routed experts, dense catch-all.
+Registration order is resolution order, most specific first: DeepSeek-V4.1,
+DSv4, DeepSeek-V3, any other config with routed experts, dense catch-all.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from __future__ import annotations
 import itertools
 from typing import Any, Mapping
 
-from lumenrl.engine.training.bridges import dsv3, dsv4, gpt
+from lumenrl.engine.training.bridges import dsv3, dsv4, dsv41, gpt
 from lumenrl.engine.training.model_registry import (
     MODEL_REGISTRY,
     ModelCaps,
@@ -77,6 +77,31 @@ def _dense_dims(hf: Mapping[str, Any]) -> gpt.GPTDims:
         ffn=hf["intermediate_size"],
         vocab=hf["vocab_size"],
     )
+
+
+# --- DeepSeek-V4.1 -----------------------------------------------------------
+# First: "deepseek_v41" also matches DSv4's detection. Not a GPTModel -- the
+# release-checked PyTorch backbone with Megatron's MoE, loaded straight from the
+# released FP8 / FP4 checkpoint -- so it builds its own model, and like DSv4 it
+# reads a microbatch as one sequence.
+DSV41 = MODEL_REGISTRY.register(
+    ModelSpec(
+        name="deepseek_v41",
+        detect=lambda hf, ec: dsv41.is_dsv41(hf),
+        caps=ModelCaps(
+            supports_hf_bridge=False,
+            supports_dynamic_batch=False,
+            builds_own_config=True,
+            # The EP microbatch lockstep lives on the pipeline path.
+            requires_pipeline_forward=True,
+            packed_stream_is_single_sequence=True,
+        ),
+        language_config=dsv41.language_config,
+        build_config=dsv41.build_dsv41_config,
+        build_model=dsv41.build_dsv41_model,
+        export_weights=dsv41.export_dsv41,
+    )
+)
 
 
 # --- DeepSeek-V4 -------------------------------------------------------------

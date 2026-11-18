@@ -76,6 +76,10 @@ class ModelSpec:
     name: str
     detect: Callable[[Mapping[str, Any], Mapping[str, Any]], bool]
     caps: ModelCaps = field(default_factory=ModelCaps)
+    # ``(hf) -> hf``: the part of config.json that describes the language model,
+    # for a family that nests it (V4.1 under ``text_config``). Every hook below
+    # and the engine see this one; ``detect`` sees the file as it is.
+    language_config: Optional[Callable[[Mapping[str, Any]], Mapping[str, Any]]] = None
     # Dims dataclass for the HF weight bridge; None if the family skips it.
     build_dims: Optional[Callable[[Mapping[str, Any]], Any]] = None
     # Architecture-level routing defaults, still overridable by engine_config.
@@ -87,6 +91,13 @@ class ModelSpec:
     build_config: Optional[Callable[..., Any]] = None
     # ``(tfcfg, ec) -> ModuleSpec`` for heterogeneous layers.
     build_layer_spec: Optional[Callable[..., Any]] = None
+    # ``(engine, hf, tfcfg) -> module``: this rank's model, on its device with
+    # its weights loaded, for a family that is not a ``GPTModel`` at all. It
+    # replaces the layer spec, the ``GPTModel`` and the weight loading; the
+    # engine still wraps it in DDP and runs Megatron's schedule over it, so it
+    # must provide what that schedule calls (``set_input_tensor``, the forward
+    # ``_pp_forward_model`` makes).
+    build_model: Optional[Callable[[Any, Mapping[str, Any], Any], Any]] = None
     # ``(tfcfg) -> int`` extra sequence-length alignment the family requires.
     sequence_alignment: Optional[Callable[[Any], int]] = None
     # ``(engine) -> None`` run before each forward, to refuse topologies the

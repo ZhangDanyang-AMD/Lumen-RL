@@ -95,8 +95,9 @@ def test_native_forwards_require_vllm_routes_not_logit_hooks() -> None:
     assert "self._r3_append = False" in logprob
     source = inspect.getsource(MegatronNativeEngine.initialize)
     assert "moe_enable_routing_replay" in source
-    cleanup = source.index("clear_stale_instances(")
-    construction = source.index("model = GPTModel(")
+    build = inspect.getsource(MegatronNativeEngine._build_gpt_model)
+    cleanup = build.index("clear_stale_instances(")
+    construction = build.index("model = GPTModel(")
     assert cleanup < construction
     assert "megatron_record_router_logits" not in source
     assert "recompute_granularity" in source

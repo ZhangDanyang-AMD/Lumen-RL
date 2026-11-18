@@ -145,6 +145,8 @@ def test_registered_families_are_ordered_specific_before_general():
     names = MODEL_REGISTRY.names
     assert names[-1] == "gpt_dense"
     assert names.index("deepseek_v4") < names.index("gpt_moe")
+    # DSv4's detection also matches "deepseek_v41".
+    assert names.index("deepseek_v41") < names.index("deepseek_v4")
 
 
 def test_caps_defaults_are_the_permissive_ones():
@@ -256,7 +258,7 @@ def test_every_registered_family_is_covered_by_these_tests():
     """
     covered = {s.name for s in _all_specs()}
     assert covered == set(MODEL_REGISTRY.names)
-    for family in ("deepseek_v4", "deepseek_v3", "gpt_moe", "gpt_dense"):
+    for family in ("deepseek_v41", "deepseek_v4", "deepseek_v3", "gpt_moe", "gpt_dense"):
         assert family in covered, f"{family} is not covered by the per-family tests"
 
 
