@@ -123,7 +123,10 @@ def _sparse_attention(q: Tensor, kv: Tensor, attn_sink: Tensor, topk_idxs: Tenso
     b, s, h, d = q.shape
     valid = topk_idxs >= 0
     idx = topk_idxs.clamp_min(0).long()
-    rows = torch.gather(kv.float(), 1, idx.reshape(b, -1, 1).expand(-1, -1, d)).reshape(b, s, -1, d)
+    # whole rows by index, not `gather` over every element: deterministic mode turns gather's
+    # backward into an index_put with an int64 index per element (~20 GB at 16K positions)
+    batch = torch.arange(b, device=kv.device).unsqueeze(1)
+    rows = kv.float()[batch, idx.reshape(b, -1)].reshape(b, s, -1, d)
     scores = torch.einsum("bshd,bstd->bsht", q.float(), rows) * softmax_scale
     scores = scores.masked_fill(~valid.unsqueeze(2), float("-inf"))
     sink = attn_sink.float().view(1, 1, h, 1).expand(b, s, h, 1)
