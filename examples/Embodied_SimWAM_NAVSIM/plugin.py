@@ -23,6 +23,8 @@ import os
 logger = logging.getLogger(__name__)
 
 _OFF = {"", "0", "false", "none", "off"}
+# counters of the verify modes, by patch
+_STATS = {}
 _PATCHES = ("hf_attn_patch", "lumen_linear", "aiter_conv")
 
 
@@ -96,6 +98,35 @@ def install_grpo_hook() -> None:
     ActionGRPOMixin.configure_grpo = configure_grpo
 
 
+def install_lora_init_seed() -> None:
+    """Seed every RNG right before ``configure_grpo``, i.e. before LoRA A is initialised.
+
+    On the NAVSIM path SimWAM seeds only in the trainer, after ``configure_grpo`` has drawn
+    LoRA A with ``kaiming_uniform_``, so two runs of the same config start from different
+    adapters. This calls SimWAM's ``set_global_seed`` (which adds the rank) first; the trainer
+    re-seeds later exactly as before, so rollout noise is unchanged.
+    ``SIMWAM_GRPO_LORA_SEED`` sets the seed (default 42, the config's ``seed``); ``off`` disables.
+    """
+    value = os.environ.get("SIMWAM_GRPO_LORA_SEED", "42").strip()
+    if value.lower() in _OFF:
+        return
+    from simwam.models.wan22.simwam_grpo import ActionGRPOMixin
+    from simwam.utils.pytorch_utils import set_global_seed
+
+    if getattr(ActionGRPOMixin.configure_grpo, "_lora_seed", False):
+        return
+    seed = int(value)
+    original = ActionGRPOMixin.configure_grpo
+
+    def configure_grpo(self, grpo_cfg):
+        set_global_seed(seed)
+        original(self, grpo_cfg)
+
+    configure_grpo._lora_seed = True
+    ActionGRPOMixin.configure_grpo = configure_grpo
+    logger.info("RNGs are seeded with %d (+rank) before LoRA initialisation", seed)
+
+
 def install_ref_logprob_cache() -> None:
     """Score each rollout with the frozen reference expert once, not once per inner epoch.
 
@@ -137,6 +168,151 @@ def install_ref_logprob_cache() -> None:
     SimWAMGRPOTrainer._policy_loss = _policy_loss
     ActionGRPOMixin.action_chain_logprobs = action_chain_logprobs
     logger.info("Reference log-probs are computed once per rollout")
+
+
+_LEAN_ATTN = {"on": False, "flag": None}
+
+
+def install_lean_lumen_attention() -> None:
+    """Make ``hf_attn_patch``'s masked no-grad attention capturable, and launch it once per call.
+
+    ``hf_attn_patch`` sends masked no-grad calls to Lumen's Triton ``attn_fwd``, whose
+    dispatcher copies unit scales from the host; under CUDA graph capture that copy raises and
+    ``hf_attn_patch`` silently falls back to torch SDPA, so a captured graph would record a
+    different kernel. Both modes call the same Triton forward with resident scales instead.
+    * ``1`` (default): inside ``action_velocity`` the masks (the action rows of the MoT mask and
+      the context mask) are all True, so ``hf_attn_patch``'s bias is all zeros. The same zero
+      bias is kept resident and broadcast over the batch with stride 0, so one launch serves
+      all samples instead of one launch per sample, and the bias is not rebuilt per call.
+      Whether the masks are all True is checked once per condition, outside capture; other
+      calls go to ``hf_attn_patch`` and are never captured.
+    * ``loop``: ``hf_attn_patch``'s path op for op (bias built from the mask, one launch per
+      sample when the mask differs per sample) for every masked no-grad call.
+    Needs ``hf_attn_patch`` in ``LUMEN_ENABLE``. ``SIMWAM_GRPO_LEAN_ATTN=0`` turns this off;
+    ``SIMWAM_GRPO_LEAN_ATTN_VERIFY=1`` also runs ``hf_attn_patch`` on every uncaptured call and
+    counts outputs that are not bit-identical.
+    """
+    mode = os.environ.get("SIMWAM_GRPO_LEAN_ATTN", "1").strip().lower()
+    if mode in _OFF:
+        return
+    import torch
+    import torch.nn.functional as F
+    from simwam.models.wan22.simwam_grpo import ActionGRPOMixin
+
+    if getattr(ActionGRPOMixin.action_velocity, "_lean_attn", False):
+        return
+
+    def attention_triton_forward_impl(*args):
+        from lumen.kernels.attention.attention_impl import attention_triton_forward_impl as impl
+
+        return impl(*args)
+    verify = os.environ.get("SIMWAM_GRPO_LEAN_ATTN_VERIFY", "0") == "1"
+    stats = {"lean": 0, "mismatch": 0, "max_diff": 0.0}
+    inner = {"sdpa": None, "ones": {}, "zeros": {}}
+
+    def mask_flag(cond, action_len):
+        key = f"_lean_attn_all_true_{action_len}"
+        flag = cond.get(key)
+        if flag is None:
+            vs = int(cond["video_seq_len"])
+            flag = bool(cond["attention_mask"][vs:vs + action_len, :vs + action_len].all()) and bool(
+                cond["context_mask"].all())
+            cond[key] = flag
+        return flag
+
+    def triton(q, k, v, bias, one):
+        return attention_triton_forward_impl(q, k, v, 1.0, one, one, one, 0.0, q.shape[-1] ** (-0.5), False, -1, -1,
+                                             bias, None, False, False)[0]
+
+    def replica(query, key, value, attn_mask, q, k, v, one):
+        # hf_attn_patch's masked no-grad path, op for op
+        b, h, sq, _ = query.shape
+        target = (b, h, sq, key.shape[-2])
+        bias = torch.zeros(attn_mask.shape, dtype=query.dtype, device=attn_mask.device)
+        bias = bias.masked_fill(~attn_mask, torch.finfo(query.dtype).min)
+        if tuple(bias.shape) != target:
+            while bias.dim() < 4:
+                bias = bias.unsqueeze(0)
+            bias = bias.expand(target)
+        if q.shape[0] > 1 and bias.stride(0) != 0:
+            return torch.cat([triton(q[i:i + 1], k[i:i + 1], v[i:i + 1], bias[i:i + 1], one)
+                              for i in range(q.shape[0])], dim=0)
+        return triton(q, k, v, bias, one)
+
+    def sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, **kwargs):
+        if ((mode != "loop" and not _LEAN_ATTN["on"]) or attn_mask is None or attn_mask.dtype != torch.bool
+                or kwargs or dropout_p or is_causal or scale is not None
+                or (torch.is_grad_enabled() and (query.requires_grad or key.requires_grad or value.requires_grad))):
+            return inner["sdpa"](query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal,
+                                 scale=scale, **kwargs)
+        q = query.transpose(1, 2).contiguous()
+        k = key.transpose(1, 2).contiguous()
+        v = value.transpose(1, 2).contiguous()
+        # Lumen's dispatcher builds its unused unit scales with torch.tensor([1.0], device=...), a host
+        # copy that cannot be captured; pass resident ones instead (made on the first, eager, call:
+        # the graphs warm up eagerly before capturing)
+        one = inner["ones"].get(q.device)
+        if one is None:
+            one = inner["ones"][q.device] = torch.ones(1, device=q.device)
+        if mode == "loop":
+            out = replica(query, key, value, attn_mask, q, k, v, one).transpose(1, 2)
+            stats["lean"] += 1
+            if verify and not torch.cuda.is_current_stream_capturing():
+                ref = inner["sdpa"](query, key, value, attn_mask=attn_mask)
+                if not torch.equal(ref, out):
+                    stats["mismatch"] += 1
+                    stats["max_diff"] = max(stats["max_diff"], float((ref.float() - out.float()).abs().max()))
+            return out
+        b, h, sq, sk = query.shape[0], query.shape[1], query.shape[2], key.shape[2]
+        zkey = (q.device, q.dtype, sq, sk)
+        zero = inner["zeros"].get(zkey)
+        if zero is None:
+            zero = inner["zeros"][zkey] = torch.zeros((1, 1, sq, sk), dtype=q.dtype, device=q.device)
+        # the same zero bias hf_attn_patch builds, broadcast over batch (stride 0) so one launch serves
+        # every sample; the kernel ignores the bias batch stride, which is why hf_attn_patch loops
+        out = triton(q, k, v, zero.expand(b, h, sq, sk), one).transpose(1, 2)
+        stats["lean"] += 1
+        if verify and not torch.cuda.is_current_stream_capturing():
+            ref = inner["sdpa"](query, key, value, attn_mask=attn_mask)
+            if not torch.equal(ref, out):
+                stats["mismatch"] += 1
+                stats["max_diff"] = max(stats["max_diff"], float((ref.float() - out.float()).abs().max()))
+        return out
+
+    original = ActionGRPOMixin.configure_grpo
+
+    def configure_grpo(self, grpo_cfg):
+        original(self, grpo_cfg)
+        from lumen.ops.attention import hf_patch
+
+        if hf_patch._original_sdpa is not None and inner["sdpa"] is None:
+            inner["sdpa"] = F.scaled_dot_product_attention
+            F.scaled_dot_product_attention = sdpa
+            logger.info("hf_attn_patch: all-True masks inside action_velocity take one bias-free Triton launch "
+                        "(verify=%s)", verify)
+
+    velocity = ActionGRPOMixin.action_velocity
+
+    def action_velocity(self, latents_action, timestep_action, cond, use_ref=False):
+        if inner["sdpa"] is None:
+            return velocity(self, latents_action, timestep_action, cond, use_ref=use_ref)
+        previous = _LEAN_ATTN["on"]
+        _LEAN_ATTN["on"] = mask_flag(cond, int(latents_action.shape[1]))
+        try:
+            return velocity(self, latents_action, timestep_action, cond, use_ref=use_ref)
+        finally:
+            _LEAN_ATTN["on"] = previous
+
+    action_velocity._lean_attn = True
+    action_velocity.stats = stats
+    _STATS["lean_attn"] = stats
+    ActionGRPOMixin.configure_grpo = configure_grpo
+    ActionGRPOMixin.action_velocity = action_velocity
+    if mode == "loop":
+        # the replica is capture-safe for any mask
+        _LEAN_ATTN["flag"] = lambda cond, action_len: "loop" if inner["sdpa"] is not None else None
+    else:
+        _LEAN_ATTN["flag"] = lambda cond, action_len: mask_flag(cond, action_len) if inner["sdpa"] is not None else None
 
 
 def install_action_velocity_graphs() -> None:
@@ -205,9 +381,15 @@ def install_action_velocity_graphs() -> None:
             stats["eager"] += 1
             return eager(self, latents_action, timestep_action, cond, use_ref=use_ref)
         tensors = cond_tensors(cond)
+        # the lean attention path bakes "masks are all True" into the graph
+        lean = _LEAN_ATTN["flag"](cond, int(latents_action.shape[1])) if _LEAN_ATTN["flag"] else None
         key = (bool(use_ref), tuple(latents_action.shape), tuple(latents_action.stride()), tuple(timestep_action.shape),
-               int(cond["video_seq_len"]), tuple((tuple(t.shape), t.dtype) for t in tensors))
+               int(cond["video_seq_len"]), tuple((tuple(t.shape), t.dtype) for t in tensors), lean)
         g = graphs.get(key)
+        if g is None and lean is False:
+            # hf_attn_patch falls back to torch SDPA when a host copy fails under capture, so a
+            # masked call outside the lean path would be recorded with a different kernel
+            g = graphs[key] = False
         if g is None:
             try:
                 g = capture(self, latents_action, timestep_action, cond, use_ref, tensors)
@@ -247,21 +429,125 @@ def install_action_velocity_graphs() -> None:
 
     action_velocity._cuda_graph = True
     action_velocity.stats = stats
+    _STATS["cuda_graph"] = stats
     action_velocity.eager = eager
     ActionGRPOMixin.action_velocity = action_velocity
     logger.info("action_velocity replays CUDA graphs under no_grad (verify=%s)", verify)
 
 
-def install_batched_logprobs() -> None:
-    """Score all stochastic steps of a chain with one ``action_velocity`` call.
+_CHUNK = {"sizes": None, "views": None, "ops": frozenset(), "lumen": None}
 
-    ``action_chain_logprobs`` calls the action expert once per stochastic step (3 by
-    default), each on the same ``B*G`` samples. Stacking the steps along the batch runs
-    the expert once on ``W*B*G`` samples, so its forward and backward launch a third of
-    the kernels. The per-step SDE mean, std, clamping and reduction are unchanged; the
-    condition (video K/V cache, context) is repeated once per condition and reused.
-    Only the rigorous-SDE, unmerged path is batched; anything else uses the original.
-    ``SIMWAM_GRPO_BATCHED_LOGP=0`` turns this off.
+
+def _chunk_active(x) -> bool:
+    sizes = _CHUNK["sizes"]
+    return sizes is not None and x.dim() >= 2 and x.shape[0] == sum(sizes)
+
+
+def _install_chunked_ops() -> None:
+    """Run the GEMMs of a batched call once per original step.
+
+    While ``_CHUNK["sizes"]`` holds the per-step batch sizes, every ``nn.Linear``, LoRA matmul and
+    Lumen bf16 GEMM whose input has that total batch runs once per step on its slice and the
+    outputs are concatenated. The GEMMs then have the shapes and strides of the unbatched path,
+    so they pick the same kernels, and autograd accumulates each LoRA weight gradient from the
+    same per-step GEMMs in the same order. ``_CHUNK["views"]`` maps ``id(weight)`` to per-step
+    inputs that replace the slices: the action encoder is fed ``chain[:, k]``, a non-contiguous
+    view, which ``F.linear`` computes as a matmul plus a separate bias add.
+    ``_CHUNK["ops"]`` can add ``rmsnorm`` and ``attn`` (SDPA) to the per-step ops.
+    """
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    from simwam.models.wan22 import wan_video_dit as wvd
+    from simwam.models.wan22.lora import LoRALinear
+
+    if getattr(nn.Linear.forward, "_chunked", False):
+        return
+
+    def pieces(x, weight=None):
+        views = _CHUNK["views"]
+        if views is not None and weight is not None and id(weight) in views:
+            return views[id(weight)]
+        return torch.split(x, _CHUNK["sizes"], dim=0)
+
+    linear_forward = nn.Linear.forward
+
+    def linear(self, x):
+        if not _chunk_active(x):
+            return linear_forward(self, x)
+        return torch.cat([linear_forward(self, xc) for xc in pieces(x, self.weight)], dim=0)
+
+    lora_forward = LoRALinear.forward
+
+    def lora(self, x):
+        if not _chunk_active(x):
+            return lora_forward(self, x)
+        out = self.base(x)
+        parts = [(self.lora_dropout(xc) @ self.lora_A.t()) @ self.lora_B.t() for xc in pieces(x)]
+        return out + self.scaling * torch.cat(parts, dim=0)
+
+    rms_forward = wvd.RMSNorm.forward
+
+    def rms(self, x):
+        if "rmsnorm" not in _CHUNK["ops"] or not _chunk_active(x):
+            return rms_forward(self, x)
+        return torch.cat([rms_forward(self, xc) for xc in pieces(x)], dim=0)
+
+    sdpa = F.scaled_dot_product_attention
+
+    def chunked_sdpa(query, key, value, attn_mask=None, *args, **kwargs):
+        if "attn" not in _CHUNK["ops"] or not _chunk_active(query):
+            return sdpa(query, key, value, attn_mask, *args, **kwargs)
+        sizes = _CHUNK["sizes"]
+        qs, ks, vs = (torch.split(t, sizes, dim=0) for t in (query, key, value))
+        if attn_mask is not None and attn_mask.dim() == 4 and attn_mask.shape[0] == query.shape[0]:
+            ms = torch.split(attn_mask, sizes, dim=0)
+        else:
+            ms = [attn_mask] * len(sizes)
+        return torch.cat([sdpa(q, k, v, m, *args, **kwargs) for q, k, v, m in zip(qs, ks, vs, ms)], dim=0)
+
+    linear._chunked = True
+    nn.Linear.forward = linear
+    LoRALinear.forward = lora
+    wvd.RMSNorm.forward = rms
+    F.scaled_dot_product_attention = chunked_sdpa
+
+    def chunk_lumen_gemm():
+        # Lumen is imported by LumenConfig inside configure_grpo; importing it here, before the
+        # trainer sets the device, would open a HIP context on GPU 0 in every rank
+        import sys
+
+        bg = sys.modules.get("lumen.ops.bf16_gemm")
+        if bg is None or getattr(bg.linear, "_chunked", False):
+            return
+        bg_linear = bg.linear
+
+        def lumen_linear(x, weight, bias=None):
+            if not _chunk_active(x):
+                return bg_linear(x, weight, bias)
+            return torch.cat([bg_linear(xc, weight, bias) for xc in pieces(x, weight)], dim=0)
+
+        lumen_linear._chunked = True
+        bg.linear = lumen_linear
+
+    _CHUNK["lumen"] = chunk_lumen_gemm
+
+
+def install_batched_logprobs() -> None:
+    """Score all stochastic steps of a chain with one grad-enabled ``action_velocity`` call.
+
+    ``action_chain_logprobs`` calls the action expert once per stochastic step (3 by default),
+    each on the same ``B*G`` samples. With gradients on, the steps are stacked along the batch
+    and the expert runs once on ``W*B*G`` samples, so the element-wise kernels of its forward
+    and backward launch once instead of ``W`` times. The GEMMs still run once per step (see
+    ``_install_chunked_ops``), which keeps the result bit-identical to the unbatched path: a
+    single GEMM over ``W*B*G`` rows picks other kernels, and its LoRA weight gradient would be
+    one reduction instead of ``W`` GEMMs summed in bf16. The per-step SDE mean, std, clamping and
+    reduction are unchanged. No-grad calls (old and reference log-probs) keep the original path,
+    which the CUDA graphs already make cheap. Only the rigorous-SDE, unmerged path is batched.
+    ``SIMWAM_GRPO_BATCHED_LOGP=0`` turns this off; ``SIMWAM_GRPO_BATCHED_CHUNK`` adds ``rmsnorm``
+    and/or ``attn`` to the per-step ops; ``SIMWAM_GRPO_BATCHED_LOGP_VERIFY=1`` also runs the
+    unbatched path on every call and compares outputs and LoRA gradients bit for bit.
     """
     if os.environ.get("SIMWAM_GRPO_BATCHED_LOGP", "1").strip().lower() in _OFF:
         return
@@ -273,6 +559,11 @@ def install_batched_logprobs() -> None:
 
     if getattr(ActionGRPOMixin.action_chain_logprobs, "_batched", False):
         return
+    _install_chunked_ops()
+    _CHUNK["ops"] = frozenset(
+        x.strip() for x in os.environ.get("SIMWAM_GRPO_BATCHED_CHUNK", "").split(",") if x.strip())
+    verify = os.environ.get("SIMWAM_GRPO_BATCHED_LOGP_VERIFY", "0") == "1"
+    stats = {"batched": 0, "fwd_mismatch": 0, "grad_mismatch": 0, "grad_checked": 0, "max_grad_diff": 0.0}
     original = ActionGRPOMixin.action_chain_logprobs
 
     def repeat_cond(cond, w):
@@ -290,27 +581,28 @@ def install_batched_logprobs() -> None:
             cond[key] = rep
         return rep
 
-    def action_chain_logprobs(self, cond, chain, timesteps, deltas, stoch_idx=None, use_ref=False,
-                              return_terms=False):
-        if getattr(self, "grpo_merge_sde_window", False) or self.grpo_sde_mode != "rigorous":
-            return original(self, cond, chain, timesteps, deltas, stoch_idx=stoch_idx, use_ref=use_ref,
-                            return_terms=return_terms)
+    def batched(self, cond, chain, timesteps, deltas, steps, use_ref, return_terms):
         sched = self.infer_action_scheduler
         device = self.device
         dtype = getattr(self, "grpo_action_dtype", self.torch_dtype)
         batch_size = int(chain.shape[0])
-        steps = self._normalize_stoch_idx(stoch_idx, int(timesteps.shape[0]))
-        if len(steps) < 2:
-            return original(self, cond, chain, timesteps, deltas, stoch_idx=stoch_idx, use_ref=use_ref,
-                            return_terms=return_terms)
-        x_all = torch.cat([chain[:, k] for k in steps], dim=0)
+        expert = self.ref_action_expert if use_ref else self.action_expert
+        x_views = [chain[:, k] for k in steps]
+        x_all = torch.cat(x_views, dim=0)
         t_all = torch.cat([
             timesteps[k].to(device=device, dtype=dtype).reshape(1).expand(batch_size) for k in steps
         ])
-        v_all = self.action_velocity(x_all, t_all, repeat_cond(cond, len(steps)), use_ref=use_ref)
+        _CHUNK["lumen"]()
+        _CHUNK["sizes"] = [batch_size] * len(steps)
+        _CHUNK["views"] = {id(expert.action_encoder.weight): x_views}
+        try:
+            v_all = self.action_velocity(x_all, t_all, repeat_cond(cond, len(steps)), use_ref=use_ref)
+        finally:
+            _CHUNK["sizes"] = None
+            _CHUNK["views"] = None
         logps, means, vels, stds = [], [], [], []
         for i, k in enumerate(steps):
-            x_k = x_all[i * batch_size:(i + 1) * batch_size]
+            x_k = chain[:, k]
             v = v_all[i * batch_size:(i + 1) * batch_size]
             x_next = chain[:, k + 1]
             sigma_k = float(timesteps[k].item()) / float(sched.num_train_timesteps)
@@ -336,10 +628,64 @@ def install_batched_logprobs() -> None:
             "std": torch.tensor(stds, device=device, dtype=torch.float32),
         }
 
+    def probe(out, gen):
+        logp, terms = out
+        total = (logp * torch.randn(logp.shape, generator=gen, device=logp.device)).sum()
+        for key in ("mean", "vel"):
+            t = terms[key]
+            total = total + (t * torch.randn(t.shape, generator=gen, device=t.device)).sum()
+        return total
+
+    def check(self, args, steps, use_ref, new):
+        expert = self.ref_action_expert if use_ref else self.action_expert
+        params = [p for p in expert.parameters() if p.requires_grad]
+        cond, chain, timesteps, deltas = args
+        ref = original(self, cond, chain, timesteps, deltas, stoch_idx=steps, use_ref=use_ref, return_terms=True)
+        fwd_ok = torch.equal(ref[0], new[0]) and all(torch.equal(ref[1][k], new[1][k]) for k in ref[1])
+        stats["fwd_mismatch"] += int(not fwd_ok)
+        if params:
+            dev = new[0].device
+            g_ref = torch.autograd.grad(probe(ref, torch.Generator(device=dev).manual_seed(1234)), params,
+                                        allow_unused=True)
+            g_new = torch.autograd.grad(probe(new, torch.Generator(device=dev).manual_seed(1234)), params,
+                                        allow_unused=True, retain_graph=True)
+            bad, worst = 0, 0.0
+            for a, b in zip(g_ref, g_new):
+                if a is None or b is None:
+                    bad += int((a is None) != (b is None))
+                    continue
+                if not torch.equal(a, b):
+                    bad += 1
+                    worst = max(worst, float((a.float() - b.float()).abs().max()))
+            stats["grad_checked"] += 1
+            stats["grad_mismatch"] += int(bad > 0)
+            stats["max_grad_diff"] = max(stats["max_grad_diff"], worst)
+            logger.info("batched logp verify: forward bit-identical=%s, LoRA grads differing=%d/%d (max %.3g)",
+                        fwd_ok, bad, len(params), worst)
+
+    def action_chain_logprobs(self, cond, chain, timesteps, deltas, stoch_idx=None, use_ref=False,
+                              return_terms=False):
+        steps = self._normalize_stoch_idx(stoch_idx, int(timesteps.shape[0]))
+        expert = self.ref_action_expert if use_ref else self.action_expert
+        if (not torch.is_grad_enabled() or getattr(self, "grpo_merge_sde_window", False)
+                or self.grpo_sde_mode != "rigorous" or len(steps) < 2
+                or (self.training and getattr(expert, "use_gradient_checkpointing", False))):
+            return original(self, cond, chain, timesteps, deltas, stoch_idx=stoch_idx, use_ref=use_ref,
+                            return_terms=return_terms)
+        stats["batched"] += 1
+        if verify:
+            new = batched(self, cond, chain, timesteps, deltas, steps, use_ref, True)
+            check(self, (cond, chain, timesteps, deltas), steps, use_ref, new)
+            return new if return_terms else new[0]
+        return batched(self, cond, chain, timesteps, deltas, steps, use_ref, return_terms)
+
     action_chain_logprobs._batched = True
     action_chain_logprobs.original = original
+    action_chain_logprobs.stats = stats
+    _STATS["batched_logp"] = stats
     ActionGRPOMixin.action_chain_logprobs = action_chain_logprobs
-    logger.info("action_chain_logprobs scores all stochastic steps in one action_velocity call")
+    logger.info("action_chain_logprobs runs the grad-enabled steps in one action_velocity call (per-step ops: %s, "
+                "verify=%s)", sorted(_CHUNK["ops"] | {"gemm"}), verify)
 
 
 _PDM_WORKER = {}
@@ -459,6 +805,10 @@ def install_train_graphs() -> None:
       stream recorded on them;
     * warmup uses ``autograd.grad`` and never touches ``.grad``; each shape gets its own pool.
 
+    The batched call still runs its GEMMs once per step (``_install_chunked_ops``); the per-step
+    views of the caller's chain that the action encoder reads are part of the graph's static
+    inputs, and the lean-attention mask check runs before capture, as in the no_grad graphs.
+
     Only without DeepSpeed (``install_manual_data_parallel``): with DeepSpeed ZeRO-1 the backward
     capture segfaults in ``capture_end`` (DeepSpeed 0.19.8, ROCm 7.14), so nothing is installed.
     Install after ``install_action_velocity_graphs`` (no_grad calls go to that path).
@@ -516,7 +866,23 @@ def install_train_graphs() -> None:
             grads = tuple(None if x is None else x.clone() for x in g["grads"])
             return (None,) + (None,) * g["n_in"] + grads
 
-    def capture(self, args, cond, params):
+    def chunk_views():
+        # install_batched_logprobs feeds some weights per-step views of the caller's chain instead
+        # of slices of the batched input; the graph must read them from a static copy of that base
+        views = _CHUNK["views"]
+        if not views:
+            return [], (), None
+        bases, geometry = [], []
+        for wid, vlist in sorted(views.items()):
+            base = vlist[0]._base if vlist[0]._base is not None else vlist[0]
+            if any((v._base if v._base is not None else v) is not base for v in vlist):
+                raise ValueError("per-step views do not share one base")
+            bases.append(base)
+            geometry.append((wid, tuple(tuple((tuple(v.shape), tuple(v.stride()), v.storage_offset() - base.storage_offset()))
+                                        for v in vlist)))
+        return bases, tuple(geometry), tuple(_CHUNK["sizes"] or ())
+
+    def capture(self, args, cond, params, n_cond, geometry):
         for expert in (self.action_expert, getattr(self, "ref_action_expert", None)):
             freqs = getattr(expert, "freqs", None)
             if torch.is_tensor(freqs) and freqs.device != args[0].device:
@@ -525,9 +891,19 @@ def install_train_graphs() -> None:
         rest = {k: v for k, v in cond.items() if k not in _COND and k != "_cuda_graph_tag"}
         inputs = [torch.empty_strided(t.shape, t.stride(), dtype=t.dtype, device=t.device) for t in args]
         torch._foreach_copy_(inputs, list(args))
+        static_views = {}
+        for base, (wid, geo) in zip(inputs[2 + n_cond:], geometry):
+            static_views[wid] = [base.as_strided(shape, stride, base.storage_offset() + offset)
+                                 for shape, stride, offset in geo]
 
         def run():
-            return eager(self, inputs[0], inputs[1], unflat(rest, layers, inputs[2:]), use_ref=False)
+            saved = _CHUNK["views"]
+            if static_views:
+                _CHUNK["views"] = static_views
+            try:
+                return eager(self, inputs[0], inputs[1], unflat(rest, layers, inputs[2:2 + n_cond]), use_ref=False)
+            finally:
+                _CHUNK["views"] = saved
 
         torch.cuda.synchronize()
         side = torch.cuda.Stream()
@@ -556,13 +932,20 @@ def install_train_graphs() -> None:
         if use_ref or not torch.is_grad_enabled() or not latents_action.is_cuda:
             return inner(self, latents_action, timestep_action, cond, use_ref=use_ref)
         params = [p for p in self.action_expert.parameters() if p.requires_grad]
-        args = (latents_action, timestep_action, *flat(cond))
+        # the lean attention path checks the masks once per condition (a host sync); do it here,
+        # outside capture, so the cached flag travels with the condition into the graph
+        lean = _LEAN_ATTN["flag"](cond, int(latents_action.shape[1])) if _LEAN_ATTN["flag"] else None
+        cond_tensors = flat(cond)
+        bases, geometry, sizes = chunk_views()
+        args = (latents_action, timestep_action, *cond_tensors, *bases)
         key = (tuple((tuple(t.shape), tuple(t.stride()), t.dtype) for t in args), len(params),
-               tuple(k for k in cond if k not in _COND), int(cond.get("video_seq_len", -1)))
+               tuple(k for k in cond if k not in _COND), int(cond.get("video_seq_len", -1)), lean, geometry, sizes)
         g = graphs.get(key)
+        if g is None and lean is False:
+            g = graphs[key] = False
         if g is None:
             try:
-                g = capture(self, args, cond, params)
+                g = capture(self, args, cond, params, len(cond_tensors), geometry)
             except Exception as exc:
                 logger.warning("CUDA graph capture of the training action_velocity failed (%s); using eager", exc)
                 g = False
@@ -786,6 +1169,259 @@ def install_manual_data_parallel() -> None:
     T._optimizer_step = _optimizer_step
     logger.info("SimWAM GRPO trains without DeepSpeed (manual gradient all-reduce, fp32-master AdamW)")
 
+
+def _emulate_eager_casts() -> None:
+    # inductor keeps fused intermediates in fp32 by default; emulate the bf16 roundings eager does
+    import torch._inductor.config as inductor_config
+
+    if hasattr(inductor_config, "emulate_precision_casts"):
+        inductor_config.emulate_precision_casts = True
+
+
+def install_compiled_rmsnorm() -> None:
+    """Compile SimWAM's own ``RMSNorm.forward`` into fused kernels (forward and backward).
+
+    Only ``simwam.models.wan22.wan_video_dit.RMSNorm`` is replaced; Lumen's class-name based
+    ``lumen_norm`` is not used, because it would also swap the affine-free ``LayerNorm``s.
+    The fused kernels are not bit-identical to eager (log-probs differ by ~0.02-0.03%), so this
+    is off by default; ``SIMWAM_GRPO_COMPILE_RMSNORM=1`` turns it on. With ``rmsnorm`` in
+    ``SIMWAM_GRPO_BATCHED_CHUNK`` the compiled function runs once per original step.
+    """
+    if os.environ.get("SIMWAM_GRPO_COMPILE_RMSNORM", "0").strip().lower() in _OFF:
+        return
+    import torch
+    from simwam.models.wan22.wan_video_dit import RMSNorm
+
+    if getattr(RMSNorm.forward, "_compiled", False):
+        return
+    _emulate_eager_casts()
+
+    @torch.compile(dynamic=None)
+    def rmsnorm(x, weight, eps: float):
+        dtype = x.dtype
+        xf = x.float()
+        return (xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)).to(dtype) * weight
+
+    def forward(self, x):
+        if "rmsnorm" in _CHUNK["ops"] and _chunk_active(x):
+            return torch.cat([rmsnorm(xc, self.weight, self.eps) for xc in torch.split(x, _CHUNK["sizes"], dim=0)], dim=0)
+        return rmsnorm(x, self.weight, self.eps)
+
+    forward._compiled = True
+    RMSNorm.forward = forward
+    logger.info("SimWAM RMSNorm runs through torch.compile")
+
+
+def install_fused_lora_add() -> None:
+    """``LoRALinear.forward`` adds the scaled adapter output with one ``torch.add(alpha=)``.
+
+    SimWAM computes ``out + self.scaling * lora`` as a multiply and an add. With the
+    default ``alpha / r = 2.0`` the scale is a power of two, so ``torch.add(out, lora,
+    alpha=scaling)`` rounds the same way. Inside a batched log-prob call the LoRA matmuls
+    still run once per original step (as in ``install_batched_logprobs``), so the weight
+    gradients come from the same per-step GEMMs. ``SIMWAM_GRPO_FUSED_LORA=0`` turns it off.
+    """
+    if os.environ.get("SIMWAM_GRPO_FUSED_LORA", "1").strip().lower() in _OFF:
+        return
+    import torch
+    from simwam.models.wan22.lora import LoRALinear
+
+    if getattr(LoRALinear.forward, "_fused_add", False):
+        return
+
+    def forward(self, x):
+        out = self.base(x)
+        if _chunk_active(x):
+            lora = torch.cat([(self.lora_dropout(xc) @ self.lora_A.t()) @ self.lora_B.t()
+                              for xc in torch.split(x, _CHUNK["sizes"], dim=0)], dim=0)
+        else:
+            lora = (self.lora_dropout(x) @ self.lora_A.t()) @ self.lora_B.t()
+        return torch.add(out, lora, alpha=self.scaling)
+
+    forward._fused_add = True
+    LoRALinear.forward = forward
+    logger.info("LoRALinear adds the adapter with torch.add(alpha=scaling)")
+
+
+def install_overlap_reward_logprobs() -> None:
+    """Score PDM rewards in the worker pool while the rollout's log-probs run on the GPU.
+
+    ``_rollout`` scores the trajectories and only then computes the old log-probs, which do
+    not depend on the rewards. With the pool from ``install_parallel_pdm_reward`` the
+    rewards are submitted asynchronously right after sampling; the old log-probs and the
+    reference log-probs of the first inner epoch (stored where ``install_ref_logprob_cache``
+    looks) are computed while the workers simulate, and the rewards are collected before the
+    advantages. Everything else follows ``SimWAMGRPOTrainer._rollout``.
+    Needs both of those patches; ``SIMWAM_GRPO_OVERLAP_REWARD=0`` turns it off.
+    """
+    if os.environ.get("SIMWAM_GRPO_OVERLAP_REWARD", "1").strip().lower() in _OFF:
+        return
+    import multiprocessing as mp
+
+    import numpy as np
+    import torch
+    from simwam.datasets.navsim.pdm_reward import NavSimPDMReward, _SUBMETRIC_COLUMNS
+    from simwam.trainer_grpo import SimWAMGRPOTrainer
+
+    if getattr(SimWAMGRPOTrainer._rollout, "_overlap", False):
+        return
+    if not getattr(NavSimPDMReward.score_batch, "_parallel", False):
+        logger.warning("install_overlap_reward_logprobs needs install_parallel_pdm_reward; skipped")
+        return
+    rollout_orig = SimWAMGRPOTrainer._rollout
+    workers = int(os.environ.get("SIMWAM_GRPO_PDM_WORKERS", "8") or 8)
+
+    def submit(reward, abs_poses, tokens, device):
+        pool = reward.__dict__.get("_pool")
+        if pool is None:
+            args, kwargs = reward._pool_init_args
+            pool = reward._pool = mp.get_context("spawn").Pool(
+                workers, initializer=_pdm_worker_init, initargs=(type(reward), args, kwargs))
+        poses_np = abs_poses.detach().to(device="cpu", dtype=torch.float32).numpy()
+        return pool.map_async(_pdm_worker_score, [(t, poses_np[i]) for i, t in enumerate(tokens)])
+
+    def collect(reward, pending, tokens, device):
+        results = pending.get()
+        reward.last_num_total = len(tokens)
+        reward.last_num_missing = 0
+        reward.last_num_failed = 0
+        reward._true_pdms, reward._submetric_rows = [], []
+        nan_row = {name: float("nan") for name in _SUBMETRIC_COLUMNS}
+        rewards = []
+        for token, res in zip(tokens, results):
+            if res[0] == "ok":
+                reward._true_pdms.append(res[2])
+                reward._submetric_rows.append(res[3])
+                rewards.append(res[1])
+                continue
+            if res[0] == "missing":
+                reward.last_num_missing += 1
+            else:
+                reward.last_num_failed += 1
+                logger.warning("PDM scoring failed for token %s: %s", token, res[1])
+            rewards.append(reward.failure_reward)
+            reward._submetric_rows.append(dict(nan_row))
+        return torch.tensor(rewards, device=device, dtype=torch.float32)
+
+    @torch.no_grad()
+    def _rollout(self, model, batch):
+        reward = self.action_reward
+        if (not isinstance(reward, NavSimPDMReward) or not hasattr(reward, "_pool_init_args")
+                or not self.ppo_enabled or self.kl_gate_enabled):
+            return rollout_orig(self, model, batch)
+        input_image, action_horizon, context, context_mask, proprio, tokens = self._batch_condition_inputs(batch)
+        cond_b = model.build_action_condition(input_image, action_horizon, context, context_mask, proprio)
+        cond_bg = model.expand_condition(cond_b, self.group_size)
+        chain, timesteps, deltas, stoch_idx = model.sample_action_chain(cond_bg, action_horizon, deterministic=False)
+        abs_poses = self.train_dataset.denormalize_action(chain[:, -1])
+        tokens_bg = [tok for tok in tokens for _ in range(self.group_size)]
+        pending = submit(reward, abs_poses, tokens_bg, self.accelerator.device)
+        il_abs = None
+        steps_ahead = max(self.num_inner_epochs * self.rollout_buffer_batches, 1)
+        will_visualize = (
+            self.vis_enabled and self.accelerator.is_main_process and self.vis_every > 0
+            and any((self.global_step + 1 + j) % self.vis_every == 0 for j in range(steps_ahead))
+        )
+        if will_visualize:
+            det_chain, _, _, _ = model.sample_action_chain(cond_b, action_horizon, deterministic=True)
+            il_abs = self.train_dataset.denormalize_action(det_chain[:, -1])
+        old_logp = model.action_chain_logprobs(cond_bg, chain, timesteps, deltas, stoch_idx=stoch_idx).detach()
+        ref = model.action_chain_logprobs(
+            cond_bg, chain, timesteps, deltas, stoch_idx=stoch_idx, use_ref=True, return_terms=True)
+        rewards = collect(reward, pending, tokens_bg, self.accelerator.device)
+        pdm_fail_frac = float(getattr(reward, "last_fail_frac", 0.0))
+        true_pdms = float(getattr(reward, "last_true_pdms", float("nan")))
+        reward_submetrics = getattr(reward, "last_submetrics", None)
+        bsz = len(tokens)
+        rewards_mat = rewards.view(bsz, self.group_size)
+        advantage_info = self._compute_advantages(rewards_mat)
+        num_unavailable = int(sum((0 if reward.available(t) else 1 for t in tokens)))
+        return {
+            "cond_b": cond_b, "cond_bg": cond_bg, "chain": chain, "timesteps": timesteps, "deltas": deltas,
+            "stoch_idx": stoch_idx, "num_sde_steps": int(stoch_idx.numel()), "pdm_fail_frac": pdm_fail_frac,
+            "true_pdms": true_pdms, "reward_submetrics": reward_submetrics, "rewards": rewards.detach(),
+            **advantage_info, "num_unavailable": num_unavailable, "tokens": tokens,
+            "abs_group": abs_poses.reshape(bsz, self.group_size, abs_poses.shape[1], abs_poses.shape[2]),
+            "il_abs": il_abs, "old_logp": old_logp, "old_mean": None, "old_std": None, "_ref_logprobs": ref,
+        }
+
+    _rollout._overlap = True
+    SimWAMGRPOTrainer._rollout = _rollout
+    logger.info("PDM rewards are scored while the rollout's old/reference log-probs run")
+
+
+def install_foreach_grad_checks() -> None:
+    """Run DeepSpeed ZeRO-1/2's overflow check and L2 gradient norm with foreach kernels.
+
+    ``DeepSpeedZeroOptimizer`` checks every gradient for inf/NaN with an ``amax``/``amin``
+    pair and computes the norm with one float64 ``vector_norm`` per gradient. With 480 LoRA
+    tensors that is several thousand small launches per optimizer step on the main thread.
+    By default only the overflow check is replaced: the flag becomes "some per-tensor float32
+    L2 norm from ``torch._foreach_norm`` is not finite" (inf and NaN propagate; a finite
+    gradient whose norm exceeds the float32 range, i.e. an element above ~1.8e19, also counts
+    as overflow). The flag is a boolean, so the run stays bit-identical; the norm keeps
+    DeepSpeed's per-tensor float64 code. ``SIMWAM_GRPO_FOREACH_GRAD_CHECKS=norm`` also computes
+    the global norm from the foreach float32 norms (squares summed in float64), which removes
+    the remaining per-tensor launches but changes the norm by ~1e-7 relative, so it is not
+    bit-identical. The parameter selection, the all-reduces and the NaN masking follow
+    ``get_grad_norm_direct``; other norm types, sparse gradients and CPU offload keep
+    DeepSpeed's code. ``SIMWAM_GRPO_FOREACH_GRAD_CHECKS=0`` turns it off. Nothing is installed when
+    ``install_manual_data_parallel`` has replaced DeepSpeed (``SIMWAM_GRPO_MANUAL_DP=1``).
+    """
+    mode = os.environ.get("SIMWAM_GRPO_FOREACH_GRAD_CHECKS", "1").strip().lower()
+    if mode in _OFF:
+        return
+    from simwam.trainer_grpo import SimWAMGRPOTrainer
+
+    if getattr(SimWAMGRPOTrainer.__init__, "_manual_dp", False):
+        logger.info("Training without DeepSpeed (SIMWAM_GRPO_MANUAL_DP=1); foreach gradient checks not installed")
+        return
+    import torch
+    import deepspeed.runtime.zero.stage_1_and_2 as s12
+
+    Z = s12.DeepSpeedZeroOptimizer
+    if getattr(Z.has_overflow_partitioned_grads_serial, "_foreach", False):
+        return
+    norm_orig = Z.get_grad_norm_direct
+    overflow_orig = Z.has_overflow_partitioned_grads_serial
+
+    def has_overflow_partitioned_grads_serial(self):
+        grads = [g for i in range(len(self.bit16_groups)) for g in self.averaged_gradients[i]
+                 if g is not None and g.numel() > 0]
+        if not grads or any(g.is_sparse for g in grads):
+            return overflow_orig(self)
+        norms = torch.stack(torch._foreach_norm(grads, 2, dtype=torch.float32))
+        return torch.isfinite(norms).all().logical_not().reshape(1)
+
+    def get_grad_norm_direct(self, gradients, params, norm_type=2):
+        if float(norm_type) != 2.0 or any(g.is_sparse for g in gradients):
+            return norm_orig(self, gradients, params, norm_type)
+        selected = []
+        param_gradients = (g for g in gradients if not getattr(g, "_zero_padding", False))
+        for g, p in zip(param_gradients, params):
+            if hasattr(p, s12.PIPE_REPLICATED) and p.ds_pipe_replicated:
+                continue
+            if s12.is_model_parallel_parameter(p) or (self.model_parallel_rank == 0):
+                selected.append(g.data.detach())
+        if selected:
+            norms = torch.stack(torch._foreach_norm(selected, 2, dtype=torch.float32))
+            total_norm = norms.double().pow(2).sum().float()
+        else:
+            total_norm = torch.tensor(0.0, dtype=torch.float32).to(self.device)
+        s12.dist.all_reduce(total_norm, op=s12.dist.ReduceOp.SUM, group=self.dp_process_group)
+        self._model_parallel_all_reduce(tensor=total_norm, op=s12.dist.ReduceOp.SUM)
+        total_norm = total_norm.pow(0.5)
+        s12.mask_nan_or_inf_with_val_inplace(total_norm, device=self.device)
+        return total_norm
+
+    has_overflow_partitioned_grads_serial._foreach = True
+    has_overflow_partitioned_grads_serial.orig = overflow_orig
+    Z.has_overflow_partitioned_grads_serial = has_overflow_partitioned_grads_serial
+    if mode == "norm":
+        get_grad_norm_direct._foreach = True
+        get_grad_norm_direct.orig = norm_orig
+        Z.get_grad_norm_direct = get_grad_norm_direct
+    logger.info("DeepSpeed ZeRO overflow check%s uses foreach kernels", " and gradient norm" if mode == "norm" else "")
 
 def enable_lumen(model, spec: str):
     """Apply ``LumenConfig.enable`` once per requested patch."""

@@ -61,12 +61,12 @@ ROOT=/home/danyzhan CUDA_VISIBLE_DEVICES=4,5,6,7 \
 `LUMEN_ENABLE` is a comma-separated list. Default in `run_embodied_grpo.sh` and the Dockerfile:
 
 ```bash
-export LUMEN_ENABLE=aiter_conv
+export LUMEN_ENABLE=hf_attn_patch,aiter_conv
 ```
 
-`hf_attn_patch` is not in the training default. SimWAM passes a bool mask on every attention call, so Lumen only takes the `no_grad` ones (rollout, old and reference log-probs) and launches a per-batch mask one batch at a time, with the mask materialised as a bias each call. On 2×MI350X that path made a rollout cycle (1 rollout + 4 optimizer steps) 36% slower than torch SDPA, which runs aotriton `attn_fwd` once per call.
+`lumen_linear` is not in the training default. The AITER tuned bf16 GEMM has no entry for the SimWAM shapes and falls back to the torch GEMM, so training is bit-identical to `hf_attn_patch,lumen_linear` (forward, LoRA gradients and weights, checked step by step) and only the dispatch cost is gone: a rollout cycle is 14% faster.
 
-`lumen_linear` is not in the training default either. The AITER tuned bf16 GEMM has no entry for the SimWAM shapes and falls back to the torch GEMM, so the outputs are bit-identical to `nn.Linear` and only the dispatch cost is added: without it a rollout cycle was 14% faster.
+`hf_attn_patch` stays in the default so that results are bit-identical to the original example. SimWAM passes a bool mask on every attention call, so Lumen takes only the `no_grad` ones (rollout, old and reference log-probs); `install_lean_lumen_attention` in `plugin.py` runs them as one Triton launch with a resident zero bias and makes them capturable by the CUDA graphs (see Training-loop patches). Dropping it (`LUMEN_ENABLE=aiter_conv`) sends those calls to torch SDPA, which is faster but changes the log-probs (max abs difference 0.009 on one rollout).
 
 Each name is one `LumenConfig.enable` call. Empty, `0`, `false`, `none`, and `off` turn patching off.
 
@@ -100,6 +100,19 @@ docker exec -it simwam-rl bash -lc \
 ```
 
 Set `LUMEN_ENABLE` to a subset to check one patch at a time.
+
+## Training-loop patches
+
+`train_grpo.py` also installs these runtime patches from `plugin.py` (SimWAM is not modified). With the default `LUMEN_ENABLE`, a run with all of them is bit-identical to the original example with `LUMEN_ENABLE=hf_attn_patch,lumen_linear` and the LoRA seed below: the LoRA init, every rollout tensor and reward, every log-prob, every LoRA weight after every optimizer step, and loss, KL and grad norm.
+
+| Patch | Switch (default) | What it does |
+|---|---|---|
+| `install_lora_init_seed` | `SIMWAM_GRPO_LORA_SEED` (`42`, `off` disables) | Seeds all RNGs (`set_global_seed`, plus rank) right before `configure_grpo`. On the NAVSIM path SimWAM seeds only in the trainer, after LoRA A is drawn, so without it two runs start from different adapters. |
+| `install_ref_logprob_cache` | `SIMWAM_GRPO_REF_CACHE` (`1`) | Reference log-probs are computed once per rollout instead of once per inner epoch. |
+| `install_lean_lumen_attention` | `SIMWAM_GRPO_LEAN_ATTN` (`1`; `loop`; `0`) | Only with `hf_attn_patch`. Lumen's Triton dispatcher copies unit scales from the host, which fails under CUDA graph capture, and `hf_attn_patch` then silently falls back to torch SDPA. This calls the same Triton forward with resident scales. `1`: inside `action_velocity` the masks are all True (checked once per condition), so the same zero bias is kept resident and broadcast over the batch: one launch instead of one per sample. `loop`: `hf_attn_patch`'s ops one for one. `SIMWAM_GRPO_LEAN_ATTN_VERIFY=1` compares every uncaptured call with `hf_attn_patch`. |
+| `install_action_velocity_graphs` | `SIMWAM_GRPO_CUDA_GRAPH` (`1`) | `no_grad` `action_velocity` (rollout denoising, old and reference log-probs) replays one CUDA graph per input shape. A masked call that would go to `hf_attn_patch` outside the lean path is never captured. `SIMWAM_GRPO_CUDA_GRAPH_VERIFY=1` compares every replay with eager. |
+| `install_batched_logprobs` | `SIMWAM_GRPO_BATCHED_LOGP` (`1`) | The grad-enabled log-probs of the 3 stochastic steps run in one `action_velocity` call, but every GEMM (`nn.Linear`, LoRA A/B, Lumen bf16 GEMM) still runs once per step on its slice, with the original shapes and strides. A single GEMM over all steps picks other kernels, and its LoRA weight gradient would be one reduction instead of 3 GEMMs summed in bf16. `SIMWAM_GRPO_BATCHED_CHUNK=rmsnorm,attn` also splits those ops; `SIMWAM_GRPO_BATCHED_LOGP_VERIFY=1` re-runs the per-step path and compares outputs and LoRA gradients. |
+| `install_parallel_pdm_reward` | `SIMWAM_GRPO_PDM_WORKERS` (`8`, `0` disables) | PDM rewards are scored in a pool of spawned workers. |
 
 ## Training
 

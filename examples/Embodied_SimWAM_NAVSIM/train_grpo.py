@@ -24,8 +24,14 @@ from omegaconf import DictConfig
 from examples.Embodied_SimWAM_NAVSIM.plugin import (
     install_action_velocity_graphs,
     install_batched_logprobs,
+    install_compiled_rmsnorm,
+    install_foreach_grad_checks,
+    install_fused_lora_add,
     install_grpo_hook,
+    install_lean_lumen_attention,
+    install_lora_init_seed,
     install_manual_data_parallel,
+    install_overlap_reward_logprobs,
     install_parallel_pdm_reward,
     install_ref_logprob_cache,
     install_train_graphs,
@@ -36,13 +42,20 @@ from simwam.utils.config_resolvers import register_default_resolvers
 install_grpo_hook()
 # before the trainer is built; decides whether DeepSpeed is used
 install_manual_data_parallel()
+install_lora_init_seed()
 # before the reference cache, which wraps action_chain_logprobs
 install_batched_logprobs()
 install_ref_logprob_cache()
+# before the CUDA graphs, which capture its attention path
+install_lean_lumen_attention()
 install_action_velocity_graphs()
 # after the no_grad graphs, which it falls through to
 install_train_graphs()
 install_parallel_pdm_reward()
+install_compiled_rmsnorm()
+install_fused_lora_add()
+install_overlap_reward_logprobs()
+install_foreach_grad_checks()
 register_default_resolvers()
 
 
