@@ -29,6 +29,7 @@ from examples.Embodied_SimWAM_NAVSIM.plugin import (
     install_grpo_hook,
     install_lean_lumen_attention,
     install_lora_init_seed,
+    install_overlap_reward_logprobs,
     install_parallel_pdm_reward,
     install_ref_logprob_cache,
 )
@@ -46,6 +47,7 @@ install_action_velocity_graphs()
 install_parallel_pdm_reward()
 install_compiled_rmsnorm()
 install_fused_lora_add()
+install_overlap_reward_logprobs()
 register_default_resolvers()
 
 
