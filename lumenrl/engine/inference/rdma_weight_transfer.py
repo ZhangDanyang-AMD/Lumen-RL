@@ -207,6 +207,7 @@ def receive_weight_stream(
     fingerprint_tracker=None,
     finalize_fingerprints: bool = True,
     staging: str = "cpu",
+    moe_router=None,
 ) -> dict[str, Any]:
     """Receive RCCL buckets and load them directly into a resident vLLM model.
 
@@ -215,6 +216,9 @@ def receive_weight_stream(
     before returning, as on BF16 and prequantized FP8), ``cpu`` and ``gpu``
     pass copies. Online-FP8 reload holds tensors until a module is complete,
     and a held view would keep its whole payload alive.
+
+    ``moe_router`` (a ``FusedMoEWeightRouter``) loads the fused expert tensors
+    an FSDP2 trainer sends, which ``model.load_weights`` would drop.
     """
     from lumenrl.engine.inference.vllm_fp8_utils import ReloadFingerprintTracker
 
@@ -243,7 +247,13 @@ def receive_weight_stream(
     # Host time inside this generator, by phase; whatever load_weights spends
     # outside it is its own loading. Each phase ends in a host sync (header,
     # metadata, .cpu()), so wall time is the transfer time.
-    timing = {"wait_s": 0.0, "recv_s": 0.0, "host_copy_s": 0.0, "observe_s": 0.0}
+    timing = {
+        "wait_s": 0.0,
+        "recv_s": 0.0,
+        "host_copy_s": 0.0,
+        "observe_s": 0.0,
+        "route_s": 0.0,
+    }
     started = time.perf_counter()
     last_source: dict[str, Any] | None = None
 
@@ -307,7 +317,13 @@ def receive_weight_stream(
                 t0 = time.perf_counter()
                 fingerprints.observe_source([(entry["name"], value)])
                 timing["observe_s"] += time.perf_counter() - t0
-                yield entry["name"], value
+                to_load = [(entry["name"], value)]
+                if moe_router is not None:
+                    t0 = time.perf_counter()
+                    to_load, moe_loaded = moe_router.route(to_load)
+                    loaded_names.update(moe_loaded)
+                    timing["route_s"] += time.perf_counter() - t0
+                yield from to_load
 
     t_load = time.perf_counter()
     try:

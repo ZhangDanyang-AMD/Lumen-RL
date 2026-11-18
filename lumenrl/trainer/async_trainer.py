@@ -56,14 +56,23 @@ def _algo_num_generations(config: LumenRLConfig) -> int:
 
 
 class AsyncRLTrainer:
-    """Fully-async RL trainer with decoupled rollout and training.
+    """The ``async_training`` trainer; superseded, see the warning below.
 
-    The rollout thread produces samples into a ``AsyncMessageQueue``.
-    The training thread consumes batches and periodically triggers
-    parameter synchronization via ``FilesystemWeightSync``.
+    ``train()`` generates and trains in turn on the same GPUs. Updated weights
+    are pushed to ``FilesystemWeightSync``, but only ``_rollout_loop``, which
+    is never started, would point the engine at them, so rollouts keep using
+    the initial weights. Asynchronous training is ``RLTrainer`` with
+    ``controller.ray.one_step_off_policy`` or ``controller.ray.fully_async``.
     """
 
     def __init__(self, config: LumenRLConfig) -> None:
+        logger.warning(
+            "async_training.enabled selects AsyncRLTrainer, which does not overlap "
+            "rollout with training and never loads updated weights into the rollout "
+            "engine. Use controller.ray.fully_async or "
+            "controller.ray.one_step_off_policy instead (see "
+            "lumenrl-docs/docs/source/advance/async_training.md)."
+        )
         self.config = config
         self.global_step: int = 0
         self.param_version: int = 0

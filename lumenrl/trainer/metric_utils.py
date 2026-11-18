@@ -150,7 +150,12 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     metrics["response_length/max"] = response_length.max().detach().item()
     metrics["response_length/min"] = response_length.min().detach().item()
 
-    max_resp_len = response_mask.shape[-1] if response_mask.dim() > 1 else 0
+    # verl's response tensors are max_response_length wide; LumenRL's
+    # response_mask spans the whole left-padded sequence, so the trainer passes
+    # the budget in meta.
+    max_resp_len = float(batch.meta.get("max_response_length") or 0)
+    if max_resp_len <= 0:
+        max_resp_len = response_mask.shape[-1] if response_mask.dim() > 1 else 0
     if max_resp_len > 0:
         metrics["response_length/clip_ratio"] = (response_length == max_resp_len).float().mean().detach().item()
 
