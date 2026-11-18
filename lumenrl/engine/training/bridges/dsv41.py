@@ -10,8 +10,9 @@ tables mapped from the checkpoint file in host memory. ``DSV41MegatronModel``
 gives it what Megatron's pipeline schedule calls.
 
 Trained: everything except the routed experts (FP4 in the release, and ATOM
-cannot take them in a weight sync), the router's expert bias and the Engram
-tables, which are not parameters.
+cannot take them in a weight sync), the indexers (no gradient reaches what is
+a discrete top-k; left trainable, weight decay alone would move them), the
+router's expert bias and the Engram tables, which are not parameters.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
 
-ROUTED_EXPERTS = ".ffn.layer.experts."
+FROZEN = (".ffn.layer.experts.", ".attn.indexer.")
 
 
 def is_dsv41(hf: dict) -> bool:
@@ -184,7 +185,7 @@ def build_dsv41_model(engine, hf: dict, tfcfg) -> torch.nn.Module:
     # read and dequantized on the GPU: a rank's FP4 experts are ~70 GB of BF16 at EP=8
     report = load_released(stage, engine.model_name, device=device)
     for name, p in stage.named_parameters():
-        if ROUTED_EXPERTS in name:
+        if any(part in name for part in FROZEN):
             p.requires_grad_(False)
     trained = sum(p.numel() for p in stage.parameters() if p.requires_grad)
     held = sum(p.numel() for p in stage.parameters())

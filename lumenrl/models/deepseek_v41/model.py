@@ -34,6 +34,7 @@ from lumenrl.models.deepseek_v41.engram import Engram, EngramHasher, EngramLayou
 FP8_BLOCK = 32
 FP4_BLOCK = 32
 KV_FP4_BLOCK = 16
+INDEXER_QUERY_CHUNK = 1024
 
 
 @dataclass(frozen=True)
@@ -177,7 +178,11 @@ class Indexer(nn.Module):
     def _q4(self, x: Tensor) -> Tensor:
         return _fake(self.quant.indexer_fp4, x, lambda t: ops.fp4_fake_quant(t, FP4_BLOCK, "e8m0"))
 
+    @torch.no_grad()
     def forward(self, x: Tensor, qr: Tensor, latent: Tensor | None, freqs: Tensor, offset: int, shared: SharedAttention) -> Tensor:
+        """No gradient reaches the indexer -- what it returns is a discrete top-k -- so it
+        runs without autograd, and over chunks of `INDEXER_QUERY_CHUNK` queries: at a ratio-1
+        layer the score of a whole sequence is [s, heads, s]."""
         seqlen, ratio, rd = x.size(1), self.ratio, self.rope_dim
         if self.owns_k and latent is not None:
             k = self.k_norm(self.wk(latent))
@@ -187,19 +192,26 @@ class Indexer(nn.Module):
         q = self._q4(rotate(q, freqs[:seqlen], rd))
         index_k = shared.index_k[:, : seqlen // ratio]
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
-        score = torch.einsum("bshd,btd->bsht", q, index_k)
-        score = (score.relu() * weights.unsqueeze(-1)).sum(dim=2)
-        compress_lens = (torch.arange(1, seqlen + 1, device=x.device) // ratio).unsqueeze(-1)
-        score = score.masked_fill(torch.arange(seqlen // ratio, device=x.device) >= compress_lens, -torch.inf)
-        if self.is_candidate_source:
-            shared.candidates = select_candidate_blocks(
-                score, compress_lens, self.candidate_topk_blocks, self.candidate_block_size
-            )
-        elif self.uses_candidates:
-            score = score.masked_fill(~shared.candidates, -torch.inf)
+        positions = torch.arange(seqlen // ratio, device=x.device)
         topk = min(self.index_topk, seqlen // ratio)
-        idxs = score.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
-        return torch.where(idxs < compress_lens, idxs + offset, -1).int()
+        idxs, candidates = [], []
+        for start in range(0, seqlen, INDEXER_QUERY_CHUNK):
+            rows = slice(start, min(start + INDEXER_QUERY_CHUNK, seqlen))
+            score = torch.einsum("bshd,btd->bsht", q[:, rows], index_k)
+            score = (score.relu() * weights[:, rows].unsqueeze(-1)).sum(dim=2)
+            compress_lens = (torch.arange(rows.start + 1, rows.stop + 1, device=x.device) // ratio).unsqueeze(-1)
+            score = score.masked_fill(positions >= compress_lens, -torch.inf)
+            if self.is_candidate_source:
+                candidates.append(
+                    select_candidate_blocks(score, compress_lens, self.candidate_topk_blocks, self.candidate_block_size)
+                )
+            elif self.uses_candidates:
+                score = score.masked_fill(~shared.candidates[:, rows], -torch.inf)
+            top = score.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
+            idxs.append(torch.where(top < compress_lens, top + offset, -1).int())
+        if self.is_candidate_source:
+            shared.candidates = torch.cat(candidates, dim=1)
+        return torch.cat(idxs, dim=1)
 
 
 class Attention(nn.Module):

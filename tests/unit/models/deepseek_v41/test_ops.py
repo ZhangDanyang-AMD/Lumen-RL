@@ -81,6 +81,25 @@ def test_sparse_attention_matches_a_dense_softmax_with_a_sink():
     assert torch.equal(got[1, 3], torch.zeros(h, d))
 
 
+def test_sparse_attention_over_query_chunks_is_the_same_and_so_is_its_gradient(monkeypatch):
+    g = torch.Generator().manual_seed(3)
+    q = torch.randn(2, 13, 4, 16, generator=g).requires_grad_()
+    kv = torch.randn(2, 20, 16, generator=g).requires_grad_()
+    sink = torch.randn(4, generator=g).requires_grad_()
+    idxs = torch.randint(-1, 20, (2, 13, 7), generator=g).int()
+    w = torch.randn(2, 13, 4, 16, generator=g)
+
+    want = ops.sparse_attention(q, kv, sink, idxs, 0.25)
+    grads = torch.autograd.grad((want * w).sum(), (q, kv, sink))
+    monkeypatch.setattr(ops, "SPARSE_ATTENTION_QUERY_CHUNK", 4)
+    got = ops.sparse_attention(q, kv, sink, idxs, 0.25)
+    chunked = torch.autograd.grad((got * w).sum(), (q, kv, sink))
+
+    assert torch.equal(got, want)
+    for a, b in zip(chunked, grads):
+        torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-6)
+
+
 def test_hc_comb_is_doubly_stochastic_and_pre_post_in_range():
     torch.manual_seed(0)
     hc = 4

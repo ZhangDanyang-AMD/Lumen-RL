@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import torch
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 
 FP8_MAX = 448.0
 FP4_MAX = 6.0
@@ -88,6 +89,9 @@ class QLinear(torch.nn.Linear):
         return torch.nn.functional.linear(x, self.weight)
 
 
+SPARSE_ATTENTION_QUERY_CHUNK = 1024
+
+
 def sparse_attention(q: Tensor, kv: Tensor, attn_sink: Tensor, topk_idxs: Tensor, softmax_scale: float) -> Tensor:
     """Shared-KV sparse attention with a per-head sink logit (`sparse_attn`).
 
@@ -95,7 +99,27 @@ def sparse_attention(q: Tensor, kv: Tensor, attn_sink: Tensor, topk_idxs: Tensor
     [B, S, T] int with -1 for an empty slot. Each query attends to the gathered kv rows plus the
     sink; a row with no valid slot outputs 0. Computed in fp32 by gathering, so a repeated index
     counts twice, as in the kernel.
+
+    A query reads only its own row of `topk_idxs`, so this runs over chunks of
+    `SPARSE_ATTENTION_QUERY_CHUNK` queries, each recomputed in backward: what autograd holds is
+    one chunk's gathered rows (fp32 [chunk, T, D]), not the sequence's.
     """
+    s, chunk = q.size(1), SPARSE_ATTENTION_QUERY_CHUNK
+    if s <= chunk:
+        return _sparse_attention(q, kv, attn_sink, topk_idxs, softmax_scale)
+    # every chunk adds to the kv gradient: summed in fp32 and rounded once, not per chunk
+    kv = kv.float()
+    parts = []
+    for start in range(0, s, chunk):
+        args = (q[:, start : start + chunk], kv, attn_sink, topk_idxs[:, start : start + chunk], softmax_scale)
+        if torch.is_grad_enabled():
+            parts.append(checkpoint(_sparse_attention, *args, use_reentrant=False))
+        else:
+            parts.append(_sparse_attention(*args))
+    return torch.cat(parts, dim=1)
+
+
+def _sparse_attention(q: Tensor, kv: Tensor, attn_sink: Tensor, topk_idxs: Tensor, softmax_scale: float) -> Tensor:
     b, s, h, d = q.shape
     valid = topk_idxs >= 0
     idx = topk_idxs.clamp_min(0).long()

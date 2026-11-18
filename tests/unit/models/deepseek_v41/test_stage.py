@@ -8,6 +8,8 @@ the split the real model gets at layer 20.
 import pytest
 import torch
 
+from lumenrl.models.deepseek_v41 import model as model_module
+from lumenrl.models.deepseek_v41 import ops
 from lumenrl.models.deepseek_v41.engram import EngramLayout
 from lumenrl.models.deepseek_v41.model import (
     DSV41Model,
@@ -102,6 +104,42 @@ def test_recomputing_each_layer_gives_the_same_gradients(model):
     assert plain.keys() == recomputed.keys()
     for name, grad in plain.items():
         assert torch.equal(recomputed[name], grad), name
+
+
+def test_chunking_the_queries_changes_no_logit(model, monkeypatch):
+    """Gradients only in fp32 summation order: the kv gradient sums over the chunks one at a
+    time (rounded to bf16 per chunk instead, layers.4.hc_attn_base was 19% off here)."""
+    ids = _ids(6)
+    again = DSV41Model(model.cfg, token_map=model.hasher.token_map, recompute=True)
+    again.load_state_dict(model.state_dict())
+
+    want = model(ids)
+    _backward(want, 7)
+    monkeypatch.setattr(model_module, "INDEXER_QUERY_CHUNK", 5)
+    monkeypatch.setattr(ops, "SPARSE_ATTENTION_QUERY_CHUNK", 5)
+    got = again(ids)
+    _backward(got, 7)
+
+    assert SEQLEN > 5 and torch.equal(got, want)
+    whole, chunked = _grads(model), _grads(again)
+    assert whole.keys() == chunked.keys()
+    for name, grad in whole.items():
+        err = (chunked[name].float() - grad.float()).norm() / grad.float().norm().clamp_min(1e-12)
+        assert err < 1e-3, (name, float(err))
+
+
+def test_autograd_keeps_nothing_of_the_indexer_scores(model):
+    """Its top-k is discrete, so nothing it computes can get a gradient; at a ratio-1 layer the
+    score of a whole sequence is [s, heads, s]."""
+    shapes = []
+    cfg = model.cfg
+    # the indexer's q [b, s, heads, head_dim] and score [b, s, heads, positions]
+    last = {cfg.index_head_dim, SEQLEN, SEQLEN // 2}
+    with torch.autograd.graph.saved_tensors_hooks(lambda t: shapes.append(tuple(t.shape)) or t, lambda t: t):
+        model(_ids(8))
+
+    indexer = [s for s in shapes if len(s) == 4 and s[1] == SEQLEN and s[2] == cfg.index_n_heads and s[3] in last]
+    assert shapes and not indexer
 
 
 def test_a_stage_holds_only_its_layers_under_their_model_numbers(model):
