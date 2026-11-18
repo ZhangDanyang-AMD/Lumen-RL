@@ -21,6 +21,11 @@ export NCCL_TIMEOUT=7200 NCCL_CUMEM_ENABLE=0
 # ROCm/HIP has no expandable_segments.
 unset PYTORCH_CUDA_ALLOC_CONF
 export HIP_FORCE_DEV_KERNARG=1 HSA_NO_SCRATCH_RECLAIM=1 HSA_DISABLE_FRAGMENT_ALLOCATOR=1
+# HIP multiplexes a process's streams over this many hardware queues (default 4). With vLLM,
+# Megatron and several RCCL communicators on one card, 4 deadlocked two-node runs at step 6-8 on
+# the ROCm 7.2.3 image (every GPU at 100%, kernels waiting on each other); 8 runs 20 steps at the
+# same speed. 16, two processes a card at 16 each, oversubscribes the hardware and slows everything.
+export GPU_MAX_HW_QUEUES="${GPU_MAX_HW_QUEUES:-8}"
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export VLLM_USE_V1=1 VLLM_ENABLE_V1_MULTIPROCESSING=1 VLLM_LOGGING_LEVEL=WARN
 export ATOM_DISABLE_VLLM_PLUGIN=1

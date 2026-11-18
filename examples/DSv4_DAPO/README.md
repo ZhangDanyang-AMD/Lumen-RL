@@ -150,6 +150,14 @@ export EXTRA_DOCKER_ARGS="--device=/dev/infiniband --cap-add=IPC_LOCK -e NCCL_IB
 
 ROCm 7.2.3 / 7.2.4 的 ROCr 中，`hipMemRelease` 要等虚拟地址区间释放后才归还物理显存，而 vLLM 的 sleep 模式保留地址区间，所以 sleep 之后 rollout 的显存仍然被占着（7.0.2、7.2.0 没有这个问题）。开 sleep 模式的配置在这类镜像上，训练阶段每卡会多占 rollout 的那部分显存（全量 43 层约 81 GB）。
 
+所以在 ROCm 7.2.3 镜像上两机跑全量 43 层时，关掉 sleep 模式并把优化器卸载提高到 0.95：
+
+```bash
+EXTRA="policy.training.megatron_cfg.optimizer_offload_fraction=0.95 policy.generation.vllm_cfg.enable_sleep_mode=false"
+```
+
+这样每卡峰值约 270 GB，主机内存峰值约 2.5 TB（共 2.75 TB）。这类镜像上还需要 `GPU_MAX_HW_QUEUES=8`，`runtime/ray_env.sh` 默认已经设好。HIP 默认把一个进程的流复用到 4 个硬件队列上，而每张卡上有 vLLM、Megatron 和多个 RCCL 通信器的流；用默认值时三次两机运行都在第 6–8 步卡死：所有 GPU 利用率 100%，末段 8 个 rank 的反向停在一次设备到主机拷贝上，也就是 GPU 上的通信 kernel 互相等待。设成 8 后 20 步跑完，每步约 8 分钟（固定镜像 + TCP 为 16–18 分钟）。不要设到 16：同时关掉 MSCCL 的那次运行，所有阶段都慢了 2–3 倍，权重同步从 7 秒变成 400 秒。
+
 ## 配置
 
 `env.example.sh` 里每一项都有说明，常用的几项：
@@ -190,6 +198,7 @@ DeepSeek-V4 所需的 Megatron 改动以补丁形式提供（`megatron/megatron_
 - `VLLM_ROCM_USE_AITER=1`，其他 AITER 开关为 0：DeepSeek-V4 的稀疏注意力 indexer 在 ROCm 上只有 AITER 实现。
 - MoE 后端用 `triton`，rollout TP=8：其他组合在 gfx950 上会出错。
 - `NCCL_ALGO=Ring`：训练开启了确定性模式，它要求这个设置。
+- `GPU_MAX_HW_QUEUES=8`：ROCm 7.2.3 镜像上默认的 4 会让两机运行卡死，16 会让所有阶段变慢（见"节点间走 RDMA"）。
 - `enable_dynamic_batch: false`：DeepSeek-V4 的注意力不支持把多条序列打包进一个 micro-batch，打包后结果会出错而且不报错。
 - `enable_sleep_mode: false`：训练和 rollout 的显存是叠加的，配置已经按这一点留好了余量。
 - 4 层切片上 `filter_groups` 保持关闭，否则所有样本组都会被过滤掉。
