@@ -66,7 +66,7 @@ export LUMEN_ENABLE=hf_attn_patch,aiter_conv
 
 `lumen_linear` is not in the training default. The AITER tuned bf16 GEMM has no entry for the SimWAM shapes and falls back to the torch GEMM, so training is bit-identical to `hf_attn_patch,lumen_linear` (forward, LoRA gradients and weights, checked step by step) and only the dispatch cost is gone: a rollout cycle is 14% faster.
 
-`hf_attn_patch` stays in the default so that results are bit-identical to the original example. SimWAM passes a bool mask on every attention call, so Lumen takes only the `no_grad` ones (rollout, old and reference log-probs); `install_lean_lumen_attention` in `plugin.py` runs them as one Triton launch with a resident zero bias and makes them capturable by the CUDA graphs (see Training-loop patches). Dropping it (`LUMEN_ENABLE=aiter_conv`) sends those calls to torch SDPA, which is faster but changes the log-probs (max abs difference 0.009 on one rollout).
+`hf_attn_patch` stays in the default so that results are bit-identical to the original example. SimWAM passes a bool mask on every attention call, so Lumen takes only the `no_grad` ones (rollout, old and reference log-probs); `install_lean_lumen_attention` in `plugin.py` runs them as one Triton launch with a resident zero bias and makes them capturable by the CUDA graphs (see Training-loop patches). Dropping it (`LUMEN_ENABLE=aiter_conv`) sends those calls to torch SDPA, which is faster but changes the log-probs (max abs difference 0.009 on one rollout). `aiter_conv` itself also changes results: with it the VAE convolutions run on AITER instead of torch, and a run differs from the original from the first step. For a run bit-identical to the original, use `LUMEN_ENABLE=hf_attn_patch`.
 
 Each name is one `LumenConfig.enable` call. Empty, `0`, `false`, `none`, and `off` turn patching off.
 
@@ -103,7 +103,7 @@ Set `LUMEN_ENABLE` to a subset to check one patch at a time.
 
 ## Training-loop patches
 
-`train_grpo.py` also installs these runtime patches from `plugin.py` (SimWAM is not modified). With the default `LUMEN_ENABLE`, a run with all of them is bit-identical to the original example with `LUMEN_ENABLE=hf_attn_patch,lumen_linear` and the LoRA seed below: the LoRA init, every rollout tensor and reward, every log-prob, every LoRA weight after every optimizer step, and loss, KL and grad norm.
+`train_grpo.py` also installs these runtime patches from `plugin.py` (SimWAM is not modified). With `LUMEN_ENABLE=hf_attn_patch` (the default without `aiter_conv`, so the VAE convolutions stay on torch as in the original), a run with all of them is bit-identical to the original example with `LUMEN_ENABLE=hf_attn_patch,lumen_linear` and the LoRA seed below: the LoRA init, every rollout tensor and reward, every log-prob, every LoRA weight after every optimizer step, and loss, KL and grad norm.
 
 | Patch | Switch (default) | What it does |
 |---|---|---|
