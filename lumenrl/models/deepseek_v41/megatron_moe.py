@@ -97,6 +97,12 @@ def reference_names(key: str, *, ep_rank: int, n_local: int) -> list[str]:
     return [f"experts.{e}.w1.weight", f"experts.{e}.w3.weight"] if m.group(1) == "1" else [f"experts.{e}.w2.weight"]
 
 
+# What Megatron's alltoall dispatcher keeps of its last call; `dispatch_preprocess` sets all three
+# again before any use. `probs` carries that call's autograd graph, so kept, it holds a recomputed
+# layer's detached inputs and their gradients until the layer's next forward.
+_DISPATCH_STATE = ("probs", "routing_map", "reversed_local_input_permutation_mapping")
+
+
 class MegatronMoE(nn.Module):
     """Drop-in for the reference `MoE` of a block: [b, s, d] in and out."""
 
@@ -115,6 +121,10 @@ class MegatronMoE(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         out, bias = self.layer(x.transpose(0, 1).contiguous())
+        dispatcher = getattr(self.layer, "token_dispatcher", None)
+        for name in _DISPATCH_STATE:
+            if getattr(dispatcher, name, None) is not None:
+                setattr(dispatcher, name, None)
         if bias is not None:
             out = out + bias
         return out.transpose(0, 1)

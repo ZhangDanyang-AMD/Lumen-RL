@@ -1,7 +1,13 @@
+import gc
+import types
+import weakref
+
 import pytest
 import torch
+from torch import nn
 
 from lumenrl.models.deepseek_v41.megatron_moe import (
+    MegatronMoE,
     moe_state_from_reference,
     reference_names,
 )
@@ -48,6 +54,38 @@ def test_router_and_shared_expert_are_on_every_rank(ffn):
 def test_experts_must_split_evenly(ffn):
     with pytest.raises(ValueError, match="do not split over EP 3"):
         moe_state_from_reference(ffn, n_experts=8, ep_rank=0, ep_size=3)
+
+
+class _StashingLayer(nn.Module):
+    """Keeps its last call's routing on the dispatcher, as Megatron's alltoall one does."""
+
+    def __init__(self, dim):
+        super().__init__()
+        self.router = nn.Linear(dim, 4, bias=False)
+        self.token_dispatcher = types.SimpleNamespace()
+
+    def forward(self, hidden):
+        probs = self.router(hidden).softmax(-1)
+        d = self.token_dispatcher
+        d.probs, d.routing_map = probs, probs > 0.25
+        d.reversed_local_input_permutation_mapping = probs.argsort(-1)
+        return hidden * probs.sum(-1, keepdim=True), None
+
+
+def test_a_forward_keeps_nothing_of_its_graph_once_backward_is_done():
+    """What a reentrant per-layer checkpoint relies on: the inputs of a layer's recompute (and
+    their gradients) are freed with that layer's backward, not at its next forward."""
+    moe = MegatronMoE.__new__(MegatronMoE)
+    nn.Module.__init__(moe)
+    moe.layer = _StashingLayer(8)
+    x = torch.randn(1, 5, 8, requires_grad=True)
+    gone = weakref.ref(x)
+
+    moe(x).sum().backward()
+    del x
+    gc.collect()
+
+    assert gone() is None
 
 
 def test_te_extra_state_has_no_source_and_another_ranks_expert_is_an_error():
