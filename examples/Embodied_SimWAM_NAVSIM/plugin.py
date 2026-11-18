@@ -613,6 +613,67 @@ def install_overlap_reward_logprobs() -> None:
     logger.info("PDM rewards are scored while the rollout's old/reference log-probs run")
 
 
+def install_foreach_grad_checks() -> None:
+    """Run DeepSpeed ZeRO-1/2's overflow check and L2 gradient norm with foreach kernels.
+
+    ``DeepSpeedZeroOptimizer`` checks every gradient for inf/NaN with an ``amax``/``amin``
+    pair and computes the norm with one float64 ``vector_norm`` per gradient. With 480 LoRA
+    tensors that is several thousand small launches per optimizer step on the main thread.
+    Here both come from ``torch._foreach_norm`` (float32 per tensor): the overflow flag is
+    "some per-tensor L2 norm is not finite" (inf and NaN propagate; a finite gradient whose
+    norm exceeds the float32 range also counts as overflow), and the global norm sums the
+    squared per-tensor norms in float64. The parameter selection, the all-reduces and the
+    NaN masking follow ``get_grad_norm_direct``; other norm types, sparse gradients and CPU
+    offload keep DeepSpeed's code. ``SIMWAM_GRPO_FOREACH_GRAD_CHECKS=0`` turns it off.
+    """
+    if os.environ.get("SIMWAM_GRPO_FOREACH_GRAD_CHECKS", "1").strip().lower() in _OFF:
+        return
+    import torch
+    import deepspeed.runtime.zero.stage_1_and_2 as s12
+
+    Z = s12.DeepSpeedZeroOptimizer
+    if getattr(Z.get_grad_norm_direct, "_foreach", False):
+        return
+    norm_orig = Z.get_grad_norm_direct
+    overflow_orig = Z.has_overflow_partitioned_grads_serial
+
+    def has_overflow_partitioned_grads_serial(self):
+        grads = [g for i in range(len(self.bit16_groups)) for g in self.averaged_gradients[i]
+                 if g is not None and g.numel() > 0]
+        if not grads or any(g.is_sparse for g in grads):
+            return overflow_orig(self)
+        norms = torch.stack(torch._foreach_norm(grads, 2, dtype=torch.float32))
+        return torch.isfinite(norms).all().logical_not().reshape(1)
+
+    def get_grad_norm_direct(self, gradients, params, norm_type=2):
+        if float(norm_type) != 2.0 or any(g.is_sparse for g in gradients):
+            return norm_orig(self, gradients, params, norm_type)
+        selected = []
+        param_gradients = (g for g in gradients if not getattr(g, "_zero_padding", False))
+        for g, p in zip(param_gradients, params):
+            if hasattr(p, s12.PIPE_REPLICATED) and p.ds_pipe_replicated:
+                continue
+            if s12.is_model_parallel_parameter(p) or (self.model_parallel_rank == 0):
+                selected.append(g.data.detach())
+        if selected:
+            norms = torch.stack(torch._foreach_norm(selected, 2, dtype=torch.float32))
+            total_norm = norms.double().pow(2).sum().float()
+        else:
+            total_norm = torch.tensor(0.0, dtype=torch.float32).to(self.device)
+        s12.dist.all_reduce(total_norm, op=s12.dist.ReduceOp.SUM, group=self.dp_process_group)
+        self._model_parallel_all_reduce(tensor=total_norm, op=s12.dist.ReduceOp.SUM)
+        total_norm = total_norm.pow(0.5)
+        s12.mask_nan_or_inf_with_val_inplace(total_norm, device=self.device)
+        return total_norm
+
+    get_grad_norm_direct._foreach = True
+    get_grad_norm_direct.orig = norm_orig
+    has_overflow_partitioned_grads_serial.orig = overflow_orig
+    Z.get_grad_norm_direct = get_grad_norm_direct
+    Z.has_overflow_partitioned_grads_serial = has_overflow_partitioned_grads_serial
+    logger.info("DeepSpeed ZeRO overflow check and gradient norm use foreach kernels")
+
+
 def enable_lumen(model, spec: str):
     """Apply ``LumenConfig.enable`` once per requested patch."""
     requested = []
