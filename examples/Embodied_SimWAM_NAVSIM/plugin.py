@@ -801,9 +801,11 @@ def install_compiled_rmsnorm() -> None:
 
     Only ``simwam.models.wan22.wan_video_dit.RMSNorm`` is replaced; Lumen's class-name based
     ``lumen_norm`` is not used, because it would also swap the affine-free ``LayerNorm``s.
-    ``SIMWAM_GRPO_COMPILE_RMSNORM=0`` turns it off.
+    The fused kernels are not bit-identical to eager (log-probs differ by ~0.02-0.03%), so this
+    is off by default; ``SIMWAM_GRPO_COMPILE_RMSNORM=1`` turns it on. With ``rmsnorm`` in
+    ``SIMWAM_GRPO_BATCHED_CHUNK`` the compiled function runs once per original step.
     """
-    if os.environ.get("SIMWAM_GRPO_COMPILE_RMSNORM", "1").strip().lower() in _OFF:
+    if os.environ.get("SIMWAM_GRPO_COMPILE_RMSNORM", "0").strip().lower() in _OFF:
         return
     import torch
     from simwam.models.wan22.wan_video_dit import RMSNorm
@@ -819,6 +821,8 @@ def install_compiled_rmsnorm() -> None:
         return (xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)).to(dtype) * weight
 
     def forward(self, x):
+        if "rmsnorm" in _CHUNK["ops"] and _chunk_active(x):
+            return torch.cat([rmsnorm(xc, self.weight, self.eps) for xc in torch.split(x, _CHUNK["sizes"], dim=0)], dim=0)
         return rmsnorm(x, self.weight, self.eps)
 
     forward._compiled = True
@@ -831,8 +835,9 @@ def install_fused_lora_add() -> None:
 
     SimWAM computes ``out + self.scaling * lora`` as a multiply and an add. With the
     default ``alpha / r = 2.0`` the scale is a power of two, so ``torch.add(out, lora,
-    alpha=scaling)`` is expected to round the same way. ``SIMWAM_GRPO_FUSED_LORA=0``
-    turns it off.
+    alpha=scaling)`` rounds the same way. Inside a batched log-prob call the LoRA matmuls
+    still run once per original step (as in ``install_batched_logprobs``), so the weight
+    gradients come from the same per-step GEMMs. ``SIMWAM_GRPO_FUSED_LORA=0`` turns it off.
     """
     if os.environ.get("SIMWAM_GRPO_FUSED_LORA", "1").strip().lower() in _OFF:
         return
@@ -844,7 +849,11 @@ def install_fused_lora_add() -> None:
 
     def forward(self, x):
         out = self.base(x)
-        lora = (self.lora_dropout(x) @ self.lora_A.t()) @ self.lora_B.t()
+        if _chunk_active(x):
+            lora = torch.cat([(self.lora_dropout(xc) @ self.lora_A.t()) @ self.lora_B.t()
+                              for xc in torch.split(x, _CHUNK["sizes"], dim=0)], dim=0)
+        else:
+            lora = (self.lora_dropout(x) @ self.lora_A.t()) @ self.lora_B.t()
         return torch.add(out, lora, alpha=self.scaling)
 
     forward._fused_add = True
@@ -965,20 +974,25 @@ def install_foreach_grad_checks() -> None:
     ``DeepSpeedZeroOptimizer`` checks every gradient for inf/NaN with an ``amax``/``amin``
     pair and computes the norm with one float64 ``vector_norm`` per gradient. With 480 LoRA
     tensors that is several thousand small launches per optimizer step on the main thread.
-    Here both come from ``torch._foreach_norm`` (float32 per tensor): the overflow flag is
-    "some per-tensor L2 norm is not finite" (inf and NaN propagate; a finite gradient whose
-    norm exceeds the float32 range also counts as overflow), and the global norm sums the
-    squared per-tensor norms in float64. The parameter selection, the all-reduces and the
-    NaN masking follow ``get_grad_norm_direct``; other norm types, sparse gradients and CPU
-    offload keep DeepSpeed's code. ``SIMWAM_GRPO_FOREACH_GRAD_CHECKS=0`` turns it off.
+    By default only the overflow check is replaced: the flag becomes "some per-tensor float32
+    L2 norm from ``torch._foreach_norm`` is not finite" (inf and NaN propagate; a finite
+    gradient whose norm exceeds the float32 range, i.e. an element above ~1.8e19, also counts
+    as overflow). The flag is a boolean, so the run stays bit-identical; the norm keeps
+    DeepSpeed's per-tensor float64 code. ``SIMWAM_GRPO_FOREACH_GRAD_CHECKS=norm`` also computes
+    the global norm from the foreach float32 norms (squares summed in float64), which removes
+    the remaining per-tensor launches but changes the norm by ~1e-7 relative, so it is not
+    bit-identical. The parameter selection, the all-reduces and the NaN masking follow
+    ``get_grad_norm_direct``; other norm types, sparse gradients and CPU offload keep
+    DeepSpeed's code. ``SIMWAM_GRPO_FOREACH_GRAD_CHECKS=0`` turns it off.
     """
-    if os.environ.get("SIMWAM_GRPO_FOREACH_GRAD_CHECKS", "1").strip().lower() in _OFF:
+    mode = os.environ.get("SIMWAM_GRPO_FOREACH_GRAD_CHECKS", "1").strip().lower()
+    if mode in _OFF:
         return
     import torch
     import deepspeed.runtime.zero.stage_1_and_2 as s12
 
     Z = s12.DeepSpeedZeroOptimizer
-    if getattr(Z.get_grad_norm_direct, "_foreach", False):
+    if getattr(Z.has_overflow_partitioned_grads_serial, "_foreach", False):
         return
     norm_orig = Z.get_grad_norm_direct
     overflow_orig = Z.has_overflow_partitioned_grads_serial
@@ -1012,12 +1026,14 @@ def install_foreach_grad_checks() -> None:
         s12.mask_nan_or_inf_with_val_inplace(total_norm, device=self.device)
         return total_norm
 
-    get_grad_norm_direct._foreach = True
-    get_grad_norm_direct.orig = norm_orig
+    has_overflow_partitioned_grads_serial._foreach = True
     has_overflow_partitioned_grads_serial.orig = overflow_orig
-    Z.get_grad_norm_direct = get_grad_norm_direct
     Z.has_overflow_partitioned_grads_serial = has_overflow_partitioned_grads_serial
-    logger.info("DeepSpeed ZeRO overflow check and gradient norm use foreach kernels")
+    if mode == "norm":
+        get_grad_norm_direct._foreach = True
+        get_grad_norm_direct.orig = norm_orig
+        Z.get_grad_norm_direct = get_grad_norm_direct
+    logger.info("DeepSpeed ZeRO overflow check%s uses foreach kernels", " and gradient norm" if mode == "norm" else "")
 
 
 def enable_lumen(model, spec: str):
