@@ -114,6 +114,9 @@ def window_topk_idxs(window: int, bsz: int, seqlen: int, device) -> Tensor:
 
 
 def select_candidate_blocks(logits: Tensor, compress_lens: Tensor, topk_blocks: int, block_size: int) -> Tensor:
+    """Which blocks of `block_size` positions each query may index, [.., blocks] bool. Kept per
+    block, not per position: every later layer's checkpoint holds it, and per position it is
+    [s, s] at a ratio-1 source."""
     width = logits.size(-1)
     scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
     scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
@@ -121,8 +124,7 @@ def select_candidate_blocks(logits: Tensor, compress_lens: Tensor, topk_blocks: 
     last = (compress_lens - 1) // block_size
     scores = scores.masked_fill(torch.arange(num_blocks, device=logits.device) == last, torch.inf)
     top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
-    keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, top.indices, top.values > -torch.inf)
-    return keep.repeat_interleave(block_size, dim=-1)[..., :width]
+    return torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, top.indices, top.values > -torch.inf)
 
 
 def _fake(enabled: bool, x: Tensor, fn) -> Tensor:
@@ -206,7 +208,8 @@ class Indexer(nn.Module):
                     select_candidate_blocks(score, compress_lens, self.candidate_topk_blocks, self.candidate_block_size)
                 )
             elif self.uses_candidates:
-                score = score.masked_fill(~shared.candidates[:, rows], -torch.inf)
+                blocks = shared.candidates[:, rows].repeat_interleave(self.candidate_block_size, dim=-1)
+                score = score.masked_fill(~blocks[..., : score.size(-1)], -torch.inf)
             top = score.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
             idxs.append(torch.where(top < compress_lens, top + offset, -1).int())
         if self.is_candidate_source:
