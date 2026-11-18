@@ -128,6 +128,24 @@ def test_chunking_the_queries_changes_no_logit(model, monkeypatch):
         assert err < 1e-3, (name, float(err))
 
 
+def test_mixing_the_copies_in_chunks_changes_no_logit_and_no_gradient(model, monkeypatch):
+    ids = _ids(10)
+    again = DSV41Model(model.cfg, token_map=model.hasher.token_map)
+    again.load_state_dict(model.state_dict())
+
+    want = model(ids)
+    _backward(want, 11)
+    monkeypatch.setattr(model_module, "HC_POST_CHUNK", 5)
+    got = again(ids)
+    _backward(got, 11)
+
+    assert SEQLEN > 5 and torch.equal(got, want)
+    whole, chunked = _grads(model), _grads(again)
+    assert whole.keys() == chunked.keys()
+    for name, grad in whole.items():
+        assert torch.equal(chunked[name], grad), name
+
+
 def test_autograd_keeps_nothing_of_the_indexer_scores(model):
     """Its top-k is discrete, so nothing it computes can get a gradient; at a ratio-1 layer the
     score of a whole sequence is [s, heads, s]."""

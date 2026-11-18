@@ -35,6 +35,7 @@ FP8_BLOCK = 32
 FP4_BLOCK = 32
 KV_FP4_BLOCK = 16
 INDEXER_QUERY_CHUNK = 1024
+HC_POST_CHUNK = 2048
 
 
 @dataclass(frozen=True)
@@ -361,6 +362,11 @@ class MoE(nn.Module):
         return y.type_as(x).view(shape)
 
 
+def _hc_post(x: Tensor, residual: Tensor, post: Tensor, comb: Tensor) -> Tensor:
+    y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
+    return y.type_as(x)
+
+
 class Block(nn.Module):
     """Single-pass mHC block: each sublayer's coefficients mix the input of the next one."""
 
@@ -404,8 +410,18 @@ class Block(nn.Module):
 
     @staticmethod
     def hc_post(x: Tensor, residual: Tensor, post: Tensor, comb: Tensor) -> Tensor:
-        y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
-        return y.type_as(x)
+        """Over chunks of `HC_POST_CHUNK` positions: mixing the copies goes through an fp32
+        [s, hc, hc, dim] product before its sum (4.8 GB at 14.6K positions), and its gradient is
+        as large. Each position's arithmetic is the same either way."""
+        s = x.size(1)
+        if s <= HC_POST_CHUNK:
+            return _hc_post(x, residual, post, comb)
+        parts = [
+            _hc_post(x[:, i : i + HC_POST_CHUNK], residual[:, i : i + HC_POST_CHUNK],
+                     post[:, i : i + HC_POST_CHUNK], comb[:, i : i + HC_POST_CHUNK])
+            for i in range(0, s, HC_POST_CHUNK)
+        ]
+        return torch.cat(parts, dim=1)
 
     def forward(self, x: Tensor, pre_mix: Tensor, shared: SharedAttention) -> tuple[Tensor, Tensor]:
         residual = x
