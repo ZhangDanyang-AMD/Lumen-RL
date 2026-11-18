@@ -1,0 +1,191 @@
+# DeepSeek-V4.1-Flash agentic SWE smoke on two nodes: the 2-node DAPO setup
+# (dapo_dsv41_flash_ray_atom_megatron_2node_smoke.yaml: all 40 layers, PP2 x EP8 +
+# four TP4 ATOM replicas) with policy.generation.multi_turn.swe -- every rollout
+# of a group works in its own sandbox of the group's SWE-rebench task with
+# mini-swe-agent's bash tool, through V4.1's DSML tool calls, and is rewarded by
+# whether its submitted patch resolves the task, graded in a fresh container.
+#
+# Tasks: the SWE-rebench ones V4.1 solved sometimes in its step-0 evaluation
+# (build: rl_data/scratch/swe_v41_smoke_data.py). The sandbox service runs where
+# the task images are (087), started separately; multi_turn.swe.url points at it.
+#
+#   * 16K context: an update of two 16K trajectories a rank peaks at ~140 GB a
+#     card, with ATOM asleep beside it (weights on the host, KV kept). Reasoning
+#     effort low, so a trajectory fits more turns.
+#   * Prefix caching off: ATOM's post-sync KV clear does nothing for V4.1 (no
+#     `kv_cache`), and the tasks recur across steps, so a cached prefix would
+#     carry KV of the old weights.
+
+cluster:
+  num_nodes: 2
+  gpus_per_node: 8
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    actor:
+      num_workers: 16
+      dispatch_mode: dp_compute_proto
+      process_on_nodes: [8, 8]
+
+policy:
+  model_name: "/mnt/m2m_nobackup/xysheng/models/DeepSeek-V4.1-Flash"
+  training_backend: megatron_native
+  generation_backend: atom
+  max_total_sequence_length: 16384
+  max_response_length: 14336
+  train_global_batch_size: 16           # 4 tasks x 4 rollouts
+  gen_batch_size: 4
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 16384
+  learning_rate: 1.0e-6
+  lr_warmup_steps: 0
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  training:
+    optimizer_dtype: bf16
+    megatron_cfg:
+      use_distributed_optimizer: true
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 2
+      context_parallel_size: 1
+      expert_model_parallel_size: 8
+      # Without it two forwards of one batch differ by 0.28 in mean token
+      # log-prob on this slice; with it, exactly 0.
+      deterministic_mode: true
+      recompute_granularity: full
+      moe_grouped_gemm: true
+      moe_token_dispatcher_type: alltoall
+      moe_aux_loss_coeff: 0.0
+      log_probs_chunk_size: 1024
+      enable_dynamic_batch: false
+      dsv41_quant_points:
+        window_kv_fp8: false
+        compressed_kv_fp4: false
+        indexer_fp4: false
+        attn_out_fp8: true
+        linear_act_fp8: false
+    fsdp_cfg:
+      param_offload: false
+      optimizer_offload: false
+  generation:
+    atom_cfg:
+      transport: ray_http
+      tensor_parallel_size: 4
+      kv_cache_dtype: bf16
+      # ATOM's fraction is of the whole card and counts what training already
+      # holds there: 0.38 left its KV budget at -79 GB (ATOM asked for >= 0.66);
+      # 0.80 left training too little for its update (OUT_OF_RESOURCES in the
+      # expert alltoall). Its KV release does nothing for V4.1, so the KV stays
+      # through training; the sleep below frees the ~70 GB of weights.
+      gpu_memory_utilization: 0.70
+      # V4.1 does not sync its frozen routed experts: ATOM's own sleep would
+      # discard them, this one keeps them on the host.
+      sleep_keeps_weights: true
+      enable_prefix_caching: false
+      online_quant_config: {}
+      engine_kwargs:
+        index_cache_dtype: fp8
+        kv_cache_block_size: 16
+        compilation_config:
+          level: 0
+    vllm_cfg:
+      transport: ray_http
+      ray_http_start_server: false
+      gpu_memory_utilization: 0.70
+      max_model_len: 16384
+      dtype: bfloat16
+      enforce_eager: true
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 8192
+      max_num_seqs: 32                  # 16 requests a replica; a smaller state pool
+      quantization: ""
+      calculate_log_probs: true
+      enable_sleep_mode: true
+      update_weights_bucket_megabytes: 512
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+    multi_turn:
+      enabled: true
+      format: dsml_v41
+      max_assistant_turns: 40
+      max_parallel_calls: 1
+      chat_template_kwargs:
+        thinking_mode: thinking
+        reasoning_effort: low
+      code_interpreter:
+        enabled: false                  # the SWE environment's bash tool alone
+      swe:
+        enabled: true
+        url: http://10.245.148.158:8090
+        command_timeout_s: 60
+        eval_timeout_s: 1800
+
+moe:
+  r3:
+    rollout_replay: false
+
+algorithm:
+  name: dapo
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  loss_agg_mode: token-mean
+  dapo:
+    num_generations: 4
+    kl_coeff: 0.0
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 10.0
+    dynamic_sampling: true
+    token_level_pg: true
+    overlong_reward_shaping: false
+    max_resp_len: 14336
+    filter_groups:
+      enable: false
+      metric: acc
+      max_num_gen_batches: 10
+    overlong_buffer:
+      enable: true
+      len: 512
+      penalty_factor: 1.0
+      log: false
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+    rollout_is_batch_normalize: false
+
+reward:
+  type: function
+  function: lumenrl.rewards.math_reward.dapo_math_reward
+  dataset: "/home/xysheng/rl_data/datasets/swe/swe_rebench_v41_mixed.parquet"
+  shuffle: true
+  shuffle_seed: 10086
+
+val_dataset: ""
+val_steps: 0
+val_batch_size: 0
+eval:
+  enabled: false
+  num_samples: 0
+
+checkpointing:
+  checkpoint_dir: ""
+  save_steps: 1000
+  save_total_limit: 0
+  resume: false
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 3
+seed: 10086
