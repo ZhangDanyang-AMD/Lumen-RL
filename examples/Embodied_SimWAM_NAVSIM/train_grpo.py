@@ -28,6 +28,7 @@ from examples.Embodied_SimWAM_NAVSIM.plugin import (
     install_manual_data_parallel,
     install_parallel_pdm_reward,
     install_ref_logprob_cache,
+    install_train_graphs,
 )
 from simwam.runtime_grpo import run_grpo_training
 from simwam.utils.config_resolvers import register_default_resolvers
@@ -39,6 +40,8 @@ install_manual_data_parallel()
 install_batched_logprobs()
 install_ref_logprob_cache()
 install_action_velocity_graphs()
+# after the no_grad graphs, which it falls through to
+install_train_graphs()
 install_parallel_pdm_reward()
 register_default_resolvers()
 

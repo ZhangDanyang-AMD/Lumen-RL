@@ -442,6 +442,162 @@ def install_parallel_pdm_reward() -> None:
     logger.info("PDM rewards are scored by %d worker processes", workers)
 
 
+def install_train_graphs() -> None:
+    """Replay the policy's grad-enabled ``action_velocity`` forward and backward from CUDA graphs.
+
+    With ``install_batched_logprobs`` each inner epoch makes one grad-enabled ``action_velocity``
+    call followed by one backward. A forward graph and a backward graph are captured per input
+    shape/stride and wrapped in an autograd Function that takes the trainable (LoRA) parameters
+    as explicit inputs, so their gradients leave the backward graph as ordinary outputs and are
+    accumulated, reduced and stepped outside the graph exactly as in eager.
+
+    Unlike ``torch.cuda.make_graphed_callables``:
+    * the parameter gradients and the output are cloned out of the graph's memory pool, so
+      nothing outside the graph holds memory that the next replay overwrites;
+    * the captured output is detached afterwards, which frees the capture-time autograd graph.
+      That graph otherwise keeps the parameters' AccumulateGrad nodes alive with the capture
+      stream recorded on them;
+    * warmup uses ``autograd.grad`` and never touches ``.grad``; each shape gets its own pool.
+
+    Only without DeepSpeed (``install_manual_data_parallel``): with DeepSpeed ZeRO-1 the backward
+    capture segfaults in ``capture_end`` (DeepSpeed 0.19.8, ROCm 7.14), so nothing is installed.
+    Install after ``install_action_velocity_graphs`` (no_grad calls go to that path).
+    ``SIMWAM_GRPO_TRAIN_GRAPH=0`` turns this off; ``SIMWAM_GRPO_TRAIN_GRAPH_VERIFY=1`` also runs
+    eager forward and backward before each replay and counts outputs and LoRA gradients that
+    are not bit-identical.
+    """
+    if os.environ.get("SIMWAM_GRPO_TRAIN_GRAPH", "1").strip().lower() in _OFF:
+        return
+    if os.environ.get("ACCELERATE_USE_DEEPSPEED", "false").strip().lower() not in _OFF:
+        logger.info("Training CUDA graphs need SIMWAM_GRPO_MANUAL_DP=1 (not DeepSpeed); not installed")
+        return
+    import torch
+    from simwam.models.wan22.simwam_grpo import ActionGRPOMixin
+
+    if getattr(ActionGRPOMixin.action_velocity, "_train_graph", False):
+        return
+    inner = ActionGRPOMixin.action_velocity
+    eager = getattr(inner, "eager", None) or inner
+    verify = os.environ.get("SIMWAM_GRPO_TRAIN_GRAPH_VERIFY", "0") == "1"
+    warmup = int(os.environ.get("SIMWAM_GRPO_TRAIN_GRAPH_WARMUP", "3"))
+    graphs = {}
+    stats = {"graphed": 0, "eager": 0, "captures": 0, "out_mismatch": 0, "grad_mismatch": 0, "checks": 0,
+             "out_maxabs": 0.0, "grad_maxabs": 0.0}
+    _COND = ("video_kv_cache", "context", "context_mask", "attention_mask")
+
+    def flat(cond):
+        kv = [t for layer in cond["video_kv_cache"] for t in (layer["k"], layer["v"])]
+        return kv + [cond["context"], cond["context_mask"], cond["attention_mask"]]
+
+    def unflat(rest, layers, tensors):
+        cond = dict(rest)
+        cond.update(
+            video_kv_cache=[{"k": tensors[2 * i], "v": tensors[2 * i + 1]} for i in range(layers)],
+            context=tensors[2 * layers], context_mask=tensors[2 * layers + 1],
+            attention_mask=tensors[2 * layers + 2],
+        )
+        return cond
+
+    class _Replay(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, g, *inputs):
+            for static, value in zip(g["inputs"], inputs[:g["n_in"]]):
+                if static.data_ptr() != value.data_ptr():
+                    static.copy_(value)
+            g["fwd"].replay()
+            ctx.g = g
+            return g["out"].clone()
+
+        @staticmethod
+        def backward(ctx, grad_out):
+            g = ctx.g
+            g["grad_out"].copy_(grad_out)
+            g["bwd"].replay()
+            grads = tuple(None if x is None else x.clone() for x in g["grads"])
+            return (None,) + (None,) * g["n_in"] + grads
+
+    def capture(self, args, cond, params):
+        for expert in (self.action_expert, getattr(self, "ref_action_expert", None)):
+            freqs = getattr(expert, "freqs", None)
+            if torch.is_tensor(freqs) and freqs.device != args[0].device:
+                expert.freqs = freqs.to(args[0].device)
+        layers = len(cond["video_kv_cache"])
+        rest = {k: v for k, v in cond.items() if k not in _COND and k != "_cuda_graph_tag"}
+        inputs = [torch.empty_strided(t.shape, t.stride(), dtype=t.dtype, device=t.device) for t in args]
+        torch._foreach_copy_(inputs, list(args))
+
+        def run():
+            return eager(self, inputs[0], inputs[1], unflat(rest, layers, inputs[2:]), use_ref=False)
+
+        torch.cuda.synchronize()
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(warmup):
+                out = run()
+                torch.autograd.grad(out, params, grad_outputs=torch.zeros_like(out), allow_unused=True)
+                del out
+        torch.cuda.current_stream().wait_stream(side)
+        torch.cuda.synchronize()
+        # Capture on the warmup stream: hipBLASLt fails ("operation not permitted when stream is
+        # capturing") the first time it sees a new stream inside a capture.
+        fwd, bwd = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
+        with torch.cuda.graph(fwd, stream=side):
+            out = run()
+        grad_out = torch.zeros_like(out)
+        with torch.cuda.graph(bwd, pool=fwd.pool(), stream=side):
+            grads = torch.autograd.grad(out, params, grad_outputs=grad_out, allow_unused=True)
+        torch.cuda.synchronize()
+        stats["captures"] += 1
+        return {"fwd": fwd, "bwd": bwd, "inputs": inputs, "n_in": len(inputs), "out": out.detach(),
+                "grad_out": grad_out, "grads": grads}
+
+    def action_velocity(self, latents_action, timestep_action, cond, use_ref=False):
+        if use_ref or not torch.is_grad_enabled() or not latents_action.is_cuda:
+            return inner(self, latents_action, timestep_action, cond, use_ref=use_ref)
+        params = [p for p in self.action_expert.parameters() if p.requires_grad]
+        args = (latents_action, timestep_action, *flat(cond))
+        key = (tuple((tuple(t.shape), tuple(t.stride()), t.dtype) for t in args), len(params),
+               tuple(k for k in cond if k not in _COND), int(cond.get("video_seq_len", -1)))
+        g = graphs.get(key)
+        if g is None:
+            try:
+                g = capture(self, args, cond, params)
+            except Exception as exc:
+                logger.warning("CUDA graph capture of the training action_velocity failed (%s); using eager", exc)
+                g = False
+            graphs[key] = g
+        if g is False:
+            stats["eager"] += 1
+            return eager(self, latents_action, timestep_action, cond, use_ref=False)
+        if verify:
+            ref = eager(self, latents_action, timestep_action, cond, use_ref=False)
+            w = torch.randn_like(ref)
+            g_ref = torch.autograd.grad(ref, params, grad_outputs=w, allow_unused=True)
+            out = _Replay.apply(g, *args, *params)
+            g_out = torch.autograd.grad(out, params, grad_outputs=w, allow_unused=True)
+            stats["checks"] += 1
+            if not torch.equal(ref, out):
+                stats["out_mismatch"] += 1
+                stats["out_maxabs"] = max(stats["out_maxabs"], float((ref.float() - out.float()).abs().max()))
+            for a, b in zip(g_ref, g_out):
+                if (a is None) != (b is None) or (a is not None and not torch.equal(a, b)):
+                    stats["grad_mismatch"] += 1
+                    if a is not None and b is not None:
+                        stats["grad_maxabs"] = max(stats["grad_maxabs"], float((a.float() - b.float()).abs().max()))
+                    break
+        stats["graphed"] += 1
+        return _Replay.apply(g, *args, *params)
+
+    action_velocity._train_graph = True
+    action_velocity._cuda_graph = getattr(inner, "_cuda_graph", False)
+    action_velocity.stats = getattr(inner, "stats", stats)
+    action_velocity.train_stats = stats
+    action_velocity.eager = eager
+    ActionGRPOMixin.action_velocity = action_velocity
+    logger.info("grad-enabled action_velocity replays CUDA graphs (verify=%s)", verify)
+
+
 class _MasterAdamW:
     """fp32 master copy of the trainable parameters, averaged gradients and AdamW.
 
