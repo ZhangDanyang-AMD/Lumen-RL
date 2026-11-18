@@ -1271,9 +1271,13 @@ class RLTrainer:
         )
         sync_dir = Path(configured_dir)
         sync_dir.mkdir(parents=True, exist_ok=True)
+        separated = getattr(self, "_rollout_wg", None) is not None
         export_results = self._actor_wg.execute_all_sync(
             "export_state_dict_safetensors",
             sync_dir=str(sync_dir),
+            # A colocated replica reads its own host's /dev/shm; with several
+            # hosts each needs a copy there. A shared folder takes one writer.
+            per_host=backend != "shared_folder" and not separated,
         )
         export_meta = export_results[0]
 
@@ -1295,7 +1299,6 @@ class RLTrainer:
 
         if sleeping:
             rollout_engine.wake(tags=["weights"])
-        separated = getattr(self, "_rollout_wg", None) is not None
         if separated and backend != "shared_folder":
             source_url = str(export_meta.get("weight_url") or "")
             if not source_url:

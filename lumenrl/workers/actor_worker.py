@@ -86,6 +86,14 @@ def _whole_tensors(params):
         yield name, param.full_tensor() if isinstance(param, DTensor) else param
 
 
+def first_rank_per_host(hosts: list[str]) -> set[int]:
+    """The lowest rank on each host, given every rank's host name in rank order."""
+    first: dict[str, int] = {}
+    for rank, host in enumerate(hosts):
+        first.setdefault(host, rank)
+    return set(first.values())
+
+
 def _sync_keeps_fp32(engine) -> bool:
     """Whether weight sync sends FP32 tensors as FP32 rather than BF16.
 
@@ -1228,6 +1236,7 @@ class LumenActorWorker(BaseWorker):
         sync_dir: str,
         max_shard_bytes: int = 4 * 1024 * 1024 * 1024,
         include_names: list[str] | None = None,
+        per_host: bool = False,
     ) -> dict[str, Any]:
         """Collectively export HF weights without returning them through Ray.
 
@@ -1236,6 +1245,10 @@ class LumenActorWorker(BaseWorker):
         to the shared filesystem; other ranks discard each gathered tensor.
         ``include_names`` limits files written by rank 0 while preserving all
         collective generator calls on every rank.
+
+        ``per_host``: ``sync_dir`` is host-local (``/dev/shm``), so the lowest
+        rank on every host writes that host's copy, for the rollout replicas
+        colocated there. Every rank sees every tensor anyway.
         """
         if self._engine is None:
             raise RuntimeError("init_model() must be called before exporting weights.")
@@ -1245,7 +1258,7 @@ class LumenActorWorker(BaseWorker):
         from safetensors.torch import save_file
 
         output_dir = Path(sync_dir)
-        is_writer = self.rank == 0
+        is_writer = self.rank in self._first_rank_per_host() if per_host else self.rank == 0
         if is_writer:
             output_dir.mkdir(parents=True, exist_ok=True)
             for old in output_dir.glob("model-*.safetensors"):
@@ -1313,6 +1326,18 @@ class LumenActorWorker(BaseWorker):
             "num_shards": len(temp_paths),
             "weight_url": weight_url,
         }
+
+    def _first_rank_per_host(self) -> set[int]:
+        cached = getattr(self, "_host_writers", None)
+        if cached is None:
+            import socket
+
+            import torch.distributed as dist
+
+            hosts: list[str | None] = [None] * dist.get_world_size()
+            dist.all_gather_object(hosts, socket.gethostname())
+            cached = self._host_writers = first_rank_per_host(hosts)
+        return cached
 
     def _ensure_weight_http_server(self, output_dir: Path) -> str:
         """Expose exported shards to rollout nodes without assuming shared storage."""
