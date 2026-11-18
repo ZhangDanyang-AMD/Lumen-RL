@@ -42,14 +42,60 @@ class _AtomRunner:
     def _post_process_fp8_weight(self, module, param):
         self.post_processed.append(module)
 
+    def _release_weights(self):
+        self.discarded = True
+        for p in self.model.parameters():
+            p.data = torch.empty(0, dtype=p.dtype)
+
+    def _resume_weights(self):
+        self.resumed_by_atom = True
+
+    def _weight_memory_modules(self):
+        return []
+
 
 @pytest.fixture
 def runner_cls(monkeypatch):
     ext = types.ModuleType("atom.rollout.model_runner_ext")
     ext.RLHFModelRunner = _AtomRunner
+    memory = types.ModuleType("atom.rollout.memory_manager")
+    memory.release_cudagraphs = lambda runner: setattr(runner, "graphs_released", True)
     monkeypatch.setitem(sys.modules, "atom.rollout.model_runner_ext", ext)
+    monkeypatch.setitem(sys.modules, "atom.rollout.memory_manager", memory)
     monkeypatch.setattr(m.NoCustomARModelRunner, "_real_cls", None)
     return m.NoCustomARModelRunner
+
+
+def _with_model(runner):
+    runner.model = torch.nn.Linear(4, 3)
+    return {n: p.detach().clone() for n, p in runner.model.named_parameters()}
+
+
+def test_sleep_can_keep_the_weights_for_a_partial_sync(runner_cls, monkeypatch):
+    """A trainer syncing only what it trains (V4.1's frozen experts never go) must
+    wake to the weights it slept with, not to ATOM's discarded placeholders."""
+    monkeypatch.setenv("LUMENRL_ATOM_SLEEP_KEEPS_WEIGHTS", "1")
+    runner = runner_cls(0, None)
+    want = _with_model(runner)
+
+    for _ in range(2):  # the host copy is reused
+        runner._release_weights()
+        assert all(p.numel() == 0 for p in runner.model.parameters()) and runner.graphs_released
+        runner._resume_weights()
+        for n, p in runner.model.named_parameters():
+            assert torch.equal(p, want[n]), n
+    assert not getattr(runner, "discarded", False) and not getattr(runner, "resumed_by_atom", False)
+
+
+def test_by_default_sleep_is_atoms(runner_cls, monkeypatch):
+    monkeypatch.delenv("LUMENRL_ATOM_SLEEP_KEEPS_WEIGHTS", raising=False)
+    runner = runner_cls(0, None)
+    _with_model(runner)
+
+    runner._release_weights()
+    runner._resume_weights()
+
+    assert runner.discarded and runner.resumed_by_atom
 
 
 def test_a_runner_without_a_kv_pool_clears_without_raising(runner_cls):

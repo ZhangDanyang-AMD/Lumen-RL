@@ -1306,6 +1306,8 @@ class RLTrainer:
         )
 
         if sleeping:
+            # What training left cached is the room the rollout's weights wake into.
+            self._actor_wg.execute_all_sync("free_cached_memory")
             rollout_engine.wake(tags=["weights"])
         if separated and backend != "shared_folder":
             source_url = str(export_meta.get("weight_url") or "")

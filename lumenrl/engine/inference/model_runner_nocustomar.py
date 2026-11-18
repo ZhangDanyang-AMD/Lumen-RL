@@ -4,7 +4,9 @@ It also fixes three ways ATOM's weight sync silently or loudly fails for
 DeepSeek-V4.1: the factory answers class-level capability questions for the
 runner it builds (``_ResolvesToRunner``), ``clear_kv_cache`` tolerates a runner
 with no ``kv_cache``, and native group32 FP8 weights are requantized
-(``quantize_native_group``).
+(``quantize_native_group``). With ``LUMENRL_ATOM_SLEEP_KEEPS_WEIGHTS=1`` a sleep
+moves the weights to host memory instead of discarding them (``offload_weights``),
+for a trainer that does not sync every weight.
 
 When ``LUMENRL_DISABLE_CUSTOM_AR=1`` is set, monkey-patches aiter so that
 ``CustomAllreduce`` is never instantiated.  This avoids the
@@ -132,6 +134,50 @@ def quantize_native_group(weight, rows: int, fp8_dtype):
     return q.view(n, k), scale.to(torch.float8_e8m0fnu)
 
 
+def offload_weights(runner) -> None:
+    """Every parameter of ``runner.model`` to host memory, the device copy freed.
+
+    ATOM's sleep discards the weights and counts on the next sync to rewrite
+    every one; a trainer that syncs only what it trains (DeepSeek-V4.1 keeps its
+    routed experts and indexers frozen) would wake to empty ones. The host
+    buffers are pinned, allocated once and reused by every sleep."""
+    import torch
+    from atom.rollout.memory_manager import release_cudagraphs
+
+    release_cudagraphs(runner)
+    host = getattr(runner, "_host_weights", None)
+    if host is None:
+        pin = torch.cuda.is_available()
+        host = runner._host_weights = {
+            name: torch.empty(p.shape, dtype=p.dtype, device="cpu", pin_memory=pin)
+            for name, p in runner.model.named_parameters()
+        }
+    for name, p in runner.model.named_parameters():
+        host[name].copy_(p.data, non_blocking=True)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    for p in runner.model.parameters():
+        p.data = torch.empty(0, dtype=p.dtype, device=p.device)
+    for module in runner._weight_memory_modules():
+        module.release_weight_memory()
+    runner._weights_offloaded = True
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def restore_weights(runner) -> None:
+    """The parameters ``offload_weights`` moved, back on the device as they were."""
+    import torch
+
+    for name, p in runner.model.named_parameters():
+        p.data = runner._host_weights[name].to(runner.device, non_blocking=True)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    runner._weights_offloaded = False
+    for module in runner._weight_memory_modules():
+        module.resume_weight_memory()
+
+
 def rank_shard(tensor, shape: tuple, rank: int, world: int):
     """This TP rank's part of a full ``tensor`` for a parameter of ``shape``."""
     if tuple(tensor.shape) == tuple(shape):
@@ -185,6 +231,16 @@ class NoCustomARModelRunner(metaclass=_ResolvesToRunner):
                 if not hasattr(self, "kv_cache"):
                     self.kv_cache = None
                 return super().clear_kv_cache()
+
+            def _release_weights(self) -> None:
+                if os.environ.get("LUMENRL_ATOM_SLEEP_KEEPS_WEIGHTS", "0") in ("1", "true", "True"):
+                    return offload_weights(self)
+                return super()._release_weights()
+
+            def _resume_weights(self) -> None:
+                if getattr(self, "_weights_offloaded", False):
+                    return restore_weights(self)
+                return super()._resume_weights()
 
             def _requantize_fp8_weight(self, module, param_name, param, tensor) -> None:
                 # ATOM's own knows per_1x128, per-tensor and per-token, and for any
