@@ -39,16 +39,19 @@ KV_FP4_BLOCK = 16
 class QuantPoints:
     """Where the rollout quantizes activations, reproduced here as fake quantization. Defaults
     are the release's: SWA KV in FP8, compressed KV in FP4 (E4M3 scales), indexer q/k in MXFP4,
-    the attention output in FP8 before `wo_a`."""
+    the attention output in FP8 before `wo_a`, and the input of every linear layer the release
+    stores in FP8 or FP4 in FP8 (`linear_act_fp8`: attention `wq_a` / `wq_b` / `wkv` / `wo_b`,
+    the indexer's `wq_b`, routed and shared experts, Engram's `wkv`)."""
 
     window_kv_fp8: bool = True
     compressed_kv_fp4: bool = True
     indexer_fp4: bool = True
     attn_out_fp8: bool = True
+    linear_act_fp8: bool = True
 
     @classmethod
     def none(cls) -> QuantPoints:
-        return cls(False, False, False, False)
+        return cls(False, False, False, False, False)
 
 
 @dataclass
@@ -164,7 +167,7 @@ class Indexer(nn.Module):
         self.n_heads, self.head_dim, self.rope_dim = cfg.index_n_heads, cfg.index_head_dim, cfg.rope_head_dim
         self.index_topk, self.softmax_scale = cfg.index_topk, cfg.index_head_dim**-0.5
         self.quant = quant
-        self.wq_b = nn.Linear(cfg.q_lora_rank, cfg.index_n_heads * cfg.index_head_dim, bias=False)
+        self.wq_b = ops.QLinear(cfg.q_lora_rank, cfg.index_n_heads * cfg.index_head_dim, act_fp8=quant.linear_act_fp8)
         self.weights_proj = nn.Linear(cfg.dim, cfg.index_n_heads, bias=False, dtype=torch.bfloat16)
         if self.owns_k:
             self.wk = nn.Linear(cfg.head_dim, cfg.index_head_dim, bias=False, dtype=torch.bfloat16)
@@ -206,15 +209,16 @@ class Attention(nn.Module):
         self.n_groups, self.o_lora_rank, self.window = cfg.o_groups, cfg.o_lora_rank, cfg.window_size
         self.ratio, self.softmax_scale = spec.compress_ratio, cfg.head_dim**-0.5
         self.attn_sink = nn.Parameter(torch.empty(cfg.n_heads, dtype=torch.float32))
-        self.wq_a = nn.Linear(cfg.dim, cfg.q_lora_rank, bias=False)
+        act = quant.linear_act_fp8
+        self.wq_a = ops.QLinear(cfg.dim, cfg.q_lora_rank, act_fp8=act)
         self.q_norm = RMSNorm(cfg.q_lora_rank, cfg.norm_eps)
-        self.wq_b = nn.Linear(cfg.q_lora_rank, cfg.n_heads * cfg.head_dim, bias=False)
-        self.wkv = nn.Linear(cfg.dim, cfg.head_dim, bias=False)
+        self.wq_b = ops.QLinear(cfg.q_lora_rank, cfg.n_heads * cfg.head_dim, act_fp8=act)
+        self.wkv = ops.QLinear(cfg.dim, cfg.head_dim, act_fp8=act)
         self.kv_norm = RMSNorm(cfg.head_dim, cfg.norm_eps)
         self.wo_a = nn.Linear(
             cfg.n_heads * cfg.head_dim // cfg.o_groups, cfg.o_groups * cfg.o_lora_rank, bias=False, dtype=torch.bfloat16
         )
-        self.wo_b = nn.Linear(cfg.o_groups * cfg.o_lora_rank, cfg.dim, bias=False)
+        self.wo_b = ops.QLinear(cfg.o_groups * cfg.o_lora_rank, cfg.dim, act_fp8=act)
         self.compressor = Compressor(cfg, self.ratio) if spec.mode is AttnMode.FULL else None
         self.indexer = Indexer(cfg, spec, quant) if spec.mode in (AttnMode.FULL, AttnMode.REINDEX) else None
         if self.ratio:
@@ -296,11 +300,11 @@ class Gate(nn.Module):
 
 
 class Expert(nn.Module):
-    def __init__(self, dim: int, inter_dim: int, swiglu_limit: float):
+    def __init__(self, dim: int, inter_dim: int, swiglu_limit: float, act_fp8: bool = False):
         super().__init__()
-        self.w1 = nn.Linear(dim, inter_dim, bias=False)
-        self.w2 = nn.Linear(inter_dim, dim, bias=False)
-        self.w3 = nn.Linear(dim, inter_dim, bias=False)
+        self.w1 = ops.QLinear(dim, inter_dim, act_fp8=act_fp8)
+        self.w2 = ops.QLinear(inter_dim, dim, act_fp8=act_fp8)
+        self.w3 = ops.QLinear(dim, inter_dim, act_fp8=act_fp8)
         self.swiglu_limit = swiglu_limit
 
     def forward(self, x: Tensor, weights: Tensor | None = None) -> Tensor:
@@ -318,14 +322,15 @@ class Expert(nn.Module):
 class MoE(nn.Module):
     """Reference MoE: routed experts in a loop plus the shared expert."""
 
-    def __init__(self, cfg: DSV41Config):
+    def __init__(self, cfg: DSV41Config, quant: QuantPoints | None = None):
         super().__init__()
         self.dim, self.n_routed_experts = cfg.dim, cfg.n_routed_experts
+        act = quant is not None and quant.linear_act_fp8
         self.gate = Gate(cfg)
         self.experts = nn.ModuleList(
-            Expert(cfg.dim, cfg.moe_inter_dim, cfg.swiglu_limit) for _ in range(cfg.n_routed_experts)
+            Expert(cfg.dim, cfg.moe_inter_dim, cfg.swiglu_limit, act) for _ in range(cfg.n_routed_experts)
         )
-        self.shared_experts = Expert(cfg.dim, cfg.moe_inter_dim, cfg.swiglu_limit)
+        self.shared_experts = Expert(cfg.dim, cfg.moe_inter_dim, cfg.swiglu_limit, act)
 
     def forward(self, x: Tensor) -> Tensor:
         shape = x.size()
@@ -348,8 +353,11 @@ class Block(nn.Module):
         self.norm_eps, self.hc_mult = cfg.norm_eps, cfg.hc_mult
         self.hc_sinkhorn_iters, self.hc_eps = cfg.hc_sinkhorn_iters, cfg.hc_eps
         self.attn = Attention(cfg, spec, quant)
-        self.ffn = MoE(cfg)
-        self.engram = Engram(cfg, layout, spec.engram_hash_index) if spec.engram_hash_index is not None else None
+        self.ffn = MoE(cfg, quant)
+        self.engram = (
+            Engram(cfg, layout, spec.engram_hash_index, act_fp8=quant.linear_act_fp8)
+            if spec.engram_hash_index is not None else None
+        )
         self.attn_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         self.ffn_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         mix_hc, hc_dim = (2 + cfg.hc_mult) * cfg.hc_mult, cfg.hc_mult * cfg.dim

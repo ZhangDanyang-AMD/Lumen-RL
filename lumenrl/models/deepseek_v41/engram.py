@@ -14,6 +14,7 @@ import torch
 from torch import Tensor, nn
 
 from lumenrl.models.deepseek_v41.config import DSV41Config
+from lumenrl.models.deepseek_v41.ops import QLinear
 
 
 def find_next_prime(start: int, seen_primes: set[int]) -> int:
@@ -171,14 +172,14 @@ class Engram(nn.Module):
     """h + gate * value, written into every hyper-connection copy; the gate is a signed-sqrt
     sigmoid of the normalized dot product between each copy and its key."""
 
-    def __init__(self, cfg: DSV41Config, layout: EngramLayout, hash_index: int):
+    def __init__(self, cfg: DSV41Config, layout: EngramLayout, hash_index: int, act_fp8: bool = False):
         super().__init__()
         self.hash_index = hash_index
         self.dim, self.hc_mult, self.eps = cfg.dim, cfg.hc_mult, cfg.norm_eps
         self.clamp_value = 1e-6
         self.embed = EngramTable(layout.num_embeddings[hash_index], layout.head_dim)
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
-        self.wkv = nn.Linear(n_hash_cols * layout.head_dim, cfg.dim * (cfg.hc_mult + 1), bias=False)
+        self.wkv = QLinear(n_hash_cols * layout.head_dim, cfg.dim * (cfg.hc_mult + 1), act_fp8=act_fp8)
         self.q_weight = nn.Parameter(torch.ones(cfg.hc_mult, cfg.dim))
         self.k_weight = nn.Parameter(torch.ones(cfg.hc_mult, cfg.dim))
 

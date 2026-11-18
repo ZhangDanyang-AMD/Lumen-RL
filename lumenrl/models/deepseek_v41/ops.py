@@ -73,6 +73,21 @@ def straight_through(x: Tensor, quantized: Tensor) -> Tensor:
     return x + (quantized - x).detach()
 
 
+class QLinear(torch.nn.Linear):
+    """A bias-free linear layer the release stores in FP8 or FP4. The release's GEMMs take its input
+    quantized to FP8 (E4M3, a power-of-two scale per 32 inputs: `linear` in `inference/model.py`);
+    with `act_fp8` that is reproduced as fake quantization with a straight-through gradient."""
+
+    def __init__(self, in_features: int, out_features: int, *, act_fp8: bool = False, **kwargs):
+        super().__init__(in_features, out_features, bias=False, **kwargs)
+        self.act_fp8 = act_fp8
+
+    def forward(self, x: Tensor) -> Tensor:
+        if self.act_fp8:
+            x = straight_through(x, fp8_fake_quant(x.detach(), 32, pow2_scale=True))
+        return torch.nn.functional.linear(x, self.weight)
+
+
 def sparse_attention(q: Tensor, kv: Tensor, attn_sink: Tensor, topk_idxs: Tensor, softmax_scale: float) -> Tensor:
     """Shared-KV sparse attention with a per-head sink logit (`sparse_attn`).
 

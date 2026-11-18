@@ -100,3 +100,23 @@ def test_straight_through_passes_the_gradient_unchanged():
 
     assert torch.equal(x.grad, torch.ones_like(x))
     assert torch.equal(y.detach(), ops.fp8_fake_quant(x.detach(), 32))
+
+
+def test_qlinear_quantizes_its_input_and_passes_the_gradient_straight_through():
+    torch.manual_seed(0)
+    layer = ops.QLinear(64, 16, act_fp8=True)
+    x = (torch.randn(3, 64) * 5).requires_grad_()
+
+    y = layer(x)
+    y.sum().backward()
+
+    want = torch.nn.functional.linear(ops.fp8_fake_quant(x.detach(), 32, pow2_scale=True), layer.weight)
+    assert torch.equal(y, want) and not torch.equal(y, torch.nn.functional.linear(x, layer.weight))
+    assert torch.equal(x.grad, layer.weight.sum(0).expand(3, -1))
+
+
+def test_qlinear_without_act_fp8_is_a_plain_linear():
+    layer = ops.QLinear(64, 16)
+    x = torch.randn(3, 64)
+
+    assert layer.bias is None and torch.equal(layer(x), torch.nn.functional.linear(x, layer.weight))

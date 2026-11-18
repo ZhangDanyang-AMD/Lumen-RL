@@ -120,3 +120,13 @@ def test_a_split_inside_a_sharing_group_is_refused(model):
 def test_a_later_stage_needs_the_stream(model):
     with pytest.raises(ValueError, match="needs the previous stage's stream"):
         DSV41Stage(model.cfg, 4, 8)(_ids(5))
+
+
+def test_release_quantization_takes_fp8_inputs_exactly_where_the_release_stores_fp8_or_fp4(model):
+    # what the release stores in FP8 / FP4, but wo_a, whose input attn_out_fp8 quantizes
+    quantized = ("attn.wq_a", "attn.wq_b", "attn.wkv", "attn.wo_b", "indexer.wq_b", "experts.", "engram.wkv")
+    linears = {n: m for n, m in model.named_modules() if isinstance(m, torch.nn.Linear)}
+    act = {n for n, m in linears.items() if getattr(m, "act_fp8", False)}
+
+    assert act == {n for n in linears if any(k in n for k in quantized) and "compressor" not in n}
+    assert any("shared_experts" in n for n in act) and any(".experts.0.w2" in n for n in act)

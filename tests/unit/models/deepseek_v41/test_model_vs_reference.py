@@ -108,7 +108,8 @@ def pair(reference, monkeypatch):
         torch.set_default_dtype(previous)
     with torch.no_grad():
         _init(ref, 0)
-    ours = DSV41Model(_config(rows), token_map=torch.tensor(_token_map()))
+    # The reference holds BF16 weights here, so its linear layers take unquantized activations.
+    ours = DSV41Model(_config(rows), token_map=torch.tensor(_token_map()), quant=QuantPoints(linear_act_fp8=False))
     for name, t in ref.state_dict().items():
         assert ours.state_dict()[name].dtype == t.dtype, name
     ours.load_state_dict(ref.state_dict(), strict=True)
