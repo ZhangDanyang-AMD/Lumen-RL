@@ -533,7 +533,8 @@ def install_action_velocity_graphs() -> None:
     a call copies its inputs into the graph's static tensors and replays. The KV cache
     of a condition is copied once per condition, not once per call. Inside the graphs the per-layer
     ``cat`` of the cached video K/V and the action K/V writes only the action rows behind the video rows
-    of a static buffer (bit-identical; ``SIMWAM_GRPO_KV_SLOT=0`` captures the plain ``cat``).
+    of a static buffer (bit-identical; ``SIMWAM_GRPO_KV_SLOT=0`` captures the plain ``cat``; the deterministic
+    eval always does).
     ``SIMWAM_GRPO_CUDA_GRAPH=0`` turns this off; ``SIMWAM_GRPO_CUDA_GRAPH_VERIFY=1``
     also runs eager on every call and counts outputs that are not bit-identical.
     """
@@ -550,6 +551,7 @@ def install_action_velocity_graphs() -> None:
     graphs = {}
     stats = {"replay": 0, "eager": 0, "mismatch": 0, "loads": 0, "kv_slots": 0, "kv_slot_cats": 0}
     serial = [0]
+    in_eval = [False]
     slots = {}
     xshared = {}
     torch_cat = torch.cat
@@ -597,7 +599,7 @@ def install_action_velocity_graphs() -> None:
         out.update(video_kv_cache=kv, context=tensors[-3], context_mask=tensors[-2], attention_mask=tensors[-1])
         return out
 
-    def capture(self, latents, timestep, cond, use_ref, tensors, xkv=None):
+    def capture(self, latents, timestep, cond, use_ref, tensors, xkv=None, slot=False):
         # ActionDiT keeps its RoPE table as a plain CPU attribute and copies it to the
         # device on every forward; a pageable host copy cannot be captured.
         for expert in (self.action_expert, getattr(self, "ref_action_expert", None)):
@@ -610,10 +612,10 @@ def install_action_velocity_graphs() -> None:
         s_lat.copy_(latents)
         s_t = timestep.clone()
         s_tensors = [t if _kv_shared(t) else t.clone() for t in tensors]
-        if kv_slot:
+        if slot:
             slot_tensors(cond, tensors, s_tensors)
         s_cond = static_cond(cond, s_tensors)
-        if kv_slot:
+        if slot:
             torch.cat = slot_cat
         if xkv is not None:
             # the graph reads the per-layer context K/V from the shared buffers, refilled outside it
@@ -646,9 +648,10 @@ def install_action_velocity_graphs() -> None:
                if _RT.get("SIMWAM_GRPO_XATTN_KV") and _XKV["reps"] <= 1 and not _XKV.get("no_pre") else None)
         # the lean attention path bakes "masks are all True" into the graph
         lean = _LEAN_ATTN["flag"](cond, int(latents_action.shape[1])) if _LEAN_ATTN["flag"] else None
+        slot = kv_slot and not in_eval[0]
         key = (bool(use_ref), tuple(latents_action.shape), tuple(latents_action.stride()), tuple(timestep_action.shape),
                int(cond["video_seq_len"]), tuple((tuple(t.shape), t.dtype) for t in tensors), lean,
-               xkv is not None, _XKV["reps"])
+               xkv is not None, _XKV["reps"], slot)
         g = graphs.get(key)
         if g is None and lean is False:
             # hf_attn_patch falls back to torch SDPA when a host copy fails under capture, so a
@@ -656,7 +659,7 @@ def install_action_velocity_graphs() -> None:
             g = graphs[key] = False
         if g is None:
             try:
-                g = capture(self, latents_action, timestep_action, cond, use_ref, tensors, xkv)
+                g = capture(self, latents_action, timestep_action, cond, use_ref, tensors, xkv, slot)
             except Exception as exc:
                 logger.warning("CUDA graph capture of action_velocity failed (%s); using eager", exc)
                 g = False
@@ -696,6 +699,22 @@ def install_action_velocity_graphs() -> None:
     _STATS["cuda_graph"] = stats
     action_velocity.eager = eager
     ActionGRPOMixin.action_velocity = action_velocity
+
+    if kv_slot:
+        from simwam.trainer_grpo import SimWAMGRPOTrainer
+
+        eval_original = SimWAMGRPOTrainer._eval_deterministic
+
+        def eval_deterministic(self):
+            # the eval's condition is group_size times the rollout's: its graphs keep the plain cat instead of
+            # allocating slot buffers that size next to the static copies
+            in_eval[0] = True
+            try:
+                return eval_original(self)
+            finally:
+                in_eval[0] = False
+
+        SimWAMGRPOTrainer._eval_deterministic = eval_deterministic
     logger.info("action_velocity replays CUDA graphs under no_grad (verify=%s)", verify)
 
 
@@ -1425,10 +1444,51 @@ def install_batched_logprobs() -> None:
 _PDM_WORKER = {}
 
 
-def _pdm_worker_init(cls, args, kwargs):
+def _pdm_worker_init(cls, args, kwargs, barrier=None):
     logging.getLogger().setLevel(logging.WARNING)
     _PDM_WORKER["reward"] = cls(*args, **kwargs)
     _PDM_WORKER["cache"] = {}
+    _PDM_WORKER["barrier"] = barrier
+
+
+def _pdm_cache_put(cache, token, value):
+    cache[token] = value
+    # a long run sees each token rarely; keep only the latest ones instead of every token in every worker
+    while len(cache) > 8:
+        cache.pop(next(iter(cache)))
+
+
+_PDM_PREFETCH = {"on": False, "tokens": None}
+
+
+def _pdm_pool(reward, workers):
+    """The reward's persistent worker pool (created on first use), with the warm-up barrier when prefetching."""
+    pool = reward.__dict__.get("_pool")
+    if pool is None:
+        import multiprocessing as mp
+
+        ctx = mp.get_context("spawn")
+        barrier = ctx.Barrier(workers) if _PDM_PREFETCH["on"] else None
+        args, kwargs = reward._pool_init_args
+        pool = reward._pool = ctx.Pool(workers, initializer=_pdm_worker_init,
+                                       initargs=(type(reward), args, kwargs, barrier))
+        reward._pool_workers = workers
+    return pool
+
+
+def _pdm_worker_warm(token):
+    """Load ``token``'s metric cache into this worker ahead of its scoring (SIMWAM_GRPO_PDM_PREFETCH); the
+    barrier makes the pool's ``workers`` warm tasks land on distinct workers."""
+    reward, cache = _PDM_WORKER["reward"], _PDM_WORKER["cache"]
+    try:
+        if token not in cache and reward.available(token):
+            _pdm_cache_put(cache, token, reward.metric_cache_loader.get_from_token(token))
+        barrier = _PDM_WORKER.get("barrier")
+        if barrier is not None:
+            barrier.wait(timeout=2)
+    except Exception:  # noqa: BLE001  warming is best effort
+        pass
+    return True
 
 
 def _pdm_worker_score(task):
@@ -1442,10 +1502,8 @@ def _pdm_worker_score(task):
     cache = _PDM_WORKER["cache"]
     metric_cache = cache.get(token)
     if metric_cache is None:
-        metric_cache = cache[token] = reward.metric_cache_loader.get_from_token(token)
-        # a long run sees each token rarely; keep only the latest ones instead of every token in every worker
-        while len(cache) > 8:
-            cache.pop(next(iter(cache)))
+        metric_cache = reward.metric_cache_loader.get_from_token(token)
+        _pdm_cache_put(cache, token, metric_cache)
     t1 = time.perf_counter()
     reward._true_pdms, reward._submetric_rows = [], []
     try:
@@ -1487,11 +1545,7 @@ def install_parallel_pdm_reward() -> None:
     def score_batch(self, abs_poses, tokens, metric_cache_map=None, device=None):
         if metric_cache_map is not None or len(tokens) < 2 or not hasattr(self, "_pool_init_args"):
             return serial(self, abs_poses, tokens, metric_cache_map=metric_cache_map, device=device)
-        pool = self.__dict__.get("_pool")
-        if pool is None:
-            args, kwargs = self._pool_init_args
-            pool = self._pool = mp.get_context("spawn").Pool(
-                workers, initializer=_pdm_worker_init, initargs=(type(self), args, kwargs))
+        pool = _pdm_pool(self, workers)
         if isinstance(abs_poses, torch.Tensor):
             if device is None:
                 device = abs_poses.device
@@ -2015,6 +2069,9 @@ def install_aiter_rmsnorm() -> None:
     logger.info("SimWAM RMSNorm runs on AITER's CK rms_norm")
 
 
+_AITER_LINEAR = {"fn": None}
+
+
 def install_aiter_gemm() -> None:
     """``nn.Linear`` forward on aiter's tuned bf16 GEMM for the shapes in its tuned table.
 
@@ -2077,8 +2134,15 @@ def install_aiter_gemm() -> None:
             return _Linear.apply(x, w, b)
         return previous(self, x)
 
+    def linear2d(x2, w, b):
+        if x2.is_contiguous() and tuned(x2.shape[0], w.shape[0], x2.shape[1], b is not None, x2.dtype):
+            stats["aiter"] += 1
+            return state["fn"](x2, w, bias=b, otype=x2.dtype)
+        return None
+
     forward._aiter_gemm = True
     _STATS["aiter_gemm"] = stats
+    _AITER_LINEAR["fn"] = linear2d
     nn.Linear.forward = forward
     logger.info("nn.Linear runs aiter's tuned GEMM for the shapes in %s",
                 os.environ.get("AITER_CONFIG_GEMM_BF16", "aiter's default bf16 table"))
@@ -2183,6 +2247,14 @@ def install_fused_lora_add() -> None:
     alpha=scaling)`` rounds the same way. Inside a batched log-prob call the LoRA matmuls
     still run once per original step (as in ``install_batched_logprobs``), so the weight
     gradients come from the same per-step GEMMs. ``SIMWAM_GRPO_FUSED_LORA=0`` turns it off.
+
+    With ``SIMWAM_GRPO_LORA_CAT`` (default ``1``; ``0`` turns it off), after ``configure_grpo`` each adapter's
+    ``A`` is stored right below the frozen base weight in one tensor ``[W; A]`` (the parameters become views of
+    it, so the optimizer's in-place
+    updates land there), and the forward is one GEMM over ``[W; A]`` that gives the base output and ``x @ A.T``
+    together, then one kernel adding ``scaling * mid @ B.T`` (``fused_kernels.lora_linear``): two kernels per
+    adapted layer instead of four. Not bit-identical to the separate GEMMs; rollout and training take the same
+    path.
     """
     if not _switch("SIMWAM_GRPO_FUSED_LORA", "1"):
         return
@@ -2195,10 +2267,61 @@ def install_fused_lora_add() -> None:
     # SIMWAM_GRPO_LORA_ADDMM=1: the second LoRA GEMM accumulates into the base output (addmm, beta=1), so the
     # scaled add happens inside the GEMM in fp32 with one rounding instead of as a separate bf16 kernel
     _switch("SIMWAM_GRPO_LORA_ADDMM", "0")
+    lora_cat = _switch("SIMWAM_GRPO_LORA_CAT", "1")
+    cat_stats = {"modules": 0, "skipped": 0, "calls": 0, "fallback": 0}
+
+    def gemm(x2, w, b):
+        fn = _AITER_LINEAR["fn"]
+        y = fn(x2, w, b) if fn is not None else None
+        return torch.nn.functional.linear(x2, w, b) if y is None else y
+
+    def cat_setup(module):
+        base, a = module.base, module.lora_A
+        w = base.weight
+        if not (w.is_cuda and w.dtype == torch.bfloat16 and a.dtype == w.dtype and module.lora_B.is_contiguous()
+                and isinstance(module.lora_dropout, torch.nn.Identity) and module.r in (16, 32, 64)):
+            cat_stats["skipped"] += 1
+            return
+        n = w.shape[0]
+        with torch.no_grad():
+            wa = torch.cat([w, a])
+            ba = None if base.bias is None else torch.cat([base.bias, base.bias.new_zeros(module.r)])
+        w.data = wa[:n]
+        a.data = wa[n:]
+        if ba is not None:
+            base.bias.data = ba[:n]
+        module._lora_cat = (wa, ba, wa.data_ptr(), wa[n:].data_ptr())
+        cat_stats["modules"] += 1
+
+    if lora_cat:
+        from simwam.models.wan22.simwam_grpo import ActionGRPOMixin
+
+        configure_previous = ActionGRPOMixin.configure_grpo
+
+        def configure_grpo(self, grpo_cfg):
+            configure_previous(self, grpo_cfg)
+            # before any forward, so the CUDA graphs capture the final weight addresses
+            for module in self.modules():
+                if isinstance(module, LoRALinear):
+                    cat_setup(module)
+            logger.info("SIMWAM_GRPO_LORA_CAT: %d LoRA layers on [W; A] (%d skipped)", cat_stats["modules"],
+                        cat_stats["skipped"])
+
+        ActionGRPOMixin.configure_grpo = configure_grpo
+        _STATS["lora_cat"] = cat_stats
 
     def forward(self, x):
         if not _RT["SIMWAM_GRPO_FUSED_LORA"]:
             return previous(self, x)
+        cat = self.__dict__.get("_lora_cat")
+        if cat is not None and _RT["SIMWAM_GRPO_LORA_CAT"] and x.is_cuda and x.dtype == torch.bfloat16 \
+                and not _chunk_active(x):
+            if self.base.weight.data_ptr() == cat[2] and self.lora_A.data_ptr() == cat[3]:
+                from examples.Embodied_SimWAM_NAVSIM.fused_kernels import lora_linear
+
+                cat_stats["calls"] += 1
+                return lora_linear(x, self.lora_A, self.lora_B, cat[0], cat[1], self.scaling, gemm)
+            cat_stats["fallback"] += 1
         if _RT["SIMWAM_GRPO_LORA_ADDMM"] and not _chunk_active(x):
             out = self.base(x)
             mid = self.lora_dropout(x) @ self.lora_A.t()
@@ -2264,7 +2387,8 @@ def install_overlap_reward_logprobs() -> None:
     reference log-probs of the first inner epoch (stored where ``install_ref_logprob_cache``
     looks) are computed while the workers simulate, and the rewards are collected before the
     advantages. Everything else follows ``SimWAMGRPOTrainer._rollout``.
-    Needs both of those patches; ``SIMWAM_GRPO_OVERLAP_REWARD=0`` turns it off.
+    Needs both of those patches; ``SIMWAM_GRPO_OVERLAP_REWARD=0`` turns it off. The next batch's metric caches
+    are loaded into the workers while the current batch trains (``SIMWAM_GRPO_PDM_PREFETCH=0`` turns it off).
     """
     if os.environ.get("SIMWAM_GRPO_OVERLAP_REWARD", "1").strip().lower() in _OFF:
         return
@@ -2282,13 +2406,32 @@ def install_overlap_reward_logprobs() -> None:
         return
     rollout_orig = SimWAMGRPOTrainer._rollout
     workers = int(os.environ.get("SIMWAM_GRPO_PDM_WORKERS", "8") or 8)
+    if _switch("SIMWAM_GRPO_PDM_PREFETCH", "1"):
+        # A few tokens' metric caches take 0.3-0.6 s to load (lzma + unpickle, in all workers at once), and the
+        # rollout then waits for them (the other rank too). The batch after the current one is fetched one call
+        # early, its token's cache is loaded into every worker while the current batch trains (see collect), and
+        # the epoch / batch counters are kept as if it had not been fetched yet.
+        _PDM_PREFETCH["on"] = True
+        next_orig = SimWAMGRPOTrainer._next_batch
+
+        def _next_batch(self):
+            ahead = self.__dict__.pop("_pdm_ahead", None)
+            if ahead is None:
+                batch = next_orig(self)
+            else:
+                batch, counters = ahead
+                self.epoch, self.batch_in_epoch = counters
+            counters = (self.epoch, self.batch_in_epoch)
+            nxt = next_orig(self)
+            self._pdm_ahead = (nxt, (self.epoch, self.batch_in_epoch))
+            self.epoch, self.batch_in_epoch = counters
+            _PDM_PREFETCH["tokens"] = list(nxt["token"])
+            return batch
+
+        SimWAMGRPOTrainer._next_batch = _next_batch
 
     def submit(reward, abs_poses, tokens, device):
-        pool = reward.__dict__.get("_pool")
-        if pool is None:
-            args, kwargs = reward._pool_init_args
-            pool = reward._pool = mp.get_context("spawn").Pool(
-                workers, initializer=_pdm_worker_init, initargs=(type(reward), args, kwargs))
+        pool = _pdm_pool(reward, workers)
         poses_np = abs_poses.detach().to(device="cpu", dtype=torch.float32).numpy()
         return pool.map_async(_pdm_worker_score, [(t, poses_np[i]) for i, t in enumerate(tokens)])
 
@@ -2303,6 +2446,14 @@ def install_overlap_reward_logprobs() -> None:
             pdm["load_sum_ms"] = round(1000 * sum(t[0] for t in times), 1)
             pdm["sim_max_ms"] = round(1000 * max(t[1] for t in times), 1)
             pdm["sim_sum_ms"] = round(1000 * sum(t[1] for t in times), 1)
+        nxt = _PDM_PREFETCH["tokens"]
+        if _PDM_PREFETCH["on"] and nxt:
+            # the pool is idle until the next rollout scores: load the next batch's metric caches now
+            _PDM_PREFETCH["tokens"] = None
+            pool = _pdm_pool(reward, workers)
+            for token in dict.fromkeys(nxt):
+                pool.map_async(_pdm_worker_warm, [token] * reward._pool_workers, chunksize=1)
+            _STATS.setdefault("pdm", {"rollouts": 0})["prefetched"] = _STATS["pdm"].get("prefetched", 0) + 1
         reward.last_num_total = len(tokens)
         reward.last_num_missing = 0
         reward.last_num_failed = 0

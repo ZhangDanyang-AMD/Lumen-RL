@@ -163,3 +163,62 @@ def layernorm_modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     """``layer_norm(x, eps) * (1 + scale) + shift`` without affine weights, over the last dim of ``x`` [B, S, D],
     in fp32 and one launch each way; ``shift`` / ``scale`` broadcast to ``x`` (3-D, last dim dense)."""
     return _LayerNormModulate.apply(x, shift, scale, eps)
+
+
+@triton.jit
+def _lora_up_add_kernel(y_ptr, b_ptr, o_ptr, n_rows, n_cols, stride_y, scale,
+                        R: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    rr = tl.arange(0, R)
+    rmask = rows < n_rows
+    cmask = cols < n_cols
+    mid = tl.load(y_ptr + rows[:, None] * stride_y + n_cols + rr[None, :], mask=rmask[:, None], other=0.0)
+    bt = tl.load(b_ptr + cols[None, :] * R + rr[:, None], mask=cmask[None, :], other=0.0)
+    up = tl.dot(mid, bt)
+    mask = rmask[:, None] & cmask[None, :]
+    base = tl.load(y_ptr + rows[:, None] * stride_y + cols[None, :], mask=mask, other=0.0).to(tl.float32)
+    tl.store(o_ptr + rows[:, None] * n_cols + cols[None, :], (base + scale * up).to(o_ptr.dtype.element_ty), mask=mask)
+
+
+class _LoRALinearCat(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, lora_a, lora_b, wa, bias_a, scale, gemm):
+        r = lora_a.shape[0]
+        n = wa.shape[0] - r
+        x2 = x.reshape(-1, x.shape[-1])
+        y = gemm(x2, wa, bias_a)
+        m = y.shape[0]
+        out = torch.empty((m, n), dtype=x.dtype, device=x.device)
+        block_m = 16 if m <= 16 else 32 if m <= 64 else 64
+        _lora_up_add_kernel[(triton.cdiv(m, block_m), triton.cdiv(n, 128))](
+            y, lora_b, out, m, n, y.stride(0), scale, R=r, BLOCK_M=block_m, BLOCK_N=128)
+        if any(ctx.needs_input_grad[:3]):
+            ctx.save_for_backward(x2, y[:, n:].contiguous(), lora_b, wa)
+        ctx.scale, ctx.x_shape = scale, x.shape
+        return out.view(*x.shape[:-1], n)
+
+    @staticmethod
+    def backward(ctx, grad):
+        x2, mid, lora_b, wa = ctx.saved_tensors
+        n = lora_b.shape[0]
+        g2 = grad.reshape(-1, n)
+        # scaled after the rank-r GEMMs instead of on the full gradient: the same values for a power-of-two scale
+        dmid = (g2 @ lora_b) * ctx.scale
+        dx = da = db = None
+        if ctx.needs_input_grad[0]:
+            dx = (g2 @ wa[:n] + dmid @ wa[n:]).view(ctx.x_shape)
+        if ctx.needs_input_grad[1]:
+            da = dmid.t() @ x2
+        if ctx.needs_input_grad[2]:
+            db = (g2.t() @ mid) * ctx.scale
+        return dx, da, db, None, None, None, None
+
+
+def lora_linear(x: torch.Tensor, lora_a: torch.Tensor, lora_b: torch.Tensor, wa: torch.Tensor,
+                bias_a, scale: float, gemm) -> torch.Tensor:
+    """``x @ W.T + bias + scale * (x @ A.T) @ B.T`` where ``wa`` is ``[W; A]`` in one tensor (``lora_a`` is its
+    last ``r`` rows) and ``bias_a`` the bias padded with ``r`` zeros: one GEMM ``gemm(x2d, wa, bias_a)`` gives the
+    base output and ``x @ A.T`` side by side, then one kernel adds ``scale * mid @ B.T`` in fp32 and rounds once.
+    The backward runs torch GEMMs; ``lora_a`` / ``lora_b`` receive the adapter gradients."""
+    return _LoRALinearCat.apply(x, lora_a, lora_b, wa, bias_a, scale, gemm)
