@@ -4,8 +4,11 @@
 # (dapo_qwen3_8b_ray_atom_bf16_longrun.yaml): DAPO-Math-17k, AIME 2024 every 10
 # steps and once before the first (mean@8).
 #
-#   * 16K context, thinking at reasoning effort low: V4.1's template defaults to
-#     high, and at a 2K budget 39-67% of its responses ran out.
+#   * Chat mode (no thinking), 10K context. Thinking, even at reasoning effort low,
+#     V4.1 is at the ceiling of this recipe: step-0 accuracy 0.948 on DAPO-Math,
+#     0.955 on AIME 1983-2023, AIME 2024 mean@8 0.917 -- little a run could show.
+#     In chat mode 0.827 on DAPO-Math (29% of prompts solved 1-3 times of 4) and
+#     AIME 2024 mean@8 0.750 (Inferact measured 0.737); responses p99 5.5K tokens.
 #   * ATOM asleep through training, its weights on the host (V4.1's frozen
 #     routed experts are never synced, so ATOM's own sleep would lose them).
 #   * No checkpoints: with the frozen experts a checkpoint of this model is ~1 TB.
@@ -27,12 +30,12 @@ policy:
   model_name: "/mnt/m2m_nobackup/xysheng/models/DeepSeek-V4.1-Flash"
   training_backend: megatron_native
   generation_backend: atom
-  max_total_sequence_length: 16384
-  max_response_length: 15360
+  max_total_sequence_length: 10240
+  max_response_length: 8192
   train_global_batch_size: 128          # 16 prompts x 8 generations
   gen_batch_size: 16
   train_micro_batch_size: 1
-  max_token_len_per_gpu: 16384
+  max_token_len_per_gpu: 10240
   learning_rate: 1.0e-6
   lr_warmup_steps: 0
   weight_decay: 0.1
@@ -64,7 +67,7 @@ policy:
       optimizer_offload: false
   generation:
     chat_template_kwargs:
-      reasoning_effort: low
+      thinking_mode: chat
     atom_cfg:
       transport: ray_http
       tensor_parallel_size: 4
@@ -82,7 +85,7 @@ policy:
       transport: ray_http
       ray_http_start_server: false
       gpu_memory_utilization: 0.70
-      max_model_len: 16384
+      max_model_len: 10240
       dtype: bfloat16
       enforce_eager: true
       enable_chunked_prefill: true
@@ -114,14 +117,14 @@ algorithm:
     dynamic_sampling: true
     token_level_pg: true
     overlong_reward_shaping: true
-    max_resp_len: 15360
+    max_resp_len: 8192
     filter_groups:
       enable: false
       metric: acc
       max_num_gen_batches: 10
     overlong_buffer:
       enable: true
-      len: 2048
+      len: 1024
       penalty_factor: 1.0
       log: false
 
