@@ -573,7 +573,7 @@ def install_action_velocity_graphs() -> None:
         sa = int(cond["attention_mask"].shape[0]) - sv
         for i in range(2 * len(cond["video_kv_cache"])):
             t = tensors[i]
-            if t.dim() != 3 or t.shape[1] != sv or sa <= 0:
+            if t.dim() != 3 or t.shape[1] != sv or sa <= 0 or _kv_shared(t):
                 continue
             full = torch.empty((t.shape[0], sv + sa, t.shape[2]), dtype=t.dtype, device=t.device)
             view = full[:, :sv]
@@ -605,7 +605,7 @@ def install_action_velocity_graphs() -> None:
         s_lat = torch.empty_strided(latents.shape, latents.stride(), dtype=latents.dtype, device=latents.device)
         s_lat.copy_(latents)
         s_t = timestep.clone()
-        s_tensors = [t.clone() for t in tensors]
+        s_tensors = [t if _kv_shared(t) else t.clone() for t in tensors]
         if kv_slot:
             slot_tensors(cond, tensors, s_tensors)
         s_cond = static_cond(cond, s_tensors)
@@ -655,7 +655,7 @@ def install_action_velocity_graphs() -> None:
             serial[0] += 1
             tag = cond["_cuda_graph_tag"] = serial[0]
         if g["loaded"] != tag:
-            torch._foreach_copy_(g["tensors"], tensors)
+            _copy_changed(g["tensors"], tensors)
             g["loaded"] = tag
             stats["loads"] += 1
         g["lat"].copy_(latents_action)
@@ -770,7 +770,9 @@ def install_prefill_graph() -> None:
     captured per input signature (shapes, strides, dtypes, and whether the masks are all True);
     a call copies its inputs into the graph's static tensors, replays, and returns a copy of the
     per-layer K/V. Grad-enabled calls, inputs not all on the GPU and failed captures run eagerly.
-    ``SIMWAM_GRPO_PREFILL_GRAPH=0`` turns it off.
+    ``SIMWAM_GRPO_PREFILL_GRAPH=0`` turns it off. ``SIMWAM_GRPO_PREFILL_NOCOPY=1`` returns the graph's own
+    output tensors (aliases) instead of a copy; a call whose previous outputs are still referenced (the
+    storages' use counts are above the graph's own) runs eagerly instead of overwriting them.
     """
     if not _switch("SIMWAM_GRPO_PREFILL_GRAPH", "1"):
         return
@@ -782,7 +784,12 @@ def install_prefill_graph() -> None:
         return
     eager = MoT.prefill_video_cache
     graphs = {}
-    stats = {"replay": 0, "eager": 0, "captured": 0}
+    stats = {"replay": 0, "eager": 0, "captured": 0, "nocopy": 0, "busy_eager": 0}
+    use_count = getattr(torch._C, "_storage_Use_Count", None)
+    nocopy = _switch("SIMWAM_GRPO_PREFILL_NOCOPY", "0") and use_count is not None
+
+    def out_storages(out):
+        return [t.untyped_storage()._cdata for t in tree_flatten(out)[0] if torch.is_tensor(t)]
 
     def capture(self, leaves, spec, flag):
         static, static_leaves = [], []
@@ -809,7 +816,11 @@ def install_prefill_graph() -> None:
         _DROP["prefill_flag"] = flag
         with torch.cuda.graph(graph):
             out = eager(self, *args)
-        return {"graph": graph, "static": static, "out": out}
+        g = {"graph": graph, "static": static, "out": out}
+        if nocopy:
+            g["storages"] = out_storages(out)
+            g["base"] = [use_count(c) for c in g["storages"]]
+        return g
 
     def prefill_video_cache(self, video_tokens, video_freqs, video_t_mod, video_context_payload,
                             video_attention_mask):
@@ -835,10 +846,16 @@ def install_prefill_graph() -> None:
         if g is False:
             stats["eager"] += 1
             return eager(self, *args)
+        if nocopy and any(use_count(c) > b for c, b in zip(g["storages"], g["base"])):
+            stats["busy_eager"] += 1
+            return eager(self, *args)
         for s, t in zip(g["static"], tensors):
             s.copy_(t)
         g["graph"].replay()
         stats["replay"] += 1
+        if nocopy:
+            stats["nocopy"] += 1
+            return tree_map(lambda t: t.detach() if torch.is_tensor(t) else t, g["out"])
         return tree_map(lambda t: t.clone() if torch.is_tensor(t) else t, g["out"])
 
     prefill_video_cache._graph = True
@@ -847,7 +864,49 @@ def install_prefill_graph() -> None:
     logger.info("the video prefill replays a CUDA graph")
 
 
+def install_eval_empty_cache() -> None:
+    """Return the allocator's cached blocks to the device after each deterministic eval.
+
+    The eval runs its own shapes on top of the training's resident memory and is the peak; its cached
+    blocks would otherwise stay reserved for the rest of the run. ``SIMWAM_GRPO_EVAL_EMPTY_CACHE=0`` turns
+    it off.
+    """
+    if not _switch("SIMWAM_GRPO_EVAL_EMPTY_CACHE", "1"):
+        return
+    import torch
+    from simwam.trainer_grpo import SimWAMGRPOTrainer
+
+    if getattr(SimWAMGRPOTrainer._eval_deterministic, "_empty_cache", False):
+        return
+    original = SimWAMGRPOTrainer._eval_deterministic
+
+    def eval_deterministic(self):
+        try:
+            return original(self)
+        finally:
+            torch.cuda.empty_cache()
+
+    eval_deterministic._empty_cache = True
+    SimWAMGRPOTrainer._eval_deterministic = eval_deterministic
+    logger.info("the allocator cache is emptied after each deterministic eval")
+
+
 _CHUNK = {"sizes": None, "views": None, "ops": frozenset(), "lumen": None}
+# data pointers of the repeated-condition buffers that SIMWAM_GRPO_SHARED_KV shares between the batched
+# log-prob calls; the CUDA graphs use them as their static inputs instead of keeping copies
+_KV_SHARE = {"ptrs": set()}
+
+
+def _kv_shared(t) -> bool:
+    return bool(_KV_SHARE["ptrs"]) and t.data_ptr() in _KV_SHARE["ptrs"]
+
+
+def _copy_changed(dst, src) -> None:
+    pairs = [(d, s) for d, s in zip(dst, src) if d.data_ptr() != s.data_ptr()]
+    if pairs:
+        import torch
+
+        torch._foreach_copy_([d for d, _ in pairs], [s for _, s in pairs])
 
 
 def _chunk_active(x) -> bool:
@@ -964,6 +1023,9 @@ def install_batched_logprobs() -> None:
     steps (no per-step split); ``SIMWAM_GRPO_BATCHED_LOGP_NOGRAD`` batches the no-grad calls (the
     rollout's old and reference log-probs) the same way, so they take the training path and the
     rollout's log-probs match the first inner update's. Set both to ``0`` for the per-step path.
+    ``SIMWAM_GRPO_SHARED_KV`` (on; ``0`` turns it off) keeps the condition repeated ``W`` times (video K/V,
+    context) in one set of buffers per shape instead of one copy per condition plus one per CUDA graph that
+    reads it.
     """
     if os.environ.get("SIMWAM_GRPO_BATCHED_LOGP", "1").strip().lower() in _OFF:
         return
@@ -981,11 +1043,49 @@ def install_batched_logprobs() -> None:
     verify = os.environ.get("SIMWAM_GRPO_BATCHED_LOGP_VERIFY", "0") == "1"
     one_gemm = os.environ.get("SIMWAM_GRPO_BATCHED_GEMM", "1").strip().lower() not in _OFF
     nograd = os.environ.get("SIMWAM_GRPO_BATCHED_LOGP_NOGRAD", "1").strip().lower() not in _OFF
+    share = _switch("SIMWAM_GRPO_SHARED_KV", "1")
+    shared, share_serial = {}, [0]
     stats = {"batched": 0, "batched_nograd": 0, "fwd_mismatch": 0, "grad_mismatch": 0, "grad_checked": 0,
-             "max_grad_diff": 0.0}
+             "max_grad_diff": 0.0, "shared_bufs": 0, "shared_fills": 0}
     original = ActionGRPOMixin.action_chain_logprobs
 
+    def shared_repeat(cond, w):
+        # the repeated K/V and context live in one set of buffers per shape, shared by every condition and
+        # read in place by the CUDA graphs; the buffers record which condition they hold and are refilled
+        # (the same concatenation, written with out=) when another one is used
+        key = f"_batched_logp_x{w}"
+        tag = cond.get("_kv_share_tag")
+        if tag is None:
+            share_serial[0] += 1
+            tag = cond["_kv_share_tag"] = share_serial[0]
+        src = [t for layer in cond["video_kv_cache"] for t in (layer["k"], layer["v"])]
+        src += [cond["context"], cond["context_mask"]]
+        sig = (w, tuple((tuple(t.shape), t.dtype, str(t.device)) for t in src))
+        entry = shared.get(sig)
+        if entry is None:
+            bufs = [torch.empty((t.shape[0] * w, *t.shape[1:]), dtype=t.dtype, device=t.device) for t in src]
+            entry = shared[sig] = {"bufs": bufs, "owner": None}
+            _KV_SHARE["ptrs"].update(b.data_ptr() for b in bufs)
+            stats["shared_bufs"] += len(bufs)
+        if entry["owner"] != tag:
+            for b, t in zip(entry["bufs"], src):
+                torch.cat([t] * w, dim=0, out=b)
+            entry["owner"] = tag
+            stats["shared_fills"] += 1
+        rep = cond.get(key)
+        if rep is None:
+            bufs, n = entry["bufs"], len(cond["video_kv_cache"])
+            rep = dict(cond)
+            rep.pop("_cuda_graph_tag", None)
+            rep.pop("_kv_share_tag", None)
+            rep["video_kv_cache"] = [{"k": bufs[2 * i], "v": bufs[2 * i + 1]} for i in range(n)]
+            rep["context"], rep["context_mask"] = bufs[2 * n], bufs[2 * n + 1]
+            cond[key] = rep
+        return rep
+
     def repeat_cond(cond, w):
+        if share:
+            return shared_repeat(cond, w)
         key = f"_batched_logp_x{w}"
         rep = cond.get(key)
         if rep is None:
@@ -1313,8 +1413,9 @@ def install_train_graphs() -> None:
                 expert.freqs = freqs.to(args[0].device)
         layers = len(cond["video_kv_cache"])
         rest = {k: v for k, v in cond.items() if k not in _COND and k != "_cuda_graph_tag"}
-        inputs = [torch.empty_strided(t.shape, t.stride(), dtype=t.dtype, device=t.device) for t in args]
-        torch._foreach_copy_(inputs, list(args))
+        inputs = [t if _kv_shared(t) else torch.empty_strided(t.shape, t.stride(), dtype=t.dtype, device=t.device)
+                  for t in args]
+        _copy_changed(inputs, list(args))
         static_views = {}
         for base, (wid, geo) in zip(inputs[2 + n_cond:], geometry):
             static_views[wid] = [base.as_strided(shape, stride, base.storage_offset() + offset)
@@ -1693,6 +1794,75 @@ def install_aiter_rmsnorm() -> None:
     forward._aiter = True
     wvd.RMSNorm.forward = forward
     logger.info("SimWAM RMSNorm runs on AITER's CK rms_norm")
+
+
+def install_aiter_gemm() -> None:
+    """``nn.Linear`` forward on aiter's tuned bf16 GEMM for the shapes in its tuned table.
+
+    ``aiter.tuned_gemm.gemm_a16w16`` looks the shape up in ``AITER_CONFIG_GEMM_BF16`` and runs the tuned
+    backend and configuration (hipBLASLt solution, asm, Triton, ...). A shape is routed there only when the
+    table has it with a backend other than torch and without split-K, so the forward stays deterministic; the
+    rollout and the training forward have the same shapes and so run the same kernel. The backward (input,
+    and weight / bias gradients when needed) is torch's. Non-contiguous inputs, per-step split calls and
+    other dtypes keep the previous path. ``SIMWAM_GRPO_AITER_GEMM=1`` turns it on.
+    """
+    if not _switch("SIMWAM_GRPO_AITER_GEMM", "0"):
+        return
+    import torch
+    import torch.nn as nn
+
+    if getattr(nn.Linear.forward, "_aiter_gemm", False):
+        return
+    # aiter_conv's conv3d loader puts the Triton utils / kernel directories of the $AITER_SRC checkout in front
+    # of the installed aiter's packages for good; import the installed tuned GEMM and its Triton backend now,
+    # before the LumenConfig flags run, or their first call imports mismatched modules from that checkout
+    from aiter.tuned_gemm import gemm_a16w16
+    import aiter.ops.triton.gemm.basic.gemm_a16w16  # noqa: F401
+
+    previous = nn.Linear.forward
+    state = {"fn": gemm_a16w16, "tuned": {}}
+    stats = {"aiter": 0}
+
+    def tuned(m, n, k, bias, dtype):
+        key = (m, n, k, bias, dtype)
+        hit = state["tuned"].get(key)
+        if hit is None:
+            from aiter.tuned_gemm import get_GEMM_A16W16_config
+
+            cfg = get_GEMM_A16W16_config(M=m, N=n, K=k, bias=bias, dtype=str(dtype), otype=str(dtype))
+            hit = state["tuned"][key] = cfg.get("libtype") not in (None, "torch") and not cfg.get("splitK")
+        return hit
+
+    class _Linear(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, weight, bias):
+            ctx.save_for_backward(x, weight)
+            ctx.has_bias = bias is not None
+            return state["fn"](x, weight, bias=bias, otype=x.dtype)
+
+        @staticmethod
+        def backward(ctx, grad):
+            x, weight = ctx.saved_tensors
+            g2 = grad.reshape(-1, grad.shape[-1])
+            dx = (g2 @ weight).view(x.shape) if ctx.needs_input_grad[0] else None
+            dw = g2.t() @ x.reshape(-1, x.shape[-1]) if ctx.needs_input_grad[1] else None
+            db = g2.sum(0) if ctx.has_bias and ctx.needs_input_grad[2] else None
+            return dx, dw, db
+
+    def forward(self, x):
+        w, b = self.weight, self.bias
+        if (x.is_cuda and x.dtype == torch.bfloat16 and w.dtype == torch.bfloat16 and x.dim() >= 2
+                and x.is_contiguous() and not _chunk_active(x)
+                and tuned(x.numel() // x.shape[-1], w.shape[0], x.shape[-1], b is not None, x.dtype)):
+            stats["aiter"] += 1
+            return _Linear.apply(x, w, b)
+        return previous(self, x)
+
+    forward._aiter_gemm = True
+    _STATS["aiter_gemm"] = stats
+    nn.Linear.forward = forward
+    logger.info("nn.Linear runs aiter's tuned GEMM for the shapes in %s",
+                os.environ.get("AITER_CONFIG_GEMM_BF16", "aiter's default bf16 table"))
 
 
 def install_triton_rope() -> None:

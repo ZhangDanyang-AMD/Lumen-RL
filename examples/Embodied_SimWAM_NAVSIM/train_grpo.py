@@ -23,10 +23,12 @@ from omegaconf import DictConfig
 
 from examples.Embodied_SimWAM_NAVSIM.plugin import (
     install_action_velocity_graphs,
+    install_aiter_gemm,
     install_aiter_rmsnorm,
     install_batched_logprobs,
     install_compiled_rmsnorm,
     install_drop_true_masks,
+    install_eval_empty_cache,
     install_foreach_grad_checks,
     install_fused_modulate,
     install_fused_lora_add,
@@ -64,11 +66,14 @@ install_train_graphs()
 install_parallel_pdm_reward()
 install_compiled_rmsnorm()
 install_aiter_rmsnorm()
+# outermost nn.Linear patch (after install_batched_logprobs' per-step split)
+install_aiter_gemm()
 install_triton_rope()
 install_fused_modulate()
 install_fused_lora_add()
 install_overlap_reward_logprobs()
 install_foreach_grad_checks()
+install_eval_empty_cache()
 install_numa_affinity()
 register_default_resolvers()
 
