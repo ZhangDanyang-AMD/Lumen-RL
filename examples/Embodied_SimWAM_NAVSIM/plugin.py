@@ -315,6 +315,144 @@ def install_lean_lumen_attention() -> None:
         _LEAN_ATTN["flag"] = lambda cond, action_len: mask_flag(cond, action_len) if inner["sdpa"] is not None else None
 
 
+_DROP = {"on": False}
+
+
+def _masks_all_true(cond) -> bool:
+    flag = cond.get("_masks_all_true")
+    if flag is None:
+        vs, al = int(cond["video_seq_len"]), int(cond["action_horizon"])
+        flag = bool(cond["attention_mask"][vs:vs + al, :vs + al].all()) and bool(cond["context_mask"].all())
+        cond["_masks_all_true"] = flag
+    return flag
+
+
+def install_drop_true_masks() -> None:
+    """Call SDPA without the attention masks when they are all True.
+
+    In this example every mask the action expert and the video prefill pass to SDPA is all True:
+    the GRPO condition is a single frame (so ``first_frame_causal`` masks nothing), the action rows
+    of the MoT mask see every video and action token, and the NAVSIM dataset sets the text mask to
+    ones (``context_mask = torch.ones_like(...)`` after zeroing the padding). A bool mask still
+    sends SDPA to the masked kernels (``hf_attn_patch``'s Lumen Triton for no-grad calls, aotriton
+    with a bias for grad-enabled ones); without it torch takes its flash path for both, so
+    rollout and training run the same attention forward. The masks are checked once per
+    condition (``build_action_condition`` / ``expand_condition``, outside any CUDA graph) and per
+    video prefill; a condition with a False entry keeps the masked path. Not bit-identical to
+    the masked kernels. ``SIMWAM_GRPO_DROP_MASKS=1`` turns it on.
+    With ``SIMWAM_GRPO_AITER_FMHA_GRAD=1`` the grad-enabled calls without a mask go to AITER's
+    Triton ``flash_attn_func`` (forward and backward) instead of torch's flash path; no-grad calls
+    stay on torch, whose flash forward is AITER's CK kernel already. ``=all`` sends the no-grad
+    calls to the same Triton kernel too, so rollout and training attention match again.
+    """
+    if os.environ.get("SIMWAM_GRPO_DROP_MASKS", "0").strip().lower() in _OFF:
+        return
+    import torch
+    import torch.nn.functional as F
+    from simwam.models.wan22.mot import MoT
+    from simwam.models.wan22.simwam_grpo import ActionGRPOMixin
+
+    if getattr(ActionGRPOMixin.action_velocity, "_drop_masks", False):
+        return
+    torch_sdpa = torch._C._nn.scaled_dot_product_attention
+    fmha_mode = os.environ.get("SIMWAM_GRPO_AITER_FMHA_GRAD", "0").strip().lower()
+    fmha_grad = fmha_mode not in _OFF
+    fmha_all = fmha_mode == "all"
+    stats = {"dropped": 0, "masked": 0, "aiter_fmha": 0}
+    state = {"fa": None}
+
+    def aiter_fmha(query, key, value, args, kwargs):
+        # SDPA's positional order after attn_mask: dropout_p, is_causal, scale
+        opts = dict(zip(("dropout_p", "is_causal", "scale"), args))
+        opts.update(kwargs)
+        grad = torch.is_grad_enabled() and (query.requires_grad or key.requires_grad or value.requires_grad)
+        if (set(opts) - {"dropout_p", "is_causal", "scale"} or opts.get("dropout_p") or opts.get("is_causal")
+                or not (grad or fmha_all)):
+            return None
+        if state["fa"] is None:
+            from aiter.ops.triton.mha import flash_attn_func
+
+            state["fa"] = flash_attn_func
+        scale = opts.get("scale") or query.shape[-1] ** (-0.5)
+        stats["aiter_fmha"] += 1
+        out = state["fa"](query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), dropout_p=0.0,
+                          softmax_scale=scale, causal=False)
+        if isinstance(out, (tuple, list)):
+            out = out[0]
+        return out.transpose(1, 2)
+
+    def wrap_sdpa(prev):
+        def sdpa(query, key, value, attn_mask=None, *args, **kwargs):
+            if _DROP["on"] and attn_mask is not None and attn_mask.dtype == torch.bool:
+                stats["dropped"] += 1
+                if fmha_grad:
+                    out = aiter_fmha(query, key, value, args, kwargs)
+                    if out is not None:
+                        return out
+                return torch_sdpa(query, key, value, None, *args, **kwargs)
+            if attn_mask is not None:
+                stats["masked"] += 1
+            return prev(query, key, value, attn_mask, *args, **kwargs)
+
+        sdpa._drop_masks = True
+        return sdpa
+
+    original_cfg = ActionGRPOMixin.configure_grpo
+
+    def configure_grpo(self, grpo_cfg):
+        # after hf_attn_patch and the lean attention have replaced SDPA, so this runs first
+        original_cfg(self, grpo_cfg)
+        if not getattr(F.scaled_dot_product_attention, "_drop_masks", False):
+            F.scaled_dot_product_attention = wrap_sdpa(F.scaled_dot_product_attention)
+            logger.info("all-True attention masks are dropped (torch SDPA without a mask)")
+
+    build = ActionGRPOMixin.build_action_condition
+    expand = ActionGRPOMixin.expand_condition
+
+    def build_action_condition(self, *args, **kwargs):
+        cond = build(self, *args, **kwargs)
+        _masks_all_true(cond)
+        return cond
+
+    def expand_condition(self, cond, *args, **kwargs):
+        out = expand(self, cond, *args, **kwargs)
+        _masks_all_true(out)
+        return out
+
+    velocity = ActionGRPOMixin.action_velocity
+
+    def action_velocity(self, latents_action, timestep_action, cond, use_ref=False):
+        flag = cond.get("_masks_all_true")
+        if flag is None:
+            flag = False if torch.cuda.is_current_stream_capturing() else _masks_all_true(cond)
+        previous = _DROP["on"]
+        _DROP["on"] = flag
+        try:
+            return velocity(self, latents_action, timestep_action, cond, use_ref=use_ref)
+        finally:
+            _DROP["on"] = previous
+
+    prefill = MoT.prefill_video_cache
+
+    def prefill_video_cache(self, video_tokens, video_freqs, video_t_mod, video_context_payload,
+                            video_attention_mask):
+        ctx = (video_context_payload or {}).get("mask")
+        previous = _DROP["on"]
+        _DROP["on"] = bool(video_attention_mask.all()) and (ctx is None or bool(ctx.all()))
+        try:
+            return prefill(self, video_tokens, video_freqs, video_t_mod, video_context_payload, video_attention_mask)
+        finally:
+            _DROP["on"] = previous
+
+    action_velocity._drop_masks = True
+    _STATS["drop_masks"] = stats
+    ActionGRPOMixin.configure_grpo = configure_grpo
+    ActionGRPOMixin.build_action_condition = build_action_condition
+    ActionGRPOMixin.expand_condition = expand_condition
+    ActionGRPOMixin.action_velocity = action_velocity
+    MoT.prefill_video_cache = prefill_video_cache
+
+
 def install_action_velocity_graphs() -> None:
     """Replay ``action_velocity`` from CUDA graphs when no gradient is needed.
 
@@ -548,6 +686,9 @@ def install_batched_logprobs() -> None:
     ``SIMWAM_GRPO_BATCHED_LOGP=0`` turns this off; ``SIMWAM_GRPO_BATCHED_CHUNK`` adds ``rmsnorm``
     and/or ``attn`` to the per-step ops; ``SIMWAM_GRPO_BATCHED_LOGP_VERIFY=1`` also runs the
     unbatched path on every call and compares outputs and LoRA gradients bit for bit.
+    Not bit-identical, off by default: ``SIMWAM_GRPO_BATCHED_GEMM=1`` runs each GEMM once over all
+    steps (no per-step split); ``SIMWAM_GRPO_BATCHED_LOGP_NOGRAD=1`` batches the no-grad calls
+    (the rollout's old and reference log-probs) the same way, so they take the training path.
     """
     if os.environ.get("SIMWAM_GRPO_BATCHED_LOGP", "1").strip().lower() in _OFF:
         return
@@ -563,7 +704,10 @@ def install_batched_logprobs() -> None:
     _CHUNK["ops"] = frozenset(
         x.strip() for x in os.environ.get("SIMWAM_GRPO_BATCHED_CHUNK", "").split(",") if x.strip())
     verify = os.environ.get("SIMWAM_GRPO_BATCHED_LOGP_VERIFY", "0") == "1"
-    stats = {"batched": 0, "fwd_mismatch": 0, "grad_mismatch": 0, "grad_checked": 0, "max_grad_diff": 0.0}
+    one_gemm = os.environ.get("SIMWAM_GRPO_BATCHED_GEMM", "0").strip().lower() not in _OFF
+    nograd = os.environ.get("SIMWAM_GRPO_BATCHED_LOGP_NOGRAD", "0").strip().lower() not in _OFF
+    stats = {"batched": 0, "batched_nograd": 0, "fwd_mismatch": 0, "grad_mismatch": 0, "grad_checked": 0,
+             "max_grad_diff": 0.0}
     original = ActionGRPOMixin.action_chain_logprobs
 
     def repeat_cond(cond, w):
@@ -592,9 +736,10 @@ def install_batched_logprobs() -> None:
         t_all = torch.cat([
             timesteps[k].to(device=device, dtype=dtype).reshape(1).expand(batch_size) for k in steps
         ])
-        _CHUNK["lumen"]()
-        _CHUNK["sizes"] = [batch_size] * len(steps)
-        _CHUNK["views"] = {id(expert.action_encoder.weight): x_views}
+        if not one_gemm:
+            _CHUNK["lumen"]()
+            _CHUNK["sizes"] = [batch_size] * len(steps)
+            _CHUNK["views"] = {id(expert.action_encoder.weight): x_views}
         try:
             v_all = self.action_velocity(x_all, t_all, repeat_cond(cond, len(steps)), use_ref=use_ref)
         finally:
@@ -667,12 +812,15 @@ def install_batched_logprobs() -> None:
                               return_terms=False):
         steps = self._normalize_stoch_idx(stoch_idx, int(timesteps.shape[0]))
         expert = self.ref_action_expert if use_ref else self.action_expert
-        if (not torch.is_grad_enabled() or getattr(self, "grpo_merge_sde_window", False)
+        grad = torch.is_grad_enabled()
+        if ((not grad and not nograd) or getattr(self, "grpo_merge_sde_window", False)
                 or self.grpo_sde_mode != "rigorous" or len(steps) < 2
                 or (self.training and getattr(expert, "use_gradient_checkpointing", False))):
             return original(self, cond, chain, timesteps, deltas, stoch_idx=stoch_idx, use_ref=use_ref,
                             return_terms=return_terms)
-        stats["batched"] += 1
+        stats["batched" if grad else "batched_nograd"] += 1
+        if not grad:
+            return batched(self, cond, chain, timesteps, deltas, steps, use_ref, return_terms)
         if verify:
             new = batched(self, cond, chain, timesteps, deltas, steps, use_ref, True)
             check(self, (cond, chain, timesteps, deltas), steps, use_ref, new)
@@ -685,7 +833,8 @@ def install_batched_logprobs() -> None:
     _STATS["batched_logp"] = stats
     ActionGRPOMixin.action_chain_logprobs = action_chain_logprobs
     logger.info("action_chain_logprobs runs the grad-enabled steps in one action_velocity call (per-step ops: %s, "
-                "verify=%s)", sorted(_CHUNK["ops"] | {"gemm"}), verify)
+                "verify=%s, no-grad calls batched=%s)",
+                sorted(_CHUNK["ops"] | (set() if one_gemm else {"gemm"})), verify, nograd)
 
 
 _PDM_WORKER = {}
@@ -1204,6 +1353,64 @@ def _emulate_eager_casts() -> None:
 
     if hasattr(inductor_config, "emulate_precision_casts"):
         inductor_config.emulate_precision_casts = True
+
+
+def install_aiter_rmsnorm() -> None:
+    """SimWAM ``RMSNorm`` on AITER's CK ``rms_norm``: one fused launch instead of the eager chain.
+
+    The kernel normalises and multiplies by the weight in one pass, without the bf16 rounding
+    eager applies before the weight multiply, so it is not bit-identical. It has no backward:
+    grad-enabled calls go through an autograd Function whose backward computes the input
+    gradient from the RMSNorm formula in fp32 (the norm weights are frozen here; a weight
+    gradient is computed too if one is needed). Only bf16 with the widths checked below.
+    ``SIMWAM_GRPO_AITER_RMSNORM=1`` turns it on.
+    """
+    if os.environ.get("SIMWAM_GRPO_AITER_RMSNORM", "0").strip().lower() in _OFF:
+        return
+    import torch
+    from simwam.models.wan22 import wan_video_dit as wvd
+
+    if getattr(wvd.RMSNorm.forward, "_aiter", False):
+        return
+    previous = wvd.RMSNorm.forward
+    widths = {3072}
+    state = {"rms": None}
+
+    class _RMSNorm(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, weight, eps):
+            ctx.save_for_backward(x, weight)
+            ctx.eps = eps
+            return state["rms"](x, weight, eps)
+
+        @staticmethod
+        def backward(ctx, grad):
+            x, weight = ctx.saved_tensors
+            xf = x.float()
+            gw = grad.float() * weight.float()
+            r = torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + ctx.eps)
+            dx = r * gw - xf * r.pow(3) * (gw * xf).mean(dim=-1, keepdim=True)
+            dw = None
+            if ctx.needs_input_grad[1]:
+                dw = (grad.float() * xf * r).reshape(-1, x.shape[-1]).sum(dim=0).to(weight.dtype)
+            return dx.to(x.dtype), dw, None
+
+    def forward(self, x):
+        if x.dtype != torch.bfloat16 or self.weight.dtype != torch.bfloat16 or x.shape[-1] not in widths:
+            return previous(self, x)
+        if state["rms"] is None:
+            # imported on first use, after the trainer has set the device
+            from aiter.ops.rmsnorm import rms_norm
+
+            state["rms"] = rms_norm
+        x = x.contiguous()
+        if torch.is_grad_enabled() and (x.requires_grad or self.weight.requires_grad):
+            return _RMSNorm.apply(x, self.weight, float(self.eps))
+        return state["rms"](x, self.weight, float(self.eps))
+
+    forward._aiter = True
+    wvd.RMSNorm.forward = forward
+    logger.info("SimWAM RMSNorm runs on AITER's CK rms_norm")
 
 
 def install_compiled_rmsnorm() -> None:

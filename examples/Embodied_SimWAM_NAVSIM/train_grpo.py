@@ -23,8 +23,10 @@ from omegaconf import DictConfig
 
 from examples.Embodied_SimWAM_NAVSIM.plugin import (
     install_action_velocity_graphs,
+    install_aiter_rmsnorm,
     install_batched_logprobs,
     install_compiled_rmsnorm,
+    install_drop_true_masks,
     install_foreach_grad_checks,
     install_fused_lora_add,
     install_grpo_hook,
@@ -48,11 +50,14 @@ install_batched_logprobs()
 install_ref_logprob_cache()
 # before the CUDA graphs, which capture its attention path
 install_lean_lumen_attention()
+# after the lean attention (its SDPA wrapper must be outermost), before the graphs that capture it
+install_drop_true_masks()
 install_action_velocity_graphs()
 # after the no_grad graphs, which it falls through to
 install_train_graphs()
 install_parallel_pdm_reward()
 install_compiled_rmsnorm()
+install_aiter_rmsnorm()
 install_fused_lora_add()
 install_overlap_reward_logprobs()
 install_foreach_grad_checks()
