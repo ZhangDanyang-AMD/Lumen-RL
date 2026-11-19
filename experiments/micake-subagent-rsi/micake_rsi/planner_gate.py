@@ -65,6 +65,37 @@ def summarize(scores: Mapping[str, list[float]]) -> dict[str, float]:
             "mean_wall_s": statistics.fmean(scores["wall_s"])}
 
 
+SIGNIFICANCE = 0.05
+
+
+def kernel_beats_reference(records: Sequence[Mapping[str, Any]], name: str, gate: PlannerGate, reference: str = "dsv4") -> bool:
+    """Faster kernel than ``reference`` by the gate margin, with a permutation p below ``SIGNIFICANCE``."""
+    best = versus(records, name, reference, gate.tau).get("best") or {}
+    if not best or best.get("p") is None:
+        return False
+    return best["rsi"] - best["base"] >= gate.min_best_gain and best["p"] < SIGNIFICANCE
+
+
+def as_fast_as_reference(records: Sequence[Mapping[str, Any]], name: str, gate: PlannerGate, reference: str = "dsv4") -> bool:
+    """Median time to ``gate.tau`` is no slower than ``reference``. Episodes that miss the threshold are censored."""
+    compared = versus(records, name, reference, gate.tau)
+    arm, ref = compared.get("arm") or {}, compared.get("reference") or {}
+    if "median_time_to_tau" not in arm or "median_time_to_tau" not in ref:
+        return False
+    return arm["median_time_to_tau"] <= ref["median_time_to_tau"]
+
+
+def beats_reference(records: Sequence[Mapping[str, Any]], name: str, gate: PlannerGate, reference: str = "dsv4") -> bool:
+    """Held-out stop: a significantly faster kernel overall and per dtype, and a median time to tau that is not slower."""
+    if not kernel_beats_reference(records, name, gate, reference):
+        return False
+    groups: dict[str, list[Mapping[str, Any]]] = {}
+    for record in records:
+        groups.setdefault(record.get("dtype") or "fp16", []).append(record)
+    return (all(kernel_beats_reference(group, name, gate, reference) for group in groups.values())
+            and as_fast_as_reference(records, name, gate, reference))
+
+
 def versus(records: Sequence[Mapping[str, Any]], arm: str, reference: str, tau: float) -> dict[str, Any]:
     """``arm`` minus ``reference`` on kernel speed and on the time to reach ``tau``."""
     a, b = episode_scores(records, reference, tau), episode_scores(records, arm, tau)

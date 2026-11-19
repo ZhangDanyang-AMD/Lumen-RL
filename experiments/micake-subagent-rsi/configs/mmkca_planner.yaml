@@ -1,0 +1,90 @@
+# Planner-only agentic RL on the MMKCA gfx950 GEMM sandbox (backend mmkca_gemm).
+# Each episode is one regime (prefill or decode) and one dtype (bf16 or fp8 blockwise).
+# Training tasks are synthetic bundles; held-out tasks are the real Qwen3-30B-A3B GEMMs.
+# Secrets: only environment-variable names appear here.
+
+rsi:
+  root: output/mmkca-planner/rl
+  cells: [[decode, bf16], [decode, fp8], [prefill, bf16], [prefill, fp8]]
+  bundles_per_cell: 16          # fresh training bundles per cell and generation
+  samples_per_task: 4           # rollouts per bundle; advantages are relative within this group
+  heldout_repeats: 6            # held-out episodes per cell and arm
+  max_submissions: 8
+  max_turns: 12
+  max_no_tool_nudges: 1
+  temperature: 0.8
+  min_group_gain: 0.005         # an episode is kept only if its best beats the group median by this margin
+  epochs: 2.0
+  search_data: /home/danyzhan/MICake-MMKCA/build/planner-data
+  workers: [0, 1, 2, 3, 5, 6, 7]
+  serve: {port: 8108, gpus: "4"}
+
+manager:
+  # DSV4.1 is the frozen reference arm; it plays the Planner role with the same prompt, tools and budget.
+  endpoint:
+    base_url: https://127.0.0.1:8443/v1
+    model: deepseek-ai/DeepSeek-V4.1-Flash
+    api_key_env: DSV4_API_KEY
+    verify_tls: false
+    timeout_s: 900
+    max_retries: 3
+    sampling: {max_tokens: 2048, temperature: 0.8, top_p: 0.95}
+    extra_body: {}
+  settings:
+    history_limit: 12
+    planner_report_reward: 0.0
+
+planner:
+  binding:
+    base_model_id: Qwen3-Coder-30B-A3B-Instruct
+    adapter_id: mmkca-planner
+    adapter_version: "0"
+    policy_version: mmkca-planner
+    trainable: true
+  endpoint:
+    api_key_env: null
+    verify_tls: false
+    timeout_s: 600
+    max_retries: 2
+    sampling: {max_tokens: 2048, temperature: 0.8, top_p: 0.95}
+    extra_body: {}
+
+micake:
+  backend: mmkca_gemm
+  module: sandbox.mmkca
+  kwargs:
+    mmkca_root: /home/danyzhan/MICake-MMKCA
+    image: mmkca-gpu:rocm7.2.4
+    gpu_id: 0
+    rocm_llvm: /opt/rocm-7.3.0/llvm/bin
+    request_timeout_s: 900
+    fidelity: performance
+    max_submissions: 8
+    new_best_min_gain: 0.005
+    measurement: {paired_repeats: 3, batch: 8}
+    reward:
+      schema_invalid: -1.0
+      verify_fail: -0.3
+      compile_fail: -0.5
+      compile_pass: 0.0
+      correctness_fail: -0.8
+      correctness_pass: 0.2
+      performance_log_clip: 0.5
+      new_best_bonus: 0.3
+      repeat_penalty: -0.3
+      unknown_outcome: -0.5
+      terminal_best_speedup: 0.5
+
+train:
+  max_steps: 1
+  min_advantage: 0.0
+  max_sequence_length: 8192
+  base_model: /home/danyzhan/Lumen/experiments/GEAK-agent-coder/models/Qwen3-Coder-30B-A3B-Instruct
+  model_revision: b2cff646eb4bb1d68355c01b18ae02e7cf42d120
+  tokenizer_sha256: 94bee6a983ac11efd608bbe76fe7d1f8977cc098e565eb537766ce55bc52cf5c
+  hardware_profile: /home/danyzhan/Lumen/experiments/GEAK-agent-coder/configs/hardware/amd_mi350_gfx950.yaml
+  recipe_profile: /home/danyzhan/Lumen/experiments/GEAK-agent-coder/configs/recipes/geak_mi308_dev.yaml
+  image: lumen/mxfp4-atom:gfx950-local
+  nproc_per_node: 8
+  serve:
+    image: micake-atom-serve:local

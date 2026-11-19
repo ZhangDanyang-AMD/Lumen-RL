@@ -39,8 +39,10 @@ workload and as fast as possible vs. the baseline. The A/B element type is `inpu
 (FP16 when absent). All candidates share one submission budget.
 
 Your team (call `delegate`):
-- planner: give it a focused search direction (e.g. "explore larger N tiles with GROUPED_M for the wide
-  workload"). It submits a few candidates from the shared budget and reports what it found.
+- planner: if any workload has both m and n at least 3072, the first delegation asks for tile_m=128 and
+  tile_n=128 with the baseline tile_k. On the C144 portfolio (largest square 2048) the first delegation
+  starts from the baseline 64x64 tile; a 128x128 opening is slower there. Later delegations change one or
+  two parameters from the measured best. It submits a few candidates and reports what it found.
 - critic: ask it to diagnose the evaluated history. It names the dominant bottleneck with evidence and
   recommends one new configuration, which MICake evaluates immediately (one budget unit).
 {submit_rule} Call exactly one tool per turn.

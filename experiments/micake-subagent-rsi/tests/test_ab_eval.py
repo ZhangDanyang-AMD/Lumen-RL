@@ -96,6 +96,32 @@ def test_stage_move_keeps_pipeline_depth_linked_and_hides_kpack():
     assert "kpack" not in submission_arguments(BASELINE, "h")["realization"]
 
 
+def _heldout(arm: str, dtype: str, speedup: float, seconds: float) -> dict:
+    return {"arm": arm, "dtype": dtype, "best": {"source": "agent"}, "verified": {"speedup": speedup}, "wall_s": 1000.0,
+            "metrics": {"final_best": speedup, "wasted_rate": 0.0, "reach": {"1.04": {"submissions": 1.0, "seconds": seconds}}},
+            "trace": [{"stage": "measured"}]}
+
+
+def test_stop_requires_a_faster_kernel_and_a_time_to_tau_that_is_not_slower():
+    from micake_rsi.planner_gate import PlannerGate, beats_reference
+
+    gate = PlannerGate()
+    dtypes = ("bf16", "fp8")
+
+    def pairs(speed: float, seconds: float) -> list[dict]:
+        rows = []
+        for dtype in dtypes:
+            for i in range(8):
+                rows.append(_heldout("dsv4", dtype, 1.10, 90.0))
+                rows.append(_heldout("challenger", dtype, speed + i * 0.0001, seconds))
+        return rows
+
+    assert beats_reference(pairs(1.13, 80.0), "challenger", gate)
+    assert beats_reference(pairs(1.13, 90.0), "challenger", gate)
+    assert not beats_reference(pairs(1.13, 140.0), "challenger", gate)
+    assert not beats_reference(pairs(1.102, 80.0), "challenger", gate)
+
+
 def test_stratified_compare_removes_between_instruction_variance():
     from micake_rsi.ab_eval import stratified_compare
 

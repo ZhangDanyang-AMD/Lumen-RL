@@ -130,5 +130,6 @@ def parse_submission(
                 raise ToolArgumentError("VALUE_OUT_OF_DOMAIN", f"{section}.{name}={value[name]!r}; allowed {allowed}")
         config[section] = dict(value)
         for name in HIDDEN_FIXED_FIELDS.get(section, ()):
-            config[section][name] = domain[section][name][0]
+            if name in domain[section]:
+                config[section][name] = domain[section][name][0]
     return Submission(config=config, hypothesis=hypothesis.strip()[:HYPOTHESIS_LIMIT])

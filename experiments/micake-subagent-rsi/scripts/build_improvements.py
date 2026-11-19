@@ -17,6 +17,7 @@ import asyncio
 import glob
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -29,7 +30,7 @@ from run_ab_eval import DEFAULT_CONFIG, REPO_ROOT, TASK  # noqa: E402
 from lumenrl.agentic.core.backends import build_environment  # noqa: E402
 from micake_rsi.improve import (  # noqa: E402
     child_element_bytes, config_key, correctable, exploit_candidates, exploit_sample, improvement_sample, improves,
-    planner_children, record_dtype, walk_steps,
+    install_opening, opening_candidate, planner_children, record_dtype, small_tile, walk_steps,
 )
 
 logger = logging.getLogger("build_improvements")
@@ -78,8 +79,9 @@ async def main_async(args) -> None:
             cache.update(json.loads(path.read_text()))
     cache_out = args.out.with_suffix(".cache.json")
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    samples, stats = [], {"records": 0, "children": 0, "positives": 0, "corrected": 0, "no_improvement": 0, "repeated_target": 0,
-                       "measured": 0}
+    samples, stats = [], {"records": 0, "children": 0, "positives": 0, "openings": 0, "corrected": 0,
+                           "no_improvement": 0, "repeated_target": 0, "measured": 0}
+    opening_cache: dict[str, dict] = {}
     targets: dict[tuple[str, str], int] = {}
 
     async def evaluate(config):
@@ -91,6 +93,20 @@ async def main_async(args) -> None:
             stats["measured"] += 1
             cache_out.write_text(json.dumps(cache))
         return cache[key]
+
+    async def opening_measured(portfolio: str, dtype: str, config: dict) -> dict:
+        """One measurement per training portfolio and dtype. Held-out shapes are refused."""
+        if portfolio not in TRAIN_PORTFOLIOS:
+            raise RuntimeError(f"refusing to measure an opening tile on portfolio {portfolio!r}")
+        key = f"{portfolio}|{dtype}|{config_key(config)}"
+        if key not in opening_cache:
+            os.environ["MICAKE_PORTFOLIO"] = portfolio
+            await micake.restart_evaluator()
+            if getattr(micake, "dtype", None) != dtype:
+                await micake.reset({**TASK, "dtype": dtype})
+            opening_cache[key] = await micake.measure(config)
+            stats["measured"] += 1
+        return opening_cache[key]
 
     await micake.reset(TASK)
     domain = micake.domain
@@ -106,6 +122,23 @@ async def main_async(args) -> None:
                 stats["children"] += 1
                 key = f"{record['key']}@{record.get('arm')}#{c}"
                 positive = improvement_sample(child, f"{key}:positive")
+                entries = list(walk_steps(child))
+                portfolio = record_portfolio(record)
+                if (args.opening_move and entries and small_tile(entries[0]["config"])
+                        and portfolio in TRAIN_PORTFOLIOS):
+                    candidate = opening_candidate(entries[0]["best_config"], child_element_bytes(child), domain)
+                    if candidate is not None:
+                        measured = await opening_measured(portfolio, record_dtype(record), candidate)
+                        perf = measured.get("performance") or {}
+                        view = {"stage": measured.get("stage"), "validity": perf.get("validity"),
+                                "speedup": perf.get("geomean_speedup")}
+                        if improves(view, entries[0]["best_speedup"]):
+                            opened = install_opening(child, candidate, f"{key}:opening")
+                            if opened:
+                                opened["experience_dir"] = stamp
+                                samples.append(opened)
+                                stats["openings"] += 1
+                                positive = None
                 if positive:
                     positive["experience_dir"] = stamp
                     samples.append(positive)
@@ -148,6 +181,8 @@ def main() -> None:
     parser.add_argument("--shards", type=int, default=1)
     parser.add_argument("--max-attempts", type=int, default=64, help="measured one-axis candidates per corrected turn (steepest ascent)")
     parser.add_argument("--max-corrections", type=int, default=3, help="corrected turns per Planner episode")
+    parser.add_argument("--opening-move", type=int, default=1,
+                        help="1: retarget a small-tile first submit to 128x128 when that candidate wins on the training portfolio")
     parser.add_argument("--max-per-target", type=int, default=3, help="samples per (session best, correction) pair")
     parser.add_argument("--cache-in", type=Path, action="append", default=[], help="measurement caches to seed from")
     parser.add_argument("--out", type=Path, required=True)

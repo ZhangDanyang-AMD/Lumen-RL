@@ -11,7 +11,9 @@ REPO_ROOT = EXPERIMENT_DIR.parents[1]
 for entry in (REPO_ROOT, REPO_ROOT / "experiments" / "sandbox", EXPERIMENT_DIR):
     sys.path.insert(0, str(entry))
 
-from micake_rsi.improve import config_key, exploit_candidates, exploit_sample, improvement_sample, walk_steps  # noqa: E402
+from micake_rsi.improve import (  # noqa: E402
+    config_key, exploit_candidates, exploit_sample, improvement_sample, install_opening, opening_candidate, walk_steps,
+)
 from micake_rsi.planner_gate import PlannerGate, gate_decision  # noqa: E402
 from micake_rsi.search_harness import fits_lds  # noqa: E402
 
@@ -75,6 +77,32 @@ def test_exploit_candidates_are_untested_fitting_neighbours():
     assert sample["steps"][0]["assistant_message_index"] == len(sample["messages"]) - 1 == 4
     assert json.loads(target["tool_calls"][0]["function"]["arguments"])["schedule"] == candidates[0]["schedule"]
     assert target["content"].count("LDS check") == 1
+
+
+def test_opening_candidate_lifts_both_axes_and_rejects_an_illegal_tile():
+    candidate = opening_candidate(BASE, element=2, domain=DOMAIN)
+    assert candidate["schedule"]["tile_m"] == candidate["schedule"]["tile_n"] == 128
+    assert candidate["schedule"]["tile_k"] == 32 and fits_lds(candidate)
+    assert opening_candidate(candidate, domain=DOMAIN) is None
+    wide = _with(tile_k=64, pipeline_depth=3, unroll_factor=4)
+    # (128+128)*64*2*(3-1)*4 = 262144 B, over the 163840 B cap.
+    assert opening_candidate(wide) is None
+
+
+def test_install_opening_replaces_only_a_small_first_submit():
+    child = _child()
+    child["messages"][2] = _call(BASE)
+    child["steps"][0]["action"]["arguments"] = BASE
+    child["steps"][0]["result"]["metadata"]["config"] = BASE
+    child["steps"][0]["result"]["observation"] = {"new_best": True, "best": {"geomean_speedup_vs_baseline": 1.02, "config": BASE}}
+    candidate = opening_candidate(BASE, domain=DOMAIN)
+    sample = install_opening(child, candidate, "k")
+    submitted = json.loads(sample["messages"][2]["tool_calls"][0]["function"]["arguments"])
+    assert submitted["schedule"]["tile_m"] == submitted["schedule"]["tile_n"] == 128
+    assert sample["steps"][0]["execution_result"] == "opening_tile" and sample["steps"][0]["advantage"] == 1.0
+    assert sample["steps"][1]["advantage"] == -1.0
+    already = _child()
+    assert install_opening(already, candidate, "k") is None
 
 
 def test_fp8_packet_halves_lds_in_candidates_and_annotations():

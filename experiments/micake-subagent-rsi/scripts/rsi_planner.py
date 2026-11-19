@@ -51,7 +51,7 @@ from run_ab_eval import DEFAULT_CONFIG, REPO_ROOT  # noqa: E402
 from run_cycle import _merge, _serve, _train  # noqa: E402
 from train_rft import DATA_PARALLEL, specialist_containers  # noqa: E402
 from micake_rsi.cycle import MERGE_MANIFEST, training_config  # noqa: E402
-from micake_rsi.planner_gate import PlannerGate, gate_decision, versus  # noqa: E402
+from micake_rsi.planner_gate import PlannerGate, beats_reference, gate_decision, versus  # noqa: E402
 from micake_rsi.sft_data import write_role_sft  # noqa: E402
 
 logger = logging.getLogger("rsi_planner")
@@ -325,26 +325,9 @@ def report(records: list[dict], arms: list[str], tau: float) -> dict:
     return {arm: versus(records, arm, "dsv4", tau) for arm in arms}
 
 
-SIGNIFICANCE = 0.05
-
-
-def _kernel_beats_dsv4(records: list[dict], name: str, gate: PlannerGate) -> bool:
-    """Faster kernel than DSV4.1 by the gate margin, with a permutation p below ``SIGNIFICANCE``."""
-    best = versus(records, name, "dsv4", gate.tau).get("best") or {}
-    if not best or best.get("p") is None:
-        return False
-    gain = best["rsi"] - best["base"]
-    return gain >= gate.min_best_gain and best["p"] < SIGNIFICANCE
-
-
 def _beats_dsv4(records: list[dict], name: str, gate: PlannerGate) -> bool:
-    """Held-out success: a significantly faster kernel than DSV4.1 overall and on every dtype."""
-    if not _kernel_beats_dsv4(records, name, gate):
-        return False
-    groups: dict[str, list[dict]] = {}
-    for record in records:
-        groups.setdefault(record.get("dtype") or "fp16", []).append(record)
-    return all(_kernel_beats_dsv4(group, name, gate) for group in groups.values())
+    """Held-out stop: faster kernel than DSV4.1 overall and per dtype, and a median time to 1.04 that is not slower."""
+    return beats_reference(records, name, gate)
 
 
 def report_by_dtype(records: list[dict], arms: list[str], tau: float) -> dict:
@@ -373,7 +356,7 @@ def main() -> None:
     parser.add_argument("--champion-checkpoint", default=str(REPO_ROOT / "output/micake-subagent-rsi/gen7/checkpoints/planner"))
     parser.add_argument("--generations", type=int, default=1, help="generations to run in this invocation")
     parser.add_argument("--until-dsv4", action="store_true",
-                        help="keep training until a generation beats DSV4.1 on the held-out portfolio")
+                        help="keep training until a generation beats DSV4.1 on held-out kernel score and is not slower to reach 1.04")
     parser.add_argument("--samples-per-shard", type=int, default=3, help="held-out episodes per arm per MICake GPU")
     parser.add_argument("--collect-samples-per-shard", type=int, default=8,
                         help="training episodes per portfolio per MICake GPU")
@@ -498,7 +481,7 @@ def main() -> None:
         if split and _beats_dsv4(records, gen["name"], gate):
             state["met_dsv4"] = gen["name"]
             lineage.save()
-            logger.info("%s beats DSV4.1 on the held-out portfolio, overall and per dtype", gen["name"])
+            logger.info("%s beats DSV4.1 on held-out kernel score and reaches %.2f no later", gen["name"], gate.tau)
             break
 
 

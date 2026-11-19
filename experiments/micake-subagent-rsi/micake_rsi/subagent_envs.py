@@ -53,6 +53,11 @@ checks correctness and measures speedup vs. the baseline (>1.0 is faster). The A
 
 Rules:
 - Act only through tools, exactly one tool call per turn.
+- The baseline tile is the scoring reference. When history is empty, look at the portfolio before the first
+  `submit_schedule`. If any workload has both m and n at least 3072, set tile_m=128 and tile_n=128 and keep
+  tile_k and the other baseline fields (that opening is faster than the 64 baseline on those portfolios, and
+  slower on the C144 portfolio, whose largest square is 2048). Otherwise start from the baseline tile.
+  After the first measurement, change one or two parameters per candidate.
 - Follow the Manager's instruction. Use the shared history: never resubmit a configuration already tried.
 - Each `submit_schedule` consumes one unit of your sub-budget. Correctness first, then speed.
 - When the sub-budget is used up or you have a clear conclusion, call `report` with what you tried,
@@ -96,7 +101,7 @@ def compact_history(history: Sequence[Mapping[str, Any]], limit: int) -> list[di
 
 def _shared_context(micake: MicakeGemmEnvironment, history_limit: int) -> dict[str, Any]:
     packet = micake.task_packet()
-    typed = {"input_dtype": packet["input_dtype"]} if "input_dtype" in packet else {}
+    typed = {key: packet[key] for key in ("input_dtype", "regime", "opening") if key in packet}
     return {
         **typed,
         "objective": packet["objective"],
@@ -216,7 +221,8 @@ class PlannerEnvironment(_ChildBase):
             **_shared_context(self.micake, self.history_limit),
         }
         tools = [submit, report]
-        return ResetResult(PLANNER_PROMPT, observation, tools, {"role": self.role, "sub_budget": self.sub_budget, "tools": tools})
+        prompt = getattr(self.micake, "planner_prompt", PLANNER_PROMPT)
+        return ResetResult(prompt, observation, tools, {"role": self.role, "sub_budget": self.sub_budget, "tools": tools})
 
     async def step(self, action: ToolCall) -> StepResult:
         if action.name == REPORT_TOOL:

@@ -166,6 +166,57 @@ def exploit_sample(child: Mapping[str, Any], entry: Mapping[str, Any], candidate
                        "tool": SUBMIT_TOOL, "execution_result": "exploit_correction", "advantage": 1.0}]}
 
 
+def small_tile(config: Mapping[str, Any] | None) -> bool:
+    """True when both tile axes are still at or below the 64-wide baseline."""
+    schedule = (config or {}).get("schedule") or {}
+    return schedule.get("tile_m", 0) <= 64 and schedule.get("tile_n", 0) <= 64
+
+
+def opening_candidate(config: Mapping[str, Any], element: int = 2, domain: Mapping[str, Any] | None = None,
+                      tile: int = 128) -> dict[str, Any] | None:
+    """Both tile axes at ``tile``, every other field unchanged. None when that candidate is illegal or already the config."""
+    if not isinstance(config, Mapping):
+        return None
+    schedule = config.get("schedule")
+    if not isinstance(schedule, Mapping):
+        return None
+    allowed = (domain or {}).get("schedule") or {}
+    for name in ("tile_m", "tile_n"):
+        values = allowed.get(name)
+        if values is not None and tile not in values:
+            return None
+    if schedule.get("tile_m") == tile and schedule.get("tile_n") == tile:
+        return None
+    candidate = copy.deepcopy({"schedule": dict(schedule), "realization": dict(config.get("realization") or {})})
+    candidate["schedule"]["tile_m"] = tile
+    candidate["schedule"]["tile_n"] = tile
+    return candidate if fits_lds(candidate, element) else None
+
+
+def install_opening(child: Mapping[str, Any], candidate: Mapping[str, Any], source_key: str) -> dict[str, Any] | None:
+    """Point the first submit at ``candidate`` when that submit is still on a small tile.
+
+    Later ``new_best`` turns stay. Held-out records never reach here: the builder only passes training portfolios.
+    """
+    entries = list(walk_steps(child))
+    if not entries or not small_tile(entries[0]["config"]):
+        return None
+    first = entries[0]
+    sample = improvement_sample(child, source_key)
+    if sample is None:
+        return exploit_sample(child, first, candidate, source_key)
+    element = child_element_bytes(child)
+    original = child["messages"][_assistant_indices(child)[first["step"]["turn_index"]]]
+    rewritten = exploit_message(original, first["best_config"], first["best_speedup"], candidate, 0, element)
+    for step in sample["steps"]:
+        if step["turn_index"] == first["step"]["turn_index"] and step["tool"] == SUBMIT_TOOL:
+            sample["messages"][step["assistant_message_index"]] = rewritten
+            step["advantage"] = 1.0
+            step["execution_result"] = "opening_tile"
+            break
+    return sample
+
+
 def improves(measured: Mapping[str, Any] | None, best_speedup: float, gain: float = NEW_BEST_GAIN) -> bool:
     return bool(measured) and measured.get("stage") == "measured" and measured.get("validity") == "VALID" \
         and float(measured.get("speedup") or 0.0) >= best_speedup + gain
