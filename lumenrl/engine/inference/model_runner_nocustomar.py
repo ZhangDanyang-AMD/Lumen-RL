@@ -114,13 +114,43 @@ def _patch_disable_custom_ar():
     logger.info("Patched aiter: custom all-reduce permanently disabled (hipIpcGetMemHandle workaround)")
 
 
-def quantize_native_group(weight, rows: int, fp8_dtype):
+def round_stochastically(x, fp8_dtype, generator=None):
+    """``x`` (float, within ``fp8_dtype``'s range) to ``fp8_dtype``: each element to one of
+    the two values around it, the far one with probability (distance to the near one) /
+    (distance between them), so its expected value is ``x``; an element already
+    representable stays. E4M3 (OCP) only -- other formats round to nearest."""
+    import torch
+
+    q = x.to(fp8_dtype)
+    if fp8_dtype != torch.float8_e4m3fn:
+        return q
+    qf = q.float()
+    err = x.float() - qf
+    bits = q.view(torch.uint8).to(torch.int16)
+    mag, sign = bits & 0x7F, bits & 0x80
+    away = (qf == 0) | ((err > 0) == (qf > 0))  # the other value is further from zero
+    other_mag = torch.where(away, mag + 1, mag - 1).clamp(0, 0x7E)  # 0x7F is NaN
+    other_sign = torch.where(qf == 0, (err < 0).to(torch.int16) * 0x80, sign)
+    other = (other_sign | other_mag).to(torch.uint8)
+    gap = (other.view(fp8_dtype).float() - qf).abs()
+    p = torch.where(gap > 0, err.abs() / gap, torch.zeros_like(gap))
+    take = torch.rand(x.shape, device=x.device, generator=generator) < p
+    return torch.where(take, other, q.view(torch.uint8)).view(fp8_dtype)
+
+
+def quantize_native_group(weight, rows: int, fp8_dtype, generator=None):
     """``weight`` [N, K] in a native group32 layout: ``fp8_dtype`` with one
     power-of-two scale per ``rows`` x 32 block, the scales E8M0 [N / rows, K / 32]
     (DeepSeek-V4.1 stores its linears so with ``rows`` 32). A scale is
     ``2 ** ceil(log2(amax / fp8_max))``, as the release and ATOM's
     ``quantize_fp8`` round it, so a dequantized release weight comes back as the
-    same values."""
+    same values.
+
+    The values are rounded stochastically: a training step moves a weight far less
+    than an FP8 step (an Adam step of 5e-6 against ~2e-3 between neighbours at
+    |w| ~ 0.02), and a released weight starts exactly on the grid, so rounding to
+    nearest returned the released value at every sync and the rollout never saw
+    the training (rollout k3 doubled in six steps at lr 5e-6)."""
     import torch
 
     n, k = weight.shape
@@ -130,7 +160,7 @@ def quantize_native_group(weight, rows: int, fp8_dtype):
     mantissa, exponent = torch.frexp(amax / fp8_max)  # an exact power of two stays put
     exponent = torch.where(mantissa == 0.5, exponent - 1, exponent)
     scale = torch.ldexp(torch.ones_like(amax), exponent)
-    q = (blocks / scale[:, None, :, None]).clamp(-fp8_max, fp8_max).to(fp8_dtype)
+    q = round_stochastically((blocks / scale[:, None, :, None]).clamp(-fp8_max, fp8_max), fp8_dtype, generator)
     return q.view(n, k), scale.to(torch.float8_e8m0fnu)
 
 

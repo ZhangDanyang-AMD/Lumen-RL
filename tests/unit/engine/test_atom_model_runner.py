@@ -171,6 +171,36 @@ def test_a_dequantized_release_weight_requantizes_to_the_same_values(rows):
     assert torch.equal(back, w)
 
 
+def _dequantize(q, scale, rows):
+    return q.float() * scale.float().repeat_interleave(rows, 0).repeat_interleave(32, 1)
+
+
+def test_an_update_far_below_an_fp8_step_reaches_the_rollout_in_expectation():
+    """A training step moves a weight ~1e3 times less than an FP8 step, and a released
+    weight starts on the grid: rounded to nearest, every sync wrote the released value."""
+    torch.manual_seed(3)
+    w = _release_like(64, 96, 32, torch.Generator().manual_seed(3))
+    moved = w + 1e-3 * w.abs()
+
+    shift = torch.stack([
+        _dequantize(*m.quantize_native_group(moved, 32, torch.float8_e4m3fn), 32) - w for _ in range(200)
+    ]).mean(0)
+
+    want = (moved - w).sum()
+    assert abs(shift.sum() - want) < 0.1 * want
+
+
+def test_stochastic_rounding_is_unbiased_and_keeps_representable_values():
+    g = torch.Generator().manual_seed(4)
+    x = (torch.rand(512, generator=g) * 2 - 1) * 400
+    nearest = x.to(torch.float8_e4m3fn).float()
+
+    mean = torch.stack([m.round_stochastically(x, torch.float8_e4m3fn, g).float() for _ in range(1000)]).mean(0)
+
+    assert (mean - x).abs().mean() < 0.1 * (nearest - x).abs().mean()
+    assert torch.equal(m.round_stochastically(nearest, torch.float8_e4m3fn, g).float(), nearest)
+
+
 def test_scales_round_up_to_a_power_of_two():
     w = torch.full((32, 32), 448.0 * 3)  # amax / 448 = 3 -> 4
 
