@@ -24,6 +24,7 @@ from omegaconf import DictConfig
 from examples.Embodied_SimWAM_NAVSIM.plugin import (
     install_action_velocity_graphs,
     install_aiter_gemm,
+    install_aiter_layernorm,
     install_aiter_triton_imports,
     install_aiter_rmsnorm,
     install_background_visualize,
@@ -32,6 +33,7 @@ from examples.Embodied_SimWAM_NAVSIM.plugin import (
     install_cross_attn_kv,
     install_drop_true_masks,
     install_eval_empty_cache,
+    install_exact_gate,
     install_foreach_grad_checks,
     install_fused_ln_modulate,
     install_fused_modulate,
@@ -77,6 +79,8 @@ install_aiter_gemm()
 install_triton_rope()
 install_cross_attn_kv()
 install_fused_modulate()
+install_exact_gate()
+install_aiter_layernorm()
 install_fused_ln_modulate()
 install_fused_lora_add()
 install_overlap_reward_logprobs()

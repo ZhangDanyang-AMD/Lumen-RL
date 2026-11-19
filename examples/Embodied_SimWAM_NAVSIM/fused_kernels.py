@@ -166,6 +166,61 @@ def layernorm_modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
 
 
 @triton.jit
+def _gate_residual_kernel(x_ptr, g_ptr, r_ptr, o_ptr, seq_len, n_cols, sxb, sxs, sgb, sgs, srb, srs,
+                          ROUND_T: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    b = row // seq_len
+    s = row % seq_len
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < n_cols
+    x = tl.load(x_ptr + b * sxb + s * sxs + cols, mask=mask, other=0.0).to(tl.float32)
+    g = tl.load(g_ptr + b * sgb + s * sgs + cols, mask=mask, other=0.0).to(tl.float32)
+    r = tl.load(r_ptr + b * srb + s * srs + cols, mask=mask, other=0.0).to(tl.float32)
+    t = g * r
+    if ROUND_T:
+        # torch rounds gate * residual to bf16 before the add
+        t = t.to(tl.bfloat16).to(tl.float32)
+    tl.store(o_ptr + row * n_cols + cols, (x + t).to(o_ptr.dtype.element_ty), mask=mask)
+
+
+class _GateResidual(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, gate, residual, save):
+        bsz, seq, n = x.shape
+        t_dtype = torch.promote_types(gate.dtype, residual.dtype)
+        out = torch.empty((bsz, seq, n), dtype=torch.promote_types(x.dtype, t_dtype), device=x.device)
+        g, gb, gs = _bcast_strides(gate, x.shape)
+        r, rb, rs = _bcast_strides(residual, x.shape)
+        block = min(1024, triton.next_power_of_2(n))
+        # enable_fp_fusion=False: no fused multiply-add where torch rounds the product first
+        _gate_residual_kernel[(bsz * seq, triton.cdiv(n, block))](
+            x, g, r, out, seq, n, x.stride(0), x.stride(1), gb, gs, rb, rs,
+            ROUND_T=t_dtype == torch.bfloat16, BLOCK=block, enable_fp_fusion=False)
+        if save:
+            ctx.save_for_backward(gate, residual)
+        ctx.t_dtype = t_dtype
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        # the ops autograd runs for x + gate * residual; returning full-size gradients leaves the reduction over
+        # broadcast dimensions and the casts to the inputs' dtypes to the engine, as for the original ops
+        gate, residual = ctx.saved_tensors
+        grad_t = grad.to(ctx.t_dtype)
+        dgate = (grad_t * residual).to(gate.dtype) if ctx.needs_input_grad[1] else None
+        dres = (grad_t * gate).to(residual.dtype) if ctx.needs_input_grad[2] else None
+        return grad, dgate, dres, None
+
+
+def gate_residual(x: torch.Tensor, gate: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+    """``x + gate * residual`` in one launch with torch's roundings (the product rounded to its dtype before the
+    add), so the output is bit-identical to the two ops; the backward runs the same ops autograd would. ``x`` is
+    ``[B, S, D]``; ``gate`` / ``residual`` broadcast to it (3-D, last dim dense)."""
+    save = torch.is_grad_enabled() and (x.requires_grad or gate.requires_grad or residual.requires_grad)
+    return _GateResidual.apply(x, gate, residual, save)
+
+
+@triton.jit
 def _lora_up_add_kernel(y_ptr, b_ptr, o_ptr, n_rows, n_cols, stride_y, scale,
                         R: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
     rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)

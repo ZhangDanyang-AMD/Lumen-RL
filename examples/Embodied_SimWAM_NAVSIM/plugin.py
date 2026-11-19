@@ -1098,6 +1098,27 @@ _KV_TRAIN_SLOTS = {}
 _GRAD_FLAT = {}
 
 
+def _fanout_function():
+    import torch
+
+    class _Fanout(torch.autograd.Function):
+        # ``reps`` aliases of one tensor; the backward adds their gradients in order (g0 + g1) + g2 ..., as the
+        # backward of torch.cat([t] * reps) feeds them to ``t``
+        @staticmethod
+        def forward(ctx, t, reps):
+            return tuple(t.view_as(t) for _ in range(reps))
+
+        @staticmethod
+        def backward(ctx, *grads):
+            total = None
+            for g in grads:
+                if g is not None:
+                    total = g if total is None else total + g
+            return total, None
+
+    return _Fanout
+
+
 def _slot_cat_function():
     import torch
 
@@ -1144,7 +1165,15 @@ def install_cross_attn_kv() -> None:
     if getattr(wvd.CrossAttention.forward, "_xkv", False):
         return
     original = wvd.CrossAttention.forward
-    stats = {"pre": 0, "dedup": 0, "full": 0}
+    stats = {"pre": 0, "dedup": 0, "full": 0, "grouped": 0}
+    # SIMWAM_GRPO_XATTN_GROUPED: a batched call attends each of the W step groups to the one copy of the context
+    # K/V instead of repeating K/V W times (no concatenation, W times less K/V read); each query row sees the
+    # same keys and values as before, so the output is the same bit for bit. "nograd" (default) does this in
+    # the no-grad calls only (the rollout's log-probs): grad-enabled ones would run W attention backwards and
+    # their summed gradients cost about as much as the forward saves. "1" groups every batched call, "0" none.
+    grouped_mode = os.environ.get("SIMWAM_GRPO_XATTN_GROUPED", "nograd").strip().lower()
+    _switch("SIMWAM_GRPO_XATTN_GROUPED", "nograd")
+    fanout = _fanout_function()
 
     def forward(self, x, ctx, ctx_mask=None):
         pre = _XKV["pre"].get(id(self))
@@ -1152,6 +1181,25 @@ def install_cross_attn_kv() -> None:
         if pre is not None and pre[0].shape[0] == ctx.shape[0]:
             k, v = pre
             stats["pre"] += 1
+        elif (reps > 1 and ctx.shape[0] % reps == 0 and _RT["SIMWAM_GRPO_XATTN_GROUPED"]
+              and (grouped_mode != "nograd" or not torch.is_grad_enabled())
+              and (ctx_mask is None or ctx_mask.shape[0] in (1, ctx.shape[0]))):
+            rows = ctx.shape[0] // reps
+            base = ctx[:rows]
+            # each group gets its rows of a per-sample mask (a broadcast mask as it is)
+            masks = ([ctx_mask] * reps if ctx_mask is None or ctx_mask.shape[0] == 1
+                     else list(ctx_mask.split(rows, dim=0)))
+            kb, vb = self.norm_k(self.k(base)), self.v(base)
+            if torch.is_grad_enabled() and (kb.requires_grad or vb.requires_grad):
+                # the copies' gradients are summed in the order the concatenation's backward adds them
+                ks, vs = fanout.apply(kb, reps), fanout.apply(vb, reps)
+            else:
+                ks, vs = [kb] * reps, [vb] * reps
+            qs = self.norm_q(self.q(x)).split(rows, dim=0)
+            out = torch.cat([wvd.flash_attention(q=qs[i], k=ks[i], v=vs[i], num_heads=self.num_heads,
+                                                 ctx_mask=masks[i]) for i in range(reps)], dim=0)
+            stats["grouped"] += 1
+            return self.o(out)
         elif reps > 1 and ctx.shape[0] % reps == 0:
             base = ctx[: ctx.shape[0] // reps]
             k = torch.cat([self.norm_k(self.k(base))] * reps, dim=0)
@@ -2569,6 +2617,86 @@ def install_fused_modulate() -> None:
     logger.info("modulate and GateModule use torch.addcmul")
 
 
+def install_exact_gate() -> None:
+    """``GateModule`` (``x + gate * residual``) in one Triton kernel that rounds like torch's two ops.
+
+    The kernel computes in fp32 and rounds the product to its dtype before the add, without a fused multiply-add,
+    so the output is bit-identical to the original multiply and add; its backward runs the same ops autograd
+    runs for them (``fused_kernels.gate_residual``). One launch instead of two in every block, rollout and
+    training alike, and no change to the backward. Calls that are not 3-D with a dense last dimension keep
+    the original; with ``SIMWAM_GRPO_FUSED_MODULATE=1`` that patch is used instead. ``SIMWAM_GRPO_EXACT_GATE=0``
+    turns it off.
+    """
+    if not _switch("SIMWAM_GRPO_EXACT_GATE", "1"):
+        return
+    import torch
+    import simwam.models.wan22.wan_video_dit as wvd
+
+    if getattr(wvd.GateModule.forward, "_exact", False):
+        return
+    previous = wvd.GateModule.forward
+    dtypes = {torch.bfloat16, torch.float32}
+    stats = {"fused": 0, "fallback": 0}
+
+    def gate_forward(self, x, gate, residual):
+        if (_RT["SIMWAM_GRPO_EXACT_GATE"] and not _RT.get("SIMWAM_GRPO_FUSED_MODULATE") and x.is_cuda
+                and x.dim() == gate.dim() == residual.dim() == 3 and x.is_contiguous()
+                and gate.stride(-1) == residual.stride(-1) == 1
+                and torch.broadcast_shapes(x.shape, gate.shape, residual.shape) == x.shape
+                and {x.dtype, gate.dtype, residual.dtype} <= dtypes):
+            from examples.Embodied_SimWAM_NAVSIM.fused_kernels import gate_residual
+
+            stats["fused"] += 1
+            return gate_residual(x, gate, residual)
+        stats["fallback"] += 1
+        return previous(self, x, gate, residual)
+
+    gate_forward._exact = True
+    _STATS["exact_gate"] = stats
+    wvd.GateModule.forward = gate_forward
+    logger.info("GateModule runs x + gate * residual in one kernel, bit-identical")
+
+
+def install_aiter_layernorm() -> None:
+    """``nn.LayerNorm`` with affine weights on aiter's Triton ``layer_norm`` (forward and backward).
+
+    In the DiT blocks this is the cross-attention input norm (``norm3``; the other two norms have no weights and
+    are fused with the modulation by ``install_fused_ln_modulate``). Rollout and training both take aiter's
+    kernel, so they still agree with each other; it is not bit-identical to torch's LayerNorm. Calls that are
+    not bf16 on the GPU with weight and bias over the last dimension keep torch's. ``SIMWAM_GRPO_AITER_LAYERNORM=0``
+    turns it off.
+    """
+    if not _switch("SIMWAM_GRPO_AITER_LAYERNORM", "1"):
+        return
+    import torch
+    import torch.nn as nn
+
+    if getattr(nn.LayerNorm.forward, "_aiter", False):
+        return
+    previous = nn.LayerNorm.forward
+    state = {"fn": None}
+    stats = {"aiter": 0, "torch": 0}
+
+    def forward(self, x):
+        w, b = self.weight, self.bias
+        if (w is not None and b is not None and x.is_cuda and x.dtype == torch.bfloat16 and w.dtype == x.dtype
+                and b.dtype == x.dtype and len(self.normalized_shape) == 1 and x.shape[-1] == w.shape[0]):
+            if state["fn"] is None:
+                from aiter.ops.triton.normalization.norm import layer_norm
+
+                state["fn"] = layer_norm
+            stats["aiter"] += 1
+            n = x.shape[-1]
+            return state["fn"](x.reshape(-1, n), w, b, self.eps).view(x.shape)
+        stats["torch"] += 1
+        return previous(self, x)
+
+    forward._aiter = True
+    _STATS["aiter_layernorm"] = stats
+    nn.LayerNorm.forward = forward
+    logger.info("nn.LayerNorm with weights runs aiter's Triton layer_norm")
+
+
 def install_overlap_reward_logprobs() -> None:
     """Score PDM rewards in the worker pool while the rollout's log-probs run on the GPU.
 
@@ -2578,8 +2706,9 @@ def install_overlap_reward_logprobs() -> None:
     reference log-probs of the first inner epoch (stored where ``install_ref_logprob_cache``
     looks) are computed while the workers simulate, and the rewards are collected before the
     advantages. Everything else follows ``SimWAMGRPOTrainer._rollout``.
-    Needs both of those patches; ``SIMWAM_GRPO_OVERLAP_REWARD=0`` turns it off. The next batch's metric caches
-    are loaded into the workers while the current batch trains (``SIMWAM_GRPO_PDM_PREFETCH=0`` turns it off).
+    Needs both of those patches; ``SIMWAM_GRPO_OVERLAP_REWARD=0`` turns it off. The batch's metric caches are
+    loaded into the workers when its rollout starts (``SIMWAM_GRPO_PDM_PREFETCH=rollout``, the default; ``1`` loads
+    the next batch's while the current batch trains, ``0`` turns it off).
     """
     if os.environ.get("SIMWAM_GRPO_OVERLAP_REWARD", "1").strip().lower() in _OFF:
         return
@@ -2597,7 +2726,28 @@ def install_overlap_reward_logprobs() -> None:
         return
     rollout_orig = SimWAMGRPOTrainer._rollout
     workers = int(os.environ.get("SIMWAM_GRPO_PDM_WORKERS", "8") or 8)
-    if _switch("SIMWAM_GRPO_PDM_PREFETCH", "1"):
+    prefetch = os.environ.get("SIMWAM_GRPO_PDM_PREFETCH", "rollout").strip().lower()
+    _switch("SIMWAM_GRPO_PDM_PREFETCH", "rollout")
+    if prefetch == "rollout":
+        # the current batch's metric caches are loaded into the workers when the rollout starts (the GPU is busy with
+        # the VAE and denoising, the host mostly idle) instead of while the previous batch trains, where the loads in
+        # every worker of every rank slowed the optimizer step; the loads are queued ahead of the scoring that needs them
+        _PDM_PREFETCH["on"] = True
+        next_orig = SimWAMGRPOTrainer._next_batch
+
+        def _next_batch(self):
+            batch = next_orig(self)
+            reward = self.action_reward
+            if hasattr(reward, "_pool_init_args"):
+                pool = _pdm_pool(reward, workers)
+                for token in dict.fromkeys(batch["token"]):
+                    pool.map_async(_pdm_worker_warm, [token] * reward._pool_workers, chunksize=1)
+                pdm = _STATS.setdefault("pdm", {"rollouts": 0})
+                pdm["prefetched"] = pdm.get("prefetched", 0) + 1
+            return batch
+
+        SimWAMGRPOTrainer._next_batch = _next_batch
+    elif prefetch not in _OFF:
         # A few tokens' metric caches take 0.3-0.6 s to load (lzma + unpickle, in all workers at once), and the
         # rollout then waits for them (the other rank too). The batch after the current one is fetched one call
         # early, its token's cache is loaded into every worker while the current batch trains (see collect), and
@@ -2644,7 +2794,8 @@ def install_overlap_reward_logprobs() -> None:
             pool = _pdm_pool(reward, workers)
             for token in dict.fromkeys(nxt):
                 pool.map_async(_pdm_worker_warm, [token] * reward._pool_workers, chunksize=1)
-            _STATS.setdefault("pdm", {"rollouts": 0})["prefetched"] = _STATS["pdm"].get("prefetched", 0) + 1
+            pdm = _STATS.setdefault("pdm", {"rollouts": 0})
+            pdm["prefetched"] = pdm.get("prefetched", 0) + 1
         reward.last_num_total = len(tokens)
         reward.last_num_missing = 0
         reward.last_num_failed = 0
