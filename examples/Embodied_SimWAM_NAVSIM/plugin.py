@@ -327,6 +327,11 @@ def _masks_all_true(cond) -> bool:
     return flag
 
 
+def _prefill_masks_all_true(video_context_payload, video_attention_mask) -> bool:
+    ctx = (video_context_payload or {}).get("mask")
+    return bool(video_attention_mask.all()) and (ctx is None or bool(ctx.all()))
+
+
 def install_drop_true_masks() -> None:
     """Call SDPA without the attention masks when they are all True.
 
@@ -436,9 +441,12 @@ def install_drop_true_masks() -> None:
 
     def prefill_video_cache(self, video_tokens, video_freqs, video_t_mod, video_context_payload,
                             video_attention_mask):
-        ctx = (video_context_payload or {}).get("mask")
         previous = _DROP["on"]
-        _DROP["on"] = bool(video_attention_mask.all()) and (ctx is None or bool(ctx.all()))
+        if torch.cuda.is_current_stream_capturing():
+            # install_prefill_graph checks the masks before capturing
+            _DROP["on"] = bool(_DROP.get("prefill_flag"))
+        else:
+            _DROP["on"] = _prefill_masks_all_true(video_context_payload, video_attention_mask)
         try:
             return prefill(self, video_tokens, video_freqs, video_t_mod, video_context_payload, video_attention_mask)
         finally:
@@ -571,6 +579,153 @@ def install_action_velocity_graphs() -> None:
     action_velocity.eager = eager
     ActionGRPOMixin.action_velocity = action_velocity
     logger.info("action_velocity replays CUDA graphs under no_grad (verify=%s)", verify)
+
+
+def install_numa_affinity() -> None:
+    """Pin each rank's threads to the CPUs of its GPU's NUMA node.
+
+    torchrun leaves every rank free to run on any CPU of both sockets, so a rank's host work
+    (eager condition building, launches) can land on the socket away from its GPU and run a
+    little slower than the others', which then wait for it in the gradient all-reduce. After
+    ``configure_grpo`` (the device is set by then) the NUMA node of the current GPU is read from
+    sysfs and every thread of the process is restricted to that node's CPUs, intersected with
+    the CPUs it is already allowed. Processes started later (PDM pool, data loader workers)
+    inherit it. Nothing changes when sysfs gives no node. ``SIMWAM_GRPO_NUMA_AFFINITY=1`` turns
+    it on.
+    """
+    if os.environ.get("SIMWAM_GRPO_NUMA_AFFINITY", "0").strip().lower() in _OFF:
+        return
+    import glob
+
+    from simwam.models.wan22.simwam_grpo import ActionGRPOMixin
+
+    if getattr(ActionGRPOMixin.configure_grpo, "_numa", False):
+        return
+    original = ActionGRPOMixin.configure_grpo
+
+    def parse_cpulist(text):
+        cpus = set()
+        for part in text.strip().split(","):
+            if "-" in part:
+                a, b = part.split("-")
+                cpus.update(range(int(a), int(b) + 1))
+            elif part:
+                cpus.add(int(part))
+        return cpus
+
+    def pin():
+        import torch
+
+        bus = int(torch.cuda.get_device_properties(torch.cuda.current_device()).pci_bus_id)
+        paths = glob.glob(f"/sys/bus/pci/devices/*:{bus:02x}:00.0/numa_node")
+        if len(paths) != 1:
+            return None
+        node = int(open(paths[0]).read().strip())
+        if node < 0:
+            return None
+        cpus = parse_cpulist(open(f"/sys/devices/system/node/node{node}/cpulist").read()) & os.sched_getaffinity(0)
+        if not cpus:
+            return None
+        for tid in os.listdir("/proc/self/task"):
+            try:
+                os.sched_setaffinity(int(tid), cpus)
+            except OSError:
+                pass
+        return node, len(cpus)
+
+    def configure_grpo(self, grpo_cfg):
+        original(self, grpo_cfg)
+        try:
+            res = pin()
+        except Exception as exc:
+            res = None
+            logger.warning("NUMA affinity not set (%s)", exc)
+        if res is not None:
+            logger.info("rank threads pinned to NUMA node %d (%d CPUs)", *res)
+
+    configure_grpo._numa = True
+    ActionGRPOMixin.configure_grpo = configure_grpo
+
+
+def install_prefill_graph() -> None:
+    """Replay the video prefill of ``build_action_condition`` from a CUDA graph.
+
+    The video expert is frozen and its prefill runs once per rollout condition with fixed
+    shapes (one frame, the same context length): about 30 layers of eager ops whose launch cost
+    the GPU does not hide, so the host spends far longer on it than the GPU does. One graph is
+    captured per input signature (shapes, strides, dtypes, and whether the masks are all True);
+    a call copies its inputs into the graph's static tensors, replays, and returns a copy of the
+    per-layer K/V. Grad-enabled calls, inputs not all on the GPU and failed captures run eagerly.
+    ``SIMWAM_GRPO_PREFILL_GRAPH=1`` turns it on.
+    """
+    if os.environ.get("SIMWAM_GRPO_PREFILL_GRAPH", "0").strip().lower() in _OFF:
+        return
+    import torch
+    from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
+    from simwam.models.wan22.mot import MoT
+
+    if getattr(MoT.prefill_video_cache, "_graph", False):
+        return
+    eager = MoT.prefill_video_cache
+    graphs = {}
+    stats = {"replay": 0, "eager": 0, "captured": 0}
+
+    def capture(self, leaves, spec, flag):
+        static, static_leaves = [], []
+        for x in leaves:
+            if torch.is_tensor(x):
+                s = torch.empty_strided(x.shape, x.stride(), dtype=x.dtype, device=x.device)
+                s.copy_(x)
+                static.append(s)
+                x = s
+            static_leaves.append(x)
+        args = tree_unflatten(static_leaves, spec)
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(2):
+                eager(self, *args)
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        _DROP["prefill_flag"] = flag
+        with torch.cuda.graph(graph):
+            out = eager(self, *args)
+        return {"graph": graph, "static": static, "out": out}
+
+    def prefill_video_cache(self, video_tokens, video_freqs, video_t_mod, video_context_payload,
+                            video_attention_mask):
+        args = (video_tokens, video_freqs, video_t_mod, video_context_payload, video_attention_mask)
+        leaves, spec = tree_flatten(args)
+        tensors = [x for x in leaves if torch.is_tensor(x)]
+        if (torch.is_grad_enabled() or torch.cuda.is_current_stream_capturing() or not tensors
+                or not all(t.is_cuda for t in tensors)):
+            stats["eager"] += 1
+            return eager(self, *args)
+        flag = _prefill_masks_all_true(video_context_payload, video_attention_mask)
+        key = (id(self), str(spec), flag, tuple((tuple(x.shape), tuple(x.stride()), x.dtype) if torch.is_tensor(x)
+                                               else repr(x) for x in leaves))
+        g = graphs.get(key)
+        if g is None:
+            try:
+                g = capture(self, leaves, spec, flag)
+                stats["captured"] += 1
+            except Exception as exc:
+                logger.warning("CUDA graph capture of the video prefill failed (%s); using eager", exc)
+                g = False
+            graphs[key] = g
+        if g is False:
+            stats["eager"] += 1
+            return eager(self, *args)
+        for s, t in zip(g["static"], tensors):
+            s.copy_(t)
+        g["graph"].replay()
+        stats["replay"] += 1
+        return tree_map(lambda t: t.clone() if torch.is_tensor(t) else t, g["out"])
+
+    prefill_video_cache._graph = True
+    _STATS["prefill_graph"] = stats
+    MoT.prefill_video_cache = prefill_video_cache
+    logger.info("the video prefill replays a CUDA graph")
 
 
 _CHUNK = {"sizes": None, "views": None, "ops": frozenset(), "lumen": None}
@@ -1364,10 +1519,13 @@ def install_aiter_rmsnorm() -> None:
     grad-enabled calls go through an autograd Function whose backward computes the input
     gradient from the RMSNorm formula in fp32 (the norm weights are frozen here; a weight
     gradient is computed too if one is needed). Only bf16 with the widths checked below.
-    ``SIMWAM_GRPO_AITER_RMSNORM=0`` turns it off.
+    ``SIMWAM_GRPO_AITER_RMSNORM=0`` turns it off. ``SIMWAM_GRPO_TRITON_RMSNORM_BWD=1`` computes the
+    input gradient in one Triton kernel (``fused_kernels.rmsnorm_backward``) instead of a chain
+    of fp32 element-wise and reduction kernels.
     """
     if os.environ.get("SIMWAM_GRPO_AITER_RMSNORM", "1").strip().lower() in _OFF:
         return
+    triton_bwd = os.environ.get("SIMWAM_GRPO_TRITON_RMSNORM_BWD", "0").strip().lower() not in _OFF
     import torch
     from simwam.models.wan22 import wan_video_dit as wvd
 
@@ -1387,6 +1545,10 @@ def install_aiter_rmsnorm() -> None:
         @staticmethod
         def backward(ctx, grad):
             x, weight = ctx.saved_tensors
+            if triton_bwd and not ctx.needs_input_grad[1]:
+                from examples.Embodied_SimWAM_NAVSIM.fused_kernels import rmsnorm_backward
+
+                return rmsnorm_backward(x, grad, weight, ctx.eps), None, None
             xf = x.float()
             gw = grad.float() * weight.float()
             r = torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + ctx.eps)
@@ -1412,6 +1574,61 @@ def install_aiter_rmsnorm() -> None:
     forward._aiter = True
     wvd.RMSNorm.forward = forward
     logger.info("SimWAM RMSNorm runs on AITER's CK rms_norm")
+
+
+def install_triton_rope() -> None:
+    """SimWAM's ``rope_apply`` as one Triton kernel in fp32, forward and backward.
+
+    SimWAM rotates q and k in float64 complex arithmetic: a cast to float64, a complex multiply
+    and a cast back, each a separate kernel, and the same again in the backward. The kernel in
+    ``fused_kernels.rope`` reads the bf16 input and the (cos, sin) table, rotates in fp32 and
+    writes bf16 in one launch; the backward rotates the gradient by the conjugate. Not
+    bit-identical to the float64 path. Calls that are not bf16 on the GPU with a complex
+    ``[S or 1, 1, D/2]`` table keep SimWAM's function. ``SIMWAM_GRPO_TRITON_ROPE=1`` turns it on.
+    """
+    if os.environ.get("SIMWAM_GRPO_TRITON_ROPE", "0").strip().lower() in _OFF:
+        return
+    import torch
+    import simwam.models.wan22.mot as mot
+    import simwam.models.wan22.wan_video_dit as wvd
+
+    if getattr(wvd.rope_apply, "_triton", False):
+        return
+    original = wvd.rope_apply
+    stats = {"triton": 0, "fallback": 0}
+
+    class _Rope(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, freqs_real):
+            from examples.Embodied_SimWAM_NAVSIM.fused_kernels import rope
+
+            ctx.save_for_backward(freqs_real)
+            return rope(x, freqs_real)
+
+        @staticmethod
+        def backward(ctx, grad):
+            from examples.Embodied_SimWAM_NAVSIM.fused_kernels import rope
+
+            (freqs_real,) = ctx.saved_tensors
+            return rope(grad, freqs_real, inverse=True), None
+
+    def rope_apply(x, freqs, num_heads):
+        if (x.dtype != torch.bfloat16 or not x.is_cuda or x.dim() != 3 or not torch.is_complex(freqs)
+                or not freqs.is_cuda or freqs.dim() != 3 or freqs.shape[1] != 1
+                or freqs.shape[0] not in (1, x.shape[1]) or x.shape[-1] != num_heads * 2 * freqs.shape[-1]):
+            stats["fallback"] += 1
+            return original(x, freqs, num_heads)
+        fr = torch.view_as_real(freqs)
+        if fr.shape[0] == 1 and x.shape[1] > 1:
+            fr = fr.expand(x.shape[1], *fr.shape[1:])
+        stats["triton"] += 1
+        return _Rope.apply(x, fr)
+
+    rope_apply._triton = True
+    _STATS["triton_rope"] = stats
+    wvd.rope_apply = rope_apply
+    mot.rope_apply = rope_apply
+    logger.info("rope_apply runs as one Triton kernel (fp32)")
 
 
 def install_compiled_rmsnorm() -> None:
@@ -1477,6 +1694,37 @@ def install_fused_lora_add() -> None:
     forward._fused_add = True
     LoRALinear.forward = forward
     logger.info("LoRALinear adds the adapter with torch.add(alpha=scaling)")
+
+
+def install_fused_modulate() -> None:
+    """``modulate`` and ``GateModule`` with ``torch.addcmul``: one kernel fewer per call.
+
+    SimWAM computes ``x * (1 + scale) + shift`` (three kernels) and ``x + gate * residual``
+    (two). ``torch.addcmul(shift, x, 1 + scale)`` and ``torch.addcmul(x, gate, residual)`` do the
+    multiply-add in one pass and round once, so they are not bit-identical; rollout and training
+    use the same op, so they still agree with each other. ``SIMWAM_GRPO_FUSED_MODULATE=1`` turns
+    it on.
+    """
+    if os.environ.get("SIMWAM_GRPO_FUSED_MODULATE", "0").strip().lower() in _OFF:
+        return
+    import torch
+    import simwam.models.wan22.mot as mot
+    import simwam.models.wan22.wan_video_dit as wvd
+
+    if getattr(wvd.modulate, "_addcmul", False):
+        return
+
+    def modulate(x, shift, scale):
+        return torch.addcmul(shift, x, 1 + scale)
+
+    def gate_forward(self, x, gate, residual):
+        return torch.addcmul(x, gate, residual)
+
+    modulate._addcmul = True
+    wvd.modulate = modulate
+    mot.modulate = modulate
+    wvd.GateModule.forward = gate_forward
+    logger.info("modulate and GateModule use torch.addcmul")
 
 
 def install_overlap_reward_logprobs() -> None:

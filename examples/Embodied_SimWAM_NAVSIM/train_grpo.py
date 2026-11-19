@@ -28,15 +28,19 @@ from examples.Embodied_SimWAM_NAVSIM.plugin import (
     install_compiled_rmsnorm,
     install_drop_true_masks,
     install_foreach_grad_checks,
+    install_fused_modulate,
     install_fused_lora_add,
     install_grpo_hook,
     install_lean_lumen_attention,
     install_lora_init_seed,
     install_manual_data_parallel,
+    install_numa_affinity,
     install_overlap_reward_logprobs,
     install_parallel_pdm_reward,
+    install_prefill_graph,
     install_ref_logprob_cache,
     install_train_graphs,
+    install_triton_rope,
 )
 from simwam.runtime_grpo import run_grpo_training
 from simwam.utils.config_resolvers import register_default_resolvers
@@ -52,15 +56,20 @@ install_ref_logprob_cache()
 install_lean_lumen_attention()
 # after the lean attention (its SDPA wrapper must be outermost), before the graphs that capture it
 install_drop_true_masks()
+# outside the mask check of the prefill, which must not run under capture
+install_prefill_graph()
 install_action_velocity_graphs()
 # after the no_grad graphs, which it falls through to
 install_train_graphs()
 install_parallel_pdm_reward()
 install_compiled_rmsnorm()
 install_aiter_rmsnorm()
+install_triton_rope()
+install_fused_modulate()
 install_fused_lora_add()
 install_overlap_reward_logprobs()
 install_foreach_grad_checks()
+install_numa_affinity()
 register_default_resolvers()
 
 
