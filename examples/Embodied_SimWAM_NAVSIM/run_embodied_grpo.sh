@@ -26,7 +26,9 @@ export AITER_SRC="${AITER_SRC:-/home/danyzhan/aiter}"
 # lumen_linear is left out: the tuned GEMM has no entry for these shapes and falls back to the torch
 # GEMM, so results are unchanged and only the dispatch cost goes. hf_attn_patch stays so results are
 # bit-identical to the original; aiter_conv alone (torch SDPA) is faster but changes log-probs (see README).
-export LUMEN_ENABLE="${LUMEN_ENABLE:-hf_attn_patch,aiter_conv}"
+# flydsl_conv moves the VAE convolutions to aiter's FlyDSL kernel when it is available (see README);
+# otherwise it logs a warning and the VAE keeps the aiter_conv / torch path.
+export LUMEN_ENABLE="${LUMEN_ENABLE:-hf_attn_patch,aiter_conv,flydsl_conv}"
 export SIMWAM_ROOT="$SIMWAM"
 export DIFFSYNTH_MODEL_BASE_PATH="${DIFFSYNTH_MODEL_BASE_PATH:-$SIMWAM/checkpoints}"
 export HF_HOME="${HF_HOME:-/home/danyzhan/.cache/huggingface}"

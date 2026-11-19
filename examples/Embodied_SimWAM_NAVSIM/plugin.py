@@ -29,6 +29,17 @@ logger = logging.getLogger(__name__)
 _OFF = {"", "0", "false", "none", "off"}
 # counters of the verify modes, by patch
 _STATS = {}
+# values of the switches read inside other patches (set when those patches are installed)
+_RT = {}
+
+
+def _switch(env: str, default: str) -> bool:
+    """Record the switch's value in ``_RT`` and return it."""
+    on = os.environ.get(env, default).strip().lower() not in _OFF
+    _RT[env] = on
+    return on
+
+
 _PATCHES = ("hf_attn_patch", "lumen_linear", "aiter_conv")
 # applied by this plugin, not by LumenConfig
 _PLUGIN_PATCHES = ("flydsl_conv",)
@@ -355,6 +366,9 @@ def install_drop_true_masks() -> None:
     Triton ``flash_attn_func`` (forward and backward) instead of torch's flash path; no-grad calls
     stay on torch, whose flash forward is AITER's CK kernel already. ``=all`` sends the no-grad
     calls to the same Triton kernel too, so rollout and training attention match again.
+    By default (``SIMWAM_GRPO_AITER_ATTN_BWD``, ``0`` turns it off) the grad-enabled calls keep torch's flash
+    forward (the rollout's kernel) and run their backward with aiter's flash-attention backward
+    (``SIMWAM_GRPO_AITER_ATTN_BWD_DETERMINISTIC``, default 1, selects its deterministic mode).
     """
     if os.environ.get("SIMWAM_GRPO_DROP_MASKS", "1").strip().lower() in _OFF:
         return
@@ -392,12 +406,53 @@ def install_drop_true_masks() -> None:
             out = out[0]
         return out.transpose(1, 2)
 
+    _switch("SIMWAM_GRPO_AITER_ATTN_BWD", "1")
+    attn_det = os.environ.get("SIMWAM_GRPO_AITER_ATTN_BWD_DETERMINISTIC", "1").strip().lower() not in _OFF
+
+    class _FlashAiterBwd(torch.autograd.Function):
+        # forward: the op torch's SDPA runs for these calls (its flash path; the rollout's no-grad calls run the
+        # same kernel), keeping its log-sum-exp; backward: aiter's flash-attention backward on those tensors
+        @staticmethod
+        def forward(ctx, q, k, v, scale):
+            r = torch.ops.aten._scaled_dot_product_flash_attention(q, k, v, 0.0, False, False, scale=scale)
+            out, lse = r[0], r[1]
+            ctx.save_for_backward(q, k, v, out, lse)
+            ctx.scale = scale
+            return out
+
+        @staticmethod
+        def backward(ctx, dout):
+            from aiter.ops import mha
+
+            q, k, v, out, lse = ctx.saved_tensors
+            t = lambda x: x.transpose(1, 2)  # aiter takes [B, S, H, D]
+            dq = torch.empty(t(q).shape, dtype=q.dtype, device=q.device)
+            dk = torch.empty(t(k).shape, dtype=k.dtype, device=k.device)
+            dv = torch.empty(t(v).shape, dtype=v.dtype, device=v.device)
+            mha._flash_attn_backward(t(dout), t(q), t(k), t(v), t(out), lse, dq, dk, dv, None, 0.0, ctx.scale,
+                                     False, -1, -1, None, None, attn_det)
+            return t(dq), t(dk), t(dv), None
+
+    def aiter_bwd_sdpa(query, key, value, args, kwargs):
+        opts = dict(zip(("dropout_p", "is_causal", "scale"), args))
+        opts.update(kwargs)
+        if (set(opts) - {"dropout_p", "is_causal", "scale"} or opts.get("dropout_p") or opts.get("is_causal")
+                or not torch.is_grad_enabled()
+                or not (query.requires_grad or key.requires_grad or value.requires_grad)):
+            return None
+        stats["aiter_attn_bwd"] = stats.get("aiter_attn_bwd", 0) + 1
+        return _FlashAiterBwd.apply(query, key, value, opts.get("scale") or query.shape[-1] ** (-0.5))
+
     def wrap_sdpa(prev):
         def sdpa(query, key, value, attn_mask=None, *args, **kwargs):
             if _DROP["on"] and attn_mask is not None and attn_mask.dtype == torch.bool:
                 stats["dropped"] += 1
                 if fmha_grad:
                     out = aiter_fmha(query, key, value, args, kwargs)
+                    if out is not None:
+                        return out
+                if _RT["SIMWAM_GRPO_AITER_ATTN_BWD"]:
+                    out = aiter_bwd_sdpa(query, key, value, args, kwargs)
                     if out is not None:
                         return out
                 return torch_sdpa(query, key, value, None, *args, **kwargs)
@@ -599,7 +654,7 @@ def install_numa_affinity() -> None:
     inherit it. Nothing changes when sysfs gives no node. ``SIMWAM_GRPO_NUMA_AFFINITY=1`` turns
     it on.
     """
-    if os.environ.get("SIMWAM_GRPO_NUMA_AFFINITY", "0").strip().lower() in _OFF:
+    if not _switch("SIMWAM_GRPO_NUMA_AFFINITY", "0"):
         return
     import glob
 
@@ -608,6 +663,7 @@ def install_numa_affinity() -> None:
     if getattr(ActionGRPOMixin.configure_grpo, "_numa", False):
         return
     original = ActionGRPOMixin.configure_grpo
+    state = {"node": None, "cpus": None, "orig": None}
 
     def parse_cpulist(text):
         cpus = set()
@@ -619,35 +675,44 @@ def install_numa_affinity() -> None:
                 cpus.add(int(part))
         return cpus
 
-    def pin():
-        import torch
-
-        bus = int(torch.cuda.get_device_properties(torch.cuda.current_device()).pci_bus_id)
-        paths = glob.glob(f"/sys/bus/pci/devices/*:{bus:02x}:00.0/numa_node")
-        if len(paths) != 1:
-            return None
-        node = int(open(paths[0]).read().strip())
+    def find_node():
+        # No CUDA call here: before the trainer sets the device, querying it would open a HIP context on GPU 0
+        # in every rank (and break the NCCL IPC setup). The GPUs this process sees are its /dev/dri render
+        # nodes; with HIP_VISIBLE_DEVICES unset or 0..n-1 the LOCAL_RANK-th of them in PCI order is its device.
+        pcis = sorted((os.path.realpath(f"/sys/class/drm/{os.path.basename(d)}/device")
+                       for d in glob.glob("/dev/dri/renderD*")), key=os.path.basename)
+        visible = os.environ.get("HIP_VISIBLE_DEVICES") or os.environ.get("CUDA_VISIBLE_DEVICES")
+        rank = int(os.environ.get("LOCAL_RANK", "0"))
+        if (visible and [x.strip() for x in visible.split(",")] != [str(i) for i in range(len(pcis))]) \
+                or rank >= len(pcis):
+            return
+        node = int(open(os.path.join(pcis[rank], "numa_node")).read().strip())
         if node < 0:
-            return None
-        cpus = parse_cpulist(open(f"/sys/devices/system/node/node{node}/cpulist").read()) & os.sched_getaffinity(0)
-        if not cpus:
-            return None
+            return
+        state["orig"] = os.sched_getaffinity(0)
+        cpus = parse_cpulist(open(f"/sys/devices/system/node/node{node}/cpulist").read()) & state["orig"]
+        if cpus:
+            state["node"], state["cpus"] = node, cpus
+
+    def apply():
+        if state["cpus"] is None:
+            return
+        cpus = state["cpus"] if _RT["SIMWAM_GRPO_NUMA_AFFINITY"] else state["orig"]
         for tid in os.listdir("/proc/self/task"):
             try:
                 os.sched_setaffinity(int(tid), cpus)
             except OSError:
                 pass
-        return node, len(cpus)
 
     def configure_grpo(self, grpo_cfg):
         original(self, grpo_cfg)
         try:
-            res = pin()
+            find_node()
+            apply()
         except Exception as exc:
-            res = None
             logger.warning("NUMA affinity not set (%s)", exc)
-        if res is not None:
-            logger.info("rank threads pinned to NUMA node %d (%d CPUs)", *res)
+        if state["cpus"] is not None and _RT["SIMWAM_GRPO_NUMA_AFFINITY"]:
+            logger.info("rank threads pinned to NUMA node %d (%d CPUs)", state["node"], len(state["cpus"]))
 
     configure_grpo._numa = True
     ActionGRPOMixin.configure_grpo = configure_grpo
@@ -662,9 +727,9 @@ def install_prefill_graph() -> None:
     captured per input signature (shapes, strides, dtypes, and whether the masks are all True);
     a call copies its inputs into the graph's static tensors, replays, and returns a copy of the
     per-layer K/V. Grad-enabled calls, inputs not all on the GPU and failed captures run eagerly.
-    ``SIMWAM_GRPO_PREFILL_GRAPH=1`` turns it on.
+    ``SIMWAM_GRPO_PREFILL_GRAPH=0`` turns it off.
     """
-    if os.environ.get("SIMWAM_GRPO_PREFILL_GRAPH", "0").strip().lower() in _OFF:
+    if not _switch("SIMWAM_GRPO_PREFILL_GRAPH", "1"):
         return
     import torch
     from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
@@ -680,7 +745,12 @@ def install_prefill_graph() -> None:
         static, static_leaves = [], []
         for x in leaves:
             if torch.is_tensor(x):
-                s = torch.empty_strided(x.shape, x.stride(), dtype=x.dtype, device=x.device)
+                # an expanded input (the context mask) has stride-0 dims; a static copy with those strides would
+                # alias its elements, so it gets dense storage (its values are copied in on every replay)
+                if any(st == 0 and n > 1 for st, n in zip(x.stride(), x.shape)):
+                    s = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+                else:
+                    s = torch.empty_strided(x.shape, x.stride(), dtype=x.dtype, device=x.device)
                 s.copy_(x)
                 static.append(s)
                 x = s
@@ -703,8 +773,8 @@ def install_prefill_graph() -> None:
         args = (video_tokens, video_freqs, video_t_mod, video_context_payload, video_attention_mask)
         leaves, spec = tree_flatten(args)
         tensors = [x for x in leaves if torch.is_tensor(x)]
-        if (torch.is_grad_enabled() or torch.cuda.is_current_stream_capturing() or not tensors
-                or not all(t.is_cuda for t in tensors)):
+        if (not _RT["SIMWAM_GRPO_PREFILL_GRAPH"] or torch.is_grad_enabled() or torch.cuda.is_current_stream_capturing()
+                or not tensors or not all(t.is_cuda for t in tensors)):
             stats["eager"] += 1
             return eager(self, *args)
         flag = _prefill_masks_all_true(video_context_payload, video_attention_mask)
@@ -1525,13 +1595,13 @@ def install_aiter_rmsnorm() -> None:
     grad-enabled calls go through an autograd Function whose backward computes the input
     gradient from the RMSNorm formula in fp32 (the norm weights are frozen here; a weight
     gradient is computed too if one is needed). Only bf16 with the widths checked below.
-    ``SIMWAM_GRPO_AITER_RMSNORM=0`` turns it off. ``SIMWAM_GRPO_TRITON_RMSNORM_BWD=1`` computes the
-    input gradient in one Triton kernel (``fused_kernels.rmsnorm_backward``) instead of a chain
-    of fp32 element-wise and reduction kernels.
+    ``SIMWAM_GRPO_AITER_RMSNORM=0`` turns it off. The input gradient is computed in one Triton
+    kernel (``fused_kernels.rmsnorm_backward``); ``SIMWAM_GRPO_TRITON_RMSNORM_BWD=0`` uses the chain
+    of fp32 element-wise and reduction kernels instead.
     """
     if os.environ.get("SIMWAM_GRPO_AITER_RMSNORM", "1").strip().lower() in _OFF:
         return
-    triton_bwd = os.environ.get("SIMWAM_GRPO_TRITON_RMSNORM_BWD", "0").strip().lower() not in _OFF
+    _switch("SIMWAM_GRPO_TRITON_RMSNORM_BWD", "1")
     import torch
     from simwam.models.wan22 import wan_video_dit as wvd
 
@@ -1551,7 +1621,7 @@ def install_aiter_rmsnorm() -> None:
         @staticmethod
         def backward(ctx, grad):
             x, weight = ctx.saved_tensors
-            if triton_bwd and not ctx.needs_input_grad[1]:
+            if _RT["SIMWAM_GRPO_TRITON_RMSNORM_BWD"] and not ctx.needs_input_grad[1]:
                 from examples.Embodied_SimWAM_NAVSIM.fused_kernels import rmsnorm_backward
 
                 return rmsnorm_backward(x, grad, weight, ctx.eps), None, None
@@ -1590,9 +1660,9 @@ def install_triton_rope() -> None:
     ``fused_kernels.rope`` reads the bf16 input and the (cos, sin) table, rotates in fp32 and
     writes bf16 in one launch; the backward rotates the gradient by the conjugate. Not
     bit-identical to the float64 path. Calls that are not bf16 on the GPU with a complex
-    ``[S or 1, 1, D/2]`` table keep SimWAM's function. ``SIMWAM_GRPO_TRITON_ROPE=1`` turns it on.
+    ``[S or 1, 1, D/2]`` table keep SimWAM's function. ``SIMWAM_GRPO_TRITON_ROPE=0`` turns it off.
     """
-    if os.environ.get("SIMWAM_GRPO_TRITON_ROPE", "0").strip().lower() in _OFF:
+    if not _switch("SIMWAM_GRPO_TRITON_ROPE", "1"):
         return
     import torch
     import simwam.models.wan22.mot as mot
@@ -1619,6 +1689,8 @@ def install_triton_rope() -> None:
             return rope(grad, freqs_real, inverse=True), None
 
     def rope_apply(x, freqs, num_heads):
+        if not _RT["SIMWAM_GRPO_TRITON_ROPE"]:
+            return original(x, freqs, num_heads)
         if (x.dtype != torch.bfloat16 or not x.is_cuda or x.dim() != 3 or not torch.is_complex(freqs)
                 or not freqs.is_cuda or freqs.dim() != 3 or freqs.shape[1] != 1
                 or freqs.shape[0] not in (1, x.shape[1]) or x.shape[-1] != num_heads * 2 * freqs.shape[-1]):
@@ -1680,15 +1752,27 @@ def install_fused_lora_add() -> None:
     still run once per original step (as in ``install_batched_logprobs``), so the weight
     gradients come from the same per-step GEMMs. ``SIMWAM_GRPO_FUSED_LORA=0`` turns it off.
     """
-    if os.environ.get("SIMWAM_GRPO_FUSED_LORA", "1").strip().lower() in _OFF:
+    if not _switch("SIMWAM_GRPO_FUSED_LORA", "1"):
         return
     import torch
     from simwam.models.wan22.lora import LoRALinear
 
     if getattr(LoRALinear.forward, "_fused_add", False):
         return
+    previous = LoRALinear.forward
+    # SIMWAM_GRPO_LORA_ADDMM=1: the second LoRA GEMM accumulates into the base output (addmm, beta=1), so the
+    # scaled add happens inside the GEMM in fp32 with one rounding instead of as a separate bf16 kernel
+    _switch("SIMWAM_GRPO_LORA_ADDMM", "0")
 
     def forward(self, x):
+        if not _RT["SIMWAM_GRPO_FUSED_LORA"]:
+            return previous(self, x)
+        if _RT["SIMWAM_GRPO_LORA_ADDMM"] and not _chunk_active(x):
+            out = self.base(x)
+            mid = self.lora_dropout(x) @ self.lora_A.t()
+            n = out.shape[-1]
+            return torch.addmm(out.reshape(-1, n), mid.reshape(-1, mid.shape[-1]), self.lora_B.t(),
+                               alpha=self.scaling).view(out.shape)
         out = self.base(x)
         if _chunk_active(x):
             lora = torch.cat([(self.lora_dropout(xc) @ self.lora_A.t()) @ self.lora_B.t()
@@ -1711,7 +1795,7 @@ def install_fused_modulate() -> None:
     use the same op, so they still agree with each other. ``SIMWAM_GRPO_FUSED_MODULATE=1`` turns
     it on.
     """
-    if os.environ.get("SIMWAM_GRPO_FUSED_MODULATE", "0").strip().lower() in _OFF:
+    if not _switch("SIMWAM_GRPO_FUSED_MODULATE", "0"):
         return
     import torch
     import simwam.models.wan22.mot as mot
@@ -1719,11 +1803,17 @@ def install_fused_modulate() -> None:
 
     if getattr(wvd.modulate, "_addcmul", False):
         return
+    original_modulate = wvd.modulate
+    original_gate = wvd.GateModule.forward
 
     def modulate(x, shift, scale):
+        if not _RT["SIMWAM_GRPO_FUSED_MODULATE"]:
+            return original_modulate(x, shift, scale)
         return torch.addcmul(shift, x, 1 + scale)
 
     def gate_forward(self, x, gate, residual):
+        if not _RT["SIMWAM_GRPO_FUSED_MODULATE"]:
+            return original_gate(self, x, gate, residual)
         return torch.addcmul(x, gate, residual)
 
     modulate._addcmul = True
@@ -1961,6 +2051,27 @@ def _flydsl_conv_module():
     return None
 
 
+def _bind_t1_conv2d_lazy(fc, m, spatial_pad, original) -> None:
+    """``flydsl_conv``'s T=1 rewrite (2-D convolution with the last temporal tap), with the tap taken from the
+    module's weight where it lives now and recomputed only when that tensor changes (moved, replaced, updated)."""
+    import types
+
+    cache = {"key": None, "w": None}
+
+    def forward(self, x, cache_x=None):
+        # a cache means the leading frames are features, not zeros: the identity does not hold
+        if cache_x is not None or x.dim() != 5 or x.shape[2] != 1:
+            return original(x, cache_x)
+        w = self.weight
+        key = (w.device, w.dtype, w.data_ptr(), w._version)
+        if cache["key"] != key:
+            cache["w"], cache["key"] = w[:, :, -1].contiguous(), key
+        out = fc.conv(x[:, :, 0], cache["w"], self.bias, self.stride[1:], spatial_pad, self.dilation[1:], self.groups)
+        return out.unsqueeze(2)
+
+    m.forward = types.MethodType(forward, m)
+
+
 def install_vae_flydsl_conv(model) -> bool:
     """Route every convolution of the VAE (``model.vae``, a ``WanVideoVAE38``) to aiter's FlyDSL kernel.
 
@@ -1979,7 +2090,13 @@ def install_vae_flydsl_conv(model) -> bool:
     fc = _flydsl_conv_module()
     if fc is None:
         return False
+    t1 = [(m, fc._t1_spatial_pad(m), m.forward) for m in vae.modules() if fc._is_causal_conv3d(m)]
+    t1 = [(m, pad, fwd) for m, pad, fwd in t1 if pad is not None]
     n_c3, n_c2, n_t1 = fc.patch_vae(vae)
+    # patch_vae materialises the last temporal tap once, at patch time: patched before the VAE moves to the
+    # GPU, that copy stays on the CPU. Take it from the module's current weight instead, cached per tensor.
+    for m, pad, original in t1:
+        _bind_t1_conv2d_lazy(fc, m, pad, original)
     vae._flydsl_conv = True
     logger.info(
         "flydsl_conv: VAE %d CausalConv3d (%d with the T=1 -> conv2d rewrite) and %d Conv2d on FlyDSL",
