@@ -423,15 +423,21 @@ class Block(nn.Module):
         ]
         return torch.cat(parts, dim=1)
 
-    def forward(self, x: Tensor, pre_mix: Tensor, shared: SharedAttention) -> tuple[Tensor, Tensor]:
+    def attn_part(self, x: Tensor, pre_mix: Tensor, shared: SharedAttention) -> tuple[Tensor, Tensor]:
         residual = x
         attn_pre, attn_post, attn_comb = self.hc_mixes(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         x = self.attn(self.attn_norm(self.hc_pre(x, pre_mix)), shared)
-        x = self.hc_post(x, residual, attn_post, attn_comb)
+        return self.hc_post(x, residual, attn_post, attn_comb), attn_pre
+
+    def ffn_part(self, x: Tensor, attn_pre: Tensor) -> tuple[Tensor, Tensor]:
         residual = x
         ffn_pre, ffn_post, ffn_comb = self.hc_mixes(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
         x = self.ffn(self.ffn_norm(self.hc_pre(x, attn_pre)))
         return self.hc_post(x, residual, ffn_post, ffn_comb), ffn_pre
+
+    def forward(self, x: Tensor, pre_mix: Tensor, shared: SharedAttention) -> tuple[Tensor, Tensor]:
+        x, attn_pre = self.attn_part(x, pre_mix, shared)
+        return self.ffn_part(x, attn_pre)
 
 
 SHARED_FIELDS = ("compress_kv", "index_k", "topk_idxs", "candidates")
@@ -493,6 +499,31 @@ def _run_layer(layer: Block, hashes: Tensor | None, h: Tensor, pre_mix: Tensor, 
         h = layer.engram(h, hashes[:, :, layer.engram.hash_index, :])
     h, pre_mix = layer(h, pre_mix, shared)
     return (h, pre_mix, *(getattr(shared, f) for f in SHARED_FIELDS))
+
+
+def _run_engram(layer: Block, hashes: Tensor, h: Tensor) -> Tensor:
+    return layer.engram(h, hashes[:, :, layer.engram.hash_index, :])
+
+
+def _run_attn(layer: Block, h: Tensor, pre_mix: Tensor, *fields):
+    shared = SharedAttention(*fields)
+    h, attn_pre = layer.attn_part(h, pre_mix, shared)
+    return (h, attn_pre, *(getattr(shared, f) for f in SHARED_FIELDS))
+
+
+def _recompute_layer(layer: Block, hashes: Tensor | None, h: Tensor, pre_mix: Tensor, *fields):
+    """`_run_layer` under the layer's reentrant checkpoint: run first without grad, then again
+    with grad in the layer's backward, where each part (Engram, the attention half, the FFN
+    half) runs under a checkpoint of its own -- the backward holds one part's activations at a
+    time rather than the layer's (~98 GB at 64K positions). The sources' tensors leave the
+    attention half as outputs, so the later layers' gradients still reach them."""
+    if not torch.is_grad_enabled():
+        return _run_layer(layer, hashes, h, pre_mix, *fields)
+    if layer.engram is not None:
+        h = checkpoint(_run_engram, layer, hashes, h, use_reentrant=True)
+    h, attn_pre, *fields = checkpoint(_run_attn, layer, h, pre_mix, *fields, use_reentrant=True)
+    h, pre_mix = checkpoint(Block.ffn_part, layer, h, attn_pre, use_reentrant=True)
+    return (h, pre_mix, *fields)
 
 
 class DSV41Stage(nn.Module):
@@ -581,7 +612,7 @@ class DSV41Stage(nn.Module):
         fields = (None,) * len(SHARED_FIELDS)
         for layer in self.layers.values():
             if self.recompute and torch.is_grad_enabled():
-                h, pre_mix, *fields = checkpoint(_run_layer, layer, hashes, h, pre_mix, *fields, use_reentrant=True)
+                h, pre_mix, *fields = checkpoint(_recompute_layer, layer, hashes, h, pre_mix, *fields, use_reentrant=True)
             else:
                 h, pre_mix, *fields = _run_layer(layer, hashes, h, pre_mix, *fields)
         if not self.post_process:

@@ -106,6 +106,27 @@ def test_recomputing_each_layer_gives_the_same_gradients(model):
         assert torch.equal(recomputed[name], grad), name
 
 
+def test_in_a_layers_backward_each_part_is_recomputed_on_its_own(model, monkeypatch):
+    """What keeps one part's activations alive in the backward rather than the layer's: in the
+    layer's recompute, Engram, the attention half and the FFN half each run under a checkpoint."""
+    again = DSV41Model(model.cfg, token_map=model.hasher.token_map, recompute=True)
+    again.load_state_dict(model.state_dict())
+    real, outer, inner = model_module.checkpoint, getattr(model_module, "_recompute_layer", None), []
+
+    def spy(fn, *args, **kwargs):
+        if torch.is_grad_enabled() and fn is not outer:
+            inner.append(getattr(fn, "__name__", repr(fn)))
+        return real(fn, *args, **kwargs)
+
+    monkeypatch.setattr(model_module, "checkpoint", spy)
+    _backward(again(_ids(5)), 6)
+
+    engram = sum(b.engram is not None for b in again.layers.values())
+    assert engram > 0
+    assert inner.count("_run_attn") == inner.count("ffn_part") == len(again.layers)
+    assert inner.count("_run_engram") == engram
+
+
 def test_chunking_the_queries_changes_no_logit(model, monkeypatch):
     """Gradients only in fp32 summation order: the kv gradient sums over the chunks one at a
     time (rounded to bf16 per chunk instead, layers.4.hc_attn_base was 19% off here)."""
