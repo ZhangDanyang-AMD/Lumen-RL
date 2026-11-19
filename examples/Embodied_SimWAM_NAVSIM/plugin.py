@@ -876,6 +876,71 @@ def install_prefill_graph() -> None:
     logger.info("the video prefill replays a CUDA graph")
 
 
+def install_fused_ln_modulate() -> None:
+    """``modulate(norm(x), shift, scale)`` of the DiT blocks as one Triton kernel each way.
+
+    Before self-attention (``norm1``) and before the FFN (``norm2``) a block normalizes ``x`` with a LayerNorm
+    without affine weights and modulates it with the timestep's shift and scale: a LayerNorm and three
+    element-wise kernels, launch-bound on the action expert's 8 tokens per sample. ``fused_kernels.
+    layernorm_modulate`` does it in fp32 with one bf16 rounding; its backward computes the input gradient in
+    one kernel (shift / scale gradients, when needed, in torch). ``MoT._build_expert_attention_io`` and
+    ``MoT._apply_expert_post_block`` are replaced by copies that call it; any other norm or input keeps the
+    original ops. Not bit-identical to them. ``SIMWAM_GRPO_FUSED_LN_MODULATE=0`` turns it off.
+    """
+    if not _switch("SIMWAM_GRPO_FUSED_LN_MODULATE", "1"):
+        return
+    import torch
+    import torch.nn as nn
+    import simwam.models.wan22.mot as mot
+
+    if getattr(mot.MoT._build_expert_attention_io, "_ln_mod", False):
+        return
+    stats = {"fused": 0, "fallback": 0}
+    half = (torch.bfloat16, torch.float16)
+
+    def ln_mod(norm, x, shift, scale):
+        if (type(norm) is nn.LayerNorm and norm.weight is None and norm.bias is None and x.is_cuda
+                and x.dim() == 3 and x.dtype in half and shift.dtype == x.dtype and scale.dtype == x.dtype
+                and shift.dim() == 3 and scale.dim() == 3 and x.stride(-1) == 1 and shift.stride(-1) == 1
+                and scale.stride(-1) == 1 and tuple(norm.normalized_shape) == (x.shape[-1],)):
+            from examples.Embodied_SimWAM_NAVSIM.fused_kernels import layernorm_modulate
+
+            stats["fused"] += 1
+            return layernorm_modulate(x, shift, scale, norm.eps)
+        stats["fallback"] += 1
+        return mot.modulate(norm(x), shift, scale)
+
+    def build_expert_attention_io(self, expert, block, x, freqs, t_mod):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self._split_modulation(block, t_mod)
+        attn_input = ln_mod(block.norm1, x, shift_msa, scale_msa)
+        q = block.self_attn.norm_q(block.self_attn.q(attn_input))
+        k = block.self_attn.norm_k(block.self_attn.k(attn_input))
+        v = block.self_attn.v(attn_input)
+        q = mot.rope_apply(q, freqs, block.num_heads)
+        k = mot.rope_apply(k, freqs, block.num_heads)
+        use_gradient_checkpointing = bool(getattr(expert, "use_gradient_checkpointing", False))
+        return q, k, v, x, gate_msa, shift_mlp, scale_mlp, gate_mlp, use_gradient_checkpointing
+
+    def apply_expert_post_block(block, residual_x, mixed_attn_out, gate_msa, shift_mlp, scale_mlp, gate_mlp,
+                                context_payload):
+        x = block.gate(residual_x, gate_msa, block.self_attn.o(mixed_attn_out))
+        if context_payload is not None:
+            context = context_payload.get("context")
+            if context is not None:
+                context_mask = context_payload.get("mask")
+                if context_mask is not None and context_mask.dim() == 3:
+                    context_mask = context_mask.unsqueeze(1)
+                x = x + block.cross_attn(block.norm3(x), context, ctx_mask=context_mask)
+        mlp_input = ln_mod(block.norm2, x, shift_mlp, scale_mlp)
+        return block.gate(x, gate_mlp, block.ffn(mlp_input))
+
+    build_expert_attention_io._ln_mod = True
+    _STATS["ln_modulate"] = stats
+    mot.MoT._build_expert_attention_io = build_expert_attention_io
+    mot.MoT._apply_expert_post_block = staticmethod(apply_expert_post_block)
+    logger.info("DiT blocks run LayerNorm + modulate as one Triton kernel")
+
+
 def install_aiter_triton_imports() -> None:
     """Order the aiter Triton imports so that aiter_conv's conv3d and the tuned GEMM both load.
 
@@ -952,9 +1017,9 @@ def install_cross_attn_kv() -> None:
     repeated (gradients sum over the copies); the rollout's no-grad log-probs and the training forward
     take this same path, so they still match bit for bit. Rollout denoising reads per-layer K/V computed
     once per condition (see ``install_action_velocity_graphs``). Results are no longer bit-identical to the
-    unpatched model: the projections run on fewer rows. ``SIMWAM_GRPO_XATTN_KV=1`` turns it on.
+    unpatched model: the projections run on fewer rows. ``SIMWAM_GRPO_XATTN_KV=0`` turns it off.
     """
-    if not _switch("SIMWAM_GRPO_XATTN_KV", "0"):
+    if not _switch("SIMWAM_GRPO_XATTN_KV", "1"):
         return
     import torch
     from simwam.models.wan22 import wan_video_dit as wvd

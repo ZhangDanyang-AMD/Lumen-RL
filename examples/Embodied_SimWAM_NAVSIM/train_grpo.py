@@ -32,6 +32,7 @@ from examples.Embodied_SimWAM_NAVSIM.plugin import (
     install_drop_true_masks,
     install_eval_empty_cache,
     install_foreach_grad_checks,
+    install_fused_ln_modulate,
     install_fused_modulate,
     install_fused_lora_add,
     install_grpo_hook,
@@ -75,6 +76,7 @@ install_aiter_gemm()
 install_triton_rope()
 install_cross_attn_kv()
 install_fused_modulate()
+install_fused_ln_modulate()
 install_fused_lora_add()
 install_overlap_reward_logprobs()
 install_foreach_grad_checks()
