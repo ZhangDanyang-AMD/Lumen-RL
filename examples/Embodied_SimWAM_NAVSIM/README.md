@@ -137,7 +137,7 @@ Set `LUMEN_ENABLE` to a subset to check one patch at a time.
 
 Measured on 4×MI350X (`NPROC=4`, 60 steps, median of the 11 cycles from step 16 on rank 0, two interleaved runs each, `LUMEN_ENABLE=hf_attn_patch`), each row adding one switch: all four off 810 ms; masks dropped 748 ms; one GEMM over the steps 625.5 ms; no-grad calls batched 606 ms; AITER RMSNorm 563.5 ms (-30% in total). With the four on, the rollout's log-probs equal the first inner update's bit for bit (importance ratio exactly 1 before the first optimizer step); with all four off they differ by about 1e-3 on average, and 4% of the ratios start outside the default PPO clip of 0.005.
 
-On 2×MI350X (40 steps, median of the cycles from step 16, `LUMEN_ENABLE=hf_attn_patch`), starting from those four: 537.5 ms; Triton RMSNorm backward 472 ms; Triton RoPE 451.5 ms; then, as the mean of two interleaved runs, prefill graph -4.2% and AITER attention backward -8.5% (about 400 ms in total). The rollout's log-probs still equal the training ones bit for bit, two runs of the same configuration give identical losses, and peak memory per rank grows by about 0.2 GB.
+On 2×MI350X (40 steps, median of the cycles from step 16, `LUMEN_ENABLE=hf_attn_patch`), starting from those four: 537.5 ms; Triton RMSNorm backward 472 ms; Triton RoPE 451.5 ms; then, as the mean of two interleaved runs, prefill graph -4.2% and AITER attention backward -8.5%. All defaults of this script (with `flydsl_conv`) against the four alone, two interleaved runs each: 402.5 ms vs 521.5 ms (-22.8%). The rollout's log-probs still equal the training ones bit for bit, two runs of the same configuration give identical losses, and peak memory per rank grows by about 0.13 GB (allocated; reserved +0.02 GB).
 
 ## Training
 
