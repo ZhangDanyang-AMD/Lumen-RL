@@ -22,12 +22,15 @@ MASTER_PORT="${MASTER_PORT:-29531}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
 export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-$CUDA_VISIBLE_DEVICES}"
 export LUMEN_DIR="${LUMEN_DIR:-/home/danyzhan/Lumen}"
-export AITER_SRC="${AITER_SRC:-/home/danyzhan/aiter}"
+# an aiter checkout with aiter/ops/triton/conv/conv3d.py (the image's aiter has none); unset, aiter_conv logs a
+# warning and Conv3d (the DiT patch embedding) stays on torch
+export AITER_SRC="${AITER_SRC:-}"
 # lumen_linear is left out: the tuned GEMM has no entry for these shapes and falls back to the torch
 # GEMM, so results are unchanged and only the dispatch cost goes. hf_attn_patch stays so results are
 # bit-identical to the original; aiter_conv alone (torch SDPA) is faster but changes log-probs (see README).
 # flydsl_conv moves the VAE convolutions to aiter's FlyDSL kernel when it is available (see README);
-# otherwise it logs a warning and the VAE keeps the aiter_conv / torch path.
+# otherwise it logs a warning and the VAE keeps the aiter_conv / torch path. With both, the VAE runs on
+# FlyDSL and the DiT patch embedding on aiter_conv's Triton conv3d (from $AITER_SRC).
 export LUMEN_ENABLE="${LUMEN_ENABLE:-hf_attn_patch,aiter_conv,flydsl_conv}"
 export SIMWAM_ROOT="$SIMWAM"
 export DIFFSYNTH_MODEL_BASE_PATH="${DIFFSYNTH_MODEL_BASE_PATH:-$SIMWAM/checkpoints}"

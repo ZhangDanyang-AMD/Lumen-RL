@@ -13,7 +13,7 @@ Quantization stays off (`LumenConfig(scaling="none")`). One patch failing to loa
 | GPU | MI350X. Default cards are `4,5,6,7`. |
 | Base image | `zhangdanyangamd/lumen-rl:embodied-MI350X` (torch 2.12 + ROCm 7.14, already in the image). |
 | Lumen | Host checkout at `$LUMEN_DIR`, branch `dev/world-model-rl`. Put on `PYTHONPATH`. Not installed as a wheel. |
-| aiter | Host checkout at `$AITER_SRC` (default `/home/danyzhan/aiter`). Conv3d is loaded from here when the image copy has no `conv3d`. |
+| aiter | Host checkout at `$AITER_SRC` with `aiter/ops/triton/conv/conv3d.py`, for example branch `hz/grpo-opt` of `huizzhan/aiter` (upstream ROCm/aiter `882bd6207`). Conv3d is loaded from here because the image copy has no `conv3d`. No default: when it is unset, `aiter_conv` logs a warning and Conv3d (the DiT patch embedding) stays on torch. |
 | SimWAM code | `examples/SimWAM` (upstream `main`). |
 | Weights | `Wan-AI/Wan2.2-TI2V-5B` (includes `Wan2.2_VAE.pth`), Wan2.1 tokenizer `Wan-AI/Wan2.1-T2V-1.3B`, ActionDiT `checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim_3outdim.pt`, IL warm start `weights/SimWAM.pt` (`SIMWAM_IL_CHECKPOINT`). |
 | NAVSIM | nuPlan maps, navtrain logs, sensor blobs, metric cache. Paths are the `NAVSIM_*` / `NUPLAN_*` variables in `run_embodied_grpo.sh`. |
@@ -131,6 +131,8 @@ Set `LUMEN_ENABLE` to a subset to check one patch at a time.
 | `install_triton_rope` | `SIMWAM_GRPO_TRITON_ROPE` (`1`) | `rope_apply` as one Triton kernel in fp32, forward and backward, instead of float64 complex arithmetic (casts, complex multiply, casts back). |
 | `install_prefill_graph` | `SIMWAM_GRPO_PREFILL_GRAPH` (`1`) | The video prefill of `build_action_condition` (frozen expert, fixed shapes) replays a CUDA graph instead of about 30 layers of eager launches. |
 | `LUMEN_ENABLE` | `flydsl_conv` (in the default) | Every VAE convolution on AITER's FlyDSL implicit-GEMM kernel through Lumen PR #32's `examples/wan2.2/flydsl_conv.py` (`SIMWAM_GRPO_FLYDSL_DIR`); the image's AITER needs `$LUMEN_DIR/examples/perf-veomni/overlay_aiter.py --apply` for the kernel. Without it the VAE keeps its previous path and a warning is logged. The first encode JIT-compiles the kernels (about 20 s). |
+| `LUMEN_ENABLE` | `aiter_conv` (in the default) | With `flydsl_conv` also on, the only convolution left to `aiter_conv` is the DiT patch embedding (`video_expert.patch_embedding`, one `Conv3d` per video prefill), which runs on AITER's Triton conv3d from `$AITER_SRC`: the VAE stays on FlyDSL. Same cycle time as without it (405.0 vs 405.25 ms on 2×MI350X, two interleaved runs each), log-probs still bit-identical between rollout and training, same peak memory. |
+| `install_action_velocity_graphs` | `SIMWAM_GRPO_KV_SLOT` (`0`) | Inside the no-grad action graphs, the per-layer `cat` of the cached video K/V and the action K/V writes only the action rows behind the video rows of a static buffer (same values and layout, bit-identical to the `cat`). No measurable gain (413.75 vs 405.25 ms, the first run noisy), off. |
 | `install_fused_modulate` | `SIMWAM_GRPO_FUSED_MODULATE` (`0`) | `modulate` / `GateModule` with `torch.addcmul`; no measurable gain, off. |
 | `install_fused_lora_add` | `SIMWAM_GRPO_LORA_ADDMM` (`0`) | The second LoRA GEMM accumulates into the base output (`addmm`); about 3% slower, off. |
 | `install_numa_affinity` | `SIMWAM_GRPO_NUMA_AFFINITY` (`0`) | Pins each rank's threads to its GPU's NUMA node; no gain measured on GPU 5+6, off. |
@@ -164,7 +166,7 @@ This is the run that finished on 4×MI350X and was scored on the full NAVSIM v1 
 Two host checkouts have to be the ones this example was written against:
 
 - Lumen `dev/world-model-rl`, including the masked-backward fallback in `lumen/ops/attention/hf_patch.py`. Without it every optimizer step logs `gnorm=inf` and the weights do not move.
-- aiter with `conv3d`. `AITER_SRC` defaults to `/home/danyzhan/aiter`.
+- aiter with `conv3d`, at `AITER_SRC` (no default; see the table at the top).
 
 `launch_container.sh` mounts `/mnt/k3` and creates `/work/tmp`. The image sets `TMPDIR=/work/tmp` but does not mount it; clang then fails to JIT HIP kernels and the process segfaults.
 

@@ -543,9 +543,44 @@ def install_action_velocity_graphs() -> None:
         return
     eager = ActionGRPOMixin.action_velocity
     verify = os.environ.get("SIMWAM_GRPO_CUDA_GRAPH_VERIFY", "0") == "1"
+    kv_slot = _switch("SIMWAM_GRPO_KV_SLOT", "0")
     graphs = {}
-    stats = {"replay": 0, "eager": 0, "mismatch": 0, "loads": 0}
+    stats = {"replay": 0, "eager": 0, "mismatch": 0, "loads": 0, "kv_slots": 0, "kv_slot_cats": 0}
     serial = [0]
+    slots = {}
+    torch_cat = torch.cat
+
+    def slot_cat(tensors, dim=0, *, out=None):
+        # [cached video K/V, action K/V] along the sequence: write the action rows behind the video rows
+        # of the static buffer the cache is a view of and hand out the buffer, the same values and layout
+        # as the concatenation
+        if out is None and dim == 1 and len(tensors) == 2:
+            a, b = tensors
+            hit = slots.get(a.data_ptr())
+            if hit is not None:
+                full, sv = hit
+                if (a.dtype == b.dtype == full.dtype and tuple(a.shape) == (full.shape[0], sv, *full.shape[2:])
+                        and tuple(b.shape) == (full.shape[0], full.shape[1] - sv, *full.shape[2:])):
+                    full[:, sv:].copy_(b)
+                    stats["kv_slot_cats"] += 1
+                    return full
+        return torch_cat(tensors, dim) if out is None else torch_cat(tensors, dim, out=out)
+
+    def slot_tensors(cond, tensors, s_tensors):
+        # the static video K/V become the leading rows of [B, Sv + Sa, D] buffers, so the graph's per-layer
+        # concatenation copies only the action rows instead of the whole cache
+        sv = int(cond["video_seq_len"])
+        sa = int(cond["attention_mask"].shape[0]) - sv
+        for i in range(2 * len(cond["video_kv_cache"])):
+            t = tensors[i]
+            if t.dim() != 3 or t.shape[1] != sv or sa <= 0:
+                continue
+            full = torch.empty((t.shape[0], sv + sa, t.shape[2]), dtype=t.dtype, device=t.device)
+            view = full[:, :sv]
+            view.copy_(t)
+            s_tensors[i] = view
+            slots[view.data_ptr()] = (full, sv)
+            stats["kv_slots"] += 1
 
     def cond_tensors(cond):
         kv = [t for layer in cond["video_kv_cache"] for t in (layer["k"], layer["v"])]
@@ -571,16 +606,24 @@ def install_action_velocity_graphs() -> None:
         s_lat.copy_(latents)
         s_t = timestep.clone()
         s_tensors = [t.clone() for t in tensors]
+        if kv_slot:
+            slot_tensors(cond, tensors, s_tensors)
         s_cond = static_cond(cond, s_tensors)
-        side = torch.cuda.Stream()
-        side.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(side):
-            for _ in range(2):
-                eager(self, s_lat, s_t, s_cond, use_ref=use_ref)
-        torch.cuda.current_stream().wait_stream(side)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            out = eager(self, s_lat, s_t, s_cond, use_ref=use_ref)
+        if kv_slot:
+            torch.cat = slot_cat
+        try:
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                for _ in range(2):
+                    eager(self, s_lat, s_t, s_cond, use_ref=use_ref)
+            torch.cuda.current_stream().wait_stream(side)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                out = eager(self, s_lat, s_t, s_cond, use_ref=use_ref)
+        finally:
+            torch.cat = torch_cat
+            slots.clear()
         return {"graph": graph, "lat": s_lat, "t": s_t, "tensors": s_tensors, "out": out, "loaded": None}
 
     def action_velocity(self, latents_action, timestep_action, cond, use_ref=False):
