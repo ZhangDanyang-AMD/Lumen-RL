@@ -138,21 +138,34 @@ def _sleep_keeps_weights() -> bool:
     return os.environ.get("LUMENRL_ATOM_SLEEP_KEEPS_WEIGHTS", "0") in ("1", "true", "True")
 
 
+# torch's pinned allocator rounds every allocation up to a power of two and pins all of it:
+# as one tensor, the 84.8 GB of a V4.1 TP rank pinned 137 GB.
+HOST_CHUNK_BYTES = 1 << 32
+
+
 def host_weight_buffers(runner) -> dict:
-    """Host tensors shaped like every parameter of ``runner.model``: views of one
-    pinned allocation, made when the runner starts. Pinned per parameter at the
-    first sleep instead, ~70 GB a card of V4.1 took past ATOM's timeout for
-    `release_memory` on a busy host."""
+    """Host tensors shaped like every parameter of ``runner.model``: views of pinned
+    allocations of at most ``HOST_CHUNK_BYTES`` (parameters packed largest first), made
+    when the runner starts. Pinned per parameter at the first sleep instead, ~70 GB a
+    card of V4.1 took past ATOM's timeout for `release_memory` on a busy host."""
     import torch
 
     params = list(runner.model.named_parameters())
     sizes = [-(-p.numel() * p.element_size() // 256) * 256 for _, p in params]  # aligned views
-    flat = torch.empty(sum(sizes), dtype=torch.uint8, pin_memory=torch.cuda.is_available())
-    views, offset = {}, 0
-    for (name, p), size in zip(params, sizes):
+    used, place = [], {}
+    for i in sorted(range(len(params)), key=lambda i: -sizes[i]):
+        c = next((c for c, u in enumerate(used) if u + sizes[i] <= HOST_CHUNK_BYTES), len(used))
+        if c == len(used):
+            used.append(0)
+        place[i] = (c, used[c])
+        used[c] += sizes[i]
+    chunks = [torch.empty(u, dtype=torch.uint8, pin_memory=torch.cuda.is_available()) for u in used]
+    views = {}
+    for i, (name, p) in enumerate(params):
+        c, offset = place[i]
         nbytes = p.numel() * p.element_size()
-        views[name] = flat[offset : offset + nbytes].view(p.dtype).view(p.shape)
-        offset += size
+        views[name] = chunks[c][offset : offset + nbytes].view(p.dtype).view(p.shape)
+    logger.info("host copy of %d parameters: %.1f GB in %d pinned chunks", len(params), sum(sizes) / 1e9, len(chunks))
     return views
 
 

@@ -73,15 +73,37 @@ def _with_model(runner):
     return {n: p.detach().clone() for n, p in runner.model.named_parameters()}
 
 
-def test_the_host_copy_is_one_allocation_made_when_the_runner_starts(runner_cls, monkeypatch):
+def test_the_host_copy_is_made_when_the_runner_starts(runner_cls, monkeypatch):
     monkeypatch.setenv("LUMENRL_ATOM_SLEEP_KEEPS_WEIGHTS", "1")
     runner = runner_cls(0, "model")
 
     host = runner._host_weights
-    storages = {t.untyped_storage().data_ptr() for t in host.values()}
-    assert set(host) == {n for n, _ in runner.model.named_parameters()} and len(storages) == 1
+    assert set(host) == {n for n, _ in runner.model.named_parameters()}
     runner._release_weights()
     assert runner._host_weights is host
+
+
+def test_the_host_copy_is_packed_into_chunks_no_larger_than_a_power_of_two(runner_cls, monkeypatch):
+    """The pinned allocator rounds each allocation up to a power of two and pins all of
+    it, so one allocation of the whole copy pinned up to twice its size (137 GB for the
+    84.8 GB of a V4.1 TP rank)."""
+    monkeypatch.setattr(m, "HOST_CHUNK_BYTES", 1024, raising=False)
+    runner = runner_cls(0, None)
+    runner.model = torch.nn.Sequential(*(torch.nn.Linear(n, 4) for n in (40, 24, 8, 30, 16)))
+    sizes = {n: p.numel() * p.element_size() for n, p in runner.model.named_parameters()}
+
+    host = m.host_weight_buffers(runner)
+
+    chunks = {}
+    for name, t in host.items():
+        assert t.shape == dict(runner.model.named_parameters())[name].shape
+        chunks.setdefault(t.untyped_storage().data_ptr(), []).append((t.storage_offset() * t.element_size(), sizes[name]))
+    nbytes = {t.untyped_storage().data_ptr(): t.untyped_storage().nbytes() for t in host.values()}
+    assert len(chunks) > 1 and all(n <= 1024 for n in nbytes.values())
+    for spans in chunks.values():
+        spans.sort()
+        assert all(a + n <= b for (a, n), (b, _) in zip(spans, spans[1:])), spans
+    assert sum(nbytes.values()) < sum(-(-s // 256) * 256 for s in sizes.values()) + 1024
 
 
 def test_sleep_can_keep_the_weights_for_a_partial_sync(runner_cls, monkeypatch):
