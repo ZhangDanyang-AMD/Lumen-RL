@@ -307,6 +307,45 @@ def compute_gae_advantage(batch: DataProto, config: LumenRLConfig) -> DataProto:
     return batch
 
 
+@register_adv_est("gae_vec_env")
+def compute_gae_vec_env_advantage(batch: DataProto, config: LumenRLConfig) -> DataProto:
+    """GAE-Lambda over a rollout of vectorized environments (Isaac Lab-style GPU simulators).
+
+    Tensors are time-major ``[T, N]``: ``rewards``, ``values`` and ``dones`` (1 where the
+    episode ended after step t; the environment auto-resets), plus ``last_values`` ``[N]``,
+    the value of the observation after the last step. Optional ``time_outs`` ``[T, N]``
+    marks truncations; their reward gets ``gamma * V(s_t)`` added (RSL-RL's time-out
+    bootstrap) while the episode still counts as ended.
+    """
+    for key in ("rewards", "values", "dones", "last_values"):
+        if key not in batch.tensors:
+            raise KeyError(f"gae_vec_env requires tensor '{key}'.")
+    values = batch.tensors["values"]
+    rewards = batch.tensors["rewards"].to(dtype=values.dtype)
+    dones = batch.tensors["dones"].to(dtype=values.dtype)
+    last_values = batch.tensors["last_values"].to(dtype=values.dtype)
+    if rewards.shape != values.shape or dones.shape != values.shape or values.dim() != 2:
+        raise ValueError("gae_vec_env expects rewards, values and dones of one [T, N] shape.")
+    cfg = config.algorithm.ppo
+    gamma = float(cfg.discount)
+    lam = float(cfg.gae_lambda)
+    time_outs = batch.tensors.get("time_outs")
+    if time_outs is not None:
+        rewards = rewards + gamma * values * time_outs.to(dtype=values.dtype)
+
+    not_done = 1.0 - dones
+    next_values = torch.cat([values[1:], last_values[None]], dim=0)
+    delta = rewards + gamma * next_values * not_done - values
+    adv = torch.empty_like(values)
+    last_gae = torch.zeros_like(last_values)
+    for t in range(values.shape[0] - 1, -1, -1):
+        last_gae = delta[t] + gamma * lam * not_done[t] * last_gae
+        adv[t] = last_gae
+    batch.tensors["advantages"] = adv
+    batch.tensors["returns"] = adv + values
+    return batch
+
+
 @register_adv_est("reinforce_plus_plus")
 def compute_reinforce_plus_plus_advantage(
     batch: DataProto, config: LumenRLConfig

@@ -86,6 +86,10 @@ def main() -> None:
         from lumenrl.trainer.embodied_trainer import EmbodiedTrainer
 
         trainer = EmbodiedTrainer(config)
+    elif config.vec_env.enabled:
+        from lumenrl.trainer.vec_env_ppo_trainer import VecEnvPPOTrainer
+
+        trainer = VecEnvPPOTrainer(config)
     elif config.assembly.use_new_assembler:
         assembler = RuntimeAssembler(config)
         graph = assembler.build_graph()
@@ -109,8 +113,8 @@ def main() -> None:
 
     cbs: list = [LoggingCallback(interval=max(1, config.logger.log_interval))]
 
-    # EmbodiedTrainer writes its own bf16 policy checkpoints (embodied.save_interval).
-    if config.checkpointing.checkpoint_dir and not config.embodied.enabled:
+    # EmbodiedTrainer and VecEnvPPOTrainer write their own checkpoints (<section>.save_interval).
+    if config.checkpointing.checkpoint_dir and not (config.embodied.enabled or config.vec_env.enabled):
         cbs.append(CheckpointCallback(
             checkpoint_dir=config.checkpointing.checkpoint_dir,
             save_interval=config.checkpointing.save_steps,

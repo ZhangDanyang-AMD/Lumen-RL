@@ -1036,6 +1036,43 @@ class EmbodiedConfig:
 
 
 @dataclass
+class VecEnvConfig:
+    """PPO on massively parallel GPU environments (Isaac Lab-style), see ``VecEnvPPOTrainer``.
+
+    Clip ratio, discount, GAE lambda, epochs and mini-batch count come from ``algorithm.ppo``
+    (``algorithm.name: ppo``, ``algorithm.adv_estimator: gae_vec_env``). One training step is
+    ``horizon`` steps of every environment followed by one PPO update.
+    """
+    enabled: bool = False
+    plugin: str = ""                   # module exposing VEC_ENV_PLUGIN (see lumenrl.core.vec_env_plugin)
+    task: str = ""                     # passed to the plugin's factories
+    num_envs: int = 4096
+    device: str = ""                   # default cuda:$LOCAL_RANK
+    env_kwargs: dict = field(default_factory=dict)
+    policy_kwargs: dict = field(default_factory=dict)
+    horizon: int = 16                  # steps per environment per update
+    minibatch_size: int = 0            # >0: overrides algorithm.ppo.num_mini_batches (num_envs * horizon / this)
+    learning_rate: float = 3e-4
+    entropy_coef: float = 0.0
+    max_grad_norm: float = 1.0
+    desired_kl: float = 0.0            # >0: KL-adaptive learning rate (x1.5 / /1.5 around this target)
+    kl_schedule: str = "epoch"         # "epoch": mean mini-batch KL after each epoch (RL-Games); "minibatch" (RSL-RL)
+    lr_min: float = 1e-6
+    lr_max: float = 1e-2
+    normalize_input: bool = False      # update policy.obs_norm with collected observations
+    normalize_value: bool = False      # the critic predicts normalized returns
+    reward_scale: float = 1.0
+    bounds_coef: float = 0.0           # penalty on the action mean leaving [-action_bound, action_bound]
+    action_bound: float = 1.0
+    time_out_bootstrap: bool = False   # add gamma * V(s_t) to the reward of truncated steps
+    log_dir: str = ""                  # per-step metrics as vec_env_metrics.jsonl
+    save_interval: int = 0             # save trainer state every N steps (and at the end) when > 0
+    save_dir: str = ""                 # default: <log_dir>/checkpoints
+    resume_from: str = ""              # trainer_state.pt written by save_state
+    resume_step: int = 0               # last finished step; the loop continues at this index
+
+
+@dataclass
 class LumenRLConfig:
     """Top-level configuration for LumenRL."""
 
@@ -1057,6 +1094,7 @@ class LumenRLConfig:
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
     embodied: EmbodiedConfig = field(default_factory=EmbodiedConfig)
+    vec_env: VecEnvConfig = field(default_factory=VecEnvConfig)
     num_training_steps: int = 1000
     seed: int = 42
     val_dataset: str = ""

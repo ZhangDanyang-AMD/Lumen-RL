@@ -1,0 +1,28 @@
+# Isaac-Velocity-Rough-G1-v0 on hipPhysics, 4096 envs.
+# Isaac Lab v2.3.0 RSL-RL G1RoughPPORunnerCfg (max_iterations 3000).
+algorithm:
+  name: ppo
+  adv_estimator: gae_vec_env
+  ppo:
+    discount: 0.99
+    gae_lambda: 0.95
+    clip_ratio: 0.2
+    num_ppo_epochs: 5
+    num_mini_batches: 4
+    kl_coeff: 0.0
+vec_env:
+  enabled: true
+  plugin: isaaclab_plugin
+  task: g1_rough
+  num_envs: 4096
+  horizon: 24
+  learning_rate: 1.0e-3
+  entropy_coef: 0.005
+  desired_kl: 0.01
+  kl_schedule: minibatch
+  lr_min: 1.0e-5
+  time_out_bootstrap: true
+  policy_kwargs:
+    init_std: 1.0
+num_training_steps: 3000
+seed: 42

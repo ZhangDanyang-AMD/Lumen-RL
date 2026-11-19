@@ -1,0 +1,5 @@
+{
+  "source": "https://github.com/google-deepmind/mujoco_menagerie",
+  "path": "shadow_hand/right_hand.xml",
+  "note": "Upstream Menagerie MJCF, unmodified. Its mesh files are not vendored: shadow_model.py removes every visual mesh and replaces the mesh collision geoms with capsules, so no mesh file is read. Upstream license: see mujoco_menagerie shadow_hand/LICENSE."
+}

@@ -1,0 +1,28 @@
+# Isaac-Cartpole-RGB-Camera-Direct-v0 on hipPhysics, 1024 envs, one 100x100 camera per env.
+# Isaac Lab v2.3.0 direct/cartpole/agents/rl_games_camera_ppo_cfg.yaml (max_epochs 500).
+# Renderer: vec_env.env_kwargs.renderer=hipphysics | hiprt
+algorithm:
+  name: ppo
+  adv_estimator: gae_vec_env
+  ppo:
+    discount: 0.99
+    gae_lambda: 0.95
+    clip_ratio: 0.2
+    num_ppo_epochs: 4
+    kl_coeff: 0.0
+vec_env:
+  enabled: true
+  plugin: isaaclab_plugin
+  task: cartpole_rgb
+  num_envs: 1024
+  horizon: 64
+  minibatch_size: 2048
+  learning_rate: 1.0e-4
+  desired_kl: 0.008
+  kl_schedule: epoch
+  normalize_value: true
+  bounds_coef: 1.0e-4
+  env_kwargs:
+    renderer: hipphysics
+num_training_steps: 500
+seed: 42
