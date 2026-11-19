@@ -24,9 +24,11 @@ from omegaconf import DictConfig
 from examples.Embodied_SimWAM_NAVSIM.plugin import (
     install_action_velocity_graphs,
     install_aiter_gemm,
+    install_aiter_triton_imports,
     install_aiter_rmsnorm,
     install_batched_logprobs,
     install_compiled_rmsnorm,
+    install_cross_attn_kv,
     install_drop_true_masks,
     install_eval_empty_cache,
     install_foreach_grad_checks,
@@ -47,6 +49,8 @@ from examples.Embodied_SimWAM_NAVSIM.plugin import (
 from simwam.runtime_grpo import run_grpo_training
 from simwam.utils.config_resolvers import register_default_resolvers
 
+# first: the installed aiter's tuned GEMM before aiter_conv puts the $AITER_SRC checkout in front of its packages
+install_aiter_triton_imports()
 install_grpo_hook()
 # before the trainer is built; decides whether DeepSpeed is used
 install_manual_data_parallel()
@@ -69,6 +73,7 @@ install_aiter_rmsnorm()
 # outermost nn.Linear patch (after install_batched_logprobs' per-step split)
 install_aiter_gemm()
 install_triton_rope()
+install_cross_attn_kv()
 install_fused_modulate()
 install_fused_lora_add()
 install_overlap_reward_logprobs()

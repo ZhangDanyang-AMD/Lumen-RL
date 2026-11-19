@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 
 logger = logging.getLogger(__name__)
 
@@ -548,6 +549,7 @@ def install_action_velocity_graphs() -> None:
     stats = {"replay": 0, "eager": 0, "mismatch": 0, "loads": 0, "kv_slots": 0, "kv_slot_cats": 0}
     serial = [0]
     slots = {}
+    xshared = {}
     torch_cat = torch.cat
 
     def slot_cat(tensors, dim=0, *, out=None):
@@ -593,7 +595,7 @@ def install_action_velocity_graphs() -> None:
         out.update(video_kv_cache=kv, context=tensors[-3], context_mask=tensors[-2], attention_mask=tensors[-1])
         return out
 
-    def capture(self, latents, timestep, cond, use_ref, tensors):
+    def capture(self, latents, timestep, cond, use_ref, tensors, xkv=None):
         # ActionDiT keeps its RoPE table as a plain CPU attribute and copies it to the
         # device on every forward; a pageable host copy cannot be captured.
         for expert in (self.action_expert, getattr(self, "ref_action_expert", None)):
@@ -611,6 +613,10 @@ def install_action_velocity_graphs() -> None:
         s_cond = static_cond(cond, s_tensors)
         if kv_slot:
             torch.cat = slot_cat
+        if xkv is not None:
+            # the graph reads the per-layer context K/V from the shared buffers, refilled outside it
+            expert = self.ref_action_expert if use_ref else self.action_expert
+            _XKV["pre"] = {id(b.cross_attn): (xkv[2 * i], xkv[2 * i + 1]) for i, b in enumerate(expert.blocks)}
         try:
             side = torch.cuda.Stream()
             side.wait_stream(torch.cuda.current_stream())
@@ -624,6 +630,7 @@ def install_action_velocity_graphs() -> None:
         finally:
             torch.cat = torch_cat
             slots.clear()
+            _XKV["pre"] = {}
         return {"graph": graph, "lat": s_lat, "t": s_t, "tensors": s_tensors, "out": out, "loaded": None}
 
     def action_velocity(self, latents_action, timestep_action, cond, use_ref=False):
@@ -631,10 +638,15 @@ def install_action_velocity_graphs() -> None:
             stats["eager"] += 1
             return eager(self, latents_action, timestep_action, cond, use_ref=use_ref)
         tensors = cond_tensors(cond)
+        # per-step calls (denoising) read the context K/V computed once per condition; batched calls
+        # deduplicate them inside the graph (install_cross_attn_kv)
+        xkv = (_xattn_precompute(self, cond, use_ref, xshared)
+               if _RT.get("SIMWAM_GRPO_XATTN_KV") and _XKV["reps"] <= 1 else None)
         # the lean attention path bakes "masks are all True" into the graph
         lean = _LEAN_ATTN["flag"](cond, int(latents_action.shape[1])) if _LEAN_ATTN["flag"] else None
         key = (bool(use_ref), tuple(latents_action.shape), tuple(latents_action.stride()), tuple(timestep_action.shape),
-               int(cond["video_seq_len"]), tuple((tuple(t.shape), t.dtype) for t in tensors), lean)
+               int(cond["video_seq_len"]), tuple((tuple(t.shape), t.dtype) for t in tensors), lean,
+               xkv is not None, _XKV["reps"])
         g = graphs.get(key)
         if g is None and lean is False:
             # hf_attn_patch falls back to torch SDPA when a host copy fails under capture, so a
@@ -642,7 +654,7 @@ def install_action_velocity_graphs() -> None:
             g = graphs[key] = False
         if g is None:
             try:
-                g = capture(self, latents_action, timestep_action, cond, use_ref, tensors)
+                g = capture(self, latents_action, timestep_action, cond, use_ref, tensors, xkv)
             except Exception as exc:
                 logger.warning("CUDA graph capture of action_velocity failed (%s); using eager", exc)
                 g = False
@@ -864,6 +876,35 @@ def install_prefill_graph() -> None:
     logger.info("the video prefill replays a CUDA graph")
 
 
+def install_aiter_triton_imports() -> None:
+    """Order the aiter Triton imports so that aiter_conv's conv3d and the tuned GEMM both load.
+
+    The image's aiter has no conv3d; Lumen's loader takes it from the ``$AITER_SRC`` checkout by putting that
+    checkout in front of a few of the installed aiter's Triton packages, for the rest of the run. The tuned
+    GEMM (``SIMWAM_GRPO_AITER_GEMM``, tuned on the installed aiter) and Lumen's attention use the installed
+    Triton modules, so they are imported first, before the checkout is in front, or their modules mismatch
+    (``config_utils.DEVICE_CU_NUM``). The installed ``_triton_kernels.common`` package is then cached and Lumen
+    does not put the checkout in front of it, so conv3d would miss ``common.activation`` and stay on torch:
+    the checkout's directory is added in front of that package too. Loading the whole Triton tree from the
+    checkout instead breaks Lumen's attention (``get_shape_from_layout``). ``SIMWAM_GRPO_AITER_TRITON_IMPORTS=0``
+    turns it off.
+    """
+    if not _switch("SIMWAM_GRPO_AITER_TRITON_IMPORTS", "1"):
+        return
+    if os.environ.get("SIMWAM_GRPO_AITER_GEMM", "1").strip().lower() not in _OFF:
+        from aiter.tuned_gemm import gemm_a16w16  # noqa: F401
+        import aiter.ops.triton.gemm.basic.gemm_a16w16  # noqa: F401
+    src = os.environ.get("AITER_SRC", "")
+    common_dir = os.path.join(src, "aiter", "ops", "triton", "_triton_kernels", "common")
+    if not src or not os.path.isfile(os.path.join(src, "aiter", "ops", "triton", "conv", "conv3d.py")):
+        return
+    import aiter.ops.triton._triton_kernels.common as common
+
+    if os.path.isdir(common_dir) and common_dir not in list(common.__path__):
+        common.__path__ = [common_dir, *common.__path__]
+        logger.info("aiter's _triton_kernels.common also looks in %s (conv3d of aiter_conv)", common_dir)
+
+
 def install_eval_empty_cache() -> None:
     """Return the allocator's cached blocks to the device after each deterministic eval.
 
@@ -895,6 +936,88 @@ _CHUNK = {"sizes": None, "views": None, "ops": frozenset(), "lumen": None}
 # data pointers of the repeated-condition buffers that SIMWAM_GRPO_SHARED_KV shares between the batched
 # log-prob calls; the CUDA graphs use them as their static inputs instead of keeping copies
 _KV_SHARE = {"ptrs": set()}
+
+
+# SIMWAM_GRPO_XATTN_KV: "reps" is the number of steps a batched log-prob call stacks (its context is that many
+# copies of the condition's), "pre" maps a cross-attention module to its precomputed context K/V
+_XKV = {"reps": 0, "pre": {}}
+
+
+def install_cross_attn_kv() -> None:
+    """Compute the cross-attention K/V of the text context once instead of per step.
+
+    The action expert's cross-attention projects the same context (``text_embedding`` of the condition's
+    text) in every layer, every denoising step and every stacked step of a batched log-prob call. In a
+    batched call the context is ``W`` copies of the condition's, so K/V are computed on the first copy and
+    repeated (gradients sum over the copies); the rollout's no-grad log-probs and the training forward
+    take this same path, so they still match bit for bit. Rollout denoising reads per-layer K/V computed
+    once per condition (see ``install_action_velocity_graphs``). Results are no longer bit-identical to the
+    unpatched model: the projections run on fewer rows. ``SIMWAM_GRPO_XATTN_KV=1`` turns it on.
+    """
+    if not _switch("SIMWAM_GRPO_XATTN_KV", "0"):
+        return
+    import torch
+    from simwam.models.wan22 import wan_video_dit as wvd
+
+    if getattr(wvd.CrossAttention.forward, "_xkv", False):
+        return
+    original = wvd.CrossAttention.forward
+    stats = {"pre": 0, "dedup": 0, "full": 0}
+
+    def forward(self, x, ctx, ctx_mask=None):
+        pre = _XKV["pre"].get(id(self))
+        reps = _XKV["reps"]
+        if pre is not None and pre[0].shape[0] == ctx.shape[0]:
+            k, v = pre
+            stats["pre"] += 1
+        elif reps > 1 and ctx.shape[0] % reps == 0:
+            base = ctx[: ctx.shape[0] // reps]
+            k = torch.cat([self.norm_k(self.k(base))] * reps, dim=0)
+            v = torch.cat([self.v(base)] * reps, dim=0)
+            stats["dedup"] += 1
+        else:
+            stats["full"] += 1
+            return original(self, x, ctx, ctx_mask)
+        q = self.norm_q(self.q(x))
+        out = wvd.flash_attention(q=q, k=k, v=v, num_heads=self.num_heads, ctx_mask=ctx_mask)
+        return self.o(out)
+
+    forward._xkv = True
+    _STATS["xattn_kv"] = stats
+    wvd.CrossAttention.forward = forward
+    logger.info("cross-attention K/V of the context: once per condition / per stacked batch")
+
+
+def _xattn_precompute(model, cond, use_ref, shared):
+    """Per-layer cross-attention K/V of ``cond``'s context for no-grad calls, in buffers shared per shape and
+    expert (refilled when another condition or new LoRA weights use them)."""
+    import torch
+
+    expert = model.ref_action_expert if use_ref else model.action_expert
+    blocks = list(expert.blocks)
+    ver = tuple(p._version for b in blocks for p in b.cross_attn.parameters())
+    ctx_in = cond["context"]
+    key = (bool(use_ref), tuple(ctx_in.shape), ctx_in.dtype)
+    entry = shared.get(key)
+    tag = cond.get("_xkv_tag")
+    if tag is None:
+        shared["_serial"] = shared.get("_serial", 0) + 1
+        tag = cond["_xkv_tag"] = shared["_serial"]
+    if entry is not None and entry["owner"] == (tag, ver):
+        return entry["bufs"]
+    with torch.no_grad():
+        ctx = expert.text_embedding(ctx_in)
+        if entry is None:
+            bufs = []
+            for b in blocks:
+                bufs += [b.cross_attn.norm_k(b.cross_attn.k(ctx)), b.cross_attn.v(ctx)]
+            entry = shared[key] = {"bufs": bufs, "owner": None}
+        else:
+            for i, b in enumerate(blocks):
+                entry["bufs"][2 * i].copy_(b.cross_attn.norm_k(b.cross_attn.k(ctx)))
+                entry["bufs"][2 * i + 1].copy_(b.cross_attn.v(ctx))
+    entry["owner"] = (tag, ver)
+    return entry["bufs"]
 
 
 def _kv_shared(t) -> bool:
@@ -1115,9 +1238,12 @@ def install_batched_logprobs() -> None:
             _CHUNK["lumen"]()
             _CHUNK["sizes"] = [batch_size] * len(steps)
             _CHUNK["views"] = {id(expert.action_encoder.weight): x_views}
+        if _RT.get("SIMWAM_GRPO_XATTN_KV"):
+            _XKV["reps"] = len(steps)
         try:
             v_all = self.action_velocity(x_all, t_all, repeat_cond(cond, len(steps)), use_ref=use_ref)
         finally:
+            _XKV["reps"] = 0
             _CHUNK["sizes"] = None
             _CHUNK["views"] = None
         logps, means, vels, stds = [], [], [], []
@@ -1464,7 +1590,8 @@ def install_train_graphs() -> None:
         bases, geometry, sizes = chunk_views()
         args = (latents_action, timestep_action, *cond_tensors, *bases)
         key = (tuple((tuple(t.shape), tuple(t.stride()), t.dtype) for t in args), len(params),
-               tuple(k for k in cond if k not in _COND), int(cond.get("video_seq_len", -1)), lean, geometry, sizes)
+               tuple(k for k in cond if k not in _COND), int(cond.get("video_seq_len", -1)), lean, geometry, sizes,
+               _XKV["reps"])
         g = graphs.get(key)
         if g is None and lean is False:
             g = graphs[key] = False
@@ -1818,22 +1945,17 @@ def install_aiter_gemm() -> None:
 
     if getattr(nn.Linear.forward, "_aiter_gemm", False):
         return
-    # aiter_conv's conv3d loader puts the Triton utils / kernel directories of the $AITER_SRC checkout in front
-    # of the installed aiter's packages for good; import the installed tuned GEMM and its Triton backend now,
-    # before the LumenConfig flags run, or their first call imports mismatched modules from that checkout
-    from aiter.tuned_gemm import gemm_a16w16
-    import aiter.ops.triton.gemm.basic.gemm_a16w16  # noqa: F401
-
     previous = nn.Linear.forward
-    state = {"fn": gemm_a16w16, "tuned": {}}
+    state = {"fn": None, "tuned": {}}
     stats = {"aiter": 0}
 
     def tuned(m, n, k, bias, dtype):
         key = (m, n, k, bias, dtype)
         hit = state["tuned"].get(key)
         if hit is None:
-            from aiter.tuned_gemm import get_GEMM_A16W16_config
+            from aiter.tuned_gemm import gemm_a16w16, get_GEMM_A16W16_config
 
+            state["fn"] = gemm_a16w16
             cfg = get_GEMM_A16W16_config(M=m, N=n, K=k, bias=bias, dtype=str(dtype), otype=str(dtype))
             hit = state["tuned"][key] = cfg.get("libtype") not in (None, "torch") and not cfg.get("splitK")
         return hit
@@ -2374,6 +2496,16 @@ def enable_lumen(model, spec: str):
             _patch_lora_gemm()
         except Exception as exc:
             logger.warning("LoRA GEMM patch failed (%s); LoRA A/B stay on torch", exc)
+    if "aiter_conv" in applied:
+        import torch.nn as nn
+
+        convs = [m for m in model.modules() if isinstance(m, (nn.Conv2d, nn.Conv3d))]
+        bound = [m for m in convs if getattr(m._conv_forward, "_lumen_conv", False)]
+        n3 = sum(isinstance(m, nn.Conv3d) for m in bound)
+        logger.info("aiter_conv bound %d Conv3d and %d Conv2d of %d convolutions", n3, len(bound) - n3, len(convs))
+        if n3 == 0 and any(isinstance(m, nn.Conv3d) for m in convs):
+            logger.warning("!!! aiter_conv is on but no Conv3d is bound: aiter conv3d did not load (check AITER_SRC "
+                           "and the 'aiter conv3d' warnings above); every Conv3d stays on torch !!!")
     # After LumenConfig, so that it rebinds the VAE convolutions aiter_conv bound.
     if "flydsl_conv" in requested:
         try:
