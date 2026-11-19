@@ -101,6 +101,25 @@ def _build_env(e, plugin, device, args):
             record_frames=bool(args.video),
         )
         return env, dataset
+    if env_cfg.backend == "hipphysics_libero":
+        from lumenrl.envs.hipphysics_libero_env import HipPhysicsLiberoEnv
+        from lumenrl.envs.libero_env import LiberoInitDataset
+
+        dataset = LiberoInitDataset(env_cfg.task_suite)
+        env = HipPhysicsLiberoEnv(
+            task_suite=env_cfg.task_suite,
+            max_episode_steps=env_cfg.max_episode_steps,
+            camera_height=env_cfg.camera_height,
+            camera_width=env_cfg.camera_width,
+            num_steps_wait=env_cfg.num_steps_wait,
+            seed=args.seed,
+            hip_repo=env_cfg.hip_repo,
+            bundle_dir=env_cfg.bundle_dir,
+            gpu_id=device.index or 0,
+            worlds_per_lane=env_cfg.worlds_per_lane,
+            record_frames=bool(args.video),
+        )
+        return env, dataset
 
     from lumenrl.envs.world_model_env import WorldModelEnv, WorldModelInitDataset
 

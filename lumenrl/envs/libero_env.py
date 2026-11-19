@@ -57,6 +57,20 @@ def suite_tasks(task_suite: str) -> list:
     return [suite.get_task(i) for i in range(int(suite.n_tasks))]
 
 
+def suite_task_origins(task_suite: str) -> list[tuple[str, int]]:
+    """``(suite, task index within that suite)`` for every task of ``suite_tasks(task_suite)``."""
+    benchmark, _, _ = _libero()
+    names = [task.name for task in suite_tasks(task_suite)]
+    suites = benchmark.get_benchmark_dict()
+    order = list(benchmark.libero_suites) if task_suite == "libero_130" else [task_suite]
+    origin: dict[str, tuple[str, int]] = {}
+    for name in order:
+        suite = suites[name]()
+        for i in range(int(suite.n_tasks)):
+            origin.setdefault(suite.get_task(i).name, (name, i))
+    return [origin[n] for n in names]
+
+
 def _agentview(obs: dict) -> np.ndarray:
     image = obs["agentview_image"]
     return np.ascontiguousarray(image[::-1, ::-1])
@@ -150,6 +164,7 @@ class LiberoInit:
     init_state: np.ndarray
     instruction: str
     source: str
+    trial: int = -1
 
 
 class LiberoInitDataset:
@@ -169,6 +184,7 @@ class LiberoInitDataset:
                     init_state=np.asarray(state, dtype=np.float64),
                     instruction=str(task.language),
                     source=f"{task_suite}/task{task_id}/trial{trial}",
+                    trial=trial,
                 ))
         self.instructions = sorted({s.instruction for s in self.states})
         logger.info(

@@ -42,10 +42,7 @@ embodied:
   log_dir: /work/runs/libero_130_grpo
   save_interval: 10
   save_dir: /work/runs/libero_130_grpo/checkpoints
-  # step_80 is the last finished policy (step 90 failed to save: disk full).
-  # Adam moments were not saved.
-  resume_from: /work/runs/libero_130_grpo/checkpoints/step_80/policy.safetensors
-  resume_step: 80
+  # Fresh run from the SFT weights in policy.model_path.
   # BF16 Lumen on the actor. scaling "none" keeps FP8 linear off.
   # GEMM solutions: <Lumen>/examples/openvla_oft/openvla_bf16_tuned_gemm.csv
   # (AITER_CONFIG_GEMM_BF16, set by run_embodied_grpo.sh).

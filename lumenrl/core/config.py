@@ -978,8 +978,9 @@ class EmbodiedPolicyConfig:
 
 @dataclass
 class EmbodiedEnvConfig:
-    """Rollout environment. ``backend=world_model`` imagines frames; ``libero`` steps robosuite/MuJoCo."""
-    backend: str = "world_model"       # "world_model" or "libero"
+    """Rollout environment. ``backend=world_model`` imagines frames; ``libero`` steps robosuite/MuJoCo
+    on CPU; ``hipphysics_libero`` steps and renders LIBERO on the GPU with hipPhysics."""
+    backend: str = "world_model"       # "world_model", "libero" or "hipphysics_libero"
     model_dir: str = ""
     init_data_dir: str = ""            # default: <model_dir>/dataset
     reward_model_file: str = "resnet_rm.pth"
@@ -995,6 +996,9 @@ class EmbodiedEnvConfig:
     camera_width: int = 128
     num_steps_wait: int = 10           # physics settle steps after set_init_state
     num_workers: int = 0               # >0: one process per sim slot
+    hip_repo: str = ""                 # hipphysics_libero: hipPhysics tree (default $HP_REPO)
+    bundle_dir: str = ""               # hipphysics_libero: success bundles (default <hip_repo>/eval/bundles)
+    worlds_per_lane: int = 8           # hipphysics_libero: worlds per engine, one task per engine
 
 
 @dataclass
@@ -1025,6 +1029,7 @@ class EmbodiedConfig:
     log_dir: str = ""                  # per-step metrics as embodied_metrics.jsonl
     save_interval: int = 0             # save the policy every N steps (and at the end) when > 0
     save_dir: str = ""                 # default: <log_dir>/checkpoints
+    keep_checkpoints: int = 0          # >0: after each save, delete older step_* dirs, keeping this many
     resume_from: str = ""              # policy.safetensors written by save_policy
     resume_step: int = 0               # last finished step; the loop continues at this index
     lumen: dict = field(default_factory=dict)

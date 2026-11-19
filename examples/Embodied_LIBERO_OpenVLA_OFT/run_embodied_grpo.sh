@@ -26,6 +26,16 @@ TUNED_GEMM="$OPENVLA_DIR/openvla_bf16_tuned_gemm.csv"
 if [[ -f "$TUNED_GEMM" ]]; then
   export AITER_CONFIG_GEMM_BF16="$TUNED_GEMM"
 fi
+# The tuned hipBLASLt kernels can return HIPBLAS_STATUS_INTERNAL_ERROR and
+# leave the output unwritten. Opus covers the vision and language shapes.
+export LUMEN_BF16_GEMM="${LUMEN_BF16_GEMM:-opus}"
+# embodied.env.backend=hipphysics_libero: HP_BUILD is a libero-flavour hipPhysics build
+# (cmake -DHP_FLAVOR=libero) and HP_REPO the tree it was built from.
+if [[ -n "${HP_BUILD:-}" ]]; then
+  export HP_REPO="${HP_REPO:?HP_BUILD needs HP_REPO}"
+  export PYTHONPATH="$HP_BUILD/python:$PYTHONPATH"
+  export LD_LIBRARY_PATH="$HP_BUILD${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
 
 cd "$REPO"
 exec torchrun --nproc_per_node="$NPROC" --master_port="$MASTER_PORT" \

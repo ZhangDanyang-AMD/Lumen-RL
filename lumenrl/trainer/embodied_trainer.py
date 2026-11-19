@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -80,6 +81,23 @@ class EmbodiedTrainer:
                 num_steps_wait=env_cfg.num_steps_wait,
                 seed=cfg.seed * 1000 + self._rank,
                 num_workers=env_cfg.num_workers,
+            )
+        elif env_cfg.backend == "hipphysics_libero":
+            from lumenrl.envs.hipphysics_libero_env import HipPhysicsLiberoEnv
+            from lumenrl.envs.libero_env import LiberoInitDataset
+
+            self.init_states = LiberoInitDataset(env_cfg.task_suite)
+            self.env = HipPhysicsLiberoEnv(
+                task_suite=env_cfg.task_suite,
+                max_episode_steps=env_cfg.max_episode_steps,
+                camera_height=env_cfg.camera_height,
+                camera_width=env_cfg.camera_width,
+                num_steps_wait=env_cfg.num_steps_wait,
+                seed=cfg.seed * 1000 + self._rank,
+                hip_repo=env_cfg.hip_repo,
+                bundle_dir=env_cfg.bundle_dir,
+                gpu_id=self._local_rank,
+                worlds_per_lane=env_cfg.worlds_per_lane,
             )
         elif env_cfg.backend == "world_model":
             if self.plugin.build_world_model is None or self.plugin.build_reward_model is None:
@@ -207,9 +225,23 @@ class EmbodiedTrainer:
             state = {n: p.detach().contiguous().cpu() for n, p in self.rollout.policy.named_parameters()}
             save_file(state, path)
             logger.info("Saved policy (%d tensors) to %s", len(state), path)
+            self._prune_checkpoints(root, step)
         if self._is_distributed:
             dist.barrier()
         return path
+
+    def _prune_checkpoints(self, root: str, step: int) -> None:
+        keep = int(self.ecfg.keep_checkpoints)
+        if keep <= 0:
+            return
+        saved = []
+        for name in os.listdir(root):
+            prefix = "step_"
+            if name.startswith(prefix) and name[len(prefix):].isdigit():
+                saved.append((int(name[len(prefix):]), os.path.join(root, name)))
+        for _, path in sorted(saved)[:-keep]:
+            shutil.rmtree(path)
+            logger.info("Removed checkpoint %s (keeping the latest %d)", path, keep)
 
     def train_step(self, step: int) -> dict[str, float]:
         t_start = time.time()
