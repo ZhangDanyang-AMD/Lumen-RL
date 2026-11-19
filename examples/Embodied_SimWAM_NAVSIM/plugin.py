@@ -531,7 +531,9 @@ def install_action_velocity_graphs() -> None:
     rollout's old log-probs and the reference log-probs all call ``action_velocity``
     under ``no_grad`` with fixed shapes. One graph is captured per (expert, shapes);
     a call copies its inputs into the graph's static tensors and replays. The KV cache
-    of a condition is copied once per condition, not once per call.
+    of a condition is copied once per condition, not once per call. Inside the graphs the per-layer
+    ``cat`` of the cached video K/V and the action K/V writes only the action rows behind the video rows
+    of a static buffer (bit-identical; ``SIMWAM_GRPO_KV_SLOT=0`` captures the plain ``cat``).
     ``SIMWAM_GRPO_CUDA_GRAPH=0`` turns this off; ``SIMWAM_GRPO_CUDA_GRAPH_VERIFY=1``
     also runs eager on every call and counts outputs that are not bit-identical.
     """
@@ -544,7 +546,7 @@ def install_action_velocity_graphs() -> None:
         return
     eager = ActionGRPOMixin.action_velocity
     verify = os.environ.get("SIMWAM_GRPO_CUDA_GRAPH_VERIFY", "0") == "1"
-    kv_slot = _switch("SIMWAM_GRPO_KV_SLOT", "0")
+    kv_slot = _switch("SIMWAM_GRPO_KV_SLOT", "1")
     graphs = {}
     stats = {"replay": 0, "eager": 0, "mismatch": 0, "loads": 0, "kv_slots": 0, "kv_slot_cats": 0}
     serial = [0]
@@ -641,7 +643,7 @@ def install_action_velocity_graphs() -> None:
         # per-step calls (denoising) read the context K/V computed once per condition; batched calls
         # deduplicate them inside the graph (install_cross_attn_kv)
         xkv = (_xattn_precompute(self, cond, use_ref, xshared)
-               if _RT.get("SIMWAM_GRPO_XATTN_KV") and _XKV["reps"] <= 1 else None)
+               if _RT.get("SIMWAM_GRPO_XATTN_KV") and _XKV["reps"] <= 1 and not _XKV.get("no_pre") else None)
         # the lean attention path bakes "masks are all True" into the graph
         lean = _LEAN_ATTN["flag"](cond, int(latents_action.shape[1])) if _LEAN_ATTN["flag"] else None
         key = (bool(use_ref), tuple(latents_action.shape), tuple(latents_action.stride()), tuple(timestep_action.shape),
@@ -1016,8 +1018,10 @@ def install_cross_attn_kv() -> None:
     batched call the context is ``W`` copies of the condition's, so K/V are computed on the first copy and
     repeated (gradients sum over the copies); the rollout's no-grad log-probs and the training forward
     take this same path, so they still match bit for bit. Rollout denoising reads per-layer K/V computed
-    once per condition (see ``install_action_velocity_graphs``). Results are no longer bit-identical to the
-    unpatched model: the projections run on fewer rows. ``SIMWAM_GRPO_XATTN_KV=0`` turns it off.
+    once per condition (see ``install_action_velocity_graphs``); the deterministic eval, whose condition is
+    ``group_size`` times larger, computes them inside its graphs instead of keeping buffers that size.
+    Results are no longer bit-identical to the unpatched model: the projections run on fewer rows.
+    ``SIMWAM_GRPO_XATTN_KV=0`` turns it off.
     """
     if not _switch("SIMWAM_GRPO_XATTN_KV", "1"):
         return
@@ -1050,6 +1054,21 @@ def install_cross_attn_kv() -> None:
     forward._xkv = True
     _STATS["xattn_kv"] = stats
     wvd.CrossAttention.forward = forward
+
+    from simwam.trainer_grpo import SimWAMGRPOTrainer
+
+    eval_original = SimWAMGRPOTrainer._eval_deterministic
+
+    def eval_deterministic(self):
+        # the eval's condition is group_size times the rollout's: its per-condition K/V buffers would stay
+        # allocated for the rest of the run (6 GB per rank on NAVSIM), so the eval computes them inside its graphs
+        _XKV["no_pre"] = True
+        try:
+            return eval_original(self)
+        finally:
+            _XKV["no_pre"] = False
+
+    SimWAMGRPOTrainer._eval_deterministic = eval_deterministic
     logger.info("cross-attention K/V of the context: once per condition / per stacked batch")
 
 
@@ -1417,16 +1436,24 @@ def _pdm_worker_score(task):
     reward = _PDM_WORKER["reward"]
     if not reward.available(token):
         return ("missing",)
+    import time
+
+    t0 = time.perf_counter()
     cache = _PDM_WORKER["cache"]
     metric_cache = cache.get(token)
     if metric_cache is None:
         metric_cache = cache[token] = reward.metric_cache_loader.get_from_token(token)
+        # a long run sees each token rarely; keep only the latest ones instead of every token in every worker
+        while len(cache) > 8:
+            cache.pop(next(iter(cache)))
+    t1 = time.perf_counter()
     reward._true_pdms, reward._submetric_rows = [], []
     try:
         value = reward.score(poses, metric_cache)
     except Exception as exc:  # same fallback as score_batch
         return ("failed", str(exc))
-    return ("ok", value, reward._true_pdms[-1], reward._submetric_rows[-1])
+    # load and simulation seconds ride along; collectors that predate them ignore the extra field
+    return ("ok", value, reward._true_pdms[-1], reward._submetric_rows[-1], (t1 - t0, time.perf_counter() - t1))
 
 
 def install_parallel_pdm_reward() -> None:
@@ -2197,10 +2224,10 @@ def install_fused_modulate() -> None:
     SimWAM computes ``x * (1 + scale) + shift`` (three kernels) and ``x + gate * residual``
     (two). ``torch.addcmul(shift, x, 1 + scale)`` and ``torch.addcmul(x, gate, residual)`` do the
     multiply-add in one pass and round once, so they are not bit-identical; rollout and training
-    use the same op, so they still agree with each other. ``SIMWAM_GRPO_FUSED_MODULATE=1`` turns
-    it on.
+    use the same op, so they still agree with each other. ``SIMWAM_GRPO_FUSED_MODULATE=0`` turns
+    it off.
     """
-    if not _switch("SIMWAM_GRPO_FUSED_MODULATE", "0"):
+    if not _switch("SIMWAM_GRPO_FUSED_MODULATE", "1"):
         return
     import torch
     import simwam.models.wan22.mot as mot
@@ -2267,6 +2294,15 @@ def install_overlap_reward_logprobs() -> None:
 
     def collect(reward, pending, tokens, device):
         results = pending.get()
+        times = [res[4] for res in results if res[0] == "ok" and len(res) > 4]
+        if times:
+            # the last rollout's metric-cache load and PDM simulation times per trajectory (worker side)
+            pdm = _STATS.setdefault("pdm", {"rollouts": 0})
+            pdm["rollouts"] += 1
+            pdm["load_max_ms"] = round(1000 * max(t[0] for t in times), 1)
+            pdm["load_sum_ms"] = round(1000 * sum(t[0] for t in times), 1)
+            pdm["sim_max_ms"] = round(1000 * max(t[1] for t in times), 1)
+            pdm["sim_sum_ms"] = round(1000 * sum(t[1] for t in times), 1)
         reward.last_num_total = len(tokens)
         reward.last_num_missing = 0
         reward.last_num_failed = 0
