@@ -82,11 +82,11 @@ def _merge_left_padded(parts: list[torch.Tensor], value: float) -> torch.Tensor:
     return torch.cat(widened, dim=0)
 
 
-def _format_chat_prompt(tokenizer: Any, messages: list[dict[str, Any]]) -> str:
+def _format_chat_prompt(tokenizer: Any, messages: list[dict[str, Any]], **template_kwargs: Any) -> str:
     """Format chat messages without silently dropping model turn markers."""
     if getattr(tokenizer, "chat_template", None):
         return tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
+            messages, tokenize=False, add_generation_prompt=True, **template_kwargs,
         )
 
     convert_token = getattr(tokenizer, "convert_tokens_to_ids", None)
@@ -98,10 +98,10 @@ def _format_chat_prompt(tokenizer: Any, messages: list[dict[str, Any]]) -> str:
             # Jinja chat template. vLLM carries the model's reference encoder.
             from vllm.tokenizers.deepseek_v4_encoding import encode_messages
 
-            return encode_messages(messages, thinking_mode="thinking")
+            return encode_messages(messages, thinking_mode=template_kwargs.get("thinking_mode", "thinking"))
 
     return tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True,
+        messages, tokenize=False, add_generation_prompt=True, **template_kwargs,
     )
 
 
@@ -1900,7 +1900,9 @@ class RLTrainer:
             s, ensure_answer_format=ensure_answer_format,
         )
         if self._tokenizer is not None and prompt_messages is not None:
-            prompt_text = _format_chat_prompt(self._tokenizer, prompt_messages)
+            generation = getattr(getattr(getattr(self, "config", None), "policy", None), "generation", None)
+            template_kwargs = dict(getattr(generation, "chat_template_kwargs", None) or {})
+            prompt_text = _format_chat_prompt(self._tokenizer, prompt_messages, **template_kwargs)
         return prompt_text, gt
 
     def _extract_prompt_messages_gt(

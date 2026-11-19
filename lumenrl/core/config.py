@@ -463,6 +463,10 @@ class GenerationConfig:
     atom_cfg: AtomConfig = field(default_factory=AtomConfig)
     vllm_cfg: VLLMConfig = field(default_factory=VLLMConfig)
     multi_turn: MultiTurnConfig = field(default_factory=MultiTurnConfig)
+    # Passed to the chat template of single-turn prompts (training and validation),
+    # e.g. {reasoning_effort: low} for DeepSeek-V4.1, whose template defaults to high.
+    # Multi-turn rollouts take multi_turn.chat_template_kwargs.
+    chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

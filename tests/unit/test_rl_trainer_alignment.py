@@ -344,6 +344,30 @@ def test_extract_prompt_gt_adds_validation_answer_format() -> None:
     assert ground_truth == "2"
 
 
+def test_single_turn_prompts_take_the_generation_chat_template_kwargs() -> None:
+    """DeepSeek-V4.1's template thinks at reasoning effort high unless told otherwise."""
+    seen = []
+
+    class Tokenizer:
+        chat_template = "configured"
+
+        @staticmethod
+        def apply_chat_template(messages, *, tokenize, add_generation_prompt, **kwargs):
+            seen.append(kwargs)
+            return messages[0]["content"]
+
+    trainer = object.__new__(RLTrainer)
+    trainer._tokenizer = Tokenizer()
+    kwargs = {"thinking_mode": "thinking", "reasoning_effort": "low"}
+    trainer.config = SimpleNamespace(policy=SimpleNamespace(generation=SimpleNamespace(chat_template_kwargs=kwargs)))
+
+    trainer._extract_prompt_gt({"prompt": [{"role": "user", "content": "Solve 1+1."}], "label": "2"})
+    trainer._extract_prompt_gt({"prompt": [{"role": "user", "content": "Solve 1+1."}], "label": "2"},
+                               ensure_answer_format=True)
+
+    assert seen == [kwargs, kwargs]
+
+
 @pytest.mark.parametrize("old_seq_len", [6, 7])
 def test_response_position_metrics_isolate_late_token_drift(old_seq_len: int) -> None:
     """Rollout/mask are [B, S-1]; Megatron old_log_probs may be width S (7 here)."""
