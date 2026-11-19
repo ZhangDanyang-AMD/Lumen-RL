@@ -25,6 +25,11 @@ export LUMEN_DIR="${LUMEN_DIR:-/home/danyzhan/Lumen}"
 # an aiter checkout with aiter/ops/triton/conv/conv3d.py (the image's aiter has none); unset, aiter_conv logs a
 # warning and Conv3d (the DiT patch embedding) stays on torch
 export AITER_SRC="${AITER_SRC:-}"
+# aiter's tuned bf16 GEMM table for this example's shapes (SIMWAM_GRPO_AITER_GEMM), from the same checkout
+_GEMM_TABLE="$AITER_SRC/aiter/configs/model_configs/simwam_grpo_bf16_tuned_gemm.csv"
+if [ -z "${AITER_CONFIG_GEMM_BF16:-}" ] && [ -n "$AITER_SRC" ] && [ -f "$_GEMM_TABLE" ]; then
+  export AITER_CONFIG_GEMM_BF16="$_GEMM_TABLE"
+fi
 # lumen_linear is left out: the tuned GEMM has no entry for these shapes and falls back to the torch
 # GEMM, so results are unchanged and only the dispatch cost goes. hf_attn_patch stays so results are
 # bit-identical to the original; aiter_conv alone (torch SDPA) is faster but changes log-probs (see README).

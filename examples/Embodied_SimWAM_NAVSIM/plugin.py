@@ -1804,9 +1804,14 @@ def install_aiter_gemm() -> None:
     table has it with a backend other than torch and without split-K, so the forward stays deterministic; the
     rollout and the training forward have the same shapes and so run the same kernel. The backward (input,
     and weight / bias gradients when needed) is torch's. Non-contiguous inputs, per-step split calls and
-    other dtypes keep the previous path. ``SIMWAM_GRPO_AITER_GEMM=1`` turns it on.
+    other dtypes keep the previous path. Only with ``AITER_CONFIG_GEMM_BF16`` set (``run_embodied_grpo.sh`` takes
+    this example's table from ``$AITER_SRC``); without it aiter would fall back to its other models' tables.
+    ``SIMWAM_GRPO_AITER_GEMM=0`` turns it off.
     """
-    if not _switch("SIMWAM_GRPO_AITER_GEMM", "0"):
+    if not _switch("SIMWAM_GRPO_AITER_GEMM", "1"):
+        return
+    if not os.environ.get("AITER_CONFIG_GEMM_BF16"):
+        logger.warning("SIMWAM_GRPO_AITER_GEMM: AITER_CONFIG_GEMM_BF16 is unset; nn.Linear stays on torch")
         return
     import torch
     import torch.nn as nn
