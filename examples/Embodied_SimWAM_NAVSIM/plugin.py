@@ -339,13 +339,13 @@ def install_drop_true_masks() -> None:
     rollout and training run the same attention forward. The masks are checked once per
     condition (``build_action_condition`` / ``expand_condition``, outside any CUDA graph) and per
     video prefill; a condition with a False entry keeps the masked path. Not bit-identical to
-    the masked kernels. ``SIMWAM_GRPO_DROP_MASKS=1`` turns it on.
+    the masked kernels. ``SIMWAM_GRPO_DROP_MASKS=0`` turns it off.
     With ``SIMWAM_GRPO_AITER_FMHA_GRAD=1`` the grad-enabled calls without a mask go to AITER's
     Triton ``flash_attn_func`` (forward and backward) instead of torch's flash path; no-grad calls
     stay on torch, whose flash forward is AITER's CK kernel already. ``=all`` sends the no-grad
     calls to the same Triton kernel too, so rollout and training attention match again.
     """
-    if os.environ.get("SIMWAM_GRPO_DROP_MASKS", "0").strip().lower() in _OFF:
+    if os.environ.get("SIMWAM_GRPO_DROP_MASKS", "1").strip().lower() in _OFF:
         return
     import torch
     import torch.nn.functional as F
@@ -686,9 +686,10 @@ def install_batched_logprobs() -> None:
     ``SIMWAM_GRPO_BATCHED_LOGP=0`` turns this off; ``SIMWAM_GRPO_BATCHED_CHUNK`` adds ``rmsnorm``
     and/or ``attn`` to the per-step ops; ``SIMWAM_GRPO_BATCHED_LOGP_VERIFY=1`` also runs the
     unbatched path on every call and compares outputs and LoRA gradients bit for bit.
-    Not bit-identical, off by default: ``SIMWAM_GRPO_BATCHED_GEMM=1`` runs each GEMM once over all
-    steps (no per-step split); ``SIMWAM_GRPO_BATCHED_LOGP_NOGRAD=1`` batches the no-grad calls
-    (the rollout's old and reference log-probs) the same way, so they take the training path.
+    Not bit-identical, on by default: ``SIMWAM_GRPO_BATCHED_GEMM`` runs each GEMM once over all
+    steps (no per-step split); ``SIMWAM_GRPO_BATCHED_LOGP_NOGRAD`` batches the no-grad calls (the
+    rollout's old and reference log-probs) the same way, so they take the training path and the
+    rollout's log-probs match the first inner update's. Set both to ``0`` for the per-step path.
     """
     if os.environ.get("SIMWAM_GRPO_BATCHED_LOGP", "1").strip().lower() in _OFF:
         return
@@ -704,8 +705,8 @@ def install_batched_logprobs() -> None:
     _CHUNK["ops"] = frozenset(
         x.strip() for x in os.environ.get("SIMWAM_GRPO_BATCHED_CHUNK", "").split(",") if x.strip())
     verify = os.environ.get("SIMWAM_GRPO_BATCHED_LOGP_VERIFY", "0") == "1"
-    one_gemm = os.environ.get("SIMWAM_GRPO_BATCHED_GEMM", "0").strip().lower() not in _OFF
-    nograd = os.environ.get("SIMWAM_GRPO_BATCHED_LOGP_NOGRAD", "0").strip().lower() not in _OFF
+    one_gemm = os.environ.get("SIMWAM_GRPO_BATCHED_GEMM", "1").strip().lower() not in _OFF
+    nograd = os.environ.get("SIMWAM_GRPO_BATCHED_LOGP_NOGRAD", "1").strip().lower() not in _OFF
     stats = {"batched": 0, "batched_nograd": 0, "fwd_mismatch": 0, "grad_mismatch": 0, "grad_checked": 0,
              "max_grad_diff": 0.0}
     original = ActionGRPOMixin.action_chain_logprobs
@@ -1363,9 +1364,9 @@ def install_aiter_rmsnorm() -> None:
     grad-enabled calls go through an autograd Function whose backward computes the input
     gradient from the RMSNorm formula in fp32 (the norm weights are frozen here; a weight
     gradient is computed too if one is needed). Only bf16 with the widths checked below.
-    ``SIMWAM_GRPO_AITER_RMSNORM=1`` turns it on.
+    ``SIMWAM_GRPO_AITER_RMSNORM=0`` turns it off.
     """
-    if os.environ.get("SIMWAM_GRPO_AITER_RMSNORM", "0").strip().lower() in _OFF:
+    if os.environ.get("SIMWAM_GRPO_AITER_RMSNORM", "1").strip().lower() in _OFF:
         return
     import torch
     from simwam.models.wan22 import wan_video_dit as wvd

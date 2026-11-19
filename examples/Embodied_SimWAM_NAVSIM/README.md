@@ -103,7 +103,7 @@ Set `LUMEN_ENABLE` to a subset to check one patch at a time.
 
 ## Training-loop patches
 
-`train_grpo.py` also installs these runtime patches from `plugin.py` (SimWAM is not modified). With `LUMEN_ENABLE=hf_attn_patch` (the default without `aiter_conv`, so the VAE convolutions stay on torch as in the original), a run with all of them is bit-identical to the original example with `LUMEN_ENABLE=hf_attn_patch,lumen_linear` and the LoRA seed below: the LoRA init, every rollout tensor and reward, every log-prob, every LoRA weight after every optimizer step, and loss, KL and grad norm.
+`train_grpo.py` also installs these runtime patches from `plugin.py` (SimWAM is not modified). With `LUMEN_ENABLE=hf_attn_patch` (the default without `aiter_conv`, so the VAE convolutions stay on torch as in the original) and the four switches under "Faster, not bit-identical" set to `0`, a run is bit-identical to the original example with `LUMEN_ENABLE=hf_attn_patch,lumen_linear` and the LoRA seed below: the LoRA init, every rollout tensor and reward, every log-prob, every LoRA weight after every optimizer step, and loss, KL and grad norm. With their defaults (on) it is not.
 
 | Patch | Switch (default) | What it does |
 |---|---|---|
@@ -115,6 +115,18 @@ Set `LUMEN_ENABLE` to a subset to check one patch at a time.
 | `install_parallel_pdm_reward` | `SIMWAM_GRPO_PDM_WORKERS` (`8`, `0` disables) | PDM rewards are scored in a pool of spawned workers. |
 | `install_manual_data_parallel` | `SIMWAM_GRPO_MANUAL_DP` (`1`; `0` uses DeepSpeed ZeRO-1) | Multi-GPU training without DeepSpeed: the LoRA gradients are all-reduced and an fp32-master AdamW steps them, bit-identical to DeepSpeed ZeRO-1. Needed for the training CUDA graphs below. |
 | `install_train_graphs` | `SIMWAM_GRPO_TRAIN_GRAPH` (`1`) | Only with manual data parallel. The grad-enabled `action_velocity` forward and backward replay from CUDA graphs captured per input shape; the LoRA gradients leave the graph and are reduced and stepped outside it. `SIMWAM_GRPO_TRAIN_GRAPH_VERIFY=1` compares every replay (output and all LoRA gradients) with eager. |
+
+### Faster, not bit-identical
+
+| Patch | Switch (default) | What it does |
+|---|---|---|
+| `install_drop_true_masks` | `SIMWAM_GRPO_DROP_MASKS` (`1`) | Calls SDPA without the attention masks when they are all True, which they are here: the GRPO condition is one frame (so `first_frame_causal` masks nothing), the action rows see every token, and the NAVSIM dataset sets the text mask to ones. Checked once per condition and per video prefill; otherwise the masked path is kept. Torch then takes its flash path (AITER's CK forward) for rollout and training alike, instead of Lumen Triton for no-grad calls and aotriton with a bias for grad-enabled ones. |
+| `install_batched_logprobs` | `SIMWAM_GRPO_BATCHED_GEMM` (`1`) | In the batched log-prob call each GEMM runs once over all steps instead of once per step. |
+| `install_batched_logprobs` | `SIMWAM_GRPO_BATCHED_LOGP_NOGRAD` (`1`) | The no-grad log-prob calls (the rollout's old and reference log-probs) are batched the same way, so the rollout scores a chain with the same kernels as the first inner update. Keep it on with `SIMWAM_GRPO_BATCHED_GEMM`: alone, the batched GEMM makes the training log-probs differ from the rollout's. |
+| `install_aiter_rmsnorm` | `SIMWAM_GRPO_AITER_RMSNORM` (`1`) | SimWAM's `RMSNorm` on AITER's CK `rms_norm` (one fused launch); grad-enabled calls use an autograd Function whose backward computes the input gradient from the RMSNorm formula in fp32. |
+| `install_drop_true_masks` | `SIMWAM_GRPO_AITER_FMHA_GRAD` (`0`; `1`; `all`) | `1`: grad-enabled maskless calls on AITER's Triton `flash_attn_func`; `all`: the no-grad ones too. Off: `1` is faster but makes the training log-probs differ from the rollout's again, `all` is no faster than off. |
+
+Measured on 4×MI350X (`NPROC=4`, 60 steps, median of the 11 cycles from step 16 on rank 0, two interleaved runs each, `LUMEN_ENABLE=hf_attn_patch`), each row adding one switch: all four off 810 ms; masks dropped 748 ms; one GEMM over the steps 625.5 ms; no-grad calls batched 606 ms; AITER RMSNorm 563.5 ms (-30% in total). With the four on, the rollout's log-probs equal the first inner update's bit for bit (importance ratio exactly 1 before the first optimizer step); with all four off they differ by about 1e-3 on average, and 4% of the ratios start outside the default PPO clip of 0.005.
 
 ## Training
 
