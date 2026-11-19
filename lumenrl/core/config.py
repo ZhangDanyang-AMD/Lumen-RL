@@ -1101,6 +1101,9 @@ class LumenRLConfig:
     seed: int = 42
     val_dataset: str = ""
     val_steps: int = 0        # validate every N steps; 0 = no validation
+    # Validate once before the first step of a run that starts from step 0 (logged as
+    # step 0), as verl's trainer.val_before_train: the baseline the later ones compare to.
+    val_before_train: bool = False
     val_batch_size: int = 16
 
     def __post_init__(self) -> None:

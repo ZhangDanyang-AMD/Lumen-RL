@@ -368,6 +368,28 @@ def test_single_turn_prompts_take_the_generation_chat_template_kwargs() -> None:
     assert seen == [kwargs, kwargs]
 
 
+@pytest.mark.parametrize("enabled, start_step, want", [(True, 0, [-1]), (True, 5, []), (False, 0, [])])
+def test_val_before_train_validates_a_fresh_run_once_as_step_0(enabled, start_step, want) -> None:
+    trainer = object.__new__(RLTrainer)
+    trainer.config = SimpleNamespace(val_before_train=enabled)
+    calls = []
+    trainer.run_validation = lambda step=None: calls.append(step) or {"val/score_mean": 0.5}
+
+    trainer._validate_before_training(start_step)
+
+    assert calls == want
+
+
+def test_both_training_loops_validate_before_their_first_step() -> None:
+    import inspect
+
+    for loop in (RLTrainer.train, RLTrainer._train_with_ray_controller):
+        source = inspect.getsource(loop)
+        assert source.index("self._validate_before_training(start_step)") < source.index(
+            "for step in range(start_step, total_steps)"
+        ), loop.__name__
+
+
 @pytest.mark.parametrize("old_seq_len", [6, 7])
 def test_response_position_metrics_isolate_late_token_drift(old_seq_len: int) -> None:
     """Rollout/mask are [B, S-1]; Megatron old_log_probs may be width S (7 here)."""

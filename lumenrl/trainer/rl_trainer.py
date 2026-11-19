@@ -3583,6 +3583,7 @@ class RLTrainer:
             logger.info("[rank %d] Resume: syncing restored weights to rollout engine before first rollout.", self._rank)
             self._sync_weights_to_atom()
 
+        self._validate_before_training(start_step)
         for step in range(start_step, total_steps):
             step_start = time.time()
             self.global_step = step
@@ -4506,6 +4507,7 @@ class RLTrainer:
                 logger.info("Resume: syncing restored actor weights to Ray rollout before first rollout.")
                 self._sync_weights_ipc()
 
+        self._validate_before_training(start_step)
         # Policy version loaded in the rollout engine, counted in optimizer steps.
         rollout_version = start_step
         pipeline_mode = self._resolve_rollout_pipeline(use_ray_rollout)
@@ -5007,6 +5009,12 @@ class RLTrainer:
         """Sync actor weights to ATOM rollout engine if configured."""
         if self._use_atom and self._atom_engine is not None:
             self._sync_weights_to_atom()
+
+    def _validate_before_training(self, start_step: int) -> dict[str, float]:
+        """``val_before_train``: the untrained policy's validation, logged as step 0."""
+        if start_step != 0 or not getattr(self.config, "val_before_train", False):
+            return {}
+        return self.run_validation(step=-1)
 
     def run_validation(self, step: int | None = None) -> dict[str, float]:
         """Evaluate on the validation set with configured sampling.
