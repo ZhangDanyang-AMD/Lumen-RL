@@ -15,6 +15,7 @@ are reconstructed with a differentiable CP all-reduce.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import math
@@ -1906,7 +1907,9 @@ class MegatronNativeEngine(MegatronBaseEngine):
             # keep the pipeline in lockstep even with no data (rare); no step.
             return {"loss": 0.0, "lr": self._cur_lr(), "grad_norm": 0.0}
 
-        data_iter = iter(mbs)
+        per_schedule = int((getattr(self, "engine_config", None) or {}).get("microbatches_per_schedule") or num_mb)
+        schedules = [mbs[i : i + per_schedule] for i in range(0, num_mb, per_schedule)]
+        in_schedule = [0]
 
         def forward_step(di, model, *args, **kwargs):
             mb = next(di[0] if isinstance(di, list) else di)
@@ -1950,12 +1953,13 @@ class MegatronNativeEngine(MegatronBaseEngine):
                     agg["rc_kl_sum"] += stats["rc_kl_sum"]; agg["rc_kl_tok"] += stats["rc_kl_tok"]
                 if bin_loss is None:
                     bin_loss = logits.sum() * 0.0
-                # Megatron's two-value loss contract applies ``*cp/num_mb``.
-                # Cancel both factors here. CP is already accounted for by the
-                # differentiable reconstruction's backward SUM followed by DDP's
-                # DP×CP average; retaining the schedule's CP multiplier would make
-                # CP=2 gradients exactly 2x too large.
-                return bin_loss * num_mb / self._cp, agg
+                # Megatron's two-value loss contract applies ``*cp/num_mb``, with
+                # num_mb this schedule's microbatches. Cancel both factors here. CP
+                # is already accounted for by the differentiable reconstruction's
+                # backward SUM followed by DDP's DP×CP average; retaining the
+                # schedule's CP multiplier would make CP=2 gradients exactly 2x too
+                # large.
+                return bin_loss * in_schedule[0] / self._cp, agg
 
             return out, loss_func
 
@@ -1970,11 +1974,23 @@ class MegatronNativeEngine(MegatronBaseEngine):
             self._r3_batch_routes = routes_from_batch(batch)
             self._r3_append = True
             clear_replay()
+        # Gradients accumulate across the schedules and are finalized (DP reduce,
+        # which the distributed optimizer does as a reduce-scatter into the same
+        # buffer, so it must run exactly once) by the last.
+        finalize = getattr(self._tfcfg, "finalize_model_grads_func", None) if len(schedules) > 1 else None
+        losses = []
         try:
-            losses = fwd_bwd(
-                forward_step_func=forward_step, data_iterator=[data_iter], model=[self._ddp],
-                num_microbatches=num_mb, seq_length=1, micro_batch_size=1, forward_only=False,
-            )
+            for k, schedule in enumerate(schedules):
+                last = k == len(schedules) - 1
+                in_schedule[0] = len(schedule)
+                if len(schedules) > 1:
+                    self._tfcfg.finalize_model_grads_func = finalize if last else None
+                hold = not last and getattr(self, "_overlap_grad_reduce", False)
+                with self._ddp.no_sync() if hold else contextlib.nullcontext():
+                    losses += fwd_bwd(
+                        forward_step_func=forward_step, data_iterator=[iter(schedule)], model=[self._ddp],
+                        num_microbatches=len(schedule), seq_length=1, micro_batch_size=1, forward_only=False,
+                    )
             # Full uniform recomputation reruns every layer of every microbatch, so
             # each one must have consumed its queued routes.
             if self._r3_enabled and self._recompute_every_layer:
@@ -1985,6 +2001,8 @@ class MegatronNativeEngine(MegatronBaseEngine):
                         "replayed, so some recomputed layer picked its own experts."
                     )
         finally:
+            if len(schedules) > 1:
+                self._tfcfg.finalize_model_grads_func = finalize
             if self._r3_enabled:
                 clear_replay()
                 self._r3_batch_routes = None

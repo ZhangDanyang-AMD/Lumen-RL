@@ -413,6 +413,7 @@ class LumenActorWorker(BaseWorker):
                 "dist_checkpoint_path": meg_cfg.get("dist_checkpoint_path", None),
                 "deterministic_mode": meg_cfg.get("deterministic_mode", None),
                 "dsv41_quant_points": meg_cfg.get("dsv41_quant_points"),
+                "microbatches_per_schedule": meg_cfg.get("microbatches_per_schedule"),
                 "build_optimizer": meg_cfg.get("build_optimizer", True),
                 # Adam step for the offloaded fraction runs on the CPU; see
                 # optimizer_cpu_offload above.

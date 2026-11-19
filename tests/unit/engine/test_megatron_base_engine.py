@@ -376,6 +376,80 @@ def test_native_pp_grpo_passes_sequence_normalization_under_dp_cp(
     torch.testing.assert_close(log_probs.grad, torch.full_like(log_probs, -0.5))
 
 
+def _native_pp_update(monkeypatch, per_schedule):
+    """One `_pp_update_policy` of three one-row microbatches through a schedule that runs
+    each microbatch and scales its loss by 1/num_microbatches, as Megatron's does; returns
+    the log-prob gradient and, per schedule, (microbatches, finalize hook it saw)."""
+    log_probs = torch.tensor([[0.1, -0.2], [0.3, 0.0], [-0.4, 0.2]], requires_grad=True)
+    calls = []
+    engine = object.__new__(MegatronNativeEngine)
+
+    def forward_backward(*, forward_step_func, data_iterator, model, num_microbatches, **_):
+        calls.append((num_microbatches, engine._tfcfg.finalize_model_grads_func))
+        out = []
+        for _ in range(num_microbatches):
+            output, loss_func = forward_step_func(data_iterator, model)
+            scaled, metrics = loss_func(output)
+            (scaled / num_microbatches).backward()
+            out.append(metrics)
+        return out
+
+    pipeline_parallel = ModuleType("megatron.core.pipeline_parallel")
+    pipeline_parallel.get_forward_backward_func = lambda: forward_backward
+    megatron, megatron_core = ModuleType("megatron"), ModuleType("megatron.core")
+    megatron.core, megatron_core.pipeline_parallel = megatron_core, pipeline_parallel
+    monkeypatch.setitem(sys.modules, "megatron", megatron)
+    monkeypatch.setitem(sys.modules, "megatron.core", megatron_core)
+    monkeypatch.setitem(sys.modules, "megatron.core.pipeline_parallel", pipeline_parallel)
+
+    def finalize(*_):
+        return None
+
+    engine.engine_config = {"microbatches_per_schedule": per_schedule}
+    engine._tfcfg = SimpleNamespace(finalize_model_grads_func=finalize)
+    engine._pp, engine._cp, engine._ep = 2, 1, 1
+    engine._is_moe, engine._is_last_stage = False, True
+    engine._r3_enabled, engine._r3_store = False, None
+    engine.module = SimpleNamespace(train=lambda: None)
+    engine._ddp = SimpleNamespace(zero_grad_buffer=lambda: None)
+    engine.optimizer = SimpleNamespace(zero_grad=lambda: None, step=lambda: (True, torch.tensor(1.0), None))
+    engine._pp_setup_config = lambda: None
+    engine.get_data_parallel_size = lambda: 1
+    engine._collect_rows = lambda seqs, am: [(i, 0, 3) for i in range(3)]
+    engine._build_microbatches = lambda seqs, rows: [{"rows": [r], "ids_list": [seqs[r[0]]]} for r in rows]
+    engine._pad_mbs_for_ep = lambda mbs: mbs
+    engine._pp_forward_model = lambda model, mb: (torch.zeros(1, 1, requires_grad=True), [mb["rows"][0][0]])
+    engine._cp_row_logprob_entropy = lambda logits, ids, row, **_: (log_probs[row], None)
+    engine._sched_step = engine._cur_lr = lambda: 1.0e-6
+    batch = DataProto(
+        tensors={
+            "input_ids": torch.ones(3, 3, dtype=torch.long),
+            "attention_mask": torch.ones(3, 3, dtype=torch.long),
+            "old_log_probs": torch.zeros(3, 2),
+            "advantages": torch.tensor([1.0, -0.5, 2.0]),
+            "response_mask": torch.tensor([[0, 1, 1]] * 3),
+        },
+        meta={"algorithm": "grpo", "dp_size": 1, "algo_config": {"loss_agg_mode": "token-mean", "grpo": {"clip_ratio": 0.2}}},
+    )
+
+    engine._pp_update_policy(batch)
+
+    assert engine._tfcfg.finalize_model_grads_func is finalize
+    return log_probs.grad, calls, finalize
+
+
+def test_native_pp_update_can_run_one_microbatch_per_schedule(monkeypatch) -> None:
+    """What keeps the first stage to one microbatch's activations: one schedule per
+    microbatch, the gradients finalized once, by the last, and summing to the same."""
+    whole, whole_calls, finalize = _native_pp_update(monkeypatch, None)
+    split, split_calls, finalize = _native_pp_update(monkeypatch, 1)
+
+    assert [n for n, _ in whole_calls] == [3]
+    assert [n for n, _ in split_calls] == [1, 1, 1]
+    assert [f is finalize for _, f in split_calls] == [False, False, True]
+    torch.testing.assert_close(split, whole)
+
+
 def test_actor_optimizer_config_propagates_optimizer_type() -> None:
     actor = LumenActorWorker(rank=0, world_size=1, config={})
 

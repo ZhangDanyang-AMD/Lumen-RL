@@ -270,6 +270,10 @@ class MegatronConfig:
     # forward reproduces (``QuantPoints`` field -> bool); unset ones keep the
     # release's.
     dsv41_quant_points: Optional[dict] = None
+    # Microbatches of one update in each pipeline schedule (unset: all of them). The
+    # first stage holds the activations of up to PP microbatches at once; schedules of
+    # one microbatch keep it to one, at the cost of no overlap between microbatches.
+    microbatches_per_schedule: Optional[int] = None
 
 
 @dataclass

@@ -661,3 +661,14 @@ def test_dsv41_quant_points_reach_the_engine() -> None:
     )
 
     assert engine_config["dsv41_quant_points"] == points
+
+
+def test_microbatches_per_schedule_reaches_the_engine() -> None:
+    worker = object.__new__(LumenActorWorker)
+    worker.config = {}
+
+    engine_config = worker._build_engine_config(
+        "megatron_native", {"megatron_cfg": {"microbatches_per_schedule": 1}}, {}
+    )
+
+    assert engine_config["microbatches_per_schedule"] == 1
