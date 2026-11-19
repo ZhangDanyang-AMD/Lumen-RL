@@ -183,7 +183,7 @@ def _lora_up_add_kernel(y_ptr, b_ptr, o_ptr, n_rows, n_cols, stride_y, scale,
 
 class _LoRALinearCat(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, lora_a, lora_b, wa, bias_a, scale, gemm):
+    def forward(ctx, x, lora_a, lora_b, wa, bias_a, scale, gemm, save):
         r = lora_a.shape[0]
         n = wa.shape[0] - r
         x2 = x.reshape(-1, x.shape[-1])
@@ -193,7 +193,7 @@ class _LoRALinearCat(torch.autograd.Function):
         block_m = 16 if m <= 16 else 32 if m <= 64 else 64
         _lora_up_add_kernel[(triton.cdiv(m, block_m), triton.cdiv(n, 128))](
             y, lora_b, out, m, n, y.stride(0), scale, R=r, BLOCK_M=block_m, BLOCK_N=128)
-        if any(ctx.needs_input_grad[:3]):
+        if save:
             # the scaled copy of x @ A.T: the B gradient then needs no separate scaling kernel
             ctx.save_for_backward(x2, y[:, n:] * scale, lora_b, wa)
         ctx.scale, ctx.x_shape = scale, x.shape
@@ -214,13 +214,17 @@ class _LoRALinearCat(torch.autograd.Function):
             da = dmid.t() @ x2
         if ctx.needs_input_grad[2]:
             db = g2.t() @ mid_s
-        return dx, da, db, None, None, None, None
+        return dx, da, db, None, None, None, None, None
 
 
 def lora_linear(x: torch.Tensor, lora_a: torch.Tensor, lora_b: torch.Tensor, wa: torch.Tensor,
-                bias_a, scale: float, gemm) -> torch.Tensor:
+                bias_a, scale: float, gemm, save=None) -> torch.Tensor:
     """``x @ W.T + bias + scale * (x @ A.T) @ B.T`` where ``wa`` is ``[W; A]`` in one tensor (``lora_a`` is its
     last ``r`` rows) and ``bias_a`` the bias padded with ``r`` zeros: one GEMM ``gemm(x2d, wa, bias_a)`` gives the
     base output and ``x @ A.T`` side by side, then one kernel adds ``scale * mid @ B.T`` in fp32 and rounds once.
-    The backward runs torch GEMMs; ``lora_a`` / ``lora_b`` receive the adapter gradients."""
-    return _LoRALinearCat.apply(x, lora_a, lora_b, wa, bias_a, scale, gemm)
+    The backward runs torch GEMMs; ``lora_a`` / ``lora_b`` receive the adapter gradients. ``save`` says whether
+    to keep what the backward needs; by default whenever an input requires grad, as autograd's
+    ``needs_input_grad`` (which follows ``requires_grad`` even under ``no_grad``)."""
+    if save is None:
+        save = x.requires_grad or lora_a.requires_grad or lora_b.requires_grad
+    return _LoRALinearCat.apply(x, lora_a, lora_b, wa, bias_a, scale, gemm, save)

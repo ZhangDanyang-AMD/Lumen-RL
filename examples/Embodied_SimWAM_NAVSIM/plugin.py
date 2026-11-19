@@ -718,6 +718,74 @@ def install_action_velocity_graphs() -> None:
     logger.info("action_velocity replays CUDA graphs under no_grad (verify=%s)", verify)
 
 
+def install_background_visualize() -> None:
+    """Rank 0 renders the periodic rollout figures in a background thread.
+
+    ``_maybe_visualize`` loads the scenes and draws the figures on rank 0 only (about 0.65 s every
+    ``vis.every`` steps on NAVSIM), and the other ranks wait for it at the next rollout's reward gather. The
+    rollout's tensors the figures need are copied to the host first and the step number is frozen, so the
+    figures are the same; the thread draws while training goes on. A rollout without the precomputed
+    reference trajectory (which needs the model) is drawn in place as before; a new figure waits for the
+    previous one. ``SIMWAM_GRPO_VIS_BACKGROUND=0`` turns it off.
+    """
+    if not _switch("SIMWAM_GRPO_VIS_BACKGROUND", "1"):
+        return
+    import atexit
+    import threading
+
+    import torch
+    from simwam.trainer_grpo import SimWAMGRPOTrainer
+
+    if getattr(SimWAMGRPOTrainer._maybe_visualize, "_background", False):
+        return
+    original = SimWAMGRPOTrainer._maybe_visualize
+    render = SimWAMGRPOTrainer._visualize_rollout
+    state = {"thread": None}
+
+    class _AtStep:
+        # the trainer as of the visualised step: global_step is frozen, everything else is the trainer's
+        def __init__(self, trainer, step):
+            self.__dict__.update(_trainer=trainer, global_step=step)
+
+        def __getattr__(self, name):
+            return getattr(self._trainer, name)
+
+    def draw(view, rollout):
+        try:
+            render(view, None, rollout)
+        except Exception as exc:  # same as _maybe_visualize: figures never stop training
+            logger.warning("GRPO rollout visualization failed at step %d: %s", view.global_step, exc)
+
+    def host(t):
+        return t.detach().to("cpu", copy=True) if torch.is_tensor(t) else t
+
+    def maybe_visualize(self, model, rollout):
+        if not self.vis_enabled or not self.accelerator.is_main_process:
+            return
+        if self.vis_every <= 0 or self.global_step % self.vis_every != 0:
+            return
+        if rollout.get("il_abs") is None:
+            return original(self, model, rollout)
+        if state["thread"] is not None:
+            state["thread"].join()
+        snapshot = {"cond_b": {"action_horizon": int(rollout["cond_b"]["action_horizon"])},
+                    "tokens": list(rollout["tokens"]), "abs_group": host(rollout["abs_group"]),
+                    "il_abs": host(rollout["il_abs"]), "rewards": host(rollout["rewards"])}
+        thread = threading.Thread(target=draw, args=(_AtStep(self, int(self.global_step)), snapshot),
+                                  name="grpo-visualize", daemon=True)
+        state["thread"] = thread
+        thread.start()
+
+    def finish():
+        if state["thread"] is not None:
+            state["thread"].join(timeout=120)
+
+    atexit.register(finish)
+    maybe_visualize._background = True
+    SimWAMGRPOTrainer._maybe_visualize = maybe_visualize
+    logger.info("rank 0 draws the rollout figures in a background thread")
+
+
 def install_numa_affinity() -> None:
     """Pin each rank's threads to the CPUs of its GPU's NUMA node.
 
@@ -1025,6 +1093,9 @@ _KV_SHARE = {"ptrs": set()}
 # shared video K/V buffer address -> (static [B, Sv + Sa, D] buffer it is the leading rows of, Sv); filled by
 # install_batched_logprobs with SIMWAM_GRPO_KV_SLOT_TRAIN, read by the training graphs' capture
 _KV_TRAIN_SLOTS = {}
+# SIMWAM_GRPO_TRAIN_GRAD_FLAT: the manual-DP optimizer's flat bf16 gradient buffer and id(param) -> (offset,
+# numel, shape) inside it; the training graphs' backward writes the LoRA gradients there
+_GRAD_FLAT = {}
 
 
 def _slot_cat_function():
@@ -1714,14 +1785,26 @@ def install_train_graphs() -> None:
                     static.copy_(value)
             g["fwd"].replay()
             ctx.g = g
+            ctx.params = inputs[g["n_in"]:]
             return g["out"].clone()
 
         @staticmethod
         def backward(ctx, grad_out):
             g = ctx.g
             g["grad_out"].copy_(grad_out)
+            flat = g.get("flat")
+            if flat is not None:
+                # a gradient still held in the flat buffer from an earlier backward would be overwritten
+                ptr = flat.untyped_storage().data_ptr()
+                for p in ctx.params:
+                    if p.grad is not None and p.grad.untyped_storage().data_ptr() == ptr:
+                        p.grad = p.grad.clone()
             g["bwd"].replay()
-            grads = tuple(None if x is None else x.clone() for x in g["grads"])
+            if flat is not None:
+                # fresh views, so autograd adopts them as .grad without copying
+                grads = tuple(flat[a:a + n].view(shape) for a, n, shape in g["flat_meta"])
+            else:
+                grads = tuple(None if x is None else x.clone() for x in g["grads"])
             return (None,) + (None,) * g["n_in"] + grads
 
     def chunk_views():
@@ -1783,12 +1866,24 @@ def install_train_graphs() -> None:
         with torch.cuda.graph(fwd, stream=side):
             out = run()
         grad_out = torch.zeros_like(out)
+        flat = _GRAD_FLAT.get("buf") if _RT.get("SIMWAM_GRPO_TRAIN_GRAD_FLAT") else None
+        meta = None
+        if flat is not None and all(id(p) in _GRAD_FLAT["offsets"] for p in params):
+            meta = [_GRAD_FLAT["offsets"][id(p)] for p in params]
+            dst = [flat[a:a + n].view(shape) for a, n, shape in meta]
         with torch.cuda.graph(bwd, pool=fwd.pool(), stream=side):
             grads = torch.autograd.grad(out, params, grad_outputs=grad_out, allow_unused=True)
+            if meta is not None:
+                # the gradients leave the graph in the optimizer's flat buffer instead of one clone each
+                used = [(d, x) for d, x in zip(dst, grads) if x is not None]
+                torch._foreach_copy_([d for d, _ in used], [x for _, x in used])
+                for d, x in zip(dst, grads):
+                    if x is None:
+                        d.zero_()
         torch.cuda.synchronize()
         stats["captures"] += 1
         return {"fwd": fwd, "bwd": bwd, "inputs": inputs, "n_in": len(inputs), "out": out.detach(),
-                "grad_out": grad_out, "grads": grads}
+                "grad_out": grad_out, "grads": grads, "flat": flat if meta is not None else None, "flat_meta": meta}
 
     def action_velocity(self, latents_action, timestep_action, cond, use_ref=False):
         if use_ref or not torch.is_grad_enabled() or not latents_action.is_cuda:
@@ -1901,6 +1996,15 @@ class _MasterAdamW:
         self.adam = torch.optim.AdamW([self.master], lr=hp["lr"], betas=hp["betas"], eps=hp["eps"],
                                       weight_decay=hp["weight_decay"], amsgrad=hp.get("amsgrad", False))
         self.loaded = False
+        self.flat_grad = None
+        if _switch("SIMWAM_GRPO_TRAIN_GRAD_FLAT", "0"):
+            # the training graphs write the gradients straight into this buffer, in this order (install_train_graphs)
+            self.flat_grad = torch.empty_like(flat, dtype=self.params[0].dtype)
+            offsets, off = {}, 0
+            for p, n in zip(self.params, sizes):
+                offsets[id(p)] = (off, n, tuple(p.shape))
+                off += n
+            _GRAD_FLAT.update(buf=self.flat_grad, offsets=offsets)
 
     def reset_from_params(self):
         """Restart the master from the current bf16 parameters (e.g. after a weights-only load)."""
@@ -1914,10 +2018,14 @@ class _MasterAdamW:
 
         if grads is None:
             grads = [p.grad for p in self.params]
-        grads = [g if g is not None else torch.zeros_like(p) for g, p in zip(grads, self.params)]
-        torch.cat([g.reshape(-1) for g in grads], out=self.low)
         buf = self.master.grad
-        buf.copy_(self.low)
+        if self.flat_grad is not None and self._grads_are_flat(grads):
+            # every gradient is its own slice of flat_grad, in order: the concatenation is already there
+            buf.copy_(self.flat_grad)
+        else:
+            grads = [g if g is not None else torch.zeros_like(p) for g, p in zip(grads, self.params)]
+            torch.cat([g.reshape(-1) for g in grads], out=self.low)
+            buf.copy_(self.low)
         if self.world > 1:
             dist.all_reduce(buf)
             buf.div_(self.world)
@@ -1936,6 +2044,17 @@ class _MasterAdamW:
         if write_back:
             torch._foreach_copy_([p.data for p in self.params], self.low_views)
         return norm
+
+    def _grads_are_flat(self, grads):
+        base = self.flat_grad.data_ptr()
+        size = self.flat_grad.element_size()
+        off = 0
+        for g, p in zip(grads, self.params):
+            n = p.numel()
+            if g is None or g.data_ptr() != base + off * size or g.numel() != n or not g.is_contiguous():
+                return False
+            off += n
+        return True
 
     def _zero1_norm(self, buf):
         import torch
@@ -2333,6 +2452,9 @@ def install_fused_lora_add() -> None:
     # scaled add happens inside the GEMM in fp32 with one rounding instead of as a separate bf16 kernel
     _switch("SIMWAM_GRPO_LORA_ADDMM", "0")
     lora_cat = _switch("SIMWAM_GRPO_LORA_CAT", "1")
+    # SIMWAM_GRPO_LORA_NOGRAD_SKIP (default 1): the no-grad calls (rollout, log-probs, eval) keep nothing for a
+    # backward; autograd's needs_input_grad follows requires_grad even under no_grad, so they otherwise saved a copy
+    _switch("SIMWAM_GRPO_LORA_NOGRAD_SKIP", "1")
     cat_stats = {"modules": 0, "skipped": 0, "calls": 0, "fallback": 0}
 
     def gemm(x2, w, b):
@@ -2385,7 +2507,11 @@ def install_fused_lora_add() -> None:
                 from examples.Embodied_SimWAM_NAVSIM.fused_kernels import lora_linear
 
                 cat_stats["calls"] += 1
-                return lora_linear(x, self.lora_A, self.lora_B, cat[0], cat[1], self.scaling, gemm)
+                save = None
+                if _RT["SIMWAM_GRPO_LORA_NOGRAD_SKIP"]:
+                    save = torch.is_grad_enabled() and (x.requires_grad or self.lora_A.requires_grad
+                                                        or self.lora_B.requires_grad)
+                return lora_linear(x, self.lora_A, self.lora_B, cat[0], cat[1], self.scaling, gemm, save)
             cat_stats["fallback"] += 1
         if _RT["SIMWAM_GRPO_LORA_ADDMM"] and not _chunk_active(x):
             out = self.base(x)
@@ -2412,10 +2538,10 @@ def install_fused_modulate() -> None:
     SimWAM computes ``x * (1 + scale) + shift`` (three kernels) and ``x + gate * residual``
     (two). ``torch.addcmul(shift, x, 1 + scale)`` and ``torch.addcmul(x, gate, residual)`` do the
     multiply-add in one pass and round once, so they are not bit-identical; rollout and training
-    use the same op, so they still agree with each other. ``SIMWAM_GRPO_FUSED_MODULATE=0`` turns
-    it off.
+    use the same op, so they still agree with each other. ``SIMWAM_GRPO_FUSED_MODULATE=1`` turns
+    it on.
     """
-    if not _switch("SIMWAM_GRPO_FUSED_MODULATE", "1"):
+    if not _switch("SIMWAM_GRPO_FUSED_MODULATE", "0"):
         return
     import torch
     import simwam.models.wan22.mot as mot

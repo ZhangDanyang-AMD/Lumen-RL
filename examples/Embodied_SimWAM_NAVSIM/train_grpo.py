@@ -26,6 +26,7 @@ from examples.Embodied_SimWAM_NAVSIM.plugin import (
     install_aiter_gemm,
     install_aiter_triton_imports,
     install_aiter_rmsnorm,
+    install_background_visualize,
     install_batched_logprobs,
     install_compiled_rmsnorm,
     install_cross_attn_kv,
@@ -82,6 +83,7 @@ install_overlap_reward_logprobs()
 install_foreach_grad_checks()
 install_eval_empty_cache()
 install_numa_affinity()
+install_background_visualize()
 register_default_resolvers()
 
 
