@@ -194,16 +194,18 @@ class _LoRALinearCat(torch.autograd.Function):
         _lora_up_add_kernel[(triton.cdiv(m, block_m), triton.cdiv(n, 128))](
             y, lora_b, out, m, n, y.stride(0), scale, R=r, BLOCK_M=block_m, BLOCK_N=128)
         if any(ctx.needs_input_grad[:3]):
-            ctx.save_for_backward(x2, y[:, n:].contiguous(), lora_b, wa)
+            # the scaled copy of x @ A.T: the B gradient then needs no separate scaling kernel
+            ctx.save_for_backward(x2, y[:, n:] * scale, lora_b, wa)
         ctx.scale, ctx.x_shape = scale, x.shape
         return out.view(*x.shape[:-1], n)
 
     @staticmethod
     def backward(ctx, grad):
-        x2, mid, lora_b, wa = ctx.saved_tensors
+        x2, mid_s, lora_b, wa = ctx.saved_tensors
         n = lora_b.shape[0]
         g2 = grad.reshape(-1, n)
-        # scaled after the rank-r GEMMs instead of on the full gradient: the same values for a power-of-two scale
+        # scaled after or before the rank-r GEMMs instead of on the full gradient: the same values for a
+        # power-of-two scale
         dmid = (g2 @ lora_b) * ctx.scale
         dx = da = db = None
         if ctx.needs_input_grad[0]:
@@ -211,7 +213,7 @@ class _LoRALinearCat(torch.autograd.Function):
         if ctx.needs_input_grad[1]:
             da = dmid.t() @ x2
         if ctx.needs_input_grad[2]:
-            db = (g2.t() @ mid) * ctx.scale
+            db = g2.t() @ mid_s
         return dx, da, db, None, None, None, None
 
 

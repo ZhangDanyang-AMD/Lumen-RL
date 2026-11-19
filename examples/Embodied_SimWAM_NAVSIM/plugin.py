@@ -1022,6 +1022,29 @@ _CHUNK = {"sizes": None, "views": None, "ops": frozenset(), "lumen": None}
 # data pointers of the repeated-condition buffers that SIMWAM_GRPO_SHARED_KV shares between the batched
 # log-prob calls; the CUDA graphs use them as their static inputs instead of keeping copies
 _KV_SHARE = {"ptrs": set()}
+# shared video K/V buffer address -> (static [B, Sv + Sa, D] buffer it is the leading rows of, Sv); filled by
+# install_batched_logprobs with SIMWAM_GRPO_KV_SLOT_TRAIN, read by the training graphs' capture
+_KV_TRAIN_SLOTS = {}
+
+
+def _slot_cat_function():
+    import torch
+
+    class _SlotCat(torch.autograd.Function):
+        # torch.cat([cached video K/V, action K/V], dim=1) for a cache that is the leading rows of ``full``:
+        # writes the action rows behind it and hands out ``full``, the same values and layout as the cat;
+        # the backward is the cat's for the action part (the cache needs no gradient)
+        @staticmethod
+        def forward(ctx, b, full, sv):
+            full[:, sv:].copy_(b)
+            ctx.sv = sv
+            return full.as_strided(full.shape, full.stride())
+
+        @staticmethod
+        def backward(ctx, grad):
+            return grad.narrow(1, ctx.sv, grad.shape[1] - ctx.sv), None, None
+
+    return _SlotCat
 
 
 # SIMWAM_GRPO_XATTN_KV: "reps" is the number of steps a batched log-prob call stacks (its context is that many
@@ -1270,6 +1293,7 @@ def install_batched_logprobs() -> None:
     one_gemm = os.environ.get("SIMWAM_GRPO_BATCHED_GEMM", "1").strip().lower() not in _OFF
     nograd = os.environ.get("SIMWAM_GRPO_BATCHED_LOGP_NOGRAD", "1").strip().lower() not in _OFF
     share = _switch("SIMWAM_GRPO_SHARED_KV", "1")
+    train_slot = share and _switch("SIMWAM_GRPO_KV_SLOT_TRAIN", "1")
     shared, share_serial = {}, [0]
     stats = {"batched": 0, "batched_nograd": 0, "fwd_mismatch": 0, "grad_mismatch": 0, "grad_checked": 0,
              "max_grad_diff": 0.0, "shared_bufs": 0, "shared_fills": 0}
@@ -1289,13 +1313,30 @@ def install_batched_logprobs() -> None:
         sig = (w, tuple((tuple(t.shape), t.dtype, str(t.device)) for t in src))
         entry = shared.get(sig)
         if entry is None:
-            bufs = [torch.empty((t.shape[0] * w, *t.shape[1:]), dtype=t.dtype, device=t.device) for t in src]
+            n_kv = 2 * len(cond["video_kv_cache"])
+            sv = int(cond.get("video_seq_len", -1))
+            sa = int(cond["attention_mask"].shape[0]) - sv if torch.is_tensor(cond.get("attention_mask")) else 0
+            bufs = []
+            for i, t in enumerate(src):
+                rows = t.shape[0] * w
+                if train_slot and i < n_kv and t.dim() == 3 and t.shape[1] == sv and sa > 0:
+                    # the training graphs' per-layer concatenation then writes only the action rows
+                    full = torch.empty((rows, sv + sa, t.shape[2]), dtype=t.dtype, device=t.device)
+                    b = full[:, :sv]
+                    _KV_TRAIN_SLOTS[b.data_ptr()] = (full, sv)
+                else:
+                    b = torch.empty((rows, *t.shape[1:]), dtype=t.dtype, device=t.device)
+                bufs.append(b)
             entry = shared[sig] = {"bufs": bufs, "owner": None}
             _KV_SHARE["ptrs"].update(b.data_ptr() for b in bufs)
             stats["shared_bufs"] += len(bufs)
         if entry["owner"] != tag:
             for b, t in zip(entry["bufs"], src):
-                torch.cat([t] * w, dim=0, out=b)
+                if b.is_contiguous():
+                    torch.cat([t] * w, dim=0, out=b)
+                else:
+                    for j in range(w):
+                        b[j * t.shape[0]:(j + 1) * t.shape[0]].copy_(t)
             entry["owner"] = tag
             stats["shared_fills"] += 1
         rep = cond.get(key)
@@ -1610,7 +1651,10 @@ def install_train_graphs() -> None:
     Install after ``install_action_velocity_graphs`` (no_grad calls go to that path).
     ``SIMWAM_GRPO_TRAIN_GRAPH=0`` turns this off; ``SIMWAM_GRPO_TRAIN_GRAPH_VERIFY=1`` also runs
     eager forward and backward before each replay and counts outputs and LoRA gradients that
-    are not bit-identical.
+    are not bit-identical. With ``SIMWAM_GRPO_KV_SLOT_TRAIN`` (default ``1``) the shared video K/V buffers of
+    ``install_batched_logprobs`` are the leading rows of static ``[B, Sv + Sa, D]`` buffers, and inside the
+    captured forward the per-layer concatenation with the action K/V writes only the action rows (same values,
+    no copy of the cache, and attention saves the static buffer instead of a new concatenation per layer).
     """
     if os.environ.get("SIMWAM_GRPO_TRAIN_GRAPH", "1").strip().lower() in _OFF:
         return
@@ -1628,8 +1672,26 @@ def install_train_graphs() -> None:
     warmup = int(os.environ.get("SIMWAM_GRPO_TRAIN_GRAPH_WARMUP", "3"))
     graphs = {}
     stats = {"graphed": 0, "eager": 0, "captures": 0, "out_mismatch": 0, "grad_mismatch": 0, "checks": 0,
-             "out_maxabs": 0.0, "grad_maxabs": 0.0}
+             "out_maxabs": 0.0, "grad_maxabs": 0.0, "kv_slot_cats": 0}
+    _STATS["train_graph"] = stats
     _COND = ("video_kv_cache", "context", "context_mask", "attention_mask")
+    torch_cat = torch.cat
+    slot_cat = _slot_cat_function()
+
+    def train_slot_cat(tensors, dim=0, *, out=None):
+        # inside the capture: the per-layer [cached video K/V, action K/V] concatenation on a shared buffer
+        # that is the leading rows of a static buffer (SIMWAM_GRPO_KV_SLOT_TRAIN) writes only the action rows
+        if out is None and dim == 1 and len(tensors) == 2:
+            a, b = tensors
+            hit = _KV_TRAIN_SLOTS.get(a.data_ptr())
+            if hit is not None and not a.requires_grad:
+                full, sv = hit
+                if (a.dtype == b.dtype == full.dtype and a.stride() == full.stride()
+                        and tuple(a.shape) == (full.shape[0], sv, *full.shape[2:])
+                        and tuple(b.shape) == (full.shape[0], full.shape[1] - sv, *full.shape[2:])):
+                    stats["kv_slot_cats"] += 1
+                    return slot_cat.apply(b, full, sv)
+        return torch_cat(tensors, dim) if out is None else torch_cat(tensors, dim, out=out)
 
     def flat(cond):
         kv = [t for layer in cond["video_kv_cache"] for t in (layer["k"], layer["v"])]
@@ -1697,10 +1759,13 @@ def install_train_graphs() -> None:
             saved = _CHUNK["views"]
             if static_views:
                 _CHUNK["views"] = static_views
+            if _KV_TRAIN_SLOTS:
+                torch.cat = train_slot_cat
             try:
                 return eager(self, inputs[0], inputs[1], unflat(rest, layers, inputs[2:2 + n_cond]), use_ref=False)
             finally:
                 _CHUNK["views"] = saved
+                torch.cat = torch_cat
 
         torch.cuda.synchronize()
         side = torch.cuda.Stream()
