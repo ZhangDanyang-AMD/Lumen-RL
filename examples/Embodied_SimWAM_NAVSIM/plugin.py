@@ -10,6 +10,10 @@ Quantization stays off.
   the same ``lumen.ops.bf16_gemm.linear`` is installed on ``LoRALinear.forward``.
 * ``aiter_conv`` — ``nn.Conv2d`` and ``nn.Conv3d`` go through AITER.
   ``CausalConv3d.forward`` is left in place; only ``_conv_forward`` changes.
+* ``flydsl_conv`` — the VAE's convolutions only, on aiter's FlyDSL implicit-GEMM
+  kernel, with Lumen PR #32's ``examples/wan2.2/flydsl_conv.py`` (see
+  :func:`install_vae_flydsl_conv`). Applied after the flags above, so with
+  ``aiter_conv`` as well the VAE takes FlyDSL and every other conv keeps AITER.
 
 Each patch is applied on its own, so one kernel failing to load does not turn
 the others off.
@@ -26,6 +30,8 @@ _OFF = {"", "0", "false", "none", "off"}
 # counters of the verify modes, by patch
 _STATS = {}
 _PATCHES = ("hf_attn_patch", "lumen_linear", "aiter_conv")
+# applied by this plugin, not by LumenConfig
+_PLUGIN_PATCHES = ("flydsl_conv",)
 
 
 def _log_coverage(model) -> None:
@@ -1907,6 +1913,102 @@ def install_foreach_grad_checks() -> None:
         Z.get_grad_norm_direct = get_grad_norm_direct
     logger.info("DeepSpeed ZeRO overflow check%s uses foreach kernels", " and gradient norm" if mode == "norm" else "")
 
+
+def _flydsl_conv_module():
+    """Lumen PR #32's ``flydsl_conv`` with a FlyDSL kernel behind it, or None.
+
+    ``SIMWAM_GRPO_FLYDSL_DIR`` is the directory holding ``flydsl_conv.py``
+    (``examples/wan2.2`` of a Lumen checkout of PR #32); default ``$LUMEN_DIR/examples/wan2.2``.
+    The kernel is loaded by Lumen's ``examples/perf-veomni/veomni_patches/aiter_conv.py`` when it
+    is there (``SIMWAM_GRPO_FLYDSL_LOADER_DIR``, default ``$LUMEN_DIR/examples/perf-veomni``):
+    on an aiter that includes ROCm/aiter#5370 it is a plain import, and on an older one (the
+    image's, after ``overlay_aiter.py --apply`` has added the kernel files) it also supplies the
+    tuned-table path and works around the older ``aiter.ops.flydsl/__init__.py``; without the
+    path every lookup would silently take the heuristic tile. Otherwise ``flydsl_conv.load()``
+    imports ``aiter.ops.flydsl.conv_kernels`` directly.
+    """
+    import importlib
+    import sys
+
+    lumen_dir = os.environ.get("LUMEN_DIR", "")
+    here = os.environ.get("SIMWAM_GRPO_FLYDSL_DIR") or os.path.join(lumen_dir, "examples", "wan2.2")
+    if not os.path.isfile(os.path.join(here, "flydsl_conv.py")):
+        logger.warning("flydsl_conv: no flydsl_conv.py in %s (set SIMWAM_GRPO_FLYDSL_DIR)", here)
+        return None
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    fc = importlib.import_module("flydsl_conv")
+
+    loader_dir = os.environ.get("SIMWAM_GRPO_FLYDSL_LOADER_DIR") or os.path.join(lumen_dir, "examples", "perf-veomni")
+    if os.path.isfile(os.path.join(loader_dir, "veomni_patches", "aiter_conv.py")):
+        if loader_dir not in sys.path:
+            sys.path.insert(0, loader_dir)
+        from veomni_patches import aiter_conv as loader
+
+        if loader.load() is not None:
+            fc.load = loader.load
+            fc.lookup_stats = loader.tuned_lookup_stats
+            logger.info("flydsl_conv: kernel through %s/veomni_patches/aiter_conv.py", loader_dir)
+            return fc
+        logger.warning(
+            "flydsl_conv: FlyDSL conv unavailable on this aiter; run %s/overlay_aiter.py --apply "
+            "in this container, or use an aiter with ROCm/aiter#5370", loader_dir,
+        )  # fmt: skip
+    # No perf-veomni loader (or it failed): the plain import, for an aiter that includes the kernel.
+    if fc.load() is not None:
+        logger.info("flydsl_conv: kernel from the installed aiter")
+        return fc
+    return None
+
+
+def install_vae_flydsl_conv(model) -> bool:
+    """Route every convolution of the VAE (``model.vae``, a ``WanVideoVAE38``) to aiter's FlyDSL kernel.
+
+    The rewrites are PR #32's ``flydsl_conv.patch_vae``: a ``CausalConv3d`` called with one frame
+    and no feature cache (every call of the rollout's single-frame encode) is the exact 2-D
+    convolution with the last temporal tap of its kernel; every other call keeps the module's
+    causal padding and only the convolution under it moves. The kernel is forward-only and
+    BF16-only; any other call, and any call that needs a gradient, stays on torch and is counted.
+
+    Logs the FlyDSL / torch calls of the first ``SIMWAM_GRPO_FLYDSL_LOG`` encodes (default 2;
+    ``all`` for every encode). Returns whether the VAE was patched.
+    """
+    vae = getattr(model, "vae", None)
+    if vae is None or getattr(vae, "_flydsl_conv", False):
+        return False
+    fc = _flydsl_conv_module()
+    if fc is None:
+        return False
+    n_c3, n_c2, n_t1 = fc.patch_vae(vae)
+    vae._flydsl_conv = True
+    logger.info(
+        "flydsl_conv: VAE %d CausalConv3d (%d with the T=1 -> conv2d rewrite) and %d Conv2d on FlyDSL",
+        n_c3, n_t1, n_c2,
+    )  # fmt: skip
+    _STATS["flydsl_conv"] = {"encodes": 0}
+
+    limit = os.environ.get("SIMWAM_GRPO_FLYDSL_LOG", "2").strip().lower()
+    encode = vae.encode
+
+    def logged_encode(*args, **kwargs):
+        before = fc.conv_calls()
+        out = encode(*args, **kwargs)
+        after = fc.conv_calls()
+        stats = _STATS["flydsl_conv"]
+        stats["encodes"] += 1
+        for k in after:
+            stats[k] = stats.get(k, 0) + after[k] - before[k]
+        if limit == "all" or stats["encodes"] <= int(limit or 0):
+            logger.info(
+                "flydsl_conv: VAE encode %d: conv calls %s, tuned-table lookups %s",
+                stats["encodes"], {k: after[k] - before[k] for k in after}, fc.lookup_stats()["calls"],
+            )  # fmt: skip
+        return out
+
+    vae.encode = logged_encode
+    return True
+
+
 def enable_lumen(model, spec: str):
     """Apply ``LumenConfig.enable`` once per requested patch."""
     requested = []
@@ -1918,13 +2020,15 @@ def enable_lumen(model, spec: str):
     if not requested:
         return model
 
-    from lumen.config import LumenConfig
-
     applied = []
     for key in requested:
+        if key in _PLUGIN_PATCHES:
+            continue
         if key not in _PATCHES:
             logger.warning("Unknown LUMEN_ENABLE flag %r; ignored", key)
             continue
+        from lumen.config import LumenConfig
+
         try:
             _, model = LumenConfig(scaling="none", **{key: True}).enable(model)
             applied.append(key)
@@ -1935,6 +2039,13 @@ def enable_lumen(model, spec: str):
             _patch_lora_gemm()
         except Exception as exc:
             logger.warning("LoRA GEMM patch failed (%s); LoRA A/B stay on torch", exc)
+    # After LumenConfig, so that it rebinds the VAE convolutions aiter_conv bound.
+    if "flydsl_conv" in requested:
+        try:
+            if install_vae_flydsl_conv(model):
+                applied.append("flydsl_conv")
+        except Exception as exc:
+            logger.warning("flydsl_conv failed (%s); the VAE convolutions keep their previous path", exc)
     _log_coverage(model)
     logger.info("Lumen enabled on SimWAM: %s", applied)
     return model
