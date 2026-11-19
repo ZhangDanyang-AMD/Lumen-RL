@@ -1,6 +1,7 @@
 """Isaac Lab 2.3 performance-benchmark measurements for hipPhysics tasks trained by Lumen-RL's VecEnvPPOTrainer.
 
     python bench.py --config configs/cartpole.yaml [--steps 300] [vec_env.num_envs=2048 ...]
+    torchrun --nproc_per_node=4 bench.py --config configs/cartpole.yaml      # 4 GPUs, one process each
 
 The published table (docs.nvidia.com/isaaclab/2.3/overview/performance-benchmarks) reports three effective FPS
 numbers per task (num_envs x steps / wall time):
@@ -9,6 +10,11 @@ numbers per task (num_envs x steps / wall time):
   environment step and inference           trainer.sample_actions (policy forward + sample) + step
   environment step, inference, and train   trainer.train_step: ``vec_env.horizon`` steps of collection plus one
                                            PPO update, amortized
+
+Multi-GPU runs are weak-scaling: every rank steps its own ``vec_env.num_envs`` environments, all ranks time the same
+loop after a barrier, and the reported FPS is the sum over ranks. VRAM is the device-wide memory in use on each GPU
+at the end of the run (hipPhysics and HIPRT allocate outside torch's caching allocator); the reported value is the
+largest over ranks.
 
 The trainer is built from the YAML exactly as ``python -m lumenrl.trainer.main`` builds it; this script only times
 it. ``--learn-iters N`` runs ``trainer.train()`` for N steps and prints progress instead. Extra ``key=value``
@@ -27,6 +33,7 @@ import time
 from typing import Callable
 
 import torch
+import torch.distributed as dist
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -41,6 +48,23 @@ AGENT = ("Lumen-RL VecEnvPPOTrainer (lumenrl.trainer.vec_env_ppo_trainer): PPOAl
 
 def sync() -> None:
     torch.cuda.synchronize()
+
+
+def world_size() -> int:
+    return int(os.environ.get("WORLD_SIZE", 1))
+
+
+def barrier() -> None:
+    if world_size() > 1:
+        dist.barrier()
+
+
+def allreduce_scalar(x: float, op) -> float:
+    if world_size() == 1:
+        return float(x)
+    t = torch.tensor([float(x)], device=torch.cuda.current_device(), dtype=torch.float64)
+    dist.all_reduce(t, op=op)
+    return float(t.item())
 
 
 def rss_gb() -> float:
@@ -59,6 +83,7 @@ def vram_used_gb(index: int) -> float:
 
 
 def step_fps(num_envs: int, steps: int, action_fn: Callable[[], None]) -> float:
+    barrier()
     sync()
     start = time.perf_counter()
     for _ in range(steps):
@@ -68,22 +93,24 @@ def step_fps(num_envs: int, steps: int, action_fn: Callable[[], None]) -> float:
 
 
 class ProgressPrinter:
-    """Trainer callback for --learn-iters: reward per env step, steps per episode, KL, LR and FPS."""
+    """Trainer callback for --learn-iters: reward per env step, steps per episode, KL, LR and FPS (rank 0)."""
 
     def __init__(self, every: int):
         self.every = every
 
     def on_train_begin(self, trainer) -> None:
-        print(f"{'iter':>5}  {'reward/step':>12}  {'episode len':>12}  {'kl':>9}  {'lr':>9}  {'FPS':>10}", flush=True)
+        if trainer._rank == 0:
+            print(f"{'iter':>5}  {'reward/step':>12}  {'episode len':>12}  {'kl':>9}  {'lr':>9}  {'FPS':>10}",
+                  flush=True)
 
     def on_step_begin(self, trainer, step: int) -> None:
         pass
 
     def on_step_end(self, trainer, step: int, m: dict) -> None:
-        if (step + 1) % self.every == 0:
+        if trainer._rank == 0 and (step + 1) % self.every == 0:
+            fps = m["throughput/env_steps_per_s"] * trainer.world_size
             print(f"{step + 1:>5}  {m['rollout/reward_per_env_step']:>12.4f}  {m['rollout/episode_length']:>12.1f}  "
-                  f"{m['train/kl']:>9.5f}  {m['train/lr']:>9.2e}  {m['throughput/env_steps_per_s']:>10,.0f}",
-                  flush=True)
+                  f"{m['train/kl']:>9.5f}  {m['train/lr']:>9.2e}  {fps:>10,.0f}", flush=True)
 
     def on_train_end(self, trainer) -> None:
         pass
@@ -106,12 +133,13 @@ def main() -> None:
     v = config.vec_env
     meta = TASKS[v.task]
     renderer = v.env_kwargs.get("renderer") if v.task == "cartpole_rgb" else None
+    world = world_size()
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
     name = meta["result_name"] + (f"_{renderer}" if renderer else "")
-    out_path = args.out or f"/work/runs/isaaclab_bench/{name}_{v.num_envs}.json"
     train_iters = args.train_iters or (3 if v.task == "cartpole_rgb" else 6)
 
     torch.backends.cuda.matmul.allow_tf32 = True
-    device = torch.device(v.device or "cuda:0")
+    device = torch.device(v.device or f"cuda:{local_rank}")
     torch.cuda.set_device(device)
     gpu_index = device.index or 0
     vram_base = vram_used_gb(gpu_index)
@@ -119,6 +147,7 @@ def main() -> None:
     trainer = VecEnvPPOTrainer(config)
     trainer.setup()
     env, n = trainer.env, v.num_envs
+    rank = trainer._rank
 
     if args.learn_iters:
         config.num_training_steps = args.learn_iters
@@ -152,7 +181,7 @@ def main() -> None:
     for _ in range(args.warmup):
         inference_step()
     infer = step_fps(n, args.steps, inference_step)
-    if args.save_frame and v.task == "cartpole_rgb":
+    if args.save_frame and v.task == "cartpole_rgb" and rank == 0:
         from PIL import Image
 
         h, w = obs.shape[1:3]
@@ -162,12 +191,14 @@ def main() -> None:
 
     trainer.obs = obs
     trainer.train_step(-1)
+    barrier()
     runs = [trainer.train_step(i) for i in range(train_iters)]
-    train = sum(m["throughput/env_steps_per_s"] for m in runs) / len(runs)
+    train_local = sum(m["throughput/env_steps_per_s"] for m in runs) / len(runs)
     last = runs[-1]
     stats = {
         "reward_per_env_step": sum(m["rollout/reward_per_env_step"] for m in runs) / len(runs),
-        "episode_length_steps": (n * v.horizon * len(runs)) / max(sum(m["rollout/episodes_done"] for m in runs), 1.0),
+        "episode_length_steps": (n * world * v.horizon * len(runs)) / max(sum(m["rollout/episodes_done"]
+                                                                              for m in runs), 1.0),
         "kl": last["train/kl"],
         "lr": last["train/lr"],
         "loss_pg": last["train/loss_pg"],
@@ -177,44 +208,67 @@ def main() -> None:
     }
 
     vram_used = vram_used_gb(gpu_index)
-    result = {
-        "task": meta["task"],
-        "source_task": meta["source_task"],
-        "agent": f"{AGENT}; {meta['hyperparameters']}",
-        "config": os.path.relpath(os.path.abspath(args.config), HERE),
-        "overrides": overrides,
-        "num_envs": n,
-        "gpu": torch.cuda.get_device_name(device),
-        "seed": config.seed,
-        "timed_steps": args.steps,
-        "train_iterations": train_iters,
-        "scene_build_s": round(trainer.env_build_s, 3),
-        "training_sanity": stats,
-        "fps": {
-            "environment_step": round(step),
-            "environment_step_and_inference": round(infer),
-            "environment_step_inference_and_train": round(train),
-        },
-        "memory_gb": {
-            "rss_after_step": round(rss_after_step, 2),
-            "torch_reserved_after_step": round(vram_after_step, 2),
-            "rss": round(rss_gb(), 2),
-            "torch_reserved": round(torch.cuda.max_memory_reserved(device) / (1024 ** 3), 2),
-            "device_vram_used": round(vram_used, 2),
-            "device_vram_delta": round(vram_used - vram_base, 2),
-        },
-        "reference_rtx4090": meta["reference_rtx4090"],
-    }
-    if renderer:
-        from cartpole_rgb_env import RENDERERS
+    fps_step = allreduce_scalar(step, dist.ReduceOp.SUM) if world > 1 else step
+    fps_infer = allreduce_scalar(infer, dist.ReduceOp.SUM) if world > 1 else infer
+    fps_train = allreduce_scalar(train_local, dist.ReduceOp.SUM) if world > 1 else train_local
+    vram_max = allreduce_scalar(vram_used, dist.ReduceOp.MAX) if world > 1 else vram_used
+    rss_max = allreduce_scalar(rss_gb(), dist.ReduceOp.MAX) if world > 1 else rss_gb()
+    if world > 1:
+        render_fps = allreduce_scalar(render_fps, dist.ReduceOp.SUM) if render_fps is not None else None
 
-        result["renderer"] = RENDERERS[renderer]
-        result["render_only_frames_per_s"] = round(render_fps)
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as fh:
-        json.dump(result, fh, indent=2)
-    print(json.dumps(result, indent=2), flush=True)
+    out_path = args.out or (f"/work/runs/isaaclab_bench/{name}_{v.num_envs}"
+                            + (f"_x{world}" if world > 1 else "") + ".json")
+    if rank == 0:
+        result = {
+            "task": meta["task"],
+            "source_task": meta["source_task"],
+            "agent": f"{AGENT}; {meta['hyperparameters']}",
+            "config": os.path.relpath(os.path.abspath(args.config), HERE),
+            "overrides": overrides,
+            "gpus": world,
+            "num_envs_per_gpu": n,
+            "num_envs_total": n * world,
+            "gpu": torch.cuda.get_device_name(device),
+            "seed": config.seed,
+            "timed_steps": args.steps,
+            "train_iterations": train_iters,
+            "scene_build_s": round(trainer.env_build_s, 3),
+            "training_sanity": stats,
+            "fps": {
+                "environment_step": round(fps_step),
+                "environment_step_and_inference": round(fps_infer),
+                "environment_step_inference_and_train": round(fps_train),
+            },
+            "fps_per_gpu": {
+                "environment_step": round(fps_step / world),
+                "environment_step_and_inference": round(fps_infer / world),
+                "environment_step_inference_and_train": round(fps_train / world),
+            },
+            "memory_gb": {
+                "rss_after_step": round(rss_after_step, 2),
+                "torch_reserved_after_step": round(vram_after_step, 2),
+                "rss_max_per_process": round(rss_max, 2),
+                "torch_reserved": round(torch.cuda.max_memory_reserved(device) / (1024 ** 3), 2),
+                "device_vram_used_per_gpu_max": round(vram_max, 2),
+                "device_vram_used_this_rank": round(vram_used, 2),
+                "device_vram_idle_before_run": round(vram_base, 2),
+            },
+            "reference_rtx4090": meta["reference_rtx4090"],
+            "reference_l40": meta["reference_l40"],
+            "reference_l40_x4": meta["reference_l40_x4"],
+        }
+        if renderer:
+            from cartpole_rgb_env import RENDERERS
+
+            result["renderer"] = RENDERERS[renderer]
+            result["render_only_frames_per_s"] = round(render_fps)
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as fh:
+            json.dump(result, fh, indent=2)
+        print(json.dumps(result, indent=2), flush=True)
     trainer.cleanup()
+    if world > 1 and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

@@ -12,7 +12,12 @@ lives here. Each training step:
    (clipped surrogate + 0.5 x clipped value loss) plus the entropy bonus and the action-bounds penalty,
    gradient clipping and the KL-adaptive learning rate.
 
-Metrics stay on the GPU during the step and are read back once at its end. Single process, single GPU.
+Multi-GPU: launch with ``torchrun --nproc_per_node=N`` (one process per GPU, LOCAL_RANK picks the device). Every
+rank steps its own ``num_envs`` environments. Gradients, advantage / value / observation statistics and the KL used
+by the learning-rate schedule are reduced across ranks, so all ranks hold the same policy. Single GPU runs without
+any collective.
+
+Metrics stay on the GPU during the step and are read back once at its end.
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch import Tensor
 
@@ -63,10 +69,27 @@ class VecEnvPPOTrainer:
         self.global_step = 0
         self._buf: dict[str, Any] | None = None
         self._metrics_file = None
+        self._rank = 0
+        self.world_size = 1
 
     # ---- lifecycle --------------------------------------------------------------------------------
+    def _init_distributed(self) -> None:
+        self.world_size = int(os.environ.get("WORLD_SIZE", 1))
+        if self.world_size <= 1:
+            return
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        if not dist.is_initialized():
+            from datetime import timedelta
+
+            timeout = timedelta(seconds=int(os.environ.get("NCCL_TIMEOUT", 7200)))
+            dist.init_process_group(backend="cpu:gloo,cuda:nccl", timeout=timeout)
+        self._rank = dist.get_rank()
+        self.world_size = dist.get_world_size()
+
     def setup(self) -> None:
         v, cfg = self.vcfg, self.config
+        self._init_distributed()
         self.device = torch.device(v.device or f"cuda:{int(os.environ.get('LOCAL_RANK', 0))}")
         if self.device.type == "cuda":
             torch.cuda.set_device(self.device)
@@ -74,13 +97,14 @@ class VecEnvPPOTrainer:
 
         plugin = load_vec_env_plugin(v.plugin)
         t0 = time.perf_counter()
-        self.env = plugin.build_env(v.task, num_envs=v.num_envs, device=str(self.device), seed=cfg.seed,
-                                    **dict(v.env_kwargs))
+        self.env = plugin.build_env(v.task, num_envs=v.num_envs, device=str(self.device),
+                                    seed=cfg.seed + self._rank, **dict(v.env_kwargs))
         self.obs = self.env.reset()
         self._sync()
         self.env_build_s = time.perf_counter() - t0
 
         self.policy = plugin.build_policy(v.task, self.env, self.obs, **dict(v.policy_kwargs)).to(self.device)
+        self._broadcast_policy()
         if v.normalize_input and getattr(self.policy, "obs_norm", None) is None:
             raise ValueError("vec_env.normalize_input needs policy.obs_norm (a RunningObsNorm)")
         self.algorithm = ALGORITHM_REGISTRY.get("ppo")(cfg)
@@ -99,7 +123,7 @@ class VecEnvPPOTrainer:
         if v.resume_from:
             self.load_state(v.resume_from)
             self.global_step = v.resume_step
-        if v.log_dir:
+        if v.log_dir and self._rank == 0:
             Path(v.log_dir).mkdir(parents=True, exist_ok=True)
             self._metrics_file = open(Path(v.log_dir) / "vec_env_metrics.jsonl", "a")
 
@@ -148,10 +172,13 @@ class VecEnvPPOTrainer:
         t2 = time.perf_counter()
 
         names = list(device_metrics)
-        values = torch.stack([device_metrics[k].detach().float().reshape(()) for k in names]
-                             + [reward_sum, done_sum]).cpu().tolist()
-        *values, reward_total, done_total = values
-        env_steps = v.num_envs * v.horizon
+        packed = torch.stack([device_metrics[k].detach().float().reshape(()) for k in names]
+                             + [reward_sum, done_sum])
+        if self.world_size > 1:
+            dist.all_reduce(packed)
+        *values, reward_total, done_total = packed.cpu().tolist()
+        values = [x / self.world_size for x in values]  # losses and KL: mean over ranks
+        env_steps = v.num_envs * v.horizon * self.world_size  # all ranks, for the per-step rates
         self.global_step = step + 1
         metrics: dict[str, Any] = {f"train/{k}": x for k, x in zip(names, values)}
         metrics.update({
@@ -162,7 +189,7 @@ class VecEnvPPOTrainer:
             "timing/rollout_s": t1 - t0,
             "timing/update_s": t2 - t1,
             "timing/step_s": t2 - t0,
-            "throughput/env_steps_per_s": env_steps / (t2 - t0),
+            "throughput/env_steps_per_s": (env_steps / self.world_size) / (t2 - t0),  # this rank
         })
         return metrics
 
@@ -180,7 +207,7 @@ class VecEnvPPOTrainer:
         """Sample from the current policy: ``(actions, log_probs, values, mu, std)``. Updates the input
         normalizer when ``vec_env.normalize_input`` is set."""
         if self.vcfg.normalize_input:
-            self.policy.obs_norm.update(obs)
+            self._update_obs_norm(obs)
         mu, std, value = self.policy(obs)
         actions = mu + std * torch.randn_like(mu)
         return actions, gaussian_log_prob(mu, std, actions), self._denorm_value(value), mu, std
@@ -226,6 +253,55 @@ class VecEnvPPOTrainer:
             "time_outs": torch.zeros(T, n, device=dev, dtype=f),
         }
 
+    @torch.no_grad()
+    def _pooled_moments(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """Per-column mean, variance and count of ``x`` [B, D] over the batches of every rank."""
+        if self.world_size == 1:
+            return x.mean(0), x.var(0, unbiased=False), torch.tensor(float(x.shape[0]), device=x.device)
+        d = x.shape[1]
+        packed = torch.cat([x.double().sum(0), x.double().square().sum(0),
+                            torch.tensor([float(x.shape[0])], device=x.device, dtype=torch.float64)])
+        dist.all_reduce(packed)
+        total = packed[-1]
+        mean = packed[:d] / total
+        var = (packed[d:2 * d] / total - mean.square()).clamp_min(0.0)
+        return mean.float(), var.float(), total.float()
+
+    @torch.no_grad()
+    def _update_obs_norm(self, obs: Tensor) -> None:
+        mean, var, count = self._pooled_moments(obs.reshape(-1, obs.shape[-1]).float())
+        self.policy.obs_norm.merge(mean, var, count)
+
+    @torch.no_grad()
+    def _mean_across_ranks(self, t: Tensor) -> Tensor:
+        if self.world_size == 1:
+            return t
+        t = t.clone()
+        dist.all_reduce(t)
+        return t / self.world_size
+
+    @torch.no_grad()
+    def _broadcast_policy(self) -> None:
+        """Rank 0's initial weights and normalizer statistics go to every rank."""
+        if self.world_size == 1:
+            return
+        for t in list(self.policy.parameters()) + list(self.policy.buffers()):
+            dist.broadcast(t.data, src=0)
+
+    def _all_reduce_grads(self) -> None:
+        """Average the gradients over ranks (one flat collective per mini-batch)."""
+        if self.world_size == 1:
+            return
+        params = [p for p in self.policy.parameters() if p.grad is not None]
+        flat = torch.cat([p.grad.reshape(-1) for p in params])
+        dist.all_reduce(flat)
+        flat.div_(self.world_size)
+        offset = 0
+        for p in params:
+            n = p.grad.numel()
+            p.grad.copy_(flat[offset:offset + n].view_as(p.grad))
+            offset += n
+
     def _denorm_value(self, raw: Tensor) -> Tensor:
         if self.value_rms is None:
             return raw
@@ -235,7 +311,7 @@ class VecEnvPPOTrainer:
     def _set_lr(self, kl: Tensor) -> None:
         v = self.vcfg
         lr = self.optimizer.param_groups[0]["lr"]
-        kl_value = float(kl)
+        kl_value = float(self._mean_across_ranks(kl))  # every rank must pick the same learning rate
         if kl_value > 2.0 * v.desired_kl:
             lr = max(lr / 1.5, v.lr_min)
         elif 0.0 < kl_value < v.desired_kl / 2.0:
@@ -262,11 +338,13 @@ class VecEnvPPOTrainer:
             adv, returns = gae.tensors["advantages"], gae.tensors["returns"]
             old_values = buf["values"]
             if self.value_rms is not None:
-                self.value_rms.update(returns)
+                mean_r, var_r, count_r = self._pooled_moments(returns.reshape(-1, 1))
+                self.value_rms.merge(mean_r[0], var_r[0], count_r)
                 mean, std = self.value_rms.mean, self.value_rms.std()
                 returns = (returns - mean) / std
                 old_values = (old_values - mean) / std
-            adv = (adv - adv.mean()) / adv.std().clamp(min=1e-8)
+            mean_a, var_a, _ = self._pooled_moments(adv.reshape(-1, 1))
+            adv = (adv - mean_a[0]) / var_a[0].sqrt().clamp(min=1e-8)
 
         T, n = buf["rewards"].shape
         count = T * n
@@ -307,6 +385,7 @@ class VecEnvPPOTrainer:
                     self._set_lr(kl)
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+                self._all_reduce_grads()
                 nn.utils.clip_grad_norm_(self.policy.parameters(), v.max_grad_norm)
                 self.optimizer.step()
             kl_epoch = torch.stack(epoch_kl).mean()
@@ -322,13 +401,16 @@ class VecEnvPPOTrainer:
         v = self.vcfg
         root = Path(v.save_dir or (Path(v.log_dir or ".") / "checkpoints"))
         path = root / f"step_{step}" / "trainer_state.pt"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({
-            "step": step,
-            "policy": self.policy.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "value_rms": None if self.value_rms is None else self.value_rms.state_dict(),
-        }, path)
+        if self._rank == 0:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({
+                "step": step,
+                "policy": self.policy.state_dict(),
+                "optimizer": self.optimizer.state_dict(),
+                "value_rms": None if self.value_rms is None else self.value_rms.state_dict(),
+            }, path)
+        if self.world_size > 1:
+            dist.barrier()
         return path
 
     def load_state(self, path: str) -> None:

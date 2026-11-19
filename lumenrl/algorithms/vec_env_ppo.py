@@ -51,8 +51,11 @@ class RunningMeanStd:
     @torch.no_grad()
     def update(self, x: Tensor) -> None:
         x = x.reshape(-1).float()
-        count = x.numel()
-        mean, var = x.mean(), x.var(unbiased=False)
+        self.merge(x.mean(), x.var(unbiased=False), x.numel())
+
+    @torch.no_grad()
+    def merge(self, mean: Tensor, var: Tensor, count: Tensor | int) -> None:
+        """Fold in the moments of a batch (the trainer pools them across ranks before calling this)."""
         total = self.count + count
         delta = mean - self.mean
         self.mean = self.mean + delta * count / total
@@ -83,9 +86,11 @@ class RunningObsNorm(nn.Module):
     @torch.no_grad()
     def update(self, x: Tensor) -> None:
         batch = x.reshape(-1, x.shape[-1])
-        count = batch.shape[0]
-        mean = batch.mean(0)
-        var = batch.var(0, unbiased=False)
+        self.merge(batch.mean(0), batch.var(0, unbiased=False), batch.shape[0])
+
+    @torch.no_grad()
+    def merge(self, mean: Tensor, var: Tensor, count: Tensor | int) -> None:
+        """Fold in per-dimension batch moments (the trainer pools them across ranks before calling this)."""
         total = self.count + count
         delta = mean - self.mean
         self.mean.copy_(self.mean + delta * count / total)

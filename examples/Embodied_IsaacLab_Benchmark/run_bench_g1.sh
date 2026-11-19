@@ -25,10 +25,18 @@ export HP_HFIELD_COLLISION=1
 
 export PYTHONPATH="$HERE:$HP_REPO/python:$HP_BUILD/python${PYTHONPATH:+:$PYTHONPATH}"
 
+# NPROC=N runs N processes, one per GPU (GPUs chosen with HIP_VISIBLE_DEVICES), with torchrun.
+NPROC="${NPROC:-1}"
+if [[ "$NPROC" -gt 1 ]]; then
+  LAUNCH=(torchrun --standalone --nproc_per_node="$NPROC")
+else
+  LAUNCH=(python)
+fi
+
 # "train" runs the full training through Lumen-RL's entry point; anything else is bench.py (three FPS columns).
 CONFIG="${CONFIG:-$HERE/configs/g1_rough.yaml}"
 if [[ "${1:-}" == "train" ]]; then
   shift
-  exec python -m lumenrl.trainer.main --config "$CONFIG" "$@"
+  exec "${LAUNCH[@]}" -m lumenrl.trainer.main --config "$CONFIG" "$@"
 fi
-exec python "$HERE/bench.py" --config "$CONFIG" "$@"
+exec "${LAUNCH[@]}" "$HERE/bench.py" --config "$CONFIG" "$@"

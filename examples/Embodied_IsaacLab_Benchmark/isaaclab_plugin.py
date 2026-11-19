@@ -26,7 +26,10 @@ from lumenrl.core.vec_env_plugin import VecEnvPlugin
 
 SHADOW_TASK = "HipPhysics-Repose-Cube-Shadow-Direct-v0"
 
-# Published Isaac Lab 2.3 numbers (docs.nvidia.com/isaaclab/2.3/overview/performance-benchmarks, RTX 4090).
+# Published Isaac Lab 2.3 numbers (docs.nvidia.com/isaaclab/2.3/overview/performance-benchmarks): reference_rtx4090
+# (single GPU), reference_l40 (single GPU) and reference_l40_x4 (single node, 4 x L40, per-env count not stated; the
+# scaling implies 4096 envs per GPU). ram_gb / vram_gb: the page's single Memory Consumption table, which does not
+# name a GPU.
 TASKS: dict[str, dict[str, Any]] = {
     "cartpole": {
         "task": "HipPhysics-Cartpole-Direct-v0",
@@ -36,6 +39,12 @@ TASKS: dict[str, dict[str, Any]] = {
         "result_name": "cartpole_direct",
         "reference_rtx4090": {"environment_step": 1_100_000, "environment_step_and_inference": 910_000,
                               "environment_step_inference_and_train": 510_000, "ram_gb": 3.7, "vram_gb": 3.3},
+        "reference_l40": {"environment_step": 620000,
+                              "environment_step_and_inference": 490000,
+                              "environment_step_inference_and_train": 260000},
+        "reference_l40_x4": {"environment_step": 2700000,
+                              "environment_step_and_inference": 2100000,
+                              "environment_step_inference_and_train": 950000},
     },
     "cartpole_rgb": {
         "task": "HipPhysics-Cartpole-RGB-Camera (hipPhysics engine, one 100x100 side camera per env)",
@@ -44,6 +53,12 @@ TASKS: dict[str, dict[str, Any]] = {
         "result_name": "cartpole_rgb_camera",
         "reference_rtx4090": {"environment_step": 50_000, "environment_step_and_inference": 45_000,
                               "environment_step_inference_and_train": 32_000, "ram_gb": 7.5, "vram_gb": 16.7},
+        "reference_l40": {"environment_step": 30000,
+                              "environment_step_and_inference": 28000,
+                              "environment_step_inference_and_train": 21000},
+        "reference_l40_x4": {"environment_step": 130000,
+                              "environment_step_and_inference": 120000,
+                              "environment_step_inference_and_train": 90000},
     },
     "shadow": {
         "task": SHADOW_TASK,
@@ -54,6 +69,12 @@ TASKS: dict[str, dict[str, Any]] = {
         "result_name": "shadow_repose",
         "reference_rtx4090": {"environment_step": 200_000, "environment_step_and_inference": 190_000,
                               "environment_step_inference_and_train": 170_000, "ram_gb": 6.7, "vram_gb": 6.4},
+        "reference_l40": {"environment_step": 170000,
+                              "environment_step_and_inference": 140000,
+                              "environment_step_inference_and_train": 120000},
+        "reference_l40_x4": {"environment_step": 440000,
+                              "environment_step_and_inference": 420000,
+                              "environment_step_inference_and_train": 390000},
     },
     "g1_rough": {
         "task": "Isaac-Velocity-Rough-G1-v0 (g1_env.G1RoughEnv)",
@@ -62,6 +83,12 @@ TASKS: dict[str, dict[str, Any]] = {
         "result_name": "g1_rough",
         "reference_rtx4090": {"environment_step": 94_000, "environment_step_and_inference": 88_000,
                               "environment_step_inference_and_train": 82_000, "ram_gb": 6.5, "vram_gb": 6.1},
+        "reference_l40": {"environment_step": 72000,
+                              "environment_step_and_inference": 64000,
+                              "environment_step_inference_and_train": 62000},
+        "reference_l40_x4": {"environment_step": 290000,
+                              "environment_step_and_inference": 270000,
+                              "environment_step_inference_and_train": 250000},
     },
 }
 
