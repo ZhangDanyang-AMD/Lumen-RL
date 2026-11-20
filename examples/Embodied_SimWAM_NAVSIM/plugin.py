@@ -548,10 +548,16 @@ def install_action_velocity_graphs() -> None:
     eager = ActionGRPOMixin.action_velocity
     verify = os.environ.get("SIMWAM_GRPO_CUDA_GRAPH_VERIFY", "0") == "1"
     kv_slot = _switch("SIMWAM_GRPO_KV_SLOT", "1")
+    # SIMWAM_GRPO_KV_SLOT_SHARED_NOGRAD=1: the batched no-grad calls (the rollout's log-probs) also write only the
+    # action rows, into the static buffers the shared video K/V are the leading rows of (SIMWAM_GRPO_KV_SLOT_TRAIN);
+    # while a training forward awaits its backward they use graphs captured without it
+    kv_slot_shared = _switch("SIMWAM_GRPO_KV_SLOT_SHARED_NOGRAD", "1")
     graphs = {}
-    stats = {"replay": 0, "eager": 0, "mismatch": 0, "loads": 0, "kv_slots": 0, "kv_slot_cats": 0}
+    stats = {"replay": 0, "eager": 0, "mismatch": 0, "loads": 0, "kv_slots": 0, "kv_slot_cats": 0,
+             "kv_slot_shared_cats": 0}
     serial = [0]
     in_eval = [False]
+    shared_slot = [False]
     slots = {}
     xshared = {}
     torch_cat = torch.cat
@@ -563,12 +569,18 @@ def install_action_velocity_graphs() -> None:
         if out is None and dim == 1 and len(tensors) == 2:
             a, b = tensors
             hit = slots.get(a.data_ptr())
+            shared = False
+            if hit is None and shared_slot[0]:
+                hit = _KV_TRAIN_SLOTS.get(a.data_ptr())
+                shared = hit is not None
+                if shared and a.stride() != hit[0].stride():
+                    hit = None
             if hit is not None:
                 full, sv = hit
                 if (a.dtype == b.dtype == full.dtype and tuple(a.shape) == (full.shape[0], sv, *full.shape[2:])
                         and tuple(b.shape) == (full.shape[0], full.shape[1] - sv, *full.shape[2:])):
                     full[:, sv:].copy_(b)
-                    stats["kv_slot_cats"] += 1
+                    stats["kv_slot_shared_cats" if shared else "kv_slot_cats"] += 1
                     return full
         return torch_cat(tensors, dim) if out is None else torch_cat(tensors, dim, out=out)
 
@@ -599,7 +611,7 @@ def install_action_velocity_graphs() -> None:
         out.update(video_kv_cache=kv, context=tensors[-3], context_mask=tensors[-2], attention_mask=tensors[-1])
         return out
 
-    def capture(self, latents, timestep, cond, use_ref, tensors, xkv=None, slot=False):
+    def capture(self, latents, timestep, cond, use_ref, tensors, xkv=None, slot=False, slot_shared=False):
         # ActionDiT keeps its RoPE table as a plain CPU attribute and copies it to the
         # device on every forward; a pageable host copy cannot be captured.
         for expert in (self.action_expert, getattr(self, "ref_action_expert", None)):
@@ -615,8 +627,9 @@ def install_action_velocity_graphs() -> None:
         if slot:
             slot_tensors(cond, tensors, s_tensors)
         s_cond = static_cond(cond, s_tensors)
-        if slot:
+        if slot or slot_shared:
             torch.cat = slot_cat
+            shared_slot[0] = slot_shared
         if xkv is not None:
             # the graph reads the per-layer context K/V from the shared buffers, refilled outside it
             expert = self.ref_action_expert if use_ref else self.action_expert
@@ -629,10 +642,11 @@ def install_action_velocity_graphs() -> None:
                     eager(self, s_lat, s_t, s_cond, use_ref=use_ref)
             torch.cuda.current_stream().wait_stream(side)
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            with torch.cuda.graph(graph), _capture_oplog("action_ref" if use_ref else "action"):
                 out = eager(self, s_lat, s_t, s_cond, use_ref=use_ref)
         finally:
             torch.cat = torch_cat
+            shared_slot[0] = False
             slots.clear()
             _XKV["pre"] = {}
         return {"graph": graph, "lat": s_lat, "t": s_t, "tensors": s_tensors, "out": out, "loaded": None}
@@ -649,9 +663,11 @@ def install_action_velocity_graphs() -> None:
         # the lean attention path bakes "masks are all True" into the graph
         lean = _LEAN_ATTN["flag"](cond, int(latents_action.shape[1])) if _LEAN_ATTN["flag"] else None
         slot = kv_slot and not in_eval[0]
+        slot_shared = (kv_slot_shared and slot and _XKV["reps"] > 1 and bool(_KV_TRAIN_SLOTS)
+                       and _TRAIN_PENDING["n"] == 0)
         key = (bool(use_ref), tuple(latents_action.shape), tuple(latents_action.stride()), tuple(timestep_action.shape),
                int(cond["video_seq_len"]), tuple((tuple(t.shape), t.dtype) for t in tensors), lean,
-               xkv is not None, _XKV["reps"], slot)
+               xkv is not None, _XKV["reps"], slot, slot_shared)
         g = graphs.get(key)
         if g is None and lean is False:
             # hf_attn_patch falls back to torch SDPA when a host copy fails under capture, so a
@@ -659,7 +675,7 @@ def install_action_velocity_graphs() -> None:
             g = graphs[key] = False
         if g is None:
             try:
-                g = capture(self, latents_action, timestep_action, cond, use_ref, tensors, xkv, slot)
+                g = capture(self, latents_action, timestep_action, cond, use_ref, tensors, xkv, slot, slot_shared)
             except Exception as exc:
                 logger.warning("CUDA graph capture of action_velocity failed (%s); using eager", exc)
                 g = False
@@ -915,7 +931,7 @@ def install_prefill_graph() -> None:
         torch.cuda.current_stream().wait_stream(side)
         graph = torch.cuda.CUDAGraph()
         _DROP["prefill_flag"] = flag
-        with torch.cuda.graph(graph):
+        with torch.cuda.graph(graph), _capture_oplog("prefill"):
             out = eager(self, *args)
         g = {"graph": graph, "static": static, "out": out}
         if nocopy:
@@ -1093,9 +1109,61 @@ _KV_SHARE = {"ptrs": set()}
 # shared video K/V buffer address -> (static [B, Sv + Sa, D] buffer it is the leading rows of, Sv); filled by
 # install_batched_logprobs with SIMWAM_GRPO_KV_SLOT_TRAIN, read by the training graphs' capture
 _KV_TRAIN_SLOTS = {}
+# training-graph forwards whose backward has not run yet: their action rows in _KV_TRAIN_SLOTS are still needed,
+# so a no-grad call meanwhile must not write there (SIMWAM_GRPO_KV_SLOT_SHARED_NOGRAD)
+_TRAIN_PENDING = {"n": 0}
 # SIMWAM_GRPO_TRAIN_GRAD_FLAT: the manual-DP optimizer's flat bf16 gradient buffer and id(param) -> (offset,
 # numel, shape) inside it; the training graphs' backward writes the LoRA gradients there
 _GRAD_FLAT = {}
+
+
+_OPLOG = {"sink": {}}
+_OPLOG_OPS = frozenset({"copy_", "clone", "cat", "_to_copy", "contiguous", "index_put_", "fill_", "zero_",
+                        "add", "add_", "mul", "addcmul", "slice_scatter", "expand_copy", "_unsafe_view"})
+_OPLOG_FILES = ("Embodied_SimWAM_NAVSIM", "simwam", "lumen")
+
+
+def _capture_oplog(kind):
+    """With SIMWAM_GRPO_CAPTURE_OPLOG=1, record the copy-like aten ops run while a CUDA graph is captured (every
+    replay runs them again): output shape, count, bytes and the innermost frames from this example, SimWAM or
+    Lumen. Summarised in _STATS["capture_oplog"], the 25 largest by bytes per graph kind. A no-op context
+    otherwise."""
+    import contextlib
+
+    if os.environ.get("SIMWAM_GRPO_CAPTURE_OPLOG", "0").strip().lower() in _OFF:
+        return contextlib.nullcontext()
+    import traceback
+
+    import torch
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    sink = _OPLOG["sink"]
+
+    class _OpLog(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            out = func(*args, **(kwargs or {}))
+            name = func.overloadpacket.__name__
+            if name in _OPLOG_OPS and torch.is_tensor(out):
+                frames = [f"{os.path.basename(f.filename)}:{f.lineno}" for f in traceback.extract_stack()[:-1]
+                          if any(k in f.filename for k in _OPLOG_FILES)]
+                key = (kind, name, tuple(out.shape), tuple(frames[-3:]))
+                entry = sink.setdefault(key, [0, 0])
+                entry[0] += 1
+                entry[1] += out.numel() * out.element_size()
+            return out
+
+        def __exit__(self, *exc):
+            # string keys and values: the timing hook's pstats keeps only scalar entries of each _STATS dict
+            rows = sorted(sink.items(), key=lambda kv: (kv[0][0], -kv[1][1]))
+            top, seen = {}, {}
+            for k, v in rows:
+                seen[k[0]] = seen.get(k[0], 0) + 1
+                if seen[k[0]] <= 25:
+                    top[f"{k[0]} {k[1]} {list(k[2])} {' < '.join(k[3])}"] = f"n={v[0]} MB={v[1] / 2**20:.2f}"
+            _STATS["capture_oplog"] = top
+            return super().__exit__(*exc)
+
+    return _OpLog()
 
 
 def _fanout_function():
@@ -1639,16 +1707,23 @@ def _pdm_pool(reward, workers):
 def _pdm_worker_warm(token):
     """Load ``token``'s metric cache into this worker ahead of its scoring (SIMWAM_GRPO_PDM_PREFETCH); the
     barrier makes the pool's ``workers`` warm tasks land on distinct workers."""
+    import time
+
     reward, cache = _PDM_WORKER["reward"], _PDM_WORKER["cache"]
+    t0 = t1 = time.perf_counter()
+    broken = False
     try:
         if token not in cache and reward.available(token):
             _pdm_cache_put(cache, token, reward.metric_cache_loader.get_from_token(token))
+        t1 = time.perf_counter()
         barrier = _PDM_WORKER.get("barrier")
         if barrier is not None:
+            broken = barrier.broken
             barrier.wait(timeout=2)
     except Exception:  # noqa: BLE001  warming is best effort
-        pass
-    return True
+        broken = True
+    # load and barrier seconds, whether the barrier was broken, and when the task finished (wall clock)
+    return (t1 - t0, time.perf_counter() - t1, broken, time.time())
 
 
 def _pdm_worker_score(task):
@@ -1658,6 +1733,7 @@ def _pdm_worker_score(task):
         return ("missing",)
     import time
 
+    start = time.time()
     t0 = time.perf_counter()
     cache = _PDM_WORKER["cache"]
     metric_cache = cache.get(token)
@@ -1670,8 +1746,10 @@ def _pdm_worker_score(task):
         value = reward.score(poses, metric_cache)
     except Exception as exc:  # same fallback as score_batch
         return ("failed", str(exc))
-    # load and simulation seconds ride along; collectors that predate them ignore the extra field
-    return ("ok", value, reward._true_pdms[-1], reward._submetric_rows[-1], (t1 - t0, time.perf_counter() - t1))
+    # load and simulation seconds and the start time (wall clock) ride along; collectors that predate them ignore
+    # the extra fields
+    return ("ok", value, reward._true_pdms[-1], reward._submetric_rows[-1], (t1 - t0, time.perf_counter() - t1),
+            start)
 
 
 def install_parallel_pdm_reward() -> None:
@@ -1834,6 +1912,7 @@ def install_train_graphs() -> None:
             g["fwd"].replay()
             ctx.g = g
             ctx.params = inputs[g["n_in"]:]
+            _TRAIN_PENDING["n"] += 1
             return g["out"].clone()
 
         @staticmethod
@@ -1848,6 +1927,7 @@ def install_train_graphs() -> None:
                     if p.grad is not None and p.grad.untyped_storage().data_ptr() == ptr:
                         p.grad = p.grad.clone()
             g["bwd"].replay()
+            _TRAIN_PENDING["n"] = max(0, _TRAIN_PENDING["n"] - 1)
             if flat is not None:
                 # fresh views, so autograd adopts them as .grad without copying
                 grads = tuple(flat[a:a + n].view(shape) for a, n, shape in g["flat_meta"])
@@ -1911,7 +1991,7 @@ def install_train_graphs() -> None:
         # Capture on the warmup stream: hipBLASLt fails ("operation not permitted when stream is
         # capturing") the first time it sees a new stream inside a capture.
         fwd, bwd = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
-        with torch.cuda.graph(fwd, stream=side):
+        with torch.cuda.graph(fwd, stream=side), _capture_oplog("train_fwd"):
             out = run()
         grad_out = torch.zeros_like(out)
         flat = _GRAD_FLAT.get("buf") if _RT.get("SIMWAM_GRPO_TRAIN_GRAD_FLAT") else None
@@ -1919,7 +1999,7 @@ def install_train_graphs() -> None:
         if flat is not None and all(id(p) in _GRAD_FLAT["offsets"] for p in params):
             meta = [_GRAD_FLAT["offsets"][id(p)] for p in params]
             dst = [flat[a:a + n].view(shape) for a, n, shape in meta]
-        with torch.cuda.graph(bwd, pool=fwd.pool(), stream=side):
+        with torch.cuda.graph(bwd, pool=fwd.pool(), stream=side), _capture_oplog("train_bwd"):
             grads = torch.autograd.grad(out, params, grad_outputs=grad_out, allow_unused=True)
             if meta is not None:
                 # the gradients leave the graph in the optimizer's flat buffer instead of one clone each
@@ -2045,7 +2125,7 @@ class _MasterAdamW:
                                       weight_decay=hp["weight_decay"], amsgrad=hp.get("amsgrad", False))
         self.loaded = False
         self.flat_grad = None
-        if _switch("SIMWAM_GRPO_TRAIN_GRAD_FLAT", "0"):
+        if _switch("SIMWAM_GRPO_TRAIN_GRAD_FLAT", "1"):
             # the training graphs write the gradients straight into this buffer, in this order (install_train_graphs)
             self.flat_grad = torch.empty_like(flat, dtype=self.params[0].dtype)
             offsets, off = {}, 0
@@ -2706,13 +2786,14 @@ def install_overlap_reward_logprobs() -> None:
     reference log-probs of the first inner epoch (stored where ``install_ref_logprob_cache``
     looks) are computed while the workers simulate, and the rewards are collected before the
     advantages. Everything else follows ``SimWAMGRPOTrainer._rollout``.
-    Needs both of those patches; ``SIMWAM_GRPO_OVERLAP_REWARD=0`` turns it off. The batch's metric caches are
-    loaded into the workers when its rollout starts (``SIMWAM_GRPO_PDM_PREFETCH=rollout``, the default; ``1`` loads
-    the next batch's while the current batch trains, ``0`` turns it off).
+    Needs both of those patches; ``SIMWAM_GRPO_OVERLAP_REWARD=0`` turns it off. The next batch's metric caches are
+    loaded into the workers while the current batch trains (``SIMWAM_GRPO_PDM_PREFETCH=1``, the default);
+    ``rollout`` loads the batch's own when its rollout starts and ``0`` turns prefetching off.
     """
     if os.environ.get("SIMWAM_GRPO_OVERLAP_REWARD", "1").strip().lower() in _OFF:
         return
     import multiprocessing as mp
+    import time
 
     import numpy as np
     import torch
@@ -2726,12 +2807,13 @@ def install_overlap_reward_logprobs() -> None:
         return
     rollout_orig = SimWAMGRPOTrainer._rollout
     workers = int(os.environ.get("SIMWAM_GRPO_PDM_WORKERS", "8") or 8)
-    prefetch = os.environ.get("SIMWAM_GRPO_PDM_PREFETCH", "rollout").strip().lower()
-    _switch("SIMWAM_GRPO_PDM_PREFETCH", "rollout")
+    prefetch = os.environ.get("SIMWAM_GRPO_PDM_PREFETCH", "1").strip().lower()
+    _switch("SIMWAM_GRPO_PDM_PREFETCH", "1")
     if prefetch == "rollout":
-        # the current batch's metric caches are loaded into the workers when the rollout starts (the GPU is busy with
-        # the VAE and denoising, the host mostly idle) instead of while the previous batch trains, where the loads in
-        # every worker of every rank slowed the optimizer step; the loads are queued ahead of the scoring that needs them
+        # the current batch's metric caches are loaded into the workers when the rollout starts, queued ahead of the
+        # scoring that needs them. Every worker loads every token of the batch, and the VAE, condition and denoising
+        # (~140 ms on MI350X) are not enough to hide that: in a 4-card run the scoring then waited ~250 ms more per
+        # rollout than with "1"
         _PDM_PREFETCH["on"] = True
         next_orig = SimWAMGRPOTrainer._next_batch
 
@@ -2740,8 +2822,9 @@ def install_overlap_reward_logprobs() -> None:
             reward = self.action_reward
             if hasattr(reward, "_pool_init_args"):
                 pool = _pdm_pool(reward, workers)
-                for token in dict.fromkeys(batch["token"]):
-                    pool.map_async(_pdm_worker_warm, [token] * reward._pool_workers, chunksize=1)
+                _PDM_PREFETCH["warm"] = [pool.map_async(_pdm_worker_warm, [token] * reward._pool_workers, chunksize=1)
+                                         for token in dict.fromkeys(batch["token"])]
+                _PDM_PREFETCH["warm_t"] = time.time()
                 pdm = _STATS.setdefault("pdm", {"rollouts": 0})
                 pdm["prefetched"] = pdm.get("prefetched", 0) + 1
             return batch
@@ -2774,27 +2857,50 @@ def install_overlap_reward_logprobs() -> None:
     def submit(reward, abs_poses, tokens, device):
         pool = _pdm_pool(reward, workers)
         poses_np = abs_poses.detach().to(device="cpu", dtype=torch.float32).numpy()
+        _PDM_PREFETCH["submit_t"] = time.time()
         return pool.map_async(_pdm_worker_score, [(t, poses_np[i]) for i, t in enumerate(tokens)])
 
     def collect(reward, pending, tokens, device):
+        t_wait = time.perf_counter()
         results = pending.get()
+        t_wait = time.perf_counter() - t_wait
+        pdm = _STATS.setdefault("pdm", {"rollouts": 0})
+        # the last rollout's wait here, how long its scoring queued behind other pool tasks, and its metric-cache
+        # load and PDM simulation times per trajectory (worker side)
+        pdm["collect_wait_ms"] = round(1000 * t_wait, 1)
+        starts = [res[5] for res in results if res[0] == "ok" and len(res) > 5]
+        if starts and _PDM_PREFETCH.get("submit_t"):
+            pdm["score_queue_ms"] = round(1000 * (min(starts) - _PDM_PREFETCH["submit_t"]), 1)
         times = [res[4] for res in results if res[0] == "ok" and len(res) > 4]
         if times:
-            # the last rollout's metric-cache load and PDM simulation times per trajectory (worker side)
-            pdm = _STATS.setdefault("pdm", {"rollouts": 0})
             pdm["rollouts"] += 1
             pdm["load_max_ms"] = round(1000 * max(t[0] for t in times), 1)
             pdm["load_sum_ms"] = round(1000 * sum(t[0] for t in times), 1)
             pdm["sim_max_ms"] = round(1000 * max(t[1] for t in times), 1)
             pdm["sim_sum_ms"] = round(1000 * sum(t[1] for t in times), 1)
+        # the prefetch tasks that loaded this batch's metric caches: load and barrier times, broken barriers, and
+        # when the last of them finished relative to the submission of the scoring (negative: before it)
+        warm = _PDM_PREFETCH.pop("warm", None)
+        if warm:
+            done = [w for ar in warm if ar.ready() for w in ar.get()]
+            pdm["warm_pending"] = sum(not ar.ready() for ar in warm)
+            if done:
+                pdm["warm_load_max_ms"] = round(1000 * max(w[0] for w in done), 1)
+                pdm["warm_load_sum_ms"] = round(1000 * sum(w[0] for w in done), 1)
+                pdm["warm_barrier_max_ms"] = round(1000 * max(w[1] for w in done), 1)
+                pdm["warm_broken"] = sum(bool(w[2]) for w in done)
+                if _PDM_PREFETCH.get("submit_t"):
+                    pdm["warm_end_vs_submit_ms"] = round(1000 * (max(w[3] for w in done) - _PDM_PREFETCH["submit_t"]), 1)
+                if _PDM_PREFETCH.get("warm_t"):
+                    pdm["warm_span_ms"] = round(1000 * (max(w[3] for w in done) - _PDM_PREFETCH["warm_t"]), 1)
         nxt = _PDM_PREFETCH["tokens"]
         if _PDM_PREFETCH["on"] and nxt:
             # the pool is idle until the next rollout scores: load the next batch's metric caches now
             _PDM_PREFETCH["tokens"] = None
             pool = _pdm_pool(reward, workers)
-            for token in dict.fromkeys(nxt):
-                pool.map_async(_pdm_worker_warm, [token] * reward._pool_workers, chunksize=1)
-            pdm = _STATS.setdefault("pdm", {"rollouts": 0})
+            _PDM_PREFETCH["warm"] = [pool.map_async(_pdm_worker_warm, [token] * reward._pool_workers, chunksize=1)
+                                     for token in dict.fromkeys(nxt)]
+            _PDM_PREFETCH["warm_t"] = time.time()
             pdm["prefetched"] = pdm.get("prefetched", 0) + 1
         reward.last_num_total = len(tokens)
         reward.last_num_missing = 0
