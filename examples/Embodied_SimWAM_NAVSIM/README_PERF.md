@@ -6,6 +6,19 @@
 和比特一致基线比快多少、每项优化的来源和实测收益、精度是否保持，以及如何复现和切回比特一致版本。
 SimWAM、DeepSpeed、Lumen 都没有修改，所有改动都是本目录 `plugin.py` 里带环境变量开关的运行时 patch。
 
+## 总表（4× MI350X）
+
+| 版本 | 每周期平均耗时 | rollout 平均耗时 | PDMS | 子项 NC / DAC / EP / TTC / C / DDC |
+|---|---:|---:|---:|---|
+| torch bf16 benchmark | 1316.5 ms | 398.2 ms | 91.13 | 98.36 / 98.64 / 85.75 / 95.42 / 99.98 / 98.17 |
+| 最终版 | 371.2 ms | 204.4 ms | 91.11 | 98.36 / 98.65 / 85.80 / 95.28 / 99.99 / 98.25 |
+| 差 | −72%（3.5×） | −49%（1.95×） | −0.02 | 0.00 / +0.01 / +0.05 / −0.14 / +0.01 / +0.08 |
+
+- 耗时：4 卡，rank 0 第 16–56 步的 11 个周期（每次 60 步的短运行，同一组 4 卡、同一口径；benchmark 是 DeepSpeed ZeRO-1 的比特一致版本 `f27ab82`，见 1.3 节）。
+- PDMS：全集 navtest（12146 token），训练 20000 步后的 checkpoint。benchmark 的 PDMS 取与它逐位相同的比特一致版本 BX20；子项由差值反推（±0.01）。
+- 20000 步全程（包含 eval、可视化和 PDM 等待）：最终版平均周期 522.9 ms、总时长 43.6 min，BX20 1054.1 ms、87.8 min，见 1.1 节。
+- PDMS 平均分没有差别（逐 token 配对 −0.02，p = 0.75），但 gate 翻转偏向变差、主要在 TTC，见 3.3 节。
+
 ---
 
 ## 1. 执行摘要
@@ -59,6 +72,9 @@ GPU 阶段的中位数从 816.1 降到 293.2 ms，但周期里还有 GPU 之外�
 | 训练前向 ×4 | 189.8 | 63.6 | 合批 GEMM、融合 kernel、训练 graph 的 KV slot |
 | 训练反向 ×4 | 248.8 | 78.8 | Triton RMSNorm 反向、aiter attention 反向、梯度直写 flat 缓冲 |
 | optimizer ×4 | 13.9 | 14.7 | |
+
+总表口径（60 步短运行）下 rollout 子阶段的倍数：去噪 2.77×、条件构建 2.40×、策略 log-prob 4.13×、参考 log-prob 4.33×、VAE 1.05×。
+短运行只覆盖前 56 步，PDM 打分的长尾和 eval 的占比都和 20000 步不同，所以整网的主口径仍是 20000 步的平均周期和总时长。
 
 ### 1.3 和 DeepSpeed 基线的对比（补充）
 
@@ -251,9 +267,127 @@ FIN20 和 BX20 之间有 217 个 token 至少有一个 gate 的结果不同，�
 
 ---
 
-## 5. Runbook
+## 5. 其他提升
 
-### 5.1 环境
+除了周期时间，这些改动还带来了下面几类变化。每一项都注明数字来自哪次运行；“2 卡 ABBA”指 GPU 5+6 上同卡交替的 40 步运行，
+“4 卡 4000 步”指 GPU 4–7 上的阶段验证运行。
+
+### 5.1 显存
+
+| 开关或改动 | 做了什么 | 实测变化（每卡） | 来源 |
+|---|---|---|---|
+| `SIMWAM_GRPO_SHARED_KV`（1） | 合批调用里重复 W 份的 video K/V 和 context 只存一套共享缓冲，cond 字典和各个 graph 不再各存一份 | 训练峰值已分配 −8.8 GB，eval 峰值 −6.6 GB | 2 卡，第 5 轮 R1 |
+| `SIMWAM_GRPO_EVAL_EMPTY_CACHE`（1） | 每次 eval 后释放缓存 | eval 后整卡占用 −6.4 GB，峰值不变 | 2 卡，第 5 轮 R3 |
+| eval 期间的 K/V 缓冲（`37c84ff9`） | XATTN_KV 不再为 eval 的大 condition 常驻一套缓冲，改在 eval 的 graph 里现算 | eval 峰值已分配 39997 → 35318 MB | 2 卡，E23 对 E24 |
+| eval 不用 KV_SLOT（`bc8cd91e`） | eval 形状下的 slot 缓冲会先 clone 再分配更大的缓冲 | 避免 eval 已保留峰值多 5.9 GB | 2 卡，C25 对 K0 / F28 |
+| `SIMWAM_GRPO_KV_SLOT_TRAIN`（1） | 训练 graph 的拼接只写 action 行，共享缓冲即 slot 的前缀 | 训练峰值已分配 −2.1 GB | 2 卡 ABBA，r19 |
+| `SIMWAM_GRPO_XATTN_KV`（1） | 共享的预计算 K/V 缓冲 | +0.76 GB（代价） | 2 卡 ABBA |
+| `SIMWAM_GRPO_EXPAND_VIEW`（1） | video K/V 用 expand view，不再复制 8 份 | 训练峰值已分配 −716 MB | 2 卡 ABBA，r25 |
+| `SIMWAM_GRPO_KV_SLOT_STEP_SHARED`（1） | 每步去噪 graph 不再有自己的 slot 缓冲 | 与上一项合计：训练峰值已分配 −1.45 GB、已保留 −2.2 GB，eval 峰值已分配 −1.4 GB | 2 卡 ABBA，r25；XV40 对 V37 |
+| PDM worker 的 metric cache 上限（`37c84ff9`） | 每个 worker 只保留最近 8 个 token 的 cache | 主机内存：32 个 worker 4000 步内从 53 GiB 涨到 121 GiB（仍在涨）→ 稳定在 41.8 GiB | 4 卡 4000 步，CFF 对 CFG |
+| 整体（20000 步） | 以上全部 | 已分配 35.62 → 34.77 GiB，已保留 44.39 → 39.61 GiB，整卡占用 53.36 → 42.90 GiB | 4 卡 20000 步，BX20 对 FIN20 |
+
+### 5.2 训推 log-prob 一致性：从 1.16e-3 到 0
+
+原始示例里 rollout 和训练算 log-prob 用的不是同一组 kernel（rollout 的 attention 走 Lumen Triton，训练前向回落到 torch SDPA；
+训练的 GEMM 和 rollout 的 GEMM 形状也不同），所以第一次 inner update 时重要性比率就不等于 1。
+
+| 配置（4 卡、60 步，逐项叠加） | \|Δlogp\| 均值 / 最大 | 超出 PPO clip |
+|---|---:|---:|
+| #51 `f3f3ca5`（比特一致） | 1.10e-3 / 0.0133 | 4.0% |
+| + `SIMWAM_GRPO_DROP_MASKS` | 0 / 0 | 0% |
+| + `SIMWAM_GRPO_BATCHED_GEMM`（单开） | 1.72e-3 / 0.0186 | 8.0% |
+| + `SIMWAM_GRPO_BATCHED_LOGP_NOGRAD` | 0 / 0 | 0% |
+| 20000 步：BX20 对 FIN20 | 1.16e-3 / 0.0324 → 0 / 0 | 4.60% → 0% |
+
+- 关键是让 rollout 走和训练相同的路径：去掉全 True 的 mask，rollout 和训练都走 torch flash 前向；no-grad 的 log-prob 也合批，和训练用同一组 GEMM。
+- 之后每个改变数值的开关（aiter GEMM、LORA_CAT、融合 kernel 等）都要求 rollout 和训练走同一条路径，每个 4 卡 4000 步运行都核对过 |Δlogp| 为 0。
+- 带梯度 attention 换 aiter Triton（`SIMWAM_GRPO_AITER_FMHA_GRAD=1`）快 4.2%，但会让一致性退回 1.02e-3，所以默认关。
+- 一致之后，clip fraction 每个 500 步区间约低 1 个百分点（4 卡 4000 步，CFD 对 C51b）。
+
+### 5.3 主机侧和 PDM 等待的长尾
+
+PDM 奖励由 CPU 上的闭环仿真算出，个别 token 的 metric cache 加载（lzma + unpickle）或仿真要几百毫秒，会让整个周期等待。
+
+| 开关（默认） | 做了什么 | 实测 | 来源 |
+|---|---|---|---|
+| `SIMWAM_GRPO_PDM_WORKERS`（8） | 每个 rank 8 个进程并行打分 | PDM 打分约 133 → 35 ms | 2 卡，第一轮 |
+| `SIMWAM_GRPO_OVERLAP_REWARD`（1） | 打分和 rollout 的 log-prob 同时进行 | 周期 −6.3% | 2 卡，第二轮 |
+| `SIMWAM_GRPO_PDM_PREFETCH`（1） | 下一批的 metric cache 在当前批训练时预先加载 | 周期平均 −23%、90 分位 −44% | 4 卡 4000 步，CFG 对 CFF |
+| 同上，对 `rollout` 模式 | `rollout` 模式让打分排在加载后面 | 平均周期 425 对 509 ms，中位数 326 对 507 ms；慢周期（GPU 之外多等超过 200 ms）18–23% 对 46–50%；打分排队 p90 27–117 对 342–350 ms | 4 卡 1000 步 ×2 轮，pf4 |
+| `SIMWAM_GRPO_VIS_BACKGROUND`（1） | rank 0 的可视化放后台线程 | 其余 rank 每次可视化不再等约 0.6 s，4 卡每周期平均约 −26 ms | 4 卡 4000 步，CFG 逐 rank 分析 |
+
+20000 步的 FIN20 里，非 eval 周期的中位数 387.9 ms、90 分位 664.9 ms，这段长尾仍然主要是 PDM 等待（1.2 节）。
+
+### 5.4 CUDA graph 和逐次校验工具
+
+| 开关（默认） | 覆盖的调用 | 校验开关 | 最近一次校验 |
+|---|---|---|---|
+| `SIMWAM_GRPO_CUDA_GRAPH`（1） | no-grad `action_velocity`：rollout 去噪、old / ref log-prob | `SIMWAM_GRPO_CUDA_GRAPH_VERIFY=1`：每次 replay 再跑一遍 eager 逐位比较 | `62acd4c5` 全默认值 24 步含 eval：每个 rank 92 次，0 次不一致（XV41） |
+| `SIMWAM_GRPO_TRAIN_GRAPH`（1） | 带梯度的 `action_velocity` 前向和反向（LoRA 梯度作为普通输出取出） | `SIMWAM_GRPO_TRAIN_GRAPH_VERIFY=1`：输出和全部 480 个 LoRA 梯度与 eager 比较 | 同上：每个 rank 24 次，误差 0 |
+| `SIMWAM_GRPO_PREFILL_GRAPH`（1） | video prefill（冻结的 video expert） | 由上面两项的端到端比较覆盖 | 2 卡第 3 轮 −4.2% |
+| `SIMWAM_GRPO_LEAN_ATTN`（1） | Lumen attention 的 no-grad 调用可被捕获 | `SIMWAM_GRPO_LEAN_ATTN_VERIFY=1` | #51：4380 次与 `hf_attn_patch` 逐位相同 |
+
+- 训练 graph 只能在不用 DeepSpeed 时捕获（在 DeepSpeed ZeRO-1 下 capture 会段错误，根因未查明），见 5.6。
+- `TRAIN_GRAPH_VERIFY` 的随机探针改用独立的 `torch.Generator`（`e527632`），打开校验不再改变 rollout 的随机数。
+- 已知问题：`SIMWAM_GRPO_BATCHED_LOGP_VERIFY=1` 在默认配置下会崩，不要在默认配置下打开。
+
+### 5.5 诊断统计
+
+训练时计时 hook 会把这些统计写进每个周期的 pstats（hook 本身不在仓库里，统计在 `plugin.py` 的 `_STATS` 里，任何读取 `_STATS` 的工具都能用）：
+
+| 统计 | 内容 | 用途 |
+|---|---|---|
+| `cuda_graph` | replay、eager、mismatch 次数，每次换 condition 的加载次数和 `load_mb`（拷进 graph 静态输入的字节数），各类 slot 拼接次数 | `load_mb` 直接量出 KV_SLOT_STEP_SHARED 的效果（每 40 步 7.25 GB → 163 MB） |
+| `train_graph` | graph replay、capture 次数，校验次数和最大误差，训练 slot 拼接次数 | 校验训练 graph |
+| `pdm` | 每个 rollout 的 collect 等待、打分排队时间、预取加载和屏障耗时、屏障失效次数 | 定位 FIN4 每周期多等约 250 ms 的原因（PDM_PREFETCH 模式） |
+| `SIMWAM_GRPO_CAPTURE_OPLOG=1` | capture 每个 CUDA graph 时记录拷贝类算子（copy、clone、cat、add、mul 等）的形状、次数、字节数和调用位置，每类 graph 取前 25 条 | 确认 graph 里没有 video K/V 的拷贝；发现训练前向每次约 2.2 GB 的 context K/V 复制（候选优化，未做） |
+| `expand_view`、`aiter_gemm`、`lora_cat`、`exact_gate` 等 | 各开关的命中和回落次数 | 确认开关确实生效 |
+
+### 5.6 去掉 DeepSpeed
+
+| 项 | 内容 | 实测 | 来源 |
+|---|---|---|---|
+| `SIMWAM_GRPO_MANUAL_DP`（1） | LoRA 梯度拼成一个缓冲做 all-reduce，fp32 master AdamW；平均后的梯度先舍入到 bf16、梯度范数按 ZeRO-1 的方式累加（`4af7c72`），和 DeepSpeed ZeRO-1 逐位一致 | 2 卡：单独换掉 DeepSpeed 881 → 749 ms（−15%），再加训练 graph 656 ms（−25.5%） | 2 卡，A / C / C+B 交替 |
+| 加训练 graph 后 | 同上 + `SIMWAM_GRPO_TRAIN_GRAPH` | 4 卡：DeepSpeed 1316.5 → 812.5 ms（−38.3%），反向约 590 → 249 ms | 4 卡，第三轮 |
+| 为什么可以不用 ZeRO-1 | 可训练参数只有 15.7 M，分片每卡只省约 94 MB；ZeRO-1 每步的逐参数范数和溢出检查约 1.66 万个小 kernel | profile 中约 60 ms / 周期 | 第二轮 profile |
+
+注意：两种模式的 checkpoint 不能互相 resume；要接着跑旧的 DeepSpeed checkpoint，设 `SIMWAM_GRPO_MANUAL_DP=0`。
+
+### 5.7 aiter 算子
+
+已经在 aiter 上的：
+
+| 算子 | aiter 实现 | 开关 |
+|---|---|---|
+| attention 前向（rollout 和训练） | torch flash，底层是 aiter CK `fmha_fwd_hd128` | `SIMWAM_GRPO_DROP_MASKS` |
+| attention 反向 | aiter CK `FmhaBwdDQDKDV`（确定性模式） | `SIMWAM_GRPO_AITER_ATTN_BWD` |
+| RMSNorm 前向 | aiter CK `rms_norm` | `SIMWAM_GRPO_AITER_RMSNORM` |
+| 带仿射的 LayerNorm 前向和反向 | aiter Triton `layer_norm` | `SIMWAM_GRPO_AITER_LAYERNORM` |
+| `nn.Linear` 前向（调优表中 43 个形状：hipBLASLt 18、Triton 14、torch 11，无 split-K） | aiter `tuned_gemm.gemm_a16w16` | `SIMWAM_GRPO_AITER_GEMM` |
+| VAE 卷积 | aiter FlyDSL implicit GEMM | `LUMEN_ENABLE` 的 `flydsl_conv` |
+| DiT patch embedding（Conv3d） | aiter Triton conv3d（`AITER_SRC`） | `LUMEN_ENABLE` 的 `aiter_conv` |
+
+还没换的（耗时来自 4415df7c 的 2 卡单周期 profile，P31；之后的改动已经减掉其中一部分）：
+
+| 算子 | 现在的实现 | 每周期 | aiter 有没有 | 为什么没换 |
+|---|---|---:|---|---|
+| 反向 dX / dW GEMM | torch → hipBLASLt | 40.3 ms | 调优 GEMM 只支持前向布局 | 还没试；换了反向不逐位，需要重新验证 |
+| LORA_CAT 的新 GEMM 形状 | torch → hipBLASLt | 未单独拆分 | 有，已调优 5 个形状 | 整周期约 −1%，在噪声内，这次不放 |
+| RoPE | 自写 fp32 Triton | 6.1 ms | 有 | 还没试，现在已经是单 kernel |
+| RMSNorm 反向 | 自写 Triton | 2.8 ms | aiter Triton rmsnorm 带反向 | 还没试，预期收益很小 |
+| LayerNorm + modulate（gate 在 P31 时还是 torch） | 自写 Triton | 6.1 ms | 没有对应融合 | 没有对应算子 |
+| 逐元素 add / mul | torch | 37.3 ms（mul 22.1、add 15.2） | 有 | 访存受限，一换一不会更快；要靠融合 |
+| cat / copy | torch / HIP runtime | 33.7 ms（cat 14.6、copy 8.4、memcpy 10.7） | 没有 | 之后的 KV slot、共享缓冲、梯度直写等已去掉其中一部分（各开关的实测见第 4 节） |
+| AdamW | torch foreach | 1.8 ms | 没有 | 没有对应算子 |
+| GELU（tanh） | torch | 3.3 ms | 有（需要现场 JIT） | 访存受限，没试 |
+| all-reduce | RCCL | 4.7 ms | 有（面向小消息） | 没试 |
+
+---
+
+## 6. Runbook
+
+### 6.1 环境
 
 镜像、Lumen、aiter、SimWAM、权重和 NAVSIM 数据的准备见 [README.md](README.md) 的 “What you need” 和 “Environment”。本文的结果需要：
 
@@ -265,7 +399,7 @@ bash examples/Embodied_SimWAM_NAVSIM/launch_container.sh
 docker exec -it simwam-rl bash examples/Embodied_SimWAM_NAVSIM/setup_env.sh
 ```
 
-### 5.2 优化版（FIN20 的配置，全部默认值）
+### 6.2 优化版（FIN20 的配置，全部默认值）
 
 在容器里、Lumen-RL 根目录下：
 
@@ -279,9 +413,9 @@ LUMEN_DIR=<Lumen> SIMWAM_ROOT=<SimWAM> AITER_SRC=<aiter hz/grpo-opt checkout> \
 
 `LUMEN_ENABLE` 不设，用脚本默认的 `hf_attn_patch,aiter_conv,flydsl_conv`。日志里应看到 `aiter_conv bound 63 Conv3d and 10 Conv2d`，没有 conv3d 回落的 warning。
 
-### 5.3 切回比特一致版本
+### 6.3 切回比特一致版本
 
-**最可靠的做法**：用 #51 合并前的 head `f3f3ca5`（BX20 的代码），设 `LUMEN_ENABLE=hf_attn_patch`，其余同 5.2。
+**最可靠的做法**：用 #51 合并前的 head `f3f3ca5`（BX20 的代码），设 `LUMEN_ENABLE=hf_attn_patch`，其余同 6.2。
 这个组合在 4 卡上 8 步对原始示例 `d0ada15` 逐位相同。
 
 **在当前代码上**：设 `LUMEN_ENABLE=hf_attn_patch`，并关掉所有改变数值的开关（README.md 的 “Faster, not bit-identical” 一节）：
@@ -299,7 +433,7 @@ export SIMWAM_GRPO_DROP_MASKS=0 SIMWAM_GRPO_BATCHED_GEMM=0 SIMWAM_GRPO_BATCHED_L
 注意：这个组合在当前 head 上没有重新做过对 `d0ada15` 的逐位复验；需要严格的比特一致基线时用 `f3f3ca5`。
 只想回到 `daf60b17`（FIN20）的行为：`SIMWAM_GRPO_EXPAND_VIEW=0 SIMWAM_GRPO_KV_SLOT_STEP_SHARED=0`。
 
-### 5.4 验收
+### 6.4 验收
 
 - 训练完成目标步数、退出码 0；日志里 conv3d 绑定 63 个、没有回落 warning。
 - `SIMWAM_GRPO_CUDA_GRAPH_VERIFY=1 SIMWAM_GRPO_TRAIN_GRAPH_VERIFY=1` 跑一次短运行（如 24 步、`eval_every=20`）：每次 graph replay 和 eager 逐位相同。
@@ -307,7 +441,7 @@ export SIMWAM_GRPO_DROP_MASKS=0 SIMWAM_GRPO_BATCHED_GEMM=0 SIMWAM_GRPO_BATCHED_L
 
 ---
 
-## 6. 故障排查
+## 7. 故障排查
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
@@ -319,7 +453,7 @@ export SIMWAM_GRPO_DROP_MASKS=0 SIMWAM_GRPO_BATCHED_GEMM=0 SIMWAM_GRPO_BATCHED_L
 
 ---
 
-## 7. 文件索引
+## 8. 文件索引
 
 | 文件 | 作用 |
 |---|---|

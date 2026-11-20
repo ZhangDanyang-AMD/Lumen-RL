@@ -7,6 +7,20 @@ how much faster it is than the bit-identical baseline, where the time went, what
 and how to reproduce it or go back to the bit-identical path. SimWAM, DeepSpeed and Lumen are not modified; every change is a runtime patch in this
 directory's `plugin.py` behind an environment switch.
 
+## Overview (4× MI350X)
+
+| Version | Mean cycle | Mean rollout | PDMS | NC / DAC / EP / TTC / C / DDC |
+|---|---:|---:|---:|---|
+| torch bf16 benchmark | 1316.5 ms | 398.2 ms | 91.13 | 98.36 / 98.64 / 85.75 / 95.42 / 99.98 / 98.17 |
+| final version | 371.2 ms | 204.4 ms | 91.11 | 98.36 / 98.65 / 85.80 / 95.28 / 99.99 / 98.25 |
+| difference | −72% (3.5×) | −49% (1.95×) | −0.02 | 0.00 / +0.01 / +0.05 / −0.14 / +0.01 / +0.08 |
+
+- Times: 4 GPUs, rank 0, the 11 cycles of steps 16–56 (60-step runs on the same GPUs with the same method; the benchmark is the bit-identical DeepSpeed ZeRO-1 path `f27ab82`, see 1.3).
+- PDMS: full navtest (12146 tokens), checkpoint after 20000 training steps. The benchmark's PDMS is that of BX20, the bit-identical run that
+  reproduces it bit for bit; its sub-scores are derived from the differences (±0.01).
+- Over the whole 20000 steps (eval, visualisation and PDM waits included): final version mean cycle 522.9 ms, total 43.6 min; BX20 1054.1 ms, 87.8 min (section 1.1).
+- The mean PDMS does not differ (paired per token −0.02, p = 0.75), but the gate flips lean towards worse, mainly in TTC (section 3.3).
+
 ---
 
 ## 1. Summary
@@ -61,6 +75,10 @@ The GPU phases drop from 816.1 to 293.2 ms (medians), but a cycle also has time 
 | training forward ×4 | 189.8 | 63.6 | batched GEMMs, fused kernels, KV slots in the training graphs |
 | training backward ×4 | 248.8 | 78.8 | Triton RMSNorm backward, aiter attention backward, gradients written into the flat buffer |
 | optimizer ×4 | 13.9 | 14.7 | |
+
+Rollout sub-phases under the overview table's method (60-step runs): denoising 2.77×, condition build 2.40×, policy log-probs 4.13×, reference log-probs 4.33×,
+VAE 1.05×. Short runs cover only the first 56 steps, where the PDM tail and the share of the eval differ from a 20000-step run, so the main whole-network
+figures remain the 20000-step mean cycle and total time.
 
 ### 1.3 Against the DeepSpeed baseline (supplementary)
 
@@ -255,9 +273,129 @@ training's log-probs are identical (|Δlogp| = 0). Gains are as measured when ea
 
 ---
 
-## 5. Runbook
+## 5. Other improvements
 
-### 5.1 Environment
+Besides the cycle time, the changes brought the following. Each figure names the run it comes from; "2-GPU A/B" means 40-step runs interleaved on
+GPUs 5+6, "4-GPU 4000 steps" a stage-check run on GPUs 4–7.
+
+### 5.1 Memory
+
+| Switch or change | What it does | Measured (per GPU) | Source |
+|---|---|---|---|
+| `SIMWAM_GRPO_SHARED_KV` (1) | the video K/V and context repeated W times in batched calls kept in one set of shared buffers instead of one copy per condition dict and per graph | peak allocated −8.8 GB in training, −6.6 GB in the eval | 2 GPUs, round 5 R1 |
+| `SIMWAM_GRPO_EVAL_EMPTY_CACHE` (1) | free the cache after each eval | device memory after an eval −6.4 GB, peaks unchanged | 2 GPUs, round 5 R3 |
+| eval K/V buffers (`37c84ff9`) | XATTN_KV no longer keeps a resident set of buffers for the eval's larger condition; the eval computes them inside its graphs | eval peak allocated 39997 → 35318 MB | 2 GPUs, E23 vs E24 |
+| no KV_SLOT in the eval (`bc8cd91e`) | at the eval's shapes the slot buffers were cloned and then allocated larger | avoids +5.9 GB of eval reserved peak | 2 GPUs, C25 vs K0 / F28 |
+| `SIMWAM_GRPO_KV_SLOT_TRAIN` (1) | the training graphs' concatenation writes only the action rows; the shared buffers are the slots' leading rows | training peak allocated −2.1 GB | 2-GPU A/B, r19 |
+| `SIMWAM_GRPO_XATTN_KV` (1) | shared precomputed K/V buffers | +0.76 GB (cost) | 2-GPU A/B |
+| `SIMWAM_GRPO_EXPAND_VIEW` (1) | video K/V as an expand view instead of 8 copies | training peak allocated −716 MB | 2-GPU A/B, r25 |
+| `SIMWAM_GRPO_KV_SLOT_STEP_SHARED` (1) | the per-step denoising graphs no longer own slot buffers | with the previous row: training peak allocated −1.45 GB, reserved −2.2 GB; eval peak allocated −1.4 GB | 2-GPU A/B, r25; XV40 vs V37 |
+| PDM worker metric-cache bound (`37c84ff9`) | each worker keeps the caches of its latest 8 tokens | host memory of the 32 workers: 53 → 121 GiB over 4000 steps and still growing → flat at 41.8 GiB | 4-GPU 4000 steps, CFF vs CFG |
+| overall (20000 steps) | all of the above | allocated 35.62 → 34.77 GiB, reserved 44.39 → 39.61 GiB, device memory in use 53.36 → 42.90 GiB | 4-GPU 20000 steps, BX20 vs FIN20 |
+
+### 5.2 Train / rollout log-prob consistency: from 1.16e-3 to 0
+
+In the original example the rollout and the training compute log-probs with different kernels (rollout attention on Lumen Triton, the training forward
+on torch SDPA; the training's GEMMs also have other shapes than the rollout's), so the importance ratio is not 1 at the first inner update.
+
+| Configuration (4 GPUs, 60 steps, one switch added per row) | mean / max \|Δlogp\| | outside the PPO clip |
+|---|---:|---:|
+| #51 `f3f3ca5` (bit-identical) | 1.10e-3 / 0.0133 | 4.0% |
+| + `SIMWAM_GRPO_DROP_MASKS` | 0 / 0 | 0% |
+| + `SIMWAM_GRPO_BATCHED_GEMM` (alone) | 1.72e-3 / 0.0186 | 8.0% |
+| + `SIMWAM_GRPO_BATCHED_LOGP_NOGRAD` | 0 / 0 | 0% |
+| 20000 steps: BX20 vs FIN20 | 1.16e-3 / 0.0324 → 0 / 0 | 4.60% → 0% |
+
+- The key is putting the rollout on the training's path: with the all-True masks dropped, rollout and training both take torch's flash forward; the
+  no-grad log-probs are batched too and use the training's GEMMs.
+- Every later value-changing switch (aiter GEMM, LORA_CAT, fused kernels, ...) keeps rollout and training on one path; every 4-GPU 4000-step run checked |Δlogp| = 0.
+- Grad-enabled attention on aiter's Triton kernel (`SIMWAM_GRPO_AITER_FMHA_GRAD=1`) is 4.2% faster but brings the gap back to 1.02e-3, so it is off.
+- With consistency the clip fraction is about 1 point lower in every 500-step block (4-GPU 4000 steps, CFD vs C51b).
+
+### 5.3 Host side and the tail of the PDM waits
+
+The PDM rewards come from closed-loop simulation on the CPU; a few tokens take hundreds of milliseconds to load their metric cache (lzma + unpickle) or
+to simulate, and the whole cycle waits for them.
+
+| Switch (default) | What it does | Measured | Source |
+|---|---|---|---|
+| `SIMWAM_GRPO_PDM_WORKERS` (8) | 8 scoring processes per rank | PDM scoring about 133 → 35 ms | 2 GPUs, first round |
+| `SIMWAM_GRPO_OVERLAP_REWARD` (1) | scoring runs during the rollout's log-probs | cycle −6.3% | 2 GPUs, second round |
+| `SIMWAM_GRPO_PDM_PREFETCH` (1) | the next batch's metric caches loaded while the current batch trains | mean cycle −23%, 90th percentile −44% | 4-GPU 4000 steps, CFG vs CFF |
+| same, against the `rollout` mode | the `rollout` mode queues the scoring behind the loads | mean cycle 425 vs 509 ms, median 326 vs 507 ms; slow cycles (over 200 ms waiting outside the GPU) 18–23% vs 46–50%; scoring queue p90 27–117 vs 342–350 ms | 4-GPU 1000 steps × 2 rounds, pf4 |
+| `SIMWAM_GRPO_VIS_BACKGROUND` (1) | rank 0 draws its figures in a background thread | the other ranks no longer wait about 0.6 s per figure: about −26 ms per cycle on average on 4 GPUs | 4-GPU 4000 steps, per-rank analysis of CFG |
+
+In the 20000-step FIN20 run the non-eval cycles have a median of 387.9 ms and a 90th percentile of 664.9 ms; that tail is still mostly PDM waits (section 1.2).
+
+### 5.4 CUDA graphs and replay checks
+
+| Switch (default) | Calls covered | Check | Latest check |
+|---|---|---|---|
+| `SIMWAM_GRPO_CUDA_GRAPH` (1) | no-grad `action_velocity`: rollout denoising, old / reference log-probs | `SIMWAM_GRPO_CUDA_GRAPH_VERIFY=1`: every replay compared bit for bit with an eager run | `62acd4c5`, all defaults, 24 steps with an eval: 92 per rank, no mismatch (XV41) |
+| `SIMWAM_GRPO_TRAIN_GRAPH` (1) | the grad-enabled `action_velocity` forward and backward (LoRA gradients leave the graph as outputs) | `SIMWAM_GRPO_TRAIN_GRAPH_VERIFY=1`: output and all 480 LoRA gradients against eager | same run: 24 per rank, error 0 |
+| `SIMWAM_GRPO_PREFILL_GRAPH` (1) | the video prefill (frozen video expert) | covered by the end-to-end comparisons above | 2 GPUs, round 3: −4.2% |
+| `SIMWAM_GRPO_LEAN_ATTN` (1) | Lumen attention's no-grad calls made capturable | `SIMWAM_GRPO_LEAN_ATTN_VERIFY=1` | #51: 4380 calls identical to `hf_attn_patch` |
+
+- The training graphs can only be captured without DeepSpeed (under DeepSpeed ZeRO-1 the capture segfaults; root cause not found); see 5.6.
+- `TRAIN_GRAPH_VERIFY` draws its probe from a private `torch.Generator` (`e527632`), so turning the check on no longer changes the rollout's random numbers.
+- Known issue: `SIMWAM_GRPO_BATCHED_LOGP_VERIFY=1` crashes with the defaults; do not turn it on with them.
+
+### 5.5 Diagnostic statistics
+
+The measurement hook writes these into each cycle's pstats (the hook is not in this repository; the statistics live in `plugin.py`'s `_STATS`, so any tool that reads `_STATS` can use them):
+
+| Statistic | Content | Use |
+|---|---|---|
+| `cuda_graph` | replay, eager and mismatch counts, loads per new condition and `load_mb` (bytes copied into the graphs' static inputs), slot concatenation counts | `load_mb` measures KV_SLOT_STEP_SHARED directly (7.25 GB → 163 MB per 40 steps) |
+| `train_graph` | graph replays and captures, checks and largest error, training slot concatenations | checking the training graphs |
+| `pdm` | per rollout: collect wait, scoring queue delay, prefetch load and barrier times, broken barriers | found why FIN4 waited about 250 ms more per cycle (the PDM_PREFETCH mode) |
+| `SIMWAM_GRPO_CAPTURE_OPLOG=1` | while each CUDA graph is captured, the copy-like ops (copy, clone, cat, add, mul, ...) with shape, count, bytes and calling lines, 25 largest per graph kind | confirmed no video K/V copy inside the graphs; found the training forward's context K/V repeat, about 2.2 GB per forward (a candidate, not done) |
+| `expand_view`, `aiter_gemm`, `lora_cat`, `exact_gate`, ... | hit and fallback counts per switch | checking that a switch is active |
+
+### 5.6 Training without DeepSpeed
+
+| Item | Content | Measured | Source |
+|---|---|---|---|
+| `SIMWAM_GRPO_MANUAL_DP` (1) | the LoRA gradients flattened into one buffer and all-reduced, fp32-master AdamW; the averaged gradient rounded to bf16 and the gradient norm accumulated as ZeRO-1 does (`4af7c72`), bit-identical to DeepSpeed ZeRO-1 | 2 GPUs: without DeepSpeed alone 881 → 749 ms (−15%), with the training graphs 656 ms (−25.5%) | 2 GPUs, A / C / C+B interleaved |
+| with the training graphs | the above plus `SIMWAM_GRPO_TRAIN_GRAPH` | 4 GPUs: DeepSpeed 1316.5 → 812.5 ms (−38.3%), backward about 590 → 249 ms | 4 GPUs, third round |
+| why ZeRO-1 is not needed | 15.7 M trainable parameters, so sharding saves about 94 MB per GPU; ZeRO-1's per-parameter norm and overflow checks are about 16.6k small kernels per step | about 60 ms per cycle in the profile | second-round profile |
+
+Note: checkpoints are not interchangeable between the two modes; to resume an older DeepSpeed checkpoint set `SIMWAM_GRPO_MANUAL_DP=0`.
+
+### 5.7 aiter ops
+
+Already on aiter:
+
+| Op | aiter implementation | Switch |
+|---|---|---|
+| attention forward (rollout and training) | torch flash, aiter CK `fmha_fwd_hd128` underneath | `SIMWAM_GRPO_DROP_MASKS` |
+| attention backward | aiter CK `FmhaBwdDQDKDV` (deterministic mode) | `SIMWAM_GRPO_AITER_ATTN_BWD` |
+| RMSNorm forward | aiter CK `rms_norm` | `SIMWAM_GRPO_AITER_RMSNORM` |
+| affine LayerNorm forward and backward | aiter Triton `layer_norm` | `SIMWAM_GRPO_AITER_LAYERNORM` |
+| `nn.Linear` forward (43 tuned shapes: 18 hipBLASLt, 14 Triton, 11 torch, no split-K) | aiter `tuned_gemm.gemm_a16w16` | `SIMWAM_GRPO_AITER_GEMM` |
+| VAE convolutions | aiter FlyDSL implicit GEMM | `flydsl_conv` in `LUMEN_ENABLE` |
+| DiT patch embedding (Conv3d) | aiter Triton conv3d (`AITER_SRC`) | `aiter_conv` in `LUMEN_ENABLE` |
+
+Not on aiter (times from a one-cycle 2-GPU profile of `4415df7c`, P31; later changes removed part of them):
+
+| Op | Current implementation | Per cycle | aiter has one | Why not replaced |
+|---|---|---:|---|---|
+| backward dX / dW GEMMs | torch → hipBLASLt | 40.3 ms | the tuned GEMM covers the forward layout only | not tried; would change the backward numerics and need re-validation |
+| LORA_CAT's new GEMM shapes | torch → hipBLASLt | not split out | yes, 5 shapes tuned | cycle about −1%, within noise; not included this time |
+| RoPE | own fp32 Triton | 6.1 ms | yes | not tried; already one kernel |
+| RMSNorm backward | own Triton | 2.8 ms | aiter's Triton rmsnorm has a backward | not tried; small expected gain |
+| LayerNorm + modulate (the gate was still torch in P31) | own Triton | 6.1 ms | no matching fusion | no matching op |
+| element-wise add / mul | torch | 37.3 ms (mul 22.1, add 15.2) | yes | memory-bound, a one-for-one swap is not faster; fusion is what helps |
+| cat / copy | torch / HIP runtime | 33.7 ms (cat 14.6, copy 8.4, memcpy 10.7) | no | later KV slots, shared buffers, flat gradients etc. removed part of it (measured per switch in section 4) |
+| AdamW | torch foreach | 1.8 ms | no | no matching op |
+| GELU (tanh) | torch | 3.3 ms | yes (JIT-compiled on first use) | memory-bound, not tried |
+| all-reduce | RCCL | 4.7 ms | yes (for small messages) | not tried |
+
+---
+
+## 6. Runbook
+
+### 6.1 Environment
 
 The image, Lumen, aiter, SimWAM, weights and NAVSIM data are set up as in [README.md](README.md) ("What you need", "Environment"). These results also need:
 
@@ -271,7 +409,7 @@ bash examples/Embodied_SimWAM_NAVSIM/launch_container.sh
 docker exec -it simwam-rl bash examples/Embodied_SimWAM_NAVSIM/setup_env.sh
 ```
 
-### 5.2 Optimized run (FIN20's configuration, all defaults)
+### 6.2 Optimized run (FIN20's configuration, all defaults)
 
 Inside the container, from the Lumen-RL root:
 
@@ -286,9 +424,9 @@ LUMEN_DIR=<Lumen> SIMWAM_ROOT=<SimWAM> AITER_SRC=<aiter hz/grpo-opt checkout> \
 Leave `LUMEN_ENABLE` unset to get the script default `hf_attn_patch,aiter_conv,flydsl_conv`. The log should show
 `aiter_conv bound 63 Conv3d and 10 Conv2d` and no conv3d fallback warning.
 
-### 5.3 Going back to the bit-identical path
+### 6.3 Going back to the bit-identical path
 
-**Most reliable**: use #51's head before this merge, `f3f3ca5` (BX20's code), with `LUMEN_ENABLE=hf_attn_patch`, otherwise as in 5.2.
+**Most reliable**: use #51's head before this merge, `f3f3ca5` (BX20's code), with `LUMEN_ENABLE=hf_attn_patch`, otherwise as in 6.2.
 That combination is bit-identical to the original example `d0ada15` over 8 steps on 4 GPUs.
 
 **On the current code**: set `LUMEN_ENABLE=hf_attn_patch` and turn off every value-changing switch (section "Faster, not bit-identical" of README.md):
@@ -306,7 +444,7 @@ The bit-identical switches (sections 4.4 and 4.5, including `62acd4c5`'s `SIMWAM
 Note: this combination has not been re-checked bit for bit against `d0ada15` on the current head; use `f3f3ca5` when a strictly bit-identical baseline
 is needed. To get `daf60b17`'s (FIN20's) behaviour back only: `SIMWAM_GRPO_EXPAND_VIEW=0 SIMWAM_GRPO_KV_SLOT_STEP_SHARED=0`.
 
-### 5.4 Acceptance
+### 6.4 Acceptance
 
 - The run completes the target steps with exit code 0; the log shows 63 Conv3d bound and no fallback warning.
 - A short run with `SIMWAM_GRPO_CUDA_GRAPH_VERIFY=1 SIMWAM_GRPO_TRAIN_GRAPH_VERIFY=1` (e.g. 24 steps, `eval_every=20`): every graph replay identical to eager.
@@ -315,7 +453,7 @@ is needed. To get `daf60b17`'s (FIN20's) behaviour back only: `SIMWAM_GRPO_EXPAN
 
 ---
 
-## 6. Troubleshooting
+## 7. Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -327,7 +465,7 @@ is needed. To get `daf60b17`'s (FIN20's) behaviour back only: `SIMWAM_GRPO_EXPAN
 
 ---
 
-## 7. Files
+## 8. Files
 
 | File | Role |
 |---|---|
