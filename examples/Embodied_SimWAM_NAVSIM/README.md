@@ -6,6 +6,8 @@ SimWAM under `examples/SimWAM` is an unmodified checkout. The hook lives in `tra
 
 Quantization stays off (`LumenConfig(scaling="none")`). One patch failing to load does not turn the others off; that op stays on torch.
 
+Whole-network performance, accuracy and reproduction on 4×MI350X (20000 steps against the bit-identical baseline): [README_PERF_EN.md](README_PERF_EN.md) (中文：[README_PERF.md](README_PERF.md)).
+
 ## What you need
 
 | Piece | Where |
