@@ -18,7 +18,9 @@ class SweRolloutEnvironment:
     """Runs one rollout of the agent in a fresh, prepared sandbox of the task in `ground_truth`
     (its v5 SWE-bench row as JSON) and sets the trajectory's `env_reward` from grading the
     submitted patch. A sandbox that cannot be opened fails the rollout; a grading failure is
-    logged and scored unresolved, since the rollout itself is still a valid sample."""
+    logged and scored unresolved, since the rollout itself is still a valid sample. A grading
+    harness that cannot be imported (no `swebench` installed) fails the rollout too: it would fail
+    every grade, and a run would train on nothing but unresolved scores."""
 
     def __init__(self, env: SweBenchEnvironment, *, resolved_reward: float = 1.0,
                  unresolved_reward: float = 0.0) -> None:
@@ -37,6 +39,8 @@ class SweRolloutEnvironment:
         try:
             grade = await self._env.grade(task, submission)
             resolved = grade.resolved
+        except ImportError:
+            raise
         except Exception as e:  # noqa: BLE001 - the rollout stands; only its grade is lost
             logger.warning("grading %s failed: %r", task.instance_id, e)
             resolved = False

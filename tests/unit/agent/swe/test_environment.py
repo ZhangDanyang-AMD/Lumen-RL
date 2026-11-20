@@ -2,6 +2,8 @@ import asyncio
 import contextlib
 import json
 
+import pytest
+
 from lumenrl.agent.swe.environment import SweRolloutEnvironment
 from lumenrl.agent.swe.swebench import Grade
 from lumenrl.agent.trajectory import Trajectory
@@ -12,8 +14,8 @@ class FakeBash:
 
 
 class FakeSweEnv:
-    def __init__(self, *, resolved=True, grade_fails=False):
-        self.resolved, self.grade_fails = resolved, grade_fails
+    def __init__(self, *, resolved=True, grade_fails=False, grade_error=None):
+        self.resolved, self.grade_fails, self.grade_error = resolved, grade_fails, grade_error
         self.opened, self.graded = [], []
 
     @contextlib.asynccontextmanager
@@ -23,6 +25,8 @@ class FakeSweEnv:
 
     async def grade(self, task, patch):
         self.graded.append((task.instance_id, patch))
+        if self.grade_error is not None:
+            raise self.grade_error
         if self.grade_fails:
             raise RuntimeError("grading sandbox died")
         return Grade(self.resolved, True, "resolved" if self.resolved else "tests failed")
@@ -65,3 +69,11 @@ def test_a_grading_failure_scores_unresolved_and_keeps_the_rollout():
     t, _ = _rollout(FakeSweEnv(grade_fails=True))
 
     assert t.env_reward == 0.0 and t.prompt_ids == [1, 2]
+
+
+def test_a_missing_grading_harness_fails_the_rollout():
+    # every grade would fail the same way and every rollout would score unresolved
+    env = FakeSweEnv(grade_error=ModuleNotFoundError("No module named 'swebench'"))
+
+    with pytest.raises(ModuleNotFoundError, match="swebench"):
+        _rollout(env)
