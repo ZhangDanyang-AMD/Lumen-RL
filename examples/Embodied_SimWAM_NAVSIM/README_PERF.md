@@ -10,11 +10,13 @@ SimWAM、DeepSpeed、Lumen 都没有修改，所有改动都是本目录 `plugin
 
 | 版本 | 每周期平均耗时 | rollout 平均耗时 | PDMS | 子项 NC / DAC / EP / TTC / C / DDC |
 |---|---:|---:|---:|---|
-| torch bf16 benchmark | 1316.5 ms | 398.2 ms | 91.13 | 98.36 / 98.64 / 85.75 / 95.42 / 99.98 / 98.17 |
+| torch bf16 benchmark | 1383.5 ms | 398.2 ms | 91.13 | 98.36 / 98.64 / 85.75 / 95.42 / 99.98 / 98.17 |
 | 最终版 | 371.2 ms | 204.4 ms | 91.11 | 98.36 / 98.65 / 85.80 / 95.28 / 99.99 / 98.25 |
-| 差 | −72%（3.5×） | −49%（1.95×） | −0.02 | 0.00 / +0.01 / +0.05 / −0.14 / +0.01 / +0.08 |
+| 差 | −73%（3.73×） | −49%（1.95×） | −0.02 | 0.00 / +0.01 / +0.05 / −0.14 / +0.01 / +0.08 |
 
-- 耗时：4 卡，rank 0 第 16–56 步的 11 个周期（每次 60 步的短运行，同一组 4 卡、同一口径；benchmark 是 DeepSpeed ZeRO-1 的比特一致版本 `f27ab82`，见 1.3 节）。
+- 耗时：4 卡，rank 0，`step_start` 16–56 的 11 个周期（第 17–60 步，没有 eval）的平均。benchmark 是 DeepSpeed ZeRO-1 的比特一致版本 `f27ab82`：
+  1383.5 ms 是两次 60 步运行共 22 个周期的平均（两次分别 1422.8 / 1344.3 ms）。最终版的 371.2 ms 取自 FIN20（`daf60b17`，`max_steps=20000`）本身的第 17–60 步。
+  两边的平均都被少数等 PDM 打分的慢周期拉高（同窗口中位数 1317.0 对 303.3 ms，见 1.3 节）。
 - PDMS：全集 navtest（12146 token），训练 20000 步后的 checkpoint。benchmark 的 PDMS 取与它逐位相同的比特一致版本 BX20；子项由差值反推（±0.01）。
 - 20000 步全程（包含 eval、可视化和 PDM 等待）：最终版平均周期 522.9 ms、总时长 43.6 min，BX20 1054.1 ms、87.8 min，见 1.1 节。
 - PDMS 平均分没有差别（逐 token 配对 −0.02，p = 0.75），但 gate 翻转偏向变差、主要在 TTC，见 3.3 节。
@@ -73,21 +75,24 @@ GPU 阶段的中位数从 816.1 降到 293.2 ms，但周期里还有 GPU 之外�
 | 训练反向 ×4 | 248.8 | 78.8 | Triton RMSNorm 反向、aiter attention 反向、梯度直写 flat 缓冲 |
 | optimizer ×4 | 13.9 | 14.7 | |
 
-总表口径（60 步短运行）下 rollout 子阶段的倍数：去噪 2.77×、条件构建 2.40×、策略 log-prob 4.13×、参考 log-prob 4.33×、VAE 1.05×。
-短运行只覆盖前 56 步，PDM 打分的长尾和 eval 的占比都和 20000 步不同，所以整网的主口径仍是 20000 步的平均周期和总时长。
+总表口径（第 17–60 步）下 rollout 子阶段的倍数：去噪 2.77×、条件构建 2.40×、策略 log-prob 4.13×、参考 log-prob 4.33×、VAE 1.05×。
+这个窗口只覆盖前 60 步，PDM 打分的长尾和 eval 的占比都和 20000 步全程不同，所以整网的主口径仍是 20000 步的平均周期和总时长。
 
 ### 1.3 和 DeepSpeed 基线的对比（补充）
 
 原始示例用 DeepSpeed ZeRO-1 训练。#51 第三轮在同一组 4 卡上测过比特一致的 DeepSpeed 版本（`f27ab82`，2026-11-18，GPU 4–7，
-`LUMEN_ENABLE=hf_attn_patch`，每次 60 步，rank 0 取第 16 步起 11 个周期的中位数，两次）：1328 / 1305 ms，平均 1316.5 ms。
+`LUMEN_ENABLE=hf_attn_patch`，两次各 60 步）。和 FIN20 取同一窗口（rank 0，`step_start` 16–56，即第 17–60 步，没有 eval）：
 
-| | DeepSpeed ZeRO-1（`f27ab82`） | FIN20（`daf60b17`） | 比值 |
+| 第 17–60 步 | DeepSpeed ZeRO-1（`f27ab82`，两次共 22 个周期） | FIN20（`daf60b17`，11 个周期） | 比值 |
 |---|---:|---:|---:|
-| 周期中位数 | 1316.5 ms | 398.9 ms（全部周期）/ 387.9 ms（非 eval 周期） | 3.30× / 3.39× |
+| 每周期平均 | 1383.5 ms（两次分别 1422.8 / 1344.3） | 371.2 ms | **3.73×** |
+| 每周期中位数 | 1317.0 ms（两次分别 1328.0 / 1305.3） | 303.3 ms | 4.34× |
 
-口径限制：DeepSpeed 的数字来自 60 步的短运行，FIN20 来自 20000 步；两者不在同一组运行里交替测量，DeepSpeed 没有 20000 步的平均周期和总时长。
-所以这一行只作量级参考，主口径仍是 1.1 节和 BX20 的同口径对比。原始示例 `d0ada15`（DeepSpeed，`hf_attn_patch,lumen_linear`）
-同期只测到一次 6076 ms（第二次被外部进程打断）。
+口径限制：
+- 两边的平均都被少数等 PDM 打分的慢周期拉高，所以平均（3.73×）比中位数（4.34×）小。
+- DeepSpeed 的两次是单独的 60 步运行，FIN20 的窗口取自 20000 步运行的开头，两者不在同一组运行里交替测量；DeepSpeed 没有 20000 步的平均周期和总时长。
+- 所以这一节只作补充，主口径仍是 1.1 节和 BX20 在 20000 步上的同口径对比。原始示例 `d0ada15`（DeepSpeed，`hf_attn_patch,lumen_linear`）
+  同期只测到一次 6076 ms（第二次被外部进程打断）。
 
 ### 1.4 报告边界
 
@@ -206,7 +211,7 @@ FIN20 和 BX20 之间有 217 个 token 至少有一个 gate 的结果不同，�
 | `SIMWAM_GRPO_LEAN_ATTN`（1） | Lumen attention 的 no-grad 调用可被 graph 捕获、一次 launch | 同上 |
 | `SIMWAM_GRPO_PDM_WORKERS`（8） | PDM 奖励在进程池里并行打分 | 同上 |
 | `SIMWAM_GRPO_OVERLAP_REWARD`、`SIMWAM_GRPO_FUSED_LORA` | PDM 打分和 rollout log-prob 重叠；LoRA 输出一次 `torch.add` | 第二轮合计（BX2，4 卡）：−9.0% |
-| `SIMWAM_GRPO_MANUAL_DP`（1）、`SIMWAM_GRPO_TRAIN_GRAPH`（1） | 不用 DeepSpeed 的数据并行（fp32 master AdamW，和 ZeRO-1 逐位一致）+ 训练前向反向 CUDA graph | 4 卡：DeepSpeed 1316.5 → 812.5 ms（−38.3%） |
+| `SIMWAM_GRPO_MANUAL_DP`（1）、`SIMWAM_GRPO_TRAIN_GRAPH`（1） | 不用 DeepSpeed 的数据并行（fp32 master AdamW，和 ZeRO-1 逐位一致）+ 训练前向反向 CUDA graph | 4 卡（两次运行各自中位数的平均）：DeepSpeed 1316.5 → 812.5 ms（−38.3%） |
 
 ### 4.2 attention 和 GEMM 路径（`c040e02`，4 卡、60 步、逐项叠加，两次交替）
 
@@ -349,7 +354,7 @@ PDM 奖励由 CPU 上的闭环仿真算出，个别 token 的 metric cache 加�
 | 项 | 内容 | 实测 | 来源 |
 |---|---|---|---|
 | `SIMWAM_GRPO_MANUAL_DP`（1） | LoRA 梯度拼成一个缓冲做 all-reduce，fp32 master AdamW；平均后的梯度先舍入到 bf16、梯度范数按 ZeRO-1 的方式累加（`4af7c72`），和 DeepSpeed ZeRO-1 逐位一致 | 2 卡：单独换掉 DeepSpeed 881 → 749 ms（−15%），再加训练 graph 656 ms（−25.5%） | 2 卡，A / C / C+B 交替 |
-| 加训练 graph 后 | 同上 + `SIMWAM_GRPO_TRAIN_GRAPH` | 4 卡：DeepSpeed 1316.5 → 812.5 ms（−38.3%），反向约 590 → 249 ms | 4 卡，第三轮 |
+| 加训练 graph 后 | 同上 + `SIMWAM_GRPO_TRAIN_GRAPH` | 4 卡（两次运行各自中位数的平均）：DeepSpeed 1316.5 → 812.5 ms（−38.3%），反向约 590 → 249 ms | 4 卡，第三轮 |
 | 为什么可以不用 ZeRO-1 | 可训练参数只有 15.7 M，分片每卡只省约 94 MB；ZeRO-1 每步的逐参数范数和溢出检查约 1.66 万个小 kernel | profile 中约 60 ms / 周期 | 第二轮 profile |
 
 注意：两种模式的 checkpoint 不能互相 resume；要接着跑旧的 DeepSpeed checkpoint，设 `SIMWAM_GRPO_MANUAL_DP=0`。

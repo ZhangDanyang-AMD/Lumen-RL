@@ -11,11 +11,14 @@ directory's `plugin.py` behind an environment switch.
 
 | Version | Mean cycle | Mean rollout | PDMS | NC / DAC / EP / TTC / C / DDC |
 |---|---:|---:|---:|---|
-| torch bf16 benchmark | 1316.5 ms | 398.2 ms | 91.13 | 98.36 / 98.64 / 85.75 / 95.42 / 99.98 / 98.17 |
+| torch bf16 benchmark | 1383.5 ms | 398.2 ms | 91.13 | 98.36 / 98.64 / 85.75 / 95.42 / 99.98 / 98.17 |
 | final version | 371.2 ms | 204.4 ms | 91.11 | 98.36 / 98.65 / 85.80 / 95.28 / 99.99 / 98.25 |
-| difference | −72% (3.5×) | −49% (1.95×) | −0.02 | 0.00 / +0.01 / +0.05 / −0.14 / +0.01 / +0.08 |
+| difference | −73% (3.73×) | −49% (1.95×) | −0.02 | 0.00 / +0.01 / +0.05 / −0.14 / +0.01 / +0.08 |
 
-- Times: 4 GPUs, rank 0, the 11 cycles of steps 16–56 (60-step runs on the same GPUs with the same method; the benchmark is the bit-identical DeepSpeed ZeRO-1 path `f27ab82`, see 1.3).
+- Times: 4 GPUs, rank 0, mean of the 11 cycles with `step_start` 16–56 (steps 17–60, no eval). The benchmark is the bit-identical DeepSpeed ZeRO-1
+  path `f27ab82`: 1383.5 ms is the mean of the 22 cycles of two 60-step runs (1422.8 / 1344.3 ms each). The final version's 371.2 ms is steps 17–60 of
+  FIN20 itself (`daf60b17`, `max_steps=20000`). Both means are pulled up by a few cycles that wait for the PDM scores (medians of the same window
+  1317.0 vs 303.3 ms, see 1.3).
 - PDMS: full navtest (12146 tokens), checkpoint after 20000 training steps. The benchmark's PDMS is that of BX20, the bit-identical run that
   reproduces it bit for bit; its sub-scores are derived from the differences (±0.01).
 - Over the whole 20000 steps (eval, visualisation and PDM waits included): final version mean cycle 522.9 ms, total 43.6 min; BX20 1054.1 ms, 87.8 min (section 1.1).
@@ -76,22 +79,26 @@ The GPU phases drop from 816.1 to 293.2 ms (medians), but a cycle also has time 
 | training backward ×4 | 248.8 | 78.8 | Triton RMSNorm backward, aiter attention backward, gradients written into the flat buffer |
 | optimizer ×4 | 13.9 | 14.7 | |
 
-Rollout sub-phases under the overview table's method (60-step runs): denoising 2.77×, condition build 2.40×, policy log-probs 4.13×, reference log-probs 4.33×,
-VAE 1.05×. Short runs cover only the first 56 steps, where the PDM tail and the share of the eval differ from a 20000-step run, so the main whole-network
-figures remain the 20000-step mean cycle and total time.
+Rollout sub-phases under the overview table's method (steps 17–60): denoising 2.77×, condition build 2.40×, policy log-probs 4.13×, reference log-probs
+4.33×, VAE 1.05×. That window covers only the first 60 steps, where the PDM tail and the share of the eval differ from the whole 20000-step run, so the
+main whole-network figures remain the 20000-step mean cycle and total time.
 
 ### 1.3 Against the DeepSpeed baseline (supplementary)
 
 The original example trains with DeepSpeed ZeRO-1. #51's third round measured the bit-identical DeepSpeed path (`f27ab82`) on the same 4 GPUs
-(2026-11-18, GPUs 4–7, `LUMEN_ENABLE=hf_attn_patch`, 60 steps per run, rank-0 median of the 11 cycles from step 16, two runs): 1328 / 1305 ms, mean 1316.5 ms.
+(2026-11-18, GPUs 4–7, `LUMEN_ENABLE=hf_attn_patch`, two runs of 60 steps). Over the same window as FIN20 (rank 0, `step_start` 16–56, i.e. steps 17–60, no eval):
 
-| | DeepSpeed ZeRO-1 (`f27ab82`) | FIN20 (`daf60b17`) | ratio |
+| Steps 17–60 | DeepSpeed ZeRO-1 (`f27ab82`, 22 cycles of two runs) | FIN20 (`daf60b17`, 11 cycles) | ratio |
 |---|---:|---:|---:|
-| Median cycle | 1316.5 ms | 398.9 ms (all cycles) / 387.9 ms (non-eval cycles) | 3.30× / 3.39× |
+| Mean cycle | 1383.5 ms (1422.8 / 1344.3 per run) | 371.2 ms | **3.73×** |
+| Median cycle | 1317.0 ms (1328.0 / 1305.3 per run) | 303.3 ms | 4.34× |
 
-Limits: the DeepSpeed figure comes from 60-step runs and FIN20 from 20000 steps; they were not interleaved in one group, and there is no 20000-step mean
-or total time for DeepSpeed. This row is an order of magnitude only; the main comparison is the like-for-like one against BX20 in 1.1. The original
-example `d0ada15` (DeepSpeed, `hf_attn_patch,lumen_linear`) was measured once at the time, 6076 ms (its second run was interrupted by another process).
+Limits:
+- Both means are pulled up by a few cycles that wait for the PDM scores, which is why the mean ratio (3.73×) is below the median ratio (4.34×).
+- The DeepSpeed runs are separate 60-step runs while FIN20's window is the start of a 20000-step run; they were not interleaved in one group, and
+  there is no 20000-step mean or total time for DeepSpeed.
+- This section is supplementary; the main comparison is the like-for-like one against BX20 over 20000 steps in 1.1. The original example `d0ada15`
+  (DeepSpeed, `hf_attn_patch,lumen_linear`) was measured once at the time, 6076 ms (its second run was interrupted by another process).
 
 ### 1.4 Scope
 
@@ -212,7 +219,7 @@ training's log-probs are identical (|Δlogp| = 0). Gains are as measured when ea
 | `SIMWAM_GRPO_LEAN_ATTN` (1) | Lumen attention's no-grad calls capturable and launched once | as above |
 | `SIMWAM_GRPO_PDM_WORKERS` (8) | PDM rewards scored in a process pool | as above |
 | `SIMWAM_GRPO_OVERLAP_REWARD`, `SIMWAM_GRPO_FUSED_LORA` | PDM scoring overlapped with the rollout's log-probs; LoRA output with one `torch.add` | second round together (BX2, 4 GPUs): −9.0% |
-| `SIMWAM_GRPO_MANUAL_DP` (1), `SIMWAM_GRPO_TRAIN_GRAPH` (1) | data parallel without DeepSpeed (fp32-master AdamW, bit-identical to ZeRO-1) plus CUDA graphs for the training forward and backward | 4 GPUs: DeepSpeed 1316.5 → 812.5 ms (−38.3%) |
+| `SIMWAM_GRPO_MANUAL_DP` (1), `SIMWAM_GRPO_TRAIN_GRAPH` (1) | data parallel without DeepSpeed (fp32-master AdamW, bit-identical to ZeRO-1) plus CUDA graphs for the training forward and backward | 4 GPUs (mean of the two runs' medians): DeepSpeed 1316.5 → 812.5 ms (−38.3%) |
 
 ### 4.2 Attention and GEMM paths (`c040e02`; 4 GPUs, 60 steps, one switch added per row, two interleaved runs)
 
@@ -357,7 +364,7 @@ The measurement hook writes these into each cycle's pstats (the hook is not in t
 | Item | Content | Measured | Source |
 |---|---|---|---|
 | `SIMWAM_GRPO_MANUAL_DP` (1) | the LoRA gradients flattened into one buffer and all-reduced, fp32-master AdamW; the averaged gradient rounded to bf16 and the gradient norm accumulated as ZeRO-1 does (`4af7c72`), bit-identical to DeepSpeed ZeRO-1 | 2 GPUs: without DeepSpeed alone 881 → 749 ms (−15%), with the training graphs 656 ms (−25.5%) | 2 GPUs, A / C / C+B interleaved |
-| with the training graphs | the above plus `SIMWAM_GRPO_TRAIN_GRAPH` | 4 GPUs: DeepSpeed 1316.5 → 812.5 ms (−38.3%), backward about 590 → 249 ms | 4 GPUs, third round |
+| with the training graphs | the above plus `SIMWAM_GRPO_TRAIN_GRAPH` | 4 GPUs (mean of the two runs' medians): DeepSpeed 1316.5 → 812.5 ms (−38.3%), backward about 590 → 249 ms | 4 GPUs, third round |
 | why ZeRO-1 is not needed | 15.7 M trainable parameters, so sharding saves about 94 MB per GPU; ZeRO-1's per-parameter norm and overflow checks are about 16.6k small kernels per step | about 60 ms per cycle in the profile | second-round profile |
 
 Note: checkpoints are not interchangeable between the two modes; to resume an older DeepSpeed checkpoint set `SIMWAM_GRPO_MANUAL_DP=0`.
