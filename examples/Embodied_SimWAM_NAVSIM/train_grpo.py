@@ -34,6 +34,7 @@ from examples.Embodied_SimWAM_NAVSIM.plugin import (
     install_drop_true_masks,
     install_eval_empty_cache,
     install_exact_gate,
+    install_expand_view,
     install_foreach_grad_checks,
     install_fused_ln_modulate,
     install_fused_modulate,
@@ -66,6 +67,8 @@ install_ref_logprob_cache()
 install_lean_lumen_attention()
 # after the lean attention (its SDPA wrapper must be outermost), before the graphs that capture it
 install_drop_true_masks()
+# around the mask check of expand_condition
+install_expand_view()
 # outside the mask check of the prefill, which must not run under capture
 install_prefill_graph()
 install_action_velocity_graphs()

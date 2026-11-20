@@ -523,6 +523,45 @@ def install_drop_true_masks() -> None:
     MoT.prefill_video_cache = prefill_video_cache
 
 
+def install_expand_view() -> None:
+    """Repeat a one-sample condition's video K/V over the group as a broadcast view instead of a copy.
+
+    ``expand_condition`` repeats every layer's cached video K/V ``group_size`` times along the batch
+    (``repeat_interleave``): 60 copies of ``[G, 252, 3072]`` per rollout, about 0.7 GB written and held while the
+    condition lives. With one sample per condition (the batch per rank here) the same values are an ``expand``
+    view of the ``[1, 252, 3072]`` cache. Every reader copies or concatenates them (the CUDA graphs' static
+    buffers, the shared repeated buffers, the attention's ``cat`` with the action K/V), so their outputs are the
+    same bit for bit; an in-place write into the view would raise instead of changing other rows. The context and
+    its mask are still repeated as before (the context enters GEMMs, whose kernel may depend on the strides).
+    ``SIMWAM_GRPO_EXPAND_VIEW=0`` turns it off.
+    """
+    if not _switch("SIMWAM_GRPO_EXPAND_VIEW", "1"):
+        return
+    from simwam.models.wan22.simwam_grpo import ActionGRPOMixin
+
+    if getattr(ActionGRPOMixin.expand_condition, "_view", False):
+        return
+    original = ActionGRPOMixin.expand_condition
+    stats = {"views": 0, "copies": 0}
+
+    def expand_condition(self, cond, group_size, *args, **kwargs):
+        g = int(group_size)
+        kv = cond.get("video_kv_cache") or []
+        if g <= 1 or not kv or any(t.shape[0] != 1 or t.requires_grad for layer in kv for t in (layer["k"], layer["v"])):
+            stats["copies"] += 1
+            return original(self, cond, group_size, *args, **kwargs)
+        out = original(self, {**cond, "video_kv_cache": []}, group_size, *args, **kwargs)
+        out["video_kv_cache"] = [{"k": layer["k"].expand(g, *layer["k"].shape[1:]),
+                                  "v": layer["v"].expand(g, *layer["v"].shape[1:])} for layer in kv]
+        stats["views"] += 1
+        return out
+
+    expand_condition._view = True
+    ActionGRPOMixin.expand_condition = expand_condition
+    _STATS["expand_view"] = stats
+    logger.info("one-sample conditions repeat their video K/V as broadcast views")
+
+
 def install_action_velocity_graphs() -> None:
     """Replay ``action_velocity`` from CUDA graphs when no gradient is needed.
 
@@ -552,9 +591,13 @@ def install_action_velocity_graphs() -> None:
     # action rows, into the static buffers the shared video K/V are the leading rows of (SIMWAM_GRPO_KV_SLOT_TRAIN);
     # while a training forward awaits its backward they use graphs captured without it
     kv_slot_shared = _switch("SIMWAM_GRPO_KV_SLOT_SHARED_NOGRAD", "1")
+    # SIMWAM_GRPO_KV_SLOT_STEP_SHARED (on; 0 turns it off): the per-step calls (rollout denoising) read the video
+    # K/V in place from the leading rows of the condition's shared buffers, filled when the condition is first used,
+    # instead of copying them into the graph's own slot buffers on every new condition
+    kv_step_shared = _switch("SIMWAM_GRPO_KV_SLOT_STEP_SHARED", "1")
     graphs = {}
     stats = {"replay": 0, "eager": 0, "mismatch": 0, "loads": 0, "kv_slots": 0, "kv_slot_cats": 0,
-             "kv_slot_shared_cats": 0}
+             "kv_slot_shared_cats": 0, "step_shared": 0}
     serial = [0]
     in_eval = [False]
     shared_slot = [False]
@@ -577,6 +620,10 @@ def install_action_velocity_graphs() -> None:
                     hit = None
             if hit is not None:
                 full, sv = hit
+                if shared and 0 < a.shape[0] < full.shape[0]:
+                    # the leading rows of a shared buffer (SIMWAM_GRPO_KV_SLOT_STEP_SHARED): contiguous, the same
+                    # layout as a per-step graph's own slot buffer
+                    full = full[:a.shape[0]]
                 if (a.dtype == b.dtype == full.dtype and tuple(a.shape) == (full.shape[0], sv, *full.shape[2:])
                         and tuple(b.shape) == (full.shape[0], full.shape[1] - sv, *full.shape[2:])):
                     full[:, sv:].copy_(b)
@@ -665,9 +712,19 @@ def install_action_velocity_graphs() -> None:
         slot = kv_slot and not in_eval[0]
         slot_shared = (kv_slot_shared and slot and _XKV["reps"] > 1 and bool(_KV_TRAIN_SLOTS)
                        and _TRAIN_PENDING["n"] == 0)
+        step_shared = False
+        w = int(getattr(self, "grpo_num_sde_steps", 0) or 0)
+        if (kv_step_shared and slot and _XKV["reps"] <= 1 and _SHARED_KV["repeat"] is not None and w > 1
+                and not getattr(self, "grpo_merge_sde_window", False) and _RT.get("SIMWAM_GRPO_KV_SLOT_TRAIN")
+                and _TRAIN_PENDING["n"] == 0):
+            shared_tensors = _step_shared_tensors(cond, tensors, lambda: _SHARED_KV["repeat"](cond, w))
+            if shared_tensors is not None:
+                tensors, step_shared = shared_tensors, True
+                slot_shared = True
+                stats["step_shared"] += 1
         key = (bool(use_ref), tuple(latents_action.shape), tuple(latents_action.stride()), tuple(timestep_action.shape),
                int(cond["video_seq_len"]), tuple((tuple(t.shape), t.dtype) for t in tensors), lean,
-               xkv is not None, _XKV["reps"], slot, slot_shared)
+               xkv is not None, _XKV["reps"], slot, slot_shared, step_shared)
         g = graphs.get(key)
         if g is None and lean is False:
             # hf_attn_patch falls back to torch SDPA when a host copy fails under capture, so a
@@ -688,7 +745,7 @@ def install_action_velocity_graphs() -> None:
             serial[0] += 1
             tag = cond["_cuda_graph_tag"] = serial[0]
         if g["loaded"] != tag:
-            _copy_changed(g["tensors"], tensors)
+            stats["load_mb"] = round(stats.get("load_mb", 0.0) + _copy_changed(g["tensors"], tensors) / 2**20, 1)
             g["loaded"] = tag
             stats["loads"] += 1
         g["lat"].copy_(latents_action)
@@ -1112,6 +1169,31 @@ _KV_TRAIN_SLOTS = {}
 # training-graph forwards whose backward has not run yet: their action rows in _KV_TRAIN_SLOTS are still needed,
 # so a no-grad call meanwhile must not write there (SIMWAM_GRPO_KV_SLOT_SHARED_NOGRAD)
 _TRAIN_PENDING = {"n": 0}
+# install_batched_logprobs' shared_repeat(cond, w): the condition repeated w times in the shared buffers (filled
+# when another condition held them), for the per-step graphs with SIMWAM_GRPO_KV_SLOT_STEP_SHARED
+_SHARED_KV = {"repeat": None}
+
+
+def _step_shared_tensors(cond, tensors, get_rep):
+    """SIMWAM_GRPO_KV_SLOT_STEP_SHARED: ``tensors`` (the video K/V of every layer, then the other condition
+    tensors) with the video K/V replaced by the leading rows of the condition's shared buffers, which are the
+    leading rows of the static slot buffers of KV_SLOT_TRAIN; None when they cannot be used (one-sample
+    conditions, buffers without slots, other shapes). ``get_rep()`` returns the repeated condition."""
+    n = 2 * len(cond["video_kv_cache"])
+    rows = int(tensors[0].shape[0]) if n else 0
+    if rows < 2:
+        return None
+    rep = get_rep()
+    kv = [t for layer in rep["video_kv_cache"] for t in (layer["k"], layer["v"])]
+    if len(kv) != n:
+        return None
+    out = []
+    for t, s in zip(tensors[:n], kv):
+        if not (_kv_shared(s) and s.data_ptr() in _KV_TRAIN_SLOTS and s.dtype == t.dtype and s.dim() == t.dim()
+                and s.shape[0] > rows and s.shape[1:] == t.shape[1:]):
+            return None
+        out.append(s[:rows])
+    return out + list(tensors[n:])
 # SIMWAM_GRPO_TRAIN_GRAD_FLAT: the manual-DP optimizer's flat bf16 gradient buffer and id(param) -> (offset,
 # numel, shape) inside it; the training graphs' backward writes the LoRA gradients there
 _GRAD_FLAT = {}
@@ -1337,12 +1419,14 @@ def _kv_shared(t) -> bool:
     return bool(_KV_SHARE["ptrs"]) and t.data_ptr() in _KV_SHARE["ptrs"]
 
 
-def _copy_changed(dst, src) -> None:
+def _copy_changed(dst, src) -> int:
+    """Copy each source into its static tensor unless they are the same memory; returns the bytes written."""
     pairs = [(d, s) for d, s in zip(dst, src) if d.data_ptr() != s.data_ptr()]
     if pairs:
         import torch
 
         torch._foreach_copy_([d for d, _ in pairs], [s for _, s in pairs])
+    return sum(d.numel() * d.element_size() for d, _ in pairs)
 
 
 def _chunk_active(x) -> bool:
@@ -1536,6 +1620,9 @@ def install_batched_logprobs() -> None:
             rep["context"], rep["context_mask"] = bufs[2 * n], bufs[2 * n + 1]
             cond[key] = rep
         return rep
+
+    if share:
+        _SHARED_KV["repeat"] = shared_repeat
 
     def repeat_cond(cond, w):
         if share:
@@ -1958,7 +2045,12 @@ def install_train_graphs() -> None:
                 expert.freqs = freqs.to(args[0].device)
         layers = len(cond["video_kv_cache"])
         rest = {k: v for k, v in cond.items() if k not in _COND and k != "_cuda_graph_tag"}
-        inputs = [t if _kv_shared(t) else torch.empty_strided(t.shape, t.stride(), dtype=t.dtype, device=t.device)
+        # a broadcast input (SIMWAM_GRPO_EXPAND_VIEW) gets dense storage: a static copy with its stride-0 dims would
+        # alias its elements
+        inputs = [t if _kv_shared(t)
+                  else torch.empty(t.shape, dtype=t.dtype, device=t.device)
+                  if any(st == 0 and n > 1 for st, n in zip(t.stride(), t.shape))
+                  else torch.empty_strided(t.shape, t.stride(), dtype=t.dtype, device=t.device)
                   for t in args]
         _copy_changed(inputs, list(args))
         static_views = {}
