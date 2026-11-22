@@ -6,6 +6,7 @@
 #   SC, no IS  : algorithm.score_centering.is_mode=none
 #   DAPO + TIS : algorithm.score_centering.enabled=false
 #                quantization.rollout_correction.rollout_is=token
+#   DAPO, no IS: algorithm.score_centering.enabled=false   (uncorrected baseline)
 #
 # verl-aligned Ray online rollout — FORMAL LONG RUN (Qwen3-8B-Base, DAPO math).
 # MEGATRON training backend variant of dapo_qwen3_8b_ray_vllm_longrun.yaml.
