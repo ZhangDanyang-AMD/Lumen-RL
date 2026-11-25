@@ -20,7 +20,15 @@ Usage in training step::
 
 from __future__ import annotations
 
+import functools
+import hashlib
+import importlib
+import inspect
+import json
 import logging
+import os
+import threading
+from pathlib import Path
 from typing import NamedTuple, Tuple
 
 import torch
@@ -191,6 +199,16 @@ def pack_sequences(
     )
 
 
+def _atom_true_vocab_size(width: int) -> int:
+    value = os.environ.get("LUMENRL_ATOM_TRUE_VOCAB_SIZE")
+    if value is None:
+        raise RuntimeError("ATOM alignment requires a resolved true vocabulary size")
+    true_vocab = int(value)
+    if not 0 < true_vocab <= width:
+        raise ValueError("ATOM true vocabulary must fit the logits width")
+    return true_vocab
+
+
 def packed_token_log_probs(
     logits: torch.Tensor,
     packed_ids: torch.Tensor,
@@ -224,6 +242,29 @@ def packed_token_log_probs(
     # not_last[j] = True if j is NOT the last token of any sequence
     not_last = torch.ones(total_tokens, dtype=torch.bool, device=device)
     not_last[cu_seqlens[1:].long() - 1] = False
+
+    if os.environ.get("LUMENRL_ATOM_OP_ALIGNMENT", "0") == "1":
+        # ATOM reports raw fp32 log-softmax, not temperature-scaled sampling logprobs.
+        # Slice rows before gathering to avoid another full-vocabulary logits copy.
+        if total_tokens == 0:
+            return logits.new_empty(0, dtype=torch.float32)
+        true_vocab = _atom_true_vocab_size(logits.shape[-1])
+        if bool((packed_ids >= true_vocab).any()):
+            raise ValueError("Packed token ID is outside ATOM's true vocabulary")
+        padded_columns = torch.arange(logits.shape[-1], device=device) >= true_vocab
+        targets = torch.empty_like(packed_ids)
+        targets[:-1] = packed_ids[1:]
+        targets[-1] = 0
+        parts = []
+        for start in range(0, total_tokens, 256):
+            end = min(start + 256, total_tokens)
+            # Match ATOM's padded-width masked reduction without mutating FSDP output.
+            z = logits[start:end].float().masked_fill(padded_columns, float("-inf"))
+            row_lp = F.log_softmax(z, dim=-1)
+            parts.append(row_lp.gather(-1, targets[start:end, None]).squeeze(-1))
+        if not parts:
+            return logits.new_empty(0, dtype=torch.float32)
+        return torch.cat(parts)[not_last]
 
     if _FUSED_CROSS_ENTROPY is not None and logits.is_cuda:
         # Fused path: one Triton kernel over the full (total_tokens, V) buffer,
@@ -287,6 +328,12 @@ def packed_token_entropy(
     Returns a flat ``(total_tokens - B,)`` tensor aligned with
     :func:`packed_token_log_probs` output.
     """
+    if os.environ.get("LUMENRL_ATOM_OP_ALIGNMENT", "0") == "1":
+        # Metrics use the same raw fp32 distribution as aligned token logprobs.
+        temperature, upcast = 1.0, True
+        true_vocab = _atom_true_vocab_size(logits.shape[-1])
+        # A zero-probability padded column must not introduce 0 * -inf NaNs.
+        logits = logits[:, :true_vocab]
     total_real = int(cu_seqlens[-1].item())
     logits = logits[:total_real]
     total_tokens = total_real
@@ -358,6 +405,189 @@ def unpack_log_probs(
 # ---------------------------------------------------------------------------
 
 _original_attn_fn = None  # saved reference to the previous sdpa function
+_ALIGNED_ATTN_LAUNCH_LOCK = threading.RLock()
+_ALIGNED_ATTN_INITIALIZED = {}
+_ALIGNED_ATTN_CONFIG_KEYS = frozenset({
+    "BLOCK_M", "BLOCK_N", "PRELOAD_V", "waves_per_eu", "num_warps",
+    "num_ctas", "num_stages", "enable_fp_fusion",
+})
+
+
+@functools.lru_cache(maxsize=4)
+def _load_aligned_attention_contract(path: str, expected_sha256: str):
+    """Load the explicit shared candidate once; never derive config from shape."""
+    raw = Path(path).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected_sha256.lower():
+        raise RuntimeError("Shared Attention config SHA256 mismatch")
+    contract = json.loads(raw)
+    if (contract.get("schema_version") != 1 or contract.get("backend") != "triton"
+            or contract.get("arch") != "gfx950" or contract.get("dtype") != "bfloat16"
+            or contract.get("module") != "aiter.ops.triton.attention.mha"
+            or contract.get("function") != "flash_attn_varlen_func"):
+        raise RuntimeError("Unsupported shared Attention contract")
+    config = contract["config"]
+    if set(config) != _ALIGNED_ATTN_CONFIG_KEYS or config["enable_fp_fusion"] is not False:
+        raise RuntimeError("Shared Attention requires a complete explicit no-fusion config")
+    if type(config["PRELOAD_V"]) is not bool:
+        raise RuntimeError("Invalid shared Attention PRELOAD_V")
+    for name in _ALIGNED_ATTN_CONFIG_KEYS - {"PRELOAD_V", "enable_fp_fusion"}:
+        if type(config[name]) is not int or config[name] <= 0:
+            raise RuntimeError("Invalid shared Attention launch option: " + name)
+    required_state = {"_MHA_IMPL": "default", "_USE_FUSED_BWD_KERNEL": False,
+                      "_USE_INT64_STRIDES": True}
+    if contract.get("runtime_requirements") != required_state:
+        raise RuntimeError("Shared Attention runtime requirements differ")
+    source_modules = {
+        "aiter/ops/triton/attention/mha.py": "aiter.ops.triton.attention.mha",
+        "aiter/ops/triton/_triton_kernels/attention/mha.py": "aiter.ops.triton._triton_kernels.attention.mha",
+        "aiter/ops/triton/attention/mha_onekernel_bwd.py": "aiter.ops.triton.attention.mha_onekernel_bwd",
+        "triton/backends/amd/compiler.py": "triton.backends.amd.compiler",
+    }
+    if set(contract["sources"]) != set(source_modules):
+        raise RuntimeError("Shared Attention dependency identities are incomplete")
+    for name, module_name in source_modules.items():
+        source = contract["sources"][name]
+        actual_module = importlib.import_module(module_name)
+        if (Path(actual_module.__file__).resolve() != Path(source["path"]).resolve()
+                or hashlib.sha256(Path(actual_module.__file__).read_bytes()).hexdigest() != source["sha256"]):
+            raise RuntimeError("Shared Attention dependency source SHA256 mismatch")
+    api = importlib.import_module(contract["module"])
+    if (Path(api.__file__).resolve() != Path(contract["module_path"]).resolve()
+            or hashlib.sha256(Path(api.__file__).read_bytes()).hexdigest() != contract["module_sha256"]):
+        raise RuntimeError("Shared Attention public module identity mismatch")
+    function = getattr(api, contract["function"])
+    if (hashlib.sha256(inspect.getsource(function).encode("utf-8")).hexdigest() != contract["function_sha256"]
+            or str(inspect.signature(function)) != contract["api_signature"]):
+        raise RuntimeError("Shared Attention public function identity mismatch")
+    compiler = importlib.import_module("triton.backends.amd.compiler")
+    if "enable_fp_fusion" not in compiler.HIPOptions.__dataclass_fields__:
+        raise RuntimeError("Compiler cannot enforce shared Attention no-fusion option")
+    logger.info("Shared Attention contract loaded: %s sha256=%s", path, expected_sha256)
+    return api, function, contract
+
+
+def _aligned_triton_attention(module, q, k, v, call_kwargs):
+    """Dispatch the supported path after one source-bound initialization check.
+
+    Default one-kernel backward does not use the public deterministic argument as
+    a backend selector. Preserve that argument, but refuse global DAO/fused-bwd
+    overrides rather than silently changing global library state.
+    """
+    path = os.environ.get("LUMENRL_ATOM_ATTENTION_CONFIG")
+    digest = os.environ.get("LUMENRL_ATOM_ATTENTION_CONFIG_SHA256")
+    if not path or not digest:
+        raise RuntimeError("Alignment Attention requires shared config path and SHA256")
+    api, function, contract = _load_aligned_attention_contract(path, digest)
+    for name, expected in contract["runtime_requirements"].items():
+        actual = getattr(api, name, None)
+        if type(actual) is not type(expected) or actual != expected:
+            raise RuntimeError("Shared Attention runtime override is unsupported: " + name)
+    if api.get_arch() != contract["arch"]:
+        raise RuntimeError("Shared Attention requires the validated GPU architecture")
+    supported = contract["input_contract"]
+    if (q.dtype != torch.bfloat16 or k.dtype != q.dtype or v.dtype != q.dtype
+            or q.shape[1:] != (supported["q_heads"], supported["head_dim"])
+            or k.shape[1:] != (supported["kv_heads"], supported["head_dim"])
+            or v.shape[1:] != k.shape[1:]
+            or call_kwargs["dropout_p"] != supported["dropout_p"]
+            or call_kwargs["softmax_scale"] != supported["softmax_scale"]
+            or call_kwargs["causal"] is not supported["causal"]):
+        raise RuntimeError("Inputs are outside the shared Attention validation contract")
+    if torch.compiler.is_compiling() or (q.is_cuda and torch.cuda.is_current_stream_capturing()):
+        raise RuntimeError("Checked shared Attention currently requires eager execution")
+    original, receipts = _initialize_aligned_attention(api, function, contract, q.device, digest.lower())
+    if api._attn_fwd is not original or getattr(api, contract["function"]) is not function:
+        raise RuntimeError("Shared Attention runtime binding changed")
+    result = function(q, k, v, **call_kwargs, backend="triton", config=dict(contract["config"]))
+    module._lumenrl_aligned_attention_receipt = {
+        "config_sha256": digest.lower(), "backend": "triton",
+        "verification_level": "zero-input initialization launch; explicit config on each real call",
+        "initialization_launches": [dict(receipt) for receipt in receipts],
+        "return_lse": call_kwargs["return_lse"], "deterministic": call_kwargs["deterministic"],
+        "backward": "existing default one-kernel; config controls forward only",
+    }
+    return result
+
+
+def _initialize_aligned_attention(api, function, contract, device, digest):
+    """Verify compiled options once per stable API/config/device binding, without RNG use."""
+    config = dict(contract["config"])
+    owner = threading.get_ident()
+    key = (id(api), id(function), str(device), digest)
+    with _ALIGNED_ATTN_LAUNCH_LOCK:
+        original = api._attn_fwd
+        cached = _ALIGNED_ATTN_INITIALIZED.get(key)
+        if cached is not None and cached[0] is original:
+            return cached
+        receipts = []
+
+        class CheckedLaunch:
+            def __getitem__(self, grid):
+                launch = original[grid]
+
+                def invoke(*args, **kwargs):
+                    if threading.get_ident() != owner:
+                        # Other threads retain the exact original launch behavior.
+                        return launch(*args, **kwargs)
+                    if any(kwargs.get(key) != value or type(kwargs.get(key)) is not type(value)
+                           for key, value in config.items()):
+                        raise RuntimeError("Public Attention did not forward the fixed config")
+                    if kwargs.get("USE_INT64_STRIDES") is not True:
+                        raise RuntimeError("Shared Attention int64 stride option was not effective")
+                    compiled = launch(*args, **kwargs)
+                    metadata = getattr(compiled, "metadata", None)
+                    if (getattr(metadata, "enable_fp_fusion", None) is not False
+                            or getattr(metadata, "num_warps", None) != config["num_warps"]):
+                        raise RuntimeError("Compiled Attention no-fusion config was not effective")
+                    receipts.append({"enable_fp_fusion": False,
+                                     "num_warps": metadata.num_warps,
+                                     "kernel": getattr(metadata, "name", None)})
+                    return compiled
+
+                return invoke
+
+        checked = CheckedLaunch()
+        api._attn_fwd = checked
+        try:
+            cpu_rng = torch.random.get_rng_state()
+            cuda_rng = torch.cuda.get_rng_state(device) if device.type == "cuda" else None
+            supported = contract["input_contract"]
+            with torch.no_grad():
+                q0 = torch.zeros((1, supported["q_heads"], supported["head_dim"]), dtype=torch.bfloat16, device=device)
+                k0 = torch.zeros((1, supported["kv_heads"], supported["head_dim"]), dtype=torch.bfloat16, device=device)
+                v0 = torch.zeros_like(k0)
+                cu = torch.tensor([0, 1], dtype=torch.int32, device=device)
+                result = function(q0, k0, v0, cu_seqlens_q=cu, cu_seqlens_k=cu,
+                                  max_seqlen_q=1, max_seqlen_k=1, dropout_p=0.0,
+                                  softmax_scale=supported["softmax_scale"], causal=True,
+                                  return_lse=False, deterministic=False,
+                                  backend="triton", config=dict(config))
+                output = result[0] if isinstance(result, tuple) else result
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                if not torch.isfinite(output).all() or torch.count_nonzero(output):
+                    raise RuntimeError("Shared Attention zero-input initialization failed")
+            if not torch.equal(cpu_rng, torch.random.get_rng_state()) or (
+                    cuda_rng is not None and not torch.equal(cuda_rng, torch.cuda.get_rng_state(device))):
+                raise RuntimeError("Shared Attention initialization unexpectedly consumed RNG")
+            if not receipts:
+                raise RuntimeError("Shared Attention produced no verifiable Triton initialization launch")
+            verified = (original, tuple(receipts))
+            _ALIGNED_ATTN_INITIALIZED[key] = verified
+            return verified
+        finally:
+            if api._attn_fwd is checked:
+                api._attn_fwd = original
+            else:
+                raise RuntimeError("Shared Attention launch binding changed concurrently")
+
+
+def configure_packed_attention_determinism(model: torch.nn.Module, enabled: bool) -> None:
+    """Configure this model's packed backward without changing global torch modes."""
+    if type(enabled) is not bool:
+        raise ValueError("Packed attention determinism must be boolean")
+    for module in model.modules():
+        module._lumenrl_deterministic_attention = enabled
 
 
 def _varlen_attention_forward(
@@ -377,8 +607,11 @@ def _varlen_attention_forward(
     ``cu_seqlens`` for correct cross-sequence isolation.  Otherwise delegates
     to the original attention function (Lumen's ``flash_attn_func`` path).
     """
+    aligned = os.environ.get("LUMENRL_ATOM_OP_ALIGNMENT", "0") == "1"
     ctx = get_packing_context()
     if ctx is None:
+        if aligned:
+            raise RuntimeError("Shared alignment Attention requires a packing context")
         # Not in a packed forward — use original attention path
         return _original_attn_fn(
             module, query, key, value, attention_mask,
@@ -387,7 +620,8 @@ def _varlen_attention_forward(
 
     cu_seqlens, max_seqlen = ctx
 
-    from aiter import flash_attn_varlen_func
+    if aligned and (attention_mask is not None or kwargs.get("sliding_window") not in (None, -1)):
+        raise RuntimeError("Shared alignment Attention supports the unmasked causal packed path only")
 
     # HF passes QKV as (B, H, S, D) where B=1 for packed input
     # Transpose to (B, S, H, D) then flatten to (total_tokens, H, D)
@@ -403,8 +637,7 @@ def _varlen_attention_forward(
         t.requires_grad for t in [q, k, v]
     )
 
-    result = flash_attn_varlen_func(
-        q, k, v,
+    call_kwargs = dict(
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_k=cu_seqlens,
         max_seqlen_q=max_seqlen,
@@ -413,7 +646,15 @@ def _varlen_attention_forward(
         softmax_scale=softmax_scale,
         causal=True,
         return_lse=needs_grad,
+        deterministic=getattr(module, "_lumenrl_deterministic_attention", False),
     )
+    if aligned:
+        result = _aligned_triton_attention(module, q, k, v, call_kwargs)
+    else:
+        # Preserve the pre-existing default route; no shared config is read here.
+        from aiter import flash_attn_varlen_func
+
+        result = flash_attn_varlen_func(q, k, v, **call_kwargs)
 
     attn_output = result[0] if isinstance(result, tuple) else result
     # Reshape back to (B, S, H_q, D) for HF

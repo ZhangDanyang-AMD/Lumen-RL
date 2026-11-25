@@ -92,7 +92,20 @@ def compute_score(solution_str: str, ground_truth: str) -> dict:
 
     Returns dict with keys: score (float), acc (bool), pred (str).
     """
+    think_open = solution_str.rfind("<think>")
+    think_close = solution_str.rfind("</think>")
+    window_start = max(0, len(solution_str) - 300)
     solution_str = solution_str[-300:]
+    # Normalize only a balanced text wrapper around a final-answer label, not
+    # numeric braces or reasoning. Keep the original 300-character window.
+    if think_open <= think_close:
+        final_offset = (
+            max(0, think_close + len("</think>") - window_start)
+            if think_close >= 0 else 0
+        )
+        solution_str = solution_str[:final_offset] + re.sub(
+            r"\\text\{\s*(?i:Answer)\s*:\s*\}", "Answer: ", solution_str[final_offset:],
+        )
 
     match = re.findall(r"(?i)Answer\s*:\s*([^\n]+)", solution_str)
     boxed = last_boxed_only_string(solution_str)
@@ -110,17 +123,39 @@ def compute_math_reward(
     overlong_buffer: int = 0,
     max_response_len: int = 0,
     overlong_penalty: float = -1.0,
+    *,
+    completed: list[bool] | None = None,
+    final_only: bool = False,
 ) -> tuple[torch.Tensor, list[dict]]:
-    """Batch math reward computation.
+    """Batch math rewards; optional terminal flags gate final-only scoring.
 
+    Without these options the existing extraction behavior is preserved.
     Returns (rewards [B], details [list of dicts]).
     """
+    if final_only and completed is None:
+        raise ValueError("final_only scoring requires explicit completion flags")
+    if completed is not None:
+        if len(completed) != len(responses) or len(ground_truths) != len(responses):
+            raise ValueError("Completion flags, responses and ground truths must align")
+        if any(type(flag) is not bool for flag in completed):
+            raise TypeError("Completion flags must be booleans")
     rewards = []
     details = []
-    for resp, gt in zip(responses, ground_truths):
-        if max_response_len > 0 and len(resp) > max_response_len + overlong_buffer:
+    for index, (resp, gt) in enumerate(zip(responses, ground_truths)):
+        if completed is not None and not completed[index]:
+            result = {"score": -1.0, "acc": False, "pred": "[UNFINISHED]"}
+        elif max_response_len > 0 and len(resp) > max_response_len + overlong_buffer:
             result = {"score": overlong_penalty, "acc": False, "pred": "[OVERLONG]"}
         else:
+            if final_only:
+                opening = resp.rfind("<think>")
+                closing = resp.rfind("</think>")
+                # The verifier sees only a completed final segment, never a
+                # correct intermediate answer inside reasoning.
+                if opening > closing:
+                    resp = ""
+                elif closing >= 0:
+                    resp = resp[closing + len("</think>"):]
             result = compute_score(resp, gt)
         rewards.append(result["score"])
         details.append(result)
@@ -161,20 +196,33 @@ def _lumenrl_batch_reward(batch: DataProto, **kwargs) -> torch.Tensor:
       - ``overlong_buffer``: int (default 0)
       - ``max_response_len``: int (default 0 = no limit)
       - ``overlong_penalty``: float (default -1.0)
+      - ``final_only``: bool, requiring a row-aligned ``response_completed``
+        bool tensor. Ragged responses/ground_truths take precedence over legacy
+        meta lists so selection preserves their association with completion.
     """
-    responses = batch.meta.get("responses", [])
-    ground_truths = batch.meta.get("ground_truths", [])
+    ragged = getattr(batch, "ragged", {})
+    responses = ragged.get("responses", batch.meta.get("responses", []))
+    ground_truths = ragged.get("ground_truths", batch.meta.get("ground_truths", []))
     if not responses or not ground_truths:
         b = batch.batch_size
+        if batch.meta.get("final_only", False) and b:
+            raise ValueError("Final-only reward batch is missing responses or ground truths")
         logger.warning("dapo_math_reward: no responses/ground_truths in meta; returning zeros.")
         return torch.zeros(b, dtype=torch.float32)
 
+    completed = getattr(batch, "tensors", {}).get("response_completed")
+    if completed is not None:
+        if completed.dtype != torch.bool or completed.ndim != 1:
+            raise TypeError("response_completed must be a one-dimensional bool tensor")
+        completed = completed.detach().cpu().tolist()
     rewards, details = compute_math_reward(
         responses,
         ground_truths,
         overlong_buffer=int(batch.meta.get("overlong_buffer", 0)),
         max_response_len=int(batch.meta.get("max_response_len", 0)),
         overlong_penalty=float(batch.meta.get("overlong_penalty", -1.0)),
+        completed=completed,
+        final_only=bool(batch.meta.get("final_only", False)),
     )
     batch.meta["reward_details"] = details
     return rewards

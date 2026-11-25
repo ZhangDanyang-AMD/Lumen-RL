@@ -174,6 +174,13 @@ class CheckpointCallback(Callback):
             "algo": trainer.config.algorithm.name,
             "format": "verl_ray_sharded",
         }
+        if hasattr(trainer, "_prompt_cursor"):
+            # Dynamic sampling can consume several generation rounds per step;
+            # save the actual cursor rather than reconstructing it from steps.
+            meta["controller_state"] = {
+                "version": 1,
+                "prompt_cursor": trainer._prompt_cursor,
+            }
         self._manager.save(meta, step_dir / f"checkpoint_{global_step}.pt", global_step)
         (ckpt_root / "latest_checkpointed_iteration.txt").write_text(str(global_step), encoding="utf-8")
         logger.info("Saved Ray checkpoint to %s (global_step=%d)", step_dir, global_step)

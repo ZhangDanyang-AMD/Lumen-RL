@@ -38,6 +38,12 @@ class FSDPEngineConfig:
     forward_prefetch: bool = False
     use_orig_params: bool = True
     use_torch_compile: bool = False
+    # FSDP packed AITER attention: save deterministic backward mode in autograd.
+    deterministic_attention: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.deterministic_attention) is not bool:
+            raise ValueError("fsdp_cfg.deterministic_attention must be boolean")
 
 
 @dataclass
@@ -560,6 +566,7 @@ class RolloutQuantConfig:
 
 @dataclass
 class TrainingQuantConfig:
+    mxfp4: bool = False
     fp8: Optional[str] = None
     fp8_recipe: str = "blockwise"
     fp8_weight_cache: bool = False

@@ -41,6 +41,7 @@ from lumenrl.core.protocol import DataProto
 logger = logging.getLogger(__name__)
 
 SAFETY_BOUND = 20.0
+TOKEN_ABS_LOGPROB_DIFF_THRESHOLD = 1e-4
 
 SUPPORTED_ROLLOUT_RS_OPTIONS: set[str] = {
     "token_k1", "token_k2", "token_k3",
@@ -430,6 +431,57 @@ def compute_offpolicy_metrics(
         metrics["log_ppl_diff_max"] = log_ppl_diff.max().detach().item()
         metrics["log_ppl_diff_min"] = log_ppl_diff.min().detach().item()
         metrics["ppl_ratio"] = torch.exp(log_ppl_diff).mean().detach().item()
+
+        # These sampled-token diagnostics are observational only; they never
+        # feed the actor loss. Mask out prompt/padding positions before stats.
+        token_abs_diff = (
+            rollout_log_prob.detach() - old_log_prob.detach()
+        ).abs()[response_mask.bool()].float()
+        token_count = token_abs_diff.numel()
+        metrics["token_abs_logprob_diff_tokens"] = int(token_count)
+        if token_count:
+            quantiles = torch.quantile(
+                token_abs_diff,
+                token_abs_diff.new_tensor([0.99, 0.999]),
+            )
+            token_max = token_abs_diff.max().item()
+            metrics["token_abs_logprob_diff_max"] = token_max
+            metrics["token_abs_logprob_diff_p99"] = quantiles[0].item()
+            metrics["token_abs_logprob_diff_p999"] = quantiles[1].item()
+            metrics["token_abs_logprob_diff_frac_gt_1e4"] = (
+                token_abs_diff.gt(TOKEN_ABS_LOGPROB_DIFF_THRESHOLD).float().mean().item()
+            )
+            if token_max > TOKEN_ABS_LOGPROB_DIFF_THRESHOLD:
+                # Keep the callback metrics small; on a gate breach, log only
+                # the five worst coordinates and values, never token contents.
+                top_values, top_indices = token_abs_diff.topk(
+                    min(5, token_count)
+                )
+                response_coords = response_mask.bool().nonzero(as_tuple=False)
+                response_positions = response_mask.long().cumsum(dim=-1) - 1
+                outliers = []
+                for value, flat_index in zip(top_values, top_indices):
+                    coord = tuple(int(v) for v in response_coords[flat_index].tolist())
+                    outliers.append(
+                        {
+                            "coord": coord,
+                            "response_position": int(response_positions[coord].item()),
+                            "rollout_logprob": float(rollout_log_prob[coord].item()),
+                            "actor_logprob": float(old_log_prob[coord].item()),
+                            "abs_diff": float(value.item()),
+                        }
+                    )
+                logger.warning(
+                    "rollout token logprob gate breach: threshold=%g tokens=%d top=%s",
+                    TOKEN_ABS_LOGPROB_DIFF_THRESHOLD,
+                    token_count,
+                    outliers,
+                )
+        else:
+            metrics["token_abs_logprob_diff_max"] = 0.0
+            metrics["token_abs_logprob_diff_p99"] = 0.0
+            metrics["token_abs_logprob_diff_p999"] = 0.0
+            metrics["token_abs_logprob_diff_frac_gt_1e4"] = 0.0
 
         lr_safe = torch.clamp(log_ratio, min=-SAFETY_BOUND, max=SAFETY_BOUND)
         rho = torch.exp(lr_safe)

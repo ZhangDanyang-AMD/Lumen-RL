@@ -117,7 +117,14 @@ class FSDP2Engine(BaseEngine):
         training_cfg = self._make_backend_config()
 
         module = FSDP2Backend.build_model(self.model_name, training_cfg)
+        if self.quant_config.get("mxfp4") and (self.engine_config.forward_only or self._is_lora):
+            raise ValueError("MXFP4 prototype is restricted to the full-parameter Actor")
         module = FSDP2Backend.apply_lumen_optimizations(module, self.quant_config)
+        from lumenrl.engine.training.packing import configure_packed_attention_determinism
+
+        configure_packed_attention_determinism(module, self.engine_config.deterministic_attention)
+        if self.engine_config.deterministic_attention:
+            logger.info("Packed attention requests deterministic AITER backward; backend selection may differ from FA3")
 
         if self._is_lora:
             module = self._build_lora_module(module)
@@ -129,6 +136,10 @@ class FSDP2Engine(BaseEngine):
 
         if not self.engine_config.forward_only:
             self.optimizer = self._build_optimizer(module)
+            if self.quant_config.get("mxfp4"):
+                from lumen.quantize import register_mxfp4_weight_optimizer_hooks
+
+                register_mxfp4_weight_optimizer_hooks(module, self.optimizer)
             self.lr_scheduler = self._build_lr_scheduler(self.optimizer)
 
     def _make_backend_config(self) -> dict[str, Any]:

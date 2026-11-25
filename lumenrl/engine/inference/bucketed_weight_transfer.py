@@ -168,6 +168,7 @@ class BucketedWeightSender:
         min_bucket_bytes: int = 0,
         gc_collect: bool = False,
         double_buffer: bool = True,
+        cpu_only_source: bool = False,
     ):
         # ``min_bucket_bytes`` raises the bucket above the configured size so a
         # receiver that needs one stable buffer per update cycle can be given a
@@ -178,6 +179,9 @@ class BucketedWeightSender:
         self.bucket_size_mb = bucket_size_mb
         self.bucket_size = max(int(bucket_size_mb) << 20, int(min_bucket_bytes))
         self.use_shm = use_shm
+        if type(cpu_only_source) is not bool or (cpu_only_source and not use_shm):
+            raise ValueError("cpu_only_source requires explicitly enabled SHM transport")
+        self.cpu_only_source = cpu_only_source
         self.version = version
         self.gc_collect = gc_collect
         self.double_buffer = double_buffer
@@ -221,7 +225,10 @@ class BucketedWeightSender:
 
         def _flush(meta: dict, is_last: bool) -> None:
             t0 = time.perf_counter()
-            _sync()
+            if not self.cpu_only_source:
+                _sync()
+            # CPU-to-CPU copies finish before the header; the opt-in source
+            # contract forbids GPU tensors, so no producer GPU fence is needed.
             t1 = time.perf_counter()
             ack_early = self.double_buffer and not is_last
             self.socket.send_pyobj(self._control(meta, is_last, ack_early))
@@ -242,6 +249,8 @@ class BucketedWeightSender:
             offset = 0
             bucket_meta: dict[str, TensorMetadata] = {}
             async for name, weight in ensure_async_iterator(weights):
+                if self.cpu_only_source and weight.device.type != "cpu":
+                    raise ValueError("CPU-only prepared transfer received a non-CPU tensor")
                 weight = weight.contiguous()
                 st["tensors"] += 1
                 st["bytes"] += weight.nbytes
@@ -331,7 +340,8 @@ class BucketedWeightSender:
             del self.shm
             self.shm = None
         _timed_cleanup(
-            self.stats, gc_collect=self.gc_collect, ipc_collect=True, empty_cache=True,
+            self.stats, gc_collect=self.gc_collect,
+            ipc_collect=not self.cpu_only_source, empty_cache=not self.cpu_only_source,
         )
 
     def _direct_send_large_weight(self, name: str, weight: torch.Tensor) -> None:

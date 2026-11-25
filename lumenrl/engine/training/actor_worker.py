@@ -30,6 +30,7 @@ from lumenrl.utils.checkpoint import (
     run_checkpoint_phase,
 )
 from lumenrl.core.protocol import DataProto
+from lumenrl.utils.rng_state import capture_actor_rng_state, restore_actor_rng_state
 from lumenrl.core.types import AlgorithmName, TrainingBackend
 from lumenrl.engine.training.base_engine import BaseEngine, EngineRegistry
 
@@ -203,6 +204,7 @@ class LumenActorWorker(BaseWorker):
                 "optimizer_offload": fsdp_cfg.get("optimizer_offload", False),
                 "grad_offload": fsdp_cfg.get("grad_offload", False),
                 "reshard_after_forward": fsdp_cfg.get("reshard_after_forward", True),
+                "deterministic_attention": fsdp_cfg.get("deterministic_attention", False),
                 "model_dtype": "fp32",
                 "mixed_precision": {
                     "param_dtype": compute_dtype,
@@ -1206,14 +1208,7 @@ class LumenActorWorker(BaseWorker):
                     "lr_scheduler": (
                         scheduler.state_dict() if scheduler is not None else None
                     ),
-                    "rng": {
-                        "cpu": torch.get_rng_state(),
-                        "cuda": (
-                            torch.cuda.get_rng_state()
-                            if torch.cuda.is_available()
-                            else None
-                        ),
-                    },
+                    "rng": capture_actor_rng_state(),
                 }
                 torch.save(
                     extra,
@@ -1328,14 +1323,7 @@ class LumenActorWorker(BaseWorker):
                 sched_state = extra.get("lr_scheduler")
                 if scheduler is not None and sched_state is not None:
                     scheduler.load_state_dict(sched_state)
-                rng = extra.get("rng") or {}
-                if rng.get("cpu") is not None:
-                    torch.set_rng_state(rng["cpu"])
-                if (
-                    torch.cuda.is_available()
-                    and rng.get("cuda") is not None
-                ):
-                    torch.cuda.set_rng_state(rng["cuda"])
+                restore_actor_rng_state(extra.get("rng") or {})
                 del extra
             import gc
 

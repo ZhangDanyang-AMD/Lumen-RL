@@ -256,11 +256,71 @@ def _apply_lumen_fp8(model: nn.Module, quant_config: dict[str, Any]) -> nn.Modul
     if not quant_config:
         return model
 
+    mxfp4_enabled = bool(quant_config.get("mxfp4", False))
+    if mxfp4_enabled:
+        if (
+            quant_config.get("fp8")
+            or quant_config.get("fp8_param_manager")
+            or os.environ.get("LUMEN_FP8", "0") == "1"
+            or os.environ.get("FP8_PARAM_MANAGER", "0") == "1"
+            or os.environ.get("LUMEN_ROLLOUT", "")
+            or quant_config.get("rollout")
+        ):
+            raise ValueError(
+                "MXFP4 Actor cannot combine FP8 storage/compute or rollout alignment patches"
+            )
+        master_dtypes = {
+            p.dtype for p in model.parameters() if p.is_floating_point()
+        }
+        if len(master_dtypes) > 1 or not master_dtypes <= {
+            torch.float32, torch.bfloat16
+        }:
+            raise ValueError(
+                "MXFP4 Actor requires uniform FP32 or BF16 master parameters "
+                "before FSDP sharding"
+            )
+        # Storage and compute precision are separate: the Actor requests FP32
+        # masters for Adam and FSDP2 supplies BF16 parameter views for forward.
+        # Casting the model here would also reduce the optimizer state precision.
+        logger.info(
+            "MXFP4 Actor preserving master dtype(s): %s; FSDP controls compute dtype",
+            sorted(str(dtype) for dtype in master_dtypes),
+        )
+        from lumen.config import LumenConfig
+
+        cfg = LumenConfig(
+            format="mxfp4",
+            scaling="blockwise",
+            block_size=32,
+            hf_attn_patch=False,
+            lumen_norm=False,
+            quantize_output_layer=False,
+        )
+        _, model = cfg.enable(model)
+        count = sum(
+            getattr(m, "_quant_scaling_type", None) == "mxfp4" for m in model.modules()
+        )
+        if not count:
+            raise RuntimeError("MXFP4 requested but no Actor linear was quantized")
+        logger.info(
+            "MXFP4 Actor enabled: %d linears, BF16 lm_head/norm/attention", count
+        )
+        return model
+
     fp8_enabled = quant_config.get("fp8") or os.environ.get("LUMEN_FP8", "0") == "1"
-    fp8_pm = quant_config.get("fp8_param_manager") or os.environ.get("FP8_PARAM_MANAGER", "0") == "1"
-    lumen_norm = quant_config.get("lumen_norm") or os.environ.get("LUMEN_NORM", "0") == "1"
-    fused_mlp = quant_config.get("fused_mlp") or os.environ.get("LUMEN_FUSED_MLP", "0") == "1"
-    fused_rope = quant_config.get("fused_rope") or os.environ.get("LUMEN_FUSED_ROPE", "0") == "1"
+    fp8_pm = (
+        quant_config.get("fp8_param_manager")
+        or os.environ.get("FP8_PARAM_MANAGER", "0") == "1"
+    )
+    lumen_norm = (
+        quant_config.get("lumen_norm") or os.environ.get("LUMEN_NORM", "0") == "1"
+    )
+    fused_mlp = (
+        quant_config.get("fused_mlp") or os.environ.get("LUMEN_FUSED_MLP", "0") == "1"
+    )
+    fused_rope = (
+        quant_config.get("fused_rope") or os.environ.get("LUMEN_FUSED_ROPE", "0") == "1"
+    )
     # ATOM rollout op-alignment (verl FP8 recipe: LUMEN_ROLLOUT=ATOM). Patches
     # norm/sdpa/linear/mlp with AITER kernels so the training-side forward matches
     # the AITER-based vLLM rollout. Works in pure BF16 (no FP8 quant).
@@ -423,12 +483,22 @@ def _apply_fsdp2_sharding(
         from torch.distributed._composable.fsdp import CPUOffloadPolicy
         offload_policy = CPUOffloadPolicy(pin_memory=True)
 
+    layer_mp_policy = mp_policy
+    if os.environ.get("LUMENRL_ATOM_OP_ALIGNMENT", "0") == "1":
+        # Hidden/residual inputs are already BF16; preserve FP32 rotary caches.
+        # Root input casting stays unchanged for externally supplied embeddings.
+        layer_mp_policy = MixedPrecisionPolicy(
+            param_dtype=param_dtype,
+            reduce_dtype=reduce_dtype,
+            cast_forward_inputs=False,
+        )
+
     for module in model.modules():
         if hasattr(module, "layers") and isinstance(module.layers, nn.ModuleList):
             for layer in module.layers:
                 fully_shard(
                     layer,
-                    mp_policy=mp_policy,
+                    mp_policy=layer_mp_policy,
                     reshard_after_forward=reshard,
                     offload_policy=offload_policy,
                 )
@@ -520,7 +590,20 @@ class FSDP2Backend:
     @staticmethod
     def apply_lumen_optimizations(model: nn.Module, quant_config: dict[str, Any] | None) -> nn.Module:
         """Apply Lumen FP8/norm optimizations before FSDP2 wrapping."""
-        return _apply_lumen_fp8(model, quant_config or {})
+        quant_config = quant_config or {}
+        model = _apply_lumen_fp8(model, quant_config)
+        if os.environ.get("LUMENRL_ATOM_OP_ALIGNMENT", "0") == "1":
+            from lumen.ops.atom_bf16_gemm import atom_bf16_gemm
+            from lumenrl.engine.training.atom_op_alignment import install_atom_op_alignment
+
+            # Apply after quantization but before decoder-layer FSDP wrapping.
+            # Opt-in alignment errors propagate; an unchanged HF path is not success.
+            install_atom_op_alignment(
+                model,
+                mxfp4=bool(quant_config.get("mxfp4", False)),
+                gemm_callback=atom_bf16_gemm,
+            )
+        return model
 
     @staticmethod
     def apply_fsdp2(model: nn.Module, fsdp_config: dict[str, Any] | None) -> nn.Module:

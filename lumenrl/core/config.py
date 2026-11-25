@@ -38,6 +38,12 @@ class FSDPEngineConfig:
     forward_prefetch: bool = False
     use_orig_params: bool = True
     use_torch_compile: bool = False
+    # FSDP packed AITER attention: save deterministic backward mode in autograd.
+    deterministic_attention: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.deterministic_attention) is not bool:
+            raise ValueError("fsdp_cfg.deterministic_attention must be boolean")
 
 
 @dataclass
@@ -357,6 +363,8 @@ class PolicyConfig:
     generation: GenerationConfig = field(default_factory=GenerationConfig)
     max_total_sequence_length: int = 4096
     max_response_length: int = 20480
+    # None preserves the tokenizer's native default for structured chat prompts.
+    enable_thinking: Optional[bool] = None
     train_global_batch_size: int = 64
     # Number of *prompt* sequences sampled per generation round for DAPO dynamic
     # sampling (verl: data.gen_batch_size). 0 = same as the number of prompts
@@ -585,6 +593,7 @@ class RolloutQuantConfig:
 
 @dataclass
 class TrainingQuantConfig:
+    mxfp4: bool = False
     fp8: Optional[str] = None
     fp8_recipe: str = "blockwise"
     fp8_weight_cache: bool = False
@@ -688,6 +697,15 @@ class RewardConfig:
     # back to the top-level ``config.seed``.
     shuffle: bool = True
     shuffle_seed: Optional[int] = None
+    # Opt-in synchronous math scoring; EOS ids must match the rollout model.
+    require_completed_final: bool = False
+    completion_eos_token_ids: list[int] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.require_completed_final and not self.completion_eos_token_ids:
+            raise ValueError("Completed-final scoring requires explicit EOS token ids")
+        if any(type(token) is not int or token < 0 for token in self.completion_eos_token_ids):
+            raise ValueError("Completion EOS token ids must be nonnegative integers")
 
 
 @dataclass
@@ -792,10 +810,23 @@ class WeightSyncConfig:
     shared_folder: str = "/volumes/oss1/lumenrl_weight_sync"
     bucket_size_mb: int = 1024
     timeout_s: int = 600
+    materialize_before_transfer: bool = False
+    materialize_on_cpu: bool = False
+    materialize_max_bytes: int = 64 * 1024**3
     verify_full_load: bool = True
     fp8_quantize: bool = False  # Quantize BF16 weights to FP8 per-block before sync (halves transfer size)
     fp8_quantization_location: str | None = None  # trainer | inference; None uses legacy fp8_quantize
     rdma: RDMAWeightSyncConfig = field(default_factory=RDMAWeightSyncConfig)
+
+    def __post_init__(self) -> None:
+        if type(self.materialize_before_transfer) is not bool:
+            raise ValueError("weight_sync.materialize_before_transfer must be boolean")
+        if type(self.materialize_on_cpu) is not bool:
+            raise ValueError("weight_sync.materialize_on_cpu must be boolean")
+        if self.materialize_on_cpu and not self.materialize_before_transfer:
+            raise ValueError("materialize_on_cpu requires materialize_before_transfer")
+        if type(self.materialize_max_bytes) is not int or self.materialize_max_bytes <= 0:
+            raise ValueError("weight_sync.materialize_max_bytes must be a positive integer")
 
     def resolve_fp8_quantize(self) -> bool:
         """Return whether weight-sync copies are quantized on the trainer."""

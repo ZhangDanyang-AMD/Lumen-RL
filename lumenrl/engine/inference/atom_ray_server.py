@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import hashlib
 import logging
 import os
 import socket
 import sys
 from multiprocessing import shared_memory
+from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -34,7 +36,9 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LUMENRL_LOGGING_LEVEL", "INFO"))
 if not logger.handlers and not logging.getLogger().handlers:
     _h = logging.StreamHandler(sys.stderr)
-    _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    _h.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
     logger.addHandler(_h)
 
 
@@ -58,6 +62,32 @@ class ATOMRayServer:
         self._preemptions_seen = 0
 
     async def launch(self) -> bool:
+        if os.environ.get("LUMEN_ATOM_MAIN_AITER_COMPAT", "0") == "1":
+            # The pinned AITER wheel lacks one import-only Gluon predicate
+            # expected by clean ATOM main. Keep the wheel/ATOM unchanged.
+            from lumenrl.engine.inference.atom_patch.aiter_main_compat import (
+                install as install_compat,
+            )
+
+            if not install_compat():
+                raise RuntimeError("selected AITER compatibility was not installed")
+        if os.environ.get("LUMEN_ATOM_MXFP4_2D", "0") == "1":
+            # Python ignores sitecustomize startup failures; enforce the
+            # selected format in the actor before ATOM config/model import.
+            from lumenrl.engine.inference.atom_patch.quant_main import (
+                install as install_quant,
+            )
+
+            if not install_quant():
+                raise RuntimeError("selected MXFP4-2D recipe was not installed")
+        if os.environ.get("LUMEN_ATOM_CLEAN_MAIN_RECIPE", "0") == "1":
+            from lumenrl.engine.inference.atom_patch.preflight import (
+                require_clean_atom_main,
+            )
+
+            atom_root = os.environ.get("LUMEN_ATOM_MAIN_ROOT", "")
+            receipt = require_clean_atom_main(atom_root=atom_root)
+            logger.info("ATOM clean-main preflight receipt: %s", receipt)
         from atom.rollout.async_engine import AsyncLLMEngine
 
         kwargs = dict(self.engine_kwargs)
@@ -65,7 +95,29 @@ class ATOMRayServer:
         kwargs.setdefault("master_addr", self._get_node_ip())
         kwargs.setdefault("port", self._get_free_port())
         self._pin_cudagraph_mode(kwargs)
+        if os.environ.get("LUMENRL_SMCI_GPU_IDENTITY_MANIFEST"):
+            from uuid import UUID
+
+            if torch.cuda.device_count() != 1:
+                raise RuntimeError("SMCI ATOM replica must see exactly one GPU")
+            prop = torch.cuda.get_device_properties(0)
+            unique_id = UUID(str(prop.uuid)).bytes.decode("ascii").lower()
+            pci = (f"{prop.pci_domain_id:04X}:{prop.pci_bus_id:02X}:"
+                   f"{prop.pci_device_id:02X}.0")
+            if (unique_id != os.environ.get("LUMENRL_EXPECTED_GPU_UUID") or
+                    pci != os.environ.get("LUMENRL_EXPECTED_GPU_PCI")):
+                raise RuntimeError(f"ATOM replica physical GPU mismatch: {unique_id} {pci}")
+            logger.info("ATOM replica[%d] physical UUID=%s PCI=%s",
+                        self.replica_rank, unique_id, pci)
         self.engine = AsyncLLMEngine(**kwargs)
+        if os.environ.get("LUMEN_ATOM_CLEAN_MAIN_RECIPE", "0") == "1":
+            receipts = await self.get_refit_and_c1_receipts(expect_committed=False)
+            if not receipts or any(
+                not row.get("refit_installed") or row.get("mxfp4_2d_target_count", 0) <= 0
+                for row in receipts
+            ):
+                raise RuntimeError("selected clean-main ModelRunner startup receipts missing")
+            logger.info("ATOM ModelRunner startup receipts: %s", receipts)
         logger.info(
             "ATOMRayServer[%d]: AsyncLLMEngine ready (master=%s:%s online_quant=%s).",
             self.replica_rank,
@@ -134,6 +186,7 @@ class ATOMRayServer:
     def _get_node_ip() -> str:
         try:
             import ray
+
             return ray.util.get_node_ip_address()
         except Exception:
             return socket.gethostbyname(socket.gethostname())
@@ -189,9 +242,15 @@ class ATOMRayServer:
 
         for key in ("repetition_penalty", "stop_token_ids", "min_tokens"):
             if key in params:
-                logger.debug("ATOM rollout dropping unsupported sampling param %s=%r", key, params.pop(key))
+                logger.debug(
+                    "ATOM rollout dropping unsupported sampling param %s=%r",
+                    key,
+                    params.pop(key),
+                )
         if params:
-            logger.debug("ATOM rollout dropping unsupported sampling params: %s", sorted(params))
+            logger.debug(
+                "ATOM rollout dropping unsupported sampling params: %s", sorted(params)
+            )
 
         sp_kwargs = {
             "max_tokens": max(1, int(max_tokens)),
@@ -215,7 +274,9 @@ class ATOMRayServer:
         request_id: Optional[str] = None,
     ) -> dict[str, Any]:
         if self.engine is None:
-            raise RuntimeError("ATOMRayServer.launch() must be called before generate().")
+            raise RuntimeError(
+                "ATOMRayServer.launch() must be called before generate()."
+            )
 
         prompt_ids = list(prompt)
         sp = self._build_sampling_params(sampling_params, prompt_length=len(prompt_ids))
@@ -240,7 +301,9 @@ class ATOMRayServer:
         sampling_params: dict[str, Any],
     ) -> list[dict[str, Any]]:
         if self.engine is None:
-            raise RuntimeError("ATOMRayServer.launch() must be called before generate_batch().")
+            raise RuntimeError(
+                "ATOMRayServer.launch() must be called before generate_batch()."
+            )
 
         prompt_ids_list = [list(p) for p in prompts]
         grouped_prompts: list[list[int]] = []
@@ -255,29 +318,39 @@ class ATOMRayServer:
         request_ids = [uuid4().hex for _ in grouped_prompts]
         params = []
         for prompt_ids, n in zip(grouped_prompts, grouped_counts):
-            sp = self._build_sampling_params(sampling_params, prompt_length=len(prompt_ids))
+            sp = self._build_sampling_params(
+                sampling_params, prompt_length=len(prompt_ids)
+            )
             if n > 1 and hasattr(sp, "n"):
                 sp.n = n
             params.append(sp)
 
         def _generate_blocking():
-            return self.engine.generate(grouped_prompts, params, request_ids=request_ids)
+            return self.engine.generate(
+                grouped_prompts, params, request_ids=request_ids
+            )
 
         outs = await asyncio.get_event_loop().run_in_executor(None, _generate_blocking)
         self._log_kv_pressure()
         results: list[dict[str, Any]] = []
-        expanded_prompts = [p for p, n in zip(grouped_prompts, grouped_counts) for _ in range(n)]
+        expanded_prompts = [
+            p for p, n in zip(grouped_prompts, grouped_counts) for _ in range(n)
+        ]
         if os.environ.get("LUMENRL_ATOM_CHECK_ALIGNMENT"):
             self._audit_alignment(expanded_prompts, outs)
         for p_ids, out in zip(expanded_prompts, outs):
             token_ids = list(out.get("token_ids", [])) if isinstance(out, dict) else []
             logprobs = out.get("logprobs") if isinstance(out, dict) else None
-            results.append({
-                "text": out.get("text", "") if isinstance(out, dict) else "",
-                "prompt_token_ids": p_ids,
-                "token_ids": token_ids,
-                "logprobs": [float(x) for x in logprobs] if logprobs is not None else None,
-            })
+            results.append(
+                {
+                    "text": out.get("text", "") if isinstance(out, dict) else "",
+                    "prompt_token_ids": p_ids,
+                    "token_ids": token_ids,
+                    "logprobs": (
+                        [float(x) for x in logprobs] if logprobs is not None else None
+                    ),
+                }
+            )
         return results
 
     def _log_kv_pressure(self) -> None:
@@ -298,8 +371,11 @@ class ATOMRayServer:
         try:
             stats = self.engine.get_metrics_statistics()
         except Exception:  # noqa: BLE001 -- diagnostics must never fail a step
-            logger.debug("ATOM[%d]: KV pressure stats unavailable", self.replica_rank,
-                         exc_info=True)
+            logger.debug(
+                "ATOM[%d]: KV pressure stats unavailable",
+                self.replica_rank,
+                exc_info=True,
+            )
             return
         total = stats.get("kv_blocks_total") or 0
         preempt = int(stats.get("preemptions") or 0)
@@ -343,7 +419,10 @@ class ATOMRayServer:
         for i, (p_ids, out) in enumerate(zip(expanded_prompts, outs)):
             got = out.get("prompt_token_ids") if isinstance(out, dict) else None
             if got is None:
-                logger.warning("ATOM[%d] align-audit: engine did not echo prompts.", self.replica_rank)
+                logger.warning(
+                    "ATOM[%d] align-audit: engine did not echo prompts.",
+                    self.replica_rank,
+                )
                 return
             if list(got) == list(p_ids):
                 continue
@@ -361,15 +440,21 @@ class ATOMRayServer:
             logging.INFO if healthy else logging.WARNING,
             "ATOM[%d] align-audit: returned=%d expected=%d mismatched=%d "
             "offset_histogram=%s examples(idx,offset)=%s",
-            self.replica_rank, n_out, n_want, bad,
-            sorted(shifts.items(), key=lambda kv: -kv[1])[:8], examples,
+            self.replica_rank,
+            n_out,
+            n_want,
+            bad,
+            sorted(shifts.items(), key=lambda kv: -kv[1])[:8],
+            examples,
         )
 
     async def update_weights_from_ipc(
         self, use_shm: bool = False, version: int | None = None
     ) -> bool:
         if self.engine is None:
-            raise RuntimeError("ATOMRayServer.launch() must be called before weight sync.")
+            raise RuntimeError(
+                "ATOMRayServer.launch() must be called before weight sync."
+            )
         if use_shm:
             self._update_weights_from_shm_sync(version)
         else:
@@ -379,7 +464,9 @@ class ATOMRayServer:
     def _get_zmq_handle(self) -> str:
         replica_rank = os.environ.get("LUMEN_REPLICA_RANK", "0")
         job_id = os.environ.get("LUMEN_RAY_JOB_ID", "0")
-        return f"ipc:///tmp/lumen-colocate-zmq-{job_id}-replica-{replica_rank}-rank-0.sock"
+        return (
+            f"ipc:///tmp/lumen-colocate-zmq-{job_id}-replica-{replica_rank}-rank-0.sock"
+        )
 
     def _counts_are_exact(self) -> bool:
         """Whether ATOM's per-bucket ``updated`` can be compared for equality.
@@ -393,7 +480,9 @@ class ATOMRayServer:
         return not (self.engine_kwargs.get("online_quant_config") or {})
 
     @staticmethod
-    def _bucket_meta(raw_bucket_meta: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], int]:
+    def _bucket_meta(
+        raw_bucket_meta: dict[str, Any],
+    ) -> tuple[dict[str, dict[str, Any]], int]:
         bucket_meta: dict[str, dict[str, Any]] = {}
         used_bytes = 0
         for name, meta in raw_bucket_meta.items():
@@ -411,6 +500,16 @@ class ATOMRayServer:
         return bucket_meta, used_bytes
 
     def _update_weights_from_ipc_sync(self, version: int | None = None) -> None:
+        mgr = self.engine.core_mgr
+        session = getattr(mgr, "weight_sync_session", None)
+        if not callable(session):
+            raise RuntimeError("clean ATOM main requires a full-cycle weight_sync_session")
+        # Main owns a single sync id, the failure fence and FINISH across all
+        # buckets; a session per bucket would expose a partial model version.
+        with session():
+            return self._update_weights_from_ipc_cycle(version)
+
+    def _update_weights_from_ipc_cycle(self, version: int | None = None) -> None:
         from torch.multiprocessing.reductions import reduce_tensor
 
         from atom.rollout.weight_sync import rebuild_ipc_handle
@@ -423,7 +522,9 @@ class ATOMRayServer:
             rename_bucket_meta,
             require_unsharded_experts,
         )
-        from lumenrl.engine.inference.bucketed_weight_transfer import check_bucket_version
+        from lumenrl.engine.inference.bucketed_weight_transfer import (
+            check_bucket_version,
+        )
 
         ctx = zmq.Context()
         socket = ctx.socket(zmq.REP)
@@ -438,14 +539,18 @@ class ATOMRayServer:
             socket.send(b"")
             ipc_buffer = rebuild_ipc_handle(comm_metadata, device_id=0)
             bucket_size = int(ipc_buffer.numel())
-            num_gpus = int(self.engine_kwargs.get("tensor_parallel_size", 1) or 1) * int(
-                self.engine_kwargs.get("data_parallel_size", 1) or 1
-            )
+            num_gpus = int(
+                self.engine_kwargs.get("tensor_parallel_size", 1) or 1
+            ) * int(self.engine_kwargs.get("data_parallel_size", 1) or 1)
             per_gpu_buffers = {
-                gpu_idx: torch.empty(bucket_size, dtype=torch.uint8, device=f"cuda:{gpu_idx}")
+                gpu_idx: torch.empty(
+                    bucket_size, dtype=torch.uint8, device=f"cuda:{gpu_idx}"
+                )
                 for gpu_idx in range(num_gpus)
             }
-            per_gpu_ipc_handles = {gpu_idx: reduce_tensor(buf) for gpu_idx, buf in per_gpu_buffers.items()}
+            per_gpu_ipc_handles = {
+                gpu_idx: reduce_tensor(buf) for gpu_idx, buf in per_gpu_buffers.items()
+            }
             stats = {"buckets": 0, "weights": 0, "experts": 0}
 
             while True:
@@ -483,10 +588,15 @@ class ATOMRayServer:
                     del per_gpu_ipc_handles
                     bucket_size = used_bytes
                     per_gpu_buffers = {
-                        gpu_idx: torch.empty(bucket_size, dtype=torch.uint8, device=f"cuda:{gpu_idx}")
+                        gpu_idx: torch.empty(
+                            bucket_size, dtype=torch.uint8, device=f"cuda:{gpu_idx}"
+                        )
                         for gpu_idx in range(num_gpus)
                     }
-                    per_gpu_ipc_handles = {gpu_idx: reduce_tensor(buf) for gpu_idx, buf in per_gpu_buffers.items()}
+                    per_gpu_ipc_handles = {
+                        gpu_idx: reduce_tensor(buf)
+                        for gpu_idx, buf in per_gpu_buffers.items()
+                    }
 
                 # transformers-5.x ships MoE experts as fused tensors under names
                 # an older ATOM's updater cannot resolve, and its unquantized MoE
@@ -495,8 +605,10 @@ class ATOMRayServer:
                 # staging buffer, before the runner reads it -- unless the ATOM
                 # in this process does it itself, in which case the trainer's
                 # names go through untouched.
-                renames = {} if atom_routes_fused_experts() else fused_expert_renames(
-                    bucket_meta
+                renames = (
+                    {}
+                    if atom_routes_fused_experts()
+                    else fused_expert_renames(bucket_meta)
                 )
                 if renames:
                     require_unsharded_experts(
@@ -507,14 +619,18 @@ class ATOMRayServer:
                 for gpu_idx, dst in per_gpu_buffers.items():
                     for name, tensor in direct_tensors.items():
                         meta = raw_bucket_meta[name]
-                        nbytes = meta["dtype"].itemsize * torch.Size(meta["shape"]).numel()
+                        nbytes = (
+                            meta["dtype"].itemsize * torch.Size(meta["shape"]).numel()
+                        )
                         offset = int(meta["offset"])
                         dst[offset : offset + nbytes].copy_(
                             tensor.contiguous().view(-1).view(torch.uint8),
                             non_blocking=True,
                         )
                     if not direct_tensors:
-                        dst[:used_bytes].copy_(ipc_buffer[:used_bytes], non_blocking=True)
+                        dst[:used_bytes].copy_(
+                            ipc_buffer[:used_bytes], non_blocking=True
+                        )
                     torch.cuda.synchronize(gpu_idx)
                     # After the copy: this rewrites the staged bytes, so it must
                     # not race the fill, and each per-GPU buffer needs its own
@@ -534,7 +650,10 @@ class ATOMRayServer:
                     is_last=is_last,
                 )
                 assert_bucket_fully_applied(
-                    responses, bucket_meta, context="ipc", exact=self._counts_are_exact()
+                    responses,
+                    bucket_meta,
+                    context="ipc",
+                    exact=self._counts_are_exact(),
                 )
                 stats["buckets"] += 1
                 stats["weights"] += len(bucket_meta)
@@ -544,7 +663,9 @@ class ATOMRayServer:
                     break
             logger.info(
                 "ATOM online weight reload: buckets=%d weights=%d fused_experts=%d",
-                stats["buckets"], stats["weights"], stats["experts"],
+                stats["buckets"],
+                stats["weights"],
+                stats["experts"],
             )
         finally:
             socket.close()
@@ -557,12 +678,22 @@ class ATOMRayServer:
             torch.cuda.empty_cache()
 
     def _update_weights_from_shm_sync(self, version: int | None = None) -> None:
+        mgr = self.engine.core_mgr
+        session = getattr(mgr, "weight_sync_session", None)
+        if not callable(session):
+            raise RuntimeError("clean ATOM main requires a full-cycle weight_sync_session")
+        with session():
+            return self._update_weights_from_shm_cycle(version)
+
+    def _update_weights_from_shm_cycle(self, version: int | None = None) -> None:
         from lumenrl.engine.inference.atom_moe_weight_sync import (
             assert_bucket_fully_applied,
             atom_routes_fused_experts,
             fused_expert_renames,
         )
-        from lumenrl.engine.inference.bucketed_weight_transfer import check_bucket_version
+        from lumenrl.engine.inference.bucketed_weight_transfer import (
+            check_bucket_version,
+        )
 
         ctx = zmq.Context()
         socket = ctx.socket(zmq.REP)
@@ -577,7 +708,10 @@ class ATOMRayServer:
                 metadata = socket.recv_pyobj()
                 check_bucket_version(metadata, version)
                 bucket_meta, _used_bytes = self._bucket_meta(metadata["bucket_meta"])
-                if fused_expert_renames(bucket_meta) and not atom_routes_fused_experts():
+                if (
+                    fused_expert_renames(bucket_meta)
+                    and not atom_routes_fused_experts()
+                ):
                     # An older ATOM needs the fused names rewritten and its
                     # shuffled layout re-established, which the IPC path does in
                     # a staging buffer it owns. Here the segment belongs to the
@@ -598,7 +732,10 @@ class ATOMRayServer:
                     is_last=bool(metadata["is_last"]),
                 )
                 assert_bucket_fully_applied(
-                    responses, bucket_meta, context="shm", exact=self._counts_are_exact()
+                    responses,
+                    bucket_meta,
+                    context="shm",
+                    exact=self._counts_are_exact(),
                 )
                 socket.send(b"")
                 if metadata["is_last"]:
@@ -626,6 +763,20 @@ class ATOMRayServer:
             self.engine.core_mgr.broadcast_utility_command_sync("clear_kv_cache")
         return True
 
+    async def get_refit_and_c1_receipts(
+        self, expect_committed: bool = True, audit_name: Optional[str] = None
+    ) -> list[dict]:
+        """Collect version and C1 hit/fallback state from every model runner."""
+        if self.engine is None or not hasattr(self.engine, "core_mgr"):
+            raise RuntimeError("ATOM model-runner receipts require a loaded engine")
+        replies = self.engine.core_mgr.broadcast_utility_command_sync(
+            "get_lumen_refit_receipts", timeout=30.0,
+            expect_committed=expect_committed, audit_name=audit_name
+        )
+        if not replies or any(reply.get("error") for reply in replies):
+            raise RuntimeError(f"incomplete ATOM model-runner receipts: {replies!r}")
+        return [reply["result"] for reply in replies]
+
     async def wait_for_requests_to_drain(self, timeout_s: float = 60.0) -> bool:
         return True
 
@@ -643,7 +794,9 @@ class ATOMRayServer:
     async def reload_weights_from_path(self, weight_dir: str) -> bool:
         """Reload weights from a safetensors directory (for multi-GPU TP replicas)."""
         if self.engine is None:
-            raise RuntimeError("ATOMRayServer.launch() must be called before reload_weights_from_path().")
+            raise RuntimeError(
+                "ATOMRayServer.launch() must be called before reload_weights_from_path()."
+            )
 
         import json
 
@@ -657,7 +810,9 @@ class ATOMRayServer:
                 index = json.load(f)
             files = sorted(set(index["weight_map"].values()))
         else:
-            files = sorted(f for f in os.listdir(weight_dir) if f.endswith(".safetensors"))
+            files = sorted(
+                f for f in os.listdir(weight_dir) if f.endswith(".safetensors")
+            )
 
         def weight_iter():
             for fname in files:
@@ -666,7 +821,9 @@ class ATOMRayServer:
                     yield name, tensor
 
         load_weights_via_shm(self.engine.core_mgr, weight_iter(), bucket_size_mb=2048)
-        logger.info("ATOMRayServer[%d]: reloaded weights from %s", self.replica_rank, weight_dir)
+        logger.info(
+            "ATOMRayServer[%d]: reloaded weights from %s", self.replica_rank, weight_dir
+        )
         return True
 
 
@@ -697,6 +854,11 @@ class ATOMReplicaManager:
         job_id = ray.get_runtime_context().get_job_id()
         infos = self.actor_wg.execute_all_sync("get_colocation_info")
         logger.info("ATOMReplicaManager: colocation infos = %s", infos)
+        if os.environ.get("LUMENRL_SMCI_GPU_IDENTITY_MANIFEST"):
+            physical = [info.get("physical_gpu_id") for info in infos]
+            if len(physical) != 8 or set(physical) != set(range(8)):
+                raise RuntimeError(f"SMCI eight-rank physical GPU coverage mismatch: {physical}")
+        self._colocation_infos = infos
 
         atom_tp = int(self.engine_kwargs.get("tensor_parallel_size", 1) or 1)
         num_workers = len(infos)
@@ -708,7 +870,33 @@ class ATOMReplicaManager:
         num_replicas = max(1, num_workers // atom_tp)
         self.num_replicas = num_replicas
 
+        shared_attention_env = None
+        if os.environ.get("LUMENRL_ATOM_OP_ALIGNMENT", "0") == "1":
+            config_path = os.environ.get("LUMENRL_ATOM_ATTENTION_CONFIG")
+            config_sha = os.environ.get("LUMENRL_ATOM_ATTENTION_CONFIG_SHA256")
+            if not config_path or not config_sha:
+                raise RuntimeError(
+                    "Aligned ATOM replicas require shared Attention config path and SHA256"
+                )
+            if (
+                hashlib.sha256(Path(config_path).read_bytes()).hexdigest()
+                != config_sha.lower()
+            ):
+                raise RuntimeError(
+                    "Aligned ATOM replica Attention config SHA256 mismatch"
+                )
+            shared_attention_env = {
+                "LUMENRL_ATOM_ATTENTION_CONFIG": config_path,
+                "LUMENRL_ATOM_ATTENTION_CONFIG_SHA256": config_sha,
+            }
+
         true_vocab_size = self._get_true_vocab_size()
+        if os.environ.get("LUMENRL_ATOM_OP_ALIGNMENT", "0") == "1":
+            expected_vocab = os.environ.get("LUMENRL_ATOM_TRUE_VOCAB_SIZE")
+            if expected_vocab is None or true_vocab_size != int(expected_vocab):
+                raise RuntimeError(
+                    "ATOM rollout tokenizer boundary differs from aligned training"
+                )
         # ATOM's no-eager compilation_config.level>0 rollout needs a live Dynamo, but the
         # FSDP2 training actors must stay on TORCHDYNAMO_DISABLE=1. Scope the opt-in to the
         # rollout actors here instead of letting the launcher export it process-tree wide.
@@ -724,7 +912,9 @@ class ATOMReplicaManager:
             gpu_ids_str = ",".join(all_gpu_ids)
 
             nccl_port = 29500 + r
-            disable_custom_ar = os.environ.get("LUMENRL_DISABLE_CUSTOM_AR", "1" if atom_tp > 1 else "0")
+            disable_custom_ar = os.environ.get(
+                "LUMENRL_DISABLE_CUSTOM_AR", "1" if atom_tp > 1 else "0"
+            )
             env_vars = {
                 "CUDA_VISIBLE_DEVICES": gpu_ids_str,
                 "HIP_VISIBLE_DEVICES": gpu_ids_str,
@@ -734,16 +924,41 @@ class ATOMReplicaManager:
                 "NCCL_CUMEM_ENABLE": "0",
                 "MASTER_PORT": str(nccl_port),
                 "LUMENRL_DISABLE_CUSTOM_AR": disable_custom_ar,
-                **({"ATOM_USE_CUSTOM_ALL_GATHER": "0"} if disable_custom_ar in ("1", "true", "True") else {}),
+                **(
+                    {"ATOM_USE_CUSTOM_ALL_GATHER": "0"}
+                    if disable_custom_ar in ("1", "true", "True")
+                    else {}
+                ),
                 "LUMEN_REPLICA_RANK": str(r),
                 "LUMEN_RAY_JOB_ID": str(job_id),
             }
+            if os.environ.get("LUMENRL_SMCI_GPU_IDENTITY_MANIFEST"):
+                if len(group) != 1 or "physical_gpu_uuid" not in group[0]:
+                    raise RuntimeError("SMCI replica lacks one verified actor GPU")
+                env_vars["LUMENRL_EXPECTED_GPU_UUID"] = group[0]["physical_gpu_uuid"]
+                env_vars["LUMENRL_EXPECTED_GPU_PCI"] = group[0]["physical_gpu_pci"]
             if true_vocab_size is not None:
                 env_vars["LUMENRL_ATOM_TRUE_VOCAB_SIZE"] = str(true_vocab_size)
             if dynamo_required:
                 env_vars["TORCHDYNAMO_DISABLE"] = "0"
             for key in (
                 "LUMENRL_ATOM_CHECK_ALIGNMENT",
+                "LUMENRL_ATOM_OP_ALIGNMENT",
+                "LUMENRL_ATOM_ATTENTION_CONFIG",
+                "LUMENRL_ATOM_ATTENTION_CONFIG_SHA256",
+                "LUMEN_ATOM_BF16_POLICY",
+                "LUMEN_ATOM_RL_PATCH",
+                "LUMEN_ATOM_MAIN_AITER_COMPAT",
+                "LUMEN_ATOM_CLEAN_MAIN_RECIPE",
+                "LUMEN_ATOM_MAIN_ROOT",
+                "LUMENRL_SMCI_GPU_IDENTITY_MANIFEST",
+                "LUMEN_ATOM_MXFP4_2D",
+                "LUMEN_ATOM_MAIN_LIFECYCLE",
+                "ATOM_ALIGNED_KV_PACK",
+                "ATOM_DECODE_PROFILE",
+                "PYTHONPATH",
+                "ATOM_USE_MODEL_SENSITIVE_RMSNORM",
+                "ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM",
                 "ATOM_ISOLATE_TORCH_COMPILE_CACHE",
                 "ATOM_LOG_LEVEL",
                 "ATOM_USE_TORCH_RMSNORM",
@@ -754,6 +969,14 @@ class ATOMReplicaManager:
                 if key in os.environ:
                     env_vars[key] = os.environ[key]
 
+            if shared_attention_env is not None and any(
+                env_vars.get(key) != value
+                for key, value in shared_attention_env.items()
+            ):
+                raise RuntimeError(
+                    "Shared Attention environment changed while creating ATOM replicas"
+                )
+
             engine_kwargs = self._engine_kwargs_for_replica(r, job_id)
             if true_vocab_size is not None:
                 # Belt and braces across two ATOM generations. The pinned build
@@ -763,6 +986,14 @@ class ATOMReplicaManager:
                 # dataclass fields and drops the rest, so the build that does not
                 # know the field ignores this line rather than failing on it --
                 # and the mask cannot go quiet just because the pin moved.
+                if os.environ.get("LUMENRL_ATOM_OP_ALIGNMENT", "0") == "1":
+                    configured_vocab = engine_kwargs.get(
+                        "true_vocab_size", true_vocab_size
+                    )
+                    if configured_vocab != true_vocab_size:
+                        raise RuntimeError(
+                            "ATOM Config overrides the aligned tokenizer boundary"
+                        )
                 engine_kwargs.setdefault("true_vocab_size", int(true_vocab_size))
             if disable_custom_ar in ("1", "true", "True"):
                 engine_kwargs.setdefault(
@@ -774,7 +1005,10 @@ class ATOMReplicaManager:
             if _dbg:
                 logger.info(
                     "[DBG] ATOMReplicaManager: replica %d — gpus=%s disable_ca=%s runner=%s",
-                    r, gpu_ids_str, disable_custom_ar, engine_kwargs.get("runner_qualname", "default"),
+                    r,
+                    gpu_ids_str,
+                    disable_custom_ar,
+                    engine_kwargs.get("runner_qualname", "default"),
                 )
 
             server = remote_cls.options(
@@ -782,7 +1016,9 @@ class ATOMReplicaManager:
                 num_cpus=1,
                 name=f"lumen-atom-replica-{r}",
                 max_concurrency=self.max_concurrency,
-                scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=False),
+                scheduling_strategy=NodeAffinitySchedulingStrategy(
+                    node_id=node_id, soft=False
+                ),
                 runtime_env={"env_vars": env_vars},
             ).remote(
                 model_name=self.model_name,
@@ -799,10 +1035,14 @@ class ATOMReplicaManager:
         )
         for i, s in enumerate(self.servers):
             ray.get(s.launch.remote())
-            logger.info("ATOMReplicaManager: replica %d/%d launched.", i + 1, num_replicas)
+            logger.info(
+                "ATOMReplicaManager: replica %d/%d launched.", i + 1, num_replicas
+            )
         logger.info(
             "ATOMReplicaManager: launched %d colocated rollout replicas (atom_tp=%d, workers=%d).",
-            num_replicas, atom_tp, num_workers,
+            num_replicas,
+            atom_tp,
+            num_workers,
         )
 
     def _torch_compile_enabled(self) -> bool:
@@ -815,25 +1055,45 @@ class ATOMReplicaManager:
         try:
             from transformers import AutoTokenizer
 
-            vocab_size = len(AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True))
-            logger.info("ATOMReplicaManager: true tokenizer vocab size = %d", vocab_size)
+            vocab_size = len(
+                AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True)
+            )
+            logger.info(
+                "ATOMReplicaManager: true tokenizer vocab size = %d", vocab_size
+            )
             return int(vocab_size)
         except Exception as exc:
-            logger.warning("ATOMReplicaManager: failed to resolve tokenizer vocab size: %s", exc)
+            logger.warning(
+                "ATOMReplicaManager: failed to resolve tokenizer vocab size: %s", exc
+            )
             return None
 
-    def _engine_kwargs_for_replica(self, replica_rank: int, job_id: str) -> dict[str, Any]:
+    def _engine_kwargs_for_replica(
+        self, replica_rank: int, job_id: str
+    ) -> dict[str, Any]:
         kwargs = dict(self.engine_kwargs)
-        if os.getenv("ATOM_ISOLATE_TORCH_COMPILE_CACHE", "0") not in {"1", "true", "TRUE", "yes", "YES"}:
+        if os.getenv("ATOM_ISOLATE_TORCH_COMPILE_CACHE", "0") not in {
+            "1",
+            "true",
+            "TRUE",
+            "yes",
+            "YES",
+        }:
             return kwargs
 
         if not self._torch_compile_enabled():
             return kwargs
 
         comp_cfg = dict(kwargs.get("compilation_config") or {})
-        cache_root = os.getenv("ATOM_TORCH_COMPILE_CACHE_ROOT", "/tmp/atom_torch_compile_cache")
-        safe_job_id = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in str(job_id))
-        comp_cfg["cache_dir"] = os.path.join(cache_root, safe_job_id, f"replica_{replica_rank}")
+        cache_root = os.getenv(
+            "ATOM_TORCH_COMPILE_CACHE_ROOT", "/tmp/atom_torch_compile_cache"
+        )
+        safe_job_id = "".join(
+            ch if ch.isalnum() or ch in "-_." else "_" for ch in str(job_id)
+        )
+        comp_cfg["cache_dir"] = os.path.join(
+            cache_root, safe_job_id, f"replica_{replica_rank}"
+        )
         kwargs["compilation_config"] = comp_cfg
         logger.info(
             "ATOMReplicaManager: replica %d torch compile cache_dir=%s",
@@ -844,22 +1104,27 @@ class ATOMReplicaManager:
 
     def sleep_all(self, level: int = 2) -> None:
         import ray
+
         ray.get([s.sleep.remote(level) for s in self.servers])
 
     def wake_all(self, tags: Optional[list[str]] = None) -> None:
         import ray
+
         ray.get([s.wake_up.remote(tags) for s in self.servers])
 
     def drain_all(self) -> None:
         import ray
+
         ray.get([s.wait_for_requests_to_drain.remote() for s in self.servers])
 
     def reload_weights_from_path(self, weight_dir: str) -> None:
         import ray
+
         ray.get([s.reload_weights_from_path.remote(weight_dir) for s in self.servers])
 
     def shutdown(self) -> None:
         import ray
+
         try:
             ray.get([s.shutdown.remote() for s in self.servers])
         except Exception:

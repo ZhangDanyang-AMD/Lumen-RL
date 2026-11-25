@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Type
 
@@ -31,6 +33,32 @@ def _prefixed_method(prefix: str, method: str) -> str:
     if not prefix:
         return method
     return f"{prefix}_{method}"
+
+
+def _actor_runtime_env() -> dict | None:
+    """Per-actor process env override for diagnostics; disabled by default.
+
+    Reads ``LUMENRL_ACTOR_RUNTIME_ENV_JSON`` (a JSON object of string values) and
+    applies it as a Ray actor-level ``runtime_env`` so the variables reach only
+    this group's training actors. A differently named source variable is used on
+    purpose: setting ``HIP_LAUNCH_BLOCKING`` in the driver/container env would
+    also reach the Raylet and the rollout engine workers, which must keep their
+    normal asynchronous launch behaviour.
+
+    Default: returns ``None`` (no runtime_env, unchanged behaviour).
+    """
+    raw = os.environ.get("LUMENRL_ACTOR_RUNTIME_ENV_JSON")
+    if not raw:
+        return None
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in parsed.items()
+    ):
+        raise ValueError(
+            "LUMENRL_ACTOR_RUNTIME_ENV_JSON must be a JSON object of string values"
+        )
+    return {"env_vars": parsed}
 
 
 def _placement_node_ips(
@@ -132,6 +160,7 @@ class RayWorkerGroup:
             num_gpus=gpus_per_worker,
             num_cpus=1,
         )(self.worker_cls)
+        actor_runtime_env = _actor_runtime_env()
 
         for rank in range(self.num_workers):
             actor_name = f"{self.pool.name}:{self.worker_cls.__name__}:{rank}"
@@ -139,6 +168,8 @@ class RayWorkerGroup:
             if self.detached:
                 options_kwargs["name"] = actor_name
                 options_kwargs["lifetime"] = "detached"
+            if actor_runtime_env is not None:
+                options_kwargs["runtime_env"] = actor_runtime_env
             actor_ctor = RemoteWorker.options(**options_kwargs) if options_kwargs else RemoteWorker
             actor = actor_ctor.remote(
                 rank=rank,
@@ -199,6 +230,7 @@ class RayWorkerGroup:
         )
 
         RemoteWorker = ray.remote(self.worker_cls)
+        actor_runtime_env = _actor_runtime_env()
         rank = 0
         for pg, count in pgs:
             for local_rank in range(count):
@@ -214,6 +246,8 @@ class RayWorkerGroup:
                 if self.detached:
                     options_kwargs["name"] = actor_name
                     options_kwargs["lifetime"] = "detached"
+                if actor_runtime_env is not None:
+                    options_kwargs["runtime_env"] = actor_runtime_env
                 actor = RemoteWorker.options(**options_kwargs).remote(
                     rank=rank,
                     world_size=self.num_workers,

@@ -39,6 +39,177 @@ logger = logging.getLogger(__name__)
 LUMENRL_DEBUG = os.environ.get("LUMENRL_DEBUG", "0") in ("1", "true", "True")
 
 
+def _training_requests_mxfp4(config: Any) -> bool:
+    training = getattr(getattr(config, "quantization", None), "training", None)
+    return bool(getattr(training, "mxfp4", False))
+
+
+def _join_weight_sync_handles(pending: list, send_set: set, timeout_s: float):
+    """Join weight-sync sender and receiver handles, or say where it stalled.
+
+    The two sides are a ZMQ REQ/REP pair: a receiver that raises leaves its
+    socket closed with the matching sender parked in ``recv()`` forever, and a
+    plain ``ray.wait`` loop then hangs with no indication of which side died.
+    Bounding the join turns that into one error naming the side still pending,
+    which is the difference between a five-minute diagnosis and a stack dump.
+    """
+    import ray
+
+    send_results: list = []
+    recv_results: list = []
+    deadline = time.monotonic() + float(timeout_s)
+    while pending:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            stalled_send = sum(1 for handle in pending if handle in send_set)
+            stalled_recv = len(pending) - stalled_send
+            raise TimeoutError(
+                f"weight sync stalled for {timeout_s:.0f}s: "
+                f"{stalled_send} sender(s) and {stalled_recv} receiver(s) never "
+                "returned; a failed receiver leaves its sender in recv()"
+            )
+        done, pending = ray.wait(pending, num_returns=1, timeout=remaining)
+        if not done:
+            continue
+        val = ray.get(done[0])
+        if done[0] in send_set:
+            if isinstance(val, dict):
+                send_results.append(val)
+        elif isinstance(val, list):
+            recv_results.extend(r for r in val if isinstance(r, dict) and "total_s" in r)
+    return send_results, recv_results
+
+
+def _run_prepared_weight_sync(actor_wg, servers, *, version: int, bucket_mb: int,
+                              max_bytes: int, timeout_s: float, on_cpu: bool = False):
+    """Finish every actor snapshot before receivers start, under one deadline."""
+    deadline = time.monotonic() + float(timeout_s)
+    original_error = None
+    try:
+        refs = actor_wg.execute_all_async(
+            "prepare_weight_transfer", version=version, max_bytes=max_bytes,
+        )
+        prepared, _ = _join_weight_sync_handles(
+            list(refs), set(refs), max(0.0, deadline - time.monotonic()),
+        )
+        if len(prepared) != len(refs) or not prepared:
+            raise RuntimeError("Not every actor returned a prepared weight snapshot")
+        expected_layout = prepared[0].get("layout")
+        expected_epoch = prepared[0].get("scheduler_epoch")
+        if not expected_layout or any(
+            result.get("version") != version
+            or result.get("layout") != expected_layout
+            or result.get("scheduler_epoch") != expected_epoch
+            for result in prepared
+        ):
+            raise RuntimeError("Prepared actor weight layouts, versions or epochs disagree")
+        if on_cpu:
+            host_refs = actor_wg.execute_all_async("stage_prepared_weight_transfer_cpu", version=version)
+            staged, _ = _join_weight_sync_handles(
+                list(host_refs), set(host_refs), max(0.0, deadline - time.monotonic()),
+            )
+            if len(staged) != len(host_refs) or any(
+                result.get("version") != version or result.get("cpu_only") is not True
+                or result.get("layout") != expected_layout
+                or result.get("scheduler_epoch") != expected_epoch
+                for result in staged
+            ):
+                raise RuntimeError("Not every actor completed matching CPU weight staging")
+            prepared.extend(staged)
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Weight preparation exhausted the complete sync budget")
+        # This point is a controller-side completion barrier, not another GPU
+        # collective: all producer streams have completed before any receiver.
+        recv = [server.update_weights_from_ipc.remote(True, version) for server in servers]
+        send = actor_wg.execute_all_async(
+            "update_weights_ipc_send", bucket_size_mb=bucket_mb, use_shm=True,
+            version=version, use_prepared=True,
+        )
+        sent, received = _join_weight_sync_handles(
+            list(send) + recv, set(send), max(0.0, deadline - time.monotonic()),
+        )
+        return sent, received, prepared
+    except BaseException as error:
+        original_error = error
+        raise
+    finally:
+        try:
+            # Actor calls are queued behind any active send, so cleanup cannot
+            # free a live transfer. A failed sync gets a separate bounded five-
+            # second cleanup grace; this never extends the success deadline.
+            cleanup = actor_wg.execute_all_async("clear_prepared_weight_transfer", version=version)
+            _join_weight_sync_handles(
+                list(cleanup), set(cleanup),
+                5.0 if original_error is not None else min(5.0, max(0.0, deadline - time.monotonic())),
+            )
+        except Exception:
+            if original_error is None:
+                raise
+            logger.exception("Prepared-buffer cleanup could not finish; preserving the original sync failure")
+
+
+def _await_actor_updates(refs: list, timeout_s: float):
+    """Wait for the per-actor update refs, naming the workers that never returned.
+
+    An FSDP update is collective, so one rank that never finishes hangs the step
+    with no attribution at all; a bare ``ray.get`` on the whole list cannot say
+    which. Bounding the wait turns a silent hang into the worker ids.
+    """
+    import ray
+
+    ordered = list(enumerate(refs))
+    values: dict[str, object] = {}
+    pending = ordered
+    deadline = time.monotonic() + float(timeout_s)
+    while pending:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            stalled = [index for index, _ in pending]
+            raise TimeoutError(
+                f"actor update did not return for worker(s) {stalled} of "
+                f"{len(refs)} within {timeout_s:.0f}s; the update is collective, "
+                "so check those workers' logs for the first error"
+            )
+        done, _ = ray.wait(
+            [ref for _, ref in pending], num_returns=1, timeout=remaining
+        )
+        if not done:
+            continue
+        handle = done[0]
+        pending = [(index, ref) for index, ref in pending if ref is not handle]
+        values[repr(handle)] = ray.get(handle)
+    return [values[repr(ref)] for _, ref in ordered]
+
+
+def _require_mxfp4_rollout_alignment(quant_cfg: Any, training_mxfp4: bool) -> None:
+    """Refuse an MXFP4 actor paired with a rollout quantizer that rounds differently.
+
+    The actor quantizes with the frozen recipe: 32x32 weight tiles and per-row
+    1x32 activations, both round-to-nearest-even on the E8M0 exponent. ATOM
+    reaches those same bytes only through ``mxfp4_2d``; its generic MXFP4 path
+    quantizes activations with ``per_1x32_mx_quant_hip``, which takes no round
+    mode and inherits AITER's RoundUp default. On real Qwen3-8B layers the
+    ``mxfp4_2d`` path matched the actor byte for byte while the generic path
+    differed in tens of thousands of scale bytes per activation, and nothing
+    raised. A policy trained that way would be scored against rollout weights
+    quantized one binade away, so this is an error rather than a warning.
+    """
+    if not training_mxfp4:
+        return
+    if isinstance(quant_cfg, dict):
+        name = str(quant_cfg.get("global_quant_config") or "")
+    else:
+        name = str(getattr(quant_cfg, "global_quant_config", "") or "")
+    if name != "mxfp4_2d":
+        raise ValueError(
+            "MXFP4 actor requires rollout online_quant_config."
+            "global_quant_config='mxfp4_2d' so actor and rollout quantize "
+            f"identically; got {name or 'none'!r}. The generic MXFP4 path rounds "
+            "E8M0 scales up instead of to-even, which silently changes the "
+            "rollout weights by one exponent binade per block."
+        )
+
+
 def _algo_num_generations(config: LumenRLConfig) -> int:
     name = config.algorithm.name.lower()
     if name == "ppo":
@@ -62,12 +233,22 @@ def _response_token_ids(
     return sequence[min(response_start, real_end):real_end]
 
 
-def _format_chat_prompt(tokenizer: Any, messages: list[dict[str, Any]]) -> str:
-    """Format chat messages without silently dropping model turn markers."""
+def _format_chat_prompt(
+    tokenizer: Any,
+    messages: list[dict[str, Any]],
+    *,
+    enable_thinking: bool | None = None,
+) -> str:
+    """Format chat messages, optionally overriding the native thinking mode."""
+    if enable_thinking is not None and not isinstance(enable_thinking, bool):
+        raise TypeError("enable_thinking must be bool or None")
     if getattr(tokenizer, "chat_template", None):
+        mode_kwargs = {} if enable_thinking is None else {"enable_thinking": enable_thinking}
         return tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
+            messages, tokenize=False, add_generation_prompt=True, **mode_kwargs,
         )
+    if enable_thinking is not None:
+        raise ValueError("enable_thinking requires a native tokenizer chat template")
 
     convert_token = getattr(tokenizer, "convert_tokens_to_ids", None)
     if callable(convert_token):
@@ -169,6 +350,7 @@ class RLTrainer:
 
         quant = {}
         tq = self.config.quantization.training
+        quant["mxfp4"] = bool(getattr(tq, "mxfp4", False))
         if tq.fp8:
             quant["fp8"] = tq.fp8
         quant["fp8_weight_cache"] = tq.fp8_weight_cache
@@ -549,6 +731,10 @@ class RLTrainer:
         if quant_cfg is None and vllm_quant in {"fp8_per_block", "per_block_fp8"}:
             quant_cfg = {"global_quant_config": "per_block_fp8"}
 
+        _require_mxfp4_rollout_alignment(
+            quant_cfg, _training_requests_mxfp4(self.config)
+        )
+
         engine_kwargs: dict[str, Any] = dict(
             model=model_name,
             tensor_parallel_size=int(getattr(atom_cfg, "tensor_parallel_size", 1) or 1),
@@ -570,9 +756,16 @@ class RLTrainer:
         if quant_cfg:
             engine_kwargs["online_quant_config"] = quant_cfg
 
-        extra = getattr(atom_cfg, "engine_kwargs", {}) or {}
+        extra = dict(getattr(atom_cfg, "engine_kwargs", {}) or {})
+        # The historical extended ATOM accepted this optional receiver staging
+        # knob. Pinned main does not; False is its unchanged default behavior.
+        if os.environ.get("LUMEN_ATOM_CLEAN_MAIN_RECIPE", "0") == "1" and (
+            "mxfp4_2d_bf16_packing" in extra
+        ):
+            if extra.pop("mxfp4_2d_bf16_packing") is not False:
+                raise ValueError("clean ATOM main does not support BF16 packed weight staging")
         if extra:
-            engine_kwargs.update(dict(extra))
+            engine_kwargs.update(extra)
 
         colocation_wg = getattr(self, "_rollout_wg", None) or self._actor_wg
         if colocation_wg is not self._actor_wg:
@@ -810,6 +1003,12 @@ class RLTrainer:
             return
 
         backend = str(getattr(self.config.weight_sync, "backend", "auto"))
+        materialize = bool(getattr(self.config.weight_sync, "materialize_before_transfer", False))
+        on_cpu = bool(getattr(self.config.weight_sync, "materialize_on_cpu", False))
+        if on_cpu and not materialize:
+            raise ValueError("materialize_on_cpu requires materialize_before_transfer")
+        if materialize and backend != "auto":
+            raise ValueError("materialize_before_transfer currently requires auto SHM transport")
         if backend == "rdma":
             self._sync_weights_rdma(mgr)
             return
@@ -824,6 +1023,8 @@ class RLTrainer:
 
         separated = getattr(self, "_rollout_wg", None) is not None
         if separated or not self._ipc_endpoints_match_actors(mgr):
+            if materialize:
+                raise ValueError("materialize_before_transfer requires colocated actor/receiver endpoints")
             if LUMENRL_DEBUG:
                 logger.info("[DBG] _sync_weights_ipc: separated=%s replicas=%d workers=%d, using safetensors",
                             separated, mgr.num_replicas, self._actor_wg.num_workers)
@@ -833,6 +1034,8 @@ class RLTrainer:
         vcfg = self.config.policy.generation.vllm_cfg
         bmb = int(vcfg.update_weights_bucket_megabytes)
         use_shm = bool(vcfg.use_shm)
+        if materialize and not use_shm:
+            raise ValueError("materialize_before_transfer requires use_shm=True")
         sleeping = bool(getattr(self._ray_vllm_engine, "enable_sleep", False))
 
         rollout_engine = self._ray_vllm_engine
@@ -844,32 +1047,33 @@ class RLTrainer:
         # 1) wake weight memory before loading (only when sleep is in use).
         if sleeping:
             rollout_engine.wake(tags=["weights"])
-        # 2) start receivers + senders concurrently, then join both.
-        recv = [
-            s.update_weights_from_ipc.remote(use_shm, version) for s in mgr.servers
-        ]
-        send = self._actor_wg.execute_all_async(
-            "update_weights_ipc_send", bucket_size_mb=bmb, use_shm=use_shm,
-            version=version,
-        )
-        # Join as they finish rather than senders-then-receivers. The two sides
-        # are a ZMQ REQ/REP pair, so a receiver that raises leaves its socket
-        # closed with the sender parked in recv() forever: waiting on the
-        # senders first turns any receiver-side error into a silent hang that
-        # only a stack dump explains. Taking whichever finishes first re-raises
-        # the real exception within a bucket's time.
-        send_set = set(send)
-        send_results: list[dict] = []
-        recv_results: list[dict] = []
-        pending = list(send) + list(recv)
-        while pending:
-            done, pending = ray.wait(pending, num_returns=1)
-            val = ray.get(done[0])
-            if done[0] in send_set:
-                if isinstance(val, dict):
-                    send_results.append(val)
-            elif isinstance(val, list):
-                recv_results.extend(r for r in val if isinstance(r, dict) and "total_s" in r)
+        # 2) The opt-in schedule completes actor materialization before receiver
+        # work. The default keeps the existing streaming overlap unchanged.
+        timeout_s = float(getattr(self.config.weight_sync, "timeout_s", 180.0) or 180.0)
+        prepared_results = []
+        try:
+            if materialize:
+                send_results, recv_results, prepared_results = _run_prepared_weight_sync(
+                    self._actor_wg, mgr.servers, version=version, bucket_mb=bmb,
+                    max_bytes=self.config.weight_sync.materialize_max_bytes,
+                    timeout_s=timeout_s, on_cpu=on_cpu,
+                )
+            else:
+                recv = [s.update_weights_from_ipc.remote(use_shm, version) for s in mgr.servers]
+                send = self._actor_wg.execute_all_async(
+                    "update_weights_ipc_send", bucket_size_mb=bmb, use_shm=use_shm,
+                    version=version,
+                )
+                # Join both sides as they finish: a failed receiver must not
+                # leave the controller waiting only on its blocked sender.
+                send_results, recv_results = _join_weight_sync_handles(
+                    list(send) + list(recv), set(send), timeout_s,
+                )
+        except TimeoutError as exc:
+            raise TimeoutError(
+                f"{exc} (version={version}, use_shm={use_shm}, bucket={bmb}MB); "
+                "check the ATOM replica logs for the first error on the receive side"
+            ) from exc
         if send_results:
             def _max_metric(rows: list[dict], key: str) -> float:
                 return max(float(r.get(key, 0.0) or 0.0) for r in rows)
@@ -880,6 +1084,13 @@ class RLTrainer:
                 "mem/weight_sync_peak_alloc_gb": _max_metric(send_results, "peak_alloc_gb"),
                 "mem/weight_sync_peak_extra_gb": _max_metric(send_results, "peak_extra_gb"),
             }
+            if prepared_results:
+                metrics.update({
+                    "timing/weight_sync_prepare_s": _max_metric(prepared_results, "prepare_s"),
+                    "timing/weight_sync_host_stage_s": _max_metric(prepared_results, "host_stage_s"),
+                    "mem/weight_sync_prepared_bytes": _max_metric(prepared_results, "wire_bytes"),
+                    "mem/weight_sync_prepare_estimated_peak_bytes": _max_metric(prepared_results, "estimated_peak_bytes"),
+                })
             from lumenrl.engine.inference.bucketed_weight_transfer import _debug_enabled
 
             debug = _debug_enabled()
@@ -914,6 +1125,43 @@ class RLTrainer:
                     "\n        ".join(_fmt(r) for r in send_results),
                     "\n        ".join(_fmt(r) for r in recv_results),
                 )
+        if os.environ.get("LUMEN_ATOM_CLEAN_MAIN_RECIPE", "0") == "1":
+            audit_name = os.environ.get("LUMENRL_REFIT_AUDIT_NAME") or None
+            per_replica = ray.get(
+                [server.get_refit_and_c1_receipts.remote(True, audit_name)
+                 for server in mgr.servers],
+                timeout=30.0,
+            )
+            identities = getattr(mgr, "_colocation_infos", [])
+            if len(per_replica) != len(mgr.servers) or len(identities) != len(per_replica):
+                raise RuntimeError("clean-main refit receipts lack complete replica coverage")
+            receipts = []
+            for replica_rank, workers in enumerate(per_replica):
+                if len(workers) != 1:
+                    raise RuntimeError("clean-main TP1 refit requires one worker receipt per replica")
+                row = dict(workers[0])
+                row["replica_rank"] = replica_rank
+                for field in ("physical_gpu_id", "physical_gpu_uuid", "physical_gpu_pci"):
+                    if field in identities[replica_rank]:
+                        expected = identities[replica_rank][field]
+                        if field in row and row[field] != expected:
+                            raise RuntimeError(
+                                f"replica {replica_rank} ModelRunner {field} differs from actor"
+                            )
+                        row[field] = expected
+                if row.get("mxfp4_2d_target_count") != 144 or not row.get("refit_installed"):
+                    raise RuntimeError(f"replica {replica_rank} lacks 144 clean-main refit targets: {row}")
+                if row.get("c1_fallback"):
+                    raise RuntimeError(f"replica {replica_rank} used a C1 fallback: {row}")
+                receipts.append(row)
+            generations = {row.get("refit_generation") for row in receipts}
+            if len(generations) != 1 or not all(isinstance(g, int) and g > 0 for g in generations):
+                raise RuntimeError(f"replica refit generations diverged: {receipts}")
+            if (os.environ.get("ATOM_ALIGNED_KV_PACK") == "1" and
+                    max(generations) > 1 and any(row["c1_hit"] == 0 for row in receipts)):
+                raise RuntimeError(f"selected C1 did not execute on all replicas: {receipts}")
+            logger.info("clean_main_weight_sync step=%d wire_version=%d per_rank=%s",
+                        self.global_step, version, receipts)
         # 3) wake KV cache so the next rollout can run.
         if sleeping:
             rollout_engine.wake(tags=["kv_cache"])
@@ -1537,14 +1785,44 @@ class RLTrainer:
                         self.config.checkpointing.checkpoint_dir)
             return
         step, actor_dir = latest
+        from lumenrl.utils.checkpoint import CheckpointManager
+
+        meta_path = Path(actor_dir).parent / f"checkpoint_{step}.pt"
+        cursor = None
+        if meta_path.is_file():
+            meta = CheckpointManager.load(meta_path)["state_dict"]
+            if not isinstance(meta, dict):
+                raise ValueError("Invalid Ray controller checkpoint metadata")
+            if "controller_state" in meta:
+                state = meta["controller_state"]
+                if (
+                    not isinstance(state, dict)
+                    or type(state.get("version")) is not int
+                    or state["version"] != 1
+                    or type(state.get("prompt_cursor")) is not int
+                    or state["prompt_cursor"] < 0
+                ):
+                    raise ValueError("Invalid or unsupported Ray controller data state")
+                cursor = state["prompt_cursor"]
+        if cursor is None:
+            # Preserve loading of legacy actor-only checkpoints, but do not
+            # invent a data position: dynamic sampling prevents step-based inference.
+            logger.warning(
+                "Ray checkpoint has no controller data position; retaining "
+                "prompt_cursor=%d. Exact data continuation is unavailable.",
+                self._prompt_cursor,
+            )
         logger.info("Resuming Ray actor checkpoint from %s (step=%d).", actor_dir, step)
         loaded = self._actor_wg.execute_all_sync("load_checkpoint", actor_dir)
         # Checkpoint directories use verl-style 1-based global steps. The
         # internal loop is 0-based, so global_step_N resumes at internal step N
         # and the next emitted callback line is step=N+1.
         self._resume_step = int(max([step] + [int(x) for x in loaded]))
+        if cursor is not None:
+            self._prompt_cursor = cursor
+            logger.info("Restored Ray controller prompt_cursor=%d", cursor)
         logger.info(
-            "Ray resume complete. Next training log will be global_step=%d.",
+            "Ray actor-state resume complete. Next training log will be global_step=%d.",
             self._resume_step + 1,
         )
 
@@ -1644,7 +1922,11 @@ class RLTrainer:
                     break
 
         if self._tokenizer is not None and prompt_messages is not None:
-            prompt_text = _format_chat_prompt(self._tokenizer, prompt_messages)
+            policy = getattr(getattr(self, "config", None), "policy", None)
+            prompt_text = _format_chat_prompt(
+                self._tokenizer, prompt_messages,
+                enable_thinking=getattr(policy, "enable_thinking", None),
+            )
 
         return prompt_text, str(gt)
 
@@ -2188,6 +2470,20 @@ class RLTrainer:
         rollout_lp = torch.cat(lps, dim=0) if want_lp else None
         return sequences, seq_mask, plens, rollout_lp
 
+    def _math_reward_options(self, response_token_rows: list[torch.Tensor]) -> dict[str, Any]:
+        reward = getattr(getattr(self, "config", None), "reward", None)
+        if not getattr(reward, "require_completed_final", False):
+            return {}
+        tokens = getattr(reward, "completion_eos_token_ids", [])
+        if not tokens or any(type(token) is not int or token < 0 for token in tokens):
+            raise ValueError("Completed-final scoring requires explicit valid EOS token ids")
+        eos_ids = set(tokens)
+        completed = [
+            bool(row.numel() and int(row[-1].item()) in eos_ids)
+            for row in response_token_rows
+        ]
+        return {"completed": completed, "final_only": True}
+
     def _compute_rewards_full(
         self,
         sequences: torch.Tensor,
@@ -2206,6 +2502,7 @@ class RLTrainer:
         N = int(sequences.shape[0])
         responses: list[str] = []
         response_lengths: list[int] = []
+        response_token_rows: list[torch.Tensor] = []
         if self._rank == 0:
             seq_cpu = sequences.cpu()
             mask_cpu = attention_mask.cpu()
@@ -2213,9 +2510,12 @@ class RLTrainer:
                 plen = int(prompt_lengths[i]) if i < len(prompt_lengths) else 0
                 response_ids = _response_token_ids(seq_cpu[i], mask_cpu[i], plen)
                 response_lengths.append(int(response_ids.numel()))
+                response_token_rows.append(response_ids)
                 text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
                 responses.append(text)
-            rewards_t, details = compute_math_reward(responses, gts_expanded)
+            rewards_t, details = compute_math_reward(
+                responses, gts_expanded, **self._math_reward_options(response_token_rows),
+            )
             rewards = rewards_t.to(self._device)
             accs = torch.tensor(
                 [1.0 if d["acc"] else 0.0 for d in details],
@@ -2727,9 +3027,11 @@ class RLTrainer:
             else attention_mask
         )
         responses = []
+        response_token_rows = []
         for i in range(seq_cpu.shape[0]):
             plen = prompt_lengths[i]
             response_ids = _response_token_ids(seq_cpu[i], mask_cpu[i], plen)
+            response_token_rows.append(response_ids)
             text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
             responses.append(text)
 
@@ -2739,7 +3041,9 @@ class RLTrainer:
 
         from lumenrl.rewards.math_reward import compute_math_reward
 
-        rewards, details = compute_math_reward(responses, expanded_gts)
+        rewards, details = compute_math_reward(
+            responses, expanded_gts, **self._math_reward_options(response_token_rows),
+        )
 
         accuracy = sum(1 for d in details if d["acc"]) / max(1, len(details))
         logger.info("Reward: accuracy=%.4f, mean=%.4f", accuracy, rewards.mean().item())
@@ -3964,7 +4268,10 @@ class RLTrainer:
                     "(FSDP requires every actor to participate)."
                 )
 
-        outputs: list[dict[str, float]] = ray.get(refs)
+        outputs: list[dict[str, float]] = _await_actor_updates(
+            refs,
+            float(os.environ.get("LUMENRL_ACTOR_UPDATE_TIMEOUT_S", "900")),
+        )
         if not outputs:
             return {"loss": 0.0}
 
@@ -4485,6 +4792,7 @@ class RLTrainer:
             seq_cpu = sequences.cpu()
             mask_cpu = seq_mask.cpu()
             responses = []
+            response_token_rows = []
             keep = max(0, seq_cpu.shape[0] - pad_size * eval_n)
             seq_cpu = seq_cpu[:keep]
             prompt_lengths = prompt_lengths[:keep]
@@ -4495,8 +4803,11 @@ class RLTrainer:
             for i in range(seq_cpu.shape[0]):
                 plen = int(prompt_lengths[i]) if i < len(prompt_lengths) else 0
                 response_ids = _response_token_ids(seq_cpu[i], mask_cpu[i], plen)
+                response_token_rows.append(response_ids)
                 responses.append(self._tokenizer.decode(response_ids, skip_special_tokens=True))
-            rewards_t, details = compute_math_reward(responses, ground_truths)
+            rewards_t, details = compute_math_reward(
+                responses, ground_truths, **self._math_reward_options(response_token_rows),
+            )
 
             all_scores.extend(rewards_t.tolist())
             all_acc.extend([1.0 if d["acc"] else 0.0 for d in details])
@@ -4593,9 +4904,6 @@ class RLTrainer:
         if self._ref_wg is not None:
             self._ref_wg.stop()
             self._ref_wg = None
-        if self._ray_cluster is not None:
-            self._ray_cluster.shutdown()
-            self._ray_cluster = None
         if self._critic_worker is not None:
             self._critic_worker.cleanup()
             self._critic_worker = None
@@ -4609,6 +4917,12 @@ class RLTrainer:
                 pass
             self._ray_vllm_engine = None
             self._ray_rollout_mgr = None
+        # Rollout shutdown still calls Ray APIs on live actor handles. Disconnect
+        # only afterwards: otherwise those calls auto-initialize a new Ray
+        # session and try to kill handles belonging to the previous session.
+        if self._ray_cluster is not None:
+            self._ray_cluster.shutdown()
+            self._ray_cluster = None
         if self._engine is not None:
             del self._engine
             self._engine = None

@@ -37,6 +37,7 @@ from lumenrl.utils.checkpoint import (
     run_checkpoint_phase,
 )
 from lumenrl.core.protocol import DataProto
+from lumenrl.utils.rng_state import capture_actor_rng_state, restore_actor_rng_state
 from lumenrl.moe.r3_scope import assert_supported_r3, r3_fields_from_config
 from lumenrl.core.types import AlgorithmName, TrainingBackend
 from lumenrl.engine.training.base_engine import BaseEngine, EngineRegistry
@@ -242,6 +243,7 @@ class LumenActorWorker(BaseWorker):
                 "optimizer_offload": fsdp_cfg.get("optimizer_offload", False),
                 "grad_offload": fsdp_cfg.get("grad_offload", False),
                 "reshard_after_forward": fsdp_cfg.get("reshard_after_forward", True),
+                "deterministic_attention": fsdp_cfg.get("deterministic_attention", False),
                 "model_dtype": "fp32",
                 "mixed_precision": {
                     "param_dtype": compute_dtype,
@@ -1322,14 +1324,7 @@ class LumenActorWorker(BaseWorker):
                     "lr_scheduler": (
                         scheduler.state_dict() if scheduler is not None else None
                     ),
-                    "rng": {
-                        "cpu": torch.get_rng_state(),
-                        "cuda": (
-                            torch.cuda.get_rng_state()
-                            if torch.cuda.is_available()
-                            else None
-                        ),
-                    },
+                    "rng": capture_actor_rng_state(),
                 }
                 torch.save(
                     extra,
@@ -1444,14 +1439,7 @@ class LumenActorWorker(BaseWorker):
                 sched_state = extra.get("lr_scheduler")
                 if scheduler is not None and sched_state is not None:
                     scheduler.load_state_dict(sched_state)
-                rng = extra.get("rng") or {}
-                if rng.get("cpu") is not None:
-                    torch.set_rng_state(rng["cpu"])
-                if (
-                    torch.cuda.is_available()
-                    and rng.get("cuda") is not None
-                ):
-                    torch.cuda.set_rng_state(rng["cuda"])
+                restore_actor_rng_state(extra.get("rng") or {})
                 del extra
             import gc
 
@@ -1493,9 +1481,71 @@ class LumenActorWorker(BaseWorker):
             itemsize = torch.bfloat16.itemsize
         return itemsize * param.numel()
 
+    def prepare_weight_transfer(self, version: int, max_bytes: int) -> dict[str, Any]:
+        """Materialize a versioned wire snapshot before receiver work starts."""
+        if self._engine is None:
+            raise RuntimeError("init_model() must precede weight preparation")
+        if getattr(self, "_prepared_weight_transfer", None) is not None:
+            raise RuntimeError("A prepared weight transfer is already owned by this actor")
+        from lumenrl.engine.inference.prepared_weight_transfer import prepare_weight_transfer
+
+        started = time.perf_counter()
+        params, _ = self._engine.get_per_tensor_param(stack_experts=False)
+        stream = torch.cuda.current_stream(self._device)
+        available, _ = torch.cuda.mem_get_info(self._device)
+        epoch = getattr(self._engine.lr_scheduler, "last_epoch", None)
+        snapshot = prepare_weight_transfer(
+            params,
+            version=version,
+            scheduler_epoch=epoch,
+            keep_fp32=os.environ.get("LUMENRL_SYNC_FP32") == "1",
+            max_bytes=max_bytes,
+            available_bytes=int(available),
+            synchronize=stream.synchronize,
+        )
+        self._prepared_weight_transfer = snapshot
+        return {
+            "version": version,
+            "parameters": len(snapshot.weights),
+            "layout": [(name, tuple(tensor.shape), str(tensor.dtype)) for name, tensor in snapshot.weights],
+            "scheduler_epoch": epoch,
+            "wire_bytes": snapshot.wire_bytes,
+            "estimated_peak_bytes": snapshot.estimated_peak_bytes,
+            "prepare_s": time.perf_counter() - started,
+            "producer_stream": int(stream.cuda_stream),
+        }
+
+    def stage_prepared_weight_transfer_cpu(self, version: int) -> dict[str, Any]:
+        """Stage an already completed GPU snapshot into owned host tensors."""
+        snapshot = getattr(self, "_prepared_weight_transfer", None)
+        if snapshot is None:
+            raise RuntimeError("No prepared weight transfer is available for host staging")
+        epoch = getattr(self._engine.lr_scheduler, "last_epoch", None)
+        snapshot.validate(version, epoch)
+        started = time.perf_counter()
+        snapshot.stage_on_cpu()
+        snapshot.validate(version, epoch)
+        return {
+            "version": version, "scheduler_epoch": epoch, "cpu_only": True,
+            "wire_bytes": snapshot.wire_bytes,
+            "layout": [(name, tuple(tensor.shape), str(tensor.dtype)) for name, tensor in snapshot.weights],
+            "host_stage_s": time.perf_counter() - started,
+        }
+
+    def clear_prepared_weight_transfer(self, version: int) -> bool:
+        """Release only the requested transfer's buffers, without cache purges."""
+        snapshot = getattr(self, "_prepared_weight_transfer", None)
+        if snapshot is None:
+            return True
+        if snapshot.version != version:
+            raise RuntimeError("Refusing to clear another weight-transfer version")
+        snapshot.release()
+        self._prepared_weight_transfer = None
+        return True
+
     def update_weights_ipc_send(
         self, bucket_size_mb: int = 512, use_shm: bool = False,
-        version: int | None = None,
+        version: int | None = None, use_prepared: bool = False,
     ) -> dict[str, float]:
         """Stream full (all-gathered) BF16 weights to the colocated vLLM replica.
 
@@ -1538,8 +1588,9 @@ class LumenActorWorker(BaseWorker):
         keep_fp32 = os.environ.get("LUMENRL_SYNC_FP32") == "1"
 
         gb = 1024.0 ** 3
+        cpu_only_source = bool(use_prepared and getattr(getattr(self, "_prepared_weight_transfer", None), "cpu_only", False))
         alloc0 = 0.0
-        if torch.cuda.is_available():
+        if torch.cuda.is_available() and not cpu_only_source:
             self._peak_carry_alloc = max(
                 self._peak_carry_alloc, float(torch.cuda.max_memory_allocated()),
             )
@@ -1558,7 +1609,16 @@ class LumenActorWorker(BaseWorker):
             not is_atom
             and os.environ.get("LUMENRL_WEIGHT_SYNC_STACK_EXPERTS", "1") != "0"
         )
-        params, _ = self._engine.get_per_tensor_param(stack_experts=stack_experts)
+        if use_prepared:
+            if not use_shm:
+                raise ValueError("Prepared transfers currently require SHM transport")
+            snapshot = getattr(self, "_prepared_weight_transfer", None)
+            if snapshot is None:
+                raise RuntimeError("No prepared weight transfer is available")
+            snapshot.validate(version, getattr(self._engine.lr_scheduler, "last_epoch", None))
+            params = snapshot.weights
+        else:
+            params, _ = self._engine.get_per_tensor_param(stack_experts=stack_experts)
         gather_s = 0.0
 
         def _gen():
@@ -1570,6 +1630,9 @@ class LumenActorWorker(BaseWorker):
                     name, param = next(it)
                 except StopIteration:
                     break
+                if use_prepared:
+                    yield name, param
+                    continue
                 full = param.full_tensor() if isinstance(param, DTensor) else param
                 full = full.detach()
                 if full.dtype == torch.float32 and not keep_fp32:
@@ -1596,13 +1659,18 @@ class LumenActorWorker(BaseWorker):
         legacy = {"gc_collect": True, "double_buffer": False} if is_atom else {}
         sender = BucketedWeightSender(
             zmq_handle=handle, bucket_size_mb=int(bucket_size_mb), use_shm=bool(use_shm),
-            version=version, min_bucket_bytes=min_bucket_bytes, **legacy,
+            version=version, min_bucket_bytes=min_bucket_bytes,
+            cpu_only_source=cpu_only_source, **legacy,
         )
         t_send = time.perf_counter()
-        asyncio.run(sender.async_send_weights(_gen()))
+        try:
+            asyncio.run(sender.async_send_weights(_gen()))
+        finally:
+            if use_prepared:
+                self.clear_prepared_weight_transfer(version)
         total_s = time.perf_counter() - t_send
         peak_alloc = 0.0
-        if torch.cuda.is_available():
+        if torch.cuda.is_available() and not cpu_only_source:
             peak_alloc = float(torch.cuda.max_memory_allocated())
         return {
             "gather_s": gather_s,

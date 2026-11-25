@@ -93,6 +93,42 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 
+def _verified_smci_gpu_identity(gpu_ids: list[Any]) -> dict[str, Any]:
+    """Resolve Ray's logical GPU id through the actual ROCm UUID and PCI."""
+    manifest_path = _os.environ.get("LUMENRL_SMCI_GPU_IDENTITY_MANIFEST")
+    if not manifest_path:
+        return {}
+    import json
+    import uuid
+    from pathlib import Path
+
+    if len(gpu_ids) != 1 or _torch.cuda.device_count() != 1:
+        raise RuntimeError("SMCI identity gate requires exactly one GPU per Ray actor")
+    ray_gpu_id = str(int(gpu_ids[0]))
+    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    if ray_gpu_id not in manifest["physical"]:
+        raise RuntimeError(f"Ray assigned an unmapped SMCI GPU id: {ray_gpu_id}")
+    prop = _torch.cuda.get_device_properties(0)
+    unique_id = uuid.UUID(str(prop.uuid)).bytes.decode("ascii").lower()
+    pci = (
+        f"{prop.pci_domain_id:04X}:{prop.pci_bus_id:02X}:"
+        f"{prop.pci_device_id:02X}.0"
+    )
+    matches = [
+        (int(physical), expected)
+        for physical, expected in manifest["physical"].items()
+        if unique_id == expected["unique_id"] and pci == expected["pci"]
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"SMCI Ray GPU id {ray_gpu_id} hardware unmapped: UUID={unique_id} PCI={pci}"
+        )
+    physical, expected = matches[0]
+    return {"ray_gpu_id": ray_gpu_id, "physical_gpu_id": physical,
+            "physical_gpu_uuid": unique_id, "physical_gpu_pci": pci,
+            "physical_gpu_render": expected["render"]}
+
+
 def get_nested_config(config: dict[str, Any], *keys: str, default: Any = None) -> Any:
     """Return ``config[k1][k2]...`` when present, else ``default``."""
     cur: Any = config
@@ -177,7 +213,22 @@ class BaseWorker(ABC):
             "rank": self.rank,
             "node_id": ctx.get_node_id(),
             "gpu_ids": [str(g) for g in gpu_ids],
+            **_verified_smci_gpu_identity(gpu_ids),
         }
+
+    def visible_device_count(self) -> int:
+        """How many accelerators this actor process can actually address.
+
+        Ray pins one GPU per actor, so a worker sees a single device even when
+        the driver sees the whole node; the driver's visibility env is therefore
+        not a valid signal for how actors must bind ``local_rank``.
+        """
+        try:
+            import torch
+
+            return int(torch.cuda.device_count()) if torch.cuda.is_available() else 0
+        except Exception:  # noqa: BLE001 - a worker without torch cannot bind a GPU
+            return 0
 
     def setup_distributed(
         self,
@@ -232,6 +283,19 @@ class BaseWorker(ABC):
             )
 
         if torch.cuda.is_available():
+            # Ray pins one GPU per actor: the visible ordinal is 0 there, even
+            # though the driver may see the whole node (it rewrites the
+            # visibility env itself). Requesting this process's ``rank`` would
+            # then be out of range.
+            visible = int(torch.cuda.device_count())
+            if visible and local_rank >= visible:
+                self._log.info(
+                    "setup_distributed: rank=%d sees %d device(s); binding device 0 "
+                    "instead of local_rank=%d (Ray GPU pinning)",
+                    rank, visible, local_rank,
+                )
+                local_rank = 0
+            os.environ["LOCAL_RANK"] = str(local_rank)
             torch.cuda.set_device(local_rank)
             _mem_snap("BEFORE init_process_group")
 
@@ -284,4 +348,5 @@ class RolloutPlacementWorker:
             "rank": self.rank,
             "node_id": ctx.get_node_id(),
             "gpu_ids": [str(g) for g in gpu_ids],
+            **_verified_smci_gpu_identity(gpu_ids),
         }
