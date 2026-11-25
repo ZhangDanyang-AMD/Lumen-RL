@@ -440,6 +440,12 @@ def _apply_fsdp2_sharding(
         offload_policy=offload_policy,
     )
 
+    # model.to(local_device) above staged the FULL model on this GPU; sharding freed
+    # it, but the caching allocator keeps it (123 GB per actor on Qwen3-30B-A3B),
+    # which colocated vLLM then cannot use and the first update OOMs.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     logger.info("[rank %d] FSDP2 full_shard applied (fp8_reduce=%s, offload=%s)",
                 rank, fp8_linear, fsdp_config.get("param_offload", False))
     return model
