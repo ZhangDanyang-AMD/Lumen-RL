@@ -283,6 +283,15 @@ def apply(module_name: str) -> None:
     patcher = _PATCHERS.get(module_name)
     if patcher is None:
         return
+    if module_name == "atom.model_engine.model_runner" and (
+        os.environ.get("LUMEN_ATOM_ALIGNED_GRAPH", "0") == "1"
+    ):
+        import sys
+
+        from . import aligned_graph
+
+        with _LOCK:
+            aligned_graph.install_runner(sys.modules[module_name])
     pack_enabled, prof_enabled = _phases_enabled()
     if not (pack_enabled or prof_enabled):
         return

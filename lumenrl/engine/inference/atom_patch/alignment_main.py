@@ -30,6 +30,11 @@ _INSTALL_LOCK = threading.RLock()
 _INIT_LOCK = threading.RLock()
 _ALIGNED_ROPE = weakref.WeakKeyDictionary()
 _RUNTIME = {}
+_GRAPH = os.environ.get("LUMEN_ATOM_ALIGNED_GRAPH", "0") == "1"
+
+
+def _aligned_graph():
+    return importlib.import_module("lumenrl.engine.inference.atom_patch.aligned_graph")
 
 _CUSEQLENS_K_CACHE_ENV = "LUMEN_ATOM_CUSEQLENS_CACHE"
 _CUSEQLENS_K_CACHE = threading.local()
@@ -399,7 +404,8 @@ def validate_aligned_attention_config(config, impl):
     for name in ("tensor_parallel_size", "pipeline_parallel_size", "prefill_context_parallel_size", "decode_context_parallel_size"):
         if getattr(config, name, None) != 1:
             raise AlignmentError(f"aligned Attention requires {name}=1")
-    if getattr(config, "enforce_eager", None) is not True:
+    eager = getattr(config, "enforce_eager", None)
+    if eager is not True and not (_GRAPH and eager is False):
         raise AlignmentError("aligned Attention requires eager execution")
     if getattr(config, "enable_prefix_caching", None) is not False:
         raise AlignmentError("prefix-cache lifecycle is not validated")
@@ -614,15 +620,19 @@ def _install_attention(module):
         )
         self._aligned_attention_max_len = validate_aligned_attention_config(config, self)
         self._aligned_attention_receipt = initialize_aligned_attention(self.rotary_emb.cos_cache.device)
+        if _GRAPH:
+            self._aligned_graph_max_rows = config.max_num_seqs
         self._lumen_alignment_main_active = True
 
     @functools.wraps(original_rope)
     def rope_cache(self, q, k, v, qkv, position, fwd_ctx):
         if getattr(self, "_lumen_alignment_main_active", False):
             validate_aligned_rope(self.rotary_emb)
-            entry = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
-            validate_aligned_cache_write(self, q, k, v, position, fwd_ctx,
-                                         entry.k_cache, entry.v_cache)
+            # Graph decode validates the same contract per replay on host mirrors.
+            if not (_GRAPH and _aligned_graph().is_graph_decode(fwd_ctx)):
+                entry = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
+                validate_aligned_cache_write(self, q, k, v, position, fwd_ctx,
+                                             entry.k_cache, entry.v_cache)
         return original_rope(self, q, k, v, qkv, position, fwd_ctx)
 
     def aligned_backend(self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx):
@@ -630,6 +640,10 @@ def _install_attention(module):
             raise AlignmentError("aligned attention invoked on an inactive instance")
         if self._cache_format != "NHD" or self.use_flash_layout or not self.use_triton_attn:
             raise AlignmentError("native Qwen3 writer did not retain 5D SHUFFLE layout")
+        if _GRAPH:
+            graph = _aligned_graph()
+            if graph.is_graph_decode(fwd_ctx):
+                return graph.graph_decode_attention(self, q, k_cache, v_cache, fwd_ctx, _pinned_varlen)
         return aligned_varlen_attention(self, q, k, v, k_cache, v_cache, fwd_ctx)
 
     @functools.wraps(original_dispatch)
