@@ -32,6 +32,11 @@ What changes with ``LUMEN_ATOM_ALIGNED_GRAPH=1``
   on a fixed (rows, 256) grid that strides over each row's live tokens instead of
   one program per 16-token tile of ``max_model_len``; the packed K/V is bitwise
   identical and the grid is still fixed at capture.
+* ``LUMEN_ATOM_ALIGNED_GRAPH_PAGED=1`` (default off) skips the pack and runs
+  ``aligned_paged_attention`` (generated fork of the pinned kernel whose K/V tile
+  loads read the paged cache through the block table). The packed buffers stay
+  allocated so ATOM's KV capacity is unchanged; the first uncaptured call per
+  device must equal pack + pinned varlen bitwise or the run stops.
 """
 
 from __future__ import annotations
@@ -49,6 +54,8 @@ PACK_LOOP_SWITCH = "LUMEN_ATOM_ALIGNED_GRAPH_PACK_LOOP"
 ENABLED = os.environ.get(SWITCH, "0") == "1"
 HOSTCHECK = os.environ.get(HOSTCHECK_SWITCH, "1") == "1"
 PACK_LOOP = os.environ.get(PACK_LOOP_SWITCH, "0") == "1"
+PAGED_SWITCH = "LUMEN_ATOM_ALIGNED_GRAPH_PAGED"
+PAGED = os.environ.get(PAGED_SWITCH, "0") == "1"
 
 _HEADS = 8
 _HEAD_DIM = 128
@@ -64,6 +71,7 @@ _BUFFERS = {}
 _GEOMETRY = {}
 _KERNEL = None
 _LOOP_KERNEL = None
+_PAGED_CHECKED = set()
 
 
 class AlignedGraphError(RuntimeError):
@@ -319,6 +327,50 @@ def _launch_pack(key_cache, value_cache, block_tables, buffers, rows, page):
     )
 
 
+def _paged_runtime(varlen, device):
+    """Pinned config and aiter launch globals, read from the same verified runtime ``varlen`` uses."""
+    import sys
+
+    from aiter.ops.triton.attention import mha as mha_api
+
+    am = sys.modules[varlen.__module__]
+    path, digest = am._policy_key()
+    state = am._RUNTIME.get((device.index, path, digest))
+    if state is None:
+        raise AlignedGraphError("paged aligned decode needs the verified pinned Attention runtime")
+    return (dict(state["config"]), mha_api.get_num_xcds(), mha_api._MHA_SWIZZLE,
+            bool(mha_api._USE_INT64_STRIDES))
+
+
+def _paged_decode(impl, q, key_cache, value_cache, block_tables, buffers, rows, page, max_len, cuq,
+                  varlen, capturing):
+    """Paged fork over the cache. The packed buffers stay allocated (unused) so KV capacity is
+    unchanged; the first uncaptured call per device must match pack+pinned bitwise."""
+    import torch
+
+    from lumenrl.engine.inference.atom_patch.aligned_paged_attention import paged_varlen
+
+    config, num_xcd, swizzle, int64 = _paged_runtime(varlen, q.device)
+    cuk = buffers.cuk[:rows + 1]
+    output = paged_varlen(q, key_cache, value_cache, block_tables, buffers.valid, cuq, cuk, max_len,
+                          impl.scale, config, num_xcd, swizzle, int64)
+    key = (q.device.type, q.device.index)
+    if key not in _PAGED_CHECKED:
+        if capturing:
+            raise AlignedGraphError("paged aligned decode self-check must run before stream capture")
+        _launch_pack(key_cache, value_cache, block_tables, buffers, rows, page)
+        reference = varlen(q, buffers.k, buffers.v, cu_seqlens_q=cuq, cu_seqlens_k=cuk,
+                           max_seqlen_q=1, max_seqlen_k=max_len,
+                           dropout_p=0.0, softmax_scale=impl.scale, causal=True)
+        if not torch.equal(output.view(torch.int16), reference.view(torch.int16)):
+            raise AlignedGraphError("paged aligned decode differs from pack+pinned varlen")
+        _PAGED_CHECKED.add(key)
+        import sys
+
+        print(f"LUMEN_ALIGNED_PAGED_SELFCHECK bitwise_equal device={key} rows={rows}", file=sys.stderr, flush=True)
+    return output
+
+
 def graph_decode_attention(impl, q, key_cache, value_cache, fwd_ctx, varlen, pack=None):
     """Capture-safe aligned decode attention over ATOM's device metadata.
 
@@ -337,14 +389,18 @@ def graph_decode_attention(impl, q, key_cache, value_cache, fwd_ctx, varlen, pac
     _GEOMETRY[(q.device.type, q.device.index)] = (pages, page, max_len)
     device_row_plan(meta.context_lens, meta.slot_mapping, rows,
                     buffers.klen, buffers.valid, buffers.cuk)
-    (pack or _launch_pack)(key_cache, value_cache, meta.block_tables, buffers, rows, page)
     cuq = meta.cu_seqlens_q[:rows + 1]
     if cuq.dtype != torch.int32:
         raise AlignedGraphError("graph aligned decode requires int32 cu_seqlens_q")
-    output = varlen(q, buffers.k, buffers.v,
-                    cu_seqlens_q=cuq, cu_seqlens_k=buffers.cuk[:rows + 1],
-                    max_seqlen_q=1, max_seqlen_k=max_len,
-                    dropout_p=0.0, softmax_scale=impl.scale, causal=True)
+    if PAGED and pack is None:
+        output = _paged_decode(impl, q, key_cache, value_cache, meta.block_tables, buffers, rows, page,
+                               max_len, cuq, varlen, capturing)
+    else:
+        (pack or _launch_pack)(key_cache, value_cache, meta.block_tables, buffers, rows, page)
+        output = varlen(q, buffers.k, buffers.v,
+                        cu_seqlens_q=cuq, cu_seqlens_k=buffers.cuk[:rows + 1],
+                        max_seqlen_q=1, max_seqlen_k=max_len,
+                        dropout_p=0.0, softmax_scale=impl.scale, causal=True)
     if not isinstance(output, torch.Tensor) or tuple(output.shape) != (rows, 32, _HEAD_DIM) or output.dtype != q.dtype or output.device != q.device:
         raise AlignedGraphError("public varlen returned an unexpected output contract")
     return output
