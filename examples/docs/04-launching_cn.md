@@ -146,6 +146,14 @@ sudo docker exec -d "$CONTAINER" bash -lc "$ENVX STEPS=1000 MODE=atomfp8  TRAIN_
 sudo docker exec -d "$CONTAINER" bash -lc "$ENVX STEPS=1000 MODE=atombf16             bash '$S'"  # 5
 ```
 
+> 例子 5 要跑训推一致路径，加上 `LUMENRL_CONSISTENT=1`：
+>
+> ```bash
+> sudo docker exec -d "$CONTAINER" bash -lc "$ENVX STEPS=1000 MODE=atombf16 LUMENRL_CONSISTENT=1 bash '$S'"  # 5，一致性
+> ```
+>
+> 它打开六个 ATOM 算子、split-KV decode 和延迟返回的 logprob。开关不设置 GEMM 表，需要自己传 `AITER_CONFIG_GEMM_BF16`。详见 [qwen3-8b-dense-bf16-align.md](../DAPO/qwen3-8b-dense-bf16-align.md)。不设这个变量就是不对齐的对照。
+
 > 例子 5 不要传 `TRAIN_FP8=1`：`MODE=atombf16` 会把 `LUMEN_FP8` / `FP8_PARAM_MANAGER` /
 > `LUMEN_FP8_SCALING` 等一并 unset，训练侧无条件是 BF16。它也**不导入 Lumen/AITER 的 norm
 > patch**（HF Qwen3 的 RMSNorm 本身就是 model-sensitive），这样才和例子 1 严格可比。

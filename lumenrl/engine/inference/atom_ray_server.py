@@ -14,6 +14,7 @@ import logging
 import os
 import socket
 import sys
+from contextlib import AbstractContextManager, nullcontext
 from multiprocessing import shared_memory
 from typing import Any, Optional
 from uuid import uuid4
@@ -38,6 +39,21 @@ if not logger.handlers and not logging.getLogger().handlers:
     logger.addHandler(_h)
 
 
+def _weight_sync_session(core_mgr: Any) -> AbstractContextManager[None]:
+    """One sync id for every bucket, when this ATOM provides the session.
+
+    A current ATOM rejects a non-final weight bucket outside
+    ``weight_sync_session``, because another sender could commit the tail of
+    this update as its own. The ATOM pinned in the release image has no such
+    method and accepts each bucket as its own sync. The lookup is once per
+    weight update, off the decode path.
+    """
+    session = getattr(core_mgr, "weight_sync_session", None)
+    if session is None:
+        return nullcontext()
+    return session()
+
+
 class ATOMRayServer:
     """Ray actor hosting one ATOM AsyncLLMEngine on a colocated GPU."""
 
@@ -53,6 +69,9 @@ class ATOMRayServer:
         self.replica_rank = int(replica_rank)
         self.base_seed = base_seed
         self.engine = None
+        # Trainer cap. The engine may be one token longer so a finished
+        # sequence can be rescored; sampling still stops at this cap.
+        self._sample_max_model_len = None
         # ATOM's preemption counter is cumulative; keep the last reading so
         # each batch can report its own.
         self._preemptions_seen = 0
@@ -64,6 +83,7 @@ class ATOMRayServer:
         kwargs.setdefault("model", self.model_name)
         kwargs.setdefault("master_addr", self._get_node_ip())
         kwargs.setdefault("port", self._get_free_port())
+        self._reserve_rescore_token(kwargs)
         self._pin_cudagraph_mode(kwargs)
         self.engine = AsyncLLMEngine(**kwargs)
         logger.info(
@@ -151,7 +171,8 @@ class ATOMRayServer:
         from atom.sampling_params import SamplingParams
 
         params = dict(params)
-        max_model_len = int(self.engine_kwargs.get("max_model_len") or 0)
+        sample_cap = getattr(self, "_sample_max_model_len", None)
+        max_model_len = int(sample_cap or self.engine_kwargs.get("max_model_len") or 0)
         max_possible = None
         if max_model_len > 0:
             max_possible = max(1, max_model_len - int(prompt_length))
@@ -227,12 +248,14 @@ class ATOMRayServer:
         out = await asyncio.get_event_loop().run_in_executor(None, _generate_blocking)
         token_ids = list(out.get("token_ids", [])) if isinstance(out, dict) else []
         logprobs = out.get("logprobs") if isinstance(out, dict) else None
-        return {
+        result = {
             "text": out.get("text", "") if isinstance(out, dict) else "",
             "prompt_token_ids": prompt_ids,
             "token_ids": token_ids,
             "logprobs": [float(x) for x in logprobs] if logprobs is not None else None,
         }
+        self._apply_prefill_rescore([result])
+        return result
 
     async def generate_batch(
         self,
@@ -278,7 +301,97 @@ class ATOMRayServer:
                 "token_ids": token_ids,
                 "logprobs": [float(x) for x in logprobs] if logprobs is not None else None,
             })
+        self._apply_prefill_rescore(results)
         return results
+
+    def _reserve_rescore_token(self, kwargs: dict[str, Any]) -> None:
+        """Leave one engine token so a sequence at the trainer cap can be rescored.
+
+        Scoring calls ``generate`` with ``max_tokens=1``. A sequence that already
+        fills ``max_model_len`` has no room for that token, and the decode
+        logprobs would be what the loss sees. Sampling keeps the original cap.
+        """
+        self._sample_max_model_len = None
+        if os.environ.get("LUMENRL_PREFILL_RESCORE", "0") != "1":
+            return
+        cap = int(kwargs.get("max_model_len") or 0)
+        if cap <= 0:
+            return
+        self._sample_max_model_len = cap
+        kwargs["max_model_len"] = cap + 1
+        self.engine_kwargs["max_model_len"] = cap + 1
+        batched = int(kwargs.get("max_num_batched_tokens") or 0)
+        if 0 < batched < cap + 1:
+            kwargs["max_num_batched_tokens"] = cap + 1
+            self.engine_kwargs["max_num_batched_tokens"] = cap + 1
+        logger.info(
+            "prefill rescore reserves one token: sample cap %d, engine max_model_len %d",
+            cap,
+            cap + 1,
+        )
+
+    def rescore_limits(self) -> dict[str, int]:
+        return {
+            "sample_cap": int(self._sample_max_model_len or 0),
+            "engine_max": int(self.engine_kwargs.get("max_model_len") or 0),
+        }
+
+    def _apply_prefill_rescore(self, results: list[dict[str, Any]]) -> None:
+        """Score each finished sequence with one prefill and keep those logprobs."""
+        if os.environ.get("LUMENRL_PREFILL_RESCORE", "0") != "1":
+            return
+        directory = os.environ.get("LUMENRL_RESCORE_DIR", "")
+        if not directory or self.engine is None:
+            return
+        from atom.sampling_params import SamplingParams
+        from prefill_rescore import load_rescore, rescore_path
+
+        scoring = SamplingParams(
+            max_tokens=1,
+            temperature=0.0,
+            top_p=1.0,
+            top_k=-1,
+            ignore_eos=True,
+            logprobs=False,
+        )
+        max_model_len = int(self.engine_kwargs.get("max_model_len") or 0)
+        for item in results:
+            if item.get("logprobs") is None:
+                continue
+            prompt = list(item["prompt_token_ids"])
+            response = list(item["token_ids"])
+            ids = prompt + response
+            if len(ids) < 2 or not response:
+                continue
+            if max_model_len > 0 and len(ids) >= max_model_len:
+                logger.warning(
+                    "prefill rescore skipped: sequence length %d fills max_model_len %d",
+                    len(ids),
+                    max_model_len,
+                )
+                continue
+            path = rescore_path(directory, ids)
+            if os.path.exists(path):
+                os.remove(path)
+            try:
+                self.engine.generate([ids], scoring)
+            except Exception:
+                logger.exception("prefill rescore forward failed")
+                continue
+            scored = load_rescore(directory, ids)
+            if scored is None:
+                logger.warning("prefill rescore missing for %d tokens", len(ids))
+                continue
+            start = len(prompt) - 1
+            chosen = scored[start : start + len(response)]
+            if chosen.shape[0] != len(response):
+                logger.warning(
+                    "prefill rescore length %d, response %d",
+                    int(chosen.shape[0]),
+                    len(response),
+                )
+                continue
+            item["logprobs"] = [float(value) for value in chosen.tolist()]
 
     def _log_kv_pressure(self) -> None:
         """Report how hard this batch leaned on the KV pool.
@@ -448,7 +561,11 @@ class ATOMRayServer:
             per_gpu_ipc_handles = {gpu_idx: reduce_tensor(buf) for gpu_idx, buf in per_gpu_buffers.items()}
             stats = {"buckets": 0, "weights": 0, "experts": 0}
 
-            while True:
+            # Non-final buckets share one sync id when ATOM provides the
+            # session. An older CoreManager has no such method; the helper
+            # then leaves the loop as it was.
+            with _weight_sync_session(self.engine.core_mgr):
+              while True:
                 metadata = socket.recv_pyobj()
                 check_bucket_version(metadata, version)
                 raw_bucket_meta = metadata["bucket_meta"]
@@ -573,7 +690,8 @@ class ATOMRayServer:
             comm_metadata = socket.recv_pyobj()
             socket.send(b"")
             shm = shared_memory.SharedMemory(name=comm_metadata["name"])
-            while True:
+            with _weight_sync_session(self.engine.core_mgr):
+              while True:
                 metadata = socket.recv_pyobj()
                 check_bucket_version(metadata, version)
                 bucket_meta, _used_bytes = self._bucket_meta(metadata["bucket_meta"])
@@ -742,17 +860,45 @@ class ATOMReplicaManager:
                 env_vars["LUMENRL_ATOM_TRUE_VOCAB_SIZE"] = str(true_vocab_size)
             if dynamo_required:
                 env_vars["TORCHDYNAMO_DISABLE"] = "0"
+            # sitecustomize keeps prefill RoPE on aiter while decode stays on Triton.
+            _patch_dir = os.path.normpath(
+                os.path.join(os.path.dirname(__file__), "..", "..", "aiter_patch")
+            )
+            if os.path.isdir(_patch_dir):
+                existing = os.environ.get("PYTHONPATH", "")
+                env_vars["PYTHONPATH"] = (
+                    _patch_dir + os.pathsep + existing if existing else _patch_dir
+                )
             for key in (
                 "LUMENRL_ATOM_CHECK_ALIGNMENT",
+                "LUMENRL_ALIGN_DECODE",
+                "LUMENRL_ALIGN_SYNC_OUTPUT",
+                "LUMENRL_ALIGN_CONTIG_KV",
+                "LUMENRL_ALIGN_CONTIG_KV_CAPACITY",
+                "LUMENRL_ALIGN_BATCHED_DECODE",
+                "LUMENRL_ALIGN_BATCHED_CHECK",
+                "LUMENRL_ALIGN_SYNC_WEIGHTS",
+                "LUMENRL_PREFILL_DECODE_ATTN",
+                "LUMENRL_STABLE_GEMM",
+                "LUMENRL_PREFILL_RESCORE",
+                "LUMENRL_RESCORE_DIR",
                 "ATOM_ISOLATE_TORCH_COMPILE_CACHE",
                 "ATOM_LOG_LEVEL",
                 "ATOM_USE_TORCH_RMSNORM",
                 "ATOM_FORCE_ATTN_TRITON",
                 "VERL_ATOM_AGENT_LOG",
                 "VERL_MEMORY_AGENT_LOG",
+                "AITER_CONFIG_GEMM_BF16",
             ):
                 if key in os.environ:
                     env_vars[key] = os.environ[key]
+            if env_vars.get("LUMENRL_PREFILL_RESCORE") == "1":
+                # One directory per replica. Engines rescore concurrently, and
+                # a shared file is deleted by one replica while another reads it.
+                base = env_vars.get("LUMENRL_RESCORE_DIR") or "/tmp/lumenrl-prefill-rescore"
+                replica_dir = os.path.join(base, f"replica-{r}")
+                os.makedirs(replica_dir, exist_ok=True)
+                env_vars["LUMENRL_RESCORE_DIR"] = replica_dir
 
             engine_kwargs = self._engine_kwargs_for_replica(r, job_id)
             if true_vocab_size is not None:
