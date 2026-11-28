@@ -590,6 +590,7 @@ class RLTrainer:
             engine_kwargs,
             max_concurrency=max(8, int(vcfg.max_num_seqs)),
             base_seed=(int(seed) if seed is not None else None),
+            ipc_staging_mb=int(getattr(atom_cfg, "ipc_staging_mb", 2048) or 2048),
         )
         mgr.create()
         self._ray_rollout_mgr = mgr
@@ -852,6 +853,11 @@ class RLTrainer:
 
         vcfg = self.config.policy.generation.vllm_cfg
         bmb = int(vcfg.update_weights_bucket_megabytes)
+        if self._gen_backend == "atom":
+            # ATOM pays a call into its runners per bucket (~11 ms), and the
+            # staging buffer the bucket is copied into is allocated anyway.
+            atom_cfg = self.config.policy.generation.atom_cfg
+            bmb = max(bmb, int(getattr(atom_cfg, "ipc_staging_mb", 2048) or 2048))
         use_shm = bool(vcfg.use_shm)
         sleeping = bool(getattr(self._ray_vllm_engine, "enable_sleep", False))
 
