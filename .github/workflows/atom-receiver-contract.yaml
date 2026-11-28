@@ -1,0 +1,58 @@
+name: ATOM Receiver Contract
+
+# ATOM's RDMA weight receiver (ROCm/ATOM, atom/rollout/rdma_weight_receiver.py)
+# decodes the stream lumenrl/engine/inference/rdma_weight_transfer.py sends.
+# tests/unit/test_atom_receiver_contract.py holds the two to one protocol -- on
+# any change to the sender, and daily, since ATOM can move without LumenRL
+# changing. Both are read as text; nothing of either runs.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'lumenrl/engine/inference/rdma_weight_transfer.py'
+      - 'tests/unit/test_atom_receiver_contract.py'
+      - '.github/workflows/atom-receiver-contract.yaml'
+  workflow_dispatch:
+  schedule:
+    - cron: '30 22 * * *'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  receiver-contract:
+    name: Check the sender against ATOM's receiver
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout LumenRL
+        uses: actions/checkout@v4
+      - name: Checkout ATOM
+        uses: actions/checkout@v4
+        with:
+          repository: ROCm/ATOM
+          path: ATOM
+          persist-credentials: false
+      - name: Find the receiver
+        id: atom
+        run: |
+          git -C ATOM log -1 --format='ATOM under test: %H %s'
+          if [ -f ATOM/atom/rollout/rdma_weight_receiver.py ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::ATOM main has no RDMA receiver yet; nothing to check"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Set up Python environment
+        if: steps.atom.outputs.present == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check the sender against the receiver
+        if: steps.atom.outputs.present == 'true'
+        env:
+          ATOM_ROOT: ${{ github.workspace }}/ATOM
+        run: |
+          pip3 install pytest
+          python -m pytest tests/unit/test_atom_receiver_contract.py -rA
